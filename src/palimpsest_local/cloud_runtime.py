@@ -1824,6 +1824,7 @@ def shell_session(
                 known_hosts=known_hosts,
                 port=port,
             )
+            command[1:1] = ["-E", str(staging / "transport.log")]
             mutation.verify_binding()
             session = spawn_process_session(command, tty=True, stdin=True)
             mutation.verify_binding()
@@ -1873,6 +1874,7 @@ def exec_session(
                 known_hosts=known_hosts,
                 port=port,
             )
+            command[1:1] = ["-E", str(staging / "transport.log")]
             mutation.verify_binding()
             session = spawn_process_session(command, tty=False, stdin=False)
             mutation.verify_binding()

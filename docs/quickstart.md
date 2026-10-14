@@ -63,7 +63,7 @@ palimpsest completion fish > ~/.config/fish/completions/palimpsest.fish
 
 #### Completion Examples
 
-- `palimpsest <Tab><Tab>` → suggests top-level command groups (`image`, `layer`, `bundle`, `build`, `run`, `compose`, `ui`, `store`, etc.)
+- `palimpsest <Tab><Tab>` → suggests top-level command groups (`image`, `layer`, `bundle`, `build`, `run`, `compose`, `web`, `store`, etc.)
 - `palimpsest image <Tab><Tab>` → suggests `image` subcommands (`inspect`, `history`, `rm`, `save`, `load`, `ls`, `pull`, `verify`, `import`, `push`)
 - `palimpsest run --backend <Tab><Tab>` → suggests backend choices (`auto`, `kvm`, `lima-vz`, `libvirt-hvf`)
 
@@ -317,7 +317,7 @@ palimpsest build \
 
 > The local build/cache/runtime-pack path is implemented. Production release still requires the clean-host Linux KVM and concurrency gates described below.
 
-An online build downloads and imports a verified Hub cache before executing an authoritative miss, uploads the refreshed Hub cache automatically, and creates one verified SquashFS runtime block. Optional registry caches are additive to that mandatory Hub path. In the following example, `--push` publishes the OCI image to the selected registry and `--runtime-push` uploads the runtime block to Hub:
+An online build in default native cache mode downloads and imports a verified Hub cache before executing an authoritative miss and uploads the refreshed Hub cache automatically. The runtime options below additionally create one verified SquashFS runtime block. Optional registry caches are additive to that mandatory Hub path. In the following example, `--push` publishes the OCI image to the selected registry and `--runtime-push` uploads the runtime block to Hub:
 
 ```bash
 RUNTIME_BASE=sha256:<boot-image-digest>
@@ -353,6 +353,15 @@ palimpsest build . \
 ```
 
 The Hub lookup and refreshed Hub cache upload still occur. Profile-level `cache_from`/`cache_to` entries are merged with these command-line entries.
+
+For an ordinary local OCI image build without Hub cache authorization, use:
+
+```bash
+palimpsest build . -f Dockerfile -t demo:dev --cache-mode local --registry docker
+```
+
+This uses managed host cache, not native/external cache backends. It can still
+fetch remote Dockerfile inputs; `--offline` is the separate isolation contract.
 
 To build without Hub or a registry, use a digest-pinned local OCI layout. Every Dockerfile `FROM` must resolve through a local alias. Strict isolation also requires selecting an already-bootstrapped local `docker-container` Buildx builder created with `--driver-opt network=none`; see the [installation guide](install.md#3-buildkit-requirements-for-dockerfile-builds).
 

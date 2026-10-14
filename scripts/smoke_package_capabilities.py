@@ -449,8 +449,11 @@ class SyntheticKeystone:
                 continue
             if project_only is not None and (kind != "project" or target != project_only):
                 continue
+            # Match Keystone's project-oriented expansion, which omits direct system grants.
+            if effective and kind == "system":
+                continue
             for role_id in self.expand([role]) if effective else [role]:
-                key = (user, kind, target, role_id)
+                key = (user, kind, target, role, role_id)
                 if key in emitted or role_id not in self.roles:
                     continue
                 emitted.add(key)
@@ -465,6 +468,11 @@ class SyntheticKeystone:
                         }
                     }
                 )
+                scope_path = "system" if kind == "system" else f"projects/{target}"
+                assignment = f"http://keystone:5000/v3/{scope_path}/users/{user}/roles/{role}"
+                links = {"assignment": assignment}
+                if role_id != role:
+                    links["prior_role"] = f"http://keystone:5000/v3/roles/{role}/implies/{role_id}"
                 result.append(
                     {
                         "user": {
@@ -474,7 +482,7 @@ class SyntheticKeystone:
                         },
                         "scope": scope,
                         "role": self._role_ref(role_id),
-                        "links": {"assignment": "synthetic"},
+                        "links": links,
                     }
                 )
         return result
@@ -1619,6 +1627,15 @@ class Smoke:
                 json_body={"name": "denied", "scope": {"packages": ["smoke/app"]}, "actions": ["packages:inventory"]},
             )
         self.http(
+            "system privilege alone cannot upload legacy artifacts",
+            "system_admin",
+            "POST",
+            "/v1/uploads",
+            expect=403,
+            auth=system_admin,
+            json_body={},
+        )
+        self.http(
             "foreign project cannot read namespace", "foreign", "GET", base + "/packages", expect=403, auth=foreign
         )
 
@@ -2267,6 +2284,33 @@ class Smoke:
             "GET",
             "/v1/projects/current",
             expect=403,
+            auth=owner,
+        )
+        self.http(
+            "system promotion retains independent ordinary legacy publication",
+            "owner",
+            "GET",
+            "/v1/me",
+            expect=200,
+            auth=owner,
+            validate=lambda r: ensure(r.json()["capabilities"]["upload"] is True, "ordinary publication lost"),
+        )
+        promoted_upload = self.http(
+            "promoted owner starts legacy upload as original project user",
+            "owner",
+            "POST",
+            "/v1/uploads",
+            expect=200,
+            auth=owner,
+            json_body={},
+            require=True,
+        )
+        self.http(
+            "promoted owner aborts its proof-only legacy session",
+            "owner",
+            "DELETE",
+            "/v1/uploads/" + promoted_upload.json()["session_id"],
+            expect=204,
             auth=owner,
         )
         self.assignment(False, "owner", "admin", system=True)

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import dataclasses
+import hashlib
 import json
 import os
 import threading
@@ -10,7 +12,7 @@ import pytest
 from palimpsest_local import inventory, state
 from palimpsest_local.errors import ArtifactValidationError, StateError
 from palimpsest_local.hub import KIND_CLOUD_IMAGE, MEDIA_TYPE_LAYER_SQUASHFS
-from palimpsest_local.oci_layout import ContentStore
+from palimpsest_local.oci_layout import ContentStore, build_bundle_tar_bytes
 from palimpsest_local.runtime_types import CapabilityCheck
 from palimpsest_local.state import TagRecord, init_roots, write_tag_record
 
@@ -21,6 +23,16 @@ def _stub_operation_capability_checks(monkeypatch: pytest.MonkeyPatch) -> None:
         inventory.runtime_dispatch.platforms,
         "_check_capability",
         lambda requirement, **_kwargs: CapabilityCheck(requirement.capability_id, "test-present", True),
+    )
+    monkeypatch.setattr(
+        inventory.host_inventory,
+        "observe",
+        lambda: {
+            "vms": [],
+            "volumes": [],
+            "networks": [],
+            "warnings": [],
+        },
     )
 
 
@@ -257,6 +269,453 @@ def test_list_artifacts(tmp_path: Path):
     assert len(img_art["tags"]) == 1
     assert img_art["tags"][0]["tag"] == "ubuntu-base"
     assert img_art["referenced_by"]["runs"] == ["art-run"]
+
+
+def _buildkit_export(roots: state.StatePaths, build_id: str, **changes):
+    """A deterministic real OCI export and the receipt written by BuildKit."""
+    layer = build_bundle_tar_bytes({"hello.txt": b"hello from Dockerfile\n"})
+    config = json.dumps(
+        {
+            "architecture": "amd64",
+            "os": "linux",
+            "rootfs": {"type": "layers", "diff_ids": ["sha256:" + hashlib.sha256(layer).hexdigest()]},
+            "config": {},
+        },
+        sort_keys=True,
+    ).encode()
+
+    def descriptor(payload, media_type):
+        return {
+            "mediaType": media_type,
+            "digest": "sha256:" + hashlib.sha256(payload).hexdigest(),
+            "size": len(payload),
+        }
+
+    config_desc = descriptor(config, "application/vnd.oci.image.config.v1+json")
+    layer_desc = descriptor(layer, "application/vnd.oci.image.layer.v1.tar")
+    manifest = json.dumps(
+        {
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": config_desc,
+            "layers": [layer_desc],
+        },
+        sort_keys=True,
+    ).encode()
+    manifest_desc = descriptor(manifest, "application/vnd.oci.image.manifest.v1+json")
+    archive = build_bundle_tar_bytes(
+        {
+            "oci-layout": b'{"imageLayoutVersion":"1.0.0"}',
+            "index.json": json.dumps({"schemaVersion": 2, "manifests": [manifest_desc]}).encode(),
+            "blobs/sha256/" + config_desc["digest"].split(":")[1]: config,
+            "blobs/sha256/" + layer_desc["digest"].split(":")[1]: layer,
+            "blobs/sha256/" + manifest_desc["digest"].split(":")[1]: manifest,
+        }
+    )
+    output = roots.builds / "outputs" / f"{build_id}.oci.tar"
+    output.parent.mkdir(exist_ok=True)
+    output.write_bytes(archive)
+    record = {
+        "schema_version": 2,
+        "engine": "buildkit",
+        "build_id": build_id,
+        "status": "success",
+        "output_path": str(output.resolve()),
+        "output_oci_manifest_digest": manifest_desc["digest"],
+        "output_oci_archive_digest": "sha256:" + hashlib.sha256(archive).hexdigest(),
+        "output_tags": ["example/image:dev"],
+        "runtime_block_digest": None,
+        "bytes": {"oci_archive": len(archive)},
+        "platform": "linux/amd64",
+        "finished_at": "2026-08-24T11:00:00Z",
+        **changes,
+    }
+    build_dir = roots.builds / build_id
+    build_dir.mkdir(exist_ok=True)
+    state.atomic_write_json(build_dir / "record.json", record)
+    return record
+
+
+def test_plain_buildkit_exports_are_images_with_typed_identity_and_provenance(tmp_path):
+    roots = _setup_roots(tmp_path)
+    first = _buildkit_export(roots, "bk-000000000001")
+    second = _buildkit_export(roots, "bk-000000000002")
+    # Two byte-distinct archives of the same image must still produce one row.
+    output = Path(second["output_path"])
+    output.write_bytes(output.read_bytes() + b"\0" * 512)
+    second["output_oci_archive_digest"] = "sha256:" + hashlib.sha256(output.read_bytes()).hexdigest()
+    second["bytes"]["oci_archive"] = output.stat().st_size
+    state.atomic_write_json(roots.builds / second["build_id"] / "record.json", second)
+
+    result = inventory.list_artifacts(roots)
+
+    assert result["artifacts"] == result["images"]
+    assert result["layers"] == result["unknown"] == []
+    assert len(result["images"]) == 1
+    image = result["images"][0]
+    assert image["kind"] == "oci-image"
+    assert image["digest_type"] == "oci-manifest"
+    assert image["digest"] == first["output_oci_manifest_digest"]
+    assert image["output_oci_archive_digest"] == first["output_oci_archive_digest"]
+    assert image["size_bytes"] == Path(first["output_path"]).stat().st_size
+    assert image["output_oci_archive_size_bytes"] == image["size_bytes"]
+    assert image["availability"] == "available"
+    assert image["editable"] is False
+    assert image["source"] == "build-record"
+    assert image["tags"] == []  # Recorded Docker output tags are not local CAS bindings.
+    assert image["output_tags"] == ["example/image:dev"]
+    assert [build["build_id"] for build in image["builds"]] == [first["build_id"], second["build_id"]]
+    assert [build["output_oci_archive_digest"] for build in image["builds"]] == [
+        first["output_oci_archive_digest"],
+        second["output_oci_archive_digest"],
+    ]
+    assert all(build["runtime_block_digest"] is None for build in image["builds"])
+    with pytest.raises(StateError):
+        inventory.tag_artifact(roots, image["digest"], "not-in-cas")
+    assert not (roots.tags / "not-in-cas.json").exists()
+
+
+def test_buildkit_inventory_preserves_cloud_and_runtime_projections(tmp_path):
+    roots = _setup_roots(tmp_path)
+    store = ContentStore(roots.store)
+    cloud_digest = "sha256:" + store.write_stream([b"cloud image"]).name
+    runtime_digest = "sha256:" + store.write_stream([b"runtime block"]).name
+    store.write_metadata(cloud_digest, {"kind": KIND_CLOUD_IMAGE, "disk_format": "qcow2"})
+    store.write_metadata(runtime_digest, {"kind": "squashfs", "media_type": MEDIA_TYPE_LAYER_SQUASHFS})
+    inventory.tag_artifact(roots, runtime_digest, "runtime")
+    build = _buildkit_export(roots, "bk-000000000001", runtime_block_digest=runtime_digest, runtime_tag="runtime")
+    run = roots.runs / "user"
+    run.mkdir()
+    state.atomic_write_json(run / "state.json", {"base": {"digest": cloud_digest}, "layers": [runtime_digest]})
+    project = roots.projects / "project"
+    project.mkdir()
+    state.atomic_write_json(project / "state.json", {"project": "project", "services": [{"run_name": "user"}]})
+
+    result = inventory.list_artifacts(roots)
+
+    assert len(result["images"]) == 2
+    cloud = next(image for image in result["images"] if image["kind"] == KIND_CLOUD_IMAGE)
+    image = next(image for image in result["images"] if image["kind"] == "oci-image")
+    layer = result["layers"][0]
+    assert cloud["referenced_by"] == layer["referenced_by"] == {"runs": ["user"], "projects": ["project"]}
+    assert layer["digest"] == layer["runtime_block_digest"] == runtime_digest
+    assert image["digest"] == build["output_oci_manifest_digest"] != runtime_digest
+    assert layer["tags"][0]["tag"] == "runtime"
+    assert layer["builds"][0]["build_id"] == build["build_id"]
+    detail = inventory.get_build(roots, build["build_id"])
+    assert detail["output_digest"] == detail["runtime_block_digest"] == runtime_digest
+    assert detail["output_oci_manifest_digest"] == image["digest"]
+    assert detail["output_oci_archive_digest"] == build["output_oci_archive_digest"]
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "missing",
+        "changed",
+        "symlink",
+        "hardlink",
+        "failed",
+        "relative",
+        "invalid-digest",
+        "bad-path",
+        "bad-record",
+        "record-symlink",
+        "directory-symlink",
+    ],
+)
+def test_buildkit_inventory_retains_provenance_and_labels_unavailable_exports(tmp_path, damage):
+    roots = _setup_roots(tmp_path)
+    rec = _buildkit_export(roots, "bk-000000000001")
+    output = Path(rec["output_path"])
+    record_path = roots.builds / rec["build_id"] / "record.json"
+    if damage == "missing":
+        output.unlink()
+    elif damage == "changed":
+        output.write_bytes(b"no longer the recorded OCI export")
+    elif damage in {"symlink", "hardlink"}:
+        external = tmp_path / "export.tar"
+        output.rename(external)
+        if damage == "symlink":
+            output.symlink_to(external)
+        else:
+            os.link(external, output)
+    elif damage == "failed":
+        rec["status"] = "failed"
+    elif damage == "relative":
+        rec["output_path"] = "relative.oci.tar"
+    elif damage == "invalid-digest":
+        rec["output_oci_archive_digest"] = "not a digest"
+    elif damage == "bad-path":
+        rec["output_path"] = {"path": str(output)}
+    elif damage == "bad-record":
+        record_path.write_text("[]")
+    elif damage == "record-symlink":
+        external = tmp_path / "record.json"
+        record_path.rename(external)
+        record_path.symlink_to(external)
+    elif damage == "directory-symlink":
+        external = tmp_path / "build"
+        record_path.parent.rename(external)
+        record_path.parent.symlink_to(external, target_is_directory=True)
+    if damage in {"failed", "relative", "invalid-digest", "bad-path"}:
+        state.atomic_write_json(record_path, rec)
+
+    images = inventory.list_artifacts(roots)["images"]
+    if damage in {"failed", "bad-record", "record-symlink", "directory-symlink"}:
+        assert images == []
+    else:
+        assert len(images) == 1
+        image = images[0]
+        assert image["digest"] == rec["output_oci_manifest_digest"]
+        expected = "missing" if damage == "missing" else "available" if damage == "invalid-digest" else "unavailable"
+        assert image["availability"] == expected
+        assert image["editable"] is False
+        assert image["build_ids"] == [rec["build_id"]]
+    if damage in {"bad-record", "record-symlink", "directory-symlink"}:
+        with pytest.raises(StateError):
+            inventory.get_build(roots, rec["build_id"])
+
+
+@pytest.mark.parametrize("manifest", [None, "invalid-digest", 42])
+def test_buildkit_archive_identity_and_conservative_detail(tmp_path, manifest):
+    roots = _setup_roots(tmp_path)
+    rec = _buildkit_export(
+        roots,
+        "bk-000000000001",
+        output_oci_manifest_digest=manifest,
+        runtime_block_digest={"digest": "invalid"},
+        output_tags="not-a-list",
+        platform=["linux/amd64"],
+        started_at=42,
+        timings_ms={"total": float("inf")},
+    )
+    image = inventory.list_artifacts(roots)["images"][0]
+    detail = inventory.get_build(roots, rec["build_id"])
+    assert image["digest_type"] == "oci-archive"
+    assert image["digest"] == detail["output_digest"] == rec["output_oci_archive_digest"]
+    assert detail["output_oci_manifest_digest"] is detail["runtime_block_digest"] is None
+    assert detail["output_tags"] == []
+    assert detail["platform"] is detail["started_at"] is detail["duration_ms"] is None
+
+
+def test_image_monitoring_does_not_release_a_blocked_fifo_writer(tmp_path):
+    roots = _setup_roots(tmp_path)
+    rec = _buildkit_export(roots, "bk-000000000001")
+    output = Path(rec["output_path"])
+    output.unlink()
+    os.mkfifo(output, 0o600)
+    starting = threading.Event()
+    opened = threading.Event()
+
+    def write_peer():
+        starting.set()
+        fd = os.open(output, os.O_WRONLY)
+        opened.set()
+        os.close(fd)
+
+    writer = threading.Thread(target=write_peer)
+    writer.start()
+    try:
+        assert starting.wait(5)
+        image = inventory.list_artifacts(roots)["images"][0]
+        assert image["availability"] == "unavailable"
+        assert not opened.wait(0.2), "read-only monitoring opened the FIFO and released its writer"
+    finally:
+        reader_fd = os.open(output, os.O_RDONLY | os.O_NONBLOCK)
+        try:
+            writer.join(5)
+            assert not writer.is_alive()
+        finally:
+            os.close(reader_fd)
+
+
+def test_local_tag_persists_conflicts_and_idempotence_without_changing_artifact(tmp_path):
+    roots = _setup_roots(tmp_path)
+    store = ContentStore(roots.store)
+    digest = "sha256:" + store.write_stream([b"local cloud image"]).name
+    other = "sha256:" + store.write_stream([b"other cloud image"]).name
+    for value in (digest, other):
+        store.write_metadata(value, {"kind": KIND_CLOUD_IMAGE, "disk_format": "qcow2"})
+        payload = state.read_json(store.metadata_path(value))
+        payload["size"] = 999  # Editable metadata is not authoritative for CAS bytes.
+        state.atomic_write_json(store.metadata_path(value), payload)
+    before_blob = store.blob_path(digest).stat()
+    before_meta = store.metadata_path(digest).read_bytes()
+
+    binding = inventory.tag_artifact(roots, digest, "base")
+    before_tag = (roots.tags / "base.json").read_bytes()
+    assert binding["digest"] == digest
+    assert binding["size_bytes"] == len(b"local cloud image")
+    assert binding["media_type"] == "application/vnd.afterglow.palimpsest.image.qcow2.v1"
+    assert state.read_tag_record(roots, "base").digest == digest
+    assert inventory.tag_artifact(roots, digest, "base") == binding
+    assert (roots.tags / "base.json").read_bytes() == before_tag
+    with pytest.raises(StateError, match="different digest"):
+        inventory.tag_artifact(roots, other, "base")
+    assert (roots.tags / "base.json").read_bytes() == before_tag
+    assert store.metadata_path(digest).read_bytes() == before_meta
+    after_blob = store.blob_path(digest).stat()
+    assert (before_blob.st_ino, before_blob.st_mode, before_blob.st_mtime_ns) == (
+        after_blob.st_ino,
+        after_blob.st_mode,
+        after_blob.st_mtime_ns,
+    )
+    assert store.blob_path(digest).read_bytes() == b"local cloud image"
+    image = next(image for image in inventory.list_artifacts(roots)["images"] if image["digest"] == digest)
+    assert image["tags"][0] == binding
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "missing",
+        "unsupported",
+        "writable",
+        "corrupt",
+        "symlink",
+        "hardlink",
+        "missing-metadata",
+        "metadata-symlink",
+        "wrong-digest",
+        "bad-parent",
+        "bad-format",
+    ],
+)
+def test_tag_artifact_refuses_unproven_cas_targets(tmp_path, damage):
+    roots = _setup_roots(tmp_path)
+    store = ContentStore(roots.store)
+    digest = "sha256:" + store.write_stream([b"local artifact"]).name
+    meta = {"kind": KIND_CLOUD_IMAGE, "disk_format": "qcow2"}
+    store.write_metadata(digest, meta)
+    blob = store.blob_path(digest)
+    metadata = store.metadata_path(digest)
+    if damage == "missing":
+        blob.unlink()
+    elif damage == "unsupported":
+        store.write_metadata(digest, {"kind": "other"})
+    elif damage == "writable":
+        blob.chmod(0o600)
+    elif damage == "corrupt":
+        blob.chmod(0o600)
+        blob.write_bytes(b"changed bytes")
+        blob.chmod(0o400)
+    elif damage in {"symlink", "hardlink"}:
+        external = tmp_path / "blob"
+        blob.rename(external)
+        if damage == "symlink":
+            blob.symlink_to(external)
+        else:
+            os.link(external, blob)
+    elif damage == "missing-metadata":
+        metadata.unlink()
+    elif damage == "metadata-symlink":
+        external = tmp_path / "metadata.json"
+        metadata.rename(external)
+        metadata.symlink_to(external)
+    else:
+        payload = state.read_json(metadata)
+        if damage == "wrong-digest":
+            payload["digest"] = "sha256:" + "a" * 64
+        elif damage == "bad-parent":
+            payload["parent_digest"] = {"digest": digest}
+        elif damage == "bad-format":
+            payload["disk_format"] = ["qcow2"]
+        state.atomic_write_json(metadata, payload)
+
+    with pytest.raises(StateError):
+        inventory.tag_artifact(roots, digest, "refused")
+    assert not (roots.tags / "refused.json").exists()
+
+
+def test_tag_artifact_retains_layer_parent_and_base(tmp_path):
+    roots = _setup_roots(tmp_path)
+    store = ContentStore(roots.store)
+    digest = "sha256:" + store.write_stream([b"layer"]).name
+    parent = "sha256:" + "a" * 64
+    base = "sha256:" + "b" * 64
+    store.write_metadata(
+        digest,
+        {
+            "kind": "squashfs",
+            "media_type": MEDIA_TYPE_LAYER_SQUASHFS,
+            "parent_digest": parent,
+            "base_image_digest": base,
+        },
+    )
+    binding = inventory.tag_artifact(roots, digest, "layer")
+    assert binding["parent_digest"] == parent
+    assert binding["base_image_digest"] == base
+    assert binding["media_type"] == MEDIA_TYPE_LAYER_SQUASHFS
+    with pytest.raises(StateError, match="invalid tag"):
+        inventory.tag_artifact(roots, digest, "../escape")
+
+
+@pytest.mark.parametrize("component", ["tags", "metadata"])
+def test_tag_artifact_rejects_symlinked_index_directory(tmp_path, component):
+    roots = _setup_roots(tmp_path)
+    store = ContentStore(roots.store)
+    digest = "sha256:" + store.write_stream([b"artifact"]).name
+    store.write_metadata(digest, {"kind": "squashfs"})
+    directory = roots.tags if component == "tags" else roots.store / "metadata"
+    external = tmp_path / "external"
+    directory.rename(external)
+    directory.symlink_to(external, target_is_directory=True)
+    with pytest.raises(StateError):
+        inventory.tag_artifact(roots, digest, "unsafe")
+    assert not (roots.tags / "unsafe.json").exists()
+
+
+@pytest.mark.parametrize(
+    "change", ["conflicting-tag", "removed-blob", "unsafe-blob", "tags-alias", "missing-metadata", "changed-metadata"]
+)
+def test_tag_artifact_rechecks_verified_authority_at_state_commit(tmp_path, monkeypatch, change):
+    roots = _setup_roots(tmp_path)
+    store = ContentStore(roots.store)
+    digest = "sha256:" + store.write_stream([b"target"]).name
+    other = "sha256:" + store.write_stream([b"concurrent target"]).name
+    store.write_metadata(digest, {"kind": "squashfs"})
+    real_writer = state._write_tag_record_locked
+
+    def concurrent_restore(writer_roots, record, **authority):
+        if change == "conflicting-tag":
+            replacement = TagRecord(
+                1,
+                record.tag,
+                other,
+                MEDIA_TYPE_LAYER_SQUASHFS,
+                len(b"concurrent target"),
+                None,
+                None,
+                "build",
+                "2026-08-24T00:00:00Z",
+            )
+            state.atomic_write_json(roots.tags / f"{record.tag}.json", dataclasses.asdict(replacement))
+        elif change == "removed-blob":
+            store.blob_path(digest).unlink()
+        elif change == "unsafe-blob":
+            store.blob_path(digest).unlink()
+            store.blob_path(digest).write_bytes(b"unverified replacement")
+        elif change == "tags-alias":
+            original = tmp_path / "original-tags"
+            roots.tags.rename(original)
+            replacement = tmp_path / "replacement-tags"
+            replacement.mkdir(mode=0o700)
+            roots.tags.symlink_to(replacement, target_is_directory=True)
+        elif change == "missing-metadata":
+            store.metadata_path(digest).unlink()
+        else:
+            # Model an out-of-band restore, not a cooperating writer's digest lock.
+            state.atomic_write_json(store.metadata_path(digest), {**store.read_metadata(digest), "kind": "other"})
+        return real_writer(writer_roots, record, **authority)
+
+    monkeypatch.setattr(state, "_write_tag_record_locked", concurrent_restore)
+    with pytest.raises(StateError):
+        inventory.tag_artifact(roots, digest, "race")
+    if change == "conflicting-tag":
+        assert state.read_tag_record(roots, "race").digest == other
+    else:
+        assert not (roots.tags / "race.json").exists()
 
 
 def test_remove_artifact_refusal_and_success(tmp_path: Path):
@@ -667,6 +1126,10 @@ def test_list_builds_and_get_build_and_log(tmp_path: Path):
 
     b1_rec = inventory.get_build(roots, b1_id)
     assert b1_rec["output_tags"] == ["myimage:v1"]
+    for build in (b1_rec, builds[0]):
+        assert build["output_oci_manifest_digest"] is None
+        assert build["output_oci_archive_digest"] is None
+        assert build["runtime_block_digest"] is None
 
     with pytest.raises(StateError, match="invalid build id"):
         inventory.get_build(roots, "invalid")
@@ -1317,3 +1780,769 @@ def test_resource_hvf_user_networks_are_not_shared_by_conventional_name(tmp_path
     assert [row["attachments"][0]["guest_ip"] for row in rows.values()] == [None, None]
     assert [vm["guest_ip"] for vm in inventory.list_vms(roots, live=False)["vms"]] == [None, None]
     assert result["warnings"] == []
+
+
+def _observed_vm(name, run_id=None, *, status="running", backend="lima-vz"):
+    return {
+        "id": f"host:{backend}:{name}",
+        "name": name,
+        "run_id": run_id,
+        "backend": backend,
+        "runtime_kind": "cloud-image" if run_id else "external",
+        "status": status,
+        "managed": False,
+        "source": "host-backend",
+        "memory_mib": 2048,
+        "vcpus": 2,
+        "ssh": {"host": "127.0.0.1", "port": 2222},
+        "guest_ip": None,
+        "ports": [],
+        "layers": [],
+        "layer_count": 0,
+        "volumes": [],
+    }
+
+
+def _live_ledger_projection(*, roots):
+    result = inventory.runtime_dispatch.ps(roots=roots)
+    return dataclasses.replace(
+        result, summaries=tuple(dataclasses.replace(row, stale=False) for row in result.summaries)
+    )
+
+
+def test_host_vms_are_visible_without_adopting_external_state(tmp_path, monkeypatch):
+    roots = _setup_roots(tmp_path)
+    snapshot = {"vms": [_observed_vm("external")], "volumes": [], "networks": [], "warnings": []}
+    monkeypatch.setattr(inventory.host_inventory, "observe", lambda: snapshot)
+    result = inventory.list_vms(roots)
+    assert [(row["name"], row["status"], row["managed"]) for row in result["vms"]] == [("external", "running", False)]
+    assert list(roots.runs.iterdir()) == []
+    assert inventory.get_vm(roots, "external")["id"] == "host:lima-vz:external"
+    monkeypatch.setattr(inventory.host_inventory, "observe", lambda: pytest.fail("ledger-only query touched host"))
+    assert inventory.list_vms(roots, live=False)["vms"] == []
+
+
+def test_host_same_name_different_run_id_is_not_managed(tmp_path, monkeypatch):
+    roots = _setup_roots(tmp_path)
+    _resource_run(roots, "collision")
+    external = _observed_vm("collision", "33333333-3333-3333-3333-333333333333")
+    monkeypatch.setattr(inventory.runtime_dispatch, "reconcile", inventory.runtime_dispatch.ps)
+    monkeypatch.setattr(
+        inventory.host_inventory, "observe", lambda: {"vms": [external], "volumes": [], "networks": [], "warnings": []}
+    )
+    result = inventory.list_vms(roots)["vms"]
+    assert len(result) == 2
+    assert {row["id"] for row in result} == {"collision", "host:lima-vz:collision"}
+    assert all(row["managed"] is False for row in result)
+    with pytest.raises(StateError, match="ambiguous"):
+        inventory.get_vm(roots, "collision")
+    assert inventory.get_vm(roots, "host:lima-vz:collision")["run_id"] == external["run_id"]
+    assert all(row["access"]["reason"] == "identity" for row in result)
+    assert inventory.vm_metrics(roots, external["id"], expected_run_id=external["run_id"])["reason"] == "identity"
+    assert inventory.vm_logs(roots, external["id"], expected_run_id=external["run_id"])["reason"] == "identity"
+
+
+def test_host_exact_identity_updates_runtime_and_disk_without_duplicate(tmp_path, monkeypatch):
+    roots = _setup_roots(tmp_path)
+    run_id = _resource_run(roots, "owned", network="vzNAT")
+    vm = _observed_vm("owned", run_id)
+    attachment = {"name": "owned", "run_id": run_id, "mount_path": "/", "read_only": False}
+    disk = {
+        "id": "host-disk:lima-vz:owned",
+        "name": "owned",
+        "kind": "vm-disk",
+        "backend": "lima-vz",
+        "status": "observed-file",
+        "source": "host-backend",
+        "size_bytes": 30 * 1024**3,
+        "file_size_bytes": 12345,
+        "allocated_bytes": 4096,
+        "attachments": [attachment],
+    }
+    network = {
+        "id": "host-network:lima-vz:vzNAT",
+        "name": "vzNAT",
+        "kind": "lima",
+        "backend": "lima-vz",
+        "mode": "vzNAT",
+        "subnet": None,
+        "gateway": None,
+        "status": "configured",
+        "source": "host-backend",
+        "attachments": [{"name": "owned", "run_id": run_id, "guest_ip": None, "ports": []}],
+    }
+    monkeypatch.setattr(inventory.runtime_dispatch, "reconcile", _live_ledger_projection)
+    monkeypatch.setattr(
+        inventory.host_inventory,
+        "observe",
+        lambda: {"vms": [vm], "volumes": [disk], "networks": [network], "warnings": []},
+    )
+    vms = inventory.list_vms(roots)["vms"]
+    assert [(row["id"], row["status"], row["managed"]) for row in vms] == [("owned", "running", True)]
+    assert vms[0]["run_id"] == run_id
+    volumes = inventory.list_volumes(roots)["volumes"]
+    assert len(volumes) == 1
+    assert volumes[0]["id"] == f"vm-disk:{run_id}"
+    assert (volumes[0]["size_bytes"], volumes[0]["file_size_bytes"], volumes[0]["allocated_bytes"]) == (
+        30 * 1024**3,
+        12345,
+        4096,
+    )
+    networks = inventory.list_networks(roots)["networks"]
+    assert len(networks) == 1
+    assert networks[0]["attachments"] == network["attachments"]
+
+
+def test_libvirt_host_refresh_preserves_recorded_published_endpoints(tmp_path, monkeypatch):
+    roots = _setup_roots(tmp_path)
+    port = {"host_ip": "127.0.0.1", "host_port": 18080, "guest_port": 8080, "protocol": "tcp"}
+    run_id = _resource_run(
+        roots,
+        "native",
+        backend="kvm",
+        network="default",
+        ports=[port],
+        ssh={"host": "192.168.122.10", "port": 22},
+        guest_ip="192.168.122.10",
+    )
+    host_vm = _observed_vm("native", run_id, backend="kvm")
+    monkeypatch.setattr(inventory.runtime_dispatch, "reconcile", _live_ledger_projection)
+    monkeypatch.setattr(
+        inventory.host_inventory, "observe", lambda: {"vms": [host_vm], "volumes": [], "networks": [], "warnings": []}
+    )
+    vm = inventory.list_vms(roots)["vms"][0]
+    assert vm["status"] == "running"
+    assert vm["ports"] == [port]
+    assert vm["ssh"] == {"host": "192.168.122.10", "port": 22}
+    assert vm["guest_ip"] == "192.168.122.10"
+
+
+def test_failed_live_ownership_reconcile_disables_managed_controls(tmp_path, monkeypatch):
+    roots = _setup_roots(tmp_path)
+    _resource_run(roots, "unverified")
+    monkeypatch.setattr(inventory.runtime_dispatch, "reconcile", inventory.runtime_dispatch.ps)
+    vm = inventory.list_vms(roots)["vms"][0]
+    assert vm["name"] == "unverified" and vm["stale"] is True and vm["managed"] is False
+    assert inventory.list_vms(roots, live=False)["vms"][0]["managed"] is True
+
+
+def test_host_network_named_none_does_not_merge_isolated_vm(tmp_path, monkeypatch):
+    roots = _setup_roots(tmp_path)
+    isolated_id = _resource_run(roots, "isolated", backend="kvm", network="none")
+    network = {
+        "id": "network:kvm:none",
+        "name": "none",
+        "backend": "kvm",
+        "kind": "libvirt",
+        "status": "active",
+        "mode": "nat",
+        "source": "host-backend",
+        "subnet": None,
+        "gateway": None,
+        "attachments": [{"name": "external", "run_id": None, "guest_ip": None, "ports": []}],
+    }
+    monkeypatch.setattr(
+        inventory.host_inventory, "observe", lambda: {"vms": [], "volumes": [], "networks": [network], "warnings": []}
+    )
+    rows = {row["id"]: row for row in inventory.list_networks(roots)["networks"]}
+    assert rows[f"network:kvm:{isolated_id}"]["status"] == "isolated"
+    assert [item["name"] for item in rows[f"network:kvm:{isolated_id}"]["attachments"]] == ["isolated"]
+    assert rows["network:kvm:none"]["mode"] == "nat"
+    assert [item["name"] for item in rows["network:kvm:none"]["attachments"]] == ["external"]
+
+
+_LINUX_METRICS = b"""@@stat
+cpu  10 2 3 40 5 1 2 0 0 0
+@@loadavg
+0.25 0.50 0.75 1/30 42
+@@meminfo
+MemTotal: 1024 kB
+MemAvailable: 256 kB
+@@uptime
+100.5 80.0
+@@sys/kernel/random/boot_id
+11111111-1111-4111-8111-111111111111
+@@net/dev
+Inter-| Receive | Transmit
+ face |bytes packets errs drop fifo frame compressed multicast|bytes packets errs drop fifo colls carrier compressed
+  eth0: 123 1 0 0 0 0 0 0 456 2 0 0 0 0 0 0
+@@diskstats
+   8 0 vda 1 0 2 3 4 0 5 6 0 7 8
+@@df
+Filesystem 1024-blocks Used Available Capacity Mounted on
+/dev/vda 1000 400 600 40% /
+@@end
+"""
+
+
+def _vm_access_fixture(
+    tmp_path, monkeypatch, *, status="running", backend="lima-vz", run_id="11111111-1111-4111-8111-111111111111"
+):
+    from palimpsest_local import vm_access
+
+    row = _observed_vm("redis", run_id, status=status, backend=backend)
+    row["access"] = vm_access.capabilities(row)
+    roots = _setup_roots(tmp_path)
+    monkeypatch.setattr(inventory, "get_vm", lambda roots, identifier: row)
+    directory = tmp_path / "redis"
+    directory.mkdir()
+    (tmp_path / "guest-environment").write_text(f"PALIMPSEST_RUN_ID={run_id}\n")
+    instance = {
+        "name": "redis",
+        "status": "Running" if status == "running" else "Stopped",
+        "dir": str(directory),
+        "vmType": "vz",
+        "config": {"env": {"PALIMPSEST_RUN_ID": run_id}},
+    }
+    monkeypatch.setattr(vm_access, "_instance", lambda name: instance)
+    return roots, row, directory, instance
+
+
+def _spawn_lima_guest(tmp_path, argv, code, **kw):
+    import shlex
+    import sys
+
+    from palimpsest_local.process_session import LocalProcessSession
+
+    gate = argv[6].replace("/etc/environment", shlex.quote(str(tmp_path / "guest-environment")))
+    return LocalProcessSession(("sh", "-c", gate, "sh", sys.executable, "-c", code), tty=kw["tty"], stdin=True)
+
+
+def test_guest_measurements_cross_real_process_consumer_boundary(tmp_path, monkeypatch):
+    from palimpsest_local import vm_access
+
+    roots, row, _, _ = _vm_access_fixture(tmp_path, monkeypatch)
+
+    def spawn(argv, **kw):
+        return _spawn_lima_guest(tmp_path, argv, f"import os; os.write(1, {_LINUX_METRICS!r})", **kw)
+
+    monkeypatch.setattr(vm_access, "spawn_process_session", spawn)
+    result = inventory.vm_metrics(roots, row["id"], expected_run_id=row["run_id"])
+    assert result["status"] == "available"
+    assert result["cpu"]["total_ticks"] == 63
+    assert result["cpu"]["idle_ticks"] == 45
+    assert result["load"] == {"one": 0.25, "five": 0.5, "fifteen": 0.75}
+    assert result["memory"] == {"total_bytes": 1048576, "available_bytes": 262144, "used_bytes": 786432}
+    assert result["filesystems"][0]["free_bytes"] == 614400
+    assert result["interfaces"] == [{"name": "eth0", "rx_bytes": 123, "tx_bytes": 456}]
+    assert result["block_devices"][0]["read_bytes"] == 1024
+    assert result["block_devices"][0]["write_bytes"] == 2560
+    assert result["uptime_seconds"] == 100.5
+    assert result["measured_at"]
+    assert list(roots.runs.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "source,bad",
+    [
+        ("stat", "cpu -1 2 3 4 5 6 7 8"),
+        ("loadavg", "nan 2 3"),
+        ("loadavg", "1"),
+        ("meminfo", "MemTotal: 2 kB"),
+        ("df", "UNAVAILABLE"),
+        ("net/dev", "bad header\nbad header\neth0: 1"),
+        ("diskstats", "8 0 vda -1"),
+        ("uptime", "inf"),
+        ("sys/kernel/random/boot_id", "bad"),
+    ],
+)
+def test_guest_measurement_unavailable_never_becomes_zero(source, bad):
+    import re
+
+    from palimpsest_local import vm_access
+
+    damaged = re.sub(
+        rb"@@" + source.encode() + rb"\n.*?(?=@@)",
+        b"@@" + source.encode() + b"\n" + bad.encode() + b"\n",
+        _LINUX_METRICS,
+        flags=re.S,
+    )
+    parsed = vm_access.parse_metrics(damaged)
+    assert source in parsed["unavailable"]
+    key = {
+        "stat": "cpu",
+        "loadavg": "load",
+        "meminfo": "memory",
+        "df": "filesystems",
+        "net/dev": "interfaces",
+        "diskstats": "block_devices",
+        "uptime": "uptime_seconds",
+        "sys/kernel/random/boot_id": "boot_id",
+    }[source]
+    assert parsed[key] is None
+
+
+def test_stopped_lima_logs_are_native_identity_bound_console(tmp_path, monkeypatch):
+    roots, row, directory, _ = _vm_access_fixture(tmp_path, monkeypatch, status="stopped")
+    (directory / "serial.log").write_text("old\nredis ready\nshutdown\n")
+    result = inventory.vm_logs(roots, row["id"], tail=2, expected_run_id=row["run_id"])
+    assert result == {
+        "status": "available",
+        "source": "lima-serial-console",
+        "log": "redis ready\nshutdown",
+        "truncated": True,
+    }
+    assert inventory.vm_metrics(roots, row["id"], expected_run_id=row["run_id"])["reason"] == "stopped"
+    (directory / "serial.log").unlink()
+    (directory / "serial.log").symlink_to(tmp_path / "secret")
+    (tmp_path / "secret").write_text("hidden credential")
+    denied = inventory.vm_logs(roots, row["id"], expected_run_id=row["run_id"])
+    assert denied["status"] == "unavailable"
+    assert "hidden credential" not in repr(denied)
+
+
+def test_running_guest_journal_failure_is_explicit(tmp_path, monkeypatch):
+    from palimpsest_local import vm_access
+
+    roots, row, _, _ = _vm_access_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        vm_access,
+        "spawn_process_session",
+        lambda argv, **kw: _spawn_lima_guest(
+            tmp_path, argv, "import os; os.write(2, b'private credential'); raise SystemExit(1)", **kw
+        ),
+    )
+    result = inventory.vm_logs(roots, row["id"], expected_run_id=row["run_id"])
+    assert result["status"] == "unavailable"
+    assert result["reason"] == "probe"
+    assert "private credential" not in repr(result)
+
+
+def test_external_libvirt_credentials_are_not_inferred_from_endpoint(tmp_path, monkeypatch):
+    roots, row, _, _ = _vm_access_fixture(tmp_path, monkeypatch, backend="hvf")
+    assert row["access"]["shell"] is False
+    assert row["access"]["reason"] == "credentials"
+    assert inventory.vm_metrics(roots, row["id"], expected_run_id=row["run_id"])["reason"] == "credentials"
+
+
+def test_resource_capabilities_are_list_projection_without_guest_probes(tmp_path, monkeypatch):
+    from palimpsest_local import vm_access
+
+    roots = _setup_roots(tmp_path)
+    row = _observed_vm("redis", "11111111-1111-4111-8111-111111111111")
+    monkeypatch.setattr(
+        inventory.host_inventory, "observe", lambda: {"vms": [row], "volumes": [], "networks": [], "warnings": []}
+    )
+    monkeypatch.setattr(vm_access, "spawn_process_session", lambda *a, **kw: pytest.fail("list must not probe SSH"))
+    listed = inventory.list_vms(roots)["vms"][0]
+    assert listed["access"]["shell"] is True
+    assert listed["access"]["metrics"] is True
+    assert list(roots.runs.iterdir()) == []
+    _resource_run(roots, "oci", backend="kvm", runtime_kind="oci-root", status="running")
+    monkeypatch.setattr(inventory.runtime_dispatch, "reconcile", _live_ledger_projection)
+    oci = next(vm for vm in inventory.list_vms(roots)["vms"] if vm["name"] == "oci")
+    assert oci["access"]["transport"] == "oci-monitor"
+    assert oci["access"]["shell"] is False
+    assert oci["access"]["exec"] is True
+    assert oci["access"]["metrics"] is True
+
+
+def test_guest_probe_time_and_output_bounds_reap_real_processes():
+    import sys
+
+    from palimpsest_local import vm_access
+    from palimpsest_local.process_session import LocalProcessSession
+
+    too_large = LocalProcessSession(
+        (sys.executable, "-c", "import os; os.write(1, b'x' * 65536)"), tty=False, stdin=False
+    )
+    with pytest.raises(vm_access.VMAccessError) as large:
+        vm_access._collect(too_large, limit=1024)
+    assert large.value.category == "output-limit"
+    assert too_large._process.poll() is not None
+    blocked = LocalProcessSession((sys.executable, "-c", "import time; time.sleep(60)"), tty=False, stdin=False)
+    with pytest.raises(vm_access.VMAccessError) as timeout:
+        vm_access._collect(blocked, timeout=0.05)
+    assert timeout.value.category == "timeout"
+    assert blocked._process.poll() is not None
+
+
+def test_selected_owned_vm_missing_ssh_trust_is_explicit(tmp_path, monkeypatch):
+    roots = _setup_roots(tmp_path)
+    run_id = _resource_run(roots, "owned", backend="kvm", status="running")
+    monkeypatch.setattr(inventory.runtime_dispatch, "reconcile", _live_ledger_projection)
+    result = inventory.vm_metrics(roots, "owned", expected_run_id=run_id)
+    assert result["status"] == "unavailable"
+    assert result["reason"] == "credentials"
+    assert result["memory"] is None
+
+
+def test_detail_identity_changed_during_measurement_discards_old_counters(tmp_path, monkeypatch):
+    from palimpsest_local import vm_access
+
+    roots, row, _, instance = _vm_access_fixture(tmp_path, monkeypatch)
+
+    def collect(session, **kw):
+        iterator = session.events()
+        output = bytearray(next(iterator).data)
+        instance["config"]["env"]["PALIMPSEST_RUN_ID"] = "22222222-2222-4222-8222-222222222222"
+        try:
+            for event in iterator:
+                if hasattr(event, "data"):
+                    output.extend(event.data)
+            return bytes(output)
+        finally:
+            session.close()
+
+    monkeypatch.setattr(vm_access, "_collect", collect)
+    monkeypatch.setattr(
+        vm_access,
+        "spawn_process_session",
+        lambda argv, **kw: _spawn_lima_guest(
+            tmp_path, argv, f"import os, time; os.write(1, {_LINUX_METRICS!r}); time.sleep(.1)", **kw
+        ),
+    )
+    result = inventory.vm_metrics(roots, row["id"], expected_run_id=row["run_id"])
+    assert result["status"] == "unavailable"
+    assert result["reason"] == "identity"
+    assert result["interfaces"] is None
+
+
+def test_stopped_owned_hvf_keeps_bounded_console_without_ssh_credentials(tmp_path, monkeypatch):
+    from palimpsest_local import vm_access
+
+    roots = _setup_roots(tmp_path)
+    run_id = _resource_run(roots, "owned-hvf", backend="libvirt-hvf")
+    monkeypatch.setattr(inventory.runtime_dispatch, "reconcile", _live_ledger_projection)
+    console = roots.runs / "owned-hvf" / "console.log"
+    console.write_bytes(b"older boot output\n" + b"x" * vm_access.MAX_OUTPUT_BYTES + b"\nREADY\npoweroff\n")
+    console.chmod(0o600)
+
+    result = inventory.vm_logs(roots, "owned-hvf", expected_run_id=run_id, tail=2)
+    assert result == {
+        "status": "available",
+        "source": "retained-console",
+        "log": "READY\npoweroff",
+        "truncated": True,
+    }
+
+    secret = tmp_path / "foreign-console"
+    secret.write_text("hidden credential")
+    console.unlink()
+    console.symlink_to(secret)
+    replaced = inventory.vm_logs(roots, "owned-hvf", expected_run_id=run_id, tail=2)
+    assert replaced["status"] == "unavailable"
+    assert replaced["log"] == ""
+
+
+@pytest.mark.parametrize("damage", ["oversized", "missing", "read-failure"])
+def test_guest_source_overflow_and_read_failure_preserve_other_measurements(tmp_path, damage):
+    import re
+
+    from palimpsest_local import vm_access
+    from palimpsest_local.process_session import LocalProcessSession
+
+    proc = tmp_path / "proc"
+    chunks = re.split(rb"(?m)^@@([^\n]+)\n", _LINUX_METRICS)
+    for source, content in zip(chunks[1::2], chunks[2::2], strict=True):
+        if source in {b"df", b"end"}:
+            continue
+        target = proc / source.decode()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+    diskstats = proc / "diskstats"
+    if damage == "oversized":
+        # Exactly 64 KiB of a syntactically valid device row hides a later
+        # device with the old prefix-only reader. Padding itself is legal.
+        row = diskstats.read_bytes()
+        diskstats.write_bytes(b" " * (65536 - len(row)) + row + b"8 1 vdb 1 0 2 3 4 0 5 6 0 7 8\n")
+    else:
+        diskstats.unlink()
+        if damage == "read-failure":
+            diskstats.mkdir()
+    probe = vm_access.METRICS_PROBE.replace("/proc/", str(proc) + "/")
+    session = LocalProcessSession(("sh", "-c", probe), tty=False, stdin=False)
+    parsed = vm_access.parse_metrics(vm_access._collect(session))
+    assert parsed["block_devices"] is None
+    assert "diskstats" in parsed["unavailable"]
+    assert parsed["cpu"]["total_ticks"] == 63
+    assert parsed["interfaces"] == [{"name": "eth0", "rx_bytes": 123, "tx_bytes": 456}]
+
+
+def _lifecycle_run(tmp_path, monkeypatch, *, status="running", **fields):
+    roots = _setup_roots(tmp_path)
+    run_id = _resource_run(roots, "selected", status=status, **fields)
+    monkeypatch.setattr(inventory.runtime_dispatch, "reconcile", _live_ledger_projection)
+    monkeypatch.setattr(
+        inventory.runtime_dispatch.lima,
+        "_run_command",
+        lambda *a, **kw: pytest.fail("must not invoke a real VM backend"),
+    )
+    return roots, run_id
+
+
+def _replace_lifecycle_run(roots):
+    replacement_id = "22222222-2222-4222-8222-222222222222"
+    run = roots.runs / "selected"
+    ledger = state.read_json(run / "state.json")
+    state.atomic_write_json(
+        run / "owner.json",
+        {
+            "schema_version": 1,
+            "name": "selected",
+            "run_id": replacement_id,
+        },
+    )
+    state.atomic_write_json(run / "state.json", {**ledger, "run_id": replacement_id})
+    return replacement_id
+
+
+@pytest.mark.parametrize("boundary", ["selected", "inventory", "dispatch", "adapter-lock"])
+def test_remove_vm_replacement_fences_original_uuid_before_backend(tmp_path, monkeypatch, boundary):
+    roots, run_id = _lifecycle_run(tmp_path, monkeypatch)
+    adapter = inventory.runtime_dispatch.lima
+    monkeypatch.setattr(
+        adapter, "_instance_info_or_none", lambda *a, **kw: pytest.fail("replacement reached backend inspection")
+    )
+    if boundary == "selected":
+        _replace_lifecycle_run(roots)
+    elif boundary == "inventory":
+        original = inventory.get_vm
+
+        def replace_after_inventory(*args, **kwargs):
+            row = original(*args, **kwargs)
+            _replace_lifecycle_run(roots)
+            return row
+
+        monkeypatch.setattr(inventory, "get_vm", replace_after_inventory)
+    elif boundary == "dispatch":
+        original = inventory.runtime_dispatch.rm
+
+        def replace_before_dispatch(*args, **kwargs):
+            assert kwargs["expected_identity"].run_id == run_id
+            _replace_lifecycle_run(roots)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(inventory.runtime_dispatch, "rm", replace_before_dispatch)
+    else:
+        original = adapter.rm
+
+        def replace_before_adapter_lock(*args, **kwargs):
+            assert kwargs["_expected_record"].run_id == run_id
+            assert kwargs["_expected_snapshot"].record.run_id == run_id
+            _replace_lifecycle_run(roots)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(adapter, "rm", replace_before_adapter_lock)
+    with pytest.raises(StateError, match="identity changed|ledger changed"):
+        inventory.remove_vm(roots, "selected", expected_run_id=run_id, confirmation="selected")
+    replacement = state.read_run_ledger_snapshot(roots, "selected")
+    assert replacement.record.run_id == "22222222-2222-4222-8222-222222222222"
+    assert replacement.state["status"] == "running"
+
+
+@pytest.mark.parametrize("identifier", ["external", "host:lima-vz:external"])
+def test_remove_vm_external_identity_is_forbidden_without_adoption(tmp_path, monkeypatch, identifier):
+    roots = _setup_roots(tmp_path)
+    run_id = "11111111-1111-4111-8111-111111111111"
+    monkeypatch.setattr(
+        inventory.host_inventory,
+        "observe",
+        lambda: {
+            "vms": [_observed_vm("external", run_id)],
+            "volumes": [],
+            "networks": [],
+            "warnings": [],
+        },
+    )
+    monkeypatch.setattr(
+        inventory.runtime_dispatch, "rm", lambda *a, **kw: pytest.fail("external VM reached lifecycle dispatch")
+    )
+    with pytest.raises(StateError, match="forbidden"):
+        inventory.remove_vm(roots, identifier, expected_run_id=run_id, confirmation="external")
+    assert list(roots.runs.iterdir()) == []
+    assert not any(inventory.list_vms(roots)["vms"][0]["lifecycle"].values())
+
+
+@pytest.mark.parametrize("confirmation", ["Selected", "selected ", " selected", "", None, True])
+def test_remove_vm_requires_exact_typed_name(tmp_path, monkeypatch, confirmation):
+    roots, run_id = _lifecycle_run(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        inventory.runtime_dispatch, "rm", lambda *a, **kw: pytest.fail("unconfirmed VM reached lifecycle dispatch")
+    )
+    with pytest.raises(StateError, match="confirmation must exactly match"):
+        inventory.remove_vm(roots, "selected", expected_run_id=run_id, confirmation=confirmation)
+    assert state.read_run_ledger_snapshot(roots, "selected").state["status"] == "running"
+
+
+@pytest.mark.parametrize("volumes", [None, 0, 1, "false", "true", [], {}])
+def test_remove_vm_requires_boolean_volume_flag(tmp_path, monkeypatch, volumes):
+    roots, run_id = _lifecycle_run(tmp_path, monkeypatch)
+    monkeypatch.setattr(inventory, "get_vm", lambda *a, **kw: pytest.fail("invalid flag read inventory"))
+    with pytest.raises(StateError, match="volumes must be a boolean"):
+        inventory.remove_vm(roots, "selected", expected_run_id=run_id, confirmation="selected", volumes=volumes)
+
+
+@pytest.mark.parametrize("condition", ["stale", "ambiguous", "removed", "oci-root"])
+def test_remove_vm_ineligible_selected_states_fail_closed(tmp_path, monkeypatch, condition):
+    roots, run_id = _lifecycle_run(
+        tmp_path,
+        monkeypatch,
+        status="removed" if condition == "removed" else "running",
+        runtime_kind="oci-root" if condition == "oci-root" else "cloud-image",
+        backend="kvm" if condition == "oci-root" else "lima-vz",
+    )
+    if condition == "stale":
+        monkeypatch.setattr(inventory.runtime_dispatch, "reconcile", inventory.runtime_dispatch.ps)
+    elif condition == "ambiguous":
+        monkeypatch.setattr(
+            inventory.host_inventory,
+            "observe",
+            lambda: {
+                "vms": [_observed_vm("selected", "33333333-3333-4333-8333-333333333333", backend="kvm")],
+                "volumes": [],
+                "networks": [],
+                "warnings": [],
+            },
+        )
+    monkeypatch.setattr(
+        inventory.runtime_dispatch, "rm", lambda *a, **kw: pytest.fail("ineligible VM reached lifecycle dispatch")
+    )
+    rows = inventory.list_vms(roots)["vms"]
+    assert not any(row["lifecycle"]["remove"] for row in rows)
+    with pytest.raises(StateError, match="unavailable|forbidden|ambiguous"):
+        inventory.remove_vm(roots, "selected", expected_run_id=run_id, confirmation="selected")
+
+
+@pytest.mark.parametrize("volumes", [False, True])
+def test_remove_vm_canonical_disk_retention_never_deletes_project_or_arbitrary_files(tmp_path, monkeypatch, volumes):
+    import subprocess
+
+    roots, run_id = _lifecycle_run(
+        tmp_path,
+        monkeypatch,
+        volumes=[
+            {
+                "name": "project-data",
+                "host_path": str(tmp_path / "unrelated.raw"),
+            }
+        ],
+    )
+    run = roots.runs / "selected"
+    (run / "disk.raw").write_bytes(b"owned run disk")
+    (run / "console.log").write_text("retained log")
+    outside = tmp_path / "unrelated.raw"
+    outside.write_bytes(b"foreign disk")
+    (run / "outside-link").symlink_to(outside)
+    project = roots.volumes / "project-data"
+    project.mkdir()
+    (project / "data.raw").write_bytes(b"named project volume")
+    sibling_id = _resource_run(roots, "sibling")
+    instance = {"name": "selected", "status": "Running", "config": {"env": {"PALIMPSEST_RUN_ID": run_id}}}
+    calls = []
+
+    def delete_backend(argv, **kwargs):
+        nonlocal instance
+        calls.append(argv)
+        assert argv == ["limactl", "delete", "--force", "selected"]
+        instance = None
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(inventory.runtime_dispatch.lima, "_instance_info_or_none", lambda name: instance)
+    monkeypatch.setattr(inventory.runtime_dispatch.lima, "_run_command", delete_backend)
+
+    kwargs = {"volumes": True} if volumes else {}  # Exercise default retention, not explicit False.
+    result = inventory.remove_vm(roots, "selected", expected_run_id=run_id, confirmation="selected", **kwargs)
+
+    assert calls == [["limactl", "delete", "--force", "selected"]]
+    assert result == {
+        "name": "selected",
+        "run_id": run_id,
+        "runtime_kind": "cloud-image",
+        "backend": "lima-vz",
+        "operation": "rm",
+        "previous_status": "running",
+        "status": "removed",
+        "lifecycle_revision": 1,
+        "warning_category": None,
+        "fallback_used": False,
+    }
+    assert str(tmp_path) not in repr(result)
+    if volumes:
+        assert not run.exists()
+    else:
+        assert (run / "disk.raw").read_bytes() == b"owned run disk"
+        assert (run / "console.log").read_text() == "retained log"
+        assert (run / "outside-link").is_symlink()
+        assert state.read_run_ledger_snapshot(roots, "selected").state["status"] == "removed"
+    assert outside.read_bytes() == b"foreign disk"
+    assert (project / "data.raw").read_bytes() == b"named project volume"
+    assert state.read_run_ledger_snapshot(roots, "sibling").record.run_id == sibling_id
+
+
+@pytest.mark.parametrize("boundary", ["dispatch", "adapter-lock"])
+@pytest.mark.parametrize("action,status", [("start", "stopped"), ("stop", "running")])
+def test_vm_lifecycle_start_stop_carry_original_identity_into_dispatch(tmp_path, monkeypatch, action, status, boundary):
+    roots, run_id = _lifecycle_run(tmp_path, monkeypatch, status=status)
+    target = inventory.runtime_dispatch if boundary == "dispatch" else inventory.runtime_dispatch.lima
+    original = getattr(target, action)
+
+    def replace_before_operation(*args, **kwargs):
+        identity = kwargs["expected_identity"] if boundary == "dispatch" else kwargs["_expected_record"]
+        assert identity.name == "selected" and identity.run_id == run_id
+        _replace_lifecycle_run(roots)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(target, action, replace_before_operation)
+    with pytest.raises(StateError, match="identity changed|ledger changed"):
+        inventory.vm_lifecycle(roots, "selected", action, expected_run_id=run_id)
+    assert state.read_run_ledger_snapshot(roots, "selected").state["status"] == status
+
+
+def test_vm_lifecycle_capabilities_require_live_unique_managed_selection(tmp_path, monkeypatch):
+    roots, _ = _lifecycle_run(tmp_path, monkeypatch, status="stopped")
+    row = inventory.list_vms(roots)["vms"][0]
+    assert row["lifecycle"] == {"start": True, "stop": False, "remove": True, "remove_volumes": True}
+    assert not any(inventory.list_vms(roots, live=False)["vms"][0]["lifecycle"].values())
+
+
+@pytest.mark.parametrize("expected_run_id", [None, "", True, "not-a-uuid"])
+def test_vm_lifecycle_missing_or_invalid_expected_uuid_fails_closed(tmp_path, monkeypatch, expected_run_id):
+    roots, _ = _lifecycle_run(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        inventory.runtime_dispatch, "rm", lambda *a, **kw: pytest.fail("invalid UUID reached lifecycle dispatch")
+    )
+    with pytest.raises(StateError, match="expected_run_id|identity changed"):
+        inventory.remove_vm(roots, "selected", expected_run_id=expected_run_id, confirmation="selected")
+
+
+def test_vm_lifecycle_stop_returns_durable_safe_receipt(tmp_path, monkeypatch):
+    roots, run_id = _lifecycle_run(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        inventory.runtime_dispatch.lima,
+        "_instance_info_or_none",
+        lambda name: {
+            "name": "selected",
+            "status": "Stopped",
+            "config": {"env": {"PALIMPSEST_RUN_ID": run_id}},
+        },
+    )
+    result = inventory.vm_lifecycle(roots, "selected", "stop", expected_run_id=run_id)
+    assert result["run_id"] == run_id
+    assert result["operation"] == "stop"
+    assert result["previous_status"] == "running"
+    assert result["status"] == "stopped"
+    assert result["lifecycle_revision"] == 1
+    assert str(tmp_path) not in repr(result)
+    snapshot = state.read_run_ledger_snapshot(roots, "selected")
+    assert snapshot.state["status"] == "stopped"
+    assert state.lifecycle_revision(snapshot) == result["lifecycle_revision"]
+
+
+@pytest.mark.parametrize("action", ["rm", "remove", "restart", None, True, []])
+def test_vm_lifecycle_rejects_other_actions_before_observation(tmp_path, monkeypatch, action):
+    roots = _setup_roots(tmp_path)
+    monkeypatch.setattr(inventory, "get_vm", lambda *a, **kw: pytest.fail("invalid action read inventory"))
+    with pytest.raises(StateError, match="must be start or stop"):
+        inventory.vm_lifecycle(roots, "selected", action, expected_run_id="11111111-1111-4111-8111-111111111111")
+
+
+def test_remove_vm_missing_selected_run_fails_closed(tmp_path, monkeypatch):
+    roots = _setup_roots(tmp_path)
+    monkeypatch.setattr(
+        inventory.runtime_dispatch, "rm", lambda *a, **kw: pytest.fail("absent VM reached lifecycle dispatch")
+    )
+    with pytest.raises(StateError, match="not found"):
+        inventory.remove_vm(
+            roots, "selected", expected_run_id="11111111-1111-4111-8111-111111111111", confirmation="selected"
+        )

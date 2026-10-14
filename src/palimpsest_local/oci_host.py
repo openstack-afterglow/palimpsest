@@ -21,6 +21,7 @@ from ._oci_stage1_kvm_proof import verify_kernel_config, verify_kvm_api
 from .errors import StateError
 from .oci_initramfs import build_bootstrap_initramfs
 from .oci_root_kvm import _verify_host_boot_artifact, verify_first_party_bootstrap_initramfs, verify_host_boot_artifacts
+from .web_job_client import defer_web_cancellation, run_preparation_tool
 
 _HOST_TOOL_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
 _RUNTIME_ANCESTOR_STAMP_FIELDS = (
@@ -132,7 +133,7 @@ def verify_runtime_parent(path: Path, *, pin: bool = False) -> int | None:
                 )
             if mode & 0o022 and not (before.st_uid == 0 and mode & stat.S_ISVTX):
                 raise StateError("OCI runtime ancestor is writable by another principal")
-            result = subprocess.run(
+            result = run_preparation_tool(
                 ["getfacl", "-cpn", "--", f"/proc/self/fd/{descriptor}"],
                 pass_fds=(descriptor,),
                 stdin=subprocess.DEVNULL,
@@ -246,7 +247,7 @@ def preflight_oci_host(config: OCIHostConfig, roots, name: str) -> None:
     )
     if verify_kernel_config(config.kernel_config).digest != config.kernel_config_digest:
         raise StateError("OCI host kernel config digest changed")
-    probe = subprocess.run(
+    probe = run_preparation_tool(
         [sys.executable, "-c", "import libvirt"],
         cwd=Path(__file__).resolve().parent.parent,
         env={"PATH": os.defpath, "PYTHONNOUSERSITE": "1"},
@@ -263,17 +264,23 @@ def preflight_oci_host(config: OCIHostConfig, roots, name: str) -> None:
 def first_party_boot(config: OCIHostConfig, roots):
     """Keep the packaged source initramfs alive until run-owned BOOT is copied."""
     built = build_bootstrap_initramfs()
-    with tempfile.TemporaryDirectory(prefix="oci-boot-", dir=roots.state) as scratch:
-        path = Path(scratch) / "initramfs"
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    directory = None
+    try:
+        with defer_web_cancellation():
+            directory = tempfile.TemporaryDirectory(prefix="oci-boot-", dir=roots.state)
+        path = Path(directory.name) / "initramfs"
+        fd = None
         try:
+            with defer_web_cancellation():
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
             with os.fdopen(fd, "wb", closefd=False) as stream:
                 stream.write(built.payload)
                 stream.flush()
             os.fchmod(fd, 0o400)
             os.fsync(fd)
         finally:
-            os.close(fd)
+            if fd is not None:
+                os.close(fd)
         initramfs = verify_first_party_bootstrap_initramfs(path, built.manifest)
         yield verify_host_boot_artifacts(
             config.kernel,
@@ -281,3 +288,7 @@ def first_party_boot(config: OCIHostConfig, roots):
             expected_kernel_digest=config.kernel_digest,
             expected_initramfs_digest=initramfs.digest,
         )
+    finally:
+        if directory is not None:
+            with defer_web_cancellation():
+                directory.cleanup()

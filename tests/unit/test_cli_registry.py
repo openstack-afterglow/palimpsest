@@ -249,6 +249,122 @@ def test_load_input_path_is_forwarded_from_both_command_forms(
     ]
 
 
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        [],
+        ["--help"],
+        ["-h"],
+        ["help", "run"],
+        ["run", "--help"],
+        ["compose", "up", "--help"],
+        ["--context", "desktop-linux", "help", "buildx"],
+        ["--host=unix:///tmp/docker.sock", "buildx", "--help"],
+    ],
+)
+def test_docker_help_forwards_actual_cli_help_before_journal_state_or_profiles(
+    arguments: list[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    calls = []
+
+    def unexpected(*_args, **_kwargs):
+        pytest.fail("Docker help accessed journal, state, profiles, or Hub")
+
+    monkeypatch.setattr(cli.host_journal, "begin", unexpected)
+    for name in ("init_roots", "resolve_roots", "load_registry_config", "HubClient"):
+        monkeypatch.setattr(cli, name, unexpected)
+
+    def runner(command, **kwargs):
+        calls.append((command, kwargs))
+        print("Native Docker command help")
+        return subprocess.CompletedProcess(command, 23)
+
+    monkeypatch.setattr(
+        cli, "run_docker_passthrough", lambda command: registry.run_docker_passthrough(command, runner=runner)
+    )
+    assert cli.main(["docker", *arguments]) == 23
+    command, kwargs = calls[0]
+    assert command == ["docker", "--config", str((tmp_path / "docker-config").resolve()), *(arguments or ["--help"])]
+    assert not {"stdin", "stdout", "stderr", "capture_output"} & kwargs.keys()
+    assert kwargs["shell"] is False
+    assert kwargs["check"] is False
+    assert capsys.readouterr().out == "Native Docker command help\n"
+    assert not (tmp_path / "xdg-config").exists()
+    assert not (tmp_path / "xdg-state").exists()
+
+
+def test_missing_docker_help_executable_is_actionable_without_journal(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def runner(*_args, **_kwargs):
+        raise FileNotFoundError("docker")
+
+    monkeypatch.setattr(cli.host_journal, "begin", lambda *_args: pytest.fail("journal accessed"))
+    monkeypatch.setattr(cli, "init_roots", lambda *_args: pytest.fail("state accessed"))
+    monkeypatch.setattr(
+        cli, "run_docker_passthrough", lambda command: registry.run_docker_passthrough(command, runner=runner)
+    )
+    assert cli.main(["docker", "--help"]) == 1
+    error = capsys.readouterr().err
+    assert "install Docker" in error
+    assert "PATH" in error
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--context", "desktop-linux", "arbitrary-plugin", "--unknown-option=value", "payload"],
+        ["--host=unix:///tmp/docker.sock", "ps", "--future-docker-option"],
+        ["exec", "container", "program", "--", "--help"],
+    ],
+)
+def test_arbitrary_docker_commands_preserve_globals_and_options_without_store_access(
+    arguments: list[str],
+    docker_dispatch: tuple[RegistryConfig, Path, list[list[str]]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _config, docker_config, calls = docker_dispatch
+    journal_calls = []
+
+    class Journal:
+        def finish(self, status):
+            journal_calls.append(status)
+
+    def begin(operation):
+        journal_calls.append(operation)
+        return Journal()
+
+    monkeypatch.setattr(cli.host_journal, "begin", begin)
+    for name in ("init_roots", "resolve_roots", "load_registry_config"):
+        monkeypatch.setattr(cli, name, lambda *_args: pytest.fail("Docker accessed Palimpsest state/profiles"))
+    assert cli.main(["--url", "https://unused.example", "docker", *arguments]) == 0
+    assert calls == [["docker", "--config", str(docker_config.resolve()), *arguments]]
+    assert journal_calls == ["docker", "success"]
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        (["--context", "desktop-linux", "login", "--password=secret"], "password-stdin"),
+        (["--host", "unix:///tmp/docker.sock", "--config", "/tmp/override", "ps"], "DOCKER_CONFIG"),
+    ],
+)
+def test_docker_global_options_do_not_bypass_existing_registry_constraints(
+    arguments: list[str],
+    message: str,
+    docker_dispatch: tuple[RegistryConfig, Path, list[list[str]]],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _config, _docker_config, calls = docker_dispatch
+    assert cli.main(["docker", *arguments]) == 1
+    assert calls == []
+    assert message in capsys.readouterr().err
+
+
 def test_generic_docker_passthrough_uses_existing_config_and_preserves_exit_status(
     docker_dispatch: tuple[RegistryConfig, Path, list[list[str]]], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -437,7 +553,10 @@ def _native_profile() -> RegistryProfile:
     )
 
 
-@pytest.mark.parametrize("option", [["--load"], ["--cache-to", "type=registry,ref=hub.example.test/cache"]])
+@pytest.mark.parametrize(
+    "option",
+    [["--load"], ["--cache-to", "type=registry,ref=hub.example.test/cache"], ["--cache-mode", "local"]],
+)
 def test_native_build_rejects_docker_side_effects_before_credential_or_builder_access(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -456,7 +575,7 @@ def test_native_build_rejects_docker_side_effects_before_credential_or_builder_a
     assert not tuple(roots.builds.glob("bk-*"))
 
 
-def test_oci_online_build_requires_explicit_native_cache_authority_before_builder_access(
+def test_oci_native_cache_build_requires_explicit_native_cache_authority_before_builder_access(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -468,6 +587,78 @@ def test_oci_online_build_requires_explicit_native_cache_authority_before_builde
     assert cli.main(["build", str(tmp_path), "-t", "test:v1", "--output", str(output)]) == 1
     assert not output.exists()
     assert not tuple(roots.builds.glob("bk-*"))
+
+
+@pytest.mark.parametrize("no_cache", [False, True])
+def test_oci_local_cache_build_uses_no_native_or_legacy_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    no_cache: bool,
+) -> None:
+    roots = cli.init_roots()
+    config = _private_registry_config()
+    registry.save_registry_config(roots, config)
+    monkeypatch.setenv("PALIMPSEST_TOKEN", "legacy-token-must-not-authorize-local-cache")
+    monkeypatch.setenv("PALIMPSEST_PACKAGE_KEY", "native-key-must-not-authorize-local-cache")
+    monkeypatch.setattr(cli, "HubClient", lambda *_args, **_kwargs: pytest.fail("legacy authority accessed"))
+    monkeypatch.setattr(cli, "NativePackageClient", lambda *_args, **_kwargs: pytest.fail("native authority accessed"))
+    captured = []
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+
+    def fake_build(spec, selected_roots, *, hub_client, cache_package, runtime_hub_client, on_oci_export):
+        assert selected_roots == roots
+        captured.append(spec)
+        assert (hub_client, cache_package, runtime_hub_client, on_oci_export) == (None, None, None, None)
+        return {"output_oci_manifest_digest": "sha256:" + "c" * 64}
+
+    monkeypatch.setattr(cli, "build_with_buildkit", fake_build)
+    output = tmp_path / "output.oci.tar"
+    argv = [
+        "build",
+        str(context),
+        "--registry",
+        "corp",
+        "-t",
+        "test:v1",
+        "--cache-mode",
+        "local",
+        "--output",
+        str(output),
+    ]
+    if no_cache:
+        argv.append("--no-cache")
+    assert cli.main(argv) == 0
+    assert len(captured) == 1
+    spec = captured[0]
+    assert (spec.cache_mode, spec.offline, spec.no_cache) == ("local", False, no_cache)
+    assert (spec.tag, spec.registry_profile) == ("registry.example.com:5000/team/test:v1", "corp")
+    assert (spec.external_cache_from, spec.external_cache_to) == ((), ())
+    assert (spec.push_image, spec.push) == (False, False)
+    assert capsys.readouterr().out.strip() == "sha256:" + "c" * 64
+
+
+@pytest.mark.parametrize(
+    "option",
+    [
+        ["--cache-registry", "cloud"],
+        ["--cache-package", "team/app"],
+        ["--cache-from", "type=registry,ref=example.test/cache"],
+        ["--cache-to", "type=registry,ref=example.test/cache"],
+    ],
+)
+def test_local_cache_rejects_explicit_remote_authority_before_clients_or_builder(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    option: list[str],
+) -> None:
+    monkeypatch.setattr(cli, "load_registry_config", lambda *_args: pytest.fail("registry profiles read"))
+    monkeypatch.setattr(cli, "NativePackageClient", lambda *_args, **_kwargs: pytest.fail("credentials read"))
+    monkeypatch.setattr(cli, "HubClient", lambda *_args, **_kwargs: pytest.fail("legacy authority read"))
+    monkeypatch.setattr(cli, "build_with_buildkit", lambda *_args, **_kwargs: pytest.fail("builder started"))
+    assert cli.main(["build", str(tmp_path), "-t", "test:v1", "--cache-mode", "local", *option]) == 2
 
 
 @pytest.mark.parametrize("operation", ["push", "pull"])

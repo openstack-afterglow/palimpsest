@@ -250,6 +250,7 @@ class BuildKitSpec:
     registry_config_digest: str | None = None
     progress: str = "plain"
     push: bool = False
+    cache_mode: str = "native"
 
     def __post_init__(self) -> None:
         context = self.context.expanduser().resolve()
@@ -293,10 +294,14 @@ class BuildKitSpec:
             raise ArtifactValidationError("registry profile must be nonempty and single-line")
         if self.registry_config_digest is not None:
             object.__setattr__(self, "registry_config_digest", require_digest(self.registry_config_digest))
-        if self.no_cache and not self.offline:
-            raise ArtifactValidationError("--no-cache is incompatible with mandatory online Hub cache reuse")
-        if not self.offline and not self.push_cache:
-            raise ArtifactValidationError("online builds require mandatory native cache refresh")
+        if self.cache_mode not in {"native", "local"}:
+            raise ArtifactValidationError("BuildKit cache mode must be native or local")
+        if self.cache_mode == "local" and (self.external_cache_from or self.external_cache_to):
+            raise ArtifactValidationError("local cache mode does not accept external cache backends")
+        if self.no_cache and not self.offline and self.cache_mode == "native":
+            raise ArtifactValidationError("--no-cache is incompatible with mandatory native Hub cache reuse")
+        if not self.offline and self.cache_mode == "native" and not self.push_cache:
+            raise ArtifactValidationError("native-cache builds require mandatory native cache refresh")
         if self.runtime_block_size < 4096 or self.runtime_block_size > 1024 * 1024:
             raise ArtifactValidationError("runtime block size must be between 4096 and 1048576 bytes")
         if self.runtime_block_size & (self.runtime_block_size - 1):
@@ -1865,21 +1870,24 @@ def build_with_buildkit(
 ) -> dict[str, Any]:
     """Build, cache, optionally pack, and optionally upload one Dockerfile."""
     project_id: str | None = None
+    native_cache = not spec.offline and spec.cache_mode == "native"
     if spec.offline:
         validate_offline_dockerfile(spec)
-    else:
+    elif native_cache:
         validate_online_dockerfile(spec)
         if hub_client is None or not cache_package:
             raise BuildError(
-                "online BuildKit builds require an explicit native cache client and cache_package; "
-                "use --cache-registry and --cache-package or --offline"
+                "native-cache BuildKit builds require an explicit native cache client and cache_package; "
+                "use --cache-registry and --cache-package, --cache-mode local, or --offline"
             )
         actor = hub_client.authorize(cache_package, ("cache:read", "cache:write"))
         project_id = actor.get("project_id") if isinstance(actor, dict) else None
         if not isinstance(project_id, str) or not project_id:
             raise HubError("native cache authorization returned an invalid project_id")
-        if spec.push and runtime_hub_client is None:
-            raise BuildError("runtime upload requires a separate original-token runtime Hub client")
+    elif hub_client is not None or cache_package is not None:
+        raise BuildError("local-cache builds do not accept native cache clients or package scopes")
+    if spec.push and runtime_hub_client is None:
+        raise BuildError("runtime upload requires a separate original-token runtime Hub client")
 
     started_at = state.utc_now_iso()
     started = time.monotonic()
@@ -1911,6 +1919,13 @@ def build_with_buildkit(
         scope_root = roots.build_cache / spec.cache_scope
         scope_lock = roots.locks / f"build-cache-{spec.cache_scope}.lock"
         cache_blob_root = roots.build_cache / "blobs"
+    elif not native_cache:
+        partition = hashlib.sha256(
+            f"{spec.platform}\0{builder_environment['fingerprint']}\0{spec.cache_scope}".encode()
+        ).hexdigest()
+        scope_root = roots.build_cache / "_local" / partition / "scope"
+        scope_lock = roots.locks / f"build-cache-local-{partition}.lock"
+        cache_blob_root = roots.build_cache / "_local" / partition / "blobs"
     else:
         partition = _cache_partition(
             hub_client.api_base,
@@ -1934,7 +1949,7 @@ def build_with_buildkit(
         cache_source = "none"
         if not spec.no_cache:
             phase = time.monotonic()
-            if not spec.offline:
+            if native_cache:
                 cache_from, cache_source = _resolve_hub_cache(
                     hub_client,
                     spec,
@@ -1993,13 +2008,13 @@ def build_with_buildkit(
             "builder_fingerprint": builder_environment["fingerprint"],
             "oci_manifest_digest": oci_manifest_digest,
         }
-        if not spec.offline:
+        if native_cache:
             cache_descriptor.update(project_id=project_id, namespace=hub_client.namespace, package=cache_package)
         _create_cache_archive(cache_export, cache_archive, cache_descriptor)
         cache_archive_digest = digest_file(cache_archive)
         timings["cache_archive"] = round((time.monotonic() - phase) * 1000)
 
-        if not spec.offline and spec.push_cache:
+        if native_cache and spec.push_cache:
             phase = time.monotonic()
             uploaded = hub_client.push_cache(cache_package, cache_archive, cache_descriptor)
             if not isinstance(uploaded, dict):
@@ -2167,11 +2182,12 @@ def build_with_buildkit(
         "build_key": build_key,
         "status": "success",
         "mode": "offline" if spec.offline else "online",
+        "cache_mode": "local" if spec.offline else spec.cache_mode,
         "cache_source": cache_source,
         "cache_archive_digest": cache_archive_digest,
         "cache_scope": spec.cache_scope,
         "cache_project_id": project_id,
-        "cache_package": cache_package if not spec.offline else None,
+        "cache_package": cache_package if native_cache else None,
         "output_tag": spec.tag,
         "output_tags": [spec.tag, *spec.additional_tags],
         "registry_image_pushed": spec.push_image,

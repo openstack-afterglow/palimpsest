@@ -77,7 +77,7 @@ ca = ["/etc/palimpsest/certs/hub-ca.pem"]
 
 Native HTTPS verifies the server with the system CA trust plus configured CA files, requires TLS 1.2 or newer, and refuses redirects. Native profiles reject `--mirror`, `--plain-http`, `--tls-skip-verify`, `--cache-from` and `--cache-to`; there is no insecure native mode.
 
-OCI profiles additionally accept repeated `--mirror`, `--cache-from` and `--cache-to`, plus `--plain-http`, `--tls-skip-verify` and `--force`. Plain HTTP and TLS-skip are mutually exclusive. Profile and command-line Buildx cache definitions supplement mandatory native cache participation only for OCI output builds; they never replace it.
+OCI profiles additionally accept repeated `--mirror`, `--cache-from` and `--cache-to`, plus `--plain-http`, `--tls-skip-verify` and `--force`. Plain HTTP and TLS-skip are mutually exclusive. Profile and command-line Buildx cache definitions supplement mandatory native cache participation for OCI output builds in default native cache mode. Local cache mode rejects external cache definitions rather than combining them with host-only cache.
 
 ### Selection precedence
 
@@ -206,6 +206,21 @@ palimpsest docker image ls --digests
 
 The passthrough uses the same existing `DOCKER_CONFIG`/`~/.docker` directory and runs without a shell. It does not apply Palimpsest registry-profile reference completion; pass Docker the exact reference you want. To prevent credential leakage or configuration bypass, a Docker-global `--config` option before the subcommand and all `docker login -p|--password` forms are rejected. A program argument named `--config` after commands such as `docker run IMAGE ...` remains untouched. Set `DOCKER_CONFIG` before invocation and use an interactive login or `--password-stdin` instead.
 
+## Automatic run acquisition
+
+`palimpsest run IMAGE` is local-first: cloud CAS/tags, successful BuildKit OCI exports, native OCI package receipts and retained acquired archives precede local Docker inspection and remote acquisition. Local build/package bindings take precedence over the retained mutable-reference cache. Every eligible OCI-profile-expanded Docker name is inspected before export; identical image IDs collapse to one source, conflicting IDs require an explicit reference. A broken configured Docker daemon is a hard failure, not permission to pull remotely.
+
+```sh
+palimpsest run alpine:3.20 --name alpine
+palimpsest run api:v1 --registry corp --name api
+```
+
+Explicit authorities and `--registry` restrict named resolution to the selected authority/profile; local paths and digests remain local. Otherwise remote lookup tries `PALIMPSEST_REGISTRY` or the default first, then remaining OCI aliases in sorted order. Only protocol-level image absence permits fallback. Authentication, TLS, transport and source-verification failures stop. Native profiles are never queried as Docker `/v2`: use native `pull` first to retain a verified local OCI package receipt. Skopeo and the Linux amd64 KVM runtime prerequisites are required; unsupported hosts fail before acquisition.
+
+Automatic pulls resolve Docker credentials for the selected host from per-registry `credHelpers`, then global `credsStore`, then inline `auths`. Docker Hub helpers receive `https://index.docker.io/v1/`. Helpers run in the caller's normal HOME/XDG and tool configuration, with the selected `DOCKER_CONFIG` and without Palimpsest API tokens/package keys. Only the selected host's credentials are written to a private temporary auth file for isolated Skopeo execution; staging is removed after success or failure. No native API/project helper key is reused for Docker authentication. Profiles retain their custom CA and explicit plain-HTTP setting; TLS validation remains enabled otherwise.
+
+Acquired OCI archives are graph-verified through SourceCAS and retained with archive/root/manifest identities in owner-only local source storage. A requested `@sha256` index pin is not replaced by its amd64 child: digest-pinned copies preserve the complete index with `--multi-arch=all`, then select and verify the Linux amd64 image. This can download other platforms too, under the existing archive-size bound. Tag-based acquisition copies the selected platform only. Retained references permit later local reuse, not a guarantee that a mutable registry tag has been refreshed.
+
 ## Building and publishing
 
 OCI builds keep the existing profile selection (explicit alias, then `PALIMPSEST_REGISTRY`, then default) for profile caches. They canonicalize output tags against that profile only when `--push` or `--registry` is given. Native builds always canonicalize their tags. For OCI profiles, repeated `-t/--tag` values and `build --push` publish via Buildx `type=registry`, and `--load` keeps Docker-format loading. `--runtime-push` is a separate legacy Hub SquashFS upload that uses the original `PALIMPSEST_TOKEN`, for either output protocol.
@@ -238,7 +253,7 @@ palimpsest build . \
   --push
 ```
 
-Every online build must authorize `cache:read` and `cache:write` on an exact native package before builder preflight or build-directory creation. Native output defaults to its selected profile and namespace/package; `--cache-registry NATIVE_ALIAS` and `--cache-package NAMESPACE/PACKAGE` can select the cache explicitly. Online OCI output **requires both flags**, even if `PALIMPSEST_TOKEN` is set. Cache packages have no tag/digest selector. No unqualified legacy-token cache writes remain; `HubClient.push_blob` refuses BuildKit-cache kind/media type. External cache imports/exports are OCI-only additive accelerators. `--no-cache` is allowed only in strict offline mode.
+Every online build in default `--cache-mode native` must authorize `cache:read` and `cache:write` on an exact native package before builder preflight or build-directory creation. Native output defaults to its selected profile and namespace/package; `--cache-registry NATIVE_ALIAS` and `--cache-package NAMESPACE/PACKAGE` can select the cache explicitly. Online OCI output in this mode **requires both flags**, even if `PALIMPSEST_TOKEN` is set. Cache packages have no tag/digest selector. No unqualified legacy-token cache writes remain; `HubClient.push_blob` refuses BuildKit-cache kind/media type. External cache imports/exports are OCI-only additive accelerators. `--cache-mode local` requires OCI output, uses managed host cache with no Hub access, and rejects native/external cache authorities. `--no-cache` is allowed in local cache mode or strict offline mode.
 
 ## BuildKit mirrors and private CAs
 

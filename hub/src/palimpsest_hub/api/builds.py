@@ -13,7 +13,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, select
 
-from palimpsest_hub.api.hub import _factory_or_503, _load_visible, _locked_file, _store_or_503
+from palimpsest_hub.api.hub import _factory_or_503, _load_visible, _store_or_503
 from palimpsest_hub.auth import require_admin
 from palimpsest_hub.config import get_settings
 from palimpsest_hub.models import PalimpsestHubBuild, exact_identity
@@ -21,6 +21,7 @@ from palimpsest_hub.rate_limit import limiter
 from palimpsest_hub.services import builds as build_service
 from palimpsest_hub.services.digest import normalize_digest
 from palimpsest_hub.services.hub_store import KIND_CLOUD_IMAGE, MEDIA_TYPE_LAYER_SQUASHFS
+from palimpsest_hub.services.worker_leases import sql_mutex
 
 router = APIRouter()
 
@@ -110,10 +111,7 @@ async def create_hub_build(
     store = _store_or_503()
     factory = _factory_or_503()
     project_id = token_info["project_id"]
-    async with (
-        _locked_file(store, lambda: store.acquire_project_build_lock(project_id, blocking=False)),
-        factory() as session,
-    ):
+    async with sql_mutex(factory, "build-api:project:" + project_id) as session:
         queued = await session.scalar(
             select(func.count())
             .select_from(PalimpsestHubBuild)

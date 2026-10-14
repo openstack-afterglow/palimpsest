@@ -14,6 +14,7 @@ import hashlib
 import json
 import threading
 import uuid
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
@@ -32,6 +33,7 @@ from palimpsest_hub.models import Base, PalimpsestImageExport, PalimpsestImageEx
 from palimpsest_hub.rate_limit import limiter
 from palimpsest_hub.services import image_exports
 from palimpsest_hub.services.hub_store import LocalPathBlobStore
+from palimpsest_hub.services.worker_leases import role_lease
 
 USER = "f" * 64
 OTHER_USER = "7" * 32
@@ -776,39 +778,41 @@ async def test_attempt_exhaustion_retires_delegation_without_glance(hub):
     assert _worker_glance(h) == []
 
 
-async def test_stale_cleanup_cannot_overwrite_reclaimed_cleanup_lease(hub, monkeypatch):
-    h = hub
-    created = await _admit(h)
-    await image_exports.soft_delete_project_export(PROJECT, created["id"])
-    started, release = threading.Event(), threading.Event()
-    now = datetime.now(UTC)
-    monkeypatch.setattr(image_exports, "_now", lambda: now)
+async def test_stale_cleanup_cannot_delete_or_overwrite_reclaimed_cleanup_lease(hub, monkeypatch):
+    await _admit(hub)
+    async with hub.factory() as session, session.begin():
+        await session.execute(update(PalimpsestImageExport).values(status=image_exports.STATUS_ERROR))
+    deletes = []
+    monkeypatch.setattr(image_exports, "delete_export_trust", lambda delegation: deletes.append(delegation) or True)
+    async with role_lease(hub.factory, "export-delegation-cleanup") as lease:
+        fences = 0
 
-    def slow_first_delete(_delegation):
-        if not started.is_set():
-            started.set()
-            assert release.wait(timeout=10)
-        return False
+        @asynccontextmanager
+        async def advanced_attempt():
+            nonlocal fences
+            fences += 1
+            if fences == 2:
+                async with hub.factory() as session, session.begin():
+                    await session.execute(
+                        update(PalimpsestImageExportDelegation).values(
+                            cleanup_attempts=2,
+                            cleanup_next_at=datetime.now(UTC) + timedelta(minutes=10),
+                        )
+                    )
+            async with lease.fence() as session:
+                yield session
 
-    monkeypatch.setattr(image_exports, "delete_export_trust", slow_first_delete)
-    first = asyncio.create_task(image_exports.run_delegation_cleanup())
-    try:
-        assert await asyncio.to_thread(started.wait, 5)
-        # The first worker outlives its five-minute lease; a second worker reclaims it.
-        now += timedelta(minutes=6)
-        assert await image_exports.run_delegation_cleanup() == 0
-        _, [newer] = await _rows(h)
-        assert newer.cleanup_attempts == 2
-        now += timedelta(seconds=30)
-    finally:
-        release.set()
-        await first
-    _, [stored] = await _rows(h)
-    assert stored.state == image_exports.DELEGATION_CLEANUP
-    assert stored.cleanup_attempts == 2
-    assert stored.cleanup_next_at == newer.cleanup_next_at
-    assert stored.updated_at == newer.updated_at
-    assert _worker_glance(h) == []
+        assert (
+            await image_exports._run_delegation_cleanup(
+                SimpleNamespace(fence=advanced_attempt), limit=20, export_id=None
+            )
+            == 0
+        )
+    assert deletes == []
+    _, [row] = await _rows(hub)
+    assert row.state == image_exports.DELEGATION_CLEANUP and row.cleanup_attempts == 2
+    assert row.finished_at is None
+    assert _worker_glance(hub) == []
 
 
 @pytest.mark.parametrize(
@@ -828,3 +832,70 @@ def test_administrative_empty_or_unbounded_delegation_settings_fail_startup(monk
     get_settings.cache_clear()
     with pytest.raises(ValueError):
         get_settings()
+
+
+async def test_competing_delegation_role_never_claims_or_deletes(hub):
+    await _admit(hub)
+    async with hub.factory() as session, session.begin():
+        await session.execute(update(PalimpsestImageExport).values(status=image_exports.STATUS_ERROR))
+    async with role_lease(hub.factory, "export-delegation-cleanup") as lease:
+        assert lease is not None
+        assert await image_exports.run_delegation_cleanup() == 0
+        _, [row] = await _rows(hub)
+        assert row.cleanup_attempts == 0 and row.state == image_exports.DELEGATION_ACTIVE
+        assert hub.identity["deletes"] == []
+    assert await image_exports.run_delegation_cleanup() == 1
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_slow_delegation_delete_holds_fence_past_ttl_and_drains_cancellation(hub, monkeypatch, cancel):
+    await _admit(hub)
+    async with hub.factory() as session, session.begin():
+        await session.execute(update(PalimpsestImageExport).values(status=image_exports.STATUS_ERROR))
+    started, release, drained = threading.Event(), threading.Event(), threading.Event()
+    calls = []
+
+    def delete(delegation):
+        calls.append(delegation.trust_id)
+        started.set()
+        try:
+            assert release.wait(5), "test did not release the blocking Keystone boundary"
+            return True
+        finally:
+            drained.set()
+
+    @asynccontextmanager
+    async def short_role(factory, name, **_kwargs):
+        async with role_lease(factory, name, ttl_seconds=0.3) as lease:
+            yield lease
+
+    monkeypatch.setattr(image_exports, "delete_export_trust", delete)
+    monkeypatch.setattr(image_exports, "role_lease", short_role)
+    first = asyncio.create_task(image_exports.run_delegation_cleanup())
+    second = None
+    try:
+        assert await asyncio.to_thread(started.wait, 3)
+        # SQLite checks exclusion before expiry; MariaDB process smoke covers
+        # takeover rejection while the provider fence outlives its nominal TTL.
+        second = asyncio.create_task(image_exports.run_delegation_cleanup())
+        assert await second == 0
+        await asyncio.sleep(0.7)
+        if cancel:
+            first.cancel()
+            await asyncio.sleep(0.05)
+            assert not first.done() and not drained.is_set()
+        assert len(calls) == 1 and not drained.is_set()
+        release.set()
+        if cancel:
+            with pytest.raises(asyncio.CancelledError):
+                await first
+            assert drained.is_set()
+        else:
+            assert await first == 1
+            _, [row] = await _rows(hub)
+            assert row.state == image_exports.DELEGATION_DELETED
+        assert await second == 0
+        assert len(calls) == 1
+    finally:
+        release.set()
+        await asyncio.gather(first, *([second] if second is not None else []), return_exceptions=True)

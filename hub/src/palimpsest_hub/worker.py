@@ -1,4 +1,4 @@
-"""Palimpsest Glance Image Export Worker process entrypoint."""
+"""Export jobs use distributed SQL claims; independent renewable SQL roles fence sweeps."""
 
 from __future__ import annotations
 
@@ -72,6 +72,7 @@ async def main() -> None:
 
             now = loop.time()
             if now - last_delegation_cleanup > delegation_cleanup_interval:
+                # The service owns its SQL role even when called outside this entrypoint.
                 try:
                     await run_delegation_cleanup()
                 except Exception:

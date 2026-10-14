@@ -8,11 +8,14 @@ import stat
 import tempfile
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 import palimpsest_local.state as state
 from palimpsest_local.errors import StateError
+from palimpsest_local.hub import KIND_CLOUD_IMAGE
+from palimpsest_local.oci_layout import ContentStore
 from palimpsest_local.runtime_types import DispatchKey, RuntimeBackend, RuntimeKind
 
 
@@ -1008,15 +1011,13 @@ def test_tag_records() -> None:
             state.write_tag_record(roots, conflicting)
 
 
-def test_conflicting_tag_writers_are_serialized(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_conflicting_tag_writers_are_serialized(tmp_path: Path) -> None:
     roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "cfg"), "XDG_STATE_HOME": str(tmp_path / "st")})
     for character in ("a", "b"):
         blob = roots.store / "blobs" / "sha256" / (character * 64)
         blob.parent.mkdir(parents=True, exist_ok=True)
         blob.write_bytes(b"stub")
-    first_entered_write = threading.Event()
-    release_first_write = threading.Event()
-    original_atomic_write = state.atomic_write_json
+    start_writers = threading.Barrier(3)
 
     def record(digest_character: str) -> state.TagRecord:
         return state.TagRecord(
@@ -1031,16 +1032,10 @@ def test_conflicting_tag_writers_are_serialized(tmp_path: Path, monkeypatch: pyt
             created_at=state.utc_now_iso(),
         )
 
-    def delayed_atomic_write(path: Path, value: dict[str, object]) -> None:
-        if path == state.tag_path(roots, "concurrent") and value.get("digest") == "sha256:" + "a" * 64:
-            first_entered_write.set()
-            assert release_first_write.wait(5)
-        original_atomic_write(path, value)
-
-    monkeypatch.setattr(state, "atomic_write_json", delayed_atomic_write)
     outcomes: list[str] = []
 
     def write(item: state.TagRecord) -> None:
+        start_writers.wait(timeout=5)
         try:
             state.write_tag_record(roots, item)
             outcomes.append("success")
@@ -1050,9 +1045,8 @@ def test_conflicting_tag_writers_are_serialized(tmp_path: Path, monkeypatch: pyt
     first = threading.Thread(target=write, args=(record("a"),))
     second = threading.Thread(target=write, args=(record("b"),))
     first.start()
-    assert first_entered_write.wait(5)
     second.start()
-    release_first_write.set()
+    start_writers.wait(timeout=5)
     first.join(5)
     second.join(5)
 
@@ -1164,24 +1158,214 @@ def test_state_root_precedence_and_source_reporting(tmp_path: Path) -> None:
     assert roots_env.state == env_st
 
 
-def test_linux_unconfigured_state_root_resolves_to_var_lib_without_mutation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.fixture
+def linux_user_defaults(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Exercise real owner-bound IO, including when the test runner itself is root."""
+    home = tmp_path / "home"
+    monkeypatch.setattr(state.sys, "platform", "linux")
+    monkeypatch.setattr(state.Path, "home", classmethod(lambda cls: home))
+    # Identity classification is covered separately; do not falsify the UID used
+    # by shared traversal's actual directory/file ownership validation.
+    monkeypatch.setattr(state, "uses_system_defaults", lambda: False)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    monkeypatch.delenv("PALIMPSEST_STATE_HOME", raising=False)
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    return home / ".local" / "state" / "palimpsest"
+
+
+@pytest.mark.parametrize("identity", ["root", "service", "normal"])
+def test_linux_default_selection_uses_effective_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, identity: str
 ) -> None:
-    config_home = tmp_path / "cfg"
     user_home = tmp_path / "home"
+    config_home = tmp_path / "cfg"
     monkeypatch.setattr(state.sys, "platform", "linux")
     monkeypatch.setattr(state.Path, "home", classmethod(lambda cls: user_home))
+    monkeypatch.setattr(state.os, "geteuid", lambda: 0 if identity == "root" else 1234)
+    monkeypatch.setenv("USER", "palimpsest")
+    monkeypatch.setenv("LOGNAME", "palimpsest")
+    monkeypatch.setenv("SUDO_USER", "palimpsest")
 
+    def lookup(uid: int) -> SimpleNamespace:
+        return SimpleNamespace(pw_name="palimpsest" if identity == "service" else "alice", pw_dir="/var/lib/palimpsest")
+
+    monkeypatch.setattr(state.pwd, "getpwuid", lookup)
+    system = identity in {"root", "service"}
+    assert state.uses_system_defaults() is system
     roots = state.resolve_roots({"XDG_CONFIG_HOME": str(config_home)})
 
     assert roots.config == config_home / "palimpsest"
-    assert roots.state == Path("/var/lib/palimpsest")
+    assert roots.state == (Path("/var/lib/palimpsest") if system else user_home / ".local/state/palimpsest")
+    assert not user_home.exists()
     assert not config_home.exists()
 
 
+@pytest.mark.parametrize("lookup_error", [KeyError, OSError])
+def test_linux_unavailable_effective_identity_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lookup_error: type[Exception]
+) -> None:
+    home = tmp_path / "home"
+    config_home = tmp_path / "cfg"
+    monkeypatch.setattr(state.sys, "platform", "linux")
+    monkeypatch.setattr(state.Path, "home", classmethod(lambda cls: home))
+    monkeypatch.setattr(state.os, "geteuid", lambda: 1234)
+
+    def lookup(uid: int) -> SimpleNamespace:
+        raise lookup_error(uid)
+
+    monkeypatch.setattr(state.pwd, "getpwuid", lookup)
+    with pytest.raises(StateError, match="cannot determine effective account for Linux defaults"):
+        state.uses_system_defaults()
+    with pytest.raises(StateError, match="cannot determine effective account for Linux defaults"):
+        state.resolve_roots({"XDG_CONFIG_HOME": str(config_home)})
+    assert not home.exists()
+    assert not config_home.exists()
+
+
+def test_linux_service_account_with_conflicting_home_fails_without_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    config_home = tmp_path / "cfg"
+    monkeypatch.setattr(state.sys, "platform", "linux")
+    monkeypatch.setattr(state.Path, "home", classmethod(lambda cls: home))
+    monkeypatch.setattr(state.os, "geteuid", lambda: 991)
+    monkeypatch.setattr(state.pwd, "getpwuid", lambda uid: SimpleNamespace(pw_name="palimpsest", pw_dir=str(home)))
+
+    with pytest.raises(StateError, match="effective palimpsest account has conflicting system home"):
+        state.uses_system_defaults()
+    with pytest.raises(StateError, match="effective palimpsest account has conflicting system home"):
+        state.init_roots({"XDG_CONFIG_HOME": str(config_home)})
+
+    assert not home.exists()
+    assert not config_home.exists()
+
+
+def test_linux_fresh_user_initializes_private_store(
+    linux_user_defaults: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from palimpsest_local import cli
+
+    selected = state.resolve_roots()
+    assert selected.state == linux_user_defaults
+    assert not selected.state.exists()
+    assert not selected.config.exists()
+
+    assert cli.main(["store", "show", "--format", "json"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["state_root"] == str(selected.state)
+    assert report["source"] == "default"
+    assert cli.main(["store", "ls", "--kind", "image", "--format", "json"]) == 0
+    assert json.loads(capsys.readouterr().out) == []
+    assert state.init_roots() == selected
+    for directory in (selected.config, selected.state, selected.runs, selected.locks, selected.store, selected.tags):
+        assert state.permission_bits(directory) == 0o700
+
+
+def test_linux_legacy_user_store_and_run_metadata_stay_in_place(
+    linux_user_defaults: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from palimpsest_local import cli
+
+    # Populate the previous explicitly selected XDG namespace, then use defaults.
+    roots = state.init_roots(
+        {"XDG_CONFIG_HOME": os.environ["XDG_CONFIG_HOME"], "XDG_STATE_HOME": str(linux_user_defaults.parent)}
+    )
+    store = ContentStore(roots.store)
+    blob = store.write_stream([b"existing user image"])
+    digest = f"sha256:{blob.name}"
+    metadata = {"kind": KIND_CLOUD_IMAGE, "disk_format": "qcow2", "arch": "x86_64", "name": "existing.img"}
+    metadata_path = store.write_metadata(digest, metadata)
+    tag = state.TagRecord(
+        schema_version=1,
+        tag="existing-image",
+        digest=digest,
+        media_type="application/octet-stream",
+        size_bytes=blob.stat().st_size,
+        parent_digest=None,
+        base_image_digest=None,
+        source="import",
+        created_at=state.utc_now_iso(),
+    )
+    state.write_tag_record(roots, tag)
+    run = state.run_paths(roots, "existing-run")
+    owner = state.write_owner_record(run)
+    ledger = state.write_run_state(run, status="stopped", data={"base_digest": digest})
+    files = (blob, metadata_path, state.tag_path(roots, tag.tag), run.owner, run.state)
+    before = {path: (path.stat().st_ino, path.stat().st_mode, path.read_bytes()) for path in files}
+
+    assert state.resolve_roots().state == roots.state == linux_user_defaults
+    assert cli.main(["store", "show", "--format", "json"]) == 0
+    assert json.loads(capsys.readouterr().out)["state_root"] == str(roots.state)
+    assert cli.main(["store", "ls", "--kind", "image", "--format", "json"]) == 0
+    images = json.loads(capsys.readouterr().out)
+    assert len(images) == 1
+    assert images[0]["digest"] == digest
+    assert images[0]["name"] == "existing.img"
+    assert images[0]["tags"][0]["tag"] == tag.tag
+    assert images[0]["referenced_by"]["runs"] == ["existing-run"]
+    assert state.read_owner_record(run) == owner
+    assert state.read_run_state(run) == ledger
+    assert state.read_tag_record(roots, tag.tag) == tag
+    assert {path: (path.stat().st_ino, path.stat().st_mode, path.read_bytes()) for path in files} == before
+
+
+@pytest.mark.parametrize("unsafe_kind", ["symlink", "dangling-symlink", "file", "foreign-owner"])
+def test_linux_user_default_does_not_fall_back_from_unsafe_state(
+    linux_user_defaults: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unsafe_kind: str
+) -> None:
+    selected = linux_user_defaults
+    selected.parent.mkdir(parents=True)
+    target = tmp_path / "unrelated"
+    target.mkdir(mode=0o755)
+    target.chmod(0o755)
+    sentinel = target / "keep"
+    sentinel.write_bytes(b"do not alter")
+    if unsafe_kind == "symlink":
+        selected.symlink_to(target, target_is_directory=True)
+    elif unsafe_kind == "dangling-symlink":
+        selected.symlink_to(tmp_path / "missing", target_is_directory=True)
+    elif unsafe_kind == "file":
+        selected.write_bytes(b"not a directory")
+    else:
+        selected.mkdir(mode=0o700)
+        uid = os.geteuid()
+        monkeypatch.setattr(state.os, "geteuid", lambda: uid + 1)
+    before = selected.lstat()
+    binding = (before.st_dev, before.st_ino, before.st_mode, before.st_uid)
+
+    assert state.resolve_roots().state == selected
+    with pytest.raises(StateError, match="OCI shared traversal authority"):
+        state.init_roots()
+
+    after = selected.lstat()
+    assert (after.st_dev, after.st_ino, after.st_mode, after.st_uid) == binding
+    assert state.permission_bits(target) == 0o755
+    assert sentinel.read_bytes() == b"do not alter"
+    assert list(target.iterdir()) == [sentinel]
+    assert not (tmp_path / "missing").exists()
+    assert not (tmp_path / "cfg").exists()
+
+
+def test_linux_user_default_preserves_corrupt_shared_authority(linux_user_defaults: Path) -> None:
+    roots = state.init_roots()
+    registry = roots.locks / "oci-shared-traversal.json"
+    registry.write_bytes(b"{corrupt registry")
+    registry.chmod(0o600)
+    before = registry.read_bytes()
+
+    assert state.resolve_roots().state == linux_user_defaults
+    with pytest.raises(StateError, match="OCI shared traversal authority"):
+        state.init_roots()
+
+    assert registry.read_bytes() == before
+    assert state.permission_bits(roots.state) == 0o700
+
+
+@pytest.mark.parametrize("identity", ["root", "service"])
 @pytest.mark.parametrize("legacy_kind", ["directory", "dangling-symlink"])
-def test_linux_unconfigured_root_refuses_to_hide_legacy_state(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, legacy_kind: str
+def test_linux_system_identity_refuses_to_hide_legacy_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, identity: str, legacy_kind: str
 ) -> None:
     user_home = tmp_path / "home"
     legacy = user_home / ".local" / "state" / "palimpsest"
@@ -1190,77 +1374,135 @@ def test_linux_unconfigured_root_refuses_to_hide_legacy_state(
         legacy.mkdir()
     else:
         legacy.symlink_to(tmp_path / "missing-target", target_is_directory=True)
+    before = legacy.lstat()
     monkeypatch.setattr(state.sys, "platform", "linux")
     monkeypatch.setattr(state.Path, "home", classmethod(lambda cls: user_home))
+    monkeypatch.setattr(state.os, "geteuid", lambda: 0 if identity == "root" else 991)
+    monkeypatch.setattr(
+        state.pwd, "getpwuid", lambda uid: SimpleNamespace(pw_name="palimpsest", pw_dir="/var/lib/palimpsest")
+    )
 
     with pytest.raises(StateError, match="legacy Linux state root exists.*XDG_STATE_HOME"):
         state.resolve_roots({"XDG_CONFIG_HOME": str(tmp_path / "cfg")})
+    assert legacy.lstat() == before
+    assert not (tmp_path / "cfg").exists()
 
 
-def test_linux_explicit_xdg_state_home_bypasses_legacy_guard(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    user_home = tmp_path / "home"
-    legacy = user_home / ".local" / "state" / "palimpsest"
-    legacy.mkdir(parents=True)
-    monkeypatch.setattr(state.sys, "platform", "linux")
-    monkeypatch.setattr(state.Path, "home", classmethod(lambda cls: user_home))
-
-    roots = state.resolve_roots({"XDG_CONFIG_HOME": str(tmp_path / "cfg"), "XDG_STATE_HOME": str(legacy.parent)})
-
-    assert roots.state == legacy
-
-
-def test_linux_unconfigured_root_fails_closed_when_legacy_probe_is_inaccessible(
+def test_linux_system_root_fails_closed_when_legacy_probe_is_inaccessible(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(state.sys, "platform", "linux")
+    monkeypatch.setattr(state.os, "geteuid", lambda: 0)
     monkeypatch.setattr(state.Path, "home", classmethod(lambda cls: tmp_path / "home"))
     monkeypatch.setattr(state.os, "lstat", lambda _path: (_ for _ in ()).throw(PermissionError()))
     with pytest.raises(StateError, match="cannot determine whether the legacy Linux state root exists"):
         state.resolve_roots({"XDG_CONFIG_HOME": str(tmp_path / "cfg")})
 
 
-@pytest.mark.parametrize("source", ["env", "config"])
-def test_linux_explicit_primary_override_bypasses_legacy_guard(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str
+@pytest.mark.parametrize("identity", ["root", "service", "normal", "unknown", "conflicting-home"])
+@pytest.mark.parametrize("source", ["env", "config", "xdg"])
+def test_linux_explicit_selection_precedes_identity_defaults_and_legacy_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, identity: str, source: str
 ) -> None:
     legacy = tmp_path / "home" / ".local" / "state" / "palimpsest"
     legacy.mkdir(parents=True)
     config_home = tmp_path / "cfg"
     selected = tmp_path / "selected"
-    environment = {"XDG_CONFIG_HOME": str(config_home)}
+    config_root = config_home / "palimpsest"
+    environment = {"XDG_CONFIG_HOME": str(config_home), "XDG_STATE_HOME": str(selected.parent)}
     if source == "env":
         environment["PALIMPSEST_STATE_HOME"] = str(selected)
-    else:
-        config_root = config_home / "palimpsest"
+        config_root.mkdir(parents=True)
+        (config_root / "config.toml").write_text("[storage\ninvalid TOML", encoding="utf-8")
+    elif source == "config":
         config_root.mkdir(parents=True)
         (config_root / "config.toml").write_text(f'[storage]\nstate_root = "{selected}"\n', encoding="utf-8")
+    else:
+        environment["XDG_STATE_HOME"] = str(legacy.parent)
+        selected = legacy
     monkeypatch.setattr(state.sys, "platform", "linux")
     monkeypatch.setattr(state.Path, "home", classmethod(lambda cls: tmp_path / "home"))
+    monkeypatch.setattr(state.os, "geteuid", lambda: 0 if identity == "root" else 1234)
+
+    def lookup(uid: int) -> SimpleNamespace:
+        if identity == "unknown":
+            raise KeyError(uid)
+        return SimpleNamespace(
+            pw_name="palimpsest" if identity in {"service", "conflicting-home"} else "alice",
+            pw_dir="/home/conflict" if identity == "conflicting-home" else "/var/lib/palimpsest",
+        )
+
+    monkeypatch.setattr(state.pwd, "getpwuid", lookup)
 
     assert state.resolve_roots(environment).state == selected
+    assert state.state_root_source(environment) == (source if source != "xdg" else "default")
+    assert not (tmp_path / "selected").exists()
 
 
-def test_non_linux_unconfigured_state_root_keeps_user_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("uid", [0, 991, 1000])
+def test_non_linux_unconfigured_root_keeps_user_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, uid: int
+) -> None:
     config_home = tmp_path / "cfg"
     user_home = tmp_path / "home"
     monkeypatch.setattr(state.sys, "platform", "darwin")
+    monkeypatch.setattr(state.os, "geteuid", lambda: uid)
     monkeypatch.setattr(state.Path, "home", classmethod(lambda cls: user_home))
+    monkeypatch.setattr(state.pwd, "getpwuid", lambda uid: pytest.fail("non-Linux identity looked up"))
 
     roots = state.resolve_roots({"XDG_CONFIG_HOME": str(config_home)})
 
     assert roots.state == user_home / ".local" / "state" / "palimpsest"
+    assert not state.uses_system_defaults()
+    assert not user_home.exists()
     assert not config_home.exists()
 
 
-def test_linux_explicit_xdg_state_home_precedes_system_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(state.sys, "platform", "linux")
-    monkeypatch.setattr(state.Path, "home", classmethod(lambda cls: tmp_path / "home"))
-    xdg_state = tmp_path / "state"
+@pytest.mark.parametrize(
+    "config_text",
+    [
+        "[storage\n",
+        "[storage]\nstate_root = 'relative'\n",
+        "[storage]\nstate_root = 42\n",
+        "[storage]\nstate_root = ''\n",
+    ],
+)
+def test_linux_user_existing_state_does_not_hide_invalid_config(
+    linux_user_defaults: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, config_text: str
+) -> None:
+    roots = state.init_roots()
+    sentinel = roots.state / "keep"
+    sentinel.write_bytes(b"existing user state")
+    config = roots.config / "config.toml"
+    config.write_text(config_text, encoding="utf-8")
+    alternate = tmp_path / "xdg-alternate"
+    monkeypatch.setenv("XDG_STATE_HOME", str(alternate))
 
-    roots = state.resolve_roots({"XDG_CONFIG_HOME": str(tmp_path / "cfg"), "XDG_STATE_HOME": str(xdg_state)})
+    with pytest.raises(StateError, match=r"invalid storage\.state_root in"):
+        state.resolve_roots()
+    with pytest.raises(StateError, match=r"invalid storage\.state_root in"):
+        state.init_roots()
 
-    assert roots.state == xdg_state / "palimpsest"
-    assert not xdg_state.exists()
+    assert sentinel.read_bytes() == b"existing user state"
+    assert config.read_text(encoding="utf-8") == config_text
+    assert not alternate.exists()
+
+
+def test_linux_user_existing_state_does_not_hide_invalid_environment(
+    linux_user_defaults: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    roots = state.init_roots()
+    sentinel = roots.state / "keep"
+    sentinel.write_bytes(b"existing user state")
+    configured = tmp_path / "configured"
+    state.write_state_root(roots, configured)
+    monkeypatch.setenv("PALIMPSEST_STATE_HOME", "relative/path")
+
+    with pytest.raises(StateError, match="PALIMPSEST_STATE_HOME must be an absolute path"):
+        state.init_roots()
+
+    assert sentinel.read_bytes() == b"existing user state"
+    assert not configured.exists()
 
 
 def test_invalid_relative_palimpsest_state_home(tmp_path: Path) -> None:

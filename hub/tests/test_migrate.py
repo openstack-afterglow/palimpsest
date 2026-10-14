@@ -8,7 +8,13 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from palimpsest_hub.migrate import MigrationError, migrate
-from palimpsest_hub.models import Base, PalimpsestImageExport, PalimpsestImageExportDelegation
+from palimpsest_hub.models import (
+    Base,
+    PalimpsestHubBuild,
+    PalimpsestImageExport,
+    PalimpsestImageExportDelegation,
+    PalimpsestWorkerLease,
+)
 
 _TABLES = (
     "palimpsest_hub_layers",
@@ -182,6 +188,84 @@ async def test_migrate_preserves_actual_export_and_delegation_metadata(tmp_path,
                 assert migrated_trusts[0]["role_names"] == ["member"]
             else:
                 assert migrated_trusts == []
+    finally:
+        await source.dispose()
+        await destination.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dry_run", [False, True])
+async def test_migration_does_not_transfer_transient_worker_or_api_mutex_ownership(tmp_path, dry_run):
+    source_url = f"sqlite+aiosqlite:///{tmp_path / 'roles-source.sqlite'}"
+    destination_url = f"sqlite+aiosqlite:///{tmp_path / 'roles-destination.sqlite'}"
+    source = create_async_engine(source_url)
+    destination = create_async_engine(destination_url)
+    roles = PalimpsestWorkerLease.__table__
+    try:
+        for engine in (source, destination):
+            async with engine.begin() as connection:
+                await connection.run_sync(Base.metadata.create_all)
+        async with source.begin() as connection:
+            await connection.execute(
+                roles.insert(),
+                [
+                    {"name": name, "token": "old-process-token", "expires_at": datetime.now(UTC)}
+                    for name in ("export-maintenance", "export-delegation-cleanup", "build-api:single-flight")
+                ],
+            )
+        copied = await migrate(source_url, destination_url, dry_run=dry_run)
+        assert roles.name not in copied
+        async with destination.connect() as connection:
+            assert await connection.scalar(text("SELECT count(*) FROM palimpsest_worker_leases")) == 0
+        async with source.connect() as connection:
+            assert await connection.scalar(text("SELECT count(*) FROM palimpsest_worker_leases")) == 3
+    finally:
+        await source.dispose()
+        await destination.dispose()
+
+
+@pytest.mark.asyncio
+async def test_migration_preserves_build_receipt_and_deadline_but_retires_sql_execution_node(tmp_path):
+    source_url = f"sqlite+aiosqlite:///{tmp_path / 'build-source.sqlite'}"
+    destination_url = f"sqlite+aiosqlite:///{tmp_path / 'build-destination.sqlite'}"
+    source = create_async_engine(source_url)
+    destination = create_async_engine(destination_url)
+    builds = PalimpsestHubBuild.__table__
+    now = datetime(2026, 10, 14, tzinfo=UTC)
+    try:
+        for engine in (source, destination):
+            async with engine.begin() as connection:
+                await connection.run_sync(Base.metadata.create_all)
+        async with source.begin() as connection:
+            await connection.execute(text("ALTER TABLE palimpsest_hub_builds ADD COLUMN execution_node VARCHAR(128)"))
+            await connection.execute(
+                builds.insert().values(
+                    id="00000000-0000-4000-8000-000000000001",
+                    project_id="original-project",
+                    created_by="original-user",
+                    name="private-build",
+                    recipe="RUN never-replay",
+                    recipe_digest="sha256:" + "1" * 64,
+                    base_digest="sha256:" + "2" * 64,
+                    layer_digests=[],
+                    status="error",
+                    error_code="worker_interrupted",
+                    lease_owner="00000000-0000-4000-8000-000000000002",
+                    lease_expires_at=now,
+                    started_at=now - timedelta(seconds=60),
+                    completed_at=now,
+                    created_at=now,
+                )
+            )
+            await connection.execute(text("UPDATE palimpsest_hub_builds SET execution_node='retired-kvm-node'"))
+        assert (await migrate(source_url, destination_url))[builds.name] == 1
+        async with source.connect() as original, destination.connect() as migrated:
+            before = (await original.execute(select(builds))).mappings().one()
+            after = (await migrated.execute(select(builds))).mappings().one()
+            assert after == before
+            assert after["status"] == "error" and after["lease_owner"] == "00000000-0000-4000-8000-000000000002"
+            assert "execution_node" not in after
+            assert await original.scalar(text("SELECT execution_node FROM palimpsest_hub_builds")) == "retired-kvm-node"
     finally:
         await source.dispose()
         await destination.dispose()

@@ -33,8 +33,8 @@ PORTABLE_FILES = {
     "core-cli": _units("""
         afterglow_tracking architecture_guard cli_contract cli_project cli_reference cli_registry completion
         development_package_workflow native_kvm_openstack openstack_system_runner package_native_afterglow publish_development_package
-        host_journal inventory linux_install log_stream metrics packaging refs runtime_dispatch runtime_facade
-        registry_intake sandbox_policy state test_lanes ui
+        host_journal host_inventory inventory linux_install log_stream metrics packaging refs runtime_dispatch runtime_facade
+        registry_intake run_source sandbox_policy state test_lanes ui console web_job_client web_operations
     """)
     + (
         "tests/test_kolla_assets.py",
@@ -49,7 +49,9 @@ PORTABLE_FILES = {
         oci_docker_hub_services_live_contract oci_ml_cpu_live_contract oci_network oci_network_live_contract
         oci_exec_cli_live_contract oci_stdio_cli_live_contract
     """),
-    "build-registry": _units("build buildkit hub_builder hub_contract registry packages package_credentials"),
+    "build-registry": _units(
+        "build buildkit hub_builder hub_contract registry packages package_credentials remote_artifacts"
+    ),
     "oci-store": _units("""
         oci_changeset oci_convert_security oci_converter_first_pass oci_image oci_root_volume_inventory
         oci_layout oci_metrics oci_provenance oci_source oci_store oci_store_handoff
@@ -110,6 +112,7 @@ SPECIAL_FILES = {
             "auth",
             "builds",
             "build_worker",
+            "build_ownership",
             "database_pool",
             "hub_api",
             "image_exports",
@@ -288,7 +291,7 @@ DEPENDENCIES = (
         ("native-live", "gate2"),
     ),
     (
-        "build buildkit hub hub_builder registry refs packages package_source package_credentials package_reference",
+        "build buildkit hub hub_builder registry refs packages package_source package_credentials package_reference remote_artifacts",
         ("build-registry", "core-cli", "host-runtime", "oci-store"),
         ("gate1", "hub"),
     ),

@@ -1,4 +1,4 @@
-"""The fixed v1 argparse surface for the ``palimpsest`` command."""
+"""Argument parsing, help, and command routing for ``palimpsest``."""
 
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ import termios
 import threading
 import tomllib
 import tty
+import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -78,6 +79,7 @@ from .registry import (
     RegistryConfig,
     RegistryProfile,
     ResolvedImageReference,
+    _docker_subcommand_index,
     add_profile,
     docker_command_argv,
     docker_history_argv,
@@ -107,6 +109,7 @@ from .registry import (
 )
 from .registry_intake import DEFAULT_TIMEOUT_SECONDS as REGISTRY_PULL_TIMEOUT
 from .registry_intake import pull_anonymous_oci_archive
+from .run_source import generate_run_name, resolve_run_source, validate_run_name
 from .runtime_types import (
     CloudImageInspectDetail,
     ExpectedRunIdentity,
@@ -137,6 +140,33 @@ from .state import (
 )
 
 _DOCKER_IMAGE_ID_RE = re.compile(r"(?:sha256:[0-9a-f]{64}|[0-9a-f]{12,64})")
+
+
+def _display_width(value: str) -> int:
+    """Count terminal cells, including wide letters and zero-width marks."""
+    return sum(
+        0
+        if unicodedata.category(char) in {"Mn", "Me", "Cf"}
+        else 2
+        if unicodedata.east_asian_width(char) in {"W", "F"}
+        else 1
+        for char in value
+    )
+
+
+def _print_table(headings: Sequence[str], rows: Sequence[Sequence[str]]) -> None:
+    """Align every displayed cell without truncation, separated by two spaces."""
+    widths = [_display_width(heading) for heading in headings]
+    for row in rows:
+        for column, cell in enumerate(row):
+            widths[column] = max(widths[column], _display_width(cell))
+    for row in (headings, *rows):
+        print(
+            "  ".join(
+                cell + " " * (widths[column] - _display_width(cell)) if column < len(widths) - 1 else cell
+                for column, cell in enumerate(row)
+            )
+        )
 
 
 def _inspect_json_payload(inspected: InspectRecord) -> dict[str, object]:
@@ -427,7 +457,7 @@ def build_mksquashfs_command(source: Path, output: Path) -> list[str]:
 
 
 def _add_limit(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--limit", type=int, default=50)
+    parser.add_argument("--limit", type=int, default=50, help="maximum Hub results (1-200; default: 50)")
 
 
 def _write_process_bytes(target: object, data: bytes) -> None:
@@ -570,77 +600,120 @@ def _run_process_session(session: ProcessSession, *, interactive: bool) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="palimpsest")
-    parser.add_argument("--url")
-    parser.add_argument("--version", action="version", version=__version__)
+    parser = argparse.ArgumentParser(
+        prog="palimpsest",
+        description="Build and store artifacts, run local VMs, and work with Hub or Docker registries.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  palimpsest image ls --arch aarch64    # boot images available from Hub\n"
+            "  palimpsest store ls                  # locally stored boot images and layers\n"
+            "  palimpsest images                    # images in the local Docker daemon\n"
+            "  digest=$(palimpsest image import ./ubuntu.qcow2 --disk-format qcow2 --arch aarch64)\n"
+            '  palimpsest run "$digest" --name dev\n'
+            "  palimpsest build . -t app --offline --output ./app.oci.tar\n"
+            "  palimpsest run ./app.oci.tar --name app  # Linux amd64 KVM only\n"
+            "  palimpsest docker --help             # help from the installed Docker CLI\n"
+            "  palimpsest completion bash\n\n"
+            "run accepts imported cloud-image digests or bundles, local OCI archives/layouts,\n"
+            "and Docker/registry image references. OCI-root requires Linux amd64 KVM.\n"
+            "Use COMMAND --help for options. See docs/cli/usage.md and docs/cli/workflows.md."
+        ),
+    )
+    parser.add_argument("--url", help="Hub API URL (overrides PALIMPSEST_URL and config.toml)")
+    parser.add_argument("--version", action="version", version=__version__, help="show the client version and exit")
     commands = parser.add_subparsers(dest="operation", required=True)
 
-    image = commands.add_parser("image")
+    image = commands.add_parser(
+        "image",
+        help="Hub boot images and local Docker image operations",
+        description=(
+            "ls/pull/push manage Hub cloud boot images; import/verify use local cloud-image files. "
+            "inspect/history/rm/save/load operate on Docker images. "
+            "Use store ls for locally stored boot images/layers, or images for local Docker inventory."
+        ),
+    )
     image_commands = image.add_subparsers(dest="image_operation", required=True)
-    image_ls = image_commands.add_parser("ls")
-    image_ls.add_argument("--ubuntu-base")
-    image_ls.add_argument("--arch")
-    image_ls.add_argument("--os-variant")
-    image_ls.add_argument("--disk-format", choices=("qcow2", "raw"))
+    image_ls = image_commands.add_parser(
+        "ls",
+        help="list boot images available from Hub (not local inventory)",
+        description="Query Hub boot-image inventory. Use store ls for local artifacts or images for local Docker images.",
+    )
+    image_ls.add_argument("--ubuntu-base", help="filter by Ubuntu base release")
+    image_ls.add_argument("--arch", help="filter by guest architecture, such as x86_64 or aarch64")
+    image_ls.add_argument("--os-variant", help="filter by operating-system variant")
+    image_ls.add_argument("--disk-format", choices=("qcow2", "raw"), help="filter by boot disk format")
     _add_limit(image_ls)
-    image_pull = image_commands.add_parser("pull")
-    image_pull.add_argument("digest")
-    image_pull.add_argument("--output", type=Path)
-    image_verify = image_commands.add_parser("verify")
-    image_verify.add_argument("path", type=Path)
-    image_verify.add_argument("--digest", required=True)
-    image_import = image_commands.add_parser("import")
-    image_import.add_argument("path", type=Path)
-    image_import.add_argument("--disk-format", choices=("qcow2", "raw"), required=True)
-    image_import.add_argument("--arch", choices=("x86_64", "aarch64"), required=True)
-    image_import.add_argument("--os-variant")
-    image_push = image_commands.add_parser("push")
-    image_push.add_argument("path", type=Path)
-    image_push.add_argument("--name", required=True)
-    image_push.add_argument("--disk-format", choices=("qcow2", "raw"), default="qcow2")
-    image_push.add_argument("--arch", choices=("x86_64", "aarch64"), default="x86_64")
-    image_push.add_argument("--os-variant")
-    image_push.add_argument("--ubuntu-base")
-    image_push.add_argument("--publish", action="store_true")
-    image_inspect = image_commands.add_parser("inspect")
-    image_inspect.add_argument("references", nargs="+")
-    image_inspect.add_argument("-f", "--format")
-    image_inspect.add_argument("--platform")
-    image_inspect.add_argument("--registry")
-    image_history = image_commands.add_parser("history")
-    image_history.add_argument("reference")
-    image_history.add_argument("--format")
-    image_history.add_argument("--no-trunc", action="store_true")
-    image_history.add_argument("--platform")
-    image_history.add_argument("-q", "--quiet", action="store_true")
-    image_rm = image_commands.add_parser("rm")
-    image_rm.add_argument("references", nargs="+")
-    image_rm.add_argument("-f", "--force", action="store_true")
-    image_rm.add_argument("--no-prune", action="store_true")
-    image_rm.add_argument("--platform", action="append", default=[])
-    image_save = image_commands.add_parser("save")
-    image_save.add_argument("references", nargs="+")
-    image_save.add_argument("-o", "--output", type=Path)
-    image_save.add_argument("--platform", action="append", default=[])
-    image_load = image_commands.add_parser("load")
-    image_load.add_argument("-i", "--input", dest="input_path", type=Path)
-    image_load.add_argument("--platform", action="append", default=[])
-    image_load.add_argument("-q", "--quiet", action="store_true")
+    image_pull = image_commands.add_parser("pull", help="download a Hub boot image into the local store")
+    image_pull.add_argument("digest", help="Hub boot-image SHA-256 digest")
+    image_pull.add_argument("--output", type=Path, help="also copy the downloaded image to this path")
+    image_verify = image_commands.add_parser("verify", help="verify a local file against a SHA-256 digest")
+    image_verify.add_argument("path", type=Path, help="local boot-image file to verify")
+    image_verify.add_argument("--digest", required=True, help="expected SHA-256 digest")
+    image_import = image_commands.add_parser("import", help="import a local cloud boot image into the store")
+    image_import.add_argument("path", type=Path, help="local qcow2 or raw cloud boot-image file")
+    image_import.add_argument("--disk-format", choices=("qcow2", "raw"), required=True, help="input disk format")
+    image_import.add_argument("--arch", choices=("x86_64", "aarch64"), required=True, help="guest architecture")
+    image_import.add_argument("--os-variant", help="operating-system variant, such as ubuntu-24.04")
+    image_push = image_commands.add_parser("push", help="upload a cloud boot-image file to Hub")
+    image_push.add_argument("path", type=Path, help="local cloud boot-image file to upload")
+    image_push.add_argument("--name", required=True, help="Hub display name for the image")
+    image_push.add_argument(
+        "--disk-format", choices=("qcow2", "raw"), default="qcow2", help="input disk format (default: qcow2)"
+    )
+    image_push.add_argument(
+        "--arch", choices=("x86_64", "aarch64"), default="x86_64", help="guest architecture (default: x86_64)"
+    )
+    image_push.add_argument("--os-variant", help="operating-system variant, such as ubuntu-24.04")
+    image_push.add_argument("--ubuntu-base", help="Ubuntu base release metadata")
+    image_push.add_argument("--publish", action="store_true", help="mark the uploaded boot image as published in Hub")
+    image_inspect = image_commands.add_parser("inspect", help="inspect local Docker image metadata")
+    image_inspect.add_argument("references", nargs="+", help="Docker image references or local image IDs")
+    image_inspect.add_argument("-f", "--format", help="Docker output template or format")
+    image_inspect.add_argument("--platform", help="Docker image platform to inspect")
+    image_inspect.add_argument("--registry", help="registry profile for resolving image references")
+    image_history = image_commands.add_parser("history", help="show local Docker image layer history")
+    image_history.add_argument("reference", help="local Docker image reference or ID")
+    image_history.add_argument("--format", help="Docker output template or format")
+    image_history.add_argument("--no-trunc", action="store_true", help="show full layer identifiers and commands")
+    image_history.add_argument("--platform", help="Docker image platform")
+    image_history.add_argument("-q", "--quiet", action="store_true", help="print layer IDs only")
+    image_rm = image_commands.add_parser("rm", help="remove images from the local Docker daemon")
+    image_rm.add_argument("references", nargs="+", help="local Docker image references or IDs to remove")
+    image_rm.add_argument("-f", "--force", action="store_true", help="ask Docker to force removal")
+    image_rm.add_argument("--no-prune", action="store_true", help="keep untagged parent images")
+    image_rm.add_argument(
+        "--platform", action="append", default=[], help="Docker image platform to remove (repeatable)"
+    )
+    image_save = image_commands.add_parser("save", help="save local Docker images as a Docker archive")
+    image_save.add_argument("references", nargs="+", help="local Docker image references or IDs to export")
+    image_save.add_argument("-o", "--output", type=Path, help="Docker archive destination (default: standard output)")
+    image_save.add_argument(
+        "--platform", action="append", default=[], help="Docker image platform to save (repeatable)"
+    )
+    image_load = image_commands.add_parser("load", help="load a Docker archive into the local Docker daemon")
+    image_load.add_argument(
+        "-i", "--input", dest="input_path", type=Path, help="Docker archive source (default: standard input)"
+    )
+    image_load.add_argument(
+        "--platform", action="append", default=[], help="Docker image platform to load (repeatable)"
+    )
+    image_load.add_argument("-q", "--quiet", action="store_true", help="suppress Docker progress")
 
-    layer = commands.add_parser("layer")
+    layer = commands.add_parser("layer", help="list, pack, pull, and publish SquashFS layers")
     layer_commands = layer.add_subparsers(dest="layer_operation", required=True)
-    layer_ls = layer_commands.add_parser("ls")
+    layer_ls = layer_commands.add_parser("ls", help="list SquashFS layers available from Hub")
     layer_ls.add_argument("--name")
     layer_ls.add_argument("--kind")
     layer_ls.add_argument("--parent")
     _add_limit(layer_ls)
-    layer_pull = layer_commands.add_parser("pull")
+    layer_pull = layer_commands.add_parser("pull", help="download a Hub layer into the local store")
     layer_pull.add_argument("digest")
     layer_pull.add_argument("--output", type=Path)
-    layer_pack = layer_commands.add_parser("pack")
+    layer_pack = layer_commands.add_parser("pack", help="pack a local directory as a tagged SquashFS layer")
     layer_pack.add_argument("directory", type=Path)
     layer_pack.add_argument("--tag", required=True)
-    layer_push = layer_commands.add_parser("push")
+    layer_push = layer_commands.add_parser("push", help="upload a local layer tag or file to Hub")
     layer_push.add_argument("value")
     layer_push.add_argument("--name")
     layer_push.add_argument("--parent")
@@ -648,176 +721,277 @@ def build_parser() -> argparse.ArgumentParser:
     layer_push.add_argument("--ubuntu-base")
     layer_push.add_argument("--publish", action="store_true")
 
-    bundle = commands.add_parser("bundle")
+    bundle = commands.add_parser("bundle", help="download and verify cloud-image/layer bundles")
     bundle_commands = bundle.add_subparsers(dest="bundle_operation", required=True)
-    bundle_pull = bundle_commands.add_parser("pull")
+    bundle_pull = bundle_commands.add_parser("pull", help="download a Hub layer chain as a local bundle")
     bundle_pull.add_argument("leaf_digest")
     bundle_pull.add_argument("--output", required=True, type=Path)
     bundle_pull.add_argument("--include-base", action="store_true")
-    bundle_verify = bundle_commands.add_parser("verify")
+    bundle_verify = bundle_commands.add_parser("verify", help="verify every descriptor and blob in a local bundle")
     bundle_verify.add_argument("directory", type=Path)
 
-    oci = commands.add_parser("oci")
+    oci = commands.add_parser("oci", help="acquire/materialize local OCI images and inspect OCI-root runtimes")
     oci_commands = oci.add_subparsers(dest="oci_operation", required=True)
-    oci_init_runtime = oci_commands.add_parser("init-runtime")
+    oci_init_runtime = oci_commands.add_parser("init-runtime", help="create an explicit private OCI runtime parent")
     oci_init_runtime.add_argument("path", type=Path)
-    oci_pull = oci_commands.add_parser("pull")
+    oci_pull = oci_commands.add_parser("pull", help="download an anonymous Linux amd64 OCI archive without Docker")
     oci_pull.add_argument("reference")
     oci_pull.add_argument("--output", required=True, type=Path)
     oci_pull.add_argument("--platform", choices=("linux/amd64",), default="linux/amd64")
     oci_pull.add_argument("--timeout", type=float, default=REGISTRY_PULL_TIMEOUT)
-    oci_materialize = oci_commands.add_parser("materialize")
+    oci_materialize = oci_commands.add_parser(
+        "materialize", help="convert a local Linux amd64 OCI image into verified SquashFS layers"
+    )
     oci_materialize.add_argument("source", type=Path)
     oci_materialize.add_argument("--manifest", help="pin a root descriptor; required when the local index is ambiguous")
     oci_materialize.add_argument("--platform", choices=("linux/amd64",), default="linux/amd64")
     oci_materialize.add_argument("--packer", type=Path, default=Path("/usr/bin/mksquashfs"))
     oci_materialize.add_argument("--timeout", type=float, default=300.0)
     oci_materialize.add_argument("--output", type=Path)
-    oci_root_proof = oci_commands.add_parser("root-proof")
+    oci_root_proof = oci_commands.add_parser("root-proof", help="inspect an OCI-root run's recorded root proof")
     oci_root_proof.add_argument("name")
-    oci_exec_status = oci_commands.add_parser("exec-status")
+    oci_exec_status = oci_commands.add_parser("exec-status", help="inspect an OCI-root run's execution status")
     oci_exec_status.add_argument("name")
-    oci_network = oci_commands.add_parser("network")
+    oci_network = oci_commands.add_parser("network", help="inspect an OCI-root run's recorded network configuration")
     oci_network.add_argument("name")
-    oci_exec_record = oci_commands.add_parser("exec-record")
+    oci_exec_record = oci_commands.add_parser("exec-record", help="validate and print a local durable exec record")
     oci_exec_record.add_argument("path")
-    oci_commands.add_parser("resource-status")
-    oci_commands.add_parser("root-volumes")
-    oci_root_volume = oci_commands.add_parser("root-volume")
+    oci_commands.add_parser("resource-status", help="inspect local OCI-root resource availability")
+    oci_commands.add_parser("root-volumes", help="list retained local OCI writable-root volumes")
+    oci_root_volume = oci_commands.add_parser("root-volume", help="inspect one local OCI writable-root volume")
     oci_root_volume.add_argument("volume_id")
 
-    build = commands.add_parser("build")
-    build.add_argument("context", nargs="?", type=Path)
-    build.add_argument("--frontend", choices=("auto", "palimpsestfile", "dockerfile"), default="auto")
-    build.add_argument("--base")
-    build.add_argument("--tag", "-t", action="append", required=True)
-    build.add_argument("-f", "--file", dest="recipe", type=Path)
-    build.add_argument("--layer", action="append")
-    build.add_argument("--network", choices=("none", "default"), default="none")
-    build.add_argument("--offline", action="store_true")
-    build.add_argument("--platform")
-    build.add_argument("--target")
-    build.add_argument("--build-arg", action="append", default=[])
-    build.add_argument("--local-image", action="append", default=[])
-    build.add_argument("--cache-scope")
-    build.add_argument("--registry")
+    build = commands.add_parser(
+        "build",
+        help="build a Dockerfile OCI archive or a Palimpsestfile layer",
+        description=(
+            "Dockerfile builds export OCI archives using a managed Buildx builder. The default native cache mode "
+            "requires Hub cache authority (--cache-registry and --cache-package); --cache-mode local uses only "
+            "the host's managed cache with an OCI output profile. --offline also forbids remote inputs. "
+            "Run the exported archive with run on Linux amd64 KVM, or use --runtime-tag/--runtime-base "
+            "to pack a SquashFS layer for a conventional cloud-image VM. Palimpsestfile builds require --base."
+        ),
+    )
+    build.add_argument(
+        "context", nargs="?", type=Path, help="Dockerfile context directory (default: current directory)"
+    )
+    build.add_argument(
+        "--frontend",
+        choices=("auto", "palimpsestfile", "dockerfile"),
+        default="auto",
+        help="recipe frontend (default: infer from inputs)",
+    )
+    build.add_argument("--base", help="cloud-image SHA-256 digest for a Palimpsestfile build")
+    build.add_argument("--tag", "-t", action="append", required=True, help="output tag; repeat for Dockerfile builds")
+    build.add_argument(
+        "-f", "--file", dest="recipe", type=Path, help="recipe path (default: Palimpsestfile or Dockerfile)"
+    )
+    build.add_argument("--layer", action="append", help="parent layer digest for a Palimpsestfile build")
+    build.add_argument(
+        "--network",
+        choices=("none", "default"),
+        default="none",
+        help="build network (default: none; offline requires none)",
+    )
+    build.add_argument(
+        "--offline", action="store_true", help="build without registry/Hub access using a prepared offline builder"
+    )
+    build.add_argument("--platform", help="Dockerfile target platform, such as linux/amd64 or linux/arm64")
+    build.add_argument("--target", help="Dockerfile target stage")
+    build.add_argument(
+        "--build-arg", action="append", default=[], help="Dockerfile build argument KEY=VALUE (repeatable)"
+    )
+    build.add_argument(
+        "--local-image", action="append", default=[], help="named local OCI context NAME=PATH (repeatable)"
+    )
+    build.add_argument("--cache-scope", help="local BuildKit cache partition")
+    build.add_argument(
+        "--cache-mode",
+        choices=("native", "local"),
+        default="native",
+        help="managed cache authority: native Hub (default) or local-only cache",
+    )
+    build.add_argument("--registry", help="registry profile used to resolve output tags")
     build.add_argument("--cache-registry", help="native profile authorizing mandatory online BuildKit cache transfer")
     build.add_argument("--cache-package", help="exact namespace/package cache partition")
-    build.add_argument("--cache-from", action="append", default=[])
-    build.add_argument("--cache-to", action="append", default=[])
-    build.add_argument("--no-cache", action="store_true")
-    build.add_argument("--pull", action="store_true")
-    build.add_argument("--load", action="store_true")
-    build.add_argument("--progress", choices=("auto", "none", "plain", "quiet", "rawjson", "tty"), default="plain")
-    build.add_argument("--output", type=Path)
-    build.add_argument("--rootfs-output", type=Path)
-    build.add_argument("--runtime-tag")
-    build.add_argument("--runtime-base")
-    build.add_argument("--runtime-block-size", type=int)
+    build.add_argument(
+        "--cache-from", action="append", default=[], help="additional online Buildx cache source (repeatable)"
+    )
+    build.add_argument(
+        "--cache-to", action="append", default=[], help="additional online Buildx cache destination (repeatable)"
+    )
+    build.add_argument(
+        "--no-cache", action="store_true", help="disable build-cache reuse (offline or local cache mode)"
+    )
+    build.add_argument("--pull", action="store_true", help="refresh Dockerfile base images (online only)")
+    build.add_argument("--load", action="store_true", help="also load the OCI output into Docker (OCI profiles only)")
+    build.add_argument(
+        "--progress",
+        choices=("auto", "none", "plain", "quiet", "rawjson", "tty"),
+        default="plain",
+        help="Buildx progress format (default: plain)",
+    )
+    build.add_argument("--output", type=Path, help="destination OCI archive path")
+    build.add_argument("--rootfs-output", type=Path, help="also export a root filesystem archive")
+    build.add_argument("--runtime-tag", help="also pack a cloud-image SquashFS layer with this local tag")
+    build.add_argument(
+        "--runtime-base", help="compatible cloud-image digest for --runtime-tag (must match target architecture)"
+    )
+    build.add_argument("--runtime-block-size", type=int, help="SquashFS block size for the runtime layer")
     build.add_argument("--push", action="store_true", help="push the OCI image to its configured registry")
     build.add_argument("--runtime-push", action="store_true", help="push the SquashFS runtime block to Palimpsest Hub")
 
-    registry = commands.add_parser("registry")
+    registry = commands.add_parser(
+        "registry",
+        help="manage local OCI/native Hub registry profiles",
+        description="Manage local endpoint profiles, not remote image inventory. Profiles contain routing and TLS settings, never credentials.",
+    )
     registry_commands = registry.add_subparsers(dest="registry_operation", required=True)
-    registry_ls = registry_commands.add_parser("ls")
-    registry_ls.add_argument("--format", choices=("table", "json"), default="table")
-    registry_add = registry_commands.add_parser("add")
-    registry_add.add_argument("name")
-    registry_add.add_argument("endpoint")
-    registry_add.add_argument("--protocol", choices=("oci", "palimpsest"), default="oci")
+    registry_ls = registry_commands.add_parser("ls", help="list configured registry profiles")
+    registry_ls.add_argument(
+        "--format", choices=("table", "json"), default="table", help="output format (default: table)"
+    )
+    registry_add = registry_commands.add_parser("add", help="add or replace a local registry profile")
+    registry_add.add_argument("name", help="local profile alias")
+    registry_add.add_argument("endpoint", help="registry authority, such as registry.example.com:5000")
+    registry_add.add_argument(
+        "--protocol",
+        choices=("oci", "palimpsest"),
+        default="oci",
+        help="OCI/Docker registry or native Hub package API (default: oci)",
+    )
     registry_add.add_argument("--api-base", help="HTTPS native API base, including its gateway path")
-    registry_add.add_argument("--namespace")
-    registry_add.add_argument("--mirror", action="append", default=[])
-    registry_add.add_argument("--ca", action="append", type=Path, default=[])
-    registry_add.add_argument("--plain-http", action="store_true")
-    registry_add.add_argument("--tls-skip-verify", action="store_true")
-    registry_add.add_argument("--cache-from", action="append", default=[])
-    registry_add.add_argument("--cache-to", action="append", default=[])
-    registry_add.add_argument("--default", action="store_true")
-    registry_add.add_argument("--force", action="store_true")
-    registry_use = registry_commands.add_parser("use")
-    registry_use.add_argument("name")
-    registry_rm = registry_commands.add_parser("rm")
-    registry_rm.add_argument("name")
-    registry_inspect = registry_commands.add_parser("inspect")
-    registry_inspect.add_argument("name", nargs="?")
-    registry_buildkit = registry_commands.add_parser("buildkit-config")
-    registry_buildkit.add_argument("--output", required=True, type=Path)
-    registry_buildkit.add_argument("--force", action="store_true")
+    registry_add.add_argument("--namespace", help="default repository/package namespace")
+    registry_add.add_argument("--mirror", action="append", default=[], help="OCI mirror endpoint (repeatable)")
+    registry_add.add_argument(
+        "--ca", action="append", type=Path, default=[], help="trusted CA certificate path (repeatable)"
+    )
+    registry_add.add_argument("--plain-http", action="store_true", help="allow unencrypted HTTP for this OCI endpoint")
+    registry_add.add_argument(
+        "--tls-skip-verify", action="store_true", help="disable TLS certificate verification for this OCI endpoint"
+    )
+    registry_add.add_argument(
+        "--cache-from", action="append", default=[], help="default online Buildx cache source (repeatable)"
+    )
+    registry_add.add_argument(
+        "--cache-to", action="append", default=[], help="default online Buildx cache destination (repeatable)"
+    )
+    registry_add.add_argument("--default", action="store_true", help="also select this profile as the default")
+    registry_add.add_argument("--force", action="store_true", help="replace an existing profile with the same alias")
+    registry_use = registry_commands.add_parser("use", help="select the default registry profile")
+    registry_use.add_argument("name", help="profile alias to select")
+    registry_rm = registry_commands.add_parser("rm", help="remove a local registry profile")
+    registry_rm.add_argument("name", help="profile alias to remove")
+    registry_inspect = registry_commands.add_parser("inspect", help="show one registry profile as JSON")
+    registry_inspect.add_argument("name", nargs="?", help="profile alias (default: selected profile)")
+    registry_buildkit = registry_commands.add_parser(
+        "buildkit-config", help="generate BuildKit registry/TLS configuration"
+    )
+    registry_buildkit.add_argument("--output", required=True, type=Path, help="destination buildkitd.toml path")
+    registry_buildkit.add_argument("--force", action="store_true", help="replace an existing output file")
 
-    login = commands.add_parser("login")
-    login.add_argument("server", nargs="?")
-    login.add_argument("-u", "--username")
-    login.add_argument("--password-stdin", action="store_true")
-    login.add_argument("--registry")
+    login = commands.add_parser("login", help="authenticate to an OCI registry or native Hub namespace")
+    login.add_argument("server", nargs="?", help="registry authority (default: selected profile)")
+    login.add_argument("-u", "--username", help="registry username")
+    login.add_argument(
+        "--password-stdin", action="store_true", help="read the password/package key from standard input"
+    )
+    login.add_argument("--registry", help="configured registry profile alias")
     login.add_argument("--namespace", help="native credential namespace (defaults to profile namespace)")
-    logout = commands.add_parser("logout")
-    logout.add_argument("server", nargs="?")
-    logout.add_argument("--registry")
+    logout = commands.add_parser("logout", help="remove stored registry or native Hub credentials")
+    logout.add_argument("server", nargs="?", help="registry authority (default: selected profile)")
+    logout.add_argument("--registry", help="configured registry profile alias")
     logout.add_argument("--namespace", help="native credential namespace (defaults to profile namespace)")
 
-    pull = commands.add_parser("pull")
-    pull.add_argument("reference")
-    pull.add_argument("-a", "--all-tags", action="store_true")
-    pull.add_argument("--platform")
-    pull.add_argument("-q", "--quiet", action="store_true")
-    pull.add_argument("--registry")
+    pull = commands.add_parser("pull", help="pull an OCI image into Docker or a native package into a local archive")
+    pull.add_argument("reference", help="registry image/package reference")
+    pull.add_argument("-a", "--all-tags", action="store_true", help="pull all tags (OCI profiles only)")
+    pull.add_argument("--platform", help="OCI target platform")
+    pull.add_argument("-q", "--quiet", action="store_true", help="suppress Docker progress")
+    pull.add_argument("--registry", help="registry profile alias")
     pull.add_argument("--output", type=Path, help="native OCI-layout archive destination; never loads Docker")
 
-    push = commands.add_parser("push")
-    push.add_argument("reference")
-    push.add_argument("-a", "--all-tags", action="store_true")
-    push.add_argument("--platform")
-    push.add_argument("-q", "--quiet", action="store_true")
-    push.add_argument("--registry")
+    push = commands.add_parser("push", help="push a Docker image or a local native OCI package")
+    push.add_argument("reference", help="destination registry image/package reference")
+    push.add_argument("-a", "--all-tags", action="store_true", help="push all tags (OCI profiles only)")
+    push.add_argument("--platform", help="OCI target platform")
+    push.add_argument("-q", "--quiet", action="store_true", help="suppress Docker progress")
+    push.add_argument("--registry", help="registry profile alias")
     push.add_argument("--input", type=Path, help="native OCI layout directory or archive")
     push.add_argument("--manifest", help="native selected root SHA-256 (required for multiple roots)")
 
-    tag = commands.add_parser("tag")
+    tag = commands.add_parser("tag", help="tag a Docker image or a retained native package")
     tag.add_argument("source")
     tag.add_argument("target")
     tag.add_argument("--registry")
 
-    images = commands.add_parser("images")
-    images.add_argument("repository", nargs="?")
-    images.add_argument("-a", "--all", action="store_true")
-    images.add_argument("--digests", action="store_true")
-    images.add_argument("-f", "--filter", action="append", default=[])
-    images.add_argument("--format")
-    images.add_argument("--no-trunc", action="store_true")
-    images.add_argument("--tree", action="store_true")
-    images.add_argument("-q", "--quiet", action="store_true")
+    images = commands.add_parser(
+        "images",
+        help="list images in the local Docker daemon (not Hub or the Palimpsest store)",
+        description="List local Docker images. Use image ls for remote Hub boot images or store ls for local Palimpsest boot images/layers.",
+    )
+    images.add_argument("repository", nargs="?", help="optional Docker repository filter")
+    images.add_argument("-a", "--all", action="store_true", help="include intermediate Docker images")
+    images.add_argument("--digests", action="store_true", help="show image digests")
+    images.add_argument(
+        "-f", "--filter", action="append", default=[], help="Docker image filter KEY=VALUE (repeatable)"
+    )
+    images.add_argument("--format", help="Docker output template or format")
+    images.add_argument("--no-trunc", action="store_true", help="show full image identifiers")
+    images.add_argument("--tree", action="store_true", help="show the Docker multi-platform image tree")
+    images.add_argument("-q", "--quiet", action="store_true", help="print image IDs only")
 
-    history = commands.add_parser("history")
+    history = commands.add_parser("history", help="show local Docker image layer history")
     history.add_argument("reference")
     history.add_argument("--format")
     history.add_argument("--no-trunc", action="store_true")
     history.add_argument("--platform")
     history.add_argument("-q", "--quiet", action="store_true")
-    rmi = commands.add_parser("rmi")
+    rmi = commands.add_parser("rmi", help="remove images from the local Docker daemon")
     rmi.add_argument("references", nargs="+")
     rmi.add_argument("-f", "--force", action="store_true")
     rmi.add_argument("--no-prune", action="store_true")
     rmi.add_argument("--platform", action="append", default=[])
-    save = commands.add_parser("save")
+    save = commands.add_parser("save", help="save local Docker images as a Docker archive")
     save.add_argument("references", nargs="+")
     save.add_argument("-o", "--output", type=Path)
     save.add_argument("--platform", action="append", default=[])
-    load = commands.add_parser("load")
+    load = commands.add_parser("load", help="load a Docker archive into the local Docker daemon")
     load.add_argument("-i", "--input", dest="input_path", type=Path)
     load.add_argument("--platform", action="append", default=[])
     load.add_argument("-q", "--quiet", action="store_true")
 
-    docker = commands.add_parser("docker", add_help=False)
-    docker.add_argument("docker_args", nargs=argparse.REMAINDER)
+    docker = commands.add_parser(
+        "docker",
+        add_help=False,
+        help="forward arbitrary arguments and help to the installed Docker CLI",
+    )
+    docker.add_argument(
+        "docker_args", nargs=argparse.REMAINDER, help="unmodified Docker command/options; use docker --help"
+    )
 
-    run = commands.add_parser("run")
-    run.add_argument("image_or_bundle")
-    run.add_argument("--name", required=True)
-    run.add_argument("--layer", action="append", default=[])
-    run.add_argument("--memory", type=int, default=4096)
-    run.add_argument("--vcpus", type=int, default=2)
-    run.add_argument("--network", default=None)
+    run = commands.add_parser(
+        "run",
+        help="boot a cloud-image VM or run a local OCI image in a KVM VM",
+        description=(
+            "Boot a cloud-image digest or cloud-image/layer bundle, or run an OCI image in a KVM VM. "
+            "Local cloud images and OCI sources (BuildKit builds, Docker daemon images, and configured OCI registries) "
+            "are resolved automatically. OCI-root requires Linux amd64 KVM. "
+            "For OCI-root, append -- COMMAND ARG... to override the image command."
+        ),
+    )
+    run.add_argument(
+        "image_or_bundle",
+        help="cloud-image digest/bundle, local OCI archive/layout, or Docker/registry image reference",
+    )
+    run.add_argument("--name", default=None, help="unique local VM/run name (default: auto-generated)")
+    run.add_argument("--registry", help="explicit registry alias to search or pull from")
+    run.add_argument(
+        "--layer", action="append", default=[], help="cloud-image SquashFS layer digest (repeatable; not for OCI-root)"
+    )
+    run.add_argument("--memory", type=int, default=4096, help="guest memory in MiB (256-1048576; default: 4096)")
+    run.add_argument("--vcpus", type=int, default=2, help="guest virtual CPUs (1-256; default: 2)")
+    run.add_argument("--network", default=None, help="backend network; OCI-root: nat, host-only, or none")
     run.add_argument(
         "-p",
         "--publish",
@@ -826,8 +1000,17 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="[HOST_IP:]HOST_PORT:GUEST_PORT[/tcp|/udp]",
         help="publish one OCI-root guest port on the host (default host address 127.0.0.1)",
     )
-    run.add_argument("--backend", choices=("auto", "kvm", "lima-vz", "libvirt-hvf"), default="auto")
-    run.add_argument("--runtime-kind", choices=("cloud-image", "oci-root"))
+    run.add_argument(
+        "--backend",
+        choices=("auto", "kvm", "lima-vz", "libvirt-hvf"),
+        default="auto",
+        help="VM backend (default: select for host and image architecture)",
+    )
+    run.add_argument(
+        "--runtime-kind",
+        choices=("cloud-image", "oci-root"),
+        help="explicit input/runtime type; required for OCI layout directories",
+    )
     run.add_argument("-d", "--detach", action="store_true", help="leave an OCI-root VM running after READY")
     run.add_argument("--manifest", help="pin the root descriptor of a local OCI image")
     run.add_argument("--user", help="run a local OCI image as USER[:GROUP]")
@@ -839,48 +1022,59 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--root-volume", help="reuse an explicitly retained OCI writable-root UUID")
 
-    compose = commands.add_parser("compose")
+    compose = commands.add_parser("compose", help="manage VM services declared in palimpsest.yml (not Docker Compose)")
     compose.add_argument("-f", "--file", dest="project_file", type=Path)
     compose.add_argument("-p", "--project-name")
     compose.add_argument("--project-directory", type=Path)
     compose.add_argument("--env-file", action="append", type=Path, default=[])
     compose_commands = compose.add_subparsers(dest="compose_operation", required=True)
-    compose_config = compose_commands.add_parser("config")
+    compose_config = compose_commands.add_parser("config", help="validate and render the VM project configuration")
     compose_config.add_argument("--quiet", action="store_true")
     compose_config.add_argument("--format", choices=("json",), default="json")
     compose_config.add_argument("--services", action="store_true")
-    compose_up = compose_commands.add_parser("up")
+    compose_up = compose_commands.add_parser("up", help="create or reconcile the project's VM services")
     compose_up.add_argument("services", nargs="*")
     compose_up.add_argument("-d", "--detach", action="store_true")
     compose_up.add_argument("--no-recreate", action="store_true")
     compose_up.add_argument("--force-recreate", action="store_true")
-    compose_down = compose_commands.add_parser("down")
+    compose_down = compose_commands.add_parser("down", help="remove the project's managed VM services")
     compose_down.add_argument("--volumes", "-v", action="store_true")
-    compose_ps = compose_commands.add_parser("ps")
+    compose_ps = compose_commands.add_parser("ps", help="list the project's managed VM services")
     compose_ps.add_argument("services", nargs="*")
     compose_ps.add_argument("--format", choices=("table", "json"), default="table")
-    compose_logs = compose_commands.add_parser("logs")
+    compose_logs = compose_commands.add_parser("logs", help="show the project's VM console logs")
     compose_logs.add_argument("services", nargs="*")
     compose_logs.add_argument("--follow", "-f", action="store_true")
-    compose_exec = compose_commands.add_parser("exec")
+    compose_exec = compose_commands.add_parser("exec", help="execute a command in a VM service")
     compose_exec.add_argument("service")
     compose_exec.add_argument("command", nargs=argparse.REMAINDER)
-    compose_stop = compose_commands.add_parser("stop")
+    compose_stop = compose_commands.add_parser("stop", help="stop the project's managed VM services")
     compose_stop.add_argument("services", nargs="*")
-    compose_port = compose_commands.add_parser("port")
+    compose_port = compose_commands.add_parser("port", help="show a VM service's published host endpoint")
     compose_port.add_argument("service")
     compose_port.add_argument("private_port", type=int)
     compose_port.add_argument("--protocol", choices=("tcp", "udp"), default="tcp")
 
-    commands.add_parser("ps")
-    inspect = commands.add_parser("inspect")
+    commands.add_parser(
+        "ps",
+        help="list live local VMs (managed and externally observed)",
+        description="Observe local backend VMs, including stopped and externally created VMs. "
+        "SCOPE distinguishes managed runs from read-only observations; inspect and controls remain managed-only.",
+    )
+    for command_name, description in (
+        ("volumes", "list local host disks and selected-state volume records"),
+        ("networks", "list local backend networks and VM attachments"),
+    ):
+        resource_list = commands.add_parser(command_name, help=description)
+        resource_list.add_argument("--format", choices=("table", "json"), default="table", help="output format")
+    inspect = commands.add_parser("inspect", help="inspect one managed VM/run")
     inspect.add_argument("name")
-    logs = commands.add_parser("logs")
+    logs = commands.add_parser("logs", help="show a managed VM/run console log")
     logs.add_argument("name")
     logs.add_argument("--follow", action="store_true")
-    shell = commands.add_parser("shell")
+    shell = commands.add_parser("shell", help="open an interactive shell in a managed VM/run")
     shell.add_argument("name")
-    execute = commands.add_parser("exec")
+    execute = commands.add_parser("exec", help="execute a command in a managed VM/run")
     execute.add_argument("--completion-record")
     execute.add_argument(
         "--timeout",
@@ -891,38 +1085,77 @@ def build_parser() -> argparse.ArgumentParser:
     )
     execute.add_argument("name")
     execute.add_argument("command", nargs=argparse.REMAINDER)
-    start = commands.add_parser("start")
+    start = commands.add_parser("start", help="start a stopped managed VM/run")
     start.add_argument("name")
-    stop = commands.add_parser("stop")
+    stop = commands.add_parser("stop", help="stop a managed VM/run")
     stop.add_argument("name")
-    remove = commands.add_parser("rm")
+    remove = commands.add_parser("rm", help="remove a managed VM/run")
     remove.add_argument("name")
     remove.add_argument("--volumes", action="store_true")
-    commit = commands.add_parser("commit")
+    commit = commands.add_parser("commit", help="capture a supported cloud-image VM's changes as a layer")
     commit.add_argument("name")
     commit.add_argument("--tag", required=True)
-    ui = commands.add_parser("ui")
-    ui.add_argument("--port", type=int, default=0)
-    ui.add_argument("--no-browser", action="store_true")
-    ui.add_argument("--allow-control", action="store_true")
+    web = commands.add_parser(
+        "web",
+        help="serve the local web dashboard until interrupted (no Hub required)",
+        description="Run the local dashboard in the foreground on 127.0.0.1. Stop with Ctrl-C. "
+        "No Hub connection is needed; ordinary CLI commands do not start this server.",
+    )
+    web.add_argument("--port", type=int, default=0, help="listen port; 0 selects an available loopback port")
+    web.add_argument("--no-browser", action="store_true", help="print the URL without opening a browser")
+    web.add_argument(
+        "--allow-control", action="store_true", help="enable local edits and VM control (default: read-only)"
+    )
 
-    store = commands.add_parser("store")
+    store = commands.add_parser(
+        "store",
+        help="inspect or manage the local Palimpsest artifact store",
+        description="Manage local boot images, layers, and their storage root. This is not Hub image inventory or Docker's image store.",
+    )
     store_commands = store.add_subparsers(dest="store_operation", required=True)
-    store_show = store_commands.add_parser("show")
-    store_show.add_argument("--format", choices=("table", "json"), default="table")
-    store_ls = store_commands.add_parser("ls")
-    store_ls.add_argument("--kind", choices=("image", "layer", "all"), default="all")
-    store_ls.add_argument("--format", choices=("table", "json"), default="table")
-    store_rm = store_commands.add_parser("rm")
-    store_rm.add_argument("digest")
-    store_rm.add_argument("--force", action="store_true")
-    store_move = store_commands.add_parser("move")
-    store_move.add_argument("--to", dest="destination", type=Path, required=True)
-    store_move.add_argument("--keep-source", action="store_true")
-    store_set = store_commands.add_parser("set")
-    store_set.add_argument("--to", dest="destination", type=Path, required=True)
-    comp_cmd = commands.add_parser("completion")
-    comp_cmd.add_argument("shell", choices=completion.SUPPORTED_SHELLS)
+    store_show = store_commands.add_parser("show", help="show local storage paths and usage")
+    store_show.add_argument(
+        "--format", choices=("table", "json"), default="table", help="output format (default: table)"
+    )
+    store_ls = store_commands.add_parser(
+        "ls",
+        help="list locally stored boot images and layers (not Hub or Docker)",
+        description="List boot images and layers already in the local Palimpsest store. Use image ls for Hub or images for Docker.",
+    )
+    store_ls.add_argument(
+        "--kind", choices=("image", "layer", "all"), default="all", help="artifact kind to list (default: all)"
+    )
+    store_ls.add_argument("--format", choices=("table", "json"), default="table", help="output format (default: table)")
+    store_rm = store_commands.add_parser("rm", help="remove a local artifact and its tags")
+    store_rm.add_argument("digest", help="local artifact SHA-256 digest")
+    store_rm.add_argument(
+        "--force", action="store_true", help="never bypasses protection for artifacts referenced by runs or projects"
+    )
+    store_move = store_commands.add_parser("move", help="migrate local state to another root")
+    store_move.add_argument("--to", dest="destination", type=Path, required=True, help="destination state root")
+    store_move.add_argument("--keep-source", action="store_true", help="retain the source after migration")
+    store_set = store_commands.add_parser("set", help="select an existing local state root")
+    store_set.add_argument("--to", dest="destination", type=Path, required=True, help="existing state root to select")
+    comp_cmd = commands.add_parser(
+        "completion",
+        help="print or explicitly install shell completion",
+        description="Print a shell completion script by default; --install explicitly adds Bash/Zsh startup registration or a Fish completion file.",
+    )
+    comp_cmd.add_argument("shell", choices=completion.SUPPORTED_SHELLS, help="shell completion target")
+    comp_cmd.add_argument(
+        "--install", action="store_true", help="install the script and print its path instead of script contents"
+    )
+    # Keep command help and shell descriptions on the same argparse schema.
+    pending = [parser]
+    while pending:
+        current = pending.pop()
+        for action in current._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                for choice in action._choices_actions:
+                    child = action.choices[choice.dest]
+                    if child.description is None:
+                        child.description = choice.help
+                pending.extend(action.choices.values())
     return parser
 
 
@@ -930,11 +1163,13 @@ def _validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
     if hasattr(args, "limit") and not 1 <= args.limit <= 200:
         parser.error("--limit must be between 1 and 200")
     if args.operation == "run":
+        if args.name is not None:
+            validate_run_name(args.name)
         if not 256 <= args.memory <= 1_048_576:
             parser.error("--memory must be between 256 and 1048576")
         if not 1 <= args.vcpus <= 256:
             parser.error("--vcpus must be between 1 and 256")
-    if args.operation == "ui":
+    if args.operation == "web":
         if args.port != 0 and not 1024 <= args.port <= 65535:
             parser.error("--port must be 0 or between 1024 and 65535")
     if args.operation == "oci" and args.oci_operation == "materialize" and not 0 < args.timeout < float("inf"):
@@ -954,8 +1189,6 @@ def _validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
                 parser.error("compose exec requires a command after SERVICE")
         if args.compose_operation == "up" and args.no_recreate and args.force_recreate:
             parser.error("--no-recreate and --force-recreate are mutually exclusive")
-    if args.operation == "docker" and not args.docker_args:
-        parser.error("docker requires a Docker CLI command")
     if args.operation == "build":
         frontend = _selected_build_frontend(args)
         if frontend == "palimpsestfile":
@@ -974,6 +1207,7 @@ def _validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
                     ("--build-arg", bool(args.build_arg)),
                     ("--local-image", bool(args.local_image)),
                     ("--cache-scope", args.cache_scope is not None),
+                    ("--cache-mode", args.cache_mode != "native"),
                     ("--registry", args.registry is not None),
                     ("--cache-registry", args.cache_registry is not None),
                     ("--cache-package", args.cache_package is not None),
@@ -1014,8 +1248,12 @@ def _validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
                 parser.error("--offline cannot select an external registry")
             if args.offline and (args.cache_registry is not None or args.cache_package is not None):
                 parser.error("--offline cannot select an online cache authority")
-            if args.no_cache and not args.offline:
-                parser.error("--no-cache is allowed only in offline mode; online builds must reuse Hub cache")
+            if args.cache_mode == "local" and (
+                args.cache_registry is not None or args.cache_package is not None or args.cache_from or args.cache_to
+            ):
+                parser.error("--cache-mode local cannot select native or external cache authorities")
+            if args.no_cache and not args.offline and args.cache_mode == "native":
+                parser.error("--no-cache requires --offline or --cache-mode local")
             if bool(args.runtime_tag) != bool(args.runtime_base):
                 parser.error("--runtime-tag and --runtime-base must be supplied together")
             if args.runtime_push and not args.runtime_tag:
@@ -1636,9 +1874,10 @@ def _dispatch_compose(
                 )
             )
         else:
-            print(f"{'SERVICE':<20} {'NAME':<40} {'STATUS':<12}")
-            for row in rows:
-                print(f"{row.service:<20} {row.run_name:<40} {row.status:<12}")
+            _print_table(
+                ("SERVICE", "NAME", "STATUS"),
+                [(row.service, row.run_name, row.status) for row in rows],
+            )
         return 0
     if operation == "logs":
         selected = args.services or None
@@ -1711,8 +1950,25 @@ def _dispatch_compose(
 def dispatch_args(args: argparse.Namespace) -> int:
     op = args.operation
     if op == "completion":
-        print(completion.generate_completion_script(args.shell))
+        try:
+            if args.install:
+                print(completion.install_completion(args.shell))
+            else:
+                print(completion.generate_completion_script(args.shell))
+        except (ValueError, OSError) as exc:
+            raise PalimpsestError(f"cannot prepare {args.shell} completion: {exc}") from exc
         return 0
+    if op == "docker":
+        argv = docker_command_argv(resolve_docker_config_dir(), *(args.docker_args or ["--help"]))
+        try:
+            return run_docker_passthrough(argv).returncode
+        except (PalimpsestError, FileNotFoundError) as exc:
+            if isinstance(exc, FileNotFoundError) or isinstance(exc.__cause__, FileNotFoundError):
+                raise PalimpsestError(
+                    "Docker CLI executable not found; install Docker and ensure 'docker' is on PATH, "
+                    "then retry palimpsest docker --help"
+                ) from exc
+            raise
     if op == "oci" and args.oci_operation == "init-runtime":
         from .oci_host import create_runtime_parent
 
@@ -1747,7 +2003,19 @@ def dispatch_args(args: argparse.Namespace) -> int:
         )
         print(json.dumps(payload, indent=2, sort_keys=True))
         return 0
-    read_only_root_operations = {"run", "start", "stop", "rm", "inspect", "logs", "ps", "exec", "shell"}
+    read_only_root_operations = {
+        "run",
+        "start",
+        "stop",
+        "rm",
+        "inspect",
+        "logs",
+        "ps",
+        "volumes",
+        "networks",
+        "exec",
+        "shell",
+    }
     read_only_oci_operations = {"root-proof", "exec-status", "network"}
     deferred_package_state = op in {"login", "logout", "push", "pull", "tag"} or (
         op == "build" and _selected_build_frontend(args) == "dockerfile"
@@ -1759,17 +2027,6 @@ def dispatch_args(args: argparse.Namespace) -> int:
         or (op == "oci" and args.oci_operation in read_only_oci_operations)
         else init_roots()
     )
-
-    if op == "run" and args.user is not None:
-        source = Path(args.image_or_bundle).expanduser()
-        explicit_kind = getattr(args, "runtime_kind", None)
-        local_oci = explicit_kind == "oci-root" or (
-            explicit_kind is None
-            and source.is_file()
-            and (source.name.endswith(".oci.tar") or source.name.endswith(".oci"))
-        )
-        if not local_oci:
-            raise PalimpsestError("--user is supported only for local OCI-root runs")
 
     if op == "oci":
         if args.oci_operation == "pull":
@@ -1909,9 +2166,6 @@ def dispatch_args(args: argparse.Namespace) -> int:
             config = load_registry_config(roots)
             _write_generated_config(args.output, render_buildkitd_toml(config), force=args.force)
             print(str(args.output.expanduser().resolve(strict=False)))
-    elif op == "docker":
-        argv = docker_command_argv(resolve_docker_config_dir(), *args.docker_args)
-        return run_docker_passthrough(argv).returncode
     elif op in {"login", "logout", "pull", "push", "tag", "images", "history", "rmi", "save", "load"}:
         docker_config = resolve_docker_config_dir()
         config = load_registry_config(roots) if op in {"login", "logout", "pull", "push", "tag"} else None
@@ -2358,6 +2612,8 @@ def dispatch_args(args: argparse.Namespace) -> int:
                 )
                 tag_profiles = {_reference_profile(registry_config, tag) for tag in resolved_tags}
                 native_build = any(_is_native(profile) for profile in tag_profiles)
+                if native_build and args.cache_mode == "local":
+                    raise PalimpsestError("local cache mode requires an OCI output profile; select --registry docker")
                 if native_build and len(tag_profiles) != 1:
                     raise PalimpsestError("one build cannot mix registry profiles or protocols")
                 selected_registry = (
@@ -2366,8 +2622,9 @@ def dispatch_args(args: argparse.Namespace) -> int:
                     else select_registry_profile(registry_config, explicit_alias=args.registry)
                 )
                 selected_registry_digest = registry_config_digest(registry_config)
-                external_cache_from = _merge_unique(external_cache_from, selected_registry.cache_from)
-                external_cache_to = _merge_unique(external_cache_to, selected_registry.cache_to)
+                if args.cache_mode == "native":
+                    external_cache_from = _merge_unique(external_cache_from, selected_registry.cache_from)
+                    external_cache_to = _merge_unique(external_cache_to, selected_registry.cache_to)
                 if native_build or args.push or args.registry:
                     build_tags = tuple(tag.canonical for tag in resolved_tags)
                 if native_build:
@@ -2381,34 +2638,37 @@ def dispatch_args(args: argparse.Namespace) -> int:
                     package_client = NativePackageClient(selected_registry, namespace=native_namespace)
                     if args.push:
                         package_client.authorize(native_package, ("packages:inventory", "packages:write"))
-                elif args.cache_registry is None or args.cache_package is None:
+                elif args.cache_mode == "native" and (args.cache_registry is None or args.cache_package is None):
                     raise PalimpsestError(
                         "online OCI build requires --cache-registry and --cache-package namespace/package"
                     )
-                cache_profile = (
-                    inspect_profile(registry_config, args.cache_registry) if args.cache_registry else selected_registry
-                )
-                if cache_profile.protocol != "palimpsest":
-                    raise PalimpsestError("mandatory Hub cache requires a native registry profile")
-                partition = args.cache_package or f"{native_namespace}/{native_package}"
-                cache_ref = resolve_image_reference(
-                    f"{cache_profile.endpoint}/{partition}",
-                    registry_config,
-                    registry_alias=cache_profile.alias,
-                    default_tag=False,
-                )
-                if cache_ref.tag is not None or cache_ref.digest is not None:
-                    raise PalimpsestError("--cache-package must be an exact namespace/package, not a tag or digest")
-                cache_namespace, cache_package = _native_target(cache_ref)
-                if (
-                    package_client is not None
-                    and cache_profile == selected_registry
-                    and cache_namespace == native_namespace
-                ):
-                    cache_client = package_client
-                else:
-                    cache_client = NativePackageClient(cache_profile, namespace=cache_namespace)
-                cache_client.authorize(cache_package, ("cache:read", "cache:write"))
+                if args.cache_mode == "native":
+                    cache_profile = (
+                        inspect_profile(registry_config, args.cache_registry)
+                        if args.cache_registry
+                        else selected_registry
+                    )
+                    if cache_profile.protocol != "palimpsest":
+                        raise PalimpsestError("mandatory Hub cache requires a native registry profile")
+                    partition = args.cache_package or f"{native_namespace}/{native_package}"
+                    cache_ref = resolve_image_reference(
+                        f"{cache_profile.endpoint}/{partition}",
+                        registry_config,
+                        registry_alias=cache_profile.alias,
+                        default_tag=False,
+                    )
+                    if cache_ref.tag is not None or cache_ref.digest is not None:
+                        raise PalimpsestError("--cache-package must be an exact namespace/package, not a tag or digest")
+                    cache_namespace, cache_package = _native_target(cache_ref)
+                    if (
+                        package_client is not None
+                        and cache_profile == selected_registry
+                        and cache_namespace == native_namespace
+                    ):
+                        cache_client = package_client
+                    else:
+                        cache_client = NativePackageClient(cache_profile, namespace=cache_namespace)
+                    cache_client.authorize(cache_package, ("cache:read", "cache:write"))
             primary_tag = build_tags[0]
             safe_tag = "".join(char if char.isalnum() or char in ".-" else "-" for char in primary_tag).strip("-.")
             safe_tag = safe_tag[:48] or "image"
@@ -2472,6 +2732,7 @@ def dispatch_args(args: argparse.Namespace) -> int:
                         no_cache=args.no_cache,
                         push_cache=not args.offline,
                         cache_scope=cache_scope,
+                        cache_mode=args.cache_mode,
                         external_cache_from=external_cache_from,
                         external_cache_to=external_cache_to,
                         registry_profile=selected_registry.alias if selected_registry is not None else None,
@@ -2534,14 +2795,25 @@ def dispatch_args(args: argparse.Namespace) -> int:
         return _dispatch_compose(args, roots, store)
 
     elif op == "run":
-        source = Path(args.image_or_bundle).expanduser()
-        explicit_kind = getattr(args, "runtime_kind", None)
-        local_oci = explicit_kind == "oci-root" or (
-            explicit_kind is None
-            and source.is_file()
-            and (source.name.endswith(".oci.tar") or source.name.endswith(".oci"))
-        )
-        if local_oci:
+        from .web_job_client import cancellable_run_preparation
+
+        if args.name is None:
+            args.name = generate_run_name(args.image_or_bundle, roots=roots)
+        else:
+            validate_run_name(args.name)
+
+        with cancellable_run_preparation():
+            resolved_source = resolve_run_source(
+                roots,
+                args.image_or_bundle,
+                runtime_kind=getattr(args, "runtime_kind", None),
+                registry_alias=getattr(args, "registry", None),
+                backend=args.backend,
+                network=args.network,
+            )
+
+        if resolved_source.is_oci:
+            source = Path(resolved_source.target).resolve()
             if args.layer:
                 raise PalimpsestError("OCI-root run does not accept cloud --layer attachments")
             if args.backend not in {"auto", "kvm"}:
@@ -2550,10 +2822,11 @@ def dispatch_args(args: argparse.Namespace) -> int:
                 raise PalimpsestError(
                     "OCI-root run networking accepts --network nat, --network host-only, or --network none"
                 )
+            manifest_to_use = getattr(args, "manifest", None) or resolved_source.manifest_digest
             request = resolve_local_oci_run_request(
                 source,
                 name=args.name,
-                manifest_digest=require_digest(args.manifest) if args.manifest is not None else None,
+                manifest_digest=require_digest(manifest_to_use) if manifest_to_use is not None else None,
                 user_override=OCIUserSpec.from_override_value(args.user) if args.user is not None else None,
                 command_override=getattr(args, "command_override", None),
                 detached=args.detach,
@@ -2573,9 +2846,9 @@ def dispatch_args(args: argparse.Namespace) -> int:
             if result.session is None:
                 raise PalimpsestError("OCI-root foreground launch is missing its process session")
             return _run_process_session(result.session, interactive=False)
+
         if (
-            getattr(args, "detach", False)
-            or getattr(args, "manifest", None) is not None
+            getattr(args, "manifest", None) is not None
             or getattr(args, "root_retention", None) is not None
             or getattr(args, "root_volume", None) is not None
             or getattr(args, "user", None) is not None
@@ -2583,19 +2856,20 @@ def dispatch_args(args: argparse.Namespace) -> int:
             or getattr(args, "publish", None)
         ):
             raise PalimpsestError(
-                "--detach, --manifest, --root-retention, --root-volume, --user, --publish and command overrides "
+                "--manifest, --root-retention, --root-volume, --user, --publish and command overrides "
                 "are supported only for local OCI-root runs"
             )
         network = args.network if args.network is not None else "default"
-        stack = _resolve_runtime_stack(
-            store,
-            args.image_or_bundle,
-            args.layer,
-            args.url,
-            requested_backend=args.backend,
-            preflight_for_run=True,
-            run_network=network,
-        )
+        with cancellable_run_preparation():
+            stack = _resolve_runtime_stack(
+                store,
+                os.fspath(resolved_source.target),
+                args.layer,
+                args.url,
+                requested_backend=args.backend,
+                preflight_for_run=True,
+                run_network=network,
+            )
         run_spec = RunSpec(
             name=args.name,
             stack=stack,
@@ -2616,35 +2890,87 @@ def dispatch_args(args: argparse.Namespace) -> int:
         print(result.launch_hint)
 
     elif op == "ps":
-        aggregation = runtime_dispatch.ps(roots=roots)
-        for error in aggregation.errors:
-            identity = error.name or error.entry_token or "unknown-entry"
-            print(f"warning: {identity}: {error.message}", file=sys.stderr)
-        print(f"{'NAME':<20} {'STATUS':<12} {'BASE':<12} {'LAYERS':<8} {'IP':<16} {'CREATED':<24} PORTS")
-        for summary in aggregation.summaries:
-            if summary.status == "removed":
+        payload = inventory.list_vms(roots)
+        for warning in payload.get("warnings", []):
+            print(f"warning: {warning}", file=sys.stderr)
+        rows = []
+        for details in payload["vms"]:
+            if details.get("status") == "removed":
                 continue
-            details = summary.details
             base_digest = details.get("base_digest") or "-"
             base_hex = str(base_digest).split(":", 1)[-1][:12]
             layers = details.get("layers")
-            layers_count = len(layers) if isinstance(layers, tuple) else 0
+            layers_count = len(layers) if isinstance(layers, (list, tuple)) else 0
             ssh = details.get("ssh")
             ssh_host = ssh.get("host") if isinstance(ssh, Mapping) else None
             guest_ip = details.get("guest_ip") or ssh_host or "-"
             created_at = details.get("created_at") or "-"
             raw_ports = details.get("ports")
             published_ports = "-"
-            if isinstance(raw_ports, tuple) and raw_ports:
-                published_ports = ",".join(
-                    f"{port['host_ip']}:{port['host_port']}->{port['guest_port']}/{port['protocol']}"
-                    for port in raw_ports
-                    if isinstance(port, Mapping)
+            if isinstance(raw_ports, (list, tuple)) and raw_ports:
+                published_ports = (
+                    ",".join(
+                        f"{port.get('host_ip') or '-'}:{port.get('host_port', '-')}"
+                        f"->{port.get('guest_port', '-')}/{port.get('protocol') or '-'}"
+                        for port in raw_ports
+                        if isinstance(port, Mapping)
+                    )
+                    or "-"
                 )
-            print(
-                f"{summary.name:<20} {summary.status:<12} {base_hex:<12} "
-                f"{layers_count:<8} {guest_ip:<16} {created_at:<24} {published_ports}"
+            scope = "observed" if details.get("managed") is False else "managed"
+            rows.append(
+                (
+                    str(details.get("name") or "-"),
+                    str(details.get("status") or "-"),
+                    str(details.get("backend") or "-"),
+                    scope,
+                    base_hex,
+                    str(layers_count),
+                    str(guest_ip),
+                    str(created_at),
+                    published_ports,
+                )
             )
+        _print_table(
+            ("NAME", "STATUS", "BACKEND", "SCOPE", "BASE", "LAYERS", "IP", "CREATED", "PORTS"),
+            rows,
+        )
+
+    elif op in {"volumes", "networks"}:
+        payload = inventory.list_volumes(roots) if op == "volumes" else inventory.list_networks(roots)
+        for warning in payload["warnings"]:
+            print(f"warning: {warning}", file=sys.stderr)
+        if args.format == "json":
+            print(json.dumps(payload, indent=2))
+        else:
+            if op == "volumes":
+                headings = (
+                    "NAME",
+                    "BACKEND",
+                    "STATUS",
+                    "CAPACITY_BYTES",
+                    "FILE_BYTES",
+                    "ALLOCATED_BYTES",
+                    "ATTACHMENTS",
+                )
+                values = ("size_bytes", "file_size_bytes", "allocated_bytes")
+            else:
+                headings = ("NAME", "BACKEND", "STATUS", "MODE", "SUBNET", "GATEWAY", "ATTACHMENTS")
+                values = ("mode", "subnet", "gateway")
+            rows = []
+            for item in payload[op]:
+                attached = ",".join(attachment["name"] for attachment in item["attachments"]) or "-"
+                measurements = [str(item.get(field)) if item.get(field) is not None else "-" for field in values]
+                rows.append(
+                    (
+                        item["name"],
+                        item.get("backend") or "-",
+                        item["status"],
+                        *measurements,
+                        attached,
+                    )
+                )
+            _print_table(headings, rows)
 
     elif op == "inspect":
         info = runtime_dispatch.inspect_run(args.name, roots=roots)
@@ -2702,7 +3028,7 @@ def dispatch_args(args: argparse.Namespace) -> int:
     elif op == "commit":
         result = runtime_dispatch.commit(args.name, args.tag, roots=roots)
         print(result.digest)
-    elif op == "ui":
+    elif op == "web":
         ui.serve(roots, port=args.port, open_browser=not args.no_browser, read_only=not args.allow_control)
         return 0
     elif op == "store":
@@ -2756,32 +3082,72 @@ def dispatch_args(args: argparse.Namespace) -> int:
     return 0
 
 
+def _docker_help_requested(arguments: Sequence[str]) -> bool:
+    """Recognize unambiguous help without skipping journals for arbitrary commands."""
+    if not arguments:
+        return True
+    command_index = _docker_subcommand_index(["docker", "--config", "", *arguments])
+    if command_index is not None and arguments[command_index - 3] == "help":
+        return True
+    # Bare options before any subcommand (e.g. docker --help, docker -h).
+    if command_index is None and all(arg in {"-h", "--help"} for arg in arguments):
+        return True
+    # Single subcommand followed only by help flags (e.g. docker run --help).
+    # Do NOT match commands with arguments after the flags or subcommands where
+    # flags like -h have another meaning (e.g. docker run -h myhost alpine).
+    if command_index is not None:
+        sub_args = list(arguments[command_index - 3 :])
+        if sub_args and sub_args[-1] == "--help" and all(not a.startswith("-") for a in sub_args[:-1]):
+            return True
+    return False
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     try:
         raw_args = list(sys.argv[1:] if argv is None else argv)
+        if not raw_args:
+            parser.print_help()
+            return 0
+        if raw_args[:1] == ["__complete"]:
+            comp_args = raw_args[1:]
+            shell = None
+            if comp_args[:1] == ["--shell"]:
+                if len(comp_args) < 3 or comp_args[1] not in completion.SUPPORTED_SHELLS or comp_args[2] != "--":
+                    parser.error("__complete requires --shell {zsh,bash,fish} -- WORDS...")
+                shell = comp_args[1]
+                comp_args = comp_args[2:]
+            if comp_args[:1] == ["--"]:
+                comp_args = comp_args[1:]
+            completion.print_completion(parser, comp_args, shell=shell)
+            return 0
+        command_index = 0
+        while command_index < len(raw_args):
+            argument = raw_args[command_index]
+            if argument == "--url":
+                command_index += 2
+            elif argument.startswith("--url="):
+                command_index += 1
+            else:
+                break
+        command_args = raw_args[command_index:]
         command_override = None
-        if raw_args[:1] == ["run"] and "--" in raw_args:
-            separator = raw_args.index("--")
+        if command_args[:1] == ["run"] and "--" in command_args:
+            separator = raw_args.index("--", command_index + 1)
             command_override = tuple(raw_args[separator + 1 :])
             if not command_override:
                 raise PalimpsestError("OCI run command override after -- must be nonempty")
             raw_args = raw_args[:separator]
-        if raw_args[:1] == ["__complete"]:
-            comp_args = raw_args[1:]
-            if comp_args[:1] == ["--"]:
-                comp_args = comp_args[1:]
-            candidates = completion.resolve_candidates(parser, comp_args)
-            for c in candidates:
-                print(c)
-            return 0
-        if raw_args[:1] == ["docker"] and len(raw_args) > 1:
-            args = argparse.Namespace(operation="docker", docker_args=raw_args[1:])
+        if command_args[:1] == ["docker"]:
+            args = parser.parse_args([*raw_args[:command_index], "docker"])
+            args.docker_args = command_args[1:]
         else:
             args = parser.parse_args(raw_args)
         if args.operation == "run":
             args.command_override = command_override
         _validate_args(args, parser)
+        if args.operation == "completion" or (args.operation == "docker" and _docker_help_requested(args.docker_args)):
+            return dispatch_args(args)
         journal = host_journal.begin(args.operation)
         try:
             result = dispatch_args(args)

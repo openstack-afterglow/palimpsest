@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import AsyncGenerator
 
 from fastapi import HTTPException
+from sqlalchemy import inspect, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 
 _engine: AsyncEngine | None = None
@@ -71,6 +72,16 @@ async def create_schema() -> None:
 
     async with _engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
+        # create_all creates new tables but intentionally does not evolve existing ones.
+        # Bootstrap runs with every API/worker stopped; never backfill a live owner.
+        columns = await connection.run_sync(
+            lambda sync: {column["name"] for column in inspect(sync).get_columns("palimpsest_hub_builds")}
+        )
+        for name, definition in (
+            ("lease_expires_at", "DATETIME(6)" if connection.dialect.name == "mysql" else "DATETIME"),
+        ):
+            if name not in columns:
+                await connection.execute(text(f"ALTER TABLE palimpsest_hub_builds ADD COLUMN {name} {definition} NULL"))
 
 
 async def close_db() -> None:

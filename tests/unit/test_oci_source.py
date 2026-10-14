@@ -157,6 +157,19 @@ def _index_layout(root: Path) -> tuple[Layout, Descriptor, Descriptor, Descripto
     return layout, index, amd_manifest, amd_config, layers[0]
 
 
+def _top_index_layout(root: Path) -> tuple[Layout, Descriptor, Descriptor, Descriptor, Descriptor]:
+    layout, index, manifest, config, layer = _index_layout(root)
+    # Preserve noncanonical bytes, with no digest-named blob for this top index.
+    payload = b"\n" + (layout.blobs / index.digest.removeprefix("sha256:")).read_bytes() + b"\n"
+    (layout.root / "index.json").write_bytes(payload)
+    top_index = Descriptor(
+        media_type=OCI_IMAGE_INDEX_MEDIA_TYPE,
+        digest=f"sha256:{hashlib.sha256(payload).hexdigest()}",
+        size=len(payload),
+    )
+    return layout, top_index, manifest, config, layer
+
+
 def _cas(tmp_path: Path) -> SourceCAS:
     return SourceCAS(tmp_path / "source-cas")
 
@@ -441,6 +454,112 @@ def test_index_snapshots_only_selected_platform_graph(tmp_path: Path) -> None:
     assert result.manifest.descriptor == manifest
     assert result.config.descriptor == config
     assert tuple(item.descriptor for item in result.layers) == (layer,)
+
+
+@pytest.mark.parametrize("explicit_reference", [False, True])
+def test_explicit_top_index_pin_preserves_exact_root_and_selected_platform(
+    tmp_path: Path, explicit_reference: bool
+) -> None:
+    layout, root, manifest, config, layer = _top_index_layout(tmp_path / "layout")
+    payload = (layout.root / "index.json").read_bytes()
+    assert not (layout.blobs / root.digest.removeprefix("sha256:")).exists()
+    cas = _cas(tmp_path)
+    reference = _ref(root.digest) if explicit_reference else None
+
+    result = layout.source(root).snapshot(reference, cas)
+
+    assert result.root.descriptor == root
+    assert result.image.index_descriptor == root
+    assert result.manifest.descriptor == result.image.manifest_descriptor == manifest
+    assert result.manifest.descriptor.digest != root.digest
+    assert result.image.platform.os == "linux"
+    assert result.image.platform.architecture == "amd64"
+    assert result.config.descriptor == config
+    assert tuple(item.descriptor for item in result.layers) == (layer,)
+    assert result.image.reference.requested_reference.endswith("@" + root.digest)
+    assert result.to_dict()["root"]["descriptor"] == root.to_dict()
+    assert cas.read_metadata(result.root) == payload
+    assert _target(tmp_path / "source-cas", root).read_bytes() == payload
+    cas.verify_image(result)
+
+    # Having a top-index digest does not turn ambiguous automatic intake into a guess.
+    with pytest.raises(ArtifactValidationError, match="exactly one descriptor"):
+        LocalLayoutSource(layout.root).snapshot(None, cas)
+
+
+def test_explicit_top_index_pin_accepts_absent_media_type_without_rewriting(tmp_path: Path) -> None:
+    layout, _root, manifest, _config, _layer = _top_index_layout(tmp_path / "layout")
+    index_path = layout.root / "index.json"
+    document = json.loads(index_path.read_bytes())
+    document.pop("mediaType")
+    payload = b"\n" + json.dumps(document, indent=2).encode() + b"\n"
+    index_path.write_bytes(payload)
+    root = Descriptor(
+        media_type=OCI_IMAGE_INDEX_MEDIA_TYPE, digest=f"sha256:{hashlib.sha256(payload).hexdigest()}", size=len(payload)
+    )
+    cas = _cas(tmp_path)
+    result = layout.source(root).snapshot(None, cas)
+    assert result.root.descriptor == result.image.index_descriptor == root
+    assert result.manifest.descriptor == manifest
+    assert result.manifest.descriptor.digest != root.digest
+    assert index_path.read_bytes() == cas.read_metadata(result.root) == payload
+    assert _target(tmp_path / "source-cas", root).read_bytes() == payload
+    cas.verify_image(result)
+
+
+@pytest.mark.parametrize("wrong_pin", ["undeclared-index", "unknown"])
+def test_explicit_top_index_wrong_pin_is_rejected_without_import(tmp_path: Path, wrong_pin: str) -> None:
+    layout, root, _manifest, _config, _layer = _top_index_layout(tmp_path / "layout")
+    compact_payload = (layout.root / "index.json").read_bytes().strip()
+    undeclared_digest = f"sha256:{hashlib.sha256(compact_payload).hexdigest()}"
+    assert (layout.blobs / undeclared_digest.removeprefix("sha256:")).exists()
+    digest = undeclared_digest if wrong_pin == "undeclared-index" else "sha256:" + "f" * 64
+    assert digest != root.digest
+    cas = _cas(tmp_path)
+
+    with pytest.raises(ArtifactValidationError, match="pinned root descriptor exactly once"):
+        LocalLayoutSource(layout.root, digest).snapshot(_ref(digest), cas)
+
+    assert list((tmp_path / "source-cas" / "blobs" / "sha256").iterdir()) == []
+
+
+@pytest.mark.parametrize("mutation", ["rewrite-before-import", "rewrite", "replace", "symlink", "hardlink"])
+def test_explicit_top_index_is_securely_reimported_from_pinned_layout(tmp_path: Path, mutation: str) -> None:
+    layout, root, _manifest, _config, _layer = _top_index_layout(tmp_path / "layout")
+    index_path = layout.root / "index.json"
+    payload = index_path.read_bytes()
+    changed = False
+
+    def checkpoint(item: SnapshotCheckpoint) -> None:
+        nonlocal changed
+        before_import = (
+            item.stage is SnapshotStage.AFTER_COMPONENT_OPEN
+            and item.component == "sha256"
+            and mutation == "rewrite-before-import"
+        )
+        during_import = item.stage is SnapshotStage.AFTER_COPY_CHUNK and item.digest == root.digest
+        if changed or not (before_import or during_import):
+            return
+        changed = True
+        if mutation in {"rewrite-before-import", "rewrite"}:
+            index_path.write_bytes(b"x" * len(payload))
+        elif mutation == "replace":
+            replacement = layout.root / "replacement.json"
+            replacement.write_bytes(payload)
+            replacement.replace(index_path)
+        elif mutation == "symlink":
+            moved = layout.root / "moved-index.json"
+            index_path.rename(moved)
+            index_path.symlink_to(moved)
+        else:
+            os.link(index_path, layout.root / "linked-index.json")
+
+    cas_root = tmp_path / "source-cas"
+    with pytest.raises(ArtifactValidationError, match="changed|verification"):
+        layout.source(root, checkpoint).snapshot(_ref(root.digest), SourceCAS(cas_root))
+
+    assert changed
+    assert list((cas_root / "blobs" / "sha256").iterdir()) == []
 
 
 @pytest.mark.parametrize("docker,layer_count", [(True, 1), (False, 128)])

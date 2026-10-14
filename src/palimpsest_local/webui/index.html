@@ -22,7 +22,7 @@
         <button id="nav-builds" data-view="builds">빌드<span data-count="builds">—</span></button>
         <button id="nav-storage" data-view="storage">스토리지<span data-count="storage">↗</span></button>
       </nav>
-      <div class="sidebar-foot"><span class="local-dot" aria-hidden="true"></span> 이 호스트의 관리 리소스만 표시<p>외부 서비스 없이 로컬 API에서 읽습니다.</p></div>
+      <div class="sidebar-foot"><span class="local-dot" aria-hidden="true"></span> 이 호스트의 실제 리소스 관찰<p>콘솔·변경은 --allow-control이 필요합니다. VM 제거는 선택한 상태의 관리 VM만 허용됩니다. 레이어·이미지에서 연결된 Hub와 OCI 레지스트리를 명시적으로 조회하고 전송합니다.</p></div>
     </aside>
     <div class="workspace">
       <header class="topbar">
@@ -31,19 +31,155 @@
       </header>
       <main id="main-content" tabindex="-1">
         <div class="page-heading"><div><p class="eyebrow">PALIMPSEST / LOCAL</p><h1 id="view-title">개요</h1><p id="view-description">이 호스트의 실제 리소스와 최근 관찰을 확인합니다.</p></div><div class="updated"><span>마지막 전체 갱신 성공</span><time id="last-success">아직 없음</time></div></div>
+        <div id="local-guidance" class="notice">호스트 관찰은 Hub 없이 동작합니다. 원격 검색·다운로드·업로드는 레이어·이미지에서 명시적으로 요청합니다. <span id="control-guidance">콘솔·변경 작업은 <code>palimpsest web --allow-control</code>의 새 CLI 링크로 허용하세요.</span></div>
         <div id="global-error" class="notice danger" role="alert" hidden></div>
         <div id="action-feedback" class="notice" role="status" hidden></div>
         <section id="panel-overview" aria-labelledby="view-title"><div id="overview-content"><p class="empty-state">로컬 리소스를 불러오는 중입니다.</p></div></section>
-        <section id="panel-vms" hidden aria-labelledby="view-title"></section>
+        <section id="panel-vms" hidden aria-labelledby="view-title">
+          <div id="vms-list"></div>
+          <details id="vm-run-controls" class="card management" hidden>
+            <summary>새 VM 실행</summary>
+            <p class="muted">로컬 이미지(클라우드 이미지 또는 OCI 아카이브)나 레지스트리 참조로 가상 머신을 실행합니다.</p>
+            <div id="host-oci-warning" class="notice warn" hidden></div>
+            <div id="run-form-feedback" class="notice" role="status" hidden></div>
+            <form id="form-run-vm" class="form-grid-run">
+              <div class="form-row">
+                <label>이미지 참조 / 다이제스트 / 경로 (필수)
+                  <input id="run-image" required autocomplete="off" placeholder="예: ubuntu:24.04 또는 sha256:... 또는 ghcr.io/...">
+                </label>
+                <label>VM 이름 (선택)
+                  <input id="run-name" autocomplete="off" placeholder="비워두면 고유 이름 자동 생성">
+                </label>
+              </div>
+              <div class="form-row">
+                <label>런타임 종류
+                  <select id="run-runtime-kind">
+                    <option value="">자동 감지</option>
+                    <option value="cloud-image">클라우드 이미지 (cloud-image · Lima / KVM)</option>
+                    <option value="oci-root">OCI 루트 (oci-root · Linux amd64 KVM 전용)</option>
+                  </select>
+                </label>
+                <label>레지스트리 프로필 (선택)
+                  <input id="run-registry" autocomplete="off" placeholder="기본 프로필 또는 지정 프로필 이름">
+                </label>
+              </div>
+              <div class="form-row three-col">
+                <label>메모리 (MiB)
+                  <input type="number" id="run-memory" min="256" max="1048576" step="256" placeholder="기본값: 4096">
+                </label>
+                <label>vCPU 수
+                  <input type="number" id="run-vcpus" min="1" max="256" placeholder="기본값: 2">
+                </label>
+                <label>네트워크 모드
+                  <select id="run-network">
+                    <option value="">기본값</option>
+                    <option value="default">default (클라우드 이미지)</option>
+                    <option value="nat">nat (OCI 루트)</option>
+                    <option value="host-only">host-only (OCI 루트)</option>
+                    <option value="none">none (OCI 루트)</option>
+                  </select>
+                </label>
+              </div>
+              <div class="form-row">
+                <label>OCI 포트 포워딩 (쉼표 구분)
+                  <input id="run-publish" autocomplete="off" placeholder="예: 8080:80, 2222:22">
+                </label>
+                <label>OCI Manifest 다이제스트 (선택)
+                  <input id="run-manifest" autocomplete="off" placeholder="sha256:...">
+                </label>
+              </div>
+              <label>클라우드 VM의 레이어 다이제스트 (선택 · 루트부터 줄마다 하나)<textarea id="run-layers" rows="2" spellcheck="false" placeholder="sha256:..."></textarea></label>
+              <label>OCI 초기 게스트 명령 (선택 · 게스트 sh -lc로 실행)
+                <input id="run-command" autocomplete="off" placeholder="예: /bin/sh -c 'uptime' 또는 nginx -g 'daemon off;'">
+              </label>
+              <button class="primary" type="submit">새 VM 실행 요청 (HTTP 202)</button>
+            </form>
+          </details>
+          <div id="vm-operations-card" class="card" hidden>
+            <h2>최근 VM 실행 비동기 작업</h2>
+            <div id="vm-operations-list"></div>
+          </div>
+        </section>
         <section id="panel-volumes" hidden aria-labelledby="view-title"></section>
         <section id="panel-artifacts" hidden aria-labelledby="view-title">
           <div id="artifacts-list"></div>
           <details id="import-controls" class="card management" hidden><summary>클라우드 이미지 가져오기</summary><p class="muted">호스트의 기존 파일을 로컬 저장소에 가져옵니다.</p>
             <form id="form-import" class="form-grid"><label>파일 경로<input id="import-path" required autocomplete="off"></label><label>디스크 형식<select id="import-format"><option value="qcow2">qcow2</option><option value="raw">raw</option></select></label><label>아키텍처<select id="import-arch"><option value="x86_64">x86_64</option><option value="aarch64">aarch64</option></select></label><label>OS 변형 (선택)<input id="import-variant" autocomplete="off"></label><button class="primary" type="submit">이미지 가져오기</button></form>
           </details>
+          <section id="remote-artifacts" class="card" aria-labelledby="remote-artifacts-title">
+            <div class="panel-heading"><div><p class="eyebrow">CONNECTED REGISTRIES</p><h2 id="remote-artifacts-title">원격 이미지 · 레이어</h2></div><button id="btn-remote-connections" type="button">연결 다시 읽기</button></div>
+            <p class="muted">등록된 Hub·레지스트리와 해당 연결의 인증만 사용합니다. Docker/OCI 이미지와 부팅용 클라우드 VM 이미지는 서로 다른 런타임입니다.</p>
+            <div id="remote-connection-feedback" class="notice" role="status"></div>
+            <form id="form-remote-search" class="remote-search-form">
+              <label>연결<select id="remote-connection"><option value="">연결 불러오는 중</option></select></label>
+              <label>분류<select id="remote-kind"><option value="all">전체</option><option value="cloud-image">클라우드 이미지</option><option value="squashfs">SquashFS 레이어</option><option value="oci-image">OCI 이미지</option><option value="runtime-bundle">런타임 번들</option></select></label>
+              <label>검색어 / 정확한 참조<input id="remote-query" type="search" autocomplete="off" placeholder="redis 또는 library/redis:7 또는 sha256:..."></label>
+              <label>저장소 (태그 조회 · 선택)<input id="remote-repository" autocomplete="off" placeholder="library/redis 또는 namespace/package"></label>
+              <button id="btn-remote-search" type="submit">조회 · 검색</button>
+            </form>
+            <p id="remote-results-state" class="muted" role="status">연결을 선택하고 조회하세요. 원격 목록은 자동 갱신하지 않습니다.</p><div id="remote-results"></div>
+            <button id="btn-remote-next" type="submit" form="form-remote-search" hidden>다음 결과</button>
+            <details id="remote-upload-controls" class="management" hidden><summary>로컬 빌드 · 아티팩트를 Palimpsest Hub에 업로드</summary>
+              <p class="muted">로컬 출력의 다이제스트와 그래프를 다시 검증합니다. OCI 빌드는 프로젝트 키 기반 native Hub, 클라우드 이미지·SquashFS는 원래 Keystone 토큰 기반 Hub를 사용합니다.</p>
+              <form id="form-remote-upload" class="form-grid">
+                <label>Hub 연결<select id="upload-connection" required></select></label><label>로컬 출력<select id="upload-source" required></select></label>
+                <label>Hub 대상 이름 / 패키지:태그<input id="upload-target" required autocomplete="off" spellcheck="false" placeholder="demo-layer 또는 namespace/app:v1"></label><button id="btn-remote-upload" class="primary" type="submit">Hub 업로드 요청 (HTTP 202)</button>
+              </form><p id="remote-upload-feedback" class="muted" role="status"></p>
+            </details>
+          </section>
+          <div id="transfer-operations-card" class="card" hidden><h2>최근 다운로드 · 업로드</h2><div id="transfer-operations-list"></div></div>
         </section>
         <section id="panel-networks" hidden aria-labelledby="view-title"></section>
-        <section id="panel-builds" hidden aria-labelledby="view-title"></section>
+        <section id="panel-builds" hidden aria-labelledby="view-title">
+          <div id="builds-list"></div>
+          <details id="build-controls" class="card management" hidden>
+            <summary>새 이미지 빌드</summary>
+            <p class="muted">호스트 컨텍스트 디렉터리에서 BuildKit으로 이미지를 빌드합니다. 로컬 캐시를 사용하며 Hub 로그인이 필요 없습니다.</p>
+            <div id="build-form-feedback" class="notice" role="status" hidden></div>
+            <form id="form-build" class="form-grid-build">
+              <div class="form-row">
+                <label>호스트 컨텍스트 경로 (필수)
+                  <input id="build-context" required autocomplete="off" placeholder="/path/to/project">
+                </label>
+                <label>출력 이미지 태그 (필수)
+                  <input id="build-tag" required autocomplete="off" placeholder="my-image:latest">
+                </label>
+              </div>
+              <div class="form-row three-col">
+                <label>Dockerfile 경로 (선택, 호스트 절대 경로)
+                  <input id="build-dockerfile" autocomplete="off" placeholder="/path/to/project/Dockerfile">
+                </label>
+                <label>플랫폼 대상
+                  <select id="build-platform">
+                    <option value="">기본값 (linux/amd64)</option>
+                    <option value="linux/amd64">linux/amd64</option>
+                    <option value="linux/arm64">linux/arm64</option>
+                  </select>
+                </label>
+                <label>빌드 대상 스테이지 (target)
+                  <input id="build-target" autocomplete="off" placeholder="선택 사항">
+                </label>
+              </div>
+              <label>빌드 인자 (Build Args, 쉼표 또는 줄바꿈 구분 KEY=VALUE)
+                <input id="build-args" autocomplete="off" placeholder="KEY=value, HTTP_PROXY=...">
+              </label>
+              <label>인라인 Dockerfile 레시피 (선택 · 지정 시 임시 작업 공간에만 작성되며 원본 파일을 덮어쓰지 않습니다)
+                <textarea id="build-dockerfile-text" rows="5" class="mono-input" placeholder="# Dockerfile 내용을 직접 입력하려면 여기에 작성하세요&#10;FROM alpine:latest&#10;RUN apk add --no-cache curl&#10;CMD [&quot;sh&quot;]"></textarea>
+              </label>
+              <div class="form-row check-row">
+                <label class="check-label">
+                  <input type="checkbox" id="build-offline">
+                  오프라인 빌드 (엄격 모드 · 네트워크 캐시/원격 다운로드 차단)
+                </label>
+              </div>
+              <button class="primary" type="submit">이미지 빌드 시작 (HTTP 202)</button>
+            </form>
+          </details>
+          <div id="build-operations-card" class="card" hidden>
+            <h2>최근 이미지 빌드 비동기 작업</h2>
+            <div id="build-operations-list"></div>
+          </div>
+        </section>
         <section id="panel-storage" hidden aria-labelledby="view-title">
           <div id="storage-content"><p class="empty-state">스토리지 보고서를 불러오는 중입니다.</p></div>
           <div class="notice">Lima VM 디스크는 Lima의 상태 디렉터리 (~/.lima)에 있습니다. Palimpsest 스토리지 이동에 포함되지 않습니다.</div>
@@ -52,14 +188,71 @@
             <div class="card"><h2>기존 상태 루트 지정</h2><p class="muted">파일 이동 없이 사용할 상태 디렉터리를 변경합니다.</p><form id="form-set-storage"><label>기존 스토리지 경로<input id="set-dest" required autocomplete="off"></label><button type="submit">상태 루트 지정</button></form></div>
           </div>
         </section>
-        <footer class="page-footer">로컬 관찰 · VM은 런타임 관찰, 볼륨은 메타데이터, 네트워크는 구성 기준입니다. <span>자동 갱신 5초</span></footer>
+        <footer class="page-footer">로컬 관찰 · VM은 백엔드 상태, 디스크는 용량·파일 관찰, 네트워크는 백엔드 구성·연결 기준입니다. <span>자동 갱신 5초</span></footer>
       </main>
     </div>
   </div>
   <dialog id="detail-drawer" aria-labelledby="drawer-title" aria-describedby="drawer-description">
     <header class="drawer-header"><div><p id="drawer-kind" class="eyebrow">리소스 상세</p><h2 id="drawer-title">상세</h2></div><button id="btn-close-drawer" aria-label="상세 닫기">닫기 <kbd>Esc</kbd></button></header>
-    <div class="drawer-body"><p id="drawer-description" class="muted"></p><div id="detail-state" class="notice" role="status" hidden></div><div id="detail-content"></div><div id="detail-actions" class="management" hidden></div>
-      <section id="log-section" hidden aria-labelledby="log-title"><div class="log-toolbar"><h3 id="log-title">콘솔 로그</h3><label for="log-tail-select">최근 줄 수</label><select id="log-tail-select"><option value="100">100</option><option value="400" selected>400</option><option value="1000">1000</option></select><button id="btn-refresh-log">로그 갱신</button></div><p id="log-state" class="muted" role="status"></p><pre id="log-content" tabindex="0" aria-label="콘솔 로그 내용"></pre></section>
+    <div class="drawer-body"><p id="drawer-description" class="muted"></p><div id="detail-state" class="notice" role="status" hidden></div>
+      <div id="vm-resource-summary" class="resource-summary" aria-label="VM 상태 및 실제 자원 요약" hidden></div>
+      <div id="detail-feedback" class="notice" role="status" hidden></div><div id="detail-actions" class="management" hidden></div>
+      <div id="vm-detail-tabs" class="detail-tabs" role="tablist" aria-label="VM 상세 보기" hidden>
+        <button id="tab-logs" role="tab" aria-controls="log-section" data-detail-tab="logs" aria-selected="true">Logs</button>
+        <button id="tab-terminal" role="tab" aria-controls="terminal-section" data-detail-tab="terminal" aria-selected="false" tabindex="-1">Terminal</button>
+        <button id="tab-resources" role="tab" aria-controls="resource-section" data-detail-tab="resources" aria-selected="false" tabindex="-1">Resources</button>
+        <button id="tab-details" role="tab" aria-controls="detail-content" data-detail-tab="details" aria-selected="false" tabindex="-1">Details</button>
+      </div>
+      <div id="detail-content"></div>
+      <section id="log-section" hidden aria-labelledby="log-title"><div class="log-toolbar"><h3 id="log-title">실제 로그</h3><label for="log-tail-select">최근 줄 수</label><select id="log-tail-select"><option value="100">100</option><option value="400" selected>400</option><option value="1000">1000</option></select><button id="btn-refresh-log">로그 갱신</button></div><p id="log-state" class="muted" role="status"></p><pre id="log-content" tabindex="0" aria-label="콘솔 로그 내용"></pre></section>
+      <section id="terminal-section" hidden role="tabpanel" aria-labelledby="tab-terminal" tabindex="0"><h3>게스트 터미널</h3><p id="terminal-state" class="muted" role="status"></p><button id="btn-detail-console" class="btn-console" type="button">콘솔 열기</button><p class="muted">기존 터미널 창에서 실제 세션을 엽니다. 창을 닫으면 세션만 종료되며 VM은 중지되지 않습니다.</p></section>
+      <section id="resource-section" hidden role="tabpanel" aria-labelledby="tab-resources" tabindex="0"><div class="resource-toolbar"><h3>Resource usage</h3><button id="btn-refresh-metrics" type="button">자원 갱신</button></div><label class="resource-device-label" for="resource-disk-select">디스크 I/O 관찰 장치<select id="resource-disk-select" disabled><option value="">표본 대기</option></select></label><p id="resource-state" class="muted" role="status"></p><div id="resource-content"></div></section>
+    </div>
+  </dialog>
+  <dialog id="remove-vm-dialog" aria-labelledby="remove-vm-title" aria-describedby="remove-vm-description">
+    <form id="form-remove-vm" class="removal-form">
+      <p class="eyebrow">선택한 상태 / VM 제거</p><h2 id="remove-vm-title">가상머신 제거</h2>
+      <p id="remove-vm-description" class="muted"></p>
+      <p id="remove-vm-warning" class="notice warn"></p>
+      <label>제거할 VM 이름을 정확히 입력하세요<input id="remove-vm-confirmation" required autocomplete="off" spellcheck="false"></label>
+      <label class="check-label"><input id="remove-vm-files" type="checkbox">이 VM의 소유 실행 디렉터리·디스크·로그도 삭제</label>
+      <p id="remove-vm-file-policy" class="muted"></p>
+      <div id="remove-vm-feedback" class="notice" role="status" hidden></div>
+      <div class="action-group"><button id="btn-remove-vm-cancel" type="button">취소</button><button id="btn-remove-vm-submit" class="danger-button" type="submit" disabled>VM 제거</button></div>
+    </form>
+  </dialog>
+  <dialog id="console-drawer" aria-labelledby="console-title" aria-describedby="console-description">
+    <header class="drawer-header">
+      <div>
+        <p id="console-kind" class="eyebrow">가상 머신 콘솔</p>
+        <h2 id="console-title">콘솔</h2>
+      </div>
+      <button id="btn-close-console" aria-label="콘솔 닫기">닫기 <kbd>Esc</kbd></button>
+    </header>
+    <div class="drawer-body">
+      <div class="console-toolbar">
+        <span id="console-status-badge" class="badge">연결 대기</span>
+        <span id="console-mode-label" class="muted"></span>
+        <div class="console-signals">
+          <button id="btn-console-sigint" type="button" title="Ctrl+C 전송">SIGINT</button>
+          <button id="btn-console-sigterm" type="button" title="SIGTERM 전송">SIGTERM</button>
+          <button id="btn-console-sighup" type="button" title="SIGHUP 전송">SIGHUP</button>
+          <button id="btn-console-disconnect" type="button" class="danger-button">연결 끊기</button>
+        </div>
+      </div>
+      <div id="console-capability-info" class="notice" hidden></div>
+      <div id="console-exec-bar" class="console-exec-bar" hidden>
+        <label>게스트 명령 (게스트 sh -lc로 실행 · 대화형 OCI 셸 아님):
+          <input id="console-exec-argv" autocomplete="off" placeholder="예: uname -a; ip a">
+        </label>
+        <button id="btn-console-exec-run" type="button" class="primary">명령 실행</button>
+      </div>
+      <div id="console-terminal-wrapper" class="console-terminal-wrapper">
+        <div id="console-terminal-container"></div>
+      </div>
+      <p id="console-description" class="muted">
+        실제 VM 게스트 콘솔 스트림입니다. 창을 닫으면 콘솔 세션이 안전하게 종료되며 VM 자체는 중지되지 않습니다.
+      </p>
     </div>
   </dialog>
   <script>
@@ -83,6 +276,19 @@
       window.palimpsestSessionToken = token;
       const headers = { Authorization: 'Bearer ' + token };
       try {
+        const [xtermCssRes, xtermJsRes] = await Promise.all([
+          fetch('/vendor/xterm.css', { headers, cache: 'no-store', credentials: 'omit', referrerPolicy: 'no-referrer' }),
+          fetch('/vendor/xterm.js', { headers, cache: 'no-store', credentials: 'omit', referrerPolicy: 'no-referrer' })
+        ]);
+        if (!xtermCssRes.ok || !xtermJsRes.ok) throw new Error('인증된 로컬 터미널 자산을 불러오지 못했습니다. 새 CLI 링크로 다시 여세요.');
+        if (xtermCssRes.ok) {
+          const css = await xtermCssRes.text();
+          const s = document.createElement('style'); s.textContent = css; document.head.appendChild(s);
+        }
+        if (xtermJsRes.ok) {
+          const js = await xtermJsRes.text();
+          const sc = document.createElement('script'); sc.textContent = js; document.head.appendChild(sc);
+        }
         const assets = await Promise.all(['/app.css', '/app.js'].map(async path => {
           const response = await fetch(path, { headers, cache: 'no-store', credentials: 'omit', referrerPolicy: 'no-referrer' });
           if (!response.ok) throw new Error(response.status === 401 || response.status === 403 ? '인증이 만료되었습니다. CLI 링크를 다시 여세요.' : '로컬 화면 파일을 불러오지 못했습니다 (HTTP ' + response.status + '). 다시 로드하세요.');

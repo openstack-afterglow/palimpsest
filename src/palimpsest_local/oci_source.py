@@ -920,19 +920,22 @@ class SourceCAS:
         source_directory_fd: int,
         descriptor: Descriptor,
         checkpoint: Checkpoint = _noop_checkpoint,
+        *,
+        _fixed_index: bool = False,
     ) -> SourceSnapshot:
-        """Copy and promote one descriptor from a pinned layout blob directory."""
+        """Securely promote a descriptor from pinned blobs, or fixed layout index.json."""
         if not isinstance(descriptor, Descriptor):
             raise ArtifactValidationError("source-CAS import requires a Descriptor")
         digest_hex = descriptor.digest.split(":", 1)[1]
+        source_name = "index.json" if _fixed_index else digest_hex
         source_fd: int | None = None
         temporary_fd: int | None = None
         temporary_name: str | None = None
         cleanup_blobs_fd: int | None = None
         try:
             try:
-                entry_before = os.stat(digest_hex, dir_fd=source_directory_fd, follow_symlinks=False)
-                source_fd = os.open(digest_hex, _READ_FLAGS, dir_fd=source_directory_fd)
+                entry_before = os.stat(source_name, dir_fd=source_directory_fd, follow_symlinks=False)
+                source_fd = os.open(source_name, _READ_FLAGS, dir_fd=source_directory_fd)
                 _notify(checkpoint, SnapshotStage.AFTER_BLOB_OPEN, digest=descriptor.digest)
                 opened_before = os.fstat(source_fd)
             except OSError:
@@ -996,7 +999,7 @@ class SourceCAS:
                 _notify(checkpoint, SnapshotStage.BEFORE_FINAL_FSTAT, digest=descriptor.digest, bytes_copied=copied)
                 try:
                     opened_after = os.fstat(source_fd)
-                    entry_after = os.stat(digest_hex, dir_fd=source_directory_fd, follow_symlinks=False)
+                    entry_after = os.stat(source_name, dir_fd=source_directory_fd, follow_symlinks=False)
                 except OSError:
                     raise ArtifactValidationError(f"OCI blob {descriptor.digest} changed during copy") from None
                 actual = f"sha256:{hasher.hexdigest()}"
@@ -1161,6 +1164,7 @@ class LocalLayoutSource:
     """A pinned root, or a unique root pinned during the same secure snapshot.
 
     Automatic selection never guesses between entries (even identical ones).
+    An explicit pin may instead name the exact top-level index.json bytes.
     Platform selection inside a single index remains the image resolver's job.
     """
 
@@ -1202,10 +1206,8 @@ class LocalLayoutSource:
             )
             if marker != {"imageLayoutVersion": "1.0.0"}:
                 raise ArtifactValidationError("unsupported OCI image layout version")
-            top_index = strict_json_object(
-                _read_stable_regular_file(layout_fd, "index.json", max_bytes=MAX_IMAGE_JSON_BYTES),
-                "OCI layout index.json",
-            )
+            top_index_bytes = _read_stable_regular_file(layout_fd, "index.json", max_bytes=MAX_IMAGE_JSON_BYTES)
+            top_index = strict_json_object(top_index_bytes, "OCI layout index.json")
             if type(top_index.get("schemaVersion")) is not int or top_index["schemaVersion"] != 2:
                 raise ArtifactValidationError("OCI layout index.json must use schemaVersion 2")
             manifests = top_index.get("manifests")
@@ -1214,6 +1216,10 @@ class LocalLayoutSource:
             top_media_type = top_index.get("mediaType")
             if top_media_type is not None and top_media_type != OCI_IMAGE_INDEX_MEDIA_TYPE:
                 raise ArtifactValidationError("OCI layout index.json has an unsupported mediaType")
+            pinned_top_index = (
+                self.root_digest is not None
+                and self.root_digest == f"sha256:{hashlib.sha256(top_index_bytes).hexdigest()}"
+            )
             roots: list[Descriptor] = []
             for index, raw_descriptor in enumerate(manifests):
                 if not isinstance(raw_descriptor, dict):
@@ -1230,13 +1236,20 @@ class LocalLayoutSource:
                     if "data" in raw_descriptor:
                         raise ArtifactValidationError("pinned OCI layout root uses unsupported embedded data")
                     roots.append(parsed_descriptor)
-            if len(roots) != 1:
-                if self.root_digest is None:
-                    raise ArtifactValidationError(
-                        "automatic OCI root selection requires exactly one descriptor; specify --manifest"
-                    )
-                raise ArtifactValidationError("OCI layout must declare the pinned root descriptor exactly once")
-            root_descriptor = roots[0]
+            if pinned_top_index:
+                root_descriptor = Descriptor(
+                    media_type=OCI_IMAGE_INDEX_MEDIA_TYPE,
+                    digest=self.root_digest,
+                    size=len(top_index_bytes),
+                )
+            else:
+                if len(roots) != 1:
+                    if self.root_digest is None:
+                        raise ArtifactValidationError(
+                            "automatic OCI root selection requires exactly one descriptor; specify --manifest"
+                        )
+                    raise ArtifactValidationError("OCI layout must declare the pinned root descriptor exactly once")
+                root_descriptor = roots[0]
             if root_descriptor.media_type not in (
                 SUPPORTED_IMAGE_MANIFEST_MEDIA_TYPES | SUPPORTED_IMAGE_INDEX_MEDIA_TYPES
             ):
@@ -1262,7 +1275,10 @@ class LocalLayoutSource:
                         if existing.descriptor != descriptor:
                             raise ArtifactValidationError("same OCI digest has contradictory descriptor metadata")
                         return existing
-                    created = cas.import_source_blob(sha256_fd, descriptor, self._checkpoint)
+                    if pinned_top_index and descriptor == root_descriptor:
+                        created = cas.import_source_blob(layout_fd, descriptor, self._checkpoint, _fixed_index=True)
+                    else:
+                        created = cas.import_source_blob(sha256_fd, descriptor, self._checkpoint)
                     memo[descriptor.digest] = created
                     return created
 

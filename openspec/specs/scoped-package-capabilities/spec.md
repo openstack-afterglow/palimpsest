@@ -31,6 +31,13 @@ Hub SHALL revalidate current effective named Keystone assignments and enabled ow
 - **WHEN** a caller accesses another namespace, an undelegated package, or another owner's key
 - **THEN** existing scope/ownership checks deny the request even for a service admin.
 
+#### Scenario: Native key owner is promoted on system-all
+
+- **WHEN** an existing ordinary package-key owner receives a direct system-all admin, manager or service assignment that project-oriented effective expansion omits
+- **THEN** the fresh separate direct-system lookup denies native member controls, key use and upload finalization
+- **AND** the original delegated actions do not bypass the current non-administrative owner policy.
+
+
 ### Requirement: Preserve global and credential boundaries
 
 Hub SHALL preserve verified-system-admin global builder/GC gates and key-only native package writes, without granting service admin global authority or allowing package keys to authorize OpenStack/VM launch. System administrator recognition SHALL use a fresh direct user/system-all assignment query through the separate reader, not project-oriented effective expansion, and SHALL still require an exact subject user, system-all scope and named admin role.
@@ -67,7 +74,7 @@ Regression cases SHALL exercise actual native FastAPI HTTP routes and a syntheti
 
 ### Requirement: Original-token console capability projection
 
-Hub SHALL expose `GET /v1/me` using the original project-scoped subject identity and roles, with no token/password/auth-reference fields and `Cache-Control: no-store` on success and errors. Its independent inventory/download/upload capabilities SHALL be computed from fresh current service leaves. Verified system administrators SHALL retain legacy inventory/download/build/delete authority without gaining upload or native member controls; membership denial SHALL expose no member capabilities, and identity outages SHALL remain failures.
+Hub SHALL expose `GET /v1/me` using the original project-scoped subject identity and roles, with no token/password/auth-reference fields and `Cache-Control: no-store` on success and errors. Its independent inventory/download/upload capabilities SHALL be computed from fresh current service leaves. Verified system administrators SHALL retain legacy inventory/download/build/delete authority, but administrative privilege alone SHALL NOT grant upload or native member controls. Legacy upload SHALL require independent ordinary current-project publication authority; membership denial SHALL expose no member capabilities, and identity outages SHALL remain failures.
 
 #### Scenario: Retained token loses membership
 
@@ -78,6 +85,22 @@ Hub SHALL expose `GET /v1/me` using the original project-scoped subject identity
 
 - **WHEN** a publish-only caller starts an upload for an already registered visible digest
 - **THEN** the server creates a normal upload session, verifies the submitted bytes and metadata at finalization, and does not return an inventory descriptor; only an inventory-authorized caller can take the verified-descriptor completion shortcut.
+
+### Requirement: Independent ordinary legacy publication authority
+
+Legacy image/layer publication SHALL preserve the original project-scoped user/token and intersect its ordinary service-role closure with fresh enabled current-project authority. Builtin admin/manager roots and their separately expanded `links.prior_role` copies SHALL NOT grant publication or baseline membership; independent ordinary direct, group or inherited roots MAY grant publication through the current unique-global role graph. Service, protected and validator identities and system/domain-scoped tokens SHALL remain denied. Native package key ownership and deferred Trust export admission/use SHALL retain their separate non-administrative owner policy; no legacy publication permission SHALL relax those boundaries.
+
+#### Scenario: Administrator publishes only with ordinary authority
+
+- **WHEN** a verified system administrator also holds baseline membership and ordinary `palimpsest-publish_editor` authority in the original token's project
+- **THEN** `/v1/me` reports upload authority and legacy upload lifecycle requests are authorized as that original project user
+- **AND** native member/key controls and deferred Trust exports remain denied.
+
+#### Scenario: Admin implication does not substitute for an ordinary grant
+
+- **WHEN** an admin implication reaches membership or publication leaves but no independent ordinary current-project assignment reaches them
+- **THEN** legacy publication is denied, including after revocation of a formerly independent grant while the token remains valid.
+
 
 ### Requirement: Same-origin console credential isolation
 

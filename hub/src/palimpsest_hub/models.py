@@ -174,12 +174,24 @@ class PalimpsestHubBuild(Base):
     output_digest: Mapped[str | None] = mapped_column(VARCHAR(71))
     output_size_bytes: Mapped[int | None] = mapped_column(BIGINT)
     error_code: Mapped[str | None] = mapped_column(VARCHAR(32))
+    # HTTP attempt receipt nonce and immutable execution deadline, never a renewable worker lease.
     lease_owner: Mapped[str | None] = mapped_column(VARCHAR(128))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
     created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False, default=_now)
     started_at: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
     completed_at: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6))
 
     __table_args__ = (Index("idx_palimpsest_builds_project_created", "project_id", "created_at"),)
+
+
+class PalimpsestWorkerLease(Base):
+    """Shared maintenance roles and reserved API mutexes; tokens are not credentials."""
+
+    __tablename__ = "palimpsest_worker_leases"
+
+    name: Mapped[str] = mapped_column(VARCHAR(255), primary_key=True)
+    token: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False)
 
 
 def _binary_name(length: int):

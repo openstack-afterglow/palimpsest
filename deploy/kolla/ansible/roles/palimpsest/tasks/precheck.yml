@@ -7,5 +7,6 @@
   when: '"palimpsest-hub-api" in palimpsest_local_services or "palimpsest-hub-worker" in palimpsest_local_services'
 
 
+
 - name: Include Palimpsest image precheck tasks
   ansible.builtin.include_tasks: image_precheck.yml

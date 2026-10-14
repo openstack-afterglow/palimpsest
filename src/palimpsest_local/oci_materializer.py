@@ -15,6 +15,7 @@ import tempfile
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,7 @@ from .oci_worker_protocol import (
     OCIWorkerResponse,
 )
 from .state import StatePaths
+from .web_job_client import defer_web_cancellation
 
 _WORKER_MODULE = "palimpsest_local.oci_materializer_worker"
 _SCRATCH_PREFIX = ".oci-materializer-worker-"
@@ -335,6 +337,7 @@ def _spawn_and_exchange(
     timeout_seconds: float,
     grace_seconds: float,
     command: tuple[str, ...] | None = None,
+    register_worker: Callable[[subprocess.Popen[bytes]], None] | None = None,
 ) -> tuple[bytes, int, subprocess.Popen[bytes]]:
     request_bytes = request.to_json_bytes()
     output = bytearray()
@@ -342,21 +345,7 @@ def _spawn_and_exchange(
     threads: tuple[threading.Thread, ...] = ()
     start_attempts = 0
     selected_command = command or (sys.executable, "-I", "-m", _WORKER_MODULE)
-    try:
-        process = subprocess.Popen(
-            selected_command,
-            cwd=scratch,
-            env=_fixed_env(),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            close_fds=True,
-            start_new_session=True,
-        )
-    except (OSError, MemoryError) as exc:
-        if process_resource_failure(exc):
-            raise OCIHardWorkerError("oci-worker-resource", process_resource_detail(exc)) from None
-        raise OCIHardWorkerError("oci-worker-spawn", "materializer worker could not be started") from None
+    process = None
 
     def write_request() -> None:
         assert process.stdin is not None
@@ -392,13 +381,42 @@ def _spawn_and_exchange(
                 pass
 
     try:
+        with defer_web_cancellation():
+            try:
+                process = subprocess.Popen(
+                    selected_command,
+                    cwd=scratch,
+                    env=_fixed_env(),
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    close_fds=True,
+                    start_new_session=True,
+                )
+                if register_worker is not None:
+                    register_worker(process)
+            except (OSError, MemoryError) as exc:
+                if process_resource_failure(exc):
+                    raise OCIHardWorkerError("oci-worker-resource", process_resource_detail(exc)) from None
+                raise OCIHardWorkerError("oci-worker-spawn", "materializer worker could not be started") from None
         writer = threading.Thread(target=write_request, name="palimpsest-oci-worker-stdin", daemon=True)
         reader = threading.Thread(target=read_response, name="palimpsest-oci-worker-stdout", daemon=True)
         threads = (writer, reader)
         for thread in threads:
-            start_attempts += 1
-            thread.start()
+            with defer_web_cancellation():
+                start_attempts += 1
+                thread.start()
+        process.wait(timeout=timeout_seconds)
+        if _group_exists(process.pid):
+            raise OCIHardWorkerError("oci-worker-protocol", "materializer worker left a live descendant")
+        writer.join(timeout=grace_seconds)
+        reader.join(timeout=grace_seconds)
+        if output_overflow.is_set() or len(output) > MAX_OCI_WORKER_MESSAGE_BYTES:
+            raise OCIHardWorkerError("oci-worker-protocol", "materializer worker response exceeds its bound")
+        return bytes(output), process.returncode, process
     except BaseException as primary:
+        if process is None:
+            raise
         reaped = False
         cleanup_failed = False
         try:
@@ -428,10 +446,19 @@ def _spawn_and_exchange(
         resource_failure = process_resource_failure(primary) or (
             isinstance(primary, RuntimeError) and str(primary) == "can't start new thread"
         )
-        if resource_failure or not reaped or cleanup_failed:
+        timed_out = isinstance(primary, subprocess.TimeoutExpired)
+        if resource_failure or timed_out or not reaped or cleanup_failed:
             failure = _WorkerBoundaryFailure(
-                "oci-worker-resource" if resource_failure else "oci-worker-interrupted",
-                "materializer helper thread could not start; check process/thread and memory limits; "
+                "oci-worker-resource"
+                if resource_failure
+                else "oci-worker-timeout"
+                if timed_out
+                else "oci-worker-interrupted",
+                (
+                    "materializer worker exceeded its wall-clock deadline; "
+                    if timed_out
+                    else "materializer helper failed; check process/thread and memory limits; "
+                )
                 + ("worker was reaped" if reaped else "worker cleanup is deferred"),
                 process=process,
                 reaped=reaped,
@@ -440,39 +467,6 @@ def _spawn_and_exchange(
                 failure.add_note("helper startup cleanup raised; original worker ownership is retained")
             raise failure from primary
         raise
-    try:
-        process.wait(timeout=timeout_seconds)
-    except subprocess.TimeoutExpired:
-        reaped = _terminate_worker(process, grace_seconds)
-        raise _WorkerBoundaryFailure(
-            "oci-worker-timeout",
-            "materializer worker exceeded its wall-clock deadline",
-            process=process,
-            reaped=reaped,
-        ) from None
-    except BaseException as primary:
-        reaped = _terminate_worker(process, grace_seconds)
-        if not reaped:
-            raise _WorkerBoundaryFailure(
-                "oci-worker-interrupted",
-                "materializer worker cleanup was deferred",
-                process=process,
-                reaped=False,
-            ) from primary
-        raise
-    if _group_exists(process.pid):
-        reaped = _terminate_worker(process, grace_seconds)
-        raise _WorkerBoundaryFailure(
-            "oci-worker-protocol",
-            "materializer worker left a live descendant",
-            process=process,
-            reaped=reaped,
-        )
-    writer.join(timeout=grace_seconds)
-    reader.join(timeout=grace_seconds)
-    if output_overflow.is_set() or len(output) > MAX_OCI_WORKER_MESSAGE_BYTES:
-        raise OCIHardWorkerError("oci-worker-protocol", "materializer worker response exceeds its bound")
-    return bytes(output), process.returncode, process
 
 
 def materialize_layer_hard(
@@ -528,18 +522,25 @@ def materialize_layer_hard(
     started = time.monotonic()
     scratch: Path | None = None
     scratch_fd: int | None = None
-    try:
-        scratch = Path(tempfile.mkdtemp(prefix=_SCRATCH_PREFIX, dir=scratch_parent))
-        os.chmod(scratch, 0o700)
-        scratch_fd = os.open(scratch, os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW)
-    except OSError:
-        if scratch is not None:
-            shutil.rmtree(scratch, ignore_errors=True)
-        raise OCIHardWorkerError("oci-worker-scratch", "materializer worker scratch could not be created") from None
-    assert scratch is not None and scratch_fd is not None
     process: subprocess.Popen[bytes] | None = None
     deferred_cleanup = False
+    worker_reaped = False
+    failure = None
+
+    def register_worker(worker):
+        nonlocal process
+        process = worker
+
     try:
+        with defer_web_cancellation():
+            try:
+                scratch = Path(tempfile.mkdtemp(prefix=_SCRATCH_PREFIX, dir=scratch_parent))
+                os.chmod(scratch, 0o700)
+                scratch_fd = os.open(scratch, os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW)
+            except OSError:
+                raise OCIHardWorkerError(
+                    "oci-worker-scratch", "materializer worker scratch could not be created"
+                ) from None
         remaining = float(timeout_seconds) - (time.monotonic() - started)
         if remaining <= 0:
             raise OCIHardWorkerError("oci-worker-timeout", "materializer deadline expired before worker start")
@@ -548,7 +549,9 @@ def materialize_layer_hard(
             scratch=scratch,
             timeout_seconds=remaining,
             grace_seconds=float(terminate_grace_seconds),
+            register_worker=register_worker,
         )
+        worker_reaped = True
         if time.monotonic() - started > float(timeout_seconds):
             raise OCIHardWorkerError("oci-worker-timeout", "late materializer success was discarded")
         if return_code != 0 or not output:
@@ -585,31 +588,38 @@ def materialize_layer_hard(
         ):
             raise OCIHardWorkerError("oci-worker-protocol", "materializer worker receipt binding is invalid")
         return response.result
-    except _WorkerBoundaryFailure as exc:
-        process = exc.process
-        deferred_cleanup = not exc.reaped
-        if deferred_cleanup:
-            try:
-                _background_reap(process, scratch, scratch_fd, scratch_parent)
-            except BaseException:
-                exc.add_note(
-                    "worker reaper startup failed; cleanup is not confirmed; scratch requires proven termination"
-                )
-        raise exc
-    except OCIHardWorkerError as exc:
-        if process is not None and process.poll() is None:
-            deferred_cleanup = not _terminate_worker(process, float(terminate_grace_seconds))
-            if deferred_cleanup:
-                try:
-                    _background_reap(process, scratch, scratch_fd, scratch_parent)
-                except BaseException:
-                    exc.add_note(
-                        "worker reaper startup failed; cleanup is not confirmed; scratch requires proven termination"
-                    )
-        raise exc
+    except BaseException as exc:
+        failure = exc
+        if isinstance(exc, _WorkerBoundaryFailure):
+            worker_reaped = exc.reaped
+        raise
     finally:
-        if not deferred_cleanup:
-            _cleanup_scratch(scratch, scratch_fd, scratch_parent)
+        # Spawn registers directly into this owner before cancellation resumes.
+        # Neither exception construction/delivery nor the except arm is an
+        # ownership handoff; every exit goes through this final cleanup guard.
+        with defer_web_cancellation():
+            if process is not None and not worker_reaped:
+                try:
+                    if process.poll() is None or _group_exists(process.pid):
+                        worker_reaped = _terminate_worker(process, float(terminate_grace_seconds))
+                    else:
+                        worker_reaped = True
+                except BaseException:
+                    worker_reaped = False
+                if not worker_reaped:
+                    deferred_cleanup = True
+                    try:
+                        _background_reap(process, scratch, scratch_fd, scratch_parent)
+                    except BaseException:
+                        if failure is not None:
+                            failure.add_note(
+                                "worker reaper startup failed; cleanup is not confirmed; scratch requires proven termination"
+                            )
+            if not deferred_cleanup and scratch is not None:
+                if scratch_fd is not None:
+                    _cleanup_scratch(scratch, scratch_fd, scratch_parent)
+                else:
+                    shutil.rmtree(scratch, ignore_errors=True)
 
 
 def materialize_image_hard(

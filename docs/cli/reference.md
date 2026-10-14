@@ -3,7 +3,7 @@
 
 This file is generated from `palimpsest_local.cli.build_parser`. It inventories every command, positional, option, choice, and parser default. For behavior, examples, and runtime restrictions, read [the usage guide](usage.md). Every command except raw `docker` pass-through accepts automatic `-h`/`--help`.
 
-Coverage: **76 command paths**, **233 positional/option definitions** (excluding automatic `-h/--help`).
+Coverage: **78 command paths**, **238 positional/option definitions** (excluding automatic `-h/--help`).
 
 ## `palimpsest`
 
@@ -12,15 +12,15 @@ Coverage: **76 command paths**, **233 positional/option definitions** (excluding
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest [-h] [--url URL] [--version] {image,layer,bundle,oci,build,registry,login,logout,pull,push,tag,images,history,rmi,save,load,docker,run,compose,ps,inspect,logs,shell,exec,start,stop,rm,commit,ui,store,completion} ...
+usage: palimpsest [-h] [--url URL] [--version] {image,layer,bundle,oci,build,registry,login,logout,pull,push,tag,images,history,rmi,save,load,docker,run,compose,ps,volumes,networks,inspect,logs,shell,exec,start,stop,rm,commit,web,store,completion} ...
 ```
 
-Subcommands: `image`, `layer`, `bundle`, `oci`, `build`, `registry`, `login`, `logout`, `pull`, `push`, `tag`, `images`, `history`, `rmi`, `save`, `load`, `docker`, `run`, `compose`, `ps`, `inspect`, `logs`, `shell`, `exec`, `start`, `stop`, `rm`, `commit`, `ui`, `store`, `completion`.
+Subcommands: `image`, `layer`, `bundle`, `oci`, `build`, `registry`, `login`, `logout`, `pull`, `push`, `tag`, `images`, `history`, `rmi`, `save`, `load`, `docker`, `run`, `compose`, `ps`, `volumes`, `networks`, `inspect`, `logs`, `shell`, `exec`, `start`, `stop`, `rm`, `commit`, `web`, `store`, `completion`.
 
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
-| `--url` | string | `None` | Override the Palimpsest Hub base URL. |
-| `--version` | flag | — | show program's version number and exit |
+| `--url` | string | `None` | Hub API URL (overrides PALIMPSEST_URL and config.toml) |
+| `--version` | flag | — | show the client version and exit |
 
 ## `palimpsest image`
 
@@ -46,11 +46,11 @@ usage: palimpsest image ls [-h] [--ubuntu-base UBUNTU_BASE] [--arch ARCH] [--os-
 
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
-| `--ubuntu-base` | string | `None` | Filter or record the Ubuntu base release. |
-| `--arch` | string | `None` | Filter or record the image CPU architecture. |
-| `--os-variant` | string | `None` | Filter or record the libvirt OS variant. |
-| `--disk-format` | one of: `qcow2`, `raw` | `None` | Select the cloud-image disk format. |
-| `--limit` | int | `50` | Maximum results to return (valid range: 1–200). |
+| `--ubuntu-base` | string | `None` | filter by Ubuntu base release |
+| `--arch` | string | `None` | filter by guest architecture, such as x86_64 or aarch64 |
+| `--os-variant` | string | `None` | filter by operating-system variant |
+| `--disk-format` | one of: `qcow2`, `raw` | `None` | filter by boot disk format |
+| `--limit` | int | `50` | maximum Hub results (1-200; default: 50) |
 
 ### `palimpsest image pull`
 
@@ -64,8 +64,8 @@ usage: palimpsest image pull [-h] [--output OUTPUT] digest
 
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
-| `digest` | string | required | Expected or selected SHA-256 content digest. |
-| `--output` | Path | `None` | Write or copy output at this path. |
+| `digest` | string | required | Hub boot-image SHA-256 digest |
+| `--output` | Path | `None` | also copy the downloaded image to this path |
 
 ### `palimpsest image verify`
 
@@ -79,8 +79,8 @@ usage: palimpsest image verify [-h] --digest DIGEST path
 
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
-| `path` | Path | required | Local image file whose bytes must match &#96;--digest&#96;. |
-| `--digest` | string | required | Expected or selected SHA-256 content digest. |
+| `path` | Path | required | local boot-image file to verify |
+| `--digest` | string | required | expected SHA-256 digest |
 
 ### `palimpsest image import`
 
@@ -94,10 +94,10 @@ usage: palimpsest image import [-h] --disk-format {qcow2,raw} --arch {x86_64,aar
 
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
-| `path` | Path | required | Local qcow2/raw cloud-image file to import into the local store. |
-| `--disk-format` | one of: `qcow2`, `raw` | required | Select the cloud-image disk format. |
-| `--arch` | one of: `x86_64`, `aarch64` | required | Filter or record the image CPU architecture. |
-| `--os-variant` | string | `None` | Filter or record the libvirt OS variant. |
+| `path` | Path | required | local qcow2 or raw cloud boot-image file |
+| `--disk-format` | one of: `qcow2`, `raw` | required | input disk format |
+| `--arch` | one of: `x86_64`, `aarch64` | required | guest architecture |
+| `--os-variant` | string | `None` | operating-system variant, such as ubuntu-24.04 |
 
 ### `palimpsest image push`
 
@@ -111,13 +111,13 @@ usage: palimpsest image push [-h] --name NAME [--disk-format {qcow2,raw}] [--arc
 
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
-| `path` | Path | required | Local qcow2/raw cloud-image file to upload to Hub &#96;/v1&#96;. |
-| `--name` | string | required | Managed object, run, profile, or publication name. |
-| `--disk-format` | one of: `qcow2`, `raw` | `'qcow2'` | Select the cloud-image disk format. |
-| `--arch` | one of: `x86_64`, `aarch64` | `'x86_64'` | Filter or record the image CPU architecture. |
-| `--os-variant` | string | `None` | Filter or record the libvirt OS variant. |
-| `--ubuntu-base` | string | `None` | Filter or record the Ubuntu base release. |
-| `--publish` | flag | `False` | Make the uploaded Hub artifact publicly visible. |
+| `path` | Path | required | local cloud boot-image file to upload |
+| `--name` | string | required | Hub display name for the image |
+| `--disk-format` | one of: `qcow2`, `raw` | `'qcow2'` | input disk format (default: qcow2) |
+| `--arch` | one of: `x86_64`, `aarch64` | `'x86_64'` | guest architecture (default: x86_64) |
+| `--os-variant` | string | `None` | operating-system variant, such as ubuntu-24.04 |
+| `--ubuntu-base` | string | `None` | Ubuntu base release metadata |
+| `--publish` | flag | `False` | mark the uploaded boot image as published in Hub |
 
 ### `palimpsest image inspect`
 
@@ -131,10 +131,10 @@ usage: palimpsest image inspect [-h] [-f FORMAT] [--platform PLATFORM] [--regist
 
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
-| `references` | string (one or more) | required | One or more Docker image references or IDs. |
-| `-f`, `--format` | string | `None` | Select the output representation or Docker format template. |
-| `--platform` | string | `None` | Select an OCI platform. |
-| `--registry` | string | `None` | Resolve the operation through this registry profile. |
+| `references` | string (one or more) | required | Docker image references or local image IDs |
+| `-f`, `--format` | string | `None` | Docker output template or format |
+| `--platform` | string | `None` | Docker image platform to inspect |
+| `--registry` | string | `None` | registry profile for resolving image references |
 
 ### `palimpsest image history`
 
@@ -148,11 +148,11 @@ usage: palimpsest image history [-h] [--format FORMAT] [--no-trunc] [--platform 
 
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
-| `reference` | string | required | Docker image reference or ID. |
-| `--format` | string | `None` | Select the output representation or Docker format template. |
-| `--no-trunc` | flag | `False` | Do not truncate Docker output. |
-| `--platform` | string | `None` | Select an OCI platform. |
-| `-q`, `--quiet` | flag | `False` | Suppress normal detail or print identifiers only. |
+| `reference` | string | required | local Docker image reference or ID |
+| `--format` | string | `None` | Docker output template or format |
+| `--no-trunc` | flag | `False` | show full layer identifiers and commands |
+| `--platform` | string | `None` | Docker image platform |
+| `-q`, `--quiet` | flag | `False` | print layer IDs only |
 
 ### `palimpsest image rm`
 
@@ -166,10 +166,10 @@ usage: palimpsest image rm [-h] [-f] [--no-prune] [--platform PLATFORM] referenc
 
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
-| `references` | string (one or more) | required | One or more Docker image references or IDs. |
-| `-f`, `--force` | flag | `False` | Replace, remove, or overwrite despite the normal protection. |
-| `--no-prune` | flag | `False` | Do not delete untagged parents. |
-| `--platform` | string; repeatable | `[]` | Select an OCI platform. |
+| `references` | string (one or more) | required | local Docker image references or IDs to remove |
+| `-f`, `--force` | flag | `False` | ask Docker to force removal |
+| `--no-prune` | flag | `False` | keep untagged parent images |
+| `--platform` | string; repeatable | `[]` | Docker image platform to remove (repeatable) |
 
 ### `palimpsest image save`
 
@@ -183,9 +183,9 @@ usage: palimpsest image save [-h] [-o OUTPUT] [--platform PLATFORM] references [
 
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
-| `references` | string (one or more) | required | One or more Docker image references or IDs. |
-| `-o`, `--output` | Path | `None` | Write or copy output at this path. |
-| `--platform` | string; repeatable | `[]` | Select an OCI platform. |
+| `references` | string (one or more) | required | local Docker image references or IDs to export |
+| `-o`, `--output` | Path | `None` | Docker archive destination (default: standard output) |
+| `--platform` | string; repeatable | `[]` | Docker image platform to save (repeatable) |
 
 ### `palimpsest image load`
 
@@ -199,9 +199,9 @@ usage: palimpsest image load [-h] [-i INPUT_PATH] [--platform PLATFORM] [-q]
 
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
-| `-i`, `--input` | Path | `None` | Read the Docker image archive from this file instead of stdin. |
-| `--platform` | string; repeatable | `[]` | Select an OCI platform. |
-| `-q`, `--quiet` | flag | `False` | Suppress normal detail or print identifiers only. |
+| `-i`, `--input` | Path | `None` | Docker archive source (default: standard input) |
+| `--platform` | string; repeatable | `[]` | Docker image platform to load (repeatable) |
+| `-q`, `--quiet` | flag | `False` | suppress Docker progress |
 
 ## `palimpsest layer`
 
@@ -230,7 +230,7 @@ usage: palimpsest layer ls [-h] [--name NAME] [--kind KIND] [--parent PARENT] [-
 | `--name` | string | `None` | Managed object, run, profile, or publication name. |
 | `--kind` | string | `None` | Filter by artifact kind. |
 | `--parent` | string | `None` | Record or filter by the parent layer digest. |
-| `--limit` | int | `50` | Maximum results to return (valid range: 1–200). |
+| `--limit` | int | `50` | maximum Hub results (1-200; default: 50) |
 
 ### `palimpsest layer pull`
 
@@ -482,38 +482,39 @@ usage: palimpsest oci root-volume [-h] volume_id
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest build [-h] [--frontend {auto,palimpsestfile,dockerfile}] [--base BASE] --tag TAG [-f RECIPE] [--layer LAYER] [--network {none,default}] [--offline] [--platform PLATFORM] [--target TARGET] [--build-arg BUILD_ARG] [--local-image LOCAL_IMAGE] [--cache-scope CACHE_SCOPE] [--registry REGISTRY] [--cache-registry CACHE_REGISTRY] [--cache-package CACHE_PACKAGE] [--cache-from CACHE_FROM] [--cache-to CACHE_TO] [--no-cache] [--pull] [--load] [--progress {auto,none,plain,quiet,rawjson,tty}] [--output OUTPUT] [--rootfs-output ROOTFS_OUTPUT] [--runtime-tag RUNTIME_TAG] [--runtime-base RUNTIME_BASE] [--runtime-block-size RUNTIME_BLOCK_SIZE] [--push] [--runtime-push] [context]
+usage: palimpsest build [-h] [--frontend {auto,palimpsestfile,dockerfile}] [--base BASE] --tag TAG [-f RECIPE] [--layer LAYER] [--network {none,default}] [--offline] [--platform PLATFORM] [--target TARGET] [--build-arg BUILD_ARG] [--local-image LOCAL_IMAGE] [--cache-scope CACHE_SCOPE] [--cache-mode {native,local}] [--registry REGISTRY] [--cache-registry CACHE_REGISTRY] [--cache-package CACHE_PACKAGE] [--cache-from CACHE_FROM] [--cache-to CACHE_TO] [--no-cache] [--pull] [--load] [--progress {auto,none,plain,quiet,rawjson,tty}] [--output OUTPUT] [--rootfs-output ROOTFS_OUTPUT] [--runtime-tag RUNTIME_TAG] [--runtime-base RUNTIME_BASE] [--runtime-block-size RUNTIME_BLOCK_SIZE] [--push] [--runtime-push] [context]
 ```
 
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
-| `context` | Path (optional) | `None` | Dockerfile build context directory. |
-| `--frontend` | one of: `auto`, `palimpsestfile`, `dockerfile` | `'auto'` | Choose frontend explicitly or infer it from the other arguments. |
-| `--base` | string | `None` | Legacy Palimpsestfile cloud-image base digest. |
-| `--tag`, `-t` | string; repeatable | required | Tag to assign to the produced artifact. |
-| `-f`, `--file` | Path | `None` | Build recipe path (Dockerfile or Palimpsestfile). |
-| `--layer` | string; repeatable | `None` | Add a legacy layer digest; repeat to preserve chain order. |
-| `--network` | one of: `none`, `default` | `'none'` | Select build or runtime networking. |
-| `--offline` | flag | `False` | Enforce an offline Dockerfile build. |
-| `--platform` | string | `None` | Select an OCI platform. |
-| `--target` | string | `None` | Dockerfile build stage to target. |
-| `--build-arg` | string; repeatable | `[]` | Set a Dockerfile build argument; repeatable. |
-| `--local-image` | string; repeatable | `[]` | Add &#96;ALIAS=/absolute/layout@sha256:DIGEST&#96; as a verified local OCI build context; repeatable. |
-| `--cache-scope` | string | `None` | Select the Palimpsest Hub cache scope. |
-| `--registry` | string | `None` | Resolve the operation through this registry profile. |
+| `context` | Path (optional) | `None` | Dockerfile context directory (default: current directory) |
+| `--frontend` | one of: `auto`, `palimpsestfile`, `dockerfile` | `'auto'` | recipe frontend (default: infer from inputs) |
+| `--base` | string | `None` | cloud-image SHA-256 digest for a Palimpsestfile build |
+| `--tag`, `-t` | string; repeatable | required | output tag; repeat for Dockerfile builds |
+| `-f`, `--file` | Path | `None` | recipe path (default: Palimpsestfile or Dockerfile) |
+| `--layer` | string; repeatable | `None` | parent layer digest for a Palimpsestfile build |
+| `--network` | one of: `none`, `default` | `'none'` | build network (default: none; offline requires none) |
+| `--offline` | flag | `False` | build without registry/Hub access using a prepared offline builder |
+| `--platform` | string | `None` | Dockerfile target platform, such as linux/amd64 or linux/arm64 |
+| `--target` | string | `None` | Dockerfile target stage |
+| `--build-arg` | string; repeatable | `[]` | Dockerfile build argument KEY=VALUE (repeatable) |
+| `--local-image` | string; repeatable | `[]` | named local OCI context NAME=PATH (repeatable) |
+| `--cache-scope` | string | `None` | local BuildKit cache partition |
+| `--cache-mode` | one of: `native`, `local` | `'native'` | managed cache authority: native Hub (default) or local-only cache |
+| `--registry` | string | `None` | registry profile used to resolve output tags |
 | `--cache-registry` | string | `None` | native profile authorizing mandatory online BuildKit cache transfer |
 | `--cache-package` | string | `None` | exact namespace/package cache partition |
-| `--cache-from` | string; repeatable | `[]` | Add an external BuildKit cache source; repeatable. |
-| `--cache-to` | string; repeatable | `[]` | Add an external BuildKit cache destination; repeatable. |
-| `--no-cache` | flag | `False` | Disable cache reuse (offline builds only). |
-| `--pull` | flag | `False` | Always resolve newer base images. |
-| `--load` | flag | `False` | Load the build result into the local Docker image store. |
-| `--progress` | one of: `auto`, `none`, `plain`, `quiet`, `rawjson`, `tty` | `'plain'` | Select BuildKit progress rendering. |
-| `--output` | Path | `None` | OCI archive output path; an invocation-unique state path is chosen when omitted. |
-| `--rootfs-output` | Path | `None` | Export the built root filesystem at this path. |
-| `--runtime-tag` | string | `None` | Tag for the generated SquashFS runtime block. |
-| `--runtime-base` | string | `None` | Base digest for the generated runtime-block chain. |
-| `--runtime-block-size` | int | `None` | SquashFS block size: power of two from 4096 through 1048576 bytes (semantic default: 131072). |
+| `--cache-from` | string; repeatable | `[]` | additional online Buildx cache source (repeatable) |
+| `--cache-to` | string; repeatable | `[]` | additional online Buildx cache destination (repeatable) |
+| `--no-cache` | flag | `False` | disable build-cache reuse (offline or local cache mode) |
+| `--pull` | flag | `False` | refresh Dockerfile base images (online only) |
+| `--load` | flag | `False` | also load the OCI output into Docker (OCI profiles only) |
+| `--progress` | one of: `auto`, `none`, `plain`, `quiet`, `rawjson`, `tty` | `'plain'` | Buildx progress format (default: plain) |
+| `--output` | Path | `None` | destination OCI archive path |
+| `--rootfs-output` | Path | `None` | also export a root filesystem archive |
+| `--runtime-tag` | string | `None` | also pack a cloud-image SquashFS layer with this local tag |
+| `--runtime-base` | string | `None` | compatible cloud-image digest for --runtime-tag (must match target architecture) |
+| `--runtime-block-size` | int | `None` | SquashFS block size for the runtime layer |
 | `--push` | flag | `False` | push the OCI image to its configured registry |
 | `--runtime-push` | flag | `False` | push the SquashFS runtime block to Palimpsest Hub |
 
@@ -541,7 +542,7 @@ usage: palimpsest registry ls [-h] [--format {table,json}]
 
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
-| `--format` | one of: `table`, `json` | `'table'` | Select the output representation or Docker format template. |
+| `--format` | one of: `table`, `json` | `'table'` | output format (default: table) |
 
 ### `palimpsest registry add`
 
@@ -555,19 +556,19 @@ usage: palimpsest registry add [-h] [--protocol {oci,palimpsest}] [--api-base AP
 
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
-| `name` | string | required | Managed object, run, profile, or publication name. |
-| `endpoint` | string | required | Registry hostname/endpoint. |
-| `--protocol` | one of: `oci`, `palimpsest` | `'oci'` | Select Docker/OCI Distribution or native Palimpsest package transport. |
+| `name` | string | required | local profile alias |
+| `endpoint` | string | required | registry authority, such as registry.example.com:5000 |
+| `--protocol` | one of: `oci`, `palimpsest` | `'oci'` | OCI/Docker registry or native Hub package API (default: oci) |
 | `--api-base` | string | `None` | HTTPS native API base, including its gateway path |
-| `--namespace` | string | `None` | Namespace prepended to short image references. |
-| `--mirror` | string; repeatable | `[]` | Add a registry mirror; repeatable. |
-| `--ca` | Path; repeatable | `[]` | Add a trusted registry CA file; repeatable. |
-| `--plain-http` | flag | `False` | Allow unencrypted HTTP for this registry. |
-| `--tls-skip-verify` | flag | `False` | Disable TLS certificate verification for this registry. |
-| `--cache-from` | string; repeatable | `[]` | Add an external BuildKit cache source; repeatable. |
-| `--cache-to` | string; repeatable | `[]` | Add an external BuildKit cache destination; repeatable. |
-| `--default` | flag | `False` | Make this the default registry profile. |
-| `--force` | flag | `False` | Replace, remove, or overwrite despite the normal protection. |
+| `--namespace` | string | `None` | default repository/package namespace |
+| `--mirror` | string; repeatable | `[]` | OCI mirror endpoint (repeatable) |
+| `--ca` | Path; repeatable | `[]` | trusted CA certificate path (repeatable) |
+| `--plain-http` | flag | `False` | allow unencrypted HTTP for this OCI endpoint |
+| `--tls-skip-verify` | flag | `False` | disable TLS certificate verification for this OCI endpoint |
+| `--cache-from` | string; repeatable | `[]` | default online Buildx cache source (repeatable) |
+| `--cache-to` | string; repeatable | `[]` | default online Buildx cache destination (repeatable) |
+| `--default` | flag | `False` | also select this profile as the default |
+| `--force` | flag | `False` | replace an existing profile with the same alias |
 
 ### `palimpsest registry use`
 
@@ -581,7 +582,7 @@ usage: palimpsest registry use [-h] name
 
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
-| `name` | string | required | Managed object, run, profile, or publication name. |
+| `name` | string | required | profile alias to select |
 
 ### `palimpsest registry rm`
 
@@ -595,7 +596,7 @@ usage: palimpsest registry rm [-h] name
 
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
-| `name` | string | required | Managed object, run, profile, or publication name. |
+| `name` | string | required | profile alias to remove |
 
 ### `palimpsest registry inspect`
 
@@ -609,7 +610,7 @@ usage: palimpsest registry inspect [-h] [name]
 
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
-| `name` | string (optional) | `None` | Managed object, run, profile, or publication name. |
+| `name` | string (optional) | `None` | profile alias (default: selected profile) |
 
 ### `palimpsest registry buildkit-config`
 
@@ -623,8 +624,8 @@ usage: palimpsest registry buildkit-config [-h] --output OUTPUT [--force]
 
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
-| `--output` | Path | required | Write or copy output at this path. |
-| `--force` | flag | `False` | Replace, remove, or overwrite despite the normal protection. |
+| `--output` | Path | required | destination buildkitd.toml path |
+| `--force` | flag | `False` | replace an existing output file |
 
 ## `palimpsest login`
 
@@ -638,10 +639,10 @@ usage: palimpsest login [-h] [-u USERNAME] [--password-stdin] [--registry REGIST
 
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
-| `server` | string (optional) | `None` | Registry authority or configured profile name; native transport requires a profile. |
-| `-u`, `--username` | string | `None` | Docker username, or the native package key's public UUID. |
-| `--password-stdin` | flag | `False` | Read the Docker password or complete native package key from stdin. |
-| `--registry` | string | `None` | Resolve the operation through this registry profile. |
+| `server` | string (optional) | `None` | registry authority (default: selected profile) |
+| `-u`, `--username` | string | `None` | registry username |
+| `--password-stdin` | flag | `False` | read the password/package key from standard input |
+| `--registry` | string | `None` | configured registry profile alias |
 | `--namespace` | string | `None` | native credential namespace (defaults to profile namespace) |
 
 ## `palimpsest logout`
@@ -656,8 +657,8 @@ usage: palimpsest logout [-h] [--registry REGISTRY] [--namespace NAMESPACE] [ser
 
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
-| `server` | string (optional) | `None` | Registry authority or configured profile name; native transport requires a profile. |
-| `--registry` | string | `None` | Resolve the operation through this registry profile. |
+| `server` | string (optional) | `None` | registry authority (default: selected profile) |
+| `--registry` | string | `None` | configured registry profile alias |
 | `--namespace` | string | `None` | native credential namespace (defaults to profile namespace) |
 
 ## `palimpsest pull`
@@ -672,11 +673,11 @@ usage: palimpsest pull [-h] [-a] [--platform PLATFORM] [-q] [--registry REGISTRY
 
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
-| `reference` | string | required | Docker image reference or native namespace/package tag or digest reference. |
-| `-a`, `--all-tags` | flag | `False` | OCI only: pull every tag of an untagged repository; native packages reject this option. |
-| `--platform` | string | `None` | Select an OCI platform. |
-| `-q`, `--quiet` | flag | `False` | Suppress normal detail or print identifiers only. |
-| `--registry` | string | `None` | Resolve the operation through this registry profile. |
+| `reference` | string | required | registry image/package reference |
+| `-a`, `--all-tags` | flag | `False` | pull all tags (OCI profiles only) |
+| `--platform` | string | `None` | OCI target platform |
+| `-q`, `--quiet` | flag | `False` | suppress Docker progress |
+| `--registry` | string | `None` | registry profile alias |
 | `--output` | Path | `None` | native OCI-layout archive destination; never loads Docker |
 
 ## `palimpsest push`
@@ -691,11 +692,11 @@ usage: palimpsest push [-h] [-a] [--platform PLATFORM] [-q] [--registry REGISTRY
 
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
-| `reference` | string | required | Docker image reference or native namespace/package tag reference. |
-| `-a`, `--all-tags` | flag | `False` | OCI only: push every tag of an untagged repository; native packages reject this option. |
-| `--platform` | string | `None` | Select an OCI platform. |
-| `-q`, `--quiet` | flag | `False` | Suppress normal detail or print identifiers only. |
-| `--registry` | string | `None` | Resolve the operation through this registry profile. |
+| `reference` | string | required | destination registry image/package reference |
+| `-a`, `--all-tags` | flag | `False` | push all tags (OCI profiles only) |
+| `--platform` | string | `None` | OCI target platform |
+| `-q`, `--quiet` | flag | `False` | suppress Docker progress |
+| `--registry` | string | `None` | registry profile alias |
 | `--input` | Path | `None` | native OCI layout directory or archive |
 | `--manifest` | string | `None` | native selected root SHA-256 (required for multiple roots) |
 
@@ -727,14 +728,14 @@ usage: palimpsest images [-h] [-a] [--digests] [-f FILTER] [--format FORMAT] [--
 
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
-| `repository` | string (optional) | `None` | Optional repository filter. |
-| `-a`, `--all` | flag | `False` | Include intermediate and dangling images. |
-| `--digests` | flag | `False` | Show content digests. |
-| `-f`, `--filter` | string; repeatable | `[]` | Add a Docker image-list filter; repeatable. |
-| `--format` | string | `None` | Select the output representation or Docker format template. |
-| `--no-trunc` | flag | `False` | Do not truncate Docker output. |
-| `--tree` | flag | `False` | Show Docker's image tree view. |
-| `-q`, `--quiet` | flag | `False` | Suppress normal detail or print identifiers only. |
+| `repository` | string (optional) | `None` | optional Docker repository filter |
+| `-a`, `--all` | flag | `False` | include intermediate Docker images |
+| `--digests` | flag | `False` | show image digests |
+| `-f`, `--filter` | string; repeatable | `[]` | Docker image filter KEY=VALUE (repeatable) |
+| `--format` | string | `None` | Docker output template or format |
+| `--no-trunc` | flag | `False` | show full image identifiers |
+| `--tree` | flag | `False` | show the Docker multi-platform image tree |
+| `-q`, `--quiet` | flag | `False` | print image IDs only |
 
 ## `palimpsest history`
 
@@ -815,7 +816,7 @@ usage: palimpsest docker ...
 
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
-| `docker_args` | string (remainder) | `None` | Arguments passed verbatim to the Docker CLI. |
+| `docker_args` | string (remainder) | `None` | unmodified Docker command/options; use docker --help |
 
 ## `palimpsest run`
 
@@ -824,20 +825,21 @@ usage: palimpsest docker ...
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest run [-h] --name NAME [--layer LAYER] [--memory MEMORY] [--vcpus VCPUS] [--network NETWORK] [-p [HOST_IP:]HOST_PORT:GUEST_PORT[/tcp|/udp]] [--backend {auto,kvm,lima-vz,libvirt-hvf}] [--runtime-kind {cloud-image,oci-root}] [-d] [--manifest MANIFEST] [--user USER] [--root-retention {delete,retain}] [--root-volume ROOT_VOLUME] image_or_bundle [-- COMMAND [ARG...]]
+usage: palimpsest run [-h] [--name NAME] [--registry REGISTRY] [--layer LAYER] [--memory MEMORY] [--vcpus VCPUS] [--network NETWORK] [-p [HOST_IP:]HOST_PORT:GUEST_PORT[/tcp|/udp]] [--backend {auto,kvm,lima-vz,libvirt-hvf}] [--runtime-kind {cloud-image,oci-root}] [-d] [--manifest MANIFEST] [--user USER] [--root-retention {delete,retain}] [--root-volume ROOT_VOLUME] image_or_bundle [-- COMMAND [ARG...]]
 ```
 
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
-| `image_or_bundle` | string | required | Cloud digest/bundle directory or local OCI archive/layout. |
-| `--name` | string | required | Managed object, run, profile, or publication name. |
-| `--layer` | string; repeatable | `[]` | Append a verified SquashFS layer digest to a cloud-image stack. |
-| `--memory` | int | `4096` | Guest memory in MiB (valid range: 256–1,048,576). |
-| `--vcpus` | int | `2` | Guest virtual CPUs (valid range: 1–256). |
-| `--network` | string | `None` | OCI-root guest network: &#96;nat&#96; (default when omitted), &#96;host-only&#96;, or &#96;none&#96;. |
+| `image_or_bundle` | string | required | cloud-image digest/bundle, local OCI archive/layout, or Docker/registry image reference |
+| `--name` | string | `None` | unique local VM/run name (default: auto-generated) |
+| `--registry` | string | `None` | explicit registry alias to search or pull from |
+| `--layer` | string; repeatable | `[]` | cloud-image SquashFS layer digest (repeatable; not for OCI-root) |
+| `--memory` | int | `4096` | guest memory in MiB (256-1048576; default: 4096) |
+| `--vcpus` | int | `2` | guest virtual CPUs (1-256; default: 2) |
+| `--network` | string | `None` | backend network; OCI-root: nat, host-only, or none |
 | `-p`, `--publish` | string; repeatable | `[]` | publish one OCI-root guest port on the host (default host address 127.0.0.1) |
-| `--backend` | one of: `auto`, `kvm`, `lima-vz`, `libvirt-hvf` | `'auto'` | Select or automatically detect the runtime backend. |
-| `--runtime-kind` | one of: `cloud-image`, `oci-root` | `None` | Disambiguate cloud-image and local OCI-root execution. |
+| `--backend` | one of: `auto`, `kvm`, `lima-vz`, `libvirt-hvf` | `'auto'` | VM backend (default: select for host and image architecture) |
+| `--runtime-kind` | one of: `cloud-image`, `oci-root` | `None` | explicit input/runtime type; required for OCI layout directories |
 | `-d`, `--detach` | flag | `False` | leave an OCI-root VM running after READY |
 | `--manifest` | string | `None` | pin the root descriptor of a local OCI image |
 | `--user` | string | `None` | run a local OCI image as USER[:GROUP] |
@@ -997,6 +999,34 @@ Automatic `-h`/`--help` prints help for this command and exits.
 usage: palimpsest ps [-h]
 ```
 
+## `palimpsest volumes`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest volumes [-h] [--format {table,json}]
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `--format` | one of: `table`, `json` | `'table'` | output format |
+
+## `palimpsest networks`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest networks [-h] [--format {table,json}]
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `--format` | one of: `table`, `json` | `'table'` | output format |
+
 ## `palimpsest inspect`
 
 [Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
@@ -1115,21 +1145,21 @@ usage: palimpsest commit [-h] --tag TAG name
 | `name` | string | required | Managed object, run, profile, or publication name. |
 | `--tag` | string | required | Tag to assign to the produced artifact. |
 
-## `palimpsest ui`
+## `palimpsest web`
 
 [Behavior, restrictions, and examples](usage.md#local-store-and-ui).
 
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest ui [-h] [--port PORT] [--no-browser] [--allow-control]
+usage: palimpsest web [-h] [--port PORT] [--no-browser] [--allow-control]
 ```
 
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
-| `--port` | int | `0` | UI listen port; 0 selects an available port. |
-| `--no-browser` | flag | `False` | Do not open the UI in a browser. |
-| `--allow-control` | flag | `False` | Enable dashboard VM, artifact, and storage changes; the default is read-only. |
+| `--port` | int | `0` | listen port; 0 selects an available loopback port |
+| `--no-browser` | flag | `False` | print the URL without opening a browser |
+| `--allow-control` | flag | `False` | enable local edits and VM control (default: read-only) |
 
 ## `palimpsest store`
 
@@ -1155,7 +1185,7 @@ usage: palimpsest store show [-h] [--format {table,json}]
 
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
-| `--format` | one of: `table`, `json` | `'table'` | Select the output representation or Docker format template. |
+| `--format` | one of: `table`, `json` | `'table'` | output format (default: table) |
 
 ### `palimpsest store ls`
 
@@ -1169,8 +1199,8 @@ usage: palimpsest store ls [-h] [--kind {image,layer,all}] [--format {table,json
 
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
-| `--kind` | one of: `image`, `layer`, `all` | `'all'` | Filter by artifact kind. |
-| `--format` | one of: `table`, `json` | `'table'` | Select the output representation or Docker format template. |
+| `--kind` | one of: `image`, `layer`, `all` | `'all'` | artifact kind to list (default: all) |
+| `--format` | one of: `table`, `json` | `'table'` | output format (default: table) |
 
 ### `palimpsest store rm`
 
@@ -1184,8 +1214,8 @@ usage: palimpsest store rm [-h] [--force] digest
 
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
-| `digest` | string | required | Expected or selected SHA-256 content digest. |
-| `--force` | flag | `False` | Accepted for compatibility; does not bypass referenced-object or lease protections. |
+| `digest` | string | required | local artifact SHA-256 digest |
+| `--force` | flag | `False` | never bypasses protection for artifacts referenced by runs or projects |
 
 ### `palimpsest store move`
 
@@ -1199,8 +1229,8 @@ usage: palimpsest store move [-h] --to DESTINATION [--keep-source]
 
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
-| `--to` | Path | required | New local store path. |
-| `--keep-source` | flag | `False` | Keep source bytes after moving the store. |
+| `--to` | Path | required | destination state root |
+| `--keep-source` | flag | `False` | retain the source after migration |
 
 ### `palimpsest store set`
 
@@ -1214,7 +1244,7 @@ usage: palimpsest store set [-h] --to DESTINATION
 
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
-| `--to` | Path | required | New local store path. |
+| `--to` | Path | required | existing state root to select |
 
 ## `palimpsest completion`
 
@@ -1223,9 +1253,10 @@ usage: palimpsest store set [-h] --to DESTINATION
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest completion [-h] {zsh,bash,fish}
+usage: palimpsest completion [-h] [--install] {zsh,bash,fish}
 ```
 
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
-| `shell` | one of: `zsh`, `bash`, `fish` | required | Shell completion target. |
+| `shell` | one of: `zsh`, `bash`, `fish` | required | shell completion target |
+| `--install` | flag | `False` | install the script and print its path instead of script contents |

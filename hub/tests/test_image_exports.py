@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
+import os
+import threading
+import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from palimpsest_hub.models import Base, PalimpsestImageExport, PalimpsestImageExportDelegation
@@ -24,6 +29,7 @@ from palimpsest_hub.services.image_exports import (
     compute_source_fingerprint,
     serialize_export,
 )
+from palimpsest_hub.services.worker_leases import LeaseLost, role_lease, run_blocking
 
 
 def _now() -> datetime:
@@ -268,7 +274,7 @@ async def test_claimed_export_logs_lifecycle_without_sensitive_data(tmp_path, mo
             elif outcome == "error":
                 assert stored.error_code == "export_failed"
             else:
-                assert stored.lease_owner == "worker-secret-id"
+                assert stored.lease_owner.startswith("worker-secret-id:")
             # Terminal outcomes delete the Trust; a lost lease leaves it to the new owner.
             if outcome == "lease_lost":
                 assert (retained.state, deleted) == (image_exports.DELEGATION_ACTIVE, [])
@@ -288,3 +294,269 @@ async def test_claimed_export_logs_lifecycle_without_sensitive_data(tmp_path, mo
             assert forbidden not in emitted
     finally:
         await engine.dispose()
+
+
+@pytest.fixture
+async def export_db(tmp_path, monkeypatch):
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'ownership.sqlite'}")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    store = LocalPathBlobStore(tmp_path / "ownership-store")
+    monkeypatch.setattr(image_exports, "get_session_factory", lambda: factory)
+    monkeypatch.setattr(image_exports, "get_blob_store", lambda: store)
+    try:
+        yield SimpleNamespace(factory=factory, store=store)
+    finally:
+        await engine.dispose()
+
+
+async def _queued_export(factory):
+    job = PalimpsestImageExport(
+        id=str(uuid.uuid4()),
+        project_id="project",
+        created_by="requester",
+        source_image_id=str(uuid.uuid4()),
+        source_name="source",
+        source_disk_format="raw",
+        source_size_bytes=1,
+        source_virtual_size_bytes=1,
+        source_hash_algo="sha256",
+        source_hash_value="a" * 64,
+        source_fingerprint=uuid.uuid4().hex * 2,
+        artifact_key=uuid.uuid4().hex * 2,
+        target_disk_format="raw",
+        status="queued",
+        progress_pct=0,
+    )
+    async with factory() as session, session.begin():
+        session.add(job)
+    return job
+
+
+@pytest.mark.asyncio
+async def test_export_expiry_rejects_heartbeat_and_completion_and_reclaim_has_unique_token(export_db):
+    factory = export_db.factory
+    job = await _queued_export(factory)
+    first = await image_exports.claim_next_image_export(owner="same-process")
+    async with factory() as session, session.begin():
+        await session.execute(
+            update(PalimpsestImageExport)
+            .where(
+                PalimpsestImageExport.id == job.id,
+            )
+            .values(lease_expires_at=_now() - timedelta(seconds=1))
+        )
+        assert not await image_exports._update_job_cas(session, job.id, first.lease_owner)
+        assert not await image_exports._update_job_cas(
+            session,
+            job.id,
+            first.lease_owner,
+            status="complete",
+            clear_lease=True,
+        )
+    second = await image_exports.claim_next_image_export(owner="same-process")
+    assert second.id == first.id and second.attempts == first.attempts + 1
+    assert second.lease_owner != first.lease_owner
+    async with factory() as session, session.begin():
+        assert not await image_exports._update_job_cas(
+            session,
+            job.id,
+            first.lease_owner,
+            status="error",
+            clear_lease=True,
+        )
+        assert await image_exports._update_job_cas(session, job.id, second.lease_owner)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_status", [None, "complete", "error"])
+async def test_export_cas_synchronizes_reloaded_naive_timestamp_owner(export_db, terminal_status):
+    factory = export_db.factory
+    job = await _queued_export(factory)
+    claimed = await image_exports.claim_next_image_export(owner="timestamp-owner")
+    async with factory() as session, session.begin():
+        loaded = await session.get(PalimpsestImageExport, job.id)
+        # SQLite, like MySQL DATETIME, returns naive storage timestamps. Keep
+        # this object in the identity map to exercise ORM bulk synchronization.
+        assert loaded.lease_expires_at.tzinfo is None
+        previous_expiry = image_exports._aware(loaded.lease_expires_at)
+        assert await image_exports._update_job_cas(
+            session,
+            job.id,
+            claimed.lease_owner,
+            status=terminal_status,
+            progress_pct=17,
+            clear_lease=terminal_status is not None,
+            extend_lease_seconds=300,
+        )
+        assert await session.get(PalimpsestImageExport, job.id) is loaded
+        assert loaded.status == (terminal_status or "downloading")
+        assert loaded.progress_pct == 17
+        if terminal_status is None:
+            assert loaded.lease_owner == claimed.lease_owner
+            assert image_exports._aware(loaded.lease_expires_at) > previous_expiry
+        else:
+            assert loaded.lease_owner is None and loaded.lease_expires_at is None
+    async with factory() as session:
+        persisted = await session.get(PalimpsestImageExport, job.id)
+        assert persisted.status == (terminal_status or "downloading")
+        assert persisted.progress_pct == 17
+        assert persisted.lease_owner == (claimed.lease_owner if terminal_status is None else None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("expired", [False, True])
+async def test_soft_delete_checks_reloaded_naive_export_lease_without_adopting_live_owner(export_db, expired):
+    factory = export_db.factory
+    job = await _queued_export(factory)
+    claimed = await image_exports.claim_next_image_export(owner="delete-owner")
+    async with factory() as session, session.begin():
+        await session.execute(
+            update(PalimpsestImageExport)
+            .where(
+                PalimpsestImageExport.id == job.id,
+            )
+            .values(lease_expires_at=_now() + timedelta(seconds=-1 if expired else 120))
+        )
+    if expired:
+        deleted = await image_exports.soft_delete_project_export(job.project_id, job.id)
+        assert deleted.deleted_at is not None
+    else:
+        with pytest.raises(image_exports.ImageExportError) as error:
+            await image_exports.soft_delete_project_export(job.project_id, job.id)
+        assert error.value.status_code == 409 and error.value.code == "cannot_delete_active_job"
+    async with factory() as session:
+        persisted = await session.get(PalimpsestImageExport, job.id)
+        assert (persisted.deleted_at is not None) is expired
+        assert persisted.lease_owner == claimed.lease_owner and persisted.status == "downloading"
+
+
+@pytest.mark.asyncio
+async def test_maintenance_keeps_live_unknown_and_current_attempt_scratch(export_db):
+    factory, store = export_db.factory, export_db.store
+    await _queued_export(factory)
+    old = await image_exports.claim_next_image_export(owner="process")
+    old_path = image_exports._scratch_dir_for(store.exports_dir, old, old.lease_owner)
+    async with factory() as session, session.begin():
+        await session.execute(
+            update(PalimpsestImageExport)
+            .where(
+                PalimpsestImageExport.id == old.id,
+            )
+            .values(lease_expires_at=_now() - timedelta(seconds=1))
+        )
+    current = await image_exports.claim_next_image_export(owner="process")
+    current_path = image_exports._scratch_dir_for(store.exports_dir, current, current.lease_owner)
+    unknown_owner = image_exports._scratch_dir_for(store.exports_dir, current, "unrecognized-attempt")
+    unknown_job = store.exports_dir / f"{uuid.uuid4()}-1-{'a' * 12}"
+    legacy = store.exports_dir / "legacy-name"
+    for path in (old_path, current_path, unknown_owner, unknown_job, legacy):
+        path.mkdir(parents=True)
+        (path / "output.raw").write_bytes(b"owned bytes")
+        os.utime(path, (1, 1))
+    await image_exports.run_export_maintenance(max_age_seconds=1)
+    assert not old_path.exists()
+    for path in (current_path, unknown_owner, unknown_job, legacy):
+        assert (path / "output.raw").read_bytes() == b"owned bytes"
+    async with factory() as session, session.begin():
+        await session.execute(
+            update(PalimpsestImageExport)
+            .where(
+                PalimpsestImageExport.id == current.id,
+            )
+            .values(lease_expires_at=_now() - timedelta(seconds=1))
+        )
+    await image_exports.run_export_maintenance(max_age_seconds=1)
+    assert not current_path.exists()
+    assert unknown_owner.exists() and unknown_job.exists() and legacy.exists()
+
+
+@pytest.mark.asyncio
+async def test_competing_maintenance_role_skips_shared_blob_removal(export_db):
+    store = export_db.store
+    store.blobs_dir.mkdir(parents=True, exist_ok=True)
+    blob = store.blobs_dir / ("a" * 64)
+    blob.write_bytes(b"old unreferenced bytes")
+    os.utime(blob, (1, 1))
+    async with role_lease(export_db.factory, "export-maintenance") as lease:
+        assert lease is not None
+        await image_exports.run_export_maintenance(max_age_seconds=1)
+        assert blob.exists()
+    await image_exports.run_export_maintenance(max_age_seconds=1)
+    assert not blob.exists()
+
+
+@pytest.mark.asyncio
+async def test_role_lease_renews_and_excludes_competitors(export_db):
+    async with role_lease(export_db.factory, "renewal", ttl_seconds=0.6) as first:
+        assert first is not None
+        await asyncio.sleep(1.4)
+        assert not first.lost.is_set()
+        async with role_lease(export_db.factory, "renewal") as contender:
+            assert contender is None
+    async with role_lease(export_db.factory, "renewal") as successor:
+        assert successor is not None and successor.token != first.token
+        await first.release()
+        assert await successor.renew()
+
+
+@pytest.mark.asyncio
+async def test_expired_role_cannot_renew_fence_or_release_successor(export_db):
+    from palimpsest_hub.models import PalimpsestWorkerLease
+
+    async with role_lease(export_db.factory, "expiry") as first:
+        async with export_db.factory() as session, session.begin():
+            await session.execute(
+                update(PalimpsestWorkerLease)
+                .where(
+                    PalimpsestWorkerLease.name == "expiry",
+                )
+                .values(expires_at=_now() - timedelta(seconds=1))
+            )
+        assert not await first.renew()
+        with pytest.raises(LeaseLost):
+            async with first.fence():
+                pytest.fail("expired lease entered effect fence")
+        async with role_lease(export_db.factory, "expiry") as successor:
+            assert successor is not None and successor.token != first.token
+            await first.release()
+            async with export_db.factory() as session:
+                stored = await session.scalar(
+                    select(PalimpsestWorkerLease).where(
+                        PalimpsestWorkerLease.name == "expiry",
+                    )
+                )
+                assert stored.token == successor.token
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("thread_fails", [False, True])
+async def test_blocking_effect_drains_repeated_cancellation_without_replacing_it(thread_fails):
+    started, release, drained = threading.Event(), threading.Event(), threading.Event()
+
+    def effect():
+        started.set()
+        try:
+            assert release.wait(5), "test did not release the blocking effect"
+            if thread_fails:
+                raise RuntimeError("late provider failure")
+            return "completed"
+        finally:
+            drained.set()
+
+    task = asyncio.create_task(run_blocking(effect))
+    try:
+        assert await asyncio.to_thread(started.wait, 3)
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done() and not drained.is_set()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert drained.is_set()
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)

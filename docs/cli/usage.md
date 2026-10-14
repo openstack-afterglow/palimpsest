@@ -83,7 +83,10 @@ palimpsest build --frontend palimpsestfile -f Palimpsestfile \
 
 Dockerfile builds accept a context, multiple tags, `-f`, platform/target/build args, named local OCI contexts, registry and cache selection, output controls, and optional runtime-block production.
 
+The default `--cache-mode native` requires an authorized Hub cache profile and package. `--cache-mode local` uses only the managed host cache and an OCI output profile; it needs no Hub URL or token and rejects native/external cache authorities. Local cache mode is not offline mode: remote Dockerfile inputs remain possible unless `--offline` is also selected.
+
 ```sh
+palimpsest build . -f Dockerfile -t example/app:dev --cache-mode local --registry docker
 palimpsest build . -f Dockerfile -t example/app:dev \
   --platform linux/amd64 --build-arg MODE=dev \
   --local-image base=/srv/oci/base@"$MANIFEST_DIGEST" --load
@@ -94,7 +97,7 @@ palimpsest build . -t example/app:release --push \
 Build restrictions enforced before execution:
 
 - `--offline` requires `--network none` and rejects `--pull`, `--push`, `--runtime-push`, `--registry`, and external `--cache-from`/`--cache-to`.
-- `--no-cache` is allowed only in offline mode; online builds must reuse Hub cache.
+- `--no-cache` requires `--offline` or `--cache-mode local`; online native-cache builds must reuse Hub cache.
 - `--runtime-tag` and `--runtime-base` must appear together; `--runtime-push` also requires both.
 - `--local-image` uses `ALIAS=/absolute/layout@sha256:DIGEST`; the layout and pinned manifest graph are verified. `--runtime-block-size` defaults semantically to 131072 bytes and must be a power of two from 4096 through 1048576.
 - `--output` is an OCI archive path, not arbitrary BuildKit exporter syntax; omission creates an invocation-unique archive beneath local build state.
@@ -108,11 +111,17 @@ palimpsest run IMAGE_DIGEST --name dev --memory 4096 --vcpus 2
 palimpsest run ./bundle --name bundled --layer "$LAYER_DIGEST"
 palimpsest run ./app.oci.tar --runtime-kind oci-root --name app
 palimpsest run ./app.oci.tar --runtime-kind oci-root --name app -d
+palimpsest run alpine:3.20 --name app
+palimpsest run app:v1 --registry corp --name app
 ```
+
+Without an explicit runtime kind, `run IMAGE` checks local cloud CAS/tags, successful BuildKit OCI exports, native OCI package receipts, retained acquired archives, and then every eligible local Docker name before querying configured OCI registries. Layout inference uses manifest/config semantics, not the shared `oci-layout` marker. Conflicting local Docker image IDs are an error. Acquired archives are verified and retained in owner-only storage for later local reuse; local build/package bindings take precedence over this retained reference cache.
+
+An explicit authority or `--registry` restricts reference resolution to that authority/profile, including local named bindings; explicit local paths/digests remain local. Unqualified remote lookup tries the configured default (or `PALIMPSEST_REGISTRY`) first, then other OCI aliases in sorted order. Only a genuine image miss advances to another profile: Docker daemon, authentication, TLS, transport and verification failures stop. Native Palimpsest package profiles are not Docker `/v2` registries; pull those packages explicitly before running their local OCI receipt. See [automatic run acquisition](../registries.md#automatic-run-acquisition).
 
 Cloud-image runs accept a local/Hub image digest or a Palimpsest bundle directory. Extra `--layer` values must continue the verified SquashFS parent chain. Backend `auto` selects KVM on Linux and Lima/VZ on macOS; experimental `libvirt-hvf` must be selected explicitly. Conventional cloud runs attach the image and layers but do not pivot the guest root.
 
-Local OCI-root runs accept a local OCI archive or image-layout path, not a registry reference. The public runtime is limited to Linux x86_64/amd64 KVM with `qemu:///system` and qualified absolute kernel/config/packer paths with digest proof. `--network` selects `nat` (the default when omitted), `host-only`, or `none`, and OCI-root-only `--publish` adds explicit loopback-by-default forwarding; see [OCI-root guest networking](../oci-network.md). The runtime remains capabilityless and is not a general hostile-container sandbox.
+OCI-root runs accept local OCI archives/layouts, verified build/package/retained bindings, or OCI registry references acquired through Skopeo. The public runtime is limited to Linux x86_64/amd64 KVM with `qemu:///system` and qualified absolute kernel/config/packer paths with digest proof. Unsupported hosts fail capability checks before Docker export, registry acquisition or runtime-state mutation. `--network` selects `nat` (the default when omitted), `host-only`, or `none`, and OCI-root-only `--publish` adds explicit loopback-by-default forwarding; see [OCI-root guest networking](../oci-network.md). The runtime remains capabilityless and is not a general hostile-container sandbox.
 
 Without `-d`, OCI `run` waits for the image workload, streams its output, and returns its exit status; it does not imply `palimpsest rm` or deletion of durable run state. `-d` returns the run name only after authenticated READY and leaves the VM running. Detach is OCI-root-only. `--manifest` pins an otherwise ambiguous root descriptor. `--user USER[:GROUP]` is OCI-root-only and changes the image user selection without adding capabilities, supplementary groups, or ownership changes. A literal `-- COMMAND [ARG...]` replaces only the local OCI image Cmd while preserving Entrypoint; see the [command override contract](../oci-run-command.md). It is literal argv and does not add a shell, environment override, TTY, keepalive, GPU, or device access.
 
@@ -159,18 +168,52 @@ palimpsest compose down --volumes
 `store show` reports the selected roots and `store ls` inventories images/layers. `store rm DIGEST` always refuses referenced or leased objects; the accepted `--force` flag does not bypass those safety checks. `store move --to PATH` migrates the selected store; `--keep-source` retains the old bytes. `store set --to PATH` changes the configured location without moving existing data.
 
 ```sh
+palimpsest ps
+palimpsest volumes --format json
+palimpsest networks --format json
 palimpsest store show --format json
 palimpsest store ls --kind layer
 palimpsest store move --to /srv/palimpsest/store --keep-source
-palimpsest ui --port 8080 --no-browser
-palimpsest ui --allow-control
+palimpsest web --port 8080 --no-browser
+palimpsest web --allow-control
 ```
 
-`ui --port 0` (the default) chooses an available port. Explicit ports must be 1024–65535. State roots are owner-only; Linux's default is `/var/lib/palimpsest` only when no env/config/XDG override is present. Existing legacy state is not silently migrated.
+`volumes` and `networks` are read-only list commands. Their default tables show backend, observation status, disk measurements or network addressing, and attached VM names; `--format json` preserves IDs, provenance, attachments and warnings for automation.
 
-`ui` is a foreground process, not a background daemon: it serves the packaged, offline dashboard on `127.0.0.1` only until interrupted, and prints a URL carrying a per-process token. The page removes that token from the address bar and keeps it in the tab session, so reloading the tab works while the process runs; a restarted process needs its new URL. Assets and `/api/v1` require the token as a bearer header. Run it as the UID that owns the selected state root. For a remote host, keep the loopback bind and forward it, for example `ssh -L 8080:127.0.0.1:8080 HOST`.
+`ps`, `volumes`, `networks` and `compose ps` align headings and all displayed
+rows with two spaces between columns. Widths follow actual terminal cells,
+including wide characters and combining marks; long names are not truncated.
+Missing values remain `-`, and zero-byte measurements remain `0`. JSON output
+is unaffected by table presentation.
 
-The dashboard is read-only by default: every `POST`/`DELETE` returns `403` before any side effect, and the page hides management controls. Read-only does not mean the VM view is a static snapshot: it live-reconciles each run against its backend, and when the observed status differs (for example, a Lima instance stopped outside Palimpsest) the reconciliation records that status in the run ledger, as the runtime does elsewhere. `--allow-control` enables the existing VM start/stop/remove, cloud-image import, unreferenced artifact removal, and state-root move/set actions with confirmations.
+`web --port 0` (the default) chooses an available port. Explicit ports must be 1024–65535. State roots are owner-only. Ordinary Linux users default to `~/.local/state/palimpsest`; root and the dedicated `palimpsest` account retain `/var/lib/palimpsest`. Explicit env/config/XDG overrides remain supported; existing state is not silently migrated.
+
+`web` replaces the former `ui` command. It is a foreground process, not a daemon or an installation-time service: ordinary CLI commands never start it. The packaged dashboard binds only `127.0.0.1` and stops serving when the command exits, including Ctrl-C/SIGINT or SIGTERM. It opens a browser by default; `--no-browser` only prints the URL. If no browser is available, open that printed URL manually. No Hub URL, token or connection is required, and the page makes no Hub requests.
+
+The printed URL carries a per-process token. The page removes it from the address bar and keeps it in the tab session, so reloading works while the process runs; a restarted process needs its new URL. Assets and `/api/v1` require the token as a bearer header. Run it as the UID that owns the selected state root. For a remote host, keep the loopback bind and forward it, for example `ssh -L 8080:127.0.0.1:8080 HOST`.
+
+The dashboard is read-only by default: every `POST`/`DELETE` returns `403` before any side effect, and the page hides management controls. Read-only does not mean the VM view is a static snapshot: it live-reconciles each run against its backend, and when observed status differs the reconciliation records that status in the run ledger. `--allow-control` enables image build/run, connected consoles, VM start/stop/remove, cloud-image import, verified local CAS tag assignment, unreferenced CAS artifact removal, and state-root move/set with confirmations. Tags cannot silently be reassigned to another digest. Artifact bytes and build identities remain immutable; build-record and retained-source OCI archives are not edited or deleted through the CAS controls.
+
+Build and run forms submit `POST /api/v1/builds` and `POST /api/v1/vms`, returning `202` with operation IDs. `GET /api/v1/operations` exposes completion and bounded output while views refresh without replacing their output panels. At most two operations are active, with 32 retained records and a 128 KiB raw output tail per operation. The build form supports inline Dockerfile editing and local-cache builds with no Hub connection. Run uses the same CLI source resolver and platform checks. Closing the dashboard cancels owned preparation tools, not an already launched VM; use Stop/Remove for VM lifecycle changes.
+
+The VM console opens a session through `POST /api/v1/vms/{identifier}/console`,
+using the row's stable ID and original `expected_run_id`. Conventional VM shells
+use a PTY with resize and terminal input; OCI-root access is non-TTY guest exec,
+not PID 1 attachment, and requires a command. Selected owned runs use their
+existing runtime transport. Marked, physically verified external Lima VZ
+instances can use their backend-provided transport without importing a ledger;
+unmarked, stale or replaced identities, and external libvirt domains without
+authenticated credentials, expose an explicit unavailable reason instead.
+Interactive access still requires `--allow-control`. Unsupported controls are
+disabled from the session capabilities. Completion distinguishes exit codes
+from signals, and bounded sessions expire when idle. Disconnect, drawer close
+and tab unload close only the owned console transport, never the VM.
+OCI foreground disconnect detaches the consumer, not its submitted command:
+the original owner drains output and acknowledges completion under the existing
+guest deadline and transport grace. Normal dashboard SIGINT/SIGTERM stops new
+OCI admission and waits for both console and detached probe owners (at most 32)
+before process exit. Unconfirmed ACKs are reported as unresolved; shutdown
+never takes over a result, retries the command or stops the VM.
 
 Polling reads time out after fifteen seconds; control requests instead remain busy until the server returns, because VM starts and storage moves can outlive a polling interval. Closing a VM drawer clears its optional volume-deletion choice before inspecting another VM. The keyboard skip link reaches the active view's main content without changing the resource view.
 
@@ -178,10 +221,30 @@ While the tab is visible it refreshes resource views every five seconds without 
 
 | View | Source | Not a claim of |
 | --- | --- | --- |
-| VMs | live backend reconciliation; durable ledger values marked stale when reconciliation fails | guest health or service readiness |
-| Volumes | project volume ledgers (including preserved volumes without a VM), OCI root-volume records, run volume attachments, and the managed KVM/HVF overlay file length | verified ext4 contents, current block attachment, or virtual disk capacity (shown as unavailable) |
-| Layers and images | the local content store, tags, and run/project references | Hub or registry state |
-| Networks | run ledgers (conventional runs grouped by backend network) and each OCI-root run's committed domain plan; Lima attachments omit the recorded guest address because it belongs to the user-mode interface | an existing bridge, NAT, or open listener |
+| VMs | live Lima/libvirt host observation plus selected-state reconciliation; explicit detail probes read the Linux guest journal, `/proc` counters and `df` through an authenticated transport | service readiness, lifecycle authority over external VMs, or measurements from an unavailable transport |
+| Volumes | host primary/additional disks and selected project/OCI root-volume records; backend-reported capacity, backing-file length and allocated host bytes are distinct measurements | verified filesystem contents or capacity when the backend did not report it |
+| Layers and images | local CAS metadata/tags and run/project references, plus successful local BuildKit OCI export records and retained acquired sources, typed manifest/archive/runtime identities and archive presence/size observations | Hub/registry state, archive content verification or OCI-root runnability |
+| Networks | backend network definitions and VM attachments plus selected-state committed OCI plans; Lima configuration is marked configured, not live traffic | successful packet delivery, guest address discovery, or an open published listener |
 | Builds and storage | local build records, the engine's console file (`console.log` for Palimpsestfile, `buildkit.log` for BuildKit; tails read at most 4 MiB), and state-directory usage | — |
 
-Only resources managed in the selected Palimpsest state are listed; unrelated Lima, libvirt, or Docker resources are not discovered. Unknown or malformed metadata appears as an unavailable row or warning rather than an empty inventory.
+`palimpsest ps` and the web VM, volume and network views discover resources
+across the local Lima/libvirt backend, even when they were launched with a
+different `PALIMPSEST_STATE_HOME`. Only exact backend/name/run-ID matches in the
+selected state can start, stop or remove a VM. Discovery never imports another
+state directory or adopts a resource. Logs, measurements and opt-in consoles
+use independently reported access capabilities and revalidate the selected
+identity. Artifacts, builds and state storage remain scoped to the selected
+state. Docker containers are not VM inventory. Unknown or malformed metadata
+and failed backend queries remain visible as unavailable observations or warnings.
+
+VM detail probes run only for the open VM, not every resource in list refreshes.
+Running logs are the bounded guest system journal; stopped selected libvirt
+runs show their identity-pinned retained console, and stopped Lima instances
+can show their native serial log when available. Guest probes have a ten-second
+transport deadline and a 512 KiB output cap. Measurements distinguish guest
+memory and filesystem use from configured RAM and host disk allocation. CPU
+usage and network/disk rates require consecutive samples; first samples,
+reboots, counter resets and paused sampling do not display invented rates.
+Block-device counters are shown per device rather than summed with partitions.
+
+Recorded OCI exports and retained acquired sources remain visible when their archive is missing or unavailable; availability means a regular local file with matching recorded size was observed, not that its digest was reverified. Polling does not rehash whole image archives. Running a selected source does reverify its archive. Recorded Docker output tags are provenance, separate from editable local CAS tags. The image detail links to its originating build when present and separates OCI manifest, OCI archive and SquashFS runtime-block digests.

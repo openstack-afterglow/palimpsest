@@ -74,6 +74,10 @@ async def migrate(source_url: str, destination_url: str, *, dry_run: bool = Fals
                     copied[table_name] = 0
                     continue
                 rows = [dict(row) for row in (await source.execute(select(source_table))).mappings()]
+                if table_name == "palimpsest_hub_builds":
+                    # Retired SQL-connected builder location is not HTTP attempt authority.
+                    for row in rows:
+                        row.pop("execution_node", None)
                 copied[table_name] = len(rows)
                 if rows and not dry_run:
                     await destination.execute(destination_table.insert(), rows)

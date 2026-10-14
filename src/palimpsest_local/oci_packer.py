@@ -26,6 +26,7 @@ from .errors import ArtifactValidationError, UnsupportedPlatformError
 from .oci_changeset import EntryKind
 from .oci_converter import StagedLayer
 from .oci_tar_emitter import TarEmissionReceipt, normalized_xattr_bytes
+from .web_job_client import run_preparation_tool
 
 _IO_CHUNK = 1024 * 1024
 _SQUASHFS_SUPERBLOCK_SIZE = 96
@@ -317,7 +318,7 @@ def _discover_dependency_paths(packer_path: Path) -> tuple[Path, ...]:
     if inspector_owner not in {0, os.geteuid()}:
         raise SquashFSPackError("oci-packer-toolchain", "dynamic dependency inspector is unsafe")
     try:
-        result = subprocess.run(
+        result = run_preparation_tool(
             [os.fspath(inspector.path), os.fspath(packer_path)],
             check=False,
             capture_output=True,
@@ -366,7 +367,7 @@ def discover_squashfs_toolchain(
     if executable.digest != f"sha256:{expected_packer_sha256}":
         raise SquashFSPackError("oci-packer-digest", "selected packer digest does not match")
     try:
-        result = subprocess.run(
+        result = run_preparation_tool(
             [os.fspath(executable.path), "-version"],
             check=False,
             capture_output=True,

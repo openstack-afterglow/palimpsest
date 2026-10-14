@@ -1,6 +1,6 @@
 # Explicit OCI run users
 
-`palimpsest run` accepts `--user USER[:GROUP]` for local OCI-root images only.
+`palimpsest run` accepts `--user USER[:GROUP]` for OCI-root images only.
 This is an explicit launch-identity override, not an image rewrite or a
 privilege option. Omitting it preserves the image's configured process.
 
@@ -9,8 +9,10 @@ palimpsest run ./redis.oci.tar --runtime-kind oci-root \
   --name redis-demo --user redis --memory 512 --vcpus 1 --network none -d
 ```
 
-The archive must already exist locally and satisfy the ordinary source and
-host qualification checks. Registry references are not accepted directly.
+The example archive must already exist locally and satisfy the ordinary source
+and host qualification checks. Registry references can also use [automatic
+local-first acquisition](registries.md#automatic-run-acquisition), with the same
+OCI source validation and user-override policy after acquisition.
 The example is not a claim that every Redis image is compatible.
 
 ## Identity and isolation

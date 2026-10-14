@@ -224,10 +224,6 @@ class LocalPathBlobStore:
         """Serialize creation against the per-project active-session cap."""
         return self._acquire_project_lock(project_id, "upload", blocking=blocking)
 
-    def acquire_project_build_lock(self, project_id: str, *, blocking: bool = True) -> int | None:
-        """Serialize count-and-insert against the per-project build cap."""
-        return self._acquire_project_lock(project_id, "build", blocking=blocking)
-
     def _acquire_project_lock(self, project_id: str, kind: str, *, blocking: bool) -> int | None:
         name = hashlib.sha256(project_id.encode("utf-8")).hexdigest()
         return self._acquire_lock_file(f"project-{kind}-{name}.lock", blocking=blocking)

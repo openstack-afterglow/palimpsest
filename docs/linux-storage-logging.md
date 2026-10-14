@@ -1,36 +1,49 @@
 # Linux storage and logging rollout
 
-## Current first slice
+## Install-and-use defaults
 
-On Linux, a fresh process with no `PALIMPSEST_STATE_HOME`, no configured
-`storage.state_root`, and no explicitly set `XDG_STATE_HOME` resolves its managed
-state and assets to `/var/lib/palimpsest`. Explicit roots keep their existing
-precedence:
+Regular Linux users select their existing `~/.local/state/palimpsest` directory
+without setting state or logging environment variables. Fresh users initialize
+that same private directory on the first state-using command; existing store
+metadata, tags, run/project ledgers, volumes, and build records stay in place.
+For example, `palimpsest store show` and `palimpsest store ls --kind image` are
+local commands and need no Hub URL or token.
+
+Explicit roots retain their precedence for every identity:
 
 1. `PALIMPSEST_STATE_HOME`
 2. `[storage].state_root` in `config.toml`
 3. an explicitly set `XDG_STATE_HOME`, with `/palimpsest` appended
-4. the Linux system default `/var/lib/palimpsest`
+4. the identity-specific default
 
-Root resolution itself does not create or change `/var/lib`, migrate an existing
-XDG or configured root, or delete old state. Normal state initialization creates
-the selected root only when operating-system permissions allow it; this change
-does not install or preprovision system directories. The separate root-only
+On Linux, effective UID 0 and the dedicated effective account named
+`palimpsest` with home `/var/lib/palimpsest` retain the system state default.
+Effective account lookup, not `USER`, `LOGNAME`, home-directory contents, low UID
+heuristics, or a write-access probe determines that policy. An unknown account,
+failed lookup, or conflicting named-service home refuses default selection
+rather than silently choosing user storage. Explicit roots remain authoritative.
+Other Linux accounts use the private home default; non-Linux state defaults are
+unchanged. Root resolution only
+selects paths and reads configuration: it creates no directories, changes no
+permissions or ownership, and never migrates data or falls back to another
+existing root when initialization fails.
+
+Package installation with pip or uv creates no accounts, mutable state, shell
+configuration, or hypervisor setup. The separate root-only
 `python -I -m palimpsest_local.linux_install` installation step creates the
 no-login `palimpsest` system account and primary group, with its home at
-`/var/lib/palimpsest`, and both standard directories owned by
+`/var/lib/palimpsest`, and both standard system directories owned by
 `palimpsest:palimpsest` with mode `0700`. Use the administrator-owned Python
-installation described in [installation](install.md). Package installation alone
-does not invoke sudo or modify host accounts. Existing explicit roots remain valid and
-are the supported way to continue managing existing runs, failed VMs, volumes,
-layers, and other assets without moving them.
+installation described in [installation](install.md). Existing explicit roots
+remain valid without moving their assets.
 
-If the former unconfigured path `~/.local/state/palimpsest` already exists,
-including as a symlink, Palimpsest refuses to silently hide it behind the new
-system default. Set `XDG_STATE_HOME=$HOME/.local/state` to select that legacy
-root explicitly. This performs no migration. The existing `store move` command
-has its own safety preconditions and will not relocate a root that still
-contains runs or projects.
+The legacy-root guard applies only when a root or dedicated-account process
+would select the system default. If its former home state path already exists,
+including as a symlink, it must explicitly select that root with
+`XDG_STATE_HOME=$HOME/.local/state` rather than silently hiding it behind the
+system default. Ordinary users already select the home directory and need no
+such override. This performs no migration; `store move` retains its own safety
+preconditions and does not relocate roots containing runs or projects.
 
 The managed state root contains the content store, source and derived OCI data,
 BuildKit cache, run and project ledgers, writable project volumes, OCI root
@@ -55,11 +68,34 @@ Docker/libvirt/KVM group membership, or runtime daemon is installed.
 
 ## Chronological host command journal
 
-The CLI records command start/end observations in
-`/var/log/palimpsest/commands.jsonl`. `PALIMPSEST_LOG_HOME` can explicitly select
-another preprovisioned absolute owner-private directory; outside Linux the
-journal is disabled unless this override is present. Invalid overrides warn,
-rather than silently disabling recording.
+On Linux, dispatched CLI commands record start/end observations in
+`commands.jsonl` under the following directory:
+
+- Regular users: `logs/` beneath the selected state root, normally
+  `~/.local/state/palimpsest/logs`. State environment/config/XDG overrides also
+  select this journal namespace.
+- Root or the dedicated `palimpsest` account: `/var/log/palimpsest`, still
+  preprovisioned by the administrator and never automatically created by the CLI.
+- Explicit `PALIMPSEST_LOG_HOME`: that absolute owner-private directory, on
+  Linux or Darwin. Explicit directories must already exist; invalid, unavailable,
+  or unsafe overrides warn instead of silently choosing another path.
+
+Only the regular-user Linux default provisions missing directory components,
+using pinned no-follow directory descriptors, effective-UID ownership, and
+`0700` modes. Existing directory modes/owners are not repaired. Foreign-owned,
+symlinked, or group/world-writable ancestors are refused, except root-owned
+sticky temporary-directory ancestors. The selected state root itself must be
+owned by the effective UID. System paths and explicit log overrides retain the
+preprovisioned-only policy. The journal itself remains `0600`.
+Directory provisioning happens only at command start. If a command moves or
+removes that selected state root, its end observation warns rather than
+recreating the old root; the next invocation resolves the current configuration.
+
+Darwin keeps the existing opt-in journal policy: no default log directory is
+created and no journal is recorded unless `PALIMPSEST_LOG_HOME` is supplied.
+This preserves its established side-effect boundary while removing the Linux
+requirement for a manually provisioned system journal. Explicit Darwin logging
+uses the same record and filesystem safety rules.
 
 Records contain only a fixed schema, allowlisted command family (or `unknown`),
 start/end phase, command success/error, random invocation ID, UTC observation

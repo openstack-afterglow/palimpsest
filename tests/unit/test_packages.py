@@ -362,6 +362,28 @@ def test_runtime_bundle_resolves_ancestor_configs_from_other_roots(tmp_path):
         assert snapshot.package_type == "runtime-bundle"
         assert snapshot.platforms == ({"os": "linux", "architecture": "amd64"},)
         assert {first_root["digest"], base_root["digest"], leaf_root["digest"]} <= set(snapshot.graph)
+        assert snapshot.runtime_configs[second["digest"]] == leaf_config
+        from palimpsest_local.remote_artifacts import RemoteArtifacts
+        from palimpsest_local.state import init_roots
+
+        roots = init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+        run_source = RemoteArtifacts(roots)._import_runtime(snapshot)
+        assert run_source["image"] == base["digest"]
+        assert run_source["layers"] == [first["digest"], second["digest"]]
+        assert run_source["runtime_kind"] == "cloud-image"
+
+    implicit_first = root([base, first], {"kind": "squashfs", "parent_digest": None})
+    implicit_leaf = root(
+        [base, first, second], {key: value for key, value in leaf_config.items() if key != "base_image_digest"}
+    )
+    _set_roots(layout, [base_root, implicit_first, implicit_leaf])
+    with snapshot_package(layout, manifest=implicit_leaf["digest"]) as snapshot:
+        assert snapshot.runtime_bases[first["digest"]] == (base["digest"],)
+        assert snapshot.runtime_bases[second["digest"]] == (base["digest"],)
+        assert "base_image_digest" not in snapshot.runtime_configs[second["digest"]]
+        imported = RemoteArtifacts(roots)._import_runtime(snapshot)
+        assert imported["image"] == base["digest"]
+        assert imported["layers"] == [first["digest"], second["digest"]]
 
     bad_root = root([base, first, second], {**leaf_config, "parent_digest": None})
     _set_roots(layout, [base_root, first_root, bad_root])
@@ -1030,3 +1052,291 @@ def test_platform_version_uses_hub_byte_bound_not_repository_grammar(tmp_path, v
     else:
         with snapshot_package(layout) as snapshot:
             assert snapshot.platforms == ({"os": "windows", "architecture": "amd64", "os.version": version},)
+
+
+def _inventory_summary(**changes):
+    return {
+        "project_id": _PROJECT,
+        "namespace": "team",
+        "name": "app",
+        "package_type": "oci-image",
+        "tags": [{"tag": "latest", "digest": "sha256:" + "a" * 64}],
+        "platforms": [],
+        **changes,
+    }
+
+
+@pytest.mark.parametrize("operation", ["list_packages", "get_package", "list_versions"])
+@pytest.mark.parametrize("actions", [["packages:read"], ["packages:write"], ["cache:read", "cache:write"]])
+def test_native_inventory_requires_inventory_not_content_or_cache_actions(operation, actions):
+    hub = _Hub(_actor(actions=actions))
+    client = _client(hub)
+    arguments = () if operation == "list_packages" else ("app",)
+    with pytest.raises(PackageError, match="does not authorize"):
+        getattr(client, operation)(*arguments)
+    assert hub.requests == [("GET", "/auth/me")]
+
+
+@pytest.mark.parametrize("operation", ["list_packages", "get_package", "list_versions"])
+def test_native_inventory_reauthenticates_after_inventory_action_revocation(operation):
+    hub = _Hub(_actor(actions=["packages:inventory"]))
+    hub.routes[("GET", "/projects/team/packages")] = lambda request: {
+        "project_id": _PROJECT,
+        "namespace": "team",
+        "items": [_inventory_summary()],
+        "next_cursor": None,
+    }
+    hub.routes[("GET", "/projects/team/package")] = lambda request: _inventory_summary()
+    hub.routes[("GET", "/projects/team/versions")] = lambda request: {
+        "project_id": _PROJECT,
+        "namespace": "team",
+        "package": "app",
+        "items": [],
+        "next_cursor": None,
+    }
+    client = _client(hub)
+    arguments = () if operation == "list_packages" else ("app",)
+    getattr(client, operation)(*arguments)
+    initial_requests = list(hub.requests)
+    hub.actor["actions"] = ["packages:read"]
+    with pytest.raises(PackageError, match="does not authorize"):
+        getattr(client, operation)(*arguments)
+    assert hub.requests == [*initial_requests, ("GET", "/auth/me")]
+
+
+def test_native_inventory_fresh_actor_and_exact_page_bindings():
+    hub = _Hub(_actor(actions=["packages:inventory"]))
+    hub.routes[("GET", "/projects/team/packages")] = lambda request: {
+        "project_id": _PROJECT,
+        "namespace": "team",
+        "items": [_inventory_summary()],
+        "next_cursor": None,
+    }
+    result = _client(hub).list_packages(limit=1)
+    assert result["items"][0]["name"] == "app"
+    assert hub.requests == [("GET", "/auth/me"), ("GET", "/projects/team/packages")]
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"project_id": "other"},
+        {"namespace": "other"},
+        {"name": "outside-scope"},
+        {"package_type": "cache"},
+        {"tags": [{"tag": "--option", "digest": "bad"}]},
+    ],
+)
+def test_native_inventory_rejects_foreign_or_malformed_summaries(changes):
+    hub = _Hub()
+    hub.routes[("GET", "/projects/team/packages")] = lambda request: {
+        "project_id": _PROJECT,
+        "namespace": "team",
+        "items": [_inventory_summary(**changes)],
+        "next_cursor": None,
+    }
+    with pytest.raises(PackageError):
+        _client(hub).list_packages(limit=1)
+
+
+@pytest.mark.parametrize("limit,cursor", [(0, None), (101, None), (True, None), (1, "bad/cursor"), (1, "x" * 2049)])
+def test_native_inventory_rejects_unbounded_query_before_auth(limit, cursor):
+    hub = _Hub()
+    with pytest.raises(PackageError):
+        _client(hub).list_packages(limit=limit, cursor=cursor)
+    assert hub.requests == []
+
+
+def test_native_version_inventory_exact_package_and_archive_bound():
+    hub = _Hub(_actor(actions=["packages:inventory"]))
+    item = {
+        "project_id": _PROJECT,
+        "namespace": "team",
+        "package": "app",
+        "root_digest": "sha256:" + "a" * 64,
+        "archive_digest": "sha256:" + "b" * 64,
+        "archive_size_bytes": 123,
+    }
+    hub.routes[("GET", "/projects/team/versions")] = lambda request: {
+        "project_id": _PROJECT,
+        "namespace": "team",
+        "package": "app",
+        "items": [item],
+        "next_cursor": None,
+    }
+    assert _client(hub).list_versions("app", limit=1)["items"] == [item]
+    item["package"] = "other"
+    with pytest.raises(PackageError, match="binding mismatch"):
+        _client(hub).list_versions("app", limit=1)
+
+
+def test_native_exact_detail_rejects_another_package():
+    hub = _Hub()
+    hub.routes[("GET", "/projects/team/package")] = lambda request: _inventory_summary(name="other")
+    with pytest.raises(PackageError, match="binding mismatch"):
+        _client(hub).get_package("app")
+
+
+def test_remote_native_upload_uses_managed_verified_build_snapshot_and_typed_receipt(tmp_path, monkeypatch):
+    from palimpsest_local.digest import digest_file
+    from palimpsest_local.package_reference import read_package_reference
+    from palimpsest_local.registry import add_profile, default_registry_config, save_registry_config
+    from palimpsest_local.remote_artifacts import RemoteArtifacts
+    from palimpsest_local.state import atomic_write_json, init_roots
+
+    roots = init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    layout = tmp_path / "layout"
+    root = _layout(layout)
+    archive = tmp_path / "built.oci.tar"
+    _archive(layout, archive)
+    build_id = "bk-" + "a" * 12
+    (roots.builds / build_id).mkdir(mode=0o700)
+    atomic_write_json(
+        roots.builds / build_id / "record.json",
+        {
+            "build_id": build_id,
+            "engine": "buildkit",
+            "status": "success",
+            "output_path": str(archive),
+            "output_oci_archive_digest": digest_file(archive),
+            "output_oci_manifest_digest": root["digest"],
+        },
+    )
+    profile = RegistryProfile("native", "example.test", protocol="palimpsest", api_base=_BASE, namespace="team")
+    save_registry_config(roots, add_profile(default_registry_config(), profile))
+    seen = []
+
+    class Client:
+        project_id = _PROJECT
+
+        def push(self, package, tag, snapshot):
+            assert package == "app" and tag == "selected"
+            assert snapshot.package_type == "oci-image" and snapshot.root_digest == root["digest"]
+            assert snapshot.graph[root["digest"]]["media_type"] == _MANIFEST
+            seen.append(snapshot.archive.read_bytes())
+            return {"digest": snapshot.root_digest}
+
+    backend = RemoteArtifacts(roots)
+    monkeypatch.setattr(backend, "_native", lambda profile: Client())
+    result = backend.upload("registry:native", {"kind": "build", "build_id": build_id}, "app:selected")
+    assert seen == [archive.read_bytes()]
+    record = read_package_reference(roots, "example.test/team/app:selected")
+    assert record.published_digest == root["digest"] and record.project_id == _PROJECT
+    assert result["receipt"] and record.archive != str(archive)
+
+
+def test_remote_native_download_retains_ambiguous_same_arch_runtime_index(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    from palimpsest_local.digest import digest_file
+    from palimpsest_local.oci_layout import ContentStore
+    from palimpsest_local.package_reference import read_package_reference
+    from palimpsest_local.registry import add_profile, default_registry_config, save_registry_config
+    from palimpsest_local.remote_artifacts import RemoteArtifacts
+    from palimpsest_local.state import init_roots
+
+    roots = init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    layout = tmp_path / "layout"
+    _new_layout(layout)
+    base = _blob(layout, _QCOW2, b"qcow2-shared-base")
+    first = _blob(layout, _SQUASHFS, b"hsqs-independent-first")
+    second = _blob(layout, _SQUASHFS, b"hsqs-independent-second")
+
+    def root(layers, config):
+        descriptor = _blob(layout, _RUNTIME_CONFIG, _json(config))
+        return _blob(
+            layout,
+            _MANIFEST,
+            _json({"schemaVersion": 2, "mediaType": _MANIFEST, "config": descriptor, "layers": layers}),
+        )
+
+    base_root = root([base], {"kind": "cloud-image", "disk_format": "qcow2", "arch": "x86_64"})
+    config = {"kind": "squashfs", "parent_digest": None, "base_image_digest": base["digest"], "arch": "x86_64"}
+    _set_roots(layout, [base_root, root([base, first], config), root([base, second], config)])
+    archive = tmp_path / "runtime.oci.tar"
+    _archive(layout, archive)
+    with snapshot_package(archive, manifest=digest_file(layout / "index.json")) as verified:
+        assert verified.package_type == "runtime-bundle"
+        assert verified.platforms == ({"os": "linux", "architecture": "amd64"},)
+        root_digest = verified.root_digest
+        archive_bytes = verified.archive.read_bytes()
+    profile = RegistryProfile("native", "example.test", protocol="palimpsest", api_base=_BASE, namespace="team")
+    save_registry_config(roots, add_profile(default_registry_config(), profile))
+    backend = RemoteArtifacts(roots)
+    monkeypatch.setattr("palimpsest_local.remote_artifacts.platform.machine", lambda: "x86_64")
+
+    class Client:
+        project_id = _PROJECT
+
+        def pull(self, package, *, tag, digest, destination):
+            assert package == "app" and tag == "selected" and digest is None
+            destination.write_bytes(archive_bytes)
+            return {"digest": root_digest}
+
+    monkeypatch.setattr(backend, "_native", lambda selected: Client())
+    result = backend.download("registry:native", "example.test/team/app:selected")
+    assert result["run_supported"] is False
+    assert "unambiguous" in result["run_limitation"]
+    assert result["manifest"] == result["package_manifest"] == root_digest
+    assert result["source"] == result["image"] == result["archive"]
+    assert result["layers"] == []
+    assert Path(result["receipt"]).is_file()
+    immutable = read_package_reference(roots, "example.test/team/app@" + root_digest)
+    tagged = read_package_reference(roots, "example.test/team/app:selected")
+    assert immutable.published_digest == tagged.published_digest == root_digest
+    assert immutable.archive == tagged.archive == result["archive"]
+    assert digest_file(Path(immutable.archive)) == immutable.archive_digest == result["archive_digest"]
+    assert not ContentStore(roots.store).exists(first["digest"])
+    assert not ContentStore(roots.store).exists(second["digest"])
+
+
+@pytest.mark.parametrize("connected", [False, True], ids=["native", "connected-native"])
+def test_native_http_error_drip_obeys_connected_browse_deadline(monkeypatch, connected):
+    from palimpsest_local import remote_artifacts as remote
+    from palimpsest_local.errors import StateError
+
+    now = [0.0]
+    monkeypatch.setattr(remote.time, "monotonic", lambda: now[0])
+    remote_text = "untrusted remote error text "
+    payload = _json({"error": {"code": "NOT_FOUND", "message": remote_text + _KEY}})
+
+    class DripResponse(io.BytesIO):
+        bytes_read = 0
+
+        def read(self, size=-1):
+            data = super().read(size)
+            self.bytes_read += len(data)
+            now[0] += 0.4 * len(data)
+            return data
+
+        def read1(self, size=-1):
+            return self.read(min(size, 1) if size >= 0 else 1)
+
+    response = DripResponse(payload)
+
+    class Transport:
+        def open(self, request, timeout):
+            assert request.full_url == _BASE + "/auth/me"
+            assert request.get_header("Authorization") == "Bearer " + _KEY
+            raise urllib.error.HTTPError(request.full_url, 404, remote_text + _KEY, {}, response)
+
+    profile = RegistryProfile("native", "example.test", protocol="palimpsest", api_base=_BASE, namespace="team")
+    client_type = remote._ConnectedNative if connected else NativePackageClient
+    client = client_type(profile, credential=_KEY)
+    client._opener = Transport()
+    client._browse_deadline = 1.0
+
+    with pytest.raises(StateError if connected else PackageHTTPError) as failure:
+        client.authenticate()
+
+    assert response.closed
+    assert remote_text not in str(failure.value)
+    assert _KEY not in str(failure.value)
+    if connected:
+        assert str(failure.value) == "remote browse exceeded its aggregate read budget"
+        assert 0 < response.bytes_read < len(payload)
+    else:
+        assert response.bytes_read == len(payload)
+        assert failure.value.status == 404
+        assert failure.value.code == "NOT_FOUND"
+        assert failure.value.authoritative_missing
