@@ -1480,6 +1480,17 @@ def test_web_process_browser_choice_and_shutdown(
             process.communicate(timeout=10)
 
 
+def test_dashboard_bind_does_not_reverse_resolve_loopback(monkeypatch: pytest.MonkeyPatch) -> None:
+    # http.server's default bind calls socket.getfqdn(), which hung `web` on macOS 15 runners.
+    monkeypatch.setattr(socket, "getfqdn", lambda *_args: pytest.fail("dashboard bind performed reverse DNS"))
+    server = ui._LoopbackHTTPServer(("127.0.0.1", 0), lambda *_args: None)
+    try:
+        assert server.server_name == "127.0.0.1"
+        assert server.server_port == server.server_address[1] != 0
+    finally:
+        server.server_close()
+
+
 def test_host_vm_detail_uses_stable_id_without_creating_run(server_env, monkeypatch):
     vm = {
         "id": "host:lima-vz:external",

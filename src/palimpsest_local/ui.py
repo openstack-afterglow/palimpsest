@@ -8,6 +8,7 @@ import json
 import re
 import secrets
 import signal
+import socketserver
 import sys
 import threading
 import time
@@ -58,6 +59,21 @@ def _vm_identifier(encoded: str) -> str | None:
     ):
         return identifier
     return None
+
+
+class _LoopbackHTTPServer(ThreadingHTTPServer):
+    """Loopback dashboard server that binds without a reverse DNS lookup.
+
+    ``HTTPServer.server_bind`` resolves ``socket.getfqdn(host)``, which blocked
+    ``palimpsest web`` for longer than 15 seconds on macOS 15 hosts before the
+    URL was printed. The dashboard never uses the resolved server name.
+    """
+
+    def server_bind(self) -> None:
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = host
+        self.server_port = port
 
 
 def build_handler(
@@ -641,7 +657,7 @@ def serve(
     """Serve a foreground, read-only-by-default dashboard on IPv4 loopback only."""
     token = secrets.token_urlsafe(32)
     # Server binds loopback 127.0.0.1 only regardless of caller host input
-    server = ThreadingHTTPServer(
+    server = _LoopbackHTTPServer(
         ("127.0.0.1", port), build_handler(roots, token=token, origin=f"http://127.0.0.1:{port}", read_only=read_only)
     )
     server.daemon_threads = True

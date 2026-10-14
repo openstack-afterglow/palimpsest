@@ -41,6 +41,15 @@ does not qualify this HTTPS build cutover.
   native KVM, BuildKit, cloud or production proof.
 - **Public diff scan:** redacted gitleaks found one false positive in vendored
   MIT minified `xterm.js` (`FourKeyMap`).
+- **Hosted macOS 15 finding:** the first PR run passed Linux, Hub, OCI and
+  guest jobs but failed six `test_web_process_browser_choice_and_shutdown`
+  cases on the macOS 15 runners only (local macOS and the same portable shard
+  passed). A throwaway diagnostic run's faulthandler stack showed the `web`
+  child blocked in `socket.getfqdn()` inside `HTTPServer.server_bind`. The
+  dashboard now uses a loopback server that skips that reverse lookup;
+  `test_dashboard_bind_does_not_reverse_resolve_loopback` fails against the
+  stdlib default bind and passes with the fix, and `tests/unit/test_ui.py`
+  passed **87** locally.
 
 Still pending: a PR to protected `dev` with all six strict required hosted
 checks on the submitted ref, an immutable `v0.3.5` tag, PyPI/GHCR publication,

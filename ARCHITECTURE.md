@@ -1211,9 +1211,9 @@ Maintenance review — 2026-10-14, 0.3.5 local qualification documentation: revi
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "49125b215e073a0c350cc7ab19a77cea29552126d8dbd7bd86c46f4e8387fea0",
-  "reviewed_at": "2026-10-14T09:12:09Z",
-  "summary": "Reviewed current 0.3.5 API SQL fixed-deadline claims, export timestamp/publication fences, offline bootstrap, HTTPS worker entrypoint, process ownership smoke, repaired local-cache fixture and canonical Hub Docker targets against architecture. Docs-only receipt update in CHANGELOG.md, docs/testing.md, ARCHITECTURE.md, README.md and docs/development-handoff.md; no source/schema/dependency/CI/deploy changes. Parent local root 7064 passed/264 skipped, Hub 559 passed/2 skipped, package/CLI/fixture/Python3.11 checks, MariaDB/process 2 passed and three emulated amd64 image imports recorded. Protected-dev PR/six checks, tag, PyPI/GHCR, native KVM/BuildKit/cloud proofs and controller1/build-worker rollout remain pending; no-ledger create_all is not production schema compatibility proof."
+  "source_sha256": "bc672cc87a6724f2e66d95eb5e928c9e2b4d81e3df1c49055a0de121f9e23ba8",
+  "reviewed_at": "2026-10-14T09:38:55Z",
+  "summary": "0.3.5 follow-up review: ui.serve now constructs a private loopback ThreadingHTTPServer subclass whose server_bind skips HTTPServer's socket.getfqdn reverse lookup, fixing the macOS 15 hosted-check startup hang of palimpsest web before the URL is printed. Loopback-only binding, token, read-only default, browser launch and shutdown are unchanged; no schema, Hub, Kolla or CLI contract change. Regression test asserts bind performs no reverse DNS; all prior 0.3.5 integration review conclusions stand."
 }
 ```
 <!-- architecture-review:end -->
