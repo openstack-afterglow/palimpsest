@@ -1442,13 +1442,16 @@ def test_web_process_browser_choice_and_shutdown(
         PALIMPSEST_TOKEN="not-used-by-local-web",
         BROWSER=f"{browser_command} {marker} %s {release_browser}",
     )
-    args = [sys.executable, "-m", "palimpsest_local.cli", "web"]
+    args = [sys.executable, "-X", "faulthandler", "-m", "palimpsest_local.cli", "web"]
     if not open_browser:
         args.append("--no-browser")
     process = subprocess.Popen(args, env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     try:
         assert process.stdout is not None
-        assert select.select([process.stdout], [], [], 15)[0], "web did not print its listening URL"
+        if not select.select([process.stdout], [], [], 15)[0]:
+            process.send_signal(signal.SIGABRT)
+            _, diagnostic = process.communicate(timeout=20)
+            raise AssertionError("web did not print its listening URL; child stderr/stack:\n" + "\n".join(diagnostic.splitlines()[-150:]))
         url = process.stdout.readline().strip()
         parsed = urllib.parse.urlparse(url)
         assert parsed.hostname == "127.0.0.1"
