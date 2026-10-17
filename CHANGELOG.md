@@ -6,8 +6,8 @@ All notable changes to Palimpsest Local are documented here.
 
 ## [0.3.6] - 2026-10-17
 
-- Prepare the owner-approved full feature release and Kolla rollout; publication and production readiness remain pending until recorded verification succeeds.
-- Add unauthenticated dependency readiness at `/v1/ready`, separate from backward-compatible process liveness at `/v1/health`; return sanitized database/Redis/blob-store status with HTTP 503 on failure. Wire API container and HAProxy health probes to readiness.
+- Publish the owner-approved full feature release as `v0.3.6` and deploy all three immutable Hub images through scoped Kolla lifecycles. Verify paired SQL/CAS restore, offline bootstrap, direct/public readiness, authenticated local CLI upload/download bytes and restart persistence; preserve shared loadbalancers and native qualification boundaries.
+- Add unauthenticated dependency readiness at `/v1/ready`, separate from backward-compatible process liveness at `/v1/health`; return sanitized database/Redis/blob-store status with HTTP 503 on failure. Wire API container health and HAProxy probe templates to readiness; the existing shared loadbalancers were not reconfigured in this rollout.
 - Default the local client and dashboard to `https://palimpsest.dmslab.re.kr`, preserving explicit configuration overrides. Show operation-stage motion without invented percentages and honor reduced motion.
 - Acquire verified OCI archives for both Linux amd64 and arm64 independently of native runtime eligibility; expose explicit experimental cross-architecture VM-carrier execution without weakening native OCI-root platform guards.
 - Bind Docker download run receipts to the retained OCI root index while recording the selected child separately. Propagate explicit forced acquisition and the requested platform through Docker-cache exports, validate exported amd64/arm64 configs, and preserve native runtime preflight for normal runs.

@@ -21,17 +21,32 @@ The inspected DMS Lab deployment uses `dms-controller1` for both API and export 
 
 Package references require a separate trusted `palimpsest_package_public_origin`; it was empty in the inspected runtime. For the Afterglow key-gateway deployment, use the approved `https://cloud.dmslab.re.kr` origin rather than inferring it from Hub Host or the internal transport. Verify nonempty exact protected IDs, current requester service leaves and original-token `/v1/projects/current` through Afterglow. Do not use admin/service credentials for package acceptance, grant ordinary users automatically, or claim health 200 proves authenticated reads/writes.
 
-### Hub liveness and readiness (0.3.6 candidate)
+### Hub liveness and readiness (0.3.6)
 
 `GET /health` and `GET /v1/health` remain dependency-free liveness endpoints
 returning `200 {"status":"ok"}`. Keep them for process-alive diagnostics;
 they must not admit traffic or certify SQL/Redis/storage availability.
 
-The candidate uses `GET /v1/ready` for API container health and both internal
-and public HAProxy backend probes, requiring HTTP 200. A 503 readiness response
-must keep the backend out of service, not be converted to liveness success.
+The released API uses `GET /v1/ready` for container health. Role templates also
+select it for internal/public HAProxy probes, requiring HTTP 200, but the limited
+0.3.6 production rollout deliberately skipped shared HAProxy reconfiguration.
+Do not infer that installing those templates changed active loadbalancer probes.
+An external monitor should check readiness directly, never substitute liveness.
 Readiness is unauthenticated and is not requester/Keystone/Glance authorization,
 worker execution, backup/restore, CLI byte integrity or native-runtime proof.
+
+For anonymous external monitoring with certificate verification:
+
+```sh
+curl --fail --silent --show-error --max-time 5 \
+  https://palimpsest.dmslab.re.kr/v1/ready
+```
+
+Healthy responses are `200` with `status: ready` and `database`, `redis`,
+`blob_store` checks all `ok`. Alert on HTTP 503, other non-200 responses,
+connection/TLS failure or timeout. No token is required; responses are sanitized
+and use `Cache-Control: no-store`. The shared asynchronous probe wait is two
+seconds; it is not a kernel-I/O, shutdown or event-loop-starvation deadline.
 
 The API-only Dockerfile healthcheck uses loopback port `8020`. Kolla overrides
 the probe with `palimpsest_api_listen_address` and
@@ -39,25 +54,29 @@ the probe with `palimpsest_api_listen_address` and
 `18021`). Both use a 5-second HTTP timeout, 30-second interval, 10-second
 container-check timeout, three retries and 30-second start period. Export and
 build-worker images do not inherit the API probe. HAProxy still expects status
-200 and retains its existing timing defaults; only its probe path changes.
+200 and retains its existing timing defaults; applying the readiness path to
+running shared loadbalancers requires separately scoped reconfiguration.
 
 The canonical role starts containers with `state: started`; it has no existing
 readiness-wait task. This change does not add a second deployment/wait mechanism
 or equate successful container creation/reconfigure with readiness. Operators
 must explicitly wait for container health and direct/public `/v1/ready` before
-reopening traffic, then complete the stronger acceptance gates below. Historical
-production `/v1/health` 200 receipts do not prove this new readiness route.
+reopening traffic, then complete the stronger acceptance gates below. The
+recorded 0.3.6 rollout separately observed container health and direct/public
+readiness; neither replaces authenticated artifact or worker acceptance.
 
 
 ### Current production rollout procedure and gates
 
-The latest recorded production release is **0.3.5**, not the local 0.3.6
-candidate. Its [publication and production receipts](testing.md#full-source-035-integration--local-verification)
-record all three immutable image digests, controller1-only Hub reconfigure,
-worker-playbook pull + deploy, and `--skip-tags haproxy` on every action.
-The new readiness wiring below has **not** been observed in production.
-Publication and deployment are separate owner decisions; these instructions
-do not authorize either.
+The latest recorded production release is **0.3.6**, deployed on 2026-10-17
+from reviewed `v0.3.6` source `b8d0d49d587e0e86d36a6e1e99875930bba0fa2a`.
+Its [publication and production receipts](testing.md#published-036-production-rollout)
+record all three immutable image pins, writer-fenced paired SQL/CAS restore,
+offline bootstrap, scoped Kolla pull/reconfigure, external readiness, original
+requester CLI bytes and authenticated worker idle claims. Every Kolla action
+retained `--skip-tags haproxy`; the running shared loadbalancers were not changed.
+Publication and deployment remain separate owner decisions; these instructions
+do not authorize another rollout or native qualification.
 
 1. **Bind reviewed published bytes.** Complete the protected-dev PR/required
    exact-SHA CI gates and immutable release publication before installing a new
