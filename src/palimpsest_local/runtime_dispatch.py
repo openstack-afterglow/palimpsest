@@ -972,9 +972,10 @@ def _dispatch_lifecycle(
         raise StateError("runtime adapter lifecycle receipt has an invalid terminal status")
     if (raw.previous_status, raw.previous_revision) != (previous_status, previous_revision):
         raise StateError("runtime adapter lifecycle receipt does not match the bound state")
+    # A repeated rm can re-archive surviving owned root bytes without changing
+    # terminal status; purge is not the only legitimate one-revision rewrite.
     deletion_rewrite = (
         operation is RuntimeOperation.RM
-        and volumes
         and previous_status == "removed"
         and raw.status == "removed"
         and raw.revision == previous_revision + 1

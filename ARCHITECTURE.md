@@ -1233,13 +1233,15 @@ Maintenance review — 2026-10-17, owner-approved 0.3.6 release preparation: rev
 Release blocker follow-through: selected verified config/child descriptors now determine Docker download platform, with host architecture used only for an unselected root. Runnable receipts bind the retained declared index root, not an undeclared selected child; forced Docker-cache acquisition propagates platform through Skopeo conversion while ordinary native preflight remains intact. Experimental web runs omit detach and request disposable roots; self-contained carrier validation rejects external QCOW data as well as backing files. A real qemu-img external-data disk was rejected before Lima launch. Public retained-archive deletion pins the exact removed-run identity before the artifact/archive locks and clears only its pointer through the already-guarded state writer; adapter purge reuses its existing run lock. Remaining source topology pins CAS until explicit CLI purge. Canonical alias-aware native checks cover active/inactive definitions and refuse uncertain inventory/persistence. Pre-existing missing/malformed archives remain fail-closed rather than silently erased. These fixes change boundary correctness, not credential domains, guest protocol or native qualification.
 
 
+Final lifecycle review exposed an already-removed cloud root being re-archived after dashboard archive deletion: the adapter correctly wrote a new removed revision, but dispatch accepted same-status rewrites only for purge. `RM` now accepts exactly one authenticated revision advance for either retention or purge, still requiring the original bound identity/status/revision and matching durable result (or confirmed absent tree for purge). Start/stop reconciliation, no-op revisions and other transition guards are unchanged. The actual CLI archive-delete→repeat-default-rm→purge regression failed for KVM/HVF before the fix; all390 retained/dispatch/cloud/Lima consumers passed afterward. This is synthetic native transport, not live disk deletion.
+
 <!-- architecture-review:start -->
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "af4ae179c7c349eaaeccf00074d3908dbec252605dc104dd4f5d06e220e2cfa7",
-  "reviewed_at": "2026-10-17T13:58:38Z",
-  "summary": "Review 0.3.6 release boundary fixes and hermetic retained-run purge regression; synthetic native profile resolution no longer probes host UEFI; production firmware and removal policy unchanged; no native qualification"
+  "source_sha256": "f401aaeae1934809d1a17d870617e1b282290cef77687de4e8ec6cce703c0536",
+  "reviewed_at": "2026-10-17T14:06:10Z",
+  "summary": "Review final0.3.6 readiness/Kolla, platform/archive and volume safety; repeated RM permits one authenticated removed-state retention/purge revision with unchanged identity and durable cursor validation;390 lifecycle consumers pass; no native qualification"
 }
 ```
 <!-- architecture-review:end -->

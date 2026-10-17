@@ -630,6 +630,18 @@ def test_managed_rm_dashboard_archive_delete_then_cli_purge_releases_layers(nati
     for digest in digests:
         with pytest.raises(StateError, match="still used by: native"):
             inventory.remove_artifact(env.roots, digest, force=True)
+    # Repeating default removal may re-archive the surviving owned cloud root.
+    # That durable removed->removed rewrite must be accepted by public dispatch.
+    before_repeat = state.read_run_ledger_snapshot(env.roots, "native")
+    assert cli.main(["rm", "native"]) == 0
+    assert "removed native" in capsys.readouterr().out
+    after_repeat = state.read_run_ledger_snapshot(env.roots, "native")
+    assert after_repeat.state["status"] == "removed"
+    if backend != "lima-vz":
+        recreated = retained_instances.list_retained_instances(env.roots)[0]
+        assert recreated["run_id"] == owner.run_id
+        assert after_repeat.state["retained_instance"] == recreated["id"]
+        assert state.lifecycle_revision(after_repeat) == state.lifecycle_revision(before_repeat) + 1
     assert cli.main(["rm", "native", "--volumes"]) == 0
     assert "removed native" in capsys.readouterr().out
     assert not rpaths.root.exists()
