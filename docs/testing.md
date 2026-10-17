@@ -1,6 +1,6 @@
 # Fast feedback without dropping coverage
 
-## 0.3.6 full-feature readiness candidate — 2026-10-17
+## 0.3.6 qualification and production — 2026-10-17
 
 Owner approved the isolated feature source's full release and existing Kolla
 rollout, not native/GPU qualification. Durable receipts are under
@@ -47,6 +47,97 @@ rollout, not native/GPU qualification. Durable receipts are under
   LSP's differing worktree classification, and seven changed files formatted.
   No native checks were enabled or skipped-as-success; policy remains explicit
   `PALIMPSEST_KVM_ENABLED=false`.
+
+### Published 0.3.6 production rollout
+
+[PR #28](https://github.com/openstack-afterglow/palimpsest/pull/28) passed all six
+required hosted checks on `c35e4f69f66337145d2697f057618e03e3960951` and merged
+into protected `dev` as `b8d0d49d587e0e86d36a6e1e99875930bba0fa2a`.
+The merge tree matched the reviewed candidate. Dev Test/Hub/Development-package
+runs `39039675595`, `39039675632`, `39039675770` succeeded. Annotated `v0.3.6`
+completed [Release](https://github.com/openstack-afterglow/palimpsest/actions/runs/39040031059)
+(verification, PyPI and GitHub release) and the
+[Hub image workflow](https://github.com/openstack-afterglow/palimpsest/actions/runs/39040020536).
+Final repeated-removal consumers passed **390** locally; independent readiness
+and lifecycle reviews closed their named findings. The reviewed source stamp
+covers 486 files, `f401aaeae1934809d1a17d870617e1b282290cef77687de4e8ec6cce703c0536`.
+
+All three published images were inspected on their target hosts: Linux amd64,
+OCI revision `b8d0d49d587e0e86d36a6e1e99875930bba0fa2a`, version `0.3.6`.
+The unknown-platform descriptor is attestation metadata, not arm64 publication.
+
+| Image (`ghcr.io/openstack-afterglow/`) | Immutable digest |
+| --- | --- |
+| `palimpsest-hub-api` | `sha256:d278ce1617e208bf42b2ecd7be99abe444487e7f9a3e0b13b7e35cfe78547dc2` |
+| `palimpsest-hub-worker` | `sha256:0afb13a900e218be383626dd581c2c98a03b004005cb464fdec7af83e45e2a56` |
+| `palimpsest-hub-build-worker` | `sha256:ccdc7a1430fb2e38f6b0d4c83c6d82a7b3dd7d3960a51eafc3c5220856740057` |
+
+- **Operator preservation:** only `palimpsest-client` changed among 110 installed
+  packages, from 0.3.5 to 0.3.6. Semantic lock changes were limited to the root
+  `kolla` requirement and that package. Existing private inputs and final
+  `99-palimpsest.yml` precedence, ports, worker hostname pin and placement were
+  preserved. The noninteractive shell lacked `uv` on PATH; its actual binary
+  was used. Sync needed existing root-owned environment permissions; no other
+  dependency was upgraded or removed.
+- **Writer-fenced recovery:** the remote worker stopped while the old API was
+  available; all four builds were terminal, exports were empty, build/export
+  leases were absent and the sole maintenance lease was expired. API/export
+  then stopped before paired SQL/CAS capture. Isolated restore matched **15
+  tables, 12 row INSERTs, 34 files and 884,748,288 bytes**, including file UID,
+  GID and mode. Root-only AES256 backups and a 0600 key remain on controller1
+  at `/var/backups/palimpsest/pre-0.3.6-20261017`; hashes are in the private
+  `restore-cleanup.json` receipt. This is an isolated-restore proof, not offsite
+  disaster-recovery availability.
+- **Resolved restore harness failures:** the initial SSH helper had a 60-second
+  client timeout while the capture continued. The first isolated SQL attempt
+  also used `mariadb-admin ping`, which reported server presence before valid
+  authenticated startup. Recovery retained the existing encrypted capture and
+  restarted only the exact-owned restore container, requiring authenticated
+  TCP `SELECT 1` before import. SQL rows and restored CAS then matched exactly;
+  production SQL/CAS were not recaptured or restored over. The isolated server,
+  its anonymous volume/internal network and plaintext restore copy were removed
+  after receipt/hash verification; encrypted recovery material was retained.
+- **Offline bootstrap and Kolla:** the pinned new API bootstrap exited 0 while
+  old writers remained stopped. Canonical `pull` + `reconfigure` targeted only
+  controller1 API/export and, through the packaged worker playbook, the existing
+  dedicated worker. Every action retained `--skip-tags haproxy`; no shared
+  Afterglow, HAProxy, ProxySQL or Keepalived reconfiguration was performed.
+- **Live API:** API Docker health is `healthy`; direct
+  `http://172.30.0.11:18021/v1/ready` and anonymous certificate-verified public
+  `https://palimpsest.dmslab.re.kr/v1/ready` returned 200 with SQL/Redis/blob
+  checks all `ok` and `Cache-Control: no-store`. Public `/v1/health` remained
+  200. The real original `pieroot/Default/test` requester obtained `/v1/me` and
+  private metadata 200; anonymous `/v1/me` remained 401. No production database
+  or Redis outage was injected; outage/503 proof above remains disposable-lab
+  evidence only.
+- **Actual published local client:** isolated Python 3.11 installed PyPI
+  `palimpsest-client==0.3.6` and reported 0.3.6. It downloaded the private layer
+  uploaded before cutover to 0.3.5 after the new API/export restart: SHA-256 and
+  extracted marker matched. A second fresh private layer was packed/pushed/
+  pulled using the published 0.3.6 client against the new API, again matching
+  exact bytes and original project ownership. Both exact-owned SQL artifacts
+  were deleted with 204 and verified absent with 404; no global blob GC ran.
+- **Worker recovery and live transport:** the old exact `claim_pending` journal
+  was preserved outside active scratch, with inode/hash checks under exclusive
+  `worker.lock`, only after the fenced terminal/lease and restore gates.
+  Nothing was replayed or adopted. The new worker is running with restart count
+  zero and only `worker.lock` in scratch; the key mount is read-only/root/0600
+  and SQL/Redis credentials and API healthcheck are absent. Actual structured
+  API logs recorded 711 authenticated idle-claim HTTP 204 responses after its
+  start. An initial proof parser expected Uvicorn access-log syntax; reading
+  the actual structured `method=POST route=... status=204` format corrected
+  that evidence harness, not service behavior. No native build was submitted.
+- **Scope:** all 261 unrelated controller container IDs, images, start times and
+  running states matched the pre-cutover baseline; no unexpected container
+  remained. Astra planning/ops signoff remains unavailable, not substituted.
+  No main promotion, GPU/device reassignment, user VM deletion or native/cloud
+  runtime qualification was performed.
+
+Private JSON receipts remain under
+`~/.local/share/palimpsest-proofs/release-036-20261017/`; they contain sanitized
+ownership/result evidence, not persisted requester tokens. The immutable
+release tag is not changed by this documentation-only follow-through.
+
 
 ## Full-source 0.3.5 integration — local verification
 
