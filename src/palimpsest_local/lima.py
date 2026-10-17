@@ -14,7 +14,7 @@ import uuid
 from collections.abc import Iterator, Mapping
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from . import state
 from .digest import require_file_digest
@@ -35,12 +35,65 @@ from .runtime_types import (
 )
 from .state import RunPaths, StatePaths
 
+if TYPE_CHECKING:
+    from .oci_run_request import LocalOCIRunRequest
+
 _BACKEND = "lima-vz"
 _CONFIG_NAME = "lima.yaml"
 _TIMEOUT_SECONDS = 600
 _LIMA_NETWORK_RE = re.compile(r"^lima:[a-z0-9][a-z0-9-]{0,62}$")
 _LIMA_VERSION_RE = re.compile(r"\b(\d+)\.(\d+)\.(\d+)(?:[-+][0-9A-Za-z.-]+)?\b")
 _RUN_ID_ENV = "PALIMPSEST_RUN_ID"
+
+
+def experimental_oci_config(
+    request: LocalOCIRunRequest, *, carrier: Path, carrier_digest: str, run_id: str, disk_bytes: int
+) -> str:
+    """Author a disposable QEMU carrier, never the native OCI-root contract.
+
+    The caller supplies a frozen, verified local carrier with guest dependencies
+    already installed. In particular Lima must not install containerd or import
+    host defaults, home mounts, proxies, SSH agents, or automatic port forwards.
+    """
+    arch = {"linux/amd64": "x86_64", "linux/arm64": "aarch64"}[request.platform]
+    config = {
+        "minimumLimaVersion": "2.1.0",
+        "vmType": "qemu",
+        "arch": arch,
+        "cpus": request.vcpus,
+        "memory": f"{request.memory_mib}MiB",
+        "disk": f"{disk_bytes // 1024**3}GiB",
+        "images": [{"location": carrier.as_uri(), "arch": arch, "digest": carrier_digest}],
+        "containerd": {"system": False, "user": False},
+        "mounts": [],
+        "networks": [],
+        "ssh": {"localPort": 0, "forwardAgent": False, "forwardX11": False, "loadDotSSHPubKeys": False},
+        "propagateProxyEnv": False,
+        "hostResolver": {"enabled": False},
+        "upgradePackages": False,
+        "env": {_RUN_ID_ENV: run_id},
+        "provision": [
+            {
+                "mode": "dependency",
+                "skipDefaultDependencyResolution": True,
+                "script": "#!/bin/sh\nset -eu\ncommand -v sudo\ncommand -v tar\n",
+            }
+        ],
+        "portForwards": [
+            {
+                "guestPort": port.guest_port,
+                "hostPort": port.host_port,
+                "guestIP": "0.0.0.0",
+                "hostIP": port.host_ip,
+                "proto": port.protocol,
+                "static": True,
+            }
+            for port in request.network.published_ports
+        ]
+        + [{"guestIP": "0.0.0.0", "proto": "any", "guestPortRange": [1, 65535], "ignore": True}],
+    }
+    # JSON is a YAML subset and avoids a second serializer/quoting convention.
+    return json.dumps(config, indent=2) + "\n"
 
 
 def _lifecycle_outcome(
@@ -60,6 +113,8 @@ def _lifecycle_outcome(
         payload["status"],
         state.lifecycle_revision(payload),
         warning_category,
+        storage_policy=payload.get("storage_policy"),
+        retained_instance=payload.get("retained_instance"),
     )
 
 
@@ -1033,6 +1088,8 @@ def rm(
     _expected_record: ExistingRunRecord | None = None,
     _expected_snapshot: state.RunLedgerSnapshot | None = None,
 ) -> dict[str, Any] | _LifecycleAdapterOutcome:
+    from .named_volumes import release_named_volume_reservations
+
     roots = roots or (state.resolve_roots() if _expected_record is not None else state.init_roots())
     with state.locked_existing_run(
         roots, name, expected=_expected_record, expected_snapshot=_expected_snapshot
@@ -1047,17 +1104,44 @@ def rm(
         if instance is not None:
             _require_owned_instance(instance, mutation.record.run_id, name)
             mutation.verify_binding()
-            _require_success(_run_command(["limactl", "delete", "--force", name], timeout_seconds=60), "delete")
-            remaining = _instance_info_or_none(name)
-            if remaining is not None:
-                raise LifecycleError(f"Lima instance '{name}' was not deleted")
+            from . import host_vm_control
+
+            identity = host_vm_control.lima_removal_identity(instance)
+            if identity is None:
+                raise StateError("Lima native directory identity is unavailable; refusing removal")
+            archive = host_vm_control._remove_lima(
+                {"name": name},
+                identity,
+                roots=roots,
+                volumes=volumes,
+                ledger=record,
+            )
+            if archive is not None:
+                record["retained_instance"] = archive
+                record["storage_policy"] = "instance-root-and-topology-retained"
         if not volumes:
-            if record.get("status") == "removed":
+            if record.get("status") == "removed" and record == mutation.mutable_state():
+                release_named_volume_reservations(roots, name=name, run_id=mutation.record.run_id)
                 return _lifecycle_outcome(mutation, record, _expected_record)
             result = mutation.write_state("removed", {**record, "updated_at": state.utc_now_iso()})
+            release_named_volume_reservations(roots, name=name, run_id=mutation.record.run_id)
             return _lifecycle_outcome(mutation, result, _expected_record)
         result = mutation.write_state("removed", {**record, "updated_at": state.utc_now_iso()})
-        outcome = _lifecycle_outcome(mutation, result, _expected_record)
+        release_named_volume_reservations(roots, name=name, run_id=mutation.record.run_id)
+        outcome = _lifecycle_outcome(
+            mutation,
+            {
+                **result,
+                "storage_policy": "instance-root-and-topology-purged",
+                "retained_instance": None,
+            },
+            _expected_record,
+        )
+        archive = record.get("retained_instance")
+        if archive:
+            from . import retained_instances
+
+            retained_instances.delete_retained_instance_for_run(roots, archive, mutation=mutation)
         mutation.delete_run_tree()
         return outcome
 

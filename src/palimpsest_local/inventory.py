@@ -19,9 +19,13 @@ from typing import Any
 
 from . import (
     host_inventory,
+    host_vm_control,
+    named_volumes,
     oci_network_status,
     oci_root_volume_inventory,
+    platforms,
     project_runtime,
+    retained_instances,
     runtime_dispatch,
     state,
     vm_access,
@@ -32,7 +36,7 @@ from .errors import ArtifactValidationError, InvalidDigestError, StateError
 from .hub import KIND_CLOUD_IMAGE, MEDIA_TYPE_LAYER_SQUASHFS
 from .oci_layout import DISK_FORMAT_MEDIA_TYPES, ContentStore
 from .oci_store import OCIStore, OCIStoreError
-from .remote_artifacts import RemoteArtifacts
+from .remote_artifacts import HubConnection, RemoteArtifacts
 from .run_source import list_retained_oci_sources
 from .runtime_types import (
     ExpectedRunIdentity,
@@ -129,10 +133,11 @@ def build_image(roots: StatePaths, operations: OperationManager, body: dict[str,
 
 
 def run_image(roots: StatePaths, operations: OperationManager, body: dict[str, Any]) -> dict[str, Any]:
-    """Start the same detached image resolution/runtime path used by run IMAGE."""
+    """Start image resolution/runtime, detached except for foreground-only force mode."""
     if set(body) - {
         "image",
         "name",
+        "backend",
         "runtime_kind",
         "manifest",
         "memory",
@@ -142,6 +147,13 @@ def run_image(roots: StatePaths, operations: OperationManager, body: dict[str, A
         "command",
         "registry",
         "layers",
+        "volumes",
+        "platform",
+        "force_architecture",
+        "vm_image",
+        "vm_image_digest",
+        "root_retention",
+        "root_volume",
     }:
         raise StateError("unsupported run field")
     image = _web_string(body, "image", required=True)
@@ -150,7 +162,23 @@ def run_image(roots: StatePaths, operations: OperationManager, body: dict[str, A
     name = _web_string(body, "name") or f"web-{uuid.uuid4().hex[:12]}"
     if re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", name) is None:
         raise StateError("invalid run name")
-    args = ["run", f"--name={name}", "--detach"]
+    force_architecture = body.get("force_architecture") is True
+    args = ["run", f"--name={name}"]
+    if not force_architecture:
+        args.append("--detach")
+    backend_val = _web_string(body, "backend")
+    if backend_val is not None:
+        args.append(f"--backend={backend_val}")
+    root_retention_val = _web_string(body, "root_retention")
+    if root_retention_val is not None:
+        if root_retention_val not in {"delete", "retain"}:
+            raise StateError("root_retention must be delete or retain")
+        if force_architecture and root_retention_val == "retain":
+            raise StateError("force_architecture requires disposable root_retention delete, not retain")
+        args.append(f"--root-retention={root_retention_val}")
+    root_volume_val = _web_string(body, "root_volume")
+    if root_volume_val is not None:
+        args.append(f"--root-volume={root_volume_val}")
     for key, option in (
         ("runtime_kind", "runtime-kind"),
         ("manifest", "manifest"),
@@ -162,6 +190,19 @@ def run_image(roots: StatePaths, operations: OperationManager, body: dict[str, A
             raise StateError("runtime_kind must be cloud-image or oci-root")
         if value is not None:
             args.append(f"--{option}={value}")
+    platform_val = _web_string(body, "platform")
+    if platform_val is not None:
+        if platform_val not in {"linux/amd64", "linux/arm64"}:
+            raise StateError("platform must be linux/amd64 or linux/arm64")
+        args.append(f"--platform={platform_val}")
+    if force_architecture:
+        args.append("--force-architecture")
+    vm_image = _web_string(body, "vm_image")
+    if vm_image is not None:
+        args.append(f"--vm-image={vm_image}")
+    vm_image_digest = _web_string(body, "vm_image_digest")
+    if vm_image_digest is not None:
+        args.append(f"--vm-image-digest={vm_image_digest}")
     for key, low, high in (("memory", 256, 1048576), ("vcpus", 1, 256)):
         value = body.get(key)
         if value is not None:
@@ -169,6 +210,21 @@ def run_image(roots: StatePaths, operations: OperationManager, body: dict[str, A
                 raise StateError(f"{key} must be an integer between {low} and {high}")
             args.append(f"--{key}={value}")
     args.extend(f"--publish={value}" for value in _web_strings(body, "publish"))
+    raw_volumes = body.get("volumes", [])
+    if not isinstance(raw_volumes, list) or len(raw_volumes) > 16:
+        raise StateError("volumes must be a list of at most 16 attachments")
+    for vol in raw_volumes:
+        if not isinstance(vol, dict) or set(vol) - {"name", "mount_path", "read_only"}:
+            raise StateError("volume attachment entry must contain name, mount_path and optional read_only")
+        v_name = _web_string(vol, "name", required=True)
+        v_mount = _web_string(vol, "mount_path", required=True)
+        v_ro = vol.get("read_only", False)
+        if type(v_ro) is not bool:
+            raise StateError("volume read_only must be a boolean")
+        if ":" in v_name or ":" in v_mount:
+            raise StateError("volume name and mount_path cannot contain ':'")
+        entry_str = f"{v_name}:{v_mount}:ro" if v_ro else f"{v_name}:{v_mount}"
+        args.append(f"--volume={entry_str}")
     for layer in _web_strings(body, "layers"):
         args.append(f"--layer={require_digest(layer)}")
     args.append(image)
@@ -178,9 +234,24 @@ def run_image(roots: StatePaths, operations: OperationManager, body: dict[str, A
     return operations.start(roots, "run", args, resource_name=name)
 
 
-def remote_connections(roots: StatePaths) -> dict[str, Any]:
-    """Describe configured protocols without invoking credential helpers."""
-    return {"connections": RemoteArtifacts(roots).connections()}
+def remote_connections(roots: StatePaths, *, hub_connection: HubConnection | None = None) -> dict[str, Any]:
+    """Describe protocols without resolving remote credentials or contacting a Hub."""
+    return {"connections": RemoteArtifacts(roots, hub_connection=hub_connection).connections()}
+
+
+def remote_hub_identity(roots: StatePaths, *, hub_connection: HubConnection | None = None) -> dict[str, Any]:
+    return RemoteArtifacts(roots, hub_connection=hub_connection).hub_identity()
+
+
+def inspect_remote_artifact(
+    roots: StatePaths,
+    *,
+    connection_id: str,
+    reference: str,
+    manifest: str | None = None,
+    hub_connection: HubConnection | None = None,
+) -> dict[str, Any]:
+    return RemoteArtifacts(roots, hub_connection=hub_connection).inspect(connection_id, reference, manifest=manifest)
 
 
 def browse_remote_artifacts(
@@ -192,25 +263,41 @@ def browse_remote_artifacts(
     repository: str = "",
     limit: int = 30,
     cursor: str | None = None,
+    arch: str = "",
+    disk_format: str = "",
+    parent: str = "",
+    hub_connection: HubConnection | None = None,
 ) -> dict[str, Any]:
-    return RemoteArtifacts(roots).browse(
+    return RemoteArtifacts(roots, hub_connection=hub_connection).browse(
         connection_id,
         kind=kind,
         query=query,
         repository=repository,
         limit=limit,
         cursor=cursor,
+        arch=arch,
+        disk_format=disk_format,
+        parent=parent,
     )
 
 
-def transfer_artifact(roots: StatePaths, operations: OperationManager, body: dict[str, Any]) -> dict[str, Any]:
+def transfer_artifact(
+    roots: StatePaths,
+    operations: OperationManager,
+    body: dict[str, Any],
+    *,
+    hub_connection: HubConnection | None = None,
+) -> dict[str, Any]:
     action = _web_string(body, "action", required=True)
     connection = _web_string(body, "connection_id", required=True)
-    backend = RemoteArtifacts(roots)
+    backend = RemoteArtifacts(roots, hub_connection=hub_connection)
     if action == "download":
-        if set(body) - {"action", "connection_id", "reference"}:
+        if set(body) - {"action", "connection_id", "reference", "platform"}:
             raise StateError("unsupported download field")
-        return backend.start_download(operations, connection, _web_string(body, "reference", required=True))
+        platform = _web_string(body, "platform") or "linux/amd64"
+        return backend.start_download(
+            operations, connection, _web_string(body, "reference", required=True), platform=platform
+        )
     if action == "upload":
         if set(body) - {"action", "connection_id", "source", "target"}:
             raise StateError("unsupported upload field")
@@ -416,11 +503,22 @@ def list_vms(roots: StatePaths, *, live: bool = True) -> dict[str, Any]:
             other is not vm and other["backend"] == vm["backend"] and other["name"] == vm["name"] for other in vms
         )
         vm["access"] = vm_access.capabilities(vm, live=live, collision=collision)
-        identity_collision = collision or any(
-            other is not vm and (other["id"] == vm["id"] or other["name"] == vm["id"]) for other in vms
-        )
-        vm["lifecycle"] = _vm_lifecycle_capabilities(vm, live=live, collision=identity_collision)
-
+        if vm.get("managed") is False and vm.get("source") == "host-backend":
+            # For host VMs, do not let stale managed run ledgers with the same name disable native removal.
+            # Only collide with distinct host-backend records of the same ID or conflicting active host names.
+            host_collision = any(
+                other is not vm
+                and other.get("source") == "host-backend"
+                and (other["id"] == vm["id"] or (other["backend"] == vm["backend"] and other["name"] == vm["name"]))
+                for other in vms
+            )
+            vm["lifecycle"] = _vm_lifecycle_capabilities(vm, live=live, collision=host_collision)
+        else:
+            identity_collision = collision or any(
+                other is not vm and (other["id"] == vm["id"] or other["name"] == vm["id"]) for other in vms
+            )
+            vm["lifecycle"] = _vm_lifecycle_capabilities(vm, live=live, collision=identity_collision)
+        vm["remove_reason"] = vm["lifecycle"].pop("remove_reason")
     unique_warnings: list[str] = []
     seen = set()
     for w in warnings:
@@ -441,11 +539,11 @@ def get_vm(roots: StatePaths, name: str) -> dict[str, Any]:
     raise StateError(f"VM '{name}' not found")
 
 
-def _vm_lifecycle_capabilities(row: dict[str, Any], *, live: bool = True, collision: bool = False) -> dict[str, bool]:
-    """Eligibility only: observation never grants lifecycle ownership.
+def _vm_lifecycle_capabilities(row: dict[str, Any], *, live: bool = True, collision: bool = False) -> dict[str, Any]:
+    """Project managed lifecycle and explicit native-identity host removal.
 
-    OCI-root currently has a separate removal/stop receipt and retention policy;
-    it cannot honor this surface's retained-run-files lifecycle contract.
+    External removal never adopts a run or permits another state's file cleanup.
+    OCI-root retains its separate runtime removal/retention policy.
     """
     eligible = (
         live
@@ -457,11 +555,40 @@ def _vm_lifecycle_capabilities(row: dict[str, Any], *, live: bool = True, collis
         and row.get("runtime_kind") == "cloud-image"
         and row.get("status") != "removed"
     )
+    host_removal = (
+        live
+        and row.get("managed") is False
+        and row.get("source") == "host-backend"
+        and not row.get("stale")
+        and not collision
+        and row.get("id") == f"host:{row.get('backend')}:{row.get('name')}"
+        and isinstance(row.get("removal_identity"), str)
+        and bool(row["removal_identity"])
+        and row.get("runtime_kind") != "oci-root"
+        and row.get("status") in {"running", "stopped", "paused", "failed"}
+    )
+    can_remove = eligible or host_removal
+    remove_reason = None
+    if not can_remove:
+        if not live:
+            remove_reason = "오프라인/기록 전용 조회에서는 제거할 수 없습니다."
+        elif row.get("runtime_kind") == "oci-root":
+            remove_reason = "OCI-root 제거는 원래 상태의 CLI rm을 사용하세요."
+        elif collision:
+            remove_reason = "동일 백엔드 내 VM 이름 또는 식별자가 충돌합니다."
+        elif row.get("managed") is False and not row.get("removal_identity"):
+            remove_reason = "호스트 백엔드의 고유 인스턴스 식별자를 확인할 수 없습니다."
+        elif row.get("stale"):
+            remove_reason = "상태가 변경되었거나 오래된 관찰입니다. 지금 갱신하세요."
+        else:
+            remove_reason = "이 VM 상태에서는 제거할 수 없습니다."
+
     return {
         "start": eligible and row.get("status") == "stopped",
         "stop": eligible and row.get("status") == "running",
-        "remove": eligible,
-        "remove_volumes": eligible,
+        "remove": can_remove,
+        "remove_reason": remove_reason,
+        "remove_volumes": eligible or host_removal and row.get("backend") in {"lima-vz", "lima-qemu", "lima-krunkit"},
     }
 
 
@@ -509,6 +636,11 @@ def _vm_lifecycle_projection(result: LifecycleResult) -> dict[str, Any]:
         "lifecycle_revision": result.cursor.revision,
         "warning_category": None if result.warning_category is None else result.warning_category.value,
         "fallback_used": result.fallback_used,
+        **(
+            {"storage_policy": result.storage_policy, "retained_instance": result.retained_instance}
+            if result.storage_policy is not None
+            else {}
+        ),
     }
 
 
@@ -522,15 +654,44 @@ def vm_lifecycle(roots: StatePaths, identifier: str, action: str, *, expected_ru
 
 
 def remove_vm(
-    roots: StatePaths, identifier: str, *, expected_run_id: str, confirmation: str, volumes: bool = False
+    roots: StatePaths,
+    identifier: str,
+    *,
+    expected_run_id: str | None = None,
+    expected_removal_identity: str | None = None,
+    confirmation: str,
+    volumes: bool = False,
 ) -> dict[str, Any]:
     """Remove an exact selection after typed-name confirmation.
 
-    Run files are retained by default. ``volumes=True`` removes only the
-    canonical owned run tree via dispatch, not project volumes or host paths.
+    Managed instance roots and ordered topology are retained by default.
+    ``volumes=True`` purges only safely owned instance state, never independent
+    named data volumes. External libvirt disks are reference-only, not adopted.
     """
     if type(volumes) is not bool:
         raise StateError("volumes must be a boolean")
+    if isinstance(identifier, str) and identifier.startswith("host:"):
+        row = get_vm(roots, identifier)
+        if (
+            row["id"] != identifier
+            or row.get("managed") is not False
+            or not row["lifecycle"]["remove"]
+            or not isinstance(expected_removal_identity, str)
+            or not expected_removal_identity
+        ):
+            raise StateError("host VM removal is forbidden without a current native identity")
+        if row.get("run_id") != expected_run_id or row.get("removal_identity") != expected_removal_identity:
+            raise StateError("selected host VM identity changed; refresh before removing")
+        if not isinstance(confirmation, str) or confirmation != row["name"]:
+            raise StateError("confirmation must exactly match the selected VM name")
+        return host_vm_control.remove_vm(
+            row,
+            expected_identity=expected_removal_identity,
+            roots=roots,
+            volumes=volumes,
+        )
+    if expected_removal_identity is not None:
+        raise StateError("native removal identity requires a stable host VM identifier")
     identity = _selected_vm_identity(
         roots, identifier, expected_run_id=expected_run_id, action="remove_volumes" if volumes else "remove"
     )
@@ -618,6 +779,12 @@ def vm_logs(
 def list_artifacts(roots: StatePaths) -> dict[str, Any]:
     proj_index = _build_project_index(roots)
     referenced_by: dict[str, dict[str, set[str]]] = {}
+    retained_metadata_valid = True
+    try:
+        retained_refs = retained_instances.artifact_references(roots)
+    except _METADATA_ERRORS:
+        retained_metadata_valid = False
+        retained_refs = {}
 
     if roots.runs.exists():
         for run_dir in roots.runs.iterdir():
@@ -674,9 +841,20 @@ def list_artifacts(roots: StatePaths) -> dict[str, Any]:
                 size_bytes = store.size(digest) if store.exists(digest) else 0
 
             tags = [t for t in tags_by_digest.get(digest, []) if isinstance(t, dict)]
-            ref_dict = {
-                "runs": sorted(referenced_by.get(digest, {}).get("runs", set())),
-                "projects": sorted(referenced_by.get(digest, {}).get("projects", set())),
+            runs_refs = sorted(referenced_by.get(digest, {}).get("runs", set()))
+            projs_refs = sorted(referenced_by.get(digest, {}).get("projects", set()))
+            vols_refs = sorted(retained_refs.get(digest, []))
+            ref_dict: dict[str, list[str]] = {
+                "runs": runs_refs,
+                "projects": projs_refs,
+            }
+            if vols_refs:
+                ref_dict["volumes"] = vols_refs
+            is_referenced = bool(runs_refs or projs_refs or vols_refs)
+            blockers = {
+                "runs": runs_refs,
+                "projects": projs_refs,
+                "volumes": vols_refs,
             }
 
             art_record = {
@@ -694,6 +872,13 @@ def list_artifacts(roots: StatePaths) -> dict[str, Any]:
                     or meta.get("media_type") == MEDIA_TYPE_LAYER_SQUASHFS
                 ),
                 "referenced_by": ref_dict,
+                "delete_supported": retained_metadata_valid and not is_referenced,
+                "delete_reason": "보존된 인스턴스 메타데이터를 확인할 수 없어 삭제가 차단되었습니다."
+                if not retained_metadata_valid
+                else "실행 중이거나 보존된 볼륨/인스턴스가 참조 중인 레이어/이미지는 삭제할 수 없습니다."
+                if is_referenced
+                else None,
+                "deletion_blockers": blockers,
             }
 
             artifacts.append(art_record)
@@ -1159,10 +1344,17 @@ def _remove_artifact_locked(roots: StatePaths, norm_digest: str, *, force: bool)
             except Exception:
                 raise StateError("cannot prove artifact is unreferenced because a run ledger is invalid") from None
 
-    names = sorted(referencing_runs | referencing_projects)
+    try:
+        retained_refs = retained_instances.artifact_references(roots)
+    except Exception:
+        raise StateError(
+            "cannot prove artifact is unreferenced because retained instance metadata is invalid"
+        ) from None
+    retained_blockers = retained_refs.get(norm_digest, [])
+
+    names = sorted(referencing_runs | referencing_projects | set(retained_blockers))
     if names:
         raise StateError(f"{norm_digest} is still used by: " + ", ".join(names))
-
     removed_tags: list[tuple[str, str, tuple[int, int, int, int, int]]] = []
     with pinned_owner_directory(roots.tags) as tags_fd, ExitStack() as index_authorities:
         assert tags_fd is not None
@@ -1567,6 +1759,33 @@ def _overlay_size(roots: StatePaths, vm: dict[str, Any]) -> int:
             os.close(run_fd)
 
 
+def create_volume(roots: StatePaths, body: dict[str, Any]) -> dict[str, Any]:
+    if set(body) != {"name", "backend", "size_bytes"}:
+        raise StateError("volume creation requires name, backend and size_bytes")
+    name = _web_string(body, "name", required=True)
+    backend = _web_string(body, "backend", required=True)
+    size = body["size_bytes"]
+    if type(size) is not int or size <= 0:
+        raise StateError("size_bytes must be a positive integer")
+    return named_volumes.create_named_volume(roots, name=name, backend=backend, size_bytes=size)
+
+
+def delete_volume(roots: StatePaths, identifier: str, *, confirmation: str) -> dict[str, Any]:
+    if not isinstance(confirmation, str) or not confirmation:
+        raise StateError("confirmation must exactly match the selected volume name")
+    if identifier.startswith("named:"):
+        parts = identifier.split(":", 2)
+        if len(parts) != 3:
+            raise StateError("invalid named volume identifier")
+        _, backend, name = parts
+        if confirmation != name:
+            raise StateError("confirmation must exactly match the selected volume name")
+        return named_volumes.delete_named_volume(roots, name=name, backend=backend)
+    if identifier.startswith("retained-instance:"):
+        return retained_instances.delete_retained_instance(roots, identifier, confirmation=confirmation)
+    raise StateError("only named volumes or retained instances can be deleted")
+
+
 def list_volumes(roots: StatePaths, *, vms_result: dict | None = None) -> dict[str, Any]:
     """Enumerate retained ledger volumes and read-only host disks, including unattached disks."""
     warnings: set[str] = set()
@@ -1675,6 +1894,16 @@ def list_volumes(roots: StatePaths, *, vms_result: dict | None = None) -> dict[s
                 row["status"] = "unavailable"
                 warnings.add(_DISK_WARNING)
         volumes[key] = row
+    try:
+        for named in named_volumes.list_named_volumes(roots):
+            volumes[named["id"]] = named
+    except _METADATA_ERRORS:
+        warnings.add("Named volume metadata is unavailable or inconsistent")
+    try:
+        for retained in retained_instances.list_retained_instances(roots):
+            volumes[retained["id"]] = retained
+    except _METADATA_ERRORS:
+        warnings.add("Retained instance metadata is unavailable or inconsistent")
     observed = host_inventory.observe()
     warnings.update(observed["warnings"])
     for host_volume in observed["volumes"]:
@@ -1699,13 +1928,41 @@ def list_volumes(roots: StatePaths, *, vms_result: dict | None = None) -> dict[s
             for field in ("size_bytes", "file_size_bytes", "allocated_bytes", "status", "source"):
                 if field in host_volume:
                     target[field] = host_volume[field]
+    host_info = platforms.detect_host()
+    create_backends = []
+    for backend in ("lima-vz", "kvm", "libvirt-hvf"):
+        try:
+            if platforms.backend_capability_report(backend, host=host_info).successful:
+                create_backends.append(backend)
+        except (ArtifactValidationError, RuntimeCapabilityError):
+            continue
     for row in volumes.values():
         row["attachments"].sort(
-            key=lambda item: (item["name"], item["run_id"] or "", item["mount_path"] or "", item["read_only"])
+            key=lambda item: (
+                item["name"],
+                item.get("run_id") or "",
+                item.get("mount_path") or "",
+                item.get("read_only", False),
+            )
         )
+        kind = row.get("kind")
+        if kind == "named":
+            has_att = bool(row.get("attachments"))
+            row["delete_supported"] = not has_att
+            row["delete_reason"] = (
+                "VM에 연결된 볼륨은 제거할 수 없습니다. VM을 먼저 종료·제거하세요." if has_att else None
+            )
+        elif kind == "retained-instance":
+            is_ref = row.get("reference_only") is True
+            row["delete_supported"] = not is_ref and row.get("deletable") is True
+            row["delete_reason"] = "참조 전용 libvirt 디스크는 원본 파일 삭제를 지원하지 않습니다." if is_ref else None
+        else:
+            row["delete_supported"] = False
+            row["delete_reason"] = "호스트 디스크 또는 프로젝트 관리 디스크는 웹에서 직접 삭제할 수 없습니다."
     return {
         "volumes": [volumes[key] for key in sorted(volumes)],
         "warnings": sorted(warnings),
+        "create_backends": create_backends,
         "classification": "local-metadata-observation",
     }
 

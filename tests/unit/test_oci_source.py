@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
 import multiprocessing
@@ -37,6 +38,8 @@ from palimpsest_local.oci_source import (
     LocalLayoutSource,
     SnapshotCheckpoint,
     SnapshotStage,
+    SnapshottedOCIArchive,
+    SnapshottedOCIImage,
     SourceCAS,
 )
 from palimpsest_local.oci_store import DerivedLayerReceipt, MaterializationResult
@@ -1470,3 +1473,116 @@ def test_materialize_image_hard_stops_after_first_failed_occurrence(
         )
 
     assert calls == [0, 1]
+
+
+def _acquisition_layout(root, *, architecture="arm64", plain=False, bad_diff_id=False, wire_payload=None):
+    raw = b"platform-independent layer bytes" * 32
+    wire = raw if plain else gzip.compress(raw, mtime=0)
+    layout, _manifest, _config, _layers = _direct_layout(root, layer_payloads=(wire,))
+    layer = layout.add(
+        wire if wire_payload is None else wire_payload,
+        "application/vnd.oci.image.layer.v1.tar" if plain else OCI_LAYER_GZIP_MEDIA_TYPE,
+    )
+    config = layout.add(
+        {
+            "architecture": architecture,
+            "os": "linux",
+            "rootfs": {
+                "type": "layers",
+                "diff_ids": ["sha256:" + ("0" * 64 if bad_diff_id else hashlib.sha256(raw).hexdigest())],
+            },
+        },
+        OCI_IMAGE_CONFIG_MEDIA_TYPE,
+    )
+    manifest = layout.add(
+        {
+            "schemaVersion": 2,
+            "mediaType": OCI_IMAGE_MANIFEST_MEDIA_TYPE,
+            "config": config.to_dict(),
+            "layers": [layer.to_dict()],
+        },
+        OCI_IMAGE_MANIFEST_MEDIA_TYPE,
+    )
+    layout.top(manifest)
+    return layout, manifest, layer, raw
+
+
+@pytest.mark.parametrize("architecture", ["amd64", "arm64"])
+@pytest.mark.parametrize("plain", [False, True])
+@pytest.mark.parametrize("archived", [False, True])
+def test_acquisition_source_verifies_diffids_and_preserves_native_type_boundary(
+    tmp_path, architecture, plain, archived
+):
+    layout, manifest, layer, _raw = _acquisition_layout(tmp_path / "layout", architecture=architecture, plain=plain)
+    if archived:
+        archive = tmp_path / "image.tar"
+        _write_oci_archive(layout.root, archive)
+        source = LocalArchiveSource(archive, manifest.digest)
+    else:
+        source = layout.source(manifest)
+    cas = _cas(tmp_path)
+    result = source.snapshot_acquisition(_ref(manifest.digest), cas, platform="linux/" + architecture)
+    assert isinstance(result, SnapshottedOCIArchive)
+    assert not isinstance(result, SnapshottedOCIImage)
+    assert result.image.platform.architecture == architecture
+    assert result.root.descriptor == result.manifest.descriptor == manifest
+    assert result.layers[0].descriptor == layer
+    assert result.image.source.platform.architecture == architecture
+    with pytest.raises(ArtifactValidationError, match="must contain an OCIImage"):
+        SnapshottedOCIImage(result.image, result.root, result.manifest, result.config, result.layers)
+    if architecture == "arm64":
+        with pytest.raises(ArtifactValidationError, match="exactly linux/amd64"):
+            source.snapshot(_ref(manifest.digest), cas)
+
+
+@pytest.mark.parametrize("failure", ["diffid", "gzip", "truncated", "trailing", "size", "digest"])
+def test_acquisition_source_rejects_invalid_layer_bytes_and_diffids(tmp_path, failure):
+    wire = {
+        "gzip": b"not gzip",
+        "truncated": gzip.compress(b"data", mtime=0)[:-4],
+        "trailing": gzip.compress(b"data", mtime=0) + b"extra",
+    }.get(failure)
+    layout, manifest, layer, _raw = _acquisition_layout(
+        tmp_path / "layout",
+        bad_diff_id=failure == "diffid",
+        wire_payload=wire,
+    )
+    if failure == "digest":
+        path = layout.blobs / layer.digest.split(":")[1]
+        payload = path.read_bytes()
+        path.write_bytes(b"x" + payload[1:])
+    with pytest.raises(
+        ArtifactValidationError,
+        match={
+            "diffid": "DiffID mismatch",
+            "gzip": "not valid gzip",
+            "truncated": "truncated",
+            "trailing": "trailing",
+            "size": "size limit",
+            "digest": "failed verification",
+        }[failure],
+    ):
+        layout.source(manifest).snapshot_acquisition(
+            _ref(manifest.digest),
+            _cas(tmp_path),
+            platform="linux/arm64",
+            maximum_bytes=64 if failure == "size" else 1024 * 1024,
+        )
+
+
+def test_acquisition_source_checks_verification_deadline(tmp_path, monkeypatch):
+    layout, manifest, _layer, _raw = _acquisition_layout(tmp_path / "layout")
+    cas = _cas(tmp_path)
+    ticks = iter([0.0, 301.0])
+    monkeypatch.setattr(oci_source.time, "monotonic", lambda: next(ticks))
+    with pytest.raises(ArtifactValidationError, match="timed out"):
+        layout.source(manifest).snapshot_acquisition(_ref(manifest.digest), cas, platform="linux/arm64")
+
+
+def test_acquisition_source_rejects_conflicting_root_platform_declaration(tmp_path):
+    layout, manifest, _layer, _raw = _acquisition_layout(tmp_path / "layout")
+    document = json.loads((layout.root / "index.json").read_bytes())
+    document["manifests"][0]["platform"] = {"os": "linux", "architecture": "amd64"}
+    (layout.root / "index.json").write_text(json.dumps(document))
+    with pytest.raises(ArtifactValidationError, match="root platform must target exactly linux/arm64"):
+        layout.source(manifest).snapshot_acquisition(_ref(manifest.digest), _cas(tmp_path), platform="linux/arm64")

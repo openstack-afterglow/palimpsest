@@ -18,6 +18,7 @@ from typing import Any
 from . import state
 from .digest import digest_hex, require_digest
 from .errors import PalimpsestError, StateError
+from .oci_image import ACQUISITION_PLATFORMS
 from .oci_layout import MAX_JSON_BYTES, MEDIA_TYPE_LAYER_CONFIG, MEDIA_TYPE_MANIFEST, ContentStore
 from .package_reference import package_reference_path, read_package_reference
 from .platforms import (
@@ -45,7 +46,6 @@ from .registry import (
 from .registry_intake import (
     DEFAULT_TIMEOUT_SECONDS,
     MAX_ARCHIVE_BYTES,
-    SUPPORTED_PLATFORM,
     RegistryImageNotFoundError,
     RegistryIntakeError,
     RegistryPullReceipt,
@@ -129,7 +129,7 @@ class RetainedSourceRecord:
             raise StateError("retained manifest digest is not canonical")
         if type(self.archive_size_bytes) is not int or not 0 < self.archive_size_bytes <= MAX_ARCHIVE_BYTES:
             raise StateError("invalid retained source archive size")
-        if not Path(self.archive_path).is_absolute() or self.platform != SUPPORTED_PLATFORM:
+        if not Path(self.archive_path).is_absolute() or self.platform not in ACQUISITION_PLATFORMS:
             raise StateError("invalid retained source path or platform")
         if self.source_type not in {"docker-daemon", "oci-registry"}:
             raise StateError("invalid retained source type")
@@ -379,7 +379,7 @@ def list_retained_oci_sources(roots: StatePaths) -> list[dict[str, Any]]:
                 "output_path": record.archive_path,
                 "created_at": record.created_at,
                 "platform": record.platform,
-                "arch": "x86_64",
+                "arch": "aarch64" if record.platform == "linux/arm64" else "x86_64",
                 "tags": [],
                 "referenced_by": {"runs": [], "projects": []},
                 "builds": [],
@@ -515,8 +515,10 @@ def find_docker_daemon_source(
     *,
     docker_config_dir: Path | None = None,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    platform: str = "linux/amd64",
+    force_architecture: bool = False,
 ) -> ResolvedRunSource | None:
-    """Inspect every eligible name before exporting one unambiguous local image."""
+    """Export one unambiguous image, preserving acquisition platform and native policy."""
     if not image_refs or shutil.which("docker") is None:
         return None
     config_dir = docker_config_dir or resolve_docker_config_dir()
@@ -555,14 +557,20 @@ def find_docker_daemon_source(
     if not matches:
         return None
     image_ref = next(iter(matches.values()))
-    preflight_oci_capabilities()
+    if not force_architecture:
+        preflight_oci_capabilities()
     state.init_resolved_roots(roots)
     with _source_directory(roots, "blobs", create=True):
         destination = (
             roots.state.resolve() / "sources" / "blobs" / (".docker-export-" + secrets.token_hex(12) + ".oci.tar")
         )
         receipt = export_docker_image_to_oci_archive(
-            image_ref, destination, roots, docker_config_dir=config_dir, timeout_seconds=timeout_seconds
+            image_ref,
+            destination,
+            roots,
+            docker_config_dir=config_dir,
+            timeout_seconds=timeout_seconds,
+            platform=platform,
         )
         return _retain_archive(roots, receipt, image_ref, "docker-daemon")
 
@@ -574,6 +582,8 @@ def acquire_remote_oci_source(
     registry_alias: str | None = None,
     docker_config_dir: Path | None = None,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    platform: str = "linux/amd64",
+    force_architecture: bool = False,
 ) -> ResolvedRunSource:
     config = load_registry_config(roots)
     if registry_alias is not None or _has_explicit_registry(image_ref):
@@ -601,7 +611,8 @@ def acquire_remote_oci_source(
             for alias in [first, *sorted(set(config.registries) - {first})]
             if config.registries[alias].protocol == "oci"
         ]
-    preflight_oci_capabilities()
+    if not force_architecture:
+        preflight_oci_capabilities()
     state.init_resolved_roots(roots)
     with _source_directory(roots, "blobs", create=True):
         for profile in profiles:
@@ -616,6 +627,7 @@ def acquire_remote_oci_source(
                     profile=profile,
                     docker_config_dir=docker_config_dir,
                     timeout_seconds=timeout_seconds,
+                    platform=platform,
                 )
             except RegistryImageNotFoundError:
                 continue
@@ -680,6 +692,8 @@ def resolve_run_source(
     backend: str = "auto",
     network: str | None = None,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    platform: str = "linux/amd64",
+    force_architecture: bool = False,
 ) -> ResolvedRunSource:
     path = Path(image_ref).expanduser()
     if path.is_file():
@@ -739,11 +753,27 @@ def resolve_run_source(
         )
     if runtime_kind is None and _DIGEST_RE.fullmatch(image_ref):
         return ResolvedRunSource("cloud-image", image_ref, source_type="cloud-store")
-    if backend not in {"auto", "kvm"}:
-        raise StateError("OCI-root run supports only the KVM backend")
-    preflight_oci_capabilities(network=network)
+    if not force_architecture:
+        if backend not in {"auto", "kvm"}:
+            raise StateError("OCI-root run supports only the KVM backend")
+        preflight_oci_capabilities(network=network)
+    elif platform not in ACQUISITION_PLATFORMS:
+        raise StateError("force-architecture requires platform linux/amd64 or linux/arm64")
     candidates = _docker_candidates(roots, image_ref, registry_alias)
-    local = find_docker_daemon_source(roots, candidates, timeout_seconds=timeout_seconds)
+    local = find_docker_daemon_source(
+        roots,
+        candidates,
+        timeout_seconds=timeout_seconds,
+        platform=platform,
+        force_architecture=force_architecture,
+    )
     if local is not None:
         return local
-    return acquire_remote_oci_source(roots, image_ref, registry_alias=registry_alias, timeout_seconds=timeout_seconds)
+    return acquire_remote_oci_source(
+        roots,
+        image_ref,
+        registry_alias=registry_alias,
+        timeout_seconds=timeout_seconds,
+        platform=platform,
+        force_architecture=force_architecture,
+    )

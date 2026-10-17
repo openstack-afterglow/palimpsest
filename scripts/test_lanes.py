@@ -32,6 +32,7 @@ def _units(names: str) -> tuple[str, ...]:
 PORTABLE_FILES = {
     "core-cli": _units("""
         afterglow_tracking architecture_guard cli_contract cli_project cli_reference cli_registry completion
+        cli_volumes
         development_package_workflow native_kvm_openstack openstack_system_runner package_native_afterglow publish_development_package
         host_journal host_inventory inventory linux_install log_stream metrics packaging refs runtime_dispatch runtime_facade
         registry_intake run_source sandbox_policy state test_lanes ui console web_job_client web_operations
@@ -43,14 +44,15 @@ PORTABLE_FILES = {
         "tests/test_kolla_remote_build.py",
     ),
     "host-runtime": _units("""
-        cloud_runtime cloud_runtime_arch cloudinit_guest kvm_contract lima pci_preflight
+        cloud_runtime cloud_runtime_arch cloudinit_guest experimental_oci_vm kvm_contract lima pci_preflight
+        named_volumes retained_instances oci_volume_policy
         platforms process_session project project_adapter project_runtime project_volumes oci_host
         oci_run_request oci_run_adapter oci_public_cli oci_resource_status oci_docker_hub_cli_live_contract
         oci_docker_hub_services_live_contract oci_ml_cpu_live_contract oci_network oci_network_live_contract
         oci_exec_cli_live_contract oci_stdio_cli_live_contract
     """),
     "build-registry": _units(
-        "build buildkit hub_builder hub_contract registry packages package_credentials remote_artifacts"
+        "build buildkit docker_hub hub_builder hub_contract registry packages package_credentials remote_artifacts"
     ),
     "oci-store": _units("""
         oci_changeset oci_convert_security oci_converter_first_pass oci_image oci_root_volume_inventory

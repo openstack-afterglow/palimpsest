@@ -165,7 +165,7 @@ class OCIImageRef:
 
 
 @dataclass(frozen=True, slots=True)
-class OCIConfig:
+class _ImageConfig:
     """The platform and ordered DiffIDs proven by an OCI image config."""
 
     descriptor: Descriptor
@@ -180,8 +180,8 @@ class OCIConfig:
             raise ArtifactValidationError("image config descriptor must be a Descriptor")
         if self.descriptor.media_type not in SUPPORTED_IMAGE_CONFIG_MEDIA_TYPES:
             raise ArtifactValidationError("image config descriptor has an unsupported media type")
-        if self.os != "linux" or self.architecture != "amd64":
-            raise ArtifactValidationError("Phase-1 image config must target exactly linux/amd64")
+        if self.os != "linux" or self.architecture not in {"amd64", "arm64"}:
+            raise ArtifactValidationError("image config must target linux/amd64 or linux/arm64")
         if self.rootfs_type != "layers":
             raise ArtifactValidationError("image config rootfs.type must be 'layers'")
         if not isinstance(self.diff_ids, tuple):
@@ -199,6 +199,21 @@ class OCIConfig:
             "process": self.process.to_dict(),
             "rootfs": {"diff_ids": list(self.diff_ids), "type": self.rootfs_type},
         }
+
+
+@dataclass(frozen=True, slots=True)
+class OCIConfig(_ImageConfig):
+    """Config accepted by native Phase-1 materialization."""
+
+    def __post_init__(self) -> None:
+        if self.os != "linux" or self.architecture != "amd64":
+            raise ArtifactValidationError("Phase-1 image config must target exactly linux/amd64")
+        super(OCIConfig, self).__post_init__()
+
+
+@dataclass(frozen=True, slots=True)
+class OCIArchiveConfig(_ImageConfig):
+    """Acquisition-only config; not a native materialization contract."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -223,13 +238,13 @@ class OCILayerSource:
 
 
 @dataclass(frozen=True, slots=True)
-class OCIImage:
-    """A selected, source-only OCI image receipt."""
+class _ImageGraph:
+    """A selected, source-only OCI image graph."""
 
     reference: OCIImageRef
     index_descriptor: Descriptor | None
     manifest_descriptor: Descriptor
-    config: OCIConfig
+    config: _ImageConfig
     platform: Platform
     layers: tuple[OCILayerSource, ...]
     reserved_path_policy: str = RESERVED_PATH_POLICY_ID
@@ -246,10 +261,10 @@ class OCIImage:
             raise ArtifactValidationError("image index descriptor has an unsupported media type")
         if self.manifest_descriptor.media_type not in SUPPORTED_IMAGE_MANIFEST_MEDIA_TYPES:
             raise ArtifactValidationError("image manifest descriptor has an unsupported media type")
-        if not isinstance(self.config, OCIConfig):
-            raise ArtifactValidationError("image config must be an OCIConfig")
-        if self.platform != Platform(os="linux", architecture="amd64"):
-            raise ArtifactValidationError("Phase-1 image platform must be exactly linux/amd64")
+        if not isinstance(self.config, _ImageConfig):
+            raise ArtifactValidationError("image config must be a validated image config")
+        if self.platform != Platform(os=self.config.os, architecture=self.config.architecture):
+            raise ArtifactValidationError("image platform must match its config")
         if not isinstance(self.layers, tuple) or not 1 <= len(self.layers) <= MAX_IMAGE_LAYERS:
             raise ArtifactValidationError(f"image must contain between 1 and {MAX_IMAGE_LAYERS} layers")
         if any(not isinstance(layer, OCILayerSource) for layer in self.layers):
@@ -290,6 +305,28 @@ class OCIImage:
     @property
     def digest(self) -> str:
         return f"sha256:{hashlib.sha256(self.canonical_bytes()).hexdigest()}"
+
+
+@dataclass(frozen=True, slots=True)
+class OCIImage(_ImageGraph):
+    """A native Phase-1 image; acquisition cannot widen this contract."""
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.config, OCIConfig):
+            raise ArtifactValidationError("image config must be an OCIConfig")
+        if self.platform != Platform(os="linux", architecture="amd64"):
+            raise ArtifactValidationError("Phase-1 image platform must be exactly linux/amd64")
+        super(OCIImage, self).__post_init__()
+
+
+@dataclass(frozen=True, slots=True)
+class OCIArchiveImage(_ImageGraph):
+    """Verified acquisition identity, never a native execution capability."""
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.config, OCIArchiveConfig):
+            raise ArtifactValidationError("archive config must be an OCIArchiveConfig")
+        super(OCIArchiveImage, self).__post_init__()
 
 
 @dataclass(frozen=True, slots=True)
@@ -365,8 +402,32 @@ def _wire_platform(value: Any, field_name: str) -> _WirePlatform:
     )
 
 
-def _exact_phase1_platform(platform: _WirePlatform | None) -> bool:
-    return platform == _WirePlatform(os="linux", architecture="amd64", variant=None, os_version=None, os_features=())
+ACQUISITION_PLATFORMS = ("linux/amd64", "linux/arm64")
+
+
+def validate_acquisition_platform(platform: str) -> str:
+    if platform not in ACQUISITION_PLATFORMS:
+        raise ArtifactValidationError("OCI acquisition supports only linux/amd64 and linux/arm64")
+    return platform.split("/", 1)[1]
+
+
+def _matches_platform(platform: _WirePlatform | None, architecture: str) -> bool:
+    # arm64 without a variant and arm64/v8 name the same baseline ISA. Count
+    # both as candidates so an index declaring both is rejected as ambiguous.
+    return (
+        platform is not None
+        and platform.os == "linux"
+        and platform.architecture == architecture
+        and platform.variant in ((None, "v8") if architecture == "arm64" else (None,))
+        and platform.os_version is None
+        and not platform.os_features
+    )
+
+
+def verify_acquisition_platform_metadata(value: Any, platform: str, field_name: str) -> None:
+    architecture = validate_acquisition_platform(platform)
+    if not _matches_platform(_wire_platform(value, field_name), architecture):
+        raise ArtifactValidationError(f"{field_name} must target exactly {platform}")
 
 
 def _require_document_media_type(document: Mapping[str, Any], descriptor: Descriptor, field_name: str) -> None:
@@ -377,7 +438,12 @@ def _require_document_media_type(document: Mapping[str, Any], descriptor: Descri
         raise ArtifactValidationError(f"{field_name} mediaType does not match its descriptor")
 
 
-def _parse_config(reader: BlobReader, descriptor: Descriptor) -> OCIConfig:
+def _parse_config(
+    reader: BlobReader,
+    descriptor: Descriptor,
+    *,
+    acquisition_platform: str | None,
+) -> _ImageConfig:
     if descriptor.media_type not in SUPPORTED_IMAGE_CONFIG_MEDIA_TYPES:
         raise ArtifactValidationError("image config descriptor has an unsupported media type")
     document = _read_json_blob(reader, descriptor, f"OCI image config {descriptor.digest}")
@@ -387,7 +453,11 @@ def _parse_config(reader: BlobReader, descriptor: Descriptor) -> OCIConfig:
     diff_ids = rootfs.get("diff_ids")
     if not isinstance(diff_ids, list):
         raise ArtifactValidationError("image config rootfs.diff_ids must be an array")
-    return OCIConfig(
+    config_type = OCIConfig
+    if acquisition_platform is not None:
+        verify_acquisition_platform_metadata(document, acquisition_platform, "image config")
+        config_type = OCIArchiveConfig
+    return config_type(
         descriptor=descriptor,
         os=document.get("os"),
         architecture=document.get("architecture"),
@@ -403,7 +473,8 @@ def _resolve_manifest(
     manifest_descriptor: Descriptor,
     *,
     index_descriptor: Descriptor | None,
-) -> OCIImage:
+    acquisition_platform: str | None = None,
+) -> OCIImage | OCIArchiveImage:
     if manifest_descriptor.media_type not in SUPPORTED_IMAGE_MANIFEST_MEDIA_TYPES:
         raise ArtifactValidationError("selected descriptor is not a supported OCI/Docker v2 image manifest")
     document = _read_json_blob(reader, manifest_descriptor, f"OCI image manifest {manifest_descriptor.digest}")
@@ -432,30 +503,33 @@ def _resolve_manifest(
         if layer.media_type not in expected_layer_types:
             raise ArtifactValidationError(f"manifest.layers[{index}] belongs to a different wire profile")
         compressed.append(layer)
-    config = _parse_config(reader, config_entry.descriptor)
+    config = _parse_config(reader, config_entry.descriptor, acquisition_platform=acquisition_platform)
     if len(config.diff_ids) != len(compressed):
         raise ArtifactValidationError("image config DiffID count does not match manifest layer count")
     layers = tuple(
         OCILayerSource(ordinal=index, compressed=layer, diff_id=config.diff_ids[index])
         for index, layer in enumerate(compressed)
     )
-    return OCIImage(
+    image_type = OCIImage if acquisition_platform is None else OCIArchiveImage
+    return image_type(
         reference=reference,
         index_descriptor=index_descriptor,
         manifest_descriptor=manifest_descriptor,
         config=config,
-        platform=Platform(os="linux", architecture="amd64"),
+        platform=Platform(os=config.os, architecture=config.architecture),
         layers=layers,
     )
 
 
-def resolve_image(reference: OCIImageRef, root_descriptor: Descriptor, reader: BlobReader) -> OCIImage:
-    """Resolve a pinned manifest or index to exactly one ``linux/amd64`` image.
-
-    Layer blobs are intentionally not read or decompressed here.  Their
-    descriptors and ordered DiffIDs are validated; snapshotting and conversion
-    happen at later trust boundaries.
-    """
+def _resolve_image(
+    reference: OCIImageRef,
+    root_descriptor: Descriptor,
+    reader: BlobReader,
+    *,
+    acquisition_platform: str | None,
+) -> OCIImage | OCIArchiveImage:
+    selected_platform = acquisition_platform or "linux/amd64"
+    architecture = validate_acquisition_platform(selected_platform)
     if not isinstance(reference, OCIImageRef):
         raise ArtifactValidationError("reference must be an OCIImageRef")
     if not isinstance(root_descriptor, Descriptor):
@@ -465,7 +539,13 @@ def resolve_image(reference: OCIImageRef, root_descriptor: Descriptor, reader: B
         if requested_digest != root_descriptor.digest:
             raise ArtifactValidationError("requested reference digest does not match the root descriptor")
     if root_descriptor.media_type in SUPPORTED_IMAGE_MANIFEST_MEDIA_TYPES:
-        return _resolve_manifest(reference, reader, root_descriptor, index_descriptor=None)
+        return _resolve_manifest(
+            reference,
+            reader,
+            root_descriptor,
+            index_descriptor=None,
+            acquisition_platform=acquisition_platform,
+        )
     if root_descriptor.media_type not in SUPPORTED_IMAGE_INDEX_MEDIA_TYPES:
         raise ArtifactValidationError("root descriptor is not a supported OCI/Docker v2 image manifest or index")
 
@@ -479,9 +559,9 @@ def resolve_image(reference: OCIImageRef, root_descriptor: Descriptor, reader: B
     matches: list[Descriptor] = []
     for index, raw_manifest in enumerate(manifests):
         entry = _wire_descriptor(raw_manifest, f"index.manifests[{index}]", platform_allowed=True)
-        if _exact_phase1_platform(entry.platform):
+        if _matches_platform(entry.platform, architecture):
             if entry.descriptor.media_type not in SUPPORTED_IMAGE_MANIFEST_MEDIA_TYPES:
-                raise ArtifactValidationError("linux/amd64 index entry is not a supported image manifest")
+                raise ArtifactValidationError(f"{selected_platform} index entry is not a supported image manifest")
             expected_manifest_type = (
                 OCI_IMAGE_MANIFEST_MEDIA_TYPE
                 if root_descriptor.media_type == OCI_IMAGE_INDEX_MEDIA_TYPE
@@ -491,7 +571,30 @@ def resolve_image(reference: OCIImageRef, root_descriptor: Descriptor, reader: B
                 raise ArtifactValidationError("image index and manifest media types belong to different wire profiles")
             matches.append(entry.descriptor)
     if not matches:
-        raise ArtifactValidationError("OCI image index has no exact linux/amd64 manifest")
+        raise ArtifactValidationError(f"OCI image index has no exact {selected_platform} manifest")
     if len(matches) != 1:
-        raise ArtifactValidationError("OCI image index has ambiguous linux/amd64 manifests")
-    return _resolve_manifest(reference, reader, matches[0], index_descriptor=root_descriptor)
+        raise ArtifactValidationError(f"OCI image index has ambiguous {selected_platform} manifests")
+    return _resolve_manifest(
+        reference,
+        reader,
+        matches[0],
+        index_descriptor=root_descriptor,
+        acquisition_platform=acquisition_platform,
+    )
+
+
+def resolve_image(reference: OCIImageRef, root_descriptor: Descriptor, reader: BlobReader) -> OCIImage:
+    """Resolve a pinned native linux/amd64 graph, without reading layer bytes."""
+    return _resolve_image(reference, root_descriptor, reader, acquisition_platform=None)
+
+
+def resolve_archive_image(
+    reference: OCIImageRef,
+    root_descriptor: Descriptor,
+    reader: BlobReader,
+    *,
+    platform: str,
+) -> OCIArchiveImage:
+    """Resolve a selected acquisition graph without granting native boot support."""
+    validate_acquisition_platform(platform)
+    return _resolve_image(reference, root_descriptor, reader, acquisition_platform=platform)

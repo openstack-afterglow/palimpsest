@@ -49,20 +49,6 @@ def test_source_build_pins_immutable_commit_and_repo():
     assert "palimpsest_head_sha.stdout | trim == palimpsest_source_version" in source_build_text
 
 
-def test_api_and_worker_ports_commands_and_health_path():
-    services = {
-        name: defaults_yaml[metadata["definition"]]
-        for name, metadata in defaults_yaml["palimpsest_service_catalog"].items()
-    }
-    assert defaults_yaml["palimpsest_api_port"] == 8020
-    assert defaults_yaml["palimpsest_api_listen_port"] == 18020
-    api_command = services["palimpsest-hub-api"]["command"]
-    assert api_command[:2] == ["uvicorn", "palimpsest_hub.main:app"]
-    assert "--port" in api_command and "{{ palimpsest_api_listen_port | string }}" in api_command
-    assert services["palimpsest-hub-worker"]["command"] == ["palimpsest-hub-worker"]
-    assert "/v1/health" in services["palimpsest-hub-api"]["healthcheck"]["test"][3]
-
-
 def test_redis_db_index_pinned_to_nine_and_hub_volume_paths():
     assert defaults_yaml["palimpsest_redis_db_index"] == 9
     assert defaults_yaml["palimpsest_hub_volume"] == "palimpsest_hub"

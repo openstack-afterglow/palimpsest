@@ -1280,7 +1280,7 @@ def test_malformed_creation_receipt_never_retains_attacker_values_in_exception(f
     assert error.__context__ is None
 
 
-def test_create_dispatch_rejects_unbound_project_request_before_adapter(
+def test_create_dispatch_rejects_missing_named_volume_before_adapter(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1297,7 +1297,7 @@ def test_create_dispatch_rejects_unbound_project_request_before_adapter(
         "run",
         lambda *_args, **_kwargs: pytest.fail("unbound request entered adapter"),
     )
-    with pytest.raises(StateError, match="volumes have not been prepared"):
+    with pytest.raises(StateError, match="must be created before attachment"):
         runtime_dispatch.run(
             request,
             preflight=_successful_run_preflight(request),

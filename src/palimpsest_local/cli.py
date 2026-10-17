@@ -32,7 +32,7 @@ from .build import build_layer, parse_palimpsestfile, verify_build_integrity
 from .buildkit import BuildKitSpec, NamedOCIContext, build_with_buildkit, image_arch_for_platform
 from .digest import digest_file, digest_hex, require_digest
 from .errors import ArtifactValidationError, PalimpsestError
-from .hub import DISK_FORMAT_MEDIA_TYPES, KIND_CLOUD_IMAGE, MEDIA_TYPE_LAYER_SQUASHFS, HubClient
+from .hub import DEFAULT_HUB_URL, DISK_FORMAT_MEDIA_TYPES, KIND_CLOUD_IMAGE, MEDIA_TYPE_LAYER_SQUASHFS, HubClient
 from .inventory import import_cloud_image
 from .oci_image import OCIImageRef
 from .oci_layout import ContentStore, extract_bundle_tar, verify_layout_dir
@@ -57,6 +57,7 @@ from .project import (
     DEFAULT_PROJECT_FILE,
     Project,
     ServiceSpec,
+    _memory_mib,
     canonical_project_json,
     deterministic_project_name,
     load_interpolation_environment,
@@ -74,6 +75,7 @@ from .project_runtime import (
     stop_project_services,
     up_project,
 )
+from .project_volumes import _validate_name
 from .refs import BuildSpec, ImageRef, LayerRef, RunSpec, StackRef
 from .registry import (
     RegistryConfig,
@@ -126,6 +128,7 @@ from .runtime_types import (
     ProcessStream,
     RunAttachmentMode,
     RunResult,
+    RunVolumeIntent,
     RunWarningCategory,
 )
 from .state import (
@@ -315,9 +318,7 @@ def _configured_url() -> str | None:
 
 
 def resolve_url(explicit_url: str | None) -> str:
-    value = explicit_url or os.environ.get("PALIMPSEST_URL") or _configured_url()
-    if not value:
-        raise PalimpsestError("Palimpsest Hub URL is required (--url, PALIMPSEST_URL, or config.toml)")
+    value = explicit_url or os.environ.get("PALIMPSEST_URL") or _configured_url() or DEFAULT_HUB_URL
     return value.rstrip("/")
 
 
@@ -597,6 +598,24 @@ def _run_process_session(session: ProcessSession, *, interactive: bool) -> int:
                     cleanup_error = PalimpsestError("cannot restore local signal handlers")
         if cleanup_error is not None and not active_exception:
             raise cleanup_error
+
+
+def _parse_run_volume(value: str) -> RunVolumeIntent:
+    parts = value.split(":")
+    if len(parts) not in {2, 3} or (len(parts) == 3 and parts[2] != "ro"):
+        raise argparse.ArgumentTypeError("--volume must be NAME:/guest/path[:ro]")
+    try:
+        return RunVolumeIntent(parts[0], parts[1], read_only=len(parts) == 3)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(f"invalid --volume: {exc}") from exc
+
+
+def _parse_volume_size(value: str) -> int:
+    raw_size = int(value) if re.fullmatch(r"[0-9]{1,10}", value) else value
+    try:
+        return _memory_mib(raw_size, "--size", minimum=16) * 1024 * 1024
+    except PalimpsestError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -989,6 +1008,15 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--layer", action="append", default=[], help="cloud-image SquashFS layer digest (repeatable; not for OCI-root)"
     )
+    run.add_argument(
+        "--volume",
+        action="append",
+        type=_parse_run_volume,
+        dest="volume_intents",
+        default=[],
+        metavar="NAME:/guest/path[:ro]",
+        help="attach an existing named data volume (repeatable; no host paths)",
+    )
     run.add_argument("--memory", type=int, default=4096, help="guest memory in MiB (256-1048576; default: 4096)")
     run.add_argument("--vcpus", type=int, default=2, help="guest virtual CPUs (1-256; default: 2)")
     run.add_argument("--network", default=None, help="backend network; OCI-root: nat, host-only, or none")
@@ -1002,7 +1030,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument(
         "--backend",
-        choices=("auto", "kvm", "lima-vz", "libvirt-hvf"),
+        choices=("auto", "kvm", "lima-vz", "libvirt-hvf", "lima-qemu-oci"),
         default="auto",
         help="VM backend (default: select for host and image architecture)",
     )
@@ -1014,6 +1042,20 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("-d", "--detach", action="store_true", help="leave an OCI-root VM running after READY")
     run.add_argument("--manifest", help="pin the root descriptor of a local OCI image")
     run.add_argument("--user", help="run a local OCI image as USER[:GROUP]")
+    run.add_argument(
+        "--platform", choices=("linux/amd64", "linux/arm64"), default="linux/amd64", help="selected OCI image platform"
+    )
+    run.add_argument(
+        "--force-architecture",
+        action="store_true",
+        help="explicit experimental OCI container-in-Lima/QEMU VM attempt; not native OCI-root",
+    )
+    run.add_argument(
+        "--vm-image",
+        type=Path,
+        help="matching local Linux carrier disk with preinstalled nerdctl/containerd (force mode only)",
+    )
+    run.add_argument("--vm-image-digest", help="SHA-256 of the local experimental carrier disk")
     run.add_argument(
         "--root-retention",
         choices=("delete", "retain"),
@@ -1067,6 +1109,25 @@ def build_parser() -> argparse.ArgumentParser:
     ):
         resource_list = commands.add_parser(command_name, help=description)
         resource_list.add_argument("--format", choices=("table", "json"), default="table", help="output format")
+    volume = commands.add_parser("volume", help="manage named data volumes")
+    volume_commands = volume.add_subparsers(dest="volume_operation", required=True)
+    for command_name, description in (
+        ("create", "create a named data volume"),
+        ("inspect", "inspect a named data volume"),
+        ("rm", "remove a named data volume"),
+    ):
+        volume_command = volume_commands.add_parser(command_name, help=description)
+        volume_command.add_argument("name")
+        volume_command.add_argument(
+            "--backend",
+            choices=("kvm", "lima-vz", "libvirt-hvf"),
+            required=True,
+            help="explicit volume backend",
+        )
+        if command_name == "create":
+            volume_command.add_argument(
+                "--size", type=_parse_volume_size, required=True, help="capacity in MiB or with a MiB/GiB suffix"
+            )
     inspect = commands.add_parser("inspect", help="inspect one managed VM/run")
     inspect.add_argument("name")
     logs = commands.add_parser("logs", help="show a managed VM/run console log")
@@ -1169,6 +1230,14 @@ def _validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
             parser.error("--memory must be between 256 and 1048576")
         if not 1 <= args.vcpus <= 256:
             parser.error("--vcpus must be between 1 and 256")
+        names = [intent.name for intent in args.volume_intents]
+        targets = [intent.target for intent in args.volume_intents]
+        if len(names) != len(set(names)):
+            parser.error("--volume cannot repeat a volume name")
+        if len(targets) != len(set(targets)):
+            parser.error("--volume cannot repeat a guest target")
+    if args.operation == "volume":
+        _validate_name(args.name, "volume name")
     if args.operation == "web":
         if args.port != 0 and not 1024 <= args.port <= 65535:
             parser.error("--port must be 0 or between 1024 and 65535")
@@ -2012,6 +2081,7 @@ def dispatch_args(args: argparse.Namespace) -> int:
         "logs",
         "ps",
         "volumes",
+        "volume",
         "networks",
         "exec",
         "shell",
@@ -2027,6 +2097,29 @@ def dispatch_args(args: argparse.Namespace) -> int:
         or (op == "oci" and args.oci_operation in read_only_oci_operations)
         else init_roots()
     )
+
+    if op == "volume":
+        from . import named_volumes
+
+        if args.volume_operation == "create":
+            payload = named_volumes.create_named_volume(
+                roots, name=args.name, backend=args.backend, size_bytes=args.size
+            )
+        elif args.volume_operation == "inspect":
+            payload = next(
+                (
+                    item
+                    for item in named_volumes.list_named_volumes(roots)
+                    if item["name"] == args.name and item["backend"] == args.backend
+                ),
+                None,
+            )
+            if payload is None:
+                raise PalimpsestError(f"named volume {args.name!r} does not exist for backend {args.backend!r}")
+        else:
+            payload = named_volumes.delete_named_volume(roots, name=args.name, backend=args.backend)
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0
 
     if op == "oci":
         if args.oci_operation == "pull":
@@ -2802,6 +2895,8 @@ def dispatch_args(args: argparse.Namespace) -> int:
         else:
             validate_run_name(args.name)
 
+        volume_intents = tuple(args.volume_intents)
+
         with cancellable_run_preparation():
             resolved_source = resolve_run_source(
                 roots,
@@ -2810,14 +2905,14 @@ def dispatch_args(args: argparse.Namespace) -> int:
                 registry_alias=getattr(args, "registry", None),
                 backend=args.backend,
                 network=args.network,
+                platform=args.platform,
+                force_architecture=args.force_architecture,
             )
 
         if resolved_source.is_oci:
             source = Path(resolved_source.target).resolve()
             if args.layer:
                 raise PalimpsestError("OCI-root run does not accept cloud --layer attachments")
-            if args.backend not in {"auto", "kvm"}:
-                raise PalimpsestError("OCI-root run supports only the KVM backend")
             if args.network is not None and args.network not in OCI_NETWORK_MODES:
                 raise PalimpsestError(
                     "OCI-root run networking accepts --network nat, --network host-only, or --network none"
@@ -2836,8 +2931,22 @@ def dispatch_args(args: argparse.Namespace) -> int:
                 root_volume_id=args.root_volume,
                 network=args.network,
                 published_ports=tuple(args.publish),
+                volume_intents=volume_intents,
+                platform=args.platform,
+                backend=args.backend,
+                force_architecture=args.force_architecture,
+                vm_image=args.vm_image,
+                vm_image_digest=args.vm_image_digest,
             )
+            if request.force_architecture:
+                print(
+                    "warning: experimental lima-qemu-oci container-in-VM runtime; not native OCI-root; foreign QEMU execution may be slow",
+                    file=sys.stderr,
+                )
             result = runtime_dispatch.run_local_oci(request, roots=roots)
+            if request.force_architecture:
+                print(f"experimental VM attempt evidence: {result.state_path}", file=sys.stderr)
+                return result.exit_code
             if args.detach:
                 if result.terminal is not None:
                     raise PalimpsestError("OCI-root workload exited before detached launch completed")
@@ -2849,15 +2958,19 @@ def dispatch_args(args: argparse.Namespace) -> int:
 
         if (
             getattr(args, "manifest", None) is not None
-            or getattr(args, "root_retention", None) is not None
+            or getattr(args, "root_retention", None) not in {None, "retain"}
             or getattr(args, "root_volume", None) is not None
             or getattr(args, "user", None) is not None
             or getattr(args, "command_override", None) is not None
             or getattr(args, "publish", None)
+            or args.force_architecture
+            or args.vm_image is not None
+            or args.vm_image_digest is not None
+            or args.platform != "linux/amd64"
         ):
             raise PalimpsestError(
-                "--manifest, --root-retention, --root-volume, --user, --publish and command overrides "
-                "are supported only for local OCI-root runs"
+                "--manifest, --root-retention=delete, --root-volume, --user, --publish, selected OCI --platform, "
+                "--force-architecture, --vm-image, --vm-image-digest and command overrides are supported only for OCI runs"
             )
         network = args.network if args.network is not None else "default"
         with cancellable_run_preparation():
@@ -2877,7 +2990,12 @@ def dispatch_args(args: argparse.Namespace) -> int:
             vcpus=args.vcpus,
             network=network,
         )
-        request = runtime_dispatch.resolve_run_request(run_spec, requested_backend=args.backend)
+        request = runtime_dispatch.resolve_run_request(
+            run_spec,
+            requested_backend=args.backend,
+            volume_intents=volume_intents,
+            require_volume_binding=bool(volume_intents),
+        )
         preflight = runtime_dispatch.preflight_run_request(request)
         result = runtime_dispatch.run(request, preflight=preflight, roots=roots)
         _render_run_warnings(result)
@@ -2973,10 +3091,22 @@ def dispatch_args(args: argparse.Namespace) -> int:
             _print_table(headings, rows)
 
     elif op == "inspect":
+        from . import experimental_oci_vm
+
+        if experimental_oci_vm.exists(roots, args.name):
+            print(json.dumps(experimental_oci_vm.inspect(roots, args.name), indent=2))
+            return 0
         info = runtime_dispatch.inspect_run(args.name, roots=roots)
         print(json.dumps(_inspect_json_payload(info), indent=2))
 
     elif op == "logs":
+        from . import experimental_oci_vm
+
+        if experimental_oci_vm.exists(roots, args.name):
+            for data in experimental_oci_vm.logs(roots, args.name, follow=args.follow):
+                sys.stdout.buffer.write(data)
+                sys.stdout.buffer.flush()
+            return 0
         stream = runtime_dispatch.logs(args.name, roots=roots, follow=args.follow)
         try:
             for event in stream.events():
@@ -3012,14 +3142,30 @@ def dispatch_args(args: argparse.Namespace) -> int:
             interactive=False,
         )
     elif op == "start":
+        from . import experimental_oci_vm
+
+        if experimental_oci_vm.exists(roots, args.name):
+            raise PalimpsestError("experimental OCI VMs are disposable; submit a new run instead of start")
         runtime_dispatch.start(args.name, roots=roots)
         print(f"started {args.name}")
 
     elif op == "stop":
+        from . import experimental_oci_vm
+
+        if experimental_oci_vm.exists(roots, args.name):
+            experimental_oci_vm.stop(roots, args.name)
+            print(f"stopped {args.name}")
+            return 0
         runtime_dispatch.stop(args.name, roots=roots)
         print(f"stopped {args.name}")
 
     elif op == "rm":
+        from . import experimental_oci_vm
+
+        if experimental_oci_vm.exists(roots, args.name):
+            experimental_oci_vm.remove(roots, args.name)
+            print(f"removed {args.name}; experimental evidence retained")
+            return 0
         removal = runtime_dispatch.rm(args.name, roots=roots, volumes=args.volumes)
         print(f"removed {args.name}")
         if isinstance(removal, OCIRunRemovalResult) and removal.retention_policy == "retain":

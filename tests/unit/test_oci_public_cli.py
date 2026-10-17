@@ -260,7 +260,6 @@ def test_detached_early_exit_is_not_reported_as_running(tmp_path, monkeypatch, c
     [
         ["--publish", "8080:80"],
         ["--manifest", "a" * 64],
-        ["--root-retention", "retain"],
         ["--root-volume", "49bd618f-1a3e-4cd8-b436-58c194efd791"],
         ["--user", "redis"],
     ],

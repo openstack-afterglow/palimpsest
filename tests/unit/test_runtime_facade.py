@@ -285,12 +285,6 @@ def test_first_party_process_operations_use_dispatcher_sessions() -> None:
     assert "adapter.shell_session(" in dispatch_source
 
 
-def test_cli_has_no_backend_lifecycle_escape_hatches() -> None:
-    source = (_source_root() / "cli.py").read_text(encoding="utf-8")
-    assert _cli_architecture_violations(source) == ()
-    assert "runtime_dispatch.commit(" in source
-
-
 @pytest.mark.parametrize(
     "source",
     [

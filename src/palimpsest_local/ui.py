@@ -22,6 +22,7 @@ from typing import Any
 from . import inventory, platforms, state
 from .console import ConsoleError, ConsoleManager
 from .errors import PalimpsestError
+from .remote_artifacts import HubConnection
 from .runtime_types import ProcessSignal
 from .vm_exec_session import ExecOwners
 from .web_operations import OperationManager
@@ -33,7 +34,7 @@ _MAX_UI_LOG_LINES = 5_000
 
 
 def _vm_identifier(encoded: str) -> str | None:
-    """Decode one bounded VM ID for reads/consoles, never lifecycle control.
+    """Decode one bounded VM ID for detail, consoles, or confirmed removal.
 
     Managed run names retain their existing syntax; host IDs identify an exact
     backend observation and may contain URL-encoded spaces or Unicode names.
@@ -84,7 +85,7 @@ def build_handler(
     Detail/logs/metrics/console accept managed names or decoded stable host IDs.
     Logs (tail 1..5000, default 200) and metrics return inventory projections
     unchanged and forward only the optional expected_run_id query identity.
-    Console forwards that identity from JSON; lifecycle remains managed-only.
+    Console forwards that identity from JSON; start/stop remain managed-only.
     """
 
     active_roots = {"current": roots}
@@ -229,7 +230,25 @@ def build_handler(
 
             try:
                 if path == "/api/v1/remotes":
-                    self._send_json(inventory.remote_connections(roots))
+                    self._send_json(
+                        inventory.remote_connections(roots, hub_connection=HubConnection.from_headers(self.headers))
+                    )
+                    return
+                if path == "/api/v1/remotes/hub/identity":
+                    self._send_json(
+                        inventory.remote_hub_identity(roots, hub_connection=HubConnection.from_headers(self.headers))
+                    )
+                    return
+                if path == "/api/v1/remotes/artifact":
+                    self._send_json(
+                        inventory.inspect_remote_artifact(
+                            roots,
+                            connection_id=qs.get("connection", [""])[0],
+                            reference=qs.get("reference", [""])[0],
+                            manifest=qs.get("manifest", [None])[0],
+                            hub_connection=HubConnection.from_headers(self.headers),
+                        )
+                    )
                     return
                 if path == "/api/v1/remotes/artifacts":
                     limit_str = qs.get("limit", ["30"])[0]
@@ -247,6 +266,10 @@ def build_handler(
                             repository=qs.get("repository", [""])[0],
                             limit=limit,
                             cursor=qs.get("cursor", [None])[0],
+                            arch=qs.get("arch", [""])[0],
+                            disk_format=qs.get("disk_format", [""])[0],
+                            parent=qs.get("parent", [""])[0],
+                            hub_connection=HubConnection.from_headers(self.headers),
                         )
                     )
                     return
@@ -411,7 +434,15 @@ def build_handler(
                     body = self._read_json_body()
                     if body is None:
                         return
-                    self._send_json(inventory.transfer_artifact(roots, operations, body), status=202)
+                    self._send_json(
+                        inventory.transfer_artifact(
+                            roots,
+                            operations,
+                            body,
+                            hub_connection=HubConnection.from_headers(self.headers),
+                        ),
+                        status=202,
+                    )
                     return
                 if path in {"/api/v1/builds", "/api/v1/vms"}:
                     body = self._read_json_body()
@@ -419,6 +450,12 @@ def build_handler(
                         return
                     launch = inventory.build_image if path == "/api/v1/builds" else inventory.run_image
                     self._send_json(launch(roots, operations, body), status=202)
+                    return
+                if path == "/api/v1/volumes":
+                    body = self._read_json_body()
+                    if body is None:
+                        return
+                    self._send_json(inventory.create_volume(roots, body), status=201)
                     return
                 if path.startswith("/api/v1/consoles/"):
                     rest = path[len("/api/v1/consoles/") :]
@@ -601,14 +638,18 @@ def build_handler(
                     self._send_json({"id": session_id, "status": "disconnected"})
                     return
                 if path.startswith("/api/v1/vms/"):
-                    name = path[len("/api/v1/vms/") :]
-                    if NAME_RE.fullmatch(name) is None:
-                        self._send_json({"error": "invalid run name"}, status=400)
+                    name = _vm_identifier(path[len("/api/v1/vms/") :])
+                    if name is None:
+                        self._send_json({"error": "invalid VM inventory identifier"}, status=400)
                         return
                     body = self._read_json_body()
                     if body is None:
                         return
-                    if set(body) - {"expected_run_id", "confirmation", "volumes"} or "volumes" in qs:
+                    if (
+                        set(body) - {"expected_run_id", "expected_removal_identity", "confirmation", "volumes"}
+                        or "volumes" in qs
+                        or (name.startswith("host:") and "expected_removal_identity" not in body)
+                    ):
                         self._send_json(
                             {"error": "VM removal requires JSON identity, confirmation and boolean volumes"}, status=400
                         )
@@ -618,18 +659,35 @@ def build_handler(
                             roots,
                             name,
                             expected_run_id=body.get("expected_run_id"),
+                            expected_removal_identity=body.get("expected_removal_identity"),
                             confirmation=body.get("confirmation"),
                             volumes=body.get("volumes", False),
                         )
                     )
                     return
 
+                if path.startswith("/api/v1/volumes/"):
+                    volume_id = urllib.parse.unquote(path[len("/api/v1/volumes/") :])
+                    body = self._read_json_body()
+                    if body is None:
+                        return
+                    if set(body) != {"confirmation"}:
+                        self._send_json({"error": "volume deletion requires exact-name confirmation"}, status=400)
+                        return
+                    self._send_json(inventory.delete_volume(roots, volume_id, confirmation=body["confirmation"]))
+                    return
                 if path.startswith("/api/v1/store/artifacts/"):
-                    digest = path[len("/api/v1/store/artifacts/") :]
+                    digest = urllib.parse.unquote(path[len("/api/v1/store/artifacts/") :])
                     if not DIGEST_RE.match(digest):
                         self._send_json({"error": "invalid digest"}, status=400)
                         return
                     force = qs.get("force", ["0"])[0].lower() in ("1", "true")
+                    body = self._read_json_body() if self.headers.get("Content-Length") else {}
+                    if body is None:
+                        return
+                    if set(body) != {"confirmation"} or body["confirmation"] != digest:
+                        self._send_json({"error": "confirmation must exactly match the artifact digest"}, status=400)
+                        return
                     res = inventory.remove_artifact(roots, digest, force=force)
                     self._send_json(res)
                     return

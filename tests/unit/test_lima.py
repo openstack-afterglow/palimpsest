@@ -601,6 +601,11 @@ def test_lima_rm_volumes_cleans_up_exact_owned_failed_instance(
     roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
     rpaths, owner = _legacy_lima_lifecycle(roots, "failed-lima-cleanup", "failed")
     present = True
+    home = tmp_path / "native-lima"
+    home.mkdir(mode=0o700)
+    native_dir = home / rpaths.name
+    native_dir.mkdir(mode=0o700)
+    monkeypatch.setenv("LIMA_HOME", str(home))
 
     def fake_command(argv: list[str], *, timeout_seconds: float = 600) -> subprocess.CompletedProcess[str]:
         nonlocal present
@@ -611,6 +616,8 @@ def test_lima_rm_volumes_cleans_up_exact_owned_failed_instance(
                     {
                         "name": rpaths.name,
                         "status": "Running",
+                        "vmType": "vz",
+                        "dir": str(native_dir),
                         "config": {"env": {"PALIMPSEST_RUN_ID": owner.run_id}},
                     }
                 )

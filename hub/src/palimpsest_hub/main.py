@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from time import perf_counter
+from typing import Literal
 from uuid import uuid4
 
 import uvicorn
@@ -15,20 +19,26 @@ from pydantic import BaseModel
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
+from sqlalchemy import text
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from palimpsest_hub.api.builds import router as build_router
 from palimpsest_hub.api.hub import configure_blocking_operations
 from palimpsest_hub.api.hub import router as hub_router
 from palimpsest_hub.api.packages import router as package_router
-from palimpsest_hub.cache import close_redis
+from palimpsest_hub.cache import close_redis, get_redis
 from palimpsest_hub.config import get_settings
-from palimpsest_hub.database import close_db, init_db
+from palimpsest_hub.database import close_db, get_session_factory, init_db
 from palimpsest_hub.logging import configure_logging
 from palimpsest_hub.rate_limit import limiter
+from palimpsest_hub.services.hub_store import get_blob_store
 
 logger = logging.getLogger(__name__)
 _METHODS = frozenset({"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"})
+_READINESS_TIMEOUT_SECONDS = 2.0
+# Retain timed-out work: cancelling an await cannot stop a filesystem syscall.
+# Repeated probes must not queue more threads or SQL/Redis checkouts behind it.
+_readiness_tasks: dict[str, asyncio.Task[bool]] = {}
 
 
 class VersionLink(BaseModel):
@@ -55,6 +65,11 @@ class HealthResponse(BaseModel):
     status: str = "ok"
 
 
+class ReadinessResponse(BaseModel):
+    status: Literal["ready", "not_ready"]
+    checks: dict[str, Literal["ok", "error", "timeout"]]
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     configure_logging()
@@ -71,6 +86,11 @@ async def lifespan(_: FastAPI):
     try:
         yield
     finally:
+        tasks = tuple(_readiness_tasks.values())
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        _readiness_tasks.clear()
         await close_redis()
         await close_db()
 
@@ -229,6 +249,90 @@ async def health_v1() -> HealthResponse:
 @app.get("/health", response_model=HealthResponse, include_in_schema=False)
 async def health() -> HealthResponse:
     return HealthResponse(status="ok")
+
+
+async def _check_database() -> None:
+    factory = get_session_factory()
+    if factory is None:
+        raise RuntimeError("database is not initialized")
+    async with factory() as session:
+        if (await session.execute(text("SELECT 1"))).scalar_one() != 1:
+            raise RuntimeError("database probe failed")
+
+
+async def _check_redis() -> None:
+    client = await get_redis()
+    if await client.ping() is not True:
+        raise RuntimeError("Redis probe failed")
+
+
+def _check_blob_store_access() -> None:
+    store = get_blob_store()
+    # Subdirectories are created lazily by the store. Check existing ones, but
+    # never create a missing root (which could hide a missing volume mount).
+    for directory in (
+        store.root,
+        store.blobs_dir.parent,
+        store.blobs_dir,
+        store.uploads_dir,
+        store.exports_dir,
+        store.locks_dir,
+    ):
+        try:
+            fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        except FileNotFoundError:
+            if directory == store.root or os.path.lexists(directory):
+                raise
+            continue
+        try:
+            if not os.access(directory, os.R_OK | os.W_OK | os.X_OK, effective_ids=True):
+                raise PermissionError("blob store access denied")
+        finally:
+            os.close(fd)
+
+
+async def _check_blob_store() -> None:
+    await asyncio.to_thread(_check_blob_store_access)
+
+
+async def _readiness_check(probe: Callable[[], Awaitable[None]]) -> bool:
+    try:
+        await probe()
+    except Exception:
+        # This endpoint is unauthenticated: no paths, URLs, credentials, SQL or
+        # remote exception messages belong in its response or logs.
+        return False
+    return True
+
+
+@app.get(
+    "/v1/ready",
+    response_model=ReadinessResponse,
+    responses={503: {"model": ReadinessResponse}},
+    operation_id="get_v1_ready",
+)
+async def ready_v1() -> JSONResponse:
+    tasks = {}
+    for name, probe in (
+        ("database", _check_database),
+        ("redis", _check_redis),
+        ("blob_store", _check_blob_store),
+    ):
+        task = _readiness_tasks.get(name)
+        if task is None or task.done():
+            task = asyncio.create_task(_readiness_check(probe))
+            _readiness_tasks[name] = task
+        tasks[name] = task
+    # Unlike wait_for, wait returns at the deadline without waiting for driver
+    # cancellation/rollback or a blocked filesystem thread to finish.
+    done, _ = await asyncio.wait(tasks.values(), timeout=_READINESS_TIMEOUT_SECONDS)
+    checks = {
+        name: "timeout" if task not in done else "ok" if not task.cancelled() and task.result() else "error"
+        for name, task in tasks.items()
+    }
+    ready = all(value == "ok" for value in checks.values())
+    body = ReadinessResponse(status="ready" if ready else "not_ready", checks=checks)
+    return JSONResponse(body.model_dump(), status_code=200 if ready else 503, headers={"Cache-Control": "no-store"})
 
 
 def run() -> None:

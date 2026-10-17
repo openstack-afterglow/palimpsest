@@ -104,6 +104,54 @@ Build restrictions enforced before execution:
 - Dockerfile builds reject legacy `--base`/`--layer`; use `--runtime-base` and `--local-image` instead.
 - `--progress` defaults to `plain`; build networking defaults to `none`.
 
+### Local build → Palimpsest Hub → another client
+
+For a macOS ARM64 client, build a matching conventional cloud-image runtime layer,
+not an unsupported local OCI-root VM. Docker/Buildx and `mksquashfs` must be
+available; use a Dockerfile context compatible with the selected ARM64 cloud base.
+Set `PALIMPSEST_URL` and `PALIMPSEST_TOKEN` to the Hub and your original
+project-scoped Keystone token first. Current inventory/download/publish authority
+is checked independently; an administrator role alone is not publication authority.
+
+```sh
+export PALIMPSEST_URL=https://palimpsest.dmslab.re.kr
+# Set PALIMPSEST_TOKEN privately, never as a literal in shell history or this file.
+BASE_DIGEST=sha256:1d6bffe64b848468ac97f821d369a4846d983de1800ccf6b5ec8853e85cefc55
+
+# This recorded Hub ARM64 base must still be visible to your original project.
+palimpsest image ls --arch aarch64 --disk-format qcow2 --limit 20
+palimpsest image pull "$BASE_DIGEST"
+
+# Run in your Dockerfile context. This is a local BuildKit build, not a Hub build.
+palimpsest build . -f Dockerfile --frontend dockerfile \
+  --platform linux/arm64 --cache-mode local --registry docker \
+  -t myapp:dev --runtime-tag myapp-runtime --runtime-base "$BASE_DIGEST"
+
+# Upload prints the complete content digest. Keep it for subsequent consumers.
+LAYER_DIGEST=$(palimpsest layer push myapp-runtime \
+  --name myapp-runtime --base-image "$BASE_DIGEST")
+palimpsest layer ls --name myapp-runtime --limit 20
+palimpsest layer pull "$LAYER_DIGEST" --output ./downloads
+palimpsest bundle pull "$LAYER_DIGEST" --include-base --output ./myapp-bundle
+palimpsest bundle verify ./myapp-bundle
+```
+
+The layer-only pull does not fetch a VM's base/parents; `bundle pull --include-base`
+is the full-chain transfer. Outputs above are directories; existing destinations
+must satisfy the normal verification/non-overwrite rules. Hub object names are not
+download identities: use the full digest printed by Push or copied from web Details.
+The current released CLI list projection may omit a Hub `blob_digest`; do not
+infer it from a name. These commands describe the current contract; the connected
+catalog acceptance exercised real reads/downloads, not a new build or upload.
+
+To build only a container archive, omit `--runtime-tag` and `--runtime-base` and
+optionally set `--output ./myapp.oci.tar`. That OCI archive is not a legacy
+SquashFS layer accepted by `layer push`; native package publication uses its
+separate registry profile/project-key protocol. `--push` targets the OCI/native
+output registry, while `--runtime-push` publishes the SquashFS runtime layer to
+Palimpsest Hub. Docker Hub is not the legacy Palimpsest `/v1` artifact namespace.
+
+
 ## Run: cloud image versus OCI root
 
 ```sh
@@ -127,7 +175,47 @@ Without `-d`, OCI `run` waits for the image workload, streams its output, and re
 
 `--root-retention` defaults semantically to `delete`. `retain` preserves only the VM-exclusive writable OCI root volume during removal. It is not a shared data volume. Reuse requires its exact UUID through `--root-volume` and compatible lower graph/size/exclusive attachment.
 
+Acquisition and execution are separate: `--platform linux/amd64|linux/arm64` can
+select verified archive bytes without promising native execution. An explicit
+experimental `--force-architecture` run uses Lima/QEMU as a VM carrier, not the
+native OCI-root stage-1. Supply `--vm-image /absolute/carrier.qcow2` and its exact
+`--vm-image-digest sha256:...`; the carrier must be a self-contained raw/QCOW2
+disk with neither backing files nor external data files. This mode is
+foreground-only and requires a disposable root (`--root-retention delete`),
+without independent named-disk attachments. The web producer follows the same
+foreground/disposable policy rather than submitting an invalid detached retained
+run. Ordinary native/conventional policies are unchanged; no cross-architecture
+guest qualification follows from archive acquisition or carrier validation.
+
+
 Parser limits are 256–1,048,576 MiB for `--memory` (default 4096) and 1–256 for `--vcpus` (default 2).
+
+Conventional cloud-image VMs accept independent named data disks. Create the disk
+first, then attach it at VM creation; existing arbitrary disks are never adopted
+or reformatted:
+
+```bash
+palimpsest volume create data --backend lima-vz --size 10GiB
+palimpsest run CLOUD_IMAGE --name app --volume data:/srv/data
+palimpsest volumes --format json
+palimpsest volume inspect data --backend lima-vz
+palimpsest rm app
+palimpsest run CLOUD_IMAGE --name replacement --volume data:/srv/data
+```
+
+Use `kvm` or `libvirt-hvf` for their conventional runtimes. `:ro` makes a mount
+read-only but still exclusive. Stopped VMs reserve their disks; only verified
+VM removal releases them. `volume rm NAME --backend BACKEND` explicitly deletes
+a detached disk. Native OCI-root and experimental carrier named-volume
+attachments are rejected; they do not silently omit the requested storage.
+Conventional removal retains the root, firmware/native configuration and ordered
+base/layer/attachment topology by default. `rm --volumes` explicitly purges only
+safely owned instance root/runtime/topology, not these independent data disks or
+shared CAS layers. The Volumes dashboard can delete an owned retained archive
+after exact-name and fresh native-detachment checks. External libvirt archives
+are reference-only and cannot authorize deletion of arbitrary source files.
+Referenced layers remain protected until all attached/retained dependencies are
+gone; force cannot bypass that gate. Invalid retained metadata blocks deletion.
 
 ## Runtime lifecycle and observation
 
@@ -143,7 +231,7 @@ palimpsest stop app
 palimpsest rm app
 ```
 
-`rm --volumes` is the conventional/project volume-removal request and is explicitly rejected for OCI-root runs; OCI root deletion/retention follows the owned run policy. OCI-root also rejects `start`, `shell`, and `commit`; use `exec` for additional processes and `stop`/`rm` for lifecycle control. `commit NAME --tag TAG` commits a conventional runtime layer.
+`rm --volumes` explicitly purges safely owned conventional instance root/runtime/topology, never independent named data disks. It is rejected for OCI-root runs; OCI root deletion/retention follows the owned run policy. OCI-root also rejects `start`, `shell`, and `commit`; use `exec` for additional processes and `stop`/`rm` for lifecycle control. `commit NAME --tag TAG` commits a conventional runtime layer.
 
 OCI diagnostic commands emit JSON: `root-proof NAME`, `exec-status NAME`, `exec-record PATH`, `resource-status`, `root-volumes`, and `root-volume UUID`. `oci init-runtime PATH` securely creates a runtime parent and prints the `PALIMPSEST_STATE_HOME=...` assignment. `oci pull FULLREF --output ARCHIVE` uses installed Skopeo to acquire one anonymously accessible HTTPS `linux/amd64` image, verifies it through the private source CAS, and only then publishes a new local archive. The caller-selected endpoint may be Internet, private-network, or local. `oci materialize SOURCE` snapshots and verifies a local archive/layout, converts layers with the selected SquashFS packer, and emits a receipt (or writes it to a new `--output` file). Their timeout defaults to 300 seconds and must be positive and finite.
 
@@ -188,7 +276,7 @@ is unaffected by table presentation.
 
 `web --port 0` (the default) chooses an available port. Explicit ports must be 1024–65535. State roots are owner-only. Ordinary Linux users default to `~/.local/state/palimpsest`; root and the dedicated `palimpsest` account retain `/var/lib/palimpsest`. Explicit env/config/XDG overrides remain supported; existing state is not silently migrated.
 
-`web` replaces the former `ui` command. It is a foreground process, not a daemon or an installation-time service: ordinary CLI commands never start it. The packaged dashboard binds only `127.0.0.1` and stops serving when the command exits, including Ctrl-C/SIGINT or SIGTERM. It opens a browser by default; `--no-browser` only prints the URL. If no browser is available, open that printed URL manually. No Hub URL, token or connection is required, and the page makes no Hub requests.
+`web` replaces the former `ui` command. It is a foreground process, not a daemon or an installation-time service: ordinary CLI commands never start it. The packaged dashboard binds only `127.0.0.1` and stops serving when the command exits, including Ctrl-C/SIGINT or SIGTERM. It opens a browser by default; `--no-browser` only prints the URL. If no browser is available, open that printed URL manually. No Hub URL, token or connection is required; remote Hub requests happen only on explicit connection, catalog or transfer actions.
 
 The printed URL carries a per-process token. The page removes it from the address bar and keeps it in the tab session, so reloading works while the process runs; a restarted process needs its new URL. Assets and `/api/v1` require the token as a bearer header. Run it as the UID that owns the selected state root. For a remote host, keep the loopback bind and forward it, for example `ssh -L 8080:127.0.0.1:8080 HOST`.
 
@@ -221,21 +309,44 @@ While the tab is visible it refreshes resource views every five seconds without 
 
 | View | Source | Not a claim of |
 | --- | --- | --- |
-| VMs | live Lima/libvirt host observation plus selected-state reconciliation; explicit detail probes read the Linux guest journal, `/proc` counters and `df` through an authenticated transport | service readiness, lifecycle authority over external VMs, or measurements from an unavailable transport |
+| VMs | live Lima/libvirt host observation plus selected-state reconciliation; explicit detail probes read the Linux guest journal, `/proc` counters and `df` through an authenticated transport | automatic deletion, adopted ownership of another state, or measurements from an unavailable transport |
 | Volumes | host primary/additional disks and selected project/OCI root-volume records; backend-reported capacity, backing-file length and allocated host bytes are distinct measurements | verified filesystem contents or capacity when the backend did not report it |
-| Layers and images | local CAS metadata/tags and run/project references, plus successful local BuildKit OCI export records and retained acquired sources, typed manifest/archive/runtime identities and archive presence/size observations | Hub/registry state, archive content verification or OCI-root runnability |
+| Layers and images | local CAS metadata/tags and run/project references, successful BuildKit exports and retained sources; separate explicit Hub/Docker Hub catalog requests | automatic remote refresh, layer-file integrity from metadata alone, or OCI-root runnability |
 | Networks | backend network definitions and VM attachments plus selected-state committed OCI plans; Lima configuration is marked configured, not live traffic | successful packet delivery, guest address discovery, or an open published listener |
 | Builds and storage | local build records, the engine's console file (`console.log` for Palimpsestfile, `buildkit.log` for BuildKit; tails read at most 4 MiB), and state-directory usage | — |
 
 `palimpsest ps` and the web VM, volume and network views discover resources
 across the local Lima/libvirt backend, even when they were launched with a
 different `PALIMPSEST_STATE_HOME`. Only exact backend/name/run-ID matches in the
-selected state can start, stop or remove a VM. Discovery never imports another
-state directory or adopts a resource. Logs, measurements and opt-in consoles
-use independently reported access capabilities and revalidate the selected
-identity. Artifacts, builds and state storage remain scoped to the selected
-state. Docker containers are not VM inventory. Unknown or malformed metadata
-and failed backend queries remain visible as unavailable observations or warnings.
+selected state can start or stop a VM; CLI lifecycle commands remain scoped to
+that state. Discovery never imports another state directory or adopts a resource.
+Logs, measurements and opt-in consoles use independently reported access
+capabilities and revalidate the selected identity. Artifacts, builds and state
+storage remain scoped to the selected state. Docker containers are not VM
+inventory. Unknown metadata and failed backend queries remain unavailable
+observations or warnings.
+
+Web **Remove** also supports external Lima VZ/QEMU/krunkit and libvirt KVM/HVF VMs. It requires
+`--allow-control`, the selected stable inventory ID, the original native removal
+identity and exact typed VM name. A Lima identity binds its physical instance
+directory/device/inode and optional run marker; libvirt uses its native domain
+UUID. Missing, changed, stale or colliding identities fail closed. Unmarked VMs
+can be removed without obtaining guest credentials; this does not unlock their
+consoles or start/stop actions. OCI-root removal still requires its original
+managed runtime.
+
+Default Lima removal stops the VM, snapshots the root/backing closure and native
+firmware/configuration plus ordered topology, then deletes its native instance.
+Explicit purge skips retention only for safely owned instance files. Libvirt
+removal preserves external disk/NVRAM/emulator TPM sources as reference-only
+topology; unsafe external purge is rejected before stopping. Unreadable/malformed
+domain metadata and OCI-root contracts disable external removal. Persistent
+emulator TPMs require explicit native KEEP_TPM support; transient emulator TPMs
+must already declare `persistent_state='yes'`. Unsupported retention is rejected
+before stopping. External removal never deletes another state's run tree or
+independent data volumes. Completion reports actual storage policy/archive ID.
+Recheck after any backend failure; a failed or ambiguous operation is not
+reported as successful.
 
 VM detail probes run only for the open VM, not every resource in list refreshes.
 Running logs are the bounded guest system journal; stopped selected libvirt
@@ -248,3 +359,44 @@ reboots, counter resets and paused sampling do not display invented rates.
 Block-device counters are shown per device rather than summed with partitions.
 
 Recorded OCI exports and retained acquired sources remain visible when their archive is missing or unavailable; availability means a regular local file with matching recorded size was observed, not that its digest was reverified. Polling does not rehash whole image archives. Running a selected source does reverify its archive. Recorded Docker output tags are provenance, separate from editable local CAS tags. The image detail links to its originating build when present and separates OCI manifest, OCI archive and SquashFS runtime-block digests.
+
+### Connected Hub and Docker Hub catalogs
+
+Open **Layers and images** and choose **Palimpsest Hub** or **Docker Hub**. No
+Afterglow backend, remote Hub deployment change or browser CORS exception is
+needed: the browser calls the authenticated loopback app, and that Python client
+contacts the selected verified HTTPS service. Remote catalogs are never polled.
+
+- **Palimpsest Hub:** enter the Hub URL and original Keystone token, then Connect.
+  The optional project ID asserts the original scope; it cannot select a different
+  project. `/v1/me` supplies the actual identity, project and independent current
+  capabilities. Search cloud images/SquashFS by name or digest prefix and filter
+  architecture, disk format or parent. Details resolve the full base/parent chain,
+  preserving errors for inaccessible or inconsistent dependencies.
+- **Docker Hub:** public repository search needs no Hub configuration; select a
+  repository for bounded tag pages, or enter `docker.io/library/alpine:latest`
+  directly. Inspect an index, then select a platform to read its manifest/config
+  and ordered layer digests, media types and compressed sizes. Tag filtering is
+  per server page, not a claim that every matching tag was searched. Changing
+  search fields resets pagination; Back restores the repository search.
+- **Authentication:** the password field clears after Connect. The override stays
+  only in JavaScript memory, disappears on reload/disconnect, and travels only in
+  scoped local headers. A transfer captures its own child-process environment;
+  it never changes `os.environ` or writes credentials into argv/receipts. Docker
+  uses only its selected config/helper; native package profiles use their own
+  scoped helper keys. Remote authorization/network errors do not log out the
+  local dashboard bearer session.
+- **Inspection versus acquisition:** metadata needs neither Docker nor Skopeo.
+  Docker manifest/config bytes are SHA-256/size checked with bounded HTTPS reads;
+  one digest-bound config request may take a credential-free hop to an allowlisted
+  Docker CDN. Layer descriptors are not downloaded/verified layer files. Download
+  needs `--allow-control` plus the existing transport prerequisites (Skopeo for
+  registry acquisition). A selected Docker platform downloads its immutable child
+  manifest, while further inspection retains the pinned parent index.
+- **VM setup:** a completed verified transfer can fill the VM form with its base
+  and ordered layers. It closes the detail modal and preserves keyboard focus;
+  a separate explicit Run is still required. OCI acquisition remains
+  `linux/amd64`-only and OCI-root execution remains Linux amd64 KVM-only, even
+  though metadata inspection exposes other platforms. Read-only mode permits
+  connection, search and inspection, but rejects every transfer mutation.
+

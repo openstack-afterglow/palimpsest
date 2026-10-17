@@ -44,6 +44,84 @@ def _setup_roots(tmp_path: Path) -> state.StatePaths:
     return init_roots({"XDG_CONFIG_HOME": str(config_dir), "XDG_STATE_HOME": str(state_dir)})
 
 
+@pytest.mark.parametrize("retention", [None, "delete"])
+def test_force_web_run_is_accepted_by_foreground_carrier_policy(tmp_path, retention):
+    from palimpsest_local.cli import build_parser
+    from palimpsest_local.oci_run_request import LocalOCIRunRequest
+    from palimpsest_local.runtime_types import ExperimentalOCIDispatchKey
+
+    roots = _setup_roots(tmp_path)
+    captured = []
+
+    class Operations:
+        def start(self, _roots, kind, argv, *, resource_name):
+            assert kind == "run" and resource_name == "web-carrier"
+            captured.append(build_parser().parse_args(argv))
+            return {"id": "submitted"}
+
+    body = {
+        "image": str(tmp_path / "image.oci"),
+        "name": "web-carrier",
+        "runtime_kind": "oci-root",
+        "backend": "lima-qemu-oci",
+        "platform": "linux/amd64",
+        "force_architecture": True,
+        "vm_image": str(tmp_path / "carrier.qcow2"),
+        "vm_image_digest": "sha256:" + "a" * 64,
+    }
+    if retention is not None:
+        body["root_retention"] = retention
+    inventory.run_image(roots, Operations(), body)
+    args = captured[0]
+    request = LocalOCIRunRequest(
+        name=args.name,
+        source=Path(args.image_or_bundle),
+        detached=args.detach,
+        backend=args.backend,
+        platform=args.platform,
+        force_architecture=args.force_architecture,
+        root_retention=args.root_retention or "delete",
+        vm_image=args.vm_image,
+        vm_image_digest=args.vm_image_digest,
+    )
+    assert isinstance(request.dispatch_key, ExperimentalOCIDispatchKey)
+    assert not request.detached and request.root_retention == "delete"
+
+
+def test_force_web_run_rejects_explicit_retained_root_before_submission(tmp_path):
+    class Operations:
+        def start(self, *_args, **_kwargs):
+            pytest.fail("invalid retained carrier must not be submitted")
+
+    with pytest.raises(StateError, match="force_architecture requires disposable root_retention delete, not retain"):
+        inventory.run_image(
+            _setup_roots(tmp_path),
+            Operations(),
+            {"image": "image.oci", "force_architecture": True, "root_retention": "retain"},
+        )
+
+
+@pytest.mark.parametrize("runtime_kind", ["oci-root", "cloud-image"])
+@pytest.mark.parametrize("force", [None, False])
+def test_native_and_conventional_web_runs_stay_detached(tmp_path, runtime_kind, force):
+    from palimpsest_local.cli import build_parser
+
+    captured = []
+
+    class Operations:
+        def start(self, _roots, _kind, argv, **_kwargs):
+            captured.append(build_parser().parse_args(argv))
+            return {"id": "submitted"}
+
+    body = {"image": "local-image", "runtime_kind": runtime_kind, "root_retention": "retain"}
+    if force is not None:
+        body["force_architecture"] = force
+    inventory.run_image(_setup_roots(tmp_path), Operations(), body)
+    assert captured[0].detach is True
+    assert captured[0].force_architecture is False
+    assert captured[0].root_retention == "retain"
+
+
 def test_storage_report(tmp_path: Path):
     roots = _setup_roots(tmp_path)
     (roots.store / "sample.txt").write_text("hello store", encoding="utf-8")
@@ -1837,6 +1915,10 @@ def test_host_same_name_different_run_id_is_not_managed(tmp_path, monkeypatch):
     with pytest.raises(StateError, match="ambiguous"):
         inventory.get_vm(roots, "collision")
     assert inventory.get_vm(roots, "host:lima-vz:collision")["run_id"] == external["run_id"]
+    external["removal_identity"] = "native-identity"
+    fresh = {row["id"]: row for row in inventory.list_vms(roots)["vms"]}
+    assert fresh[external["id"]]["lifecycle"]["remove"] is True
+    assert fresh["collision"]["lifecycle"]["remove"] is False
     assert all(row["access"]["reason"] == "identity" for row in result)
     assert inventory.vm_metrics(roots, external["id"], expected_run_id=external["run_id"])["reason"] == "identity"
     assert inventory.vm_logs(roots, external["id"], expected_run_id=external["run_id"])["reason"] == "identity"
@@ -2332,7 +2414,7 @@ def test_remove_vm_replacement_fences_original_uuid_before_backend(tmp_path, mon
 
 
 @pytest.mark.parametrize("identifier", ["external", "host:lima-vz:external"])
-def test_remove_vm_external_identity_is_forbidden_without_adoption(tmp_path, monkeypatch, identifier):
+def test_remove_vm_external_identity_is_forbidden_without_native_identity(tmp_path, monkeypatch, identifier):
     roots = _setup_roots(tmp_path)
     run_id = "11111111-1111-4111-8111-111111111111"
     monkeypatch.setattr(
@@ -2428,14 +2510,30 @@ def test_remove_vm_canonical_disk_retention_never_deletes_project_or_arbitrary_f
     project.mkdir()
     (project / "data.raw").write_bytes(b"named project volume")
     sibling_id = _resource_run(roots, "sibling")
-    instance = {"name": "selected", "status": "Running", "config": {"env": {"PALIMPSEST_RUN_ID": run_id}}}
+    home = (tmp_path / "lima").resolve()
+    native = home / "selected"
+    native.mkdir(parents=True, mode=0o700)
+    (native / "diffdisk").write_bytes(b"native root sentinel")
+    monkeypatch.setenv("LIMA_HOME", str(home))
+    instance = {
+        "name": "selected",
+        "dir": str(native),
+        "vmType": "vz",
+        "status": "Running",
+        "config": {"env": {"PALIMPSEST_RUN_ID": run_id}},
+    }
     calls = []
 
     def delete_backend(argv, **kwargs):
         nonlocal instance
         calls.append(argv)
-        assert argv == ["limactl", "delete", "--force", "selected"]
-        instance = None
+        if argv[1] == "stop":
+            instance["status"] = "Stopped"
+        else:
+            import shutil
+
+            shutil.rmtree(native)
+            instance = None
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     monkeypatch.setattr(inventory.runtime_dispatch.lima, "_instance_info_or_none", lambda name: instance)
@@ -2444,19 +2542,16 @@ def test_remove_vm_canonical_disk_retention_never_deletes_project_or_arbitrary_f
     kwargs = {"volumes": True} if volumes else {}  # Exercise default retention, not explicit False.
     result = inventory.remove_vm(roots, "selected", expected_run_id=run_id, confirmation="selected", **kwargs)
 
-    assert calls == [["limactl", "delete", "--force", "selected"]]
-    assert result == {
-        "name": "selected",
-        "run_id": run_id,
-        "runtime_kind": "cloud-image",
-        "backend": "lima-vz",
-        "operation": "rm",
-        "previous_status": "running",
-        "status": "removed",
-        "lifecycle_revision": 1,
-        "warning_category": None,
-        "fallback_used": False,
-    }
+    assert calls[-1] == ["limactl", "delete", "--force", "--", "selected"]
+    assert result["status"] == "removed" and result["run_id"] == run_id
+    archives = inventory.retained_instances.list_retained_instances(roots)
+    if volumes:
+        assert archives == []
+    else:
+        archive = archives[0]
+        saved = roots.state / "retained-instances" / archive["id"].split(":", 1)[1]
+        assert (saved / "diffdisk").read_bytes() == b"native root sentinel"
+        assert archive["topology"]["volumes"][0]["name"] == "project-data"
     assert str(tmp_path) not in repr(result)
     if volumes:
         assert not run.exists()
@@ -2546,3 +2641,43 @@ def test_remove_vm_missing_selected_run_fails_closed(tmp_path, monkeypatch):
         inventory.remove_vm(
             roots, "selected", expected_run_id="11111111-1111-4111-8111-111111111111", confirmation="selected"
         )
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_retained_instance_prevents_layer_deletion_until_archive_purge(tmp_path, monkeypatch, force):
+    roots = _setup_roots(tmp_path)
+    store = ContentStore(roots.store)
+    digest = f"sha256:{store.write_stream([b'retained shared layer']).name}"
+    store.write_metadata(digest, {"kind": "squashfs"})
+    native = tmp_path / "native"
+    native.mkdir(mode=0o700)
+    (native / "diffdisk").write_bytes(b"private root sentinel")
+    instance = {"name": "saved", "dir": str(native), "vmType": "vz", "config": {}}
+    archive = inventory.retained_instances.retain_lima(
+        roots, instance, identity="native-saved", ledger={"layers": [{"digest": digest}]}
+    )
+    inventory.retained_instances.mark_native_removed(roots, archive)
+    row = inventory.list_artifacts(roots)["artifacts"][0]
+    assert row["delete_supported"] is False
+    assert row["deletion_blockers"]["volumes"]
+    with pytest.raises(StateError, match="still used by.*retained-instance"):
+        inventory.remove_artifact(roots, digest, force=force)
+    assert store.exists(digest)
+    monkeypatch.setattr(inventory.retained_instances, "_assert_detached", lambda *_a: None)
+    inventory.delete_volume(roots, archive, confirmation="saved")
+    inventory.remove_artifact(roots, digest, force=force)
+    assert not store.exists(digest)
+
+
+def test_corrupt_retained_metadata_blocks_layer_deletion_and_inventory_action(tmp_path):
+    roots = _setup_roots(tmp_path)
+    store = ContentStore(roots.store)
+    digest = f"sha256:{store.write_stream([b'protected while uncertain']).name}"
+    store.write_metadata(digest, {"kind": "squashfs"})
+    directory = roots.state / "retained-instances" / ("a" * 64)
+    directory.mkdir(parents=True, mode=0o700)
+    (directory / "record.json").write_text("{")
+    with pytest.raises(StateError, match="retained instance metadata is invalid"):
+        inventory.remove_artifact(roots, digest, force=True)
+    assert store.exists(digest)
+    assert inventory.list_artifacts(roots)["artifacts"][0]["delete_supported"] is False

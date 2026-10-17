@@ -224,11 +224,17 @@ class LocalProcessSession:
         try:
             for descriptor, stream in self._event_sources():
                 selector.register(descriptor, selectors.EVENT_READ, stream)
-            while selector.get_map():
-                for key, _mask in selector.select():
+            # kqueue does not wake a blocked select when another thread closes
+            # its registered pipes. Bound the wait so close() can end consumers.
+            while selector.get_map() and not self._cancel_event.is_set():
+                for key, _mask in selector.select(timeout=0.1):
+                    if self._cancel_event.is_set():
+                        break
                     try:
                         data = os.read(key.fd, _READ_SIZE)
                     except OSError as exc:
+                        if self._cancel_event.is_set():
+                            break
                         if self._tty and exc.errno == errno.EIO:
                             data = b""
                         elif exc.errno == errno.EINTR:

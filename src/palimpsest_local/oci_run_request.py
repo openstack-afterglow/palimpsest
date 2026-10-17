@@ -26,7 +26,7 @@ from .oci_process import OCIProcessSpec, OCIUserSpec
 from .oci_source import LocalArchiveSource, LocalLayoutSource, SourceCAS, SourceSnapshot
 from .oci_store import OCIStore
 from .project_volumes import _validate_size
-from .runtime_types import DispatchKey, RuntimeBackend, RuntimeKind
+from .runtime_types import DispatchKey, ExperimentalOCIDispatchKey, RuntimeBackend, RuntimeKind, RunVolumeIntent
 from .state import StatePaths
 
 
@@ -48,6 +48,10 @@ class LocalOCIRunRequest:
     backend: str = "kvm"
     user_override: OCIUserSpec | None = None
     command_override: tuple[str, ...] | None = None
+    force_architecture: bool = False
+    vm_image: Path | None = field(default=None, repr=False)
+    vm_image_digest: str | None = None
+    volume_intents: tuple[RunVolumeIntent, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", self.name) is None:
@@ -79,6 +83,19 @@ class LocalOCIRunRequest:
         if type(self.vcpus) is not int or not 1 <= self.vcpus <= 256:
             raise ArtifactValidationError("OCI run vcpus must be between 1 and 256")
         _validate_size(self.root_size_bytes)
+        if not isinstance(self.volume_intents, tuple) or not all(
+            isinstance(intent, RunVolumeIntent) for intent in self.volume_intents
+        ):
+            raise ArtifactValidationError("OCI run requires immutable typed volume intents")
+        if self.volume_intents:
+            if self.backend == "lima-qemu-oci":
+                raise ArtifactValidationError(
+                    "data volume attachment to the experimental OCI carrier is unsupported; "
+                    "carrier container disks are not attached; use a cloud-image VM or compose block service"
+                )
+            raise ArtifactValidationError(
+                "data volume attachment to native OCI-root is unsupported; use cloud-image VM or compose block service"
+            )
         if type(self.root_retention) is not str or self.root_retention not in {"delete", "retain"}:
             raise ArtifactValidationError("OCI run root retention policy is invalid")
         if self.root_volume_id is not None:
@@ -94,11 +111,38 @@ class LocalOCIRunRequest:
             raise ArtifactValidationError(
                 "OCI run networking must be a typed configuration; the CLI resolves --network and --publish"
             )
-        if self.platform != "linux/amd64" or self.backend != "kvm":
-            raise ArtifactValidationError("local OCI run supports only linux/amd64 on KVM")
+        if type(self.force_architecture) is not bool:
+            raise ArtifactValidationError("force architecture policy must be a boolean")
+        if self.platform not in {"linux/amd64", "linux/arm64"}:
+            raise ArtifactValidationError("local OCI platform must be linux/amd64 or linux/arm64")
+        if self.backend == "lima-qemu-oci":
+            if not self.force_architecture:
+                raise ArtifactValidationError("experimental OCI execution requires --force-architecture")
+            if self.detached:
+                raise ArtifactValidationError("experimental Lima/QEMU OCI execution is foreground-only; omit --detach")
+            if self.root_retention != "delete" or self.root_volume_id is not None:
+                raise ArtifactValidationError(
+                    "experimental OCI execution has a disposable VM disk, not native retained roots"
+                )
+            if self.network.mode == "host-only":
+                raise ArtifactValidationError("experimental OCI execution supports nat or none, not host-only")
+            if any(port.protocol != "tcp" or port.host_ip != "127.0.0.1" for port in self.network.published_ports):
+                raise ArtifactValidationError("experimental OCI publications require TCP on 127.0.0.1")
+        elif self.platform != "linux/amd64" or self.backend != "kvm" or self.force_architecture:
+            raise ArtifactValidationError("native local OCI run supports only linux/amd64 on KVM")
+        elif self.vm_image is not None or self.vm_image_digest is not None:
+            raise ArtifactValidationError("--vm-image and --vm-image-digest require --force-architecture")
+        if self.vm_image is not None and (not isinstance(self.vm_image, Path) or not self.vm_image.is_absolute()):
+            raise ArtifactValidationError("experimental VM carrier must be an absolute local path")
+        if self.vm_image_digest is not None and (
+            not isinstance(self.vm_image_digest, str) or normalize_digest(self.vm_image_digest) != self.vm_image_digest
+        ):
+            raise ArtifactValidationError("experimental VM carrier digest must be canonical sha256")
 
     @property
-    def dispatch_key(self) -> DispatchKey:
+    def dispatch_key(self) -> DispatchKey | ExperimentalOCIDispatchKey:
+        if self.backend == "lima-qemu-oci":
+            return ExperimentalOCIDispatchKey()
         return DispatchKey(RuntimeKind.OCI_ROOT, RuntimeBackend.KVM)
 
 
@@ -144,17 +188,38 @@ def resolve_local_oci_run_request(
     network: str | OCINetworkConfig | None = None,
     published_ports: Sequence[str] = (),
     platform: str = "linux/amd64",
-    backend: str = "kvm",
+    backend: str = "auto",
+    force_architecture: bool = False,
+    vm_image: Path | None = None,
+    vm_image_digest: str | None = None,
+    volume_intents: tuple[RunVolumeIntent, ...] = (),
 ) -> LocalOCIRunRequest:
     """Resolve only a local path; image selection happens in the secure snapshot."""
     if not isinstance(source, Path):
         raise ArtifactValidationError("local OCI run source must be a path")
+    if vm_image is not None and not isinstance(vm_image, Path):
+        raise ArtifactValidationError("local experimental VM carrier must be a path")
     try:
         selected = source.expanduser().resolve(strict=True)
         if not selected.is_file() and not selected.is_dir():
             raise OSError("unsupported source type")
+        selected_carrier = vm_image.expanduser().resolve(strict=True) if vm_image is not None else None
     except (OSError, RuntimeError, ValueError):
-        raise ArtifactValidationError("local OCI run source is missing or not a regular file/directory") from None
+        raise ArtifactValidationError(
+            "local OCI source or VM carrier is missing or not a regular file/directory"
+        ) from None
+    from .platforms import select_backend
+
+    # Native resolution remains host-independent; its existing adapter owns
+    # strict preflight. Only explicit experimental consent adds host selection.
+    selected_backend = "kvm" if backend == "auto" else backend
+    if force_architecture or backend == "lima-qemu-oci":
+        selected_backend = select_backend(
+            platform.removeprefix("linux/"),
+            requested=backend,
+            runtime_kind="oci-root",
+            force_architecture=force_architecture,
+        )
     return LocalOCIRunRequest(
         name=name,
         source=selected,
@@ -171,7 +236,11 @@ def resolve_local_oci_run_request(
             network if isinstance(network, OCINetworkConfig) else OCINetworkConfig.resolve(network, published_ports)
         ),
         platform=platform,
-        backend=backend,
+        backend=selected_backend,
+        force_architecture=force_architecture,
+        vm_image=selected_carrier,
+        vm_image_digest=vm_image_digest,
+        volume_intents=volume_intents,
     )
 
 
@@ -190,6 +259,8 @@ def materialize_local_oci_run(
     """
     if not isinstance(request, LocalOCIRunRequest) or not isinstance(roots, StatePaths):
         raise ArtifactValidationError("local OCI intake requires a typed request and state paths")
+    if request.backend != "kvm" or request.platform != "linux/amd64" or request.force_architecture:
+        raise ArtifactValidationError("native OCI materialization does not accept experimental VM execution requests")
     if os.name != "posix" or not sys.platform.startswith("linux"):
         raise UnsupportedPlatformError("local OCI run materialization requires Linux")
     if type(timeout_seconds) not in (int, float) or not math.isfinite(timeout_seconds) or timeout_seconds <= 0:

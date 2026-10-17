@@ -615,14 +615,45 @@ not digest verification or proof that OCI-root execution works. Automatic OCI
 run remains Linux amd64 KVM-only; local cache mode does not itself prohibit
 remote Dockerfile inputs.
 
+The **Layers and images** page also makes explicit remote catalog requests through
+the local client. Connect Palimpsest Hub with its HTTPS URL and your original
+Keystone token in the tab; inspect cloud images, SquashFS layers and their full
+base/parent chains, with architecture, disk-format and parent filters. Docker Hub
+supports public repository search, tag pages and exact-reference inspection of
+platform manifests, config and ordered compressed layer descriptors without a
+Docker daemon or Skopeo. Metadata is not a downloaded or verified layer file.
+Downloads require `--allow-control` and use the canonical verified transfer path;
+VM setup only fills the run form and never launches a VM automatically. Hub
+credentials stay in tab memory and request-scoped local headers, not browser
+storage or the server's global environment. Reload/disconnect clears the tab
+override; Docker/native package credentials remain separate. The browser needs
+only loopback access; the local client needs verified HTTPS access to each Hub.
+
+
 The desktop-style VM list provides explicit Console/Details actions and
 Logs, Terminal, Resources and Details tabs. Open detail collects real bounded
 Linux guest journal, CPU/memory/filesystem, interface and per-device disk counters;
 first samples and unavailable/stale measurements are labelled, not guessed.
 Marked external Lima VMs can expose authenticated guest access without adoption;
-start/stop/remove still require an exact selected-owned run. Drawer/tab/chart
-motion respects reduced-motion settings. Normal dashboard shutdown retains the
-original OCI result owners through bounded drain/ACK, never command retry or VM stop.
+start/stop still require an exact selected-owned run. With `--allow-control`,
+Remove also supports observed Lima VZ/QEMU/krunkit and libvirt VMs after exact-name
+and native identity confirmation, without switching state directories or adoption.
+Default removal retains the instance root, native configuration/firmware state,
+and ordered base/layer/connection topology before deleting the native VM. Explicit
+instance purge removes only safely owned root/runtime/topology files. External
+libvirt archives are reference-only: original disks/NVRAM/TPM remain untouched,
+and arbitrary external-file purge is refused before stopping the VM.
+The Volumes page creates independent named ext4 data disks and selects them at
+conventional VM creation (`--volume NAME:/guest/path[:ro]`). Stopped VMs still
+reserve disks; VM removal releases them without deleting their contents, even
+with `rm --volumes`. Delete detached named volumes separately with exact-name
+confirmation. Lima VZ, Linux KVM and libvirt/HVF conventional VMs are supported;
+native OCI-root and experimental carrier named-volume attachments are rejected.
+Retained instance roots keep their layer dependencies pinned until explicit
+root/topology purge; malformed retention metadata blocks layer deletion.
+OCI-root web removal remains unsupported. Drawer/tab/chart motion respects
+reduced-motion settings. Normal dashboard shutdown retains the original OCI
+result owners through bounded drain/ACK, never command retry or VM stop.
 `ps`, `volumes`, `networks` and `compose ps` align complete cell widths without
 truncating names or changing JSON. For macOS HVF from a source checkout, retain
 the optional binding with `uv run --frozen --extra kvm palimpsest web --allow-control`.

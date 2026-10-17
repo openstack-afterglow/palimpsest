@@ -529,3 +529,344 @@ def test_observe_libvirt_multi_disk_and_blockinfo(monkeypatch: pytest.MonkeyPatc
     assert v_sec["attachments"][0]["mount_path"] == ""
     # Path digest prevents leaking the raw filesystem path in ID
     assert str(data_disk_file) not in v_sec["id"]
+
+
+@pytest.fixture
+def external_libvirt(tmp_path, monkeypatch):
+    import sys
+    from types import SimpleNamespace
+
+    from palimpsest_local import host_vm_control, state
+
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+
+    class NativeError(RuntimeError):
+        def get_error_code(self):
+            return 42
+
+    native = {
+        "uuid": "11111111-1111-4111-8111-111111111111",
+        "name": "Guest café:one",
+        "active": True,
+        "persistent": True,
+        "exists": True,
+        "fail_destroy": False,
+        "flags": None,
+        "tpm": False,
+        "tpm_persistent": False,
+        "metadata": "",
+        "xml_error": False,
+    }
+    disk = tmp_path / "shared-disk.raw"
+    disk.write_bytes(b"shared disk")
+    nvram = tmp_path / "firmware.fd"
+    nvram.write_bytes(b"firmware")
+    tpm = tmp_path / "tpm.state"
+    tpm.write_bytes(b"sealed TPM state")
+
+    def destroy():
+        if native["fail_destroy"]:
+            raise NativeError("private driver diagnostics")
+        native["active"] = False
+        if native["tpm"] and not native["persistent"] and not native["tpm_persistent"]:
+            tpm.unlink()
+        if not native["persistent"]:
+            native["exists"] = False
+
+    def undefine(flags):
+        native["flags"] = flags
+        native["exists"] = False
+        if native["tpm"] and not flags & 64 and not native["tpm_persistent"]:
+            tpm.unlink()
+
+    def lookup(identity):
+        if native["exists"] and identity == native["uuid"]:
+            return domain
+        raise NativeError("no domain")
+
+    def xml_desc(flags=0):
+        if native["xml_error"]:
+            raise NativeError("XML unavailable")
+        if "xml_override" in native:
+            return native["xml_override"]
+        policy = " persistent_state='yes'" if native["tpm_persistent"] else ""
+        tpm_xml = f"<tpm><backend type='emulator'{policy}/></tpm>" if native["tpm"] else ""
+        return (
+            f"<domain><name>{native['name']}</name><uuid>{native['uuid']}</uuid>"
+            f"<metadata>{native['metadata']}</metadata><os><nvram>{nvram}</nvram></os>"
+            f"<devices><disk type='file' device='disk'><source file='{disk}'/><target dev='vda'/></disk>{tpm_xml}</devices></domain>"
+        )
+
+    domain = SimpleNamespace(
+        UUIDString=lambda: native["uuid"],
+        name=lambda: native["name"],
+        isActive=lambda: native["active"],
+        isPersistent=lambda: native["persistent"],
+        destroy=destroy,
+        undefineFlags=undefine,
+        state=lambda: (1 if native["active"] else 5, 0),
+        info=lambda: (1, 1024, 1024, 1, 0),
+        XMLDesc=xml_desc,
+    )
+    conn = SimpleNamespace(
+        lookupByUUIDString=lookup,
+        close=lambda: None,
+        listAllDomains=lambda: [domain] if native["exists"] else [],
+        listAllNetworks=lambda: [],
+        listAllStoragePools=lambda: [],
+    )
+    libvirt = SimpleNamespace(
+        libvirtError=NativeError,
+        VIR_ERR_NO_DOMAIN=42,
+        VIR_DOMAIN_UNDEFINE_KEEP_NVRAM=8,
+        VIR_DOMAIN_UNDEFINE_MANAGED_SAVE=1,
+        VIR_DOMAIN_UNDEFINE_SNAPSHOTS_METADATA=2,
+        VIR_DOMAIN_UNDEFINE_KEEP_TPM=64,
+        openReadOnly=lambda uri: conn,
+    )
+    monkeypatch.setitem(sys.modules, "libvirt", libvirt)
+    monkeypatch.setattr(host_vm_control.kvm, "_libvirt", lambda: libvirt)
+    monkeypatch.setattr(host_vm_control.kvm, "connect", lambda uri: conn)
+    monkeypatch.setattr(host_inventory, "_observe_lima", lambda: ([], [], [], []))
+    return {
+        "native": native,
+        "disk": disk,
+        "nvram": nvram,
+        "tpm": tpm,
+        "domain": domain,
+        "libvirt": libvirt,
+        "roots": roots,
+    }
+
+
+@pytest.mark.parametrize(
+    ("backend", "system", "machine"), [("kvm", "Linux", "x86_64"), ("libvirt-hvf", "Darwin", "aarch64")]
+)
+@pytest.mark.parametrize(("active", "persistent"), [(True, True), (False, True), (True, False)])
+def test_observed_libvirt_removal_preserves_disks_and_nvram(
+    external_libvirt, monkeypatch, backend, system, machine, active, persistent
+):
+    from palimpsest_local import host_vm_control
+
+    native = external_libvirt["native"]
+    native.update(active=active, persistent=persistent)
+    monkeypatch.setattr(platforms, "detect_host", lambda: platforms.HostPlatform(system, machine))
+    row = host_inventory.observe()["vms"][0]
+    assert row["backend"] == backend and row["run_id"] is None
+    assert row["removal_identity"] == native["uuid"]
+    receipt = host_vm_control.remove_vm(row, expected_identity=row["removal_identity"], roots=external_libvirt["roots"])
+    assert receipt["status"] == "removed" and receipt["storage_policy"] == "libvirt-disks-retained"
+    assert not native["exists"] and not native["active"]
+    assert native["flags"] == (11 if persistent else None)
+    assert external_libvirt["disk"].read_bytes() == b"shared disk"
+    assert external_libvirt["nvram"].read_bytes() == b"firmware"
+    assert host_inventory.observe()["vms"] == []
+
+
+@pytest.mark.parametrize("change", ["uuid", "name", "destroy-failure", "oci-root"])
+def test_libvirt_removal_identity_or_backend_failure_never_reports_success(external_libvirt, monkeypatch, change):
+    from palimpsest_local import host_vm_control
+    from palimpsest_local.errors import StateError
+
+    monkeypatch.setattr(platforms, "detect_host", lambda: platforms.HostPlatform("Darwin", "aarch64"))
+    native = external_libvirt["native"]
+    row = host_inventory.observe()["vms"][0]
+    if change == "uuid":
+        native["uuid"] = "22222222-2222-4222-8222-222222222222"
+    elif change == "name":
+        native["name"] = "replacement"
+    elif change == "oci-root":
+        row["runtime_kind"] = "oci-root"
+    else:
+        native["fail_destroy"] = True
+    with pytest.raises(StateError):
+        host_vm_control.remove_vm(row, expected_identity=row["removal_identity"], roots=external_libvirt["roots"])
+    assert native["exists"] and native["active"] and native["flags"] is None
+    assert external_libvirt["disk"].read_bytes() == b"shared disk"
+
+
+@pytest.mark.parametrize("damage", ["symlink", "shared-writable", "wrong-home", "wrong-marker"])
+def test_lima_removal_identity_rejects_unsafe_native_directories(tmp_path, monkeypatch, damage):
+    from palimpsest_local import host_vm_control
+
+    home = tmp_path.resolve()
+    monkeypatch.setenv("LIMA_HOME", str(home))
+    native = home / "native"
+    native.mkdir(mode=0o700)
+    instance = {"name": "native", "vmType": "vz", "dir": str(native), "config": {}}
+    assert host_vm_control.lima_removal_identity(instance) is not None
+    if damage == "symlink":
+        actual = native.with_name("actual")
+        native.rename(actual)
+        native.symlink_to(actual, target_is_directory=True)
+    elif damage == "shared-writable":
+        native.chmod(0o777)
+    elif damage == "wrong-home":
+        monkeypatch.setenv("LIMA_HOME", str(home / "different"))
+    else:
+        instance["config"] = {"env": {"PALIMPSEST_RUN_ID": "malformed"}}
+    assert host_vm_control.lima_removal_identity(instance) is None
+
+
+@pytest.mark.parametrize(
+    "damage", ["XML-unavailable", "malformed-XML", "wrong-root", "invalid-marker", "OCI-contract", "duplicate-marker"]
+)
+def test_libvirt_unknown_or_oci_classification_never_exposes_removal(external_libvirt, monkeypatch, damage):
+    from palimpsest_local import inventory
+
+    monkeypatch.setattr(platforms, "detect_host", lambda: platforms.HostPlatform("Darwin", "aarch64"))
+    native = external_libvirt["native"]
+    marker = (
+        f"<pal:run xmlns:pal='{host_inventory.kvm.DOMAIN_MARKER_NAMESPACE}' schema='1' "
+        f"version='{host_inventory.kvm.DOMAIN_MARKER_VERSION}' id='{native['uuid']}'/>"
+    )
+    if damage == "XML-unavailable":
+        native["xml_error"] = True
+    elif damage == "malformed-XML":
+        native["xml_override"] = "<domain>"
+    elif damage == "wrong-root":
+        native["xml_override"] = "<invalid/>"
+    elif damage == "invalid-marker":
+        native["metadata"] = marker.replace("schema='1'", "schema='99'")
+    elif damage == "OCI-contract":
+        native["metadata"] = marker.replace("/>", " contract='sha256:" + "a" * 64 + "'/>")
+    else:
+        native["metadata"] = marker + marker
+    row = host_inventory.observe()["vms"][0]
+    assert row["removal_identity"] is None
+    assert not inventory._vm_lifecycle_capabilities(row)["remove"]
+    assert native["active"] and native["exists"]
+
+
+@pytest.mark.parametrize(
+    "change", ["unreadable-XML", "malformed-XML", "OCI-contract", "unsafe-transient-TPM", "missing-keep-TPM"]
+)
+def test_libvirt_preflight_rejects_changed_classification_or_unsafe_tpm_before_stop(
+    external_libvirt, monkeypatch, change
+):
+    from palimpsest_local import host_vm_control
+    from palimpsest_local.errors import StateError
+
+    monkeypatch.setattr(platforms, "detect_host", lambda: platforms.HostPlatform("Darwin", "aarch64"))
+    native = external_libvirt["native"]
+    row = host_inventory.observe()["vms"][0]
+    if change == "unreadable-XML":
+        native["xml_error"] = True
+    elif change == "malformed-XML":
+        native["xml_override"] = "<domain>"
+    elif change == "OCI-contract":
+        native["metadata"] = (
+            f"<pal:run xmlns:pal='{host_inventory.kvm.DOMAIN_MARKER_NAMESPACE}' schema='1' "
+            f"version='{host_inventory.kvm.DOMAIN_MARKER_VERSION}' id='{native['uuid']}' "
+            f"contract='sha256:{'a' * 64}'/>"
+        )
+    else:
+        native["tpm"] = True
+        if change == "unsafe-transient-TPM":
+            native["persistent"] = False
+        else:
+            del external_libvirt["libvirt"].VIR_DOMAIN_UNDEFINE_KEEP_TPM
+    with pytest.raises(StateError):
+        host_vm_control.remove_vm(row, expected_identity=row["removal_identity"], roots=external_libvirt["roots"])
+    assert native["active"] and native["exists"] and native["flags"] is None
+    assert external_libvirt["tpm"].read_bytes() == b"sealed TPM state"
+    assert external_libvirt["disk"].read_bytes() == b"shared disk"
+
+
+@pytest.mark.parametrize(("persistent", "tpm_persistent"), [(True, False), (True, True), (False, True)])
+def test_libvirt_removal_explicitly_retains_emulator_tpm_state(
+    external_libvirt, monkeypatch, persistent, tpm_persistent
+):
+    from palimpsest_local import host_vm_control
+
+    monkeypatch.setattr(platforms, "detect_host", lambda: platforms.HostPlatform("Darwin", "aarch64"))
+    native = external_libvirt["native"]
+    native.update(tpm=True, persistent=persistent, tpm_persistent=tpm_persistent)
+    row = host_inventory.observe()["vms"][0]
+    result = host_vm_control.remove_vm(row, expected_identity=row["removal_identity"])
+    assert result["status"] == "removed" and not native["exists"]
+    assert external_libvirt["tpm"].read_bytes() == b"sealed TPM state"
+    assert external_libvirt["disk"].read_bytes() == b"shared disk"
+
+
+@pytest.mark.parametrize(("before", "after"), [(None, "first"), ("first", None), ("first", "second")])
+@pytest.mark.parametrize("change_at", [1, 2])
+def test_libvirt_marker_presence_and_uuid_changes_are_fenced_before_stop(
+    external_libvirt, monkeypatch, before, after, change_at
+):
+    from palimpsest_local import host_vm_control
+    from palimpsest_local.errors import StateError
+
+    monkeypatch.setattr(platforms, "detect_host", lambda: platforms.HostPlatform("Darwin", "aarch64"))
+    native = external_libvirt["native"]
+    identities = {"first": "33333333-3333-4333-8333-333333333333", "second": "44444444-4444-4444-8444-444444444444"}
+
+    def marker(label):
+        if label is None:
+            return ""
+        return (
+            f"<pal:run xmlns:pal='{host_inventory.kvm.DOMAIN_MARKER_NAMESPACE}' schema='1' "
+            f"version='{host_inventory.kvm.DOMAIN_MARKER_VERSION}' id='{identities[label]}'/>"
+        )
+
+    native["metadata"] = marker(before)
+    row = host_inventory.observe()["vms"][0]
+    assert row["run_id"] == (identities[before] if before else None)
+    original = external_libvirt["domain"].XMLDesc
+    calls = 0
+
+    def changed(flags=0):
+        nonlocal calls
+        calls += 1
+        if calls == change_at:
+            native["metadata"] = marker(after)
+        return original(flags)
+
+    monkeypatch.setattr(external_libvirt["domain"], "XMLDesc", changed)
+    with pytest.raises(StateError, match="run marker changed"):
+        host_vm_control.remove_vm(row, expected_identity=row["removal_identity"])
+    assert native["active"] and native["exists"] and native["flags"] is None
+    assert external_libvirt["disk"].read_bytes() == b"shared disk"
+
+
+def test_stopped_libvirt_missing_disk_remains_removable_without_native_block_query(
+    external_libvirt, monkeypatch, tmp_path
+):
+    from palimpsest_local import inventory
+
+    monkeypatch.setattr(platforms, "detect_host", lambda: platforms.HostPlatform("Darwin", "aarch64"))
+    native = external_libvirt["native"]
+    native["active"] = False
+    definition = external_libvirt["domain"].XMLDesc(0)
+    missing = tmp_path / "missing-overlay.qcow2"
+    native["xml_override"] = definition.replace(str(external_libvirt["disk"]), str(missing))
+    monkeypatch.setattr(
+        external_libvirt["domain"], "blockInfo", lambda *a: pytest.fail("missing inactive disk queried"), raising=False
+    )
+    observed = host_inventory.observe()
+    assert inventory._vm_lifecycle_capabilities(observed["vms"][0])["remove"]
+    assert observed["volumes"][0]["status"] == "unavailable"
+    assert observed["volumes"][0]["size_bytes"] is None
+
+
+def test_stopped_libvirt_local_stat_denial_still_uses_native_capacity(external_libvirt, monkeypatch, tmp_path):
+    monkeypatch.setattr(platforms, "detect_host", lambda: platforms.HostPlatform("Linux", "x86_64"))
+    external_libvirt["native"]["active"] = False
+    protected = tmp_path / "daemon-readable.qcow2"
+    protected.write_bytes(b"disk")
+    definition = external_libvirt["domain"].XMLDesc(0)
+    external_libvirt["native"]["xml_override"] = definition.replace(
+        "<devices>", f"<devices><disk type='file' device='disk'><source file='{protected}'/><target dev='vda'/></disk>"
+    )
+    actual_stat = host_inventory.os.lstat
+
+    def denied(path, *args, **kwargs):
+        if str(path) == str(protected):
+            raise PermissionError("only the libvirt daemon can inspect this path")
+        return actual_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(host_inventory.os, "lstat", denied)
+    monkeypatch.setattr(external_libvirt["domain"], "blockInfo", lambda *a: (4096, 128, 256), raising=False)
+    volume = host_inventory.observe()["volumes"][0]
+    assert volume["size_bytes"] == 4096 and volume["allocated_bytes"] == 128
+    assert volume["file_size_bytes"] is None and volume["status"] == "unavailable"

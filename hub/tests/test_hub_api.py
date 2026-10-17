@@ -8,8 +8,11 @@ import hashlib
 import io
 import json
 import logging
+import os
 import tarfile
+import threading
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID
@@ -22,6 +25,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from starlette.requests import Request
 
+from palimpsest_hub import cache as hub_cache
+from palimpsest_hub import database as hub_database
+from palimpsest_hub import main as hub_main
 from palimpsest_hub.api import hub as hub_api
 from palimpsest_hub.api.hub import (
     HubLayerMeta,
@@ -36,6 +42,7 @@ from palimpsest_hub.models import (
     PalimpsestHubLayerAccess,
     PalimpsestHubUpload,
 )
+from palimpsest_hub.services import hub_store
 from palimpsest_hub.services.digest import compute_config_digest
 from palimpsest_hub.services.hub_bundle import (
     ANNOTATION_CONFIG_DIGEST,
@@ -916,6 +923,242 @@ def test_discovery_and_health_endpoints():
     h_resp = client.get("/health")
     assert h_resp.status_code == 200
     assert h_resp.json() == {"status": "ok"}
+
+
+@pytest.fixture
+async def ready_dependencies(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Real SQL and store, with Redis isolated at the network boundary."""
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'ready.sqlite'}")
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    root = tmp_path / "store"
+    root.mkdir()
+    settings = SimpleNamespace(palimpsest_hub_local_path=str(root))
+
+    class Redis:
+        calls = 0
+        result = True
+
+        async def ping(self):
+            self.calls += 1
+            return self.result
+
+    redis = Redis()
+    monkeypatch.setattr(hub_database, "_session_factory", factory)
+    monkeypatch.setattr(hub_cache, "_client", redis)
+    monkeypatch.setattr(hub_store, "get_settings", lambda: settings)
+    monkeypatch.setattr(hub_main, "_readiness_tasks", {})
+    try:
+        yield SimpleNamespace(engine=engine, factory=factory, root=root, settings=settings, redis=redis)
+    finally:
+        await asyncio.gather(*hub_main._readiness_tasks.values(), return_exceptions=True)
+        await engine.dispose()
+
+
+async def _get_ready():
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        return await client.get("/v1/ready")
+
+
+@pytest.mark.asyncio
+async def test_readiness_checks_real_sql_store_and_current_redis_ping(ready_dependencies):
+    response = await _get_ready()
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "ready",
+        "checks": {"database": "ok", "redis": "ok", "blob_store": "ok"},
+    }
+    assert response.headers["cache-control"] == "no-store"
+    assert ready_dependencies.redis.calls == 1
+    assert list(ready_dependencies.root.iterdir()) == []
+
+    # An initialized Redis client is not evidence that it still answers PING.
+    ready_dependencies.redis.result = False
+    response = await _get_ready()
+    assert response.status_code == 503
+    assert response.json()["checks"]["redis"] == "error"
+    ready_dependencies.redis.result = True
+    assert (await _get_ready()).status_code == 200
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["uninitialized", "query"])
+async def test_readiness_database_failure_is_not_liveness_failure(ready_dependencies, monkeypatch, failure):
+    if failure == "uninitialized":
+        monkeypatch.setattr(hub_database, "_session_factory", None)
+    else:
+
+        @asynccontextmanager
+        async def broken_session():
+            async with ready_dependencies.factory() as session:
+
+                async def execute(*args, **kwargs):
+                    raise RuntimeError("secret database URL and SQL bind")
+
+                monkeypatch.setattr(session, "execute", execute)
+                yield session
+
+        monkeypatch.setattr(hub_database, "_session_factory", broken_session)
+    response = await _get_ready()
+    assert response.status_code == 503
+    assert response.json() == {
+        "status": "not_ready",
+        "checks": {"database": "error", "redis": "ok", "blob_store": "ok"},
+    }
+    assert response.headers["cache-control"] == "no-store"
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        for path in ("/health", "/v1/health"):
+            live = await client.get(path)
+            assert live.status_code == 200
+            assert live.json() == {"status": "ok"}
+    monkeypatch.setattr(hub_database, "_session_factory", ready_dependencies.factory)
+    assert (await _get_ready()).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_readiness_redis_exception_is_sanitized(ready_dependencies, monkeypatch, caplog):
+    async def failed_ping():
+        raise RuntimeError("redis://private:secret@host")
+
+    monkeypatch.setattr(ready_dependencies.redis, "ping", failed_ping)
+    with caplog.at_level(logging.DEBUG):
+        response = await _get_ready()
+    assert response.status_code == 503
+    assert response.json() == {
+        "status": "not_ready",
+        "checks": {"database": "ok", "redis": "error", "blob_store": "ok"},
+    }
+    assert "private:secret" not in response.text + caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["unset", "missing", "file", "child_file", "dangling_child", "denied"])
+async def test_readiness_store_access_fails_without_creating_or_repairing_paths(
+    ready_dependencies, monkeypatch, failure
+):
+    root = ready_dependencies.root
+    if failure == "unset":
+        ready_dependencies.settings.palimpsest_hub_local_path = ""
+    elif failure == "missing":
+        root.rmdir()
+    elif failure == "file":
+        root.rmdir()
+        root.write_bytes(b"not a directory")
+    elif failure == "child_file":
+        (root / "uploads").write_bytes(b"not a directory")
+    elif failure == "dangling_child":
+        (root / "uploads").symlink_to(root / "missing-target", target_is_directory=True)
+    else:
+        # Mode bits are not a reliable permission-denial fixture under root.
+        monkeypatch.setattr(hub_main.os, "access", lambda *args, **kwargs: False)
+    response = await _get_ready()
+    assert response.status_code == 503
+    assert response.json() == {
+        "status": "not_ready",
+        "checks": {"database": "ok", "redis": "ok", "blob_store": "error"},
+    }
+    if failure == "missing":
+        assert not root.exists()
+    elif failure == "file":
+        assert root.read_bytes() == b"not a directory"
+    elif failure == "child_file":
+        assert (root / "uploads").read_bytes() == b"not a directory"
+    elif failure == "dangling_child":
+        assert (root / "uploads").is_symlink()
+        assert not (root / "missing-target").exists()
+    else:
+        assert list(root.iterdir()) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dependency", ["database", "redis", "blob_store"])
+async def test_readiness_timeout_bounds_wait_and_retains_single_probe_until_recovery(
+    ready_dependencies, monkeypatch, dependency
+):
+    monkeypatch.setattr(hub_main, "_READINESS_TIMEOUT_SECONDS", 0.01)
+    release = asyncio.Event()
+    thread_release = threading.Event()
+    calls = 0
+
+    if dependency == "database":
+
+        @asynccontextmanager
+        async def blocked_session():
+            nonlocal calls
+            calls += 1
+            await release.wait()
+            async with ready_dependencies.factory() as session:
+                yield session
+
+        monkeypatch.setattr(hub_database, "_session_factory", blocked_session)
+    elif dependency == "redis":
+
+        async def blocked_ping():
+            nonlocal calls
+            calls += 1
+            await release.wait()
+            return True
+
+        monkeypatch.setattr(ready_dependencies.redis, "ping", blocked_ping)
+    else:
+        original_open = os.open
+
+        def blocked_open(*args, **kwargs):
+            nonlocal calls
+            if args[0] == ready_dependencies.root:
+                calls += 1
+                thread_release.wait()
+            return original_open(*args, **kwargs)
+
+        monkeypatch.setattr(hub_main.os, "open", blocked_open)
+    try:
+        # A stuck dependency cannot hold the response until it finishes. No
+        # elapsed-time threshold: the event stays closed throughout both calls.
+        for _ in range(2):
+            response = await asyncio.wait_for(_get_ready(), timeout=5)
+            assert response.status_code == 503
+            assert response.json()["status"] == "not_ready"
+            assert response.json()["checks"][dependency] == "timeout"
+            assert response.headers["cache-control"] == "no-store"
+        assert calls == 1
+    finally:
+        release.set()
+        thread_release.set()
+        await asyncio.gather(*hub_main._readiness_tasks.values())
+    monkeypatch.setattr(hub_main, "_READINESS_TIMEOUT_SECONDS", 2.0)
+    response = await _get_ready()
+    assert response.status_code == 200
+    assert response.json()["checks"] == {"database": "ok", "redis": "ok", "blob_store": "ok"}
+
+
+@pytest.mark.asyncio
+async def test_cancelled_readiness_request_does_not_cancel_or_duplicate_shared_work(ready_dependencies, monkeypatch):
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def blocked_ping():
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        return True
+
+    monkeypatch.setattr(ready_dependencies.redis, "ping", blocked_ping)
+    abandoned = asyncio.create_task(_get_ready())
+    try:
+        await asyncio.wait_for(started.wait(), timeout=5)
+        abandoned.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await abandoned
+        monkeypatch.setattr(hub_main, "_READINESS_TIMEOUT_SECONDS", 0.01)
+        # A new request still shares the original live Redis probe.
+        response = await asyncio.wait_for(_get_ready(), timeout=5)
+        assert response.status_code == 503
+        assert response.json()["checks"]["redis"] == "timeout"
+        assert calls == 1
+    finally:
+        release.set()
+        await asyncio.gather(abandoned, return_exceptions=True)
 
 
 def test_hub_log_configuration_limits_debug_to_hub_namespace(monkeypatch):

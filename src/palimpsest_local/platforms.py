@@ -45,6 +45,7 @@ from .runtime_types import (
 BACKEND_KVM = "kvm"
 BACKEND_LIMA = "lima-vz"
 BACKEND_HVF = "libvirt-hvf"
+BACKEND_LIMA_QEMU_OCI = "lima-qemu-oci"
 BACKENDS = (BACKEND_KVM, BACKEND_LIMA, BACKEND_HVF)
 
 _QEMU_SYSTEM_X86_64 = Path("/usr/bin/qemu-system-x86_64")
@@ -759,7 +760,14 @@ def detect_host(*, system: str | None = None, machine: str | None = None) -> Hos
     return HostPlatform(system=resolved_system, machine=resolved_machine)
 
 
-def select_backend(image_arch: str, *, host: HostPlatform | None = None, requested: str = "auto") -> str:
+def select_backend(
+    image_arch: str,
+    *,
+    host: HostPlatform | None = None,
+    requested: str = "auto",
+    runtime_kind: str = "cloud-image",
+    force_architecture: bool = False,
+) -> str:
     """Choose a runtime backend for booting ``image_arch``, failing closed.
 
     Raises ``ArtifactValidationError`` with an actionable message whenever no
@@ -770,6 +778,28 @@ def select_backend(image_arch: str, *, host: HostPlatform | None = None, request
     host = host or detect_host()
     arch = normalize_machine(image_arch)
 
+    if runtime_kind == "oci-root":
+        if arch not in {"x86_64", "aarch64"}:
+            raise ArtifactValidationError("local OCI execution requires linux/amd64 or linux/arm64")
+        if force_architecture or requested == BACKEND_LIMA_QEMU_OCI:
+            if not force_architecture:
+                raise ArtifactValidationError("lima-qemu-oci requires explicit --force-architecture consent")
+            if requested not in {"auto", BACKEND_LIMA_QEMU_OCI}:
+                raise ArtifactValidationError("--force-architecture cannot be combined with a native backend")
+            if host.system != "Darwin" or host.machine not in {"aarch64", "x86_64"}:
+                raise ArtifactValidationError("experimental lima-qemu-oci execution requires a supported macOS host")
+            return BACKEND_LIMA_QEMU_OCI
+        if requested not in {"auto", BACKEND_KVM}:
+            raise ArtifactValidationError("native OCI-root supports only KVM; opt into --force-architecture on macOS")
+        if host.system != "Linux" or host.machine != "x86_64" or arch != "x86_64":
+            raise ArtifactValidationError(
+                "native OCI-root requires Linux x86_64/KVM and linux/amd64; "
+                "on macOS use --platform linux/amd64 or linux/arm64 --force-architecture "
+                "for the experimental Lima/QEMU container runtime"
+            )
+        return BACKEND_KVM
+    if runtime_kind != "cloud-image" or force_architecture or requested == BACKEND_LIMA_QEMU_OCI:
+        raise ArtifactValidationError("--force-architecture is supported only for local OCI images, not cloud disks")
     if requested == BACKEND_LIMA:
         if not (host.system == "Darwin" and host.machine == "aarch64"):
             raise ArtifactValidationError("the lima-vz backend requires macOS on Apple Silicon")

@@ -269,12 +269,11 @@ def test_pack_command_matches_fixed_mksquashfs_argv(tmp_path: Path):
         cli.build_mksquashfs_command(tmp_path / "missing", tmp_path / "out.squashfs")
 
 
-def test_hub_environment_errors_are_actionable(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+def test_default_hub_keeps_authentication_required(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.delenv("PALIMPSEST_URL", raising=False)
     monkeypatch.delenv("PALIMPSEST_TOKEN", raising=False)
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
-    with pytest.raises(PalimpsestError, match="Hub URL is required"):
-        cli.resolve_url(None)
+    assert cli.resolve_url(None) == "https://palimpsest.dmslab.re.kr"
     with pytest.raises(PalimpsestError, match="PALIMPSEST_TOKEN"):
         cli.resolve_token()
 

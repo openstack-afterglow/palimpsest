@@ -194,13 +194,24 @@ palimpsest rm hello-vm --volumes
 ```
 
 `stop` requests an orderly shutdown and force-destroys the domain if it does not
-exit in time; it is idempotent. `rm` destroys and undefines the VM. Without
-`--volumes` the run directory and its name remain reserved, and reusing the name
-fails with a message telling you to rerun with `--volumes`; with `--volumes` the
-run directory, overlay, seed, and keys are deleted.
+exit in time; it is idempotent. `rm` retains root/backing bytes, firmware/native
+configuration and ordered base/layer/attachment topology before removing the VM.
+Without `--volumes` the run directory/name remains reserved; with `--volumes`
+only safely owned instance root/runtime/topology is purged. Independent named
+data disks survive both forms and can be attached to a replacement conventional
+VM with `--volume NAME:/guest/path[:ro]`. Stopped VMs keep exclusive reservations.
 
-Neither form deletes content-store artifacts. Base images and layers stay
-reusable:
+Neither form deletes shared content-store artifacts. A retained instance still
+pins its layer dependencies. Deleting its owned archive in the Volumes dashboard
+clears the archive pointer only on its exact matching removed run; it does not
+purge the source run directory or free the name. Run `palimpsest rm NAME --volumes`
+afterwards to purge the owned source root/topology and release its remaining
+base/layer references before removing shared artifacts. A same-name replacement
+run is never changed by deletion of an older archive. Archive deletion rechecks
+native identity and canonical live/persistent disk references, including path
+aliases. Invalid retention metadata or uncertain native inventory blocks deletion,
+including force. Independent named data disks survive both cleanup stages.
+Base images and layers stay reusable:
 
 ```bash
 palimpsest store ls --kind layer

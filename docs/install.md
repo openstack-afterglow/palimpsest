@@ -7,8 +7,8 @@ Released installations use pinned published bytes; trusted local installation be
 
 Palimpsest Local requires Python 3.11 or newer; Hub requires Python 3.12+.
 Palimpsest 0.3.5 was released on 2026-10-14 from protected dev merge
-`04d51ad6e1bf00c4b6e5bf82050383d0bb0a10cf`. Root/Hub metadata, modules,
-native-generated locks and Kolla image defaults are 0.3.5. Install released
+`04d51ad6e1bf00c4b6e5bf82050383d0bb0a10cf`. At that release, root/Hub
+metadata, modules, native-generated locks and Kolla image defaults were 0.3.5. Install released
 client bytes with `uv tool install --python 3.11 palimpsest-client==0.3.5`, or
 install the actual trusted local checkout with
 `uv tool install --force --python 3.11 .`. A root wheel upgrade neither
@@ -20,6 +20,129 @@ needed only for VCS installation.
 The inspected DMS Lab deployment uses `dms-controller1` for both API and export worker, private listen port `18021`, internal VIP port `8021`, and public `https://palimpsest.dmslab.re.kr`. Preserve these actual overrides; do not replace them with role defaults. Historical transport/validator checks observed Afterglow's Hub transport as `https://palimpsest.dmslab.re.kr`, certificate-verified backend requests returning HTTP 200, and a dedicated Hub validator authenticated with only system `reader`; these do not qualify current requester reads/writes. The 0.3.5 rollout separately observed Hub health 200 direct/public and unauthenticated `/v1/me` 401.
 
 Package references require a separate trusted `palimpsest_package_public_origin`; it was empty in the inspected runtime. For the Afterglow key-gateway deployment, use the approved `https://cloud.dmslab.re.kr` origin rather than inferring it from Hub Host or the internal transport. Verify nonempty exact protected IDs, current requester service leaves and original-token `/v1/projects/current` through Afterglow. Do not use admin/service credentials for package acceptance, grant ordinary users automatically, or claim health 200 proves authenticated reads/writes.
+
+### Hub liveness and readiness (0.3.6 candidate)
+
+`GET /health` and `GET /v1/health` remain dependency-free liveness endpoints
+returning `200 {"status":"ok"}`. Keep them for process-alive diagnostics;
+they must not admit traffic or certify SQL/Redis/storage availability.
+
+The candidate uses `GET /v1/ready` for API container health and both internal
+and public HAProxy backend probes, requiring HTTP 200. A 503 readiness response
+must keep the backend out of service, not be converted to liveness success.
+Readiness is unauthenticated and is not requester/Keystone/Glance authorization,
+worker execution, backup/restore, CLI byte integrity or native-runtime proof.
+
+The API-only Dockerfile healthcheck uses loopback port `8020`. Kolla overrides
+the probe with `palimpsest_api_listen_address` and
+`palimpsest_api_listen_port` (role default `18020`, recorded production override
+`18021`). Both use a 5-second HTTP timeout, 30-second interval, 10-second
+container-check timeout, three retries and 30-second start period. Export and
+build-worker images do not inherit the API probe. HAProxy still expects status
+200 and retains its existing timing defaults; only its probe path changes.
+
+The canonical role starts containers with `state: started`; it has no existing
+readiness-wait task. This change does not add a second deployment/wait mechanism
+or equate successful container creation/reconfigure with readiness. Operators
+must explicitly wait for container health and direct/public `/v1/ready` before
+reopening traffic, then complete the stronger acceptance gates below. Historical
+production `/v1/health` 200 receipts do not prove this new readiness route.
+
+
+### Current production rollout procedure and gates
+
+The latest recorded production release is **0.3.5**, not the local 0.3.6
+candidate. Its [publication and production receipts](testing.md#full-source-035-integration--local-verification)
+record all three immutable image digests, controller1-only Hub reconfigure,
+worker-playbook pull + deploy, and `--skip-tags haproxy` on every action.
+The new readiness wiring below has **not** been observed in production.
+Publication and deployment are separate owner decisions; these instructions
+do not authorize either.
+
+1. **Bind reviewed published bytes.** Complete the protected-dev PR/required
+   exact-SHA CI gates and immutable release publication before installing a new
+   operator wheel or pinning images. The canonical
+   [Hub workflow](../.github/workflows/hub-docker.yml) builds API, export-worker
+   and build-worker targets from repository-root context and
+   `docker/hub/Dockerfile`; PR runs do not push. Repository release tags, not
+   an independently installed Hub wheel version, determine image tags. Current
+   publication is Linux amd64; local arm64 builds are not arm64 publication.
+   Inspect each required manifest/revision against the same reviewed release
+   commit and pin each `palimpsest_*_image_ref` to its immutable digest. A version
+   default, mutable `dev`/`latest`, installed root wheel, or prior release image
+   cannot contain unpublished working-tree changes.
+2. **Preserve operator ownership and scope.** Record actual old image digests,
+   container IDs/start times, configuration, secret inputs, numeric storage
+   owners/modes and mounted paths. Preserve controller1 placement, ports
+   `18021`/`8021`, the public HTTPS origin, worker key/hostname pins and
+   `/etc/kolla/globals.d/99-palimpsest.yml` precedence over aggregate-owned
+   `90-openstack-afterglow-globals.yml`. API/export need the same SQL and exact
+   coherent CAS/locking view; identical host-local volume names are not shared
+   storage. The remote build worker keeps private local scratch and HTTPS only.
+3. **Fence all writers and prove recovery before schema cutover.** Close new
+   ingress; stop/drain the remote build worker **while the API is still up**,
+   settle any uncertain claim by server status and the preserved private journal,
+   then drain/stop every old API/export/build/upload/GC writer and already-started
+   blocking effect. Do not infer this from health, idle polling, lease expiry or
+   a single container's exit. Capture paired SQL and CAS from one no-writers
+   interval, plus private configuration and exact prior pins. Encrypt/restrict
+   backups, record hashes, preserve numeric ownership and prove an isolated
+   restore. Preserve unknown scratch/loops/jobs/Trusts; never replay them or
+   delete volumes to force a clean start.
+4. **Apply reviewed schema offline.** Run the new pinned API image's
+   `palimpsest-hub-bootstrap` with approved private database/config inputs while
+   every writer remains stopped. Current bootstrap creates missing tables
+   (including `palimpsest_worker_leases`) and adds nullable build
+   `lease_expires_at` when absent; there is no migration ledger, ownership
+   backfill or legacy guest adoption. Empty-database smoke is not compatibility
+   proof for the actual existing schema. `reconfigure.yml` does **not** bootstrap;
+   `deploy`/`upgrade` do, but neither orchestrates the all-writer stop/backup.
+   Migration into a separate empty initialized database is a distinct operation;
+   it copies durable rows, not blob bytes or transient maintenance leases.
+5. **Use the existing image-mode lifecycle.** After the approved operator wheel
+   install and immutable pins, pull both placements. For the existing production
+   placement, the controller path is:
+
+   ```sh
+   kolla-ansible pull -i /etc/kolla/multinode --tags palimpsest \
+     --limit dms-controller1 --skip-tags haproxy
+   kolla-ansible reconfigure -i /etc/kolla/multinode --tags palimpsest \
+     --limit dms-controller1 --skip-tags haproxy
+   ```
+
+   Between pull and reconfigure, complete the offline schema gate above.
+   The deployed aggregate does not target `palimpsest-build-worker`; use the
+   [packaged worker playbook](#remote-build-worker-deployment-034-source-candidate)
+   with `pull` then `reconfigure` for an existing worker (the recorded 0.3.5
+   rollout used `pull` + `deploy`). Start only the new version; old recovery must
+   not coexist with new live claims. Reconfigure includes precheck/config/start
+   without rerunning Keystone/reader provisioning (`update_password: always`).
+   Do not broaden controller limits, run global genconfig, or remove the
+   historical HAProxy skip implicitly. Installing new role defaults alone does
+   not update a running HAProxy: applying the revised internal/public probes
+   through the separately owned aggregate/loadbalancer path needs its own scope
+   approval and rendered-config/runtime evidence.
+6. **Gate before reopening.** Require expected new container IDs, exact pinned
+   images/revisions/versions, API container health, direct
+   `http://<controller-address>:18021/v1/ready` and public verified-TLS
+   `https://palimpsest.dmslab.re.kr/v1/ready` returning 200. Confirm actual SQL,
+   Redis and CAS behavior, current original-requester authorization and CLI
+   upload/download bytes, restored reads, restart persistence and worker
+   claim/execution/cleanup separately. Health/readiness do not replace those
+   acceptance gates. Compare the unrelated-container baseline. Rollback requires
+   another all-writer stop, exact previous images/config and paired SQL/CAS
+   restore, not older workers over new ownership state.
+
+**Source-mode constraint:** `palimpsest_source_version` deliberately remains
+`c4887f7806608e98f215abbd377d2eafe159ff76`; changing the image tag does not
+advance it. Override only to the separately reviewed, published full commit
+SHA. Source builds reject dirty or wrong-HEAD existing checkouts; use a separate
+clean checkout rather than resetting operator work. Local image refs must use
+`afterglow-local/palimpsest-hub-{api|worker|build-worker}:<12-hex-commit>`.
+`pull` skips registry pulls in source mode and `reconfigure` does not build;
+source builds occur in canonical `deploy`/`upgrade`, subject to the same offline
+cutover gates. Never self-pin a dirty or not-yet-published release tree.
+
 
 **Historical operations, 2026-10-13/14 (0.3.3, not current production):** canonical Kolla
 deployment put API/export-worker 0.3.3 on `dms-controller1`. The observed immutable live refs were:
@@ -246,10 +369,12 @@ With the corresponding updated Afterglow role, this explicit endpoint defaults
 trusted HTTPS transport URL can override the Afterglow variable. Unset/empty
 values preserve detailed Afterglow operator TOML, not a catalog fallback.
 `palimpsest_package_public_origin` is still a separate package-key gateway origin
-(the Afterglow origin in the DMS Lab example), not the Hub routing URL. Apply the
-reviewed roles through normal `kolla-ansible reconfigure --tags palimpsest,afterglow`
-after preserving image pins and data. A correct HAProxy route does not install
-new package APIs; verify Hub version and authenticated `/v1/projects/current`.
+(the Afterglow origin in the DMS Lab example), not the Hub routing URL. For
+Hub-only rollout, follow the [current production procedure](#current-production-rollout-procedure-and-gates),
+including controller1 limits and `--skip-tags haproxy`. Applying Afterglow or
+shared load-balancer changes is a separate approval-gated operation, not part of
+the Hub-only command. A correct HAProxy route does not install new package APIs;
+verify Hub version and authenticated `/v1/projects/current` separately.
 
 Repository tags label both
 `ghcr.io/openstack-afterglow/palimpsest-hub-api` and
