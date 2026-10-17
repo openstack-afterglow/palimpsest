@@ -1,0 +1,78 @@
+---
+- name: Storage | Validate Hub storage mode and inventory
+  ansible.builtin.assert:
+    that:
+      - palimpsest_hub_storage_mode in ['local', 'shared']
+      - palimpsest_hub_storage_mode == 'shared' or groups.get('palimpsest', []) | length <= 1
+      - palimpsest_hub_storage_mode != 'local' or palimpsest_hub_volume is match('^[A-Za-z0-9][A-Za-z0-9_.-]*$')
+    fail_msg: "Multi-host API/export inventory requires shared Hub storage; local mode supports only a single host and a named Docker volume"
+
+- name: Storage | Verify existing operator-qualified shared mount
+  when: palimpsest_hub_storage_mode == 'shared'
+  block:
+    - name: Storage | Validate explicit shared mount settings
+      ansible.builtin.assert:
+        that:
+          - palimpsest_hub_shared_path is string
+          - palimpsest_hub_shared_path is match('^/[^:\n\r]+\\Z')
+          - palimpsest_hub_shared_fstype in ['ceph', 'fuse.ceph', 'nfs4']
+          - palimpsest_hub_shared_source is string
+          - palimpsest_hub_shared_source | length > 0
+        fail_msg: "Shared Hub storage requires an existing canonical absolute mountpoint, qualified ceph/fuse.ceph/nfs4 fstype, and exact findmnt SOURCE"
+
+    - name: Storage | Inspect shared mountpoint without following symlinks
+      become: true
+      ansible.builtin.stat:
+        path: "{{ palimpsest_hub_shared_path }}"
+        follow: false
+        get_checksum: false
+        get_mime: false
+        get_attributes: false
+      register: palimpsest_hub_shared_stat
+
+    - name: Storage | Reject missing or symlink shared mountpoint
+      ansible.builtin.assert:
+        that:
+          - palimpsest_hub_shared_stat.stat.exists
+          - palimpsest_hub_shared_stat.stat.isdir | default(false)
+          - not (palimpsest_hub_shared_stat.stat.islnk | default(false))
+        fail_msg: "Shared Hub mountpoint must already exist as a real directory; storage is never provisioned by this role"
+
+    - name: Storage | Resolve existing shared mountpoint
+      become: true
+      ansible.builtin.command:
+        argv:
+          - realpath
+          - "{{ palimpsest_hub_shared_path }}"
+      register: palimpsest_hub_shared_realpath
+      changed_when: false
+      check_mode: false
+
+    - name: Storage | Reject noncanonical or symlink ancestor paths
+      ansible.builtin.assert:
+        that:
+          - palimpsest_hub_shared_realpath.stdout == palimpsest_hub_shared_path
+        fail_msg: "Shared Hub path must be canonical, with no symlink ancestors or trailing slash"
+
+    - name: Storage | Read actual mount metadata
+      become: true
+      ansible.builtin.command:
+        argv:
+          - findmnt
+          - --json
+          - --mountpoint
+          - "{{ palimpsest_hub_shared_path }}"
+          - --output
+          - TARGET,FSTYPE,SOURCE
+      register: palimpsest_hub_shared_findmnt
+      changed_when: false
+      check_mode: false
+
+    - name: Storage | Require one exact shared mount
+      ansible.builtin.assert:
+        that:
+          - (palimpsest_hub_shared_findmnt.stdout | from_json).filesystems | length == 1
+          - (palimpsest_hub_shared_findmnt.stdout | from_json).filesystems[0].target == palimpsest_hub_shared_path
+          - (palimpsest_hub_shared_findmnt.stdout | from_json).filesystems[0].fstype == palimpsest_hub_shared_fstype
+          - (palimpsest_hub_shared_findmnt.stdout | from_json).filesystems[0].source == palimpsest_hub_shared_source
+        fail_msg: "Shared Hub mount TARGET/FSTYPE/SOURCE must match exactly; refusing local fallback storage"

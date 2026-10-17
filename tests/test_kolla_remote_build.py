@@ -45,7 +45,7 @@ if __name__ == "__main__":
 """
 
 
-def _run_lifecycle(tmp_path, actions, variables, *, hosts=None, expect_success=True):
+def _run_lifecycle(tmp_path, actions, variables, *, hosts=None, expect_success=True, environment=None):
     hosts = hosts or {"worker1": ["palimpsest-build-worker"]}
     library = tmp_path / "library"
     library.mkdir()
@@ -140,6 +140,7 @@ def _run_lifecycle(tmp_path, actions, variables, *, hosts=None, expect_success=T
     inventory_file = tmp_path / "inventory.yml"
     inventory_file.write_text(yaml.safe_dump(inventory))
     settings = {
+        "ansible_become": False,
         "enable_palimpsest": False,
         "enable_palimpsest_hub_build_worker": True,
         "palimpsest_build_worker_key": KEY,
@@ -169,6 +170,7 @@ def _run_lifecycle(tmp_path, actions, variables, *, hosts=None, expect_success=T
     result = subprocess.run(
         ["ansible-playbook", "--diff", "-i", str(inventory_file), str(playbook), "-e", "@" + str(extra)],
         capture_output=True,
+        cwd=ROOT,
         text=True,
         timeout=90,
         env={
@@ -178,6 +180,7 @@ def _run_lifecycle(tmp_path, actions, variables, *, hosts=None, expect_success=T
             "ANSIBLE_LOCAL_TEMP": str(tmp_path / "local"),
             "ANSIBLE_REMOTE_TEMP": str(tmp_path / "remote"),
             "ANSIBLE_NOCOLOR": "1",
+            **(environment or {}),
         },
     )
     transcript = result.stdout + result.stderr

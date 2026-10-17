@@ -66,6 +66,75 @@ recorded 0.3.6 rollout separately observed container health and direct/public
 readiness; neither replaces authenticated artifact or worker acceptance.
 
 
+### Multi-controller Hub HA (0.3.7)
+
+This source supports API and export-worker replicas on every approved controller.
+It does **not** move recipe execution onto controllers or create extra build VMs:
+the existing dedicated build worker keeps HTTPS-only access and private scratch.
+Publication, storage provisioning and rollout require their own owner approval;
+the dated 0.3.6 single-controller record below is not an HA deployment claim.
+
+**Shared CAS is mandatory.** Put the intended API/export hosts in `[palimpsest]`
+and explicitly configure `palimpsest_hub_storage_mode: shared`,
+`palimpsest_hub_shared_path` (a pre-existing canonical absolute mountpoint),
+`palimpsest_hub_shared_fstype` (`ceph`, `fuse.ceph` or `nfs4`) and
+`palimpsest_hub_shared_source` (the exact actual `findmnt --json --mountpoint`
+SOURCE). Keep the same container `palimpsest_hub_path` and SQL database everywhere.
+The default `local` mode rejects a multi-host inventory before Docker mutation;
+matching local volume names cannot substitute for shared storage.
+
+Provision a dedicated least-privilege share/access identity outside this role.
+Do not reuse another workload's share or broad backend key. Prepare numeric
+UID/GID ownership for the pinned non-root image and a non-writable underlying
+local mountpoint, then independently prove cross-controller byte visibility,
+exclusive `flock`, atomic rename and file/directory `fsync`. Mount metadata and
+readiness alone do not prove these properties, free capacity or runtime mount-loss
+fencing. Keep the original local volume and writer-fenced paired backup intact.
+
+The role never mounts a filesystem, creates the shared path or recursively
+chowns it. It checks non-symlink canonical path and exact TARGET/FSTYPE/SOURCE
+before bootstrap, again immediately before the bootstrap container, and before
+each API/export writer start. Prepare shared ownership separately; the local-mode
+volume-owner container is deliberately skipped in shared mode. Pull, stop and
+destroy remain available while a shared mount is missing. Mount loss after the
+last check is an operational failure, not a guaranteed race-free guard.
+
+**Discover the Redis primary.** Kolla derives
+`palimpsest_redis_sentinel_addresses` from its Valkey inventory/port and
+`palimpsest_redis_sentinel_master` from the existing monitor name. These become
+JSON `REDIS_SENTINEL_ADDRESSES` pairs and `REDIS_SENTINEL_MASTER` in API/export
+containers. `REDIS_URL` retains the data-server username/password, database and
+options, but its hostname is not a fallback. `palimpsest_redis_sentinel_password`
+is a separate discovery credential; stock Kolla has no Sentinel client AUTH,
+so its default is empty, never the Valkey master password. Do not reconfigure or
+fault-inject the shared Valkey service to qualify this client.
+
+Discovery/data socket waits default to two seconds in HA mode; URL overrides
+must be finite and greater than zero, at most30seconds. `rediss://` enables
+verified TLS for discovery and data with the URL's explicit TLS options.
+Unavailable discovery/master fails closed. The next operation may reconnect
+and discover a successor, but the client never replays an ambiguous write.
+Redis asynchronous replication does not guarantee preservation of every token.
+Standalone use requires empty Sentinel addresses/master/password. Hub requires
+redis-py5.0.1 or newer for deterministic asynchronous connection cleanup.
+
+**Cut over once, with all writers stopped.** Complete the existing protected
+publication, original-requester baseline, all-writer drain, paired encrypted
+SQL/CAS backup and isolated restore gates below. Copy the cold CAS into the
+qualified share preserving numeric metadata and verify bytes before starting
+new replicas. Bootstrap once through the new pinned API image. Use canonical
+Kolla pull/reconfigure limited to the approved controller set, retaining
+`--skip-tags haproxy`; use the packaged playbook separately for the unchanged
+dedicated worker placement. Do not rerun Keystone/reader provisioning.
+
+Changing active shared HAProxy requires separate narrowly scoped approval:
+only Palimpsest backend membership/probes, all approved controller addresses,
+`/v1/ready`, config validation and graceful reload. Do not reconfigure other
+routes, Keepalived or ProxySQL. Before reopening require all replica readiness,
+original-project authenticated upload/download byte equality, cross-replica
+visibility, SQL ownership/fencing, API-service failover and sustained monitoring.
+An idle worker is not a successful recipe execution or native qualification.
+
 ### Current production rollout procedure and gates
 
 The latest recorded production release is **0.3.6**, deployed on 2026-10-17
@@ -358,11 +427,12 @@ Verify the lock's PyPI wheel hash, installed role bytes and unchanged unrelated
 package versions. This installs role data; it does not pull or restart the Hub.
 
 
-On deploy and upgrade, each Palimpsest host pulls the API image and sets the
-root of its own named Hub volume to the image's runtime user before containers
-start. Database/bootstrap initialization remains a single operation on the
-first host; a local Docker volume is not shared across hosts. Existing blob
-subdirectories are not recursively changed.
+On deploy and upgrade, single-host `local` mode prepares only the root of its
+named Hub volume for the pinned image's runtime user; it does not recursively
+change blob children. Multi-host placement requires qualified `shared` mode,
+which checks the existing mount and skips ownership changes entirely.
+Database bootstrap remains a single operation on the first host. See the
+[shared-CAS preparation and rollout gates](#multi-controller-hub-ha-037).
 
 For an operator-owned public Hub URL, configure the HTTPS origin and explicitly
 enable public HAProxy exposure:

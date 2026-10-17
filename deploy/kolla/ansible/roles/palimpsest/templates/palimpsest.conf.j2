@@ -21,6 +21,9 @@ pool_timeout = 10
 
 [cache]
 redis_url = "{{ palimpsest_redis_url }}"
+redis_sentinel_addresses = {{ palimpsest_redis_sentinel_addresses | to_json }}
+redis_sentinel_master = {{ palimpsest_redis_sentinel_master | to_json }}
+redis_sentinel_password = {{ palimpsest_redis_sentinel_password | to_json }}
 
 [palimpsest]
 hub_local_path = "{{ palimpsest_hub_path }}"

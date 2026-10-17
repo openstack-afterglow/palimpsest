@@ -1,0 +1,22 @@
+# Scope this allowlist to the canonical Hub Dockerfile, not other project builds.
+**
+!README.md
+!pyproject.toml
+!src/**
+!hub/pyproject.toml
+!hub/uv.lock
+!hub/src/**
+!deploy/kolla/ansible/palimpsest-build-worker.yml
+!deploy/kolla/ansible/roles/palimpsest/**
+**/__pycache__/
+**/*.pyc
+**/.venv
+**/venv
+**/.env
+**/.env.*
+**/clouds.yaml
+**/clouds.yml
+**/*openrc*
+**/*.pem
+**/*.key
+**/*.keyring

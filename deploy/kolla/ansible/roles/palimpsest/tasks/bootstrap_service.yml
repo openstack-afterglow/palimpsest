@@ -2,6 +2,10 @@
 - name: Select host-local Palimpsest services
   ansible.builtin.include_tasks: select_services.yml
 
+- name: Bootstrap | Verify Hub storage before Docker and volume ownership
+  ansible.builtin.include_tasks: storage_check.yml
+  when: '"palimpsest-hub-api" in palimpsest_local_services'
+
 - name: Bootstrap | Pull Palimpsest API image for bootstrap
   become: true
   community.docker.docker_image:
@@ -12,7 +16,7 @@
     - '"palimpsest-hub-api" in palimpsest_local_services'
     - not (palimpsest_source_mode | default(false) | bool)
 
-- name: Bootstrap | Set Hub volume owner to image runtime user
+- name: Bootstrap | Set local named Hub volume owner to image runtime user
   become: true
   community.docker.docker_container:
     name: palimpsest_hub_volume_owner
@@ -26,7 +30,16 @@
     network_mode: none
     volumes:
       - "{{ palimpsest_hub_volume }}:{{ palimpsest_hub_path }}"
-  when: '"palimpsest-hub-api" in palimpsest_local_services'
+  # Shared storage is operator-prepared. Never chown an unmounted fallback root.
+  when:
+    - '"palimpsest-hub-api" in palimpsest_local_services'
+    - palimpsest_hub_storage_mode == 'local'
+
+- name: Bootstrap | Recheck Hub storage before database bootstrap writer
+  ansible.builtin.include_tasks: storage_check.yml
+  when:
+    - '"palimpsest-hub-api" in palimpsest_local_services'
+    - inventory_hostname == (groups.get('palimpsest', []) | first)
 
 - name: Bootstrap | Run Palimpsest Hub bootstrap
   become: true
@@ -40,7 +53,7 @@
     network_mode: host
     volumes:
       - "{{ palimpsest_config_dir }}/palimpsest.conf:/app/palimpsest.conf:ro"
-      - "{{ palimpsest_hub_volume }}:{{ palimpsest_hub_path }}"
+      - "{{ palimpsest_hub_shared_path if palimpsest_hub_storage_mode == 'shared' else palimpsest_hub_volume }}:{{ palimpsest_hub_path }}"
     env:
       DATABASE_URL: "{{ palimpsest_database_url }}"
       REDIS_URL: "{{ palimpsest_redis_url }}"

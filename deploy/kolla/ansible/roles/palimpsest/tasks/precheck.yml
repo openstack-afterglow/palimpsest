@@ -2,6 +2,10 @@
 - name: Select host-local Palimpsest services
   ansible.builtin.include_tasks: select_services.yml
 
+- name: Precheck | Verify Hub storage before writers
+  ansible.builtin.include_tasks: storage_check.yml
+  when: '"palimpsest-hub-api" in palimpsest_local_services or "palimpsest-hub-worker" in palimpsest_local_services'
+
 - name: Include controller-only precheck tasks
   ansible.builtin.include_tasks: precheck_controller.yml
   when: '"palimpsest-hub-api" in palimpsest_local_services or "palimpsest-hub-worker" in palimpsest_local_services'

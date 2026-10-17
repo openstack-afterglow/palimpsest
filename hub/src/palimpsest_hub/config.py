@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+import math
 import re
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from redis.asyncio.connection import SSLConnection, parse_url
 
 # Never delegated through an export Trust, whatever the operator configures.
 FORBIDDEN_DELEGATED_ROLES = frozenset({"admin", "manager", "service"})
@@ -39,7 +41,12 @@ class DatabaseSettings(BaseSettings):
 
 
 class Settings(DatabaseSettings):
+    model_config = SettingsConfigDict(case_sensitive=False, extra="ignore", hide_input_in_errors=True)
+
     redis_url: str
+    redis_sentinel_addresses: tuple[tuple[str, int], ...] = ()
+    redis_sentinel_master: str = ""
+    redis_sentinel_password: SecretStr = SecretStr("")
 
     palimpsest_hub_local_path: str
     palimpsest_hub_max_blob_bytes: int = Field(default=107374182400, ge=1)
@@ -73,6 +80,54 @@ class Settings(DatabaseSettings):
     os_reader_username: str = ""
     os_reader_password: SecretStr = SecretStr("")
     os_reader_user_domain_name: str = "Default"
+
+    @field_validator("redis_sentinel_addresses")
+    @classmethod
+    def bounded_sentinel_addresses(cls, value: tuple[tuple[str, int], ...]) -> tuple[tuple[str, int], ...]:
+        if len(value) > 16:
+            raise ValueError("Redis Sentinel supports at most 16 addresses")
+        if len(set(value)) != len(value):
+            raise ValueError("Redis Sentinel addresses must be distinct")
+        for host, port in value:
+            if (
+                not host
+                or len(host) > 253
+                or any(character.isspace() or ord(character) < 32 for character in host)
+                or any(character in host for character in "/@?#[]")
+                or not 1 <= port <= 65535
+            ):
+                raise ValueError("Redis Sentinel addresses require a hostname/IP and port 1..65535")
+            if ":" in host:
+                try:
+                    ipaddress.IPv6Address(host)
+                except ValueError:
+                    raise ValueError("Redis Sentinel IPv6 addresses must be bare IP literals") from None
+        return value
+
+    @model_validator(mode="after")
+    def coherent_redis_sentinel(self) -> Settings:
+        if not (
+            self.redis_sentinel_addresses
+            or self.redis_sentinel_master
+            or self.redis_sentinel_password.get_secret_value()
+        ):
+            return self
+        if not self.redis_sentinel_addresses or not re.fullmatch(r"[A-Za-z0-9_.-]{1,255}", self.redis_sentinel_master):
+            raise ValueError("Redis Sentinel requires addresses and a bounded ASCII master name")
+        try:
+            scheme = urlsplit(self.redis_url).scheme
+            options = parse_url(self.redis_url)
+        except (TypeError, ValueError):
+            raise ValueError("Redis Sentinel requires a valid redis:// or rediss:// data URL") from None
+        if scheme not in {"redis", "rediss"}:
+            raise ValueError("Redis Sentinel requires a redis:// or rediss:// data URL")
+        if options.get("connection_class") not in (None, SSLConnection):
+            raise ValueError("Redis Sentinel cannot override its managed connection class")
+        for name in ("socket_connect_timeout", "socket_timeout"):
+            timeout = options.get(name, 2.0)
+            if not math.isfinite(timeout) or not 0 < timeout <= 30:
+                raise ValueError("Redis Sentinel socket timeouts must be finite and in (0, 30] seconds")
+        return self
 
     @field_validator("palimpsest_hub_build_worker_key")
     @classmethod
