@@ -751,6 +751,11 @@ Historical checks and live pins remain dated evidence; see the [handoff](docs/de
 and [storage/credential prerequisites](docs/install.md).
 
 
+The 0.3.7 HA source adds Sentinel primary discovery and fail-closed shared-CAS
+prechecks for multi-controller API/export replicas. The dedicated HTTPS build
+executor remains off controllers. See [HA configuration and cutover gates](docs/install.md#multi-controller-hub-ha-037);
+source tests and local images are separate from published/live deployment evidence.
+
 ### Resume ongoing development
 
 Start with the [development handoff](docs/development-handoff.md) for the

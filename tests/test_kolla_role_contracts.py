@@ -49,14 +49,6 @@ def test_source_build_pins_immutable_commit_and_repo():
     assert "palimpsest_head_sha.stdout | trim == palimpsest_source_version" in source_build_text
 
 
-def test_redis_db_index_pinned_to_nine_and_hub_volume_paths():
-    assert defaults_yaml["palimpsest_redis_db_index"] == 9
-    assert defaults_yaml["palimpsest_hub_volume"] == "palimpsest_hub"
-    assert defaults_yaml["palimpsest_hub_path"] == "/var/lib/palimpsest/hub"
-    # Precheck independently guards the same invariant so a defaults edit cannot silently drift it.
-    assert "palimpsest_redis_db_index == 9" in precheck_text
-
-
 def test_keystone_registers_dedicated_service_project_and_user():
     assert "type: palimpsest" in keystone_text
     assert "name: palimpsest" in keystone_text
@@ -96,16 +88,6 @@ def test_bootstrap_runs_dedicated_command_without_automatic_data_migration():
 
 def test_validator_recognizes_local_source_build_image_naming():
     assert "afterglow-local/palimpsest-hub-" in validator_text
-
-
-def test_valkey_dependency_wiring_matches_stock_kolla_inventory():
-    assert defaults_yaml["palimpsest_valkey_host"] == "{{ 'api' | kolla_address(groups['valkey'][0]) }}"
-    assert defaults_yaml["palimpsest_valkey_port"] == "{{ valkey_server_port }}"
-    assert "valkey_master_password" in defaults_yaml["palimpsest_valkey_password"]
-    assert defaults_yaml["palimpsest_redis_url"] == (
-        "redis://default:{{ palimpsest_valkey_password }}@{{ palimpsest_valkey_host }}:"
-        "{{ palimpsest_valkey_port }}/{{ palimpsest_redis_db_index }}"
-    )
 
 
 def test_precheck_requires_stock_valkey_with_no_plugin_redis_fallback():

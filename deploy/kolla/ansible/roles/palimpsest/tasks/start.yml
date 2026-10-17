@@ -56,34 +56,7 @@
   failed_when: palimpsest_build_worker_scratch_init.status | default(-1) | int != 0
 
 - name: Start | Start enabled local Palimpsest containers
-  become: true
-  community.docker.docker_container:
-    name: "{{ palimpsest_service.container_name }}"
-    image: "{{ palimpsest_service.image }}"
-    pull: "{{ 'never' if (palimpsest_source_mode | bool) else 'always' }}"
-    state: started
-    restart_policy: "{{ palimpsest_service.restart_policy | default('unless-stopped') }}"
-    init: "{{ palimpsest_service.init | default(omit) }}"
-    etc_hosts: "{{ palimpsest_service.etc_hosts | default(omit) }}"
-    volumes: "{{ palimpsest_service.volumes | default([]) }}"
-    env: "{{ palimpsest_service.environment | default({}) }}"
-    command: "{{ palimpsest_service.command | default(omit) }}"
-    healthcheck: "{{ palimpsest_service.healthcheck | default(omit) }}"
-    ports: "{{ palimpsest_service.ports | default([]) }}"
-    network_mode: "{{ palimpsest_service.network_mode | default(omit) }}"
-    user: "{{ palimpsest_service.user | default(omit) }}"
-    privileged: "{{ palimpsest_service.privileged | default(false) }}"
-    memory: "{{ palimpsest_service.memory | default(omit) }}"
-    memory_swap: "{{ palimpsest_service.memory_swap | default(omit) }}"
-    cpus: "{{ palimpsest_service.cpus | default(omit) }}"
-    pids_limit: "{{ palimpsest_service.pids_limit | default(omit) }}"
-    labels:
-      kolla_version: "2025.2"
-      service: palimpsest
-      config_hash: "{{ palimpsest_build_worker_key_stat.stat.checksum | default('') if item.key == 'palimpsest-hub-build-worker' else palimpsest_config_stat.stat.checksum | default('') }}"
-  vars:
-    palimpsest_service: "{{ lookup('vars', item.value.definition) }}"
-  no_log: true
+  ansible.builtin.include_tasks: start_container.yml
   loop: "{{ palimpsest_local_services | dict2items }}"
   loop_control:
     label: "{{ item.key }}"

@@ -4,6 +4,14 @@ All notable changes to Palimpsest Local are documented here.
 
 ## [Unreleased]
 
+## [0.3.7] - 2026-10-18
+
+- Support multi-controller API/export deployment with an explicitly qualified shared CAS. Reject multi-host local volumes and missing, aliased or mismatched mounts before bootstrap/each writer start; never provision or chown shared storage, and preserve stop/pull/destroy during mount outages.
+- Discover the current writable Redis primary through Sentinel instead of pinning a replica-prone seed. Preserve URL data credentials/database/options, separate discovery authentication, bound HA socket waits, close owned clients and never replay an ambiguous write or fall back to a seed.
+- Sanitize malformed credential-bearing Redis URL parser errors and raise the redis-py minimum to5.0.1 for `aclose()`; preserve the native lock's Redis8.1.0 resolution.
+- Retain the dedicated HTTPS-only build executor, SQL job/maintenance ownership and native/GPU qualification boundaries. Scope the canonical Hub Docker context to required public build inputs, excluding private proof environments and credentials.
+
+
 ## [0.3.6] - 2026-10-17
 
 - Publish the owner-approved full feature release as `v0.3.6` and deploy all three immutable Hub images through scoped Kolla lifecycles. Verify paired SQL/CAS restore, offline bootstrap, direct/public readiness, authenticated local CLI upload/download bytes and restart persistence; preserve shared loadbalancers and native qualification boundaries.

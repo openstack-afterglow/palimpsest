@@ -8,6 +8,18 @@
     fail_msg: "Deploy stock Kolla Valkey before enabling palimpsest; no plugin Redis fallback exists"
   tags: precheck
 
+- name: Precheck | Require coherent Sentinel discovery for controller HA
+  ansible.builtin.assert:
+    that:
+      - (palimpsest_redis_sentinel_addresses | length > 0) == (palimpsest_redis_sentinel_master | length > 0)
+      - groups.get('palimpsest', []) | length < 2 or palimpsest_redis_sentinel_addresses | length >= 3
+      - palimpsest_redis_sentinel_addresses | map('last') | select('integer') | list | length == palimpsest_redis_sentinel_addresses | length
+      - palimpsest_redis_sentinel_addresses | unique | length == palimpsest_redis_sentinel_addresses | length
+    fail_msg: "Controller HA requires at least three distinct Sentinel endpoints and a monitored master; standalone Redis must disable both discovery fields"
+    quiet: true
+  tags: precheck
+
+
 - name: Precheck | Check required Palimpsest secrets
   ansible.builtin.assert:
     that:

@@ -1,7 +1,7 @@
 ---
 # Palimpsest kolla role defaults
 
-palimpsest_image_tag: "0.3.6"
+palimpsest_image_tag: "0.3.7"
 palimpsest_image_namespace: "ghcr.io/openstack-afterglow"
 palimpsest_api_image: "{{ palimpsest_image_namespace }}/palimpsest-hub-api"
 palimpsest_worker_image: "{{ palimpsest_image_namespace }}/palimpsest-hub-worker"
@@ -54,6 +54,16 @@ palimpsest_valkey_port: "{{ valkey_server_port }}"
 palimpsest_valkey_password: "{{ valkey_master_password }}"
 palimpsest_redis_db_index: 9
 palimpsest_redis_url: "redis://default:{{ palimpsest_valkey_password }}@{{ palimpsest_valkey_host }}:{{ palimpsest_valkey_port }}/{{ palimpsest_redis_db_index }}"
+# The URL carries data credentials/DB; Sentinel selects the current primary.
+palimpsest_redis_sentinel_addresses: >-
+  {%- set nodes = namespace(addresses=[]) -%}
+  {%- for host in groups.get('valkey', []) -%}
+  {%- set nodes.addresses = nodes.addresses + [['api' | kolla_address(host), valkey_sentinel_port | int]] -%}
+  {%- endfor -%}
+  {{- nodes.addresses -}}
+palimpsest_redis_sentinel_master: "{{ valkey_sentinel_monitor_name if (palimpsest_redis_sentinel_addresses | length > 0) else '' }}"
+# Stock Kolla Sentinel has no client AUTH; never reuse its data-server password.
+palimpsest_redis_sentinel_password: ""
 
 palimpsest_keystone_user: "palimpsest"
 palimpsest_keystone_auth_url: "{{ keystone_internal_url }}"
@@ -81,6 +91,11 @@ palimpsest_admin_endpoint_url: "{{ palimpsest_internal_endpoint_url }}"
 
 palimpsest_hub_volume: "palimpsest_hub"
 palimpsest_hub_path: "/var/lib/palimpsest/hub"
+palimpsest_hub_storage_mode: "local"
+palimpsest_hub_shared_path: ""
+# Mount metadata is not cross-client flock/rename/fsync qualification proof.
+palimpsest_hub_shared_fstype: ""
+palimpsest_hub_shared_source: ""
 palimpsest_config_dir: "{{ node_config_directory }}/palimpsest"
 palimpsest_hub_max_blob_bytes: 107374182400
 palimpsest_hub_max_bundle_expanded_bytes: 107374182400
@@ -134,12 +149,15 @@ palimpsest_hub_api_service:
   restart_policy: unless-stopped
   volumes:
     - "{{ palimpsest_config_dir }}/palimpsest.conf:/app/palimpsest.conf:ro"
-    - "{{ palimpsest_hub_volume }}:{{ palimpsest_hub_path }}"
+    - "{{ palimpsest_hub_shared_path if palimpsest_hub_storage_mode == 'shared' else palimpsest_hub_volume }}:{{ palimpsest_hub_path }}"
     - "kolla_logs:/var/log/kolla/"
   environment:
     PALIMPSEST_HUB_BUILD_WORKER_KEY: "{{ palimpsest_build_worker_key if (enable_palimpsest_hub_build_worker | bool) else '' }}"
     DATABASE_URL: "{{ palimpsest_database_url }}"
     REDIS_URL: "{{ palimpsest_redis_url }}"
+    REDIS_SENTINEL_ADDRESSES: "{{ palimpsest_redis_sentinel_addresses | to_json }}"
+    REDIS_SENTINEL_MASTER: "{{ palimpsest_redis_sentinel_master }}"
+    REDIS_SENTINEL_PASSWORD: "{{ palimpsest_redis_sentinel_password }}"
     OS_PASSWORD: "{{ palimpsest_keystone_password }}"
     OS_READER_USERNAME: "{{ palimpsest_reader_user }}"
     OS_READER_PASSWORD: "{{ palimpsest_reader_password }}"
@@ -208,11 +226,14 @@ palimpsest_hub_worker_service:
   restart_policy: unless-stopped
   volumes:
     - "{{ palimpsest_config_dir }}/palimpsest.conf:/app/palimpsest.conf:ro"
-    - "{{ palimpsest_hub_volume }}:{{ palimpsest_hub_path }}"
+    - "{{ palimpsest_hub_shared_path if palimpsest_hub_storage_mode == 'shared' else palimpsest_hub_volume }}:{{ palimpsest_hub_path }}"
     - "kolla_logs:/var/log/kolla/"
   environment:
     DATABASE_URL: "{{ palimpsest_database_url }}"
     REDIS_URL: "{{ palimpsest_redis_url }}"
+    REDIS_SENTINEL_ADDRESSES: "{{ palimpsest_redis_sentinel_addresses | to_json }}"
+    REDIS_SENTINEL_MASTER: "{{ palimpsest_redis_sentinel_master }}"
+    REDIS_SENTINEL_PASSWORD: "{{ palimpsest_redis_sentinel_password }}"
     OS_PASSWORD: "{{ palimpsest_keystone_password }}"
     # Revalidate the requester's current authority before each delegated export.
     OS_READER_USERNAME: "{{ palimpsest_reader_user }}"

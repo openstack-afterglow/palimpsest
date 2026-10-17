@@ -2026,3 +2026,57 @@ these smaller synchronous receipts are authoritative. The macOS selector stall
 was fixed, not skipped: the existing real-probe deadline node and an actual
 sleeping-child smoke now return bounded timeout/cancelled (0.217s observed).
 
+
+## Controller HA 0.3.7 qualification — 2026-10-18
+
+All source work is in the isolated feature worktree, based on protected dev
+`8e35fd3967cdc7b2e3232b4b6f23bd1d800ca2e9`. Working review guard:
+492 files, `ebc2598ad7d3266c25cf876be463d63b64a102ef9abd185ea7c0ee3ab98bb7be`.
+The original dirty checkout/shared editable environment is not this candidate.
+
+- Hub full suite: **603 passed,2 skipped**; focused Kolla controller/storage,
+  placement/image consumers: **120 passed,1 skipped**. Root/Hub Ruff lint/format
+  and lane manifest passed. An isolated actual redis-py5.0.1 environment also
+  passed the33 cache cases before the endpoint-dedup follow-through; native lock
+  remains8.1.0, not9. Neither result qualifies Redis9 or native execution.
+- Parent observed failing-before malformed-URL startup traceback disclosure and
+  accepted integer/string duplicate Sentinel endpoints in actual Settings and
+  Ansible consumers. Fixed parser errors are credential-free with suppressed
+  cause, endpoints are unique after coercion, and Kolla requires integer ports
+  before counting distinct endpoints. Incidental exception-wording assertions
+  and duplicate same-path timeout rows were removed, not repinned.
+- Actual BuildKit synthetic-only context copy admitted a Hub clouds canary
+  before the ignore fix. After precise input exceptions/private-path exclusions,
+  all8 required files/subtrees were present and all8 forbidden canaries absent.
+  This proves the BuildKit path, not the distinct community.docker source-mode
+  context packager. No live credential was used in the context probe.
+- Canonical API/export/build-worker targets built and executed on linux/arm64
+  and linux/amd64. All6 reported Hub0.3.7/Redis8.1.0, expected architecture and
+  config source SHA256 `b091a9462132ff320e84fecc82f0a7b720cc82749f2c0fc431081502844ddcee`.
+  API/export UID1000; build-worker UID0/client0.3.7, bubblewrap0.12.0 and
+  qemu-img10.0.13. These are local images/import/tool executions, not publication
+  or a recipe/native build. Hub wheel/sdist build passed.
+- Real disposable Redis7 primary/two replicas/three Sentinels: old0.3.6 fixed
+  seed selected an ineligible replica and SETEX raised ReadOnlyError. Final0.3.7
+  used primary discovery, DB9, exact bytes and two replica acknowledgements;
+  after stopping only the owned fixture primary, the same client discovered the
+  eligible successor in2.209seconds after one observed TimeoutError. Before/after
+  values matched and both owned keys were deleted. This does not prove preservation
+  of unacknowledged writes, TLS handshakes, cancellation fault injection or a
+  production Valkey election; shared production Valkey was not mutated.
+- Approved dedicated512GiB CephFS share/access and persistent controller1/2/3
+  mounts were actually prepared. Real UID1000 cross-controller flock handoffs
+  rejected all6 remote contenders; file fsync, atomic replacement, directory
+  fsync and exact subsequent cross-client reads succeeded on each owner. Probe
+  bytes were removed. Root-owned0555 underlying local paths rejected UID1000
+  writes before mount. This is not power-loss/reboot/capacity/mount-loss fencing.
+  Existing Manila identity denied raw Ceph auth-cap inspection; no elevated
+  fallback or raw-cap verification is claimed.
+
+Secret-free receipts and the exact storage approval boundary are in
+`~/.local/share/palimpsest-proofs/hub-controller-ha-037-20261018/`.
+Production publication, paired cold SQL/CAS restore, migration, all-controller
+API/export cutover, narrow LB change, original-client bytes/CPU smoke and
+stability monitoring are separately recorded when exercised; this preparation
+record does not claim those gates completed.
+

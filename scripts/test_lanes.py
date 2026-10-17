@@ -42,6 +42,8 @@ PORTABLE_FILES = {
         "tests/test_kolla_palimpsest_image_ref.py",
         "tests/test_kolla_role_contracts.py",
         "tests/test_kolla_remote_build.py",
+        "tests/test_kolla_shared_storage.py",
+        "tests/test_kolla_sentinel.py",
     ),
     "host-runtime": _units("""
         cloud_runtime cloud_runtime_arch cloudinit_guest experimental_oci_vm kvm_contract lima pci_preflight
@@ -115,6 +117,7 @@ SPECIAL_FILES = {
             "builds",
             "build_worker",
             "build_ownership",
+            "cache",
             "database_pool",
             "hub_api",
             "image_exports",
