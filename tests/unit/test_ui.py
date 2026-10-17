@@ -4,6 +4,7 @@ import http.client
 import json
 import os
 import select
+import shutil
 import signal
 import socket
 import struct
@@ -27,6 +28,123 @@ from palimpsest_local.runtime_types import (
     _issue_lifecycle_adapter_outcome,
 )
 from palimpsest_local.state import init_roots
+
+
+def _run_ui_consumer(start, end, invocation, data):
+    """Execute the production handler, capturing its outbound request (not an echo)."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("UI JavaScript consumer regressions require Node.js")
+    source = Path(ui.__file__).with_name("webui").joinpath("app.js").read_text()
+    handler = source[source.index(start) : source.index(end, source.index(start))]
+    script = (
+        r"""
+import fs from 'node:fs';
+const data = JSON.parse(fs.readFileSync(0, 'utf8'));
+const requests = [], messages = [], elements = new Map();
+let submit;
+function $(id) {
+  if (!elements.has(id)) elements.set(id, {
+    value: '', checked: false, open: false,
+    addEventListener: (_event, callback) => { submit = callback; }
+  });
+  return elements.get(id);
+}
+const state = { summary: { data: { host: data.host } }, volumes: { data: {} } };
+const remoteState = { result: { connection_id: 'docker' } };
+const remoteDetail = {}, hubState = {}, pendingRemoteRuns = new Set();
+let actionBusy = false, refreshPromise = null;
+const array = value => Array.isArray(value) ? value : [];
+const object = value => value || {};
+const text = value => String(value);
+const canControl = () => true, freshForMutation = () => true;
+const selectedRunVolumes = () => [];
+const updateControls = () => {}, schedule = () => {}, rememberOperation = () => {};
+const refresh = async () => {}, closeRemoteDetail = () => {};
+const feedback = message => messages.push(message);
+const notice = (_target, message) => messages.push(message);
+async function api(path, options) { requests.push({ path, ...options }); return { id: 'submitted' }; }
+$('remote-connection').value = 'docker';
+$('run-image').value = '/private/image.oci';
+$('run-runtime-kind').value = data.runtime_kind || 'oci-root';
+$('run-force-architecture').checked = data.force || false;
+"""
+        + handler
+        + "\n"
+        + invocation
+        + "\nconsole.log(JSON.stringify({ requests, messages }));"
+    )
+    result = subprocess.run(
+        [node, "--input-type=module", "-e", script],
+        input=json.dumps(data),
+        text=True,
+        capture_output=True,
+        check=True,
+        timeout=10,
+    )
+    return json.loads(result.stdout)
+
+
+@pytest.mark.parametrize(
+    "machine,selection,expected",
+    [
+        ("arm64", "config-amd64", "linux/amd64"),
+        ("x86_64", "config-arm64", "linux/arm64"),
+        ("arm64", "manifest", "linux/amd64"),
+        ("x86_64", "root", "linux/amd64"),
+        ("amd64", "root", "linux/amd64"),
+        ("arm64", "root", "linux/arm64"),
+        ("aarch64", "root", "linux/arm64"),
+        ("x86_64", "root-digestless", "linux/amd64"),
+    ],
+)
+def test_remote_download_uses_selected_child_or_actual_host(machine, selection, expected):
+    parent, child = "sha256:" + "1" * 64, "sha256:" + "2" * 64
+    item = {
+        "download_supported": True,
+        "run_supported": True,
+        "immutable_reference": "docker.io/library/alpine@" + parent,
+        "platforms": [
+            {"digest": "sha256:" + "3" * 64, "os": "linux", "architecture": "arm64"},
+            {"digest": child, "os": "linux", "architecture": "amd64"},
+        ],
+    }
+    if selection == "root-digestless":
+        for platform in item["platforms"]:
+            platform.pop("digest")
+    if not selection.startswith("root"):
+        item["manifest_digest"] = child
+        item["download_reference"] = "docker.io/library/alpine@" + child
+    if selection.startswith("config-"):
+        item["config"] = {"os": "linux", "architecture": selection.removeprefix("config-")}
+        if selection == "config-arm64":
+            item["platforms"][0]["digest"], item["platforms"][1]["digest"] = (child, "sha256:" + "3" * 64)
+    result = _run_ui_consumer(
+        "  function remoteDownloadPlatform(",
+        "  function setupRunFromReceipt(",
+        "await startRemoteDownload(data.item, true);",
+        {"host": {"system": "Darwin" if machine == "arm64" else "Linux", "machine": machine}, "item": item},
+    )
+    assert len(result["requests"]) == 1, result["messages"]
+    request = result["requests"][0]
+    assert request["path"] == "/api/v1/transfers" and request["method"] == "POST"
+    assert request["body"]["reference"] == item.get("download_reference", item["immutable_reference"])
+    assert request["body"]["platform"] == expected
+
+
+@pytest.mark.parametrize("force,runtime_kind", [(True, "oci-root"), (False, "oci-root"), (False, "cloud-image")])
+def test_run_form_emits_disposable_carrier_but_retains_native_roots(force, runtime_kind):
+    result = _run_ui_consumer(
+        "  $('form-run-vm').addEventListener(",
+        "  $('form-build').addEventListener(",
+        "await submit({ preventDefault() {} });",
+        {"host": {"system": "Linux", "machine": "x86_64"}, "force": force, "runtime_kind": runtime_kind},
+    )
+    assert len(result["requests"]) == 1, result["messages"]
+    request = result["requests"][0]
+    assert request["path"] == "/api/v1/vms" and request["method"] == "POST"
+    assert request["body"]["root_retention"] == ("delete" if force else "retain")
+    assert request["body"].get("force_architecture", False) is force
 
 
 def _setup_roots(tmp_path: Path) -> state.StatePaths:
@@ -471,23 +589,6 @@ def test_vm_console_forwards_decoded_stable_id_and_expected_run_id(
             },
         )
     ]
-    assert list(server_env["roots"].runs.iterdir()) == []
-
-
-def test_external_vm_lifecycle_routes_never_forward_to_dispatch(server_env, monkeypatch):
-    calls = []
-    for method in ("start", "stop", "rm"):
-        monkeypatch.setattr(ui.inventory.runtime_dispatch, method, lambda *a, **k: calls.append((a, k)))
-    headers = {"Authorization": f"Bearer {server_env['token']}", "Origin": server_env["origin"]}
-    for identifier in ("host:lima-vz:external", "host:libvirt-hvf:Guest café"):
-        for encoded in {identifier, urllib.parse.quote(identifier, safe="")}:
-            if not encoded.isascii():
-                continue
-            for method, suffix in (("POST", "/start"), ("POST", "/stop"), ("DELETE", "")):
-                status, _, result = _request(server_env["port"], method, "/api/v1/vms/" + encoded + suffix, headers)
-                assert status == 400
-                assert result == {"error": "invalid run name"}
-    assert calls == []
     assert list(server_env["roots"].runs.iterdir()) == []
 
 
@@ -1050,7 +1151,13 @@ def test_referenced_artifact_deletion_409(server_env: dict[str, Any]):
     )
 
     # Attempt deleting referenced artifact -> 409
-    status, _, json_data = _request(port, "DELETE", f"/api/v1/store/artifacts/{base_digest}", headers=headers)
+    status, _, json_data = _request(
+        port,
+        "DELETE",
+        f"/api/v1/store/artifacts/{base_digest}",
+        headers=headers,
+        body={"confirmation": base_digest},
+    )
     assert status == 409
     assert "still used by: active-vm" in json_data["error"]
 
@@ -1278,6 +1385,9 @@ def test_read_only_default_refuses_all_mutation_routes_without_state_changes(ser
             {"context": str(roots.state), "tag": "example", "dockerfile_text": "FROM scratch\n"},
         ),
         ("POST", "/api/v1/vms", {"image": "example"}),
+        ("POST", "/api/v1/volumes", {"name": "data", "backend": "kvm", "size_bytes": 1073741824}),
+        ("DELETE", "/api/v1/volumes/named:kvm:data", {"confirmation": "data"}),
+        ("DELETE", "/api/v1/volumes/retained-instance:" + "a" * 64, {"confirmation": "saved"}),
         ("POST", "/api/v1/vms/ui-vm/console", {"mode": "shell"}),
         ("POST", "/api/v1/consoles/" + "a" * 32 + "/input", {"data": "eA=="}),
         ("POST", "/api/v1/consoles/" + "a" * 32 + "/resize", {"rows": 24, "columns": 80}),
@@ -1516,3 +1626,372 @@ def test_host_vm_detail_uses_stable_id_without_creating_run(server_env, monkeypa
         status, _, _ = _request(server_env["port"], method, "/api/v1/vms/" + vm["id"] + suffix, headers)
         assert status == 400
     assert list(server_env["roots"].runs.iterdir()) == []
+
+
+@pytest.fixture
+def catalog_hub():
+    """An isolated HTTP peer enforces original caller authority for real client IO."""
+    import hashlib
+    from http.server import BaseHTTPRequestHandler
+
+    from palimpsest_local.hub import MEDIA_TYPE_LAYER_SQUASHFS
+
+    payload = b"hsqs-local-catalog-consumer-proof"
+    digest = "sha256:" + hashlib.sha256(payload).hexdigest()
+    descriptor = {
+        "blob_digest": digest,
+        "name": "catalog-owned-layer",
+        "kind": "squashfs",
+        "media_type": MEDIA_TYPE_LAYER_SQUASHFS,
+        "size_bytes": len(payload),
+        "arch": "aarch64",
+        "parent_digest": None,
+        "base_image_digest": None,
+        "ancestors": [],
+        "chain_complete": True,
+    }
+
+    class Peer(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            pass
+
+        def do_GET(self):
+            selected = urllib.parse.urlsplit(self.path)
+            if self.headers.get("X-Auth-Token") != "synthetic-tab-keystone":
+                code, body = 401, {"detail": "never echo remote credential rejection bodies"}
+            elif self.headers.get("X-Project-Id") not in (None, "tab-project"):
+                code, body = 403, {"detail": "foreign project assertion"}
+            elif selected.path == "/v1/me":
+                code, body = (
+                    200,
+                    {
+                        "project_id": "tab-project",
+                        "user_id": "tab-user",
+                        "capabilities": {"inventory": True, "download": True, "upload": False},
+                        "untrusted-extra": "synthetic-tab-keystone",
+                    },
+                )
+            elif selected.path == "/v1/layers":
+                query = urllib.parse.parse_qs(selected.query)
+                matches = all(
+                    not query.get(key) or query[key][0] == descriptor.get(key)
+                    for key in ("kind", "arch", "name", "disk_format")
+                )
+                code, body = 200, [descriptor] if matches else []
+            elif selected.path == "/v1/layers/" + digest:
+                code, body = 200, descriptor
+            elif selected.path == "/v1/layers/" + digest + "/blob":
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+            else:
+                code, body = 404, {"detail": "missing"}
+            encoded = json.dumps(body).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Peer)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield {"url": f"http://127.0.0.1:{server.server_port}", "digest": digest, "payload": payload}
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+@pytest.mark.parametrize("server_env", [None], indirect=True)
+def test_read_only_catalog_connect_inspect_and_remote_failure_do_not_unlock_or_logout(
+    server_env, catalog_hub, monkeypatch
+):
+    monkeypatch.setenv("PALIMPSEST_URL", "https://unrelated.invalid")
+    monkeypatch.setenv("PALIMPSEST_TOKEN", "unrelated-secret")
+    monkeypatch.setenv("PALIMPSEST_PROJECT_ID", "unrelated-project")
+    headers = {
+        "Authorization": "Bearer " + server_env["token"],
+        "X-Palimpsest-Hub-Url": catalog_hub["url"],
+        "X-Palimpsest-Hub-Token": "synthetic-tab-keystone",
+    }
+    port = server_env["port"]
+    code, _, identity = _request(port, "GET", "/api/v1/remotes/hub/identity", headers)
+    assert code == 200 and identity["project_id"] == "tab-project"
+    assert "synthetic-tab-keystone" not in json.dumps(identity)
+    code, _, page = _request(port, "GET", "/api/v1/remotes/artifacts?connection=legacy&arch=aarch64", headers)
+    assert code == 200 and page["items"][0]["reference"] == catalog_hub["digest"]
+    code, _, page = _request(port, "GET", "/api/v1/remotes/artifacts?connection=legacy&arch=x86_64", headers)
+    assert code == 200 and page["items"] == []
+    detail_path = "/api/v1/remotes/artifact?" + urllib.parse.urlencode(
+        {"connection": "legacy", "reference": catalog_hub["digest"]}
+    )
+    code, _, detail = _request(port, "GET", detail_path, headers)
+    assert code == 200 and detail["chain"][0]["digest"] == catalog_hub["digest"]
+    assert detail["download_supported"] is True and detail["run_supported"] is False
+    denied_headers = {**headers, "X-Palimpsest-Hub-Token": "wrong-secret"}
+    code, _, denial = _request(port, "GET", detail_path, denied_headers)
+    assert code == 409 and "never echo" not in json.dumps(denial)
+    code, _, _ = _request(port, "GET", "/api/v1/operations", headers)
+    assert code == 200
+    code, _, _ = _request(
+        port,
+        "POST",
+        "/api/v1/transfers",
+        {**headers, "Origin": server_env["origin"]},
+        {"action": "download", "connection_id": "legacy", "reference": catalog_hub["digest"]},
+    )
+    assert code == 403
+    assert os.environ["PALIMPSEST_PROJECT_ID"] == "unrelated-project"
+
+
+def test_header_authority_survives_owned_transfer_child_without_process_global_credentials(
+    server_env, catalog_hub, monkeypatch
+):
+    from palimpsest_local.oci_layout import ContentStore
+
+    monkeypatch.setenv("PALIMPSEST_URL", "https://unrelated.invalid")
+    monkeypatch.setenv("PALIMPSEST_TOKEN", "unrelated-secret")
+    monkeypatch.setenv("PALIMPSEST_PROJECT_ID", "unrelated-project")
+    headers = {
+        "Authorization": "Bearer " + server_env["token"],
+        "Origin": server_env["origin"],
+        "X-Palimpsest-Hub-Url": catalog_hub["url"],
+        "X-Palimpsest-Hub-Token": "synthetic-tab-keystone",
+    }
+    code, _, operation = _request(
+        server_env["port"],
+        "POST",
+        "/api/v1/transfers",
+        headers,
+        {"action": "download", "connection_id": "legacy", "reference": catalog_hub["digest"]},
+    )
+    assert code == 202
+    deadline = time.monotonic() + 8
+    while True:
+        _, _, listing = _request(server_env["port"], "GET", "/api/v1/operations", headers)
+        result = next(item for item in listing["operations"] if item["id"] == operation["id"])
+        if result["status"] != "running":
+            break
+        assert time.monotonic() < deadline
+        time.sleep(0.02)
+    assert result["status"] == "succeeded", result
+    assert ContentStore(server_env["roots"].store).verify_blob(catalog_hub["digest"]) == len(catalog_hub["payload"])
+    assert "synthetic-tab-keystone" not in json.dumps(result)
+    assert os.environ["PALIMPSEST_PROJECT_ID"] == "unrelated-project"
+
+
+@pytest.fixture
+def external_lima(server_env, tmp_path, monkeypatch):
+    import shutil
+
+    from palimpsest_local import host_vm_control, lima
+
+    home = (tmp_path / "lima").resolve()
+    home.mkdir(mode=0o700)
+    native = home / "external-vm"
+    native.mkdir(mode=0o700)
+    (native / "diffdisk").write_bytes(b"native VM disk")
+    independent = home / "independent.raw"
+    independent.write_bytes(b"independent disk")
+    monkeypatch.setenv("LIMA_HOME", str(home))
+    instance = {"name": native.name, "dir": str(native), "vmType": "vz", "status": "Running", "config": {}}
+    control = {"instances": [instance], "fail_delete": False, "native": native, "independent": independent}
+
+    def command(argv, **kwargs):
+        if argv == ["limactl", "list", "--format", "json"]:
+            return subprocess.CompletedProcess(argv, 0, "\n".join(json.dumps(row) for row in control["instances"]), "")
+        if argv == ["limactl", "stop", "--force", "--", native.name]:
+            control["instances"][0]["status"] = "Stopped"
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        assert argv == ["limactl", "delete", "--force", "--", native.name]
+        if control["fail_delete"]:
+            return subprocess.CompletedProcess(argv, 1, "", "sensitive backend failure")
+        shutil.rmtree(native)
+        control["instances"].clear()
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    def observed():
+        return {
+            "vms": [
+                {
+                    "id": "host:lima-vz:" + row["name"],
+                    "name": row["name"],
+                    "run_id": lima._instance_run_id(row),
+                    "backend": "lima-vz",
+                    "runtime_kind": "external",
+                    "status": row["status"].lower(),
+                    "managed": False,
+                    "source": "host-backend",
+                    "removal_identity": host_vm_control.lima_removal_identity(row),
+                }
+                for row in control["instances"]
+            ],
+            "volumes": [],
+            "networks": [],
+            "warnings": [],
+        }
+
+    monkeypatch.setattr(lima, "_run_command", command)
+    monkeypatch.setattr(ui.inventory.host_inventory, "observe", observed)
+    control["headers"] = {"Authorization": "Bearer " + server_env["token"], "Origin": server_env["origin"]}
+    control["path"] = "/api/v1/vms/" + urllib.parse.quote("host:lima-vz:" + native.name, safe="")
+    code, _, row = _request(server_env["port"], "GET", control["path"], control["headers"])
+    assert code == 200
+    control["body"] = {
+        "expected_run_id": row["run_id"],
+        "expected_removal_identity": row["removal_identity"],
+        "confirmation": row["name"],
+        "volumes": False,
+    }
+    control["row"] = row
+    return control
+
+
+@pytest.mark.parametrize("status", ["Running", "Stopped"])
+@pytest.mark.parametrize("marked", [False, True])
+def test_external_lima_removal_without_original_state(server_env, external_lima, status, marked):
+    native = external_lima
+    native["instances"][0]["status"] = status
+    if marked:
+        native["instances"][0]["config"] = {"env": {"PALIMPSEST_RUN_ID": str(uuid.uuid4())}}
+    code, _, row = _request(server_env["port"], "GET", native["path"], native["headers"])
+    assert code == 200
+    assert row["lifecycle"]["remove"] is True
+    assert row["lifecycle"]["start"] is False and row["lifecycle"]["stop"] is False
+    body = {**native["body"], "expected_run_id": row["run_id"], "expected_removal_identity": row["removal_identity"]}
+    code, _, receipt = _request(server_env["port"], "DELETE", native["path"], native["headers"], body)
+    assert code == 200 and receipt["status"] == "removed"
+    assert receipt["storage_policy"] == "instance-root-and-topology-retained"
+    archive = server_env["roots"].state / "retained-instances" / receipt["retained_instance"].split(":", 1)[1]
+    assert (archive / "diffdisk").read_bytes() == b"native VM disk"
+    assert not native["native"].exists()
+    assert native["independent"].read_bytes() == b"independent disk"
+    assert list(server_env["roots"].runs.iterdir()) == []
+    _, _, inventory = _request(server_env["port"], "GET", "/api/v1/vms", native["headers"])
+    assert inventory["vms"] == []
+
+
+@pytest.mark.parametrize("change", ["name", "native-id", "run-id", "status", "backend-failure"])
+def test_external_lima_removal_refuses_changed_or_unsupported_selection(server_env, external_lima, change):
+    native = external_lima
+    body = dict(native["body"])
+    if change == "name":
+        body["confirmation"] += " "
+    elif change == "native-id":
+        body["expected_removal_identity"] = "0" * 64
+    elif change == "run-id":
+        body["expected_run_id"] = str(uuid.uuid4())
+    elif change == "status":
+        native["instances"][0]["status"] = "Starting"
+    else:
+        native["fail_delete"] = True
+    code, _, error = _request(server_env["port"], "DELETE", native["path"], native["headers"], body)
+    assert code == 409 and "sensitive" not in json.dumps(error)
+    assert (native["native"] / "diffdisk").read_bytes() == b"native VM disk"
+    assert native["independent"].read_bytes() == b"independent disk"
+    assert list(server_env["roots"].runs.iterdir()) == []
+
+
+def test_external_lima_replacement_at_final_backend_check_preserves_both_vms(server_env, external_lima, monkeypatch):
+    from palimpsest_local import lima
+
+    native = external_lima["native"]
+    held = native.with_name("original-held")
+    original = lima._instance_info_or_none
+    calls = 0
+
+    def replaced(name):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            native.rename(held)
+            native.mkdir(mode=0o700)
+            (native / "diffdisk").write_bytes(b"replacement VM disk")
+        return original(name)
+
+    monkeypatch.setattr(lima, "_instance_info_or_none", replaced)
+    code, _, error = _request(
+        server_env["port"], "DELETE", external_lima["path"], external_lima["headers"], external_lima["body"]
+    )
+    assert code == 409 and "identity changed" in error["error"]
+    assert (held / "diffdisk").read_bytes() == b"native VM disk"
+    assert (native / "diffdisk").read_bytes() == b"replacement VM disk"
+
+
+@pytest.mark.parametrize("authority", ["missing-token", "foreign-origin", "cross-site"])
+def test_external_vm_removal_preserves_http_authority(server_env, external_lima, authority):
+    headers = dict(external_lima["headers"])
+    if authority == "missing-token":
+        headers.pop("Authorization")
+    elif authority == "foreign-origin":
+        headers["Origin"] = "https://foreign.invalid"
+    else:
+        headers["Sec-Fetch-Site"] = "cross-site"
+    code, _, _ = _request(server_env["port"], "DELETE", external_lima["path"], headers, external_lima["body"])
+    assert code == (401 if authority == "missing-token" else 403)
+    assert (external_lima["native"] / "diffdisk").read_bytes() == b"native VM disk"
+
+
+@pytest.mark.parametrize("server_env", [None], indirect=True)
+def test_external_vm_removal_read_only_preserves_native_disk(server_env, external_lima):
+    code, _, _ = _request(
+        server_env["port"], "DELETE", external_lima["path"], external_lima["headers"], external_lima["body"]
+    )
+    assert code == 403
+    assert (external_lima["native"] / "diffdisk").read_bytes() == b"native VM disk"
+
+
+def test_external_vm_removal_does_not_adopt_or_delete_same_named_ledger(server_env, external_lima):
+    native = external_lima["native"]
+    run = server_env["roots"].runs / native.name
+    run.mkdir(mode=0o700)
+    run_id = str(uuid.uuid4())
+    state.atomic_write_json(run / "owner.json", {"schema_version": 1, "name": native.name, "run_id": run_id})
+    state.atomic_write_json(
+        run / "state.json",
+        {
+            "schema_version": 2,
+            "name": native.name,
+            "run_id": run_id,
+            "backend": "lima-vz",
+            "runtime_kind": "cloud-image",
+            "status": "running",
+        },
+    )
+    code, _, error = _request(
+        server_env["port"], "DELETE", external_lima["path"], external_lima["headers"], external_lima["body"]
+    )
+    assert code == 200 and error["status"] == "removed"
+    archive = server_env["roots"].state / "retained-instances" / error["retained_instance"].split(":", 1)[1]
+    assert (archive / "diffdisk").read_bytes() == b"native VM disk"
+    assert not native.exists()
+    assert state.read_run_ledger_snapshot(server_env["roots"], native.name).record.run_id == run_id
+
+
+@pytest.mark.parametrize("confirmation", [None, "wrong", True])
+def test_artifact_http_delete_requires_exact_digest_before_removing_bytes(server_env, confirmation):
+    roots = server_env["roots"]
+    from palimpsest_local.oci_layout import ContentStore
+
+    store = ContentStore(roots.store)
+    digest = f"sha256:{store.write_stream([b'keep until exact confirmation']).name}"
+    headers = {"Authorization": f"Bearer {server_env['token']}", "Origin": server_env["origin"]}
+    body = {} if confirmation is None else {"confirmation": confirmation}
+    status, _, _ = _request(
+        server_env["port"], "DELETE", f"/api/v1/store/artifacts/{digest}", headers=headers, body=body
+    )
+    assert status == 400
+    assert store.exists(digest)
+    status, _, _ = _request(
+        server_env["port"],
+        "DELETE",
+        f"/api/v1/store/artifacts/{urllib.parse.quote(digest, safe='')}",
+        headers=headers,
+        body={"confirmation": digest},
+    )
+    assert status == 200
+    assert not store.exists(digest)

@@ -38,6 +38,25 @@ class RuntimeBackend(StrEnum):
     LIMA_VZ = "lima-vz"
 
 
+@dataclass(frozen=True, slots=True)
+class ExperimentalOCIDispatchKey:
+    """Not an OCI-root ledger identity or native isolation claim."""
+
+    runtime_kind: str = dataclass_field(default="oci-container", init=False)
+    backend: str = dataclass_field(default="lima-qemu-oci", init=False)
+
+
+@dataclass(frozen=True, slots=True)
+class ExperimentalOCIRunResult:
+    """Completed foreground VM attempt; durable metadata lives outside runs/."""
+
+    name: str
+    run_id: str
+    state_path: str
+    exit_code: int
+    dispatch_key: ExperimentalOCIDispatchKey = dataclass_field(default_factory=ExperimentalOCIDispatchKey, init=False)
+
+
 class RuntimeOperation(StrEnum):
     RUN = "run"
     START = "start"
@@ -544,10 +563,10 @@ class RunVolumeIntent:
 class ResolvedRunRequest:
     """A pure create-time routing decision plus its non-reflective logical spec.
 
-    ``attachments_bound`` is false only while a project is still preparing
-    managed volume artifacts. Resolver and binder provenance authenticate the
-    immutable request shape, while the separate one-use preflight report
-    authorizes a fresh adapter entry.
+    ``attachments_bound`` is false while a project or independent named-volume
+    launch is preparing managed volume artifacts. Resolver and binder provenance
+    authenticate the immutable request shape, while the separate one-use
+    preflight report authorizes a fresh adapter entry.
     """
 
     dispatch_key: DispatchKey
@@ -882,6 +901,8 @@ class LifecycleResult:
     cursor: LifecycleCursor
     warning_category: LifecycleWarningCategory | None = None
     fallback_used: bool = False
+    storage_policy: str | None = None
+    retained_instance: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.record, ExistingRunRecord):
@@ -913,6 +934,17 @@ class LifecycleResult:
             or self.previous_status != self.current_status
         ):
             raise ValueError("backend reconciliation warning requires a same-status start or stop")
+        if self.storage_policy not in {
+            None,
+            "instance-root-and-topology-retained",
+            "instance-root-and-topology-purged",
+        }:
+            raise ValueError("lifecycle result has an invalid storage policy")
+        if self.retained_instance is not None and (
+            not isinstance(self.retained_instance, str)
+            or re.fullmatch(r"retained-instance:[0-9a-f]{64}", self.retained_instance) is None
+        ):
+            raise ValueError("lifecycle result has an invalid retained instance")
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -927,6 +959,8 @@ class _LifecycleAdapterOutcome:
     warning_category: LifecycleWarningCategory | None = None
     fallback_used: bool = False
     authentication_tag: bytes = dataclass_field(default=b"", repr=False)
+    storage_policy: str | None = None
+    retained_instance: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.record, ExistingRunRecord):
@@ -949,10 +983,6 @@ class _LifecycleAdapterOutcome:
             self.previous_status != self.status or self.revision <= self.previous_revision
         ):
             raise ValueError("adapter lifecycle outcome reconciliation metadata is inconsistent")
-        if self.warning_category is LifecycleWarningCategory.BACKEND_RECONCILED and (
-            self.previous_status != self.status or self.revision <= self.previous_revision
-        ):
-            raise ValueError("adapter lifecycle outcome recovery metadata is inconsistent")
         if type(self.authentication_tag) is not bytes or len(self.authentication_tag) != 32:
             raise ValueError("adapter lifecycle outcome authentication is invalid")
 
@@ -965,6 +995,8 @@ def _lifecycle_outcome_authentication_tag(
     revision: int,
     warning_category: LifecycleWarningCategory | None,
     fallback_used: bool,
+    storage_policy: str | None = None,
+    retained_instance: str | None = None,
 ) -> bytes:
     payload = json.dumps(
         {
@@ -979,6 +1011,8 @@ def _lifecycle_outcome_authentication_tag(
             "revision": revision,
             "warning_category": None if warning_category is None else warning_category.value,
             "fallback_used": fallback_used,
+            "storage_policy": storage_policy,
+            "retained_instance": retained_instance,
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -994,6 +1028,9 @@ def _issue_lifecycle_adapter_outcome(
     revision: int,
     warning_category: LifecycleWarningCategory | None = None,
     fallback_used: bool = False,
+    *,
+    storage_policy: str | None = None,
+    retained_instance: str | None = None,
 ) -> _LifecycleAdapterOutcome:
     tag = _lifecycle_outcome_authentication_tag(
         record,
@@ -1003,6 +1040,8 @@ def _issue_lifecycle_adapter_outcome(
         revision,
         warning_category,
         fallback_used,
+        storage_policy,
+        retained_instance,
     )
     return _LifecycleAdapterOutcome(
         record,
@@ -1013,6 +1052,8 @@ def _issue_lifecycle_adapter_outcome(
         warning_category,
         fallback_used,
         tag,
+        storage_policy,
+        retained_instance,
     )
 
 

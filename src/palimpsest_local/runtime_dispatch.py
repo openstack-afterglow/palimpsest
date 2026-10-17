@@ -535,8 +535,6 @@ def run(
     if not isinstance(request, ResolvedRunRequest):
         raise TypeError("runtime run requires a ResolvedRunRequest")
     _require_run_request_provenance(request)
-    if not request.attachments_bound:
-        raise StateError("run request volumes have not been prepared")
     resolved_roots = roots or state.resolve_roots()
     require_run_preflight(request, preflight)
     if request.spec.host_shares:
@@ -547,6 +545,63 @@ def run(
         )
         kvm.preflight_host_share_support(read_only=any(share.read_only for share in request.spec.host_shares))
     resolved_roots = state.init_resolved_roots(resolved_roots)
+    if not request.attachments_bound:
+        return _run_with_named_volumes(request, resolved_roots)
+    return _run_bound_request(request, resolved_roots)
+
+
+def _run_with_named_volumes(request: ResolvedRunRequest, roots: StatePaths) -> RunResult:
+    from . import named_volumes
+
+    reservation_id = "pending-" + secrets.token_hex(32)
+    attachments = named_volumes.reserve_named_volumes(
+        roots,
+        name=request.spec.name,
+        run_id=reservation_id,
+        backend=request.dispatch_key.backend.value,
+        intents=request.volume_intents,
+    )
+    try:
+        final_spec = replace(request.spec, volumes=attachments)
+        receipt = _issue_volume_binding_receipt(
+            request,
+            final_spec,
+            dispatch_key=request.dispatch_key,
+            _authority=_PROJECT_VOLUME_BINDING_AUTHORITY,
+        )
+        bound = bind_run_request_volumes(request, final_spec, dispatch_key=request.dispatch_key, receipt=receipt)
+        result = _run_bound_request(bound, roots)
+        named_volumes.bind_named_volume_reservations(
+            roots,
+            name=request.spec.name,
+            reservation_id=reservation_id,
+            run_id=result.record.run_id,
+        )
+        return result
+    except BaseException:
+        # An adapter can commit a failed/uncertain run before raising. Such a
+        # run still owns its disks until rm, just like a stopped VM.
+        if state.run_entry_present_or_ambiguous(roots, request.spec.name):
+            current = state.read_run_ledger_snapshot(roots, request.spec.name)
+            try:
+                named_volumes.bind_named_volume_reservations(
+                    roots,
+                    name=request.spec.name,
+                    reservation_id=reservation_id,
+                    run_id=current.record.run_id,
+                )
+            except StateError:
+                named_volumes.release_named_volume_reservations(
+                    roots,
+                    name=request.spec.name,
+                    run_id=reservation_id,
+                )
+        else:
+            named_volumes.release_named_volume_reservations(roots, name=request.spec.name, run_id=reservation_id)
+        raise
+
+
+def _run_bound_request(request: ResolvedRunRequest, resolved_roots: StatePaths) -> RunResult:
     if request.dispatch_key.backend is RuntimeBackend.LIMA_VZ:
         raw_result = lima.run(request.spec, roots=resolved_roots)
     else:
@@ -668,6 +723,10 @@ def run_local_oci(request: LocalOCIRunRequest, *, roots: StatePaths) -> Any:
     """Enter the distinct typed local-image launcher, with its own host preflight."""
     if not isinstance(request, LocalOCIRunRequest) or not isinstance(roots, StatePaths):
         raise TypeError("local OCI create requires a typed request and state paths")
+    if request.backend == platforms.BACKEND_LIMA_QEMU_OCI:
+        from . import experimental_oci_vm
+
+        return experimental_oci_vm.run(roots, request)
     platforms.capability_profile(
         request.dispatch_key,
         RuntimeOperation.RUN,
@@ -734,6 +793,8 @@ class _NormalizedLifecycleOutcome:
     revision: int
     warning_category: Any
     fallback_used: bool
+    storage_policy: str | None
+    retained_instance: str | None
 
 
 def _normalize_lifecycle_outcome(candidate: object) -> _NormalizedLifecycleOutcome:
@@ -767,6 +828,8 @@ def _normalize_lifecycle_outcome(candidate: object) -> _NormalizedLifecycleOutco
         warning_category = candidate.warning_category
         fallback_used = candidate.fallback_used
         authentication_tag = candidate.authentication_tag
+        storage_policy = candidate.storage_policy
+        retained_instance = candidate.retained_instance
         if (
             type(previous_status) is not str
             or type(previous_revision) is not int
@@ -792,6 +855,8 @@ def _normalize_lifecycle_outcome(candidate: object) -> _NormalizedLifecycleOutco
             revision,
             warning_category,
             fallback_used,
+            storage_policy,
+            retained_instance,
         )
         if not hmac.compare_digest(authentication_tag, expected_tag):
             raise ValueError
@@ -803,6 +868,8 @@ def _normalize_lifecycle_outcome(candidate: object) -> _NormalizedLifecycleOutco
             revision,
             warning_category,
             fallback_used,
+            storage_policy,
+            retained_instance,
         )
     except Exception:
         pass
@@ -860,6 +927,9 @@ def _dispatch_lifecycle(
     if bound.record != record or bound.state != before.state:
         raise StateError("run ledger changed during dispatch")
     if operation is RuntimeOperation.START:
+        from .named_volumes import validate_named_volume_reservations
+
+        validate_named_volume_reservations(resolved_roots, name=name, run_id=record.run_id)
         raw = adapter.start(
             name,
             roots=resolved_roots,
@@ -949,6 +1019,8 @@ def _dispatch_lifecycle(
             LifecycleCursor(raw.record, raw.revision),
             raw.warning_category,
             raw.fallback_used,
+            raw.storage_policy,
+            raw.retained_instance,
         )
     except (TypeError, ValueError):
         raise StateError("runtime adapter returned an invalid lifecycle receipt") from None

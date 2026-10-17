@@ -27,7 +27,7 @@ import uuid
 import xml.etree.ElementTree as ET
 from typing import Any
 
-from . import cloud_runtime, kvm, platforms
+from . import cloud_runtime, host_vm_control, kvm, platforms
 from .runtime_types import RuntimeBackend
 
 _BACKEND_LIMA = platforms.BACKEND_LIMA
@@ -297,6 +297,8 @@ def _observe_lima() -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[di
             continue
 
         config = instance.get("config") if isinstance(instance.get("config"), dict) else {}
+        vm_type = instance.get("vmType") or config.get("vmType", "vz")
+        instance_backend = f"lima-{vm_type}"
         run_id = _safe_instance_run_id(instance)
         runtime_kind = "cloud-image" if run_id is not None else "external"
         status = _safe_instance_status(instance)
@@ -355,10 +357,11 @@ def _observe_lima() -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[di
                 )
 
         vm_row = {
-            "id": f"host:{_BACKEND_LIMA}:{name}",
+            "id": f"host:{instance_backend}:{name}",
             "name": name,
             "run_id": run_id,
-            "backend": _BACKEND_LIMA,
+            "removal_identity": host_vm_control.lima_removal_identity(instance),
+            "backend": instance_backend,
             "runtime_kind": runtime_kind,
             "status": status,
             "stale": False,
@@ -439,10 +442,10 @@ def _observe_lima() -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[di
         # Never fallback capacity = file_size: file_size is apparent byte length, not virtual capacity
 
         primary_disk = {
-            "id": f"disk:{_BACKEND_LIMA}:{name}:primary",
+            "id": f"disk:{instance_backend}:{name}:primary",
             "name": name,
             "kind": "vm-disk",
-            "backend": _BACKEND_LIMA,
+            "backend": instance_backend,
             "project": None,
             "status": disk_status,
             "size_bytes": capacity,
@@ -655,6 +658,8 @@ def _observe_libvirt() -> tuple[list[dict[str, Any]], list[dict[str, Any]], list
                         try:
                             dom_tree = ET.fromstring(xml_desc)
                             markers = dom_tree.findall(f"./metadata/{{{kvm.DOMAIN_MARKER_NAMESPACE}}}run")
+                            run_id = kvm._validated_domain_marker_run_id(markers[0]) if len(markers) == 1 else None
+                            runtime_kind = "cloud-image" if run_id is not None else "external"
                             if run_id and len(markers) == 1 and markers[0].get("id") == run_id:
                                 contract = markers[0].get("contract", "")
                                 if backend == _BACKEND_KVM and re.fullmatch(r"sha256:[0-9a-f]{64}", contract):
@@ -686,7 +691,15 @@ def _observe_libvirt() -> tuple[list[dict[str, Any]], list[dict[str, Any]], list
                                 # Virtual capacity from blockInfo, never file length
                                 disk_capacity = None
                                 disk_allocated = None
-                                if target_dev and hasattr(dom, "blockInfo"):
+                                missing_local_disk = False
+                                if not is_active and file_path and os.path.isabs(file_path):
+                                    try:
+                                        os.lstat(file_path)
+                                    except FileNotFoundError:
+                                        missing_local_disk = True
+                                    except (OSError, ValueError):
+                                        pass  # The libvirt daemon may still have access.
+                                if target_dev and hasattr(dom, "blockInfo") and not missing_local_disk:
                                     try:
                                         binfo = dom.blockInfo(target_dev, 0)
                                         if isinstance(binfo, (tuple, list)) and len(binfo) >= 2:
@@ -786,6 +799,7 @@ def _observe_libvirt() -> tuple[list[dict[str, Any]], list[dict[str, Any]], list
                         "updated_at": None,
                         "managed": False,
                         "source": "host-backend",
+                        "removal_identity": host_vm_control.libvirt_removal_identity(dom, definition=dom_tree),
                     }
                     vms.append(vm_row)
 

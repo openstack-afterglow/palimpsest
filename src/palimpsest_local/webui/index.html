@@ -22,7 +22,7 @@
         <button id="nav-builds" data-view="builds">빌드<span data-count="builds">—</span></button>
         <button id="nav-storage" data-view="storage">스토리지<span data-count="storage">↗</span></button>
       </nav>
-      <div class="sidebar-foot"><span class="local-dot" aria-hidden="true"></span> 이 호스트의 실제 리소스 관찰<p>콘솔·변경은 --allow-control이 필요합니다. VM 제거는 선택한 상태의 관리 VM만 허용됩니다. 레이어·이미지에서 연결된 Hub와 OCI 레지스트리를 명시적으로 조회하고 전송합니다.</p></div>
+      <div class="sidebar-foot"><span class="local-dot" aria-hidden="true"></span> 이 호스트의 실제 리소스 관찰<p>콘솔·변경은 --allow-control이 필요합니다. 외부 VM도 이름·백엔드 식별자 확인 후 제거할 수 있습니다. 레이어·이미지에서 연결된 Hub와 OCI 레지스트리를 명시적으로 조회하고 전송합니다.</p></div>
     </aside>
     <div class="workspace">
       <header class="topbar">
@@ -63,6 +63,27 @@
                   <input id="run-registry" autocomplete="off" placeholder="기본 프로필 또는 지정 프로필 이름">
                 </label>
               </div>
+              <div class="form-row">
+                <label>플랫폼 대상 (OCI 이기종)
+                  <select id="run-platform">
+                    <option value="">자동 / 기본값</option>
+                    <option value="linux/amd64">linux/amd64</option>
+                    <option value="linux/arm64">linux/arm64</option>
+                  </select>
+                </label>
+                <label class="check-label" style="margin-top:28px;">
+                  <input type="checkbox" id="run-force-architecture">
+                  이기종 강제 실행 시도 (--force-architecture)
+                </label>
+              </div>
+              <div class="form-row">
+                <label>실행용 VM 캐리어 디스크 경로 (--vm-image)
+                  <input id="run-vm-image" autocomplete="off" placeholder="호스트 절대 경로: /path/to/carrier.qcow2">
+                </label>
+                <label>VM 캐리어 다이제스트 (--vm-image-digest)
+                  <input id="run-vm-image-digest" autocomplete="off" placeholder="sha256:...">
+                </label>
+              </div>
               <div class="form-row three-col">
                 <label>메모리 (MiB)
                   <input type="number" id="run-memory" min="256" max="1048576" step="256" placeholder="기본값: 4096">
@@ -88,6 +109,13 @@
                   <input id="run-manifest" autocomplete="off" placeholder="sha256:...">
                 </label>
               </div>
+              <label>백엔드 (선택)<select id="run-backend"><option value="">자동 선택</option></select></label>
+              <fieldset class="volume-attachments"><legend>독립 데이터 볼륨</legend>
+                <p class="muted">이름 있는 볼륨은 VM 제거와 별개로 보존됩니다. 연결할 볼륨의 백엔드를 먼저 선택하세요. 연결 가능 여부는 서버가 다시 확인합니다.</p>
+                <div id="run-volumes"></div>
+                <button id="btn-add-run-volume" type="button">볼륨 연결 추가</button>
+              </fieldset>
+              <p class="muted">OCI 루트 보존 기본값: retain · VM 제거 시 루트와 순서 있는 레이어 연결 토폴로지를 함께 보존합니다.</p>
               <label>클라우드 VM의 레이어 다이제스트 (선택 · 루트부터 줄마다 하나)<textarea id="run-layers" rows="2" spellcheck="false" placeholder="sha256:..."></textarea></label>
               <label>OCI 초기 게스트 명령 (선택 · 게스트 sh -lc로 실행)
                 <input id="run-command" autocomplete="off" placeholder="예: /bin/sh -c 'uptime' 또는 nginx -g 'daemon off;'">
@@ -100,7 +128,20 @@
             <div id="vm-operations-list"></div>
           </div>
         </section>
-        <section id="panel-volumes" hidden aria-labelledby="view-title"></section>
+        <section id="panel-volumes" hidden aria-labelledby="view-title">
+          <div id="volumes-list"></div>
+          <details id="volume-create-controls" class="card management" hidden>
+            <summary>이름 있는 데이터 볼륨 생성</summary>
+            <p class="muted">한 번 생성한 독립 데이터 디스크를 VM에 연결해 재사용합니다. VM 제거 시에도 데이터는 보존되며, 미연결 상태에서 정확한 이름 확인 후에만 별도로 삭제합니다.</p>
+            <form id="form-create-volume" class="form-grid">
+              <label>볼륨 이름<input id="volume-name" required autocomplete="off" spellcheck="false"></label>
+              <label>백엔드<select id="volume-backend" required></select></label>
+              <label>용량 (GiB)<input id="volume-size-gib" type="number" min="1" step="1" value="10" required></label>
+              <button id="btn-create-volume" class="primary" type="submit">볼륨 생성</button>
+            </form>
+            <p id="volume-create-feedback" class="notice" role="status" hidden></p>
+          </details>
+        </section>
         <section id="panel-artifacts" hidden aria-labelledby="view-title">
           <div id="artifacts-list"></div>
           <details id="import-controls" class="card management" hidden><summary>클라우드 이미지 가져오기</summary><p class="muted">호스트의 기존 파일을 로컬 저장소에 가져옵니다.</p>
@@ -108,15 +149,26 @@
           </details>
           <section id="remote-artifacts" class="card" aria-labelledby="remote-artifacts-title">
             <div class="panel-heading"><div><p class="eyebrow">CONNECTED REGISTRIES</p><h2 id="remote-artifacts-title">원격 이미지 · 레이어</h2></div><button id="btn-remote-connections" type="button">연결 다시 읽기</button></div>
-            <p class="muted">등록된 Hub·레지스트리와 해당 연결의 인증만 사용합니다. Docker/OCI 이미지와 부팅용 클라우드 VM 이미지는 서로 다른 런타임입니다.</p>
+            <p class="muted">Palimpsest Hub는 아래에서 이 탭에 연결하거나 서버 환경의 인증을 사용합니다. Docker Hub는 별도 연결입니다. OCI 이미지와 부팅용 클라우드 VM 이미지는 서로 다른 런타임입니다.</p>
+            <form id="form-hub-connect" class="remote-connection-bar" autocomplete="off">
+              <label>Palimpsest Hub URL<input id="hub-url" type="url" required autocomplete="off" spellcheck="false" placeholder="https://hub.example"></label>
+              <label>원래 Keystone 토큰<input id="hub-token" type="password" required autocomplete="off" spellcheck="false"></label>
+              <label>프로젝트 ID (선택 · 원래 범위 확인)<input id="hub-project" autocomplete="off" spellcheck="false"></label>
+              <button id="btn-hub-connect" type="submit">연결</button><button id="btn-hub-disconnect" type="button" hidden>연결 해제</button>
+              <p class="muted remote-connection-note">토큰은 이 탭의 메모리에만 보관하며 연결 해제 시 지웁니다. <span id="hub-connection-status" class="badge" role="status">탭 연결 없음 · 서버 설정 사용</span></p>
+            </form>
             <div id="remote-connection-feedback" class="notice" role="status"></div>
             <form id="form-remote-search" class="remote-search-form">
               <label>연결<select id="remote-connection"><option value="">연결 불러오는 중</option></select></label>
               <label>분류<select id="remote-kind"><option value="all">전체</option><option value="cloud-image">클라우드 이미지</option><option value="squashfs">SquashFS 레이어</option><option value="oci-image">OCI 이미지</option><option value="runtime-bundle">런타임 번들</option></select></label>
               <label>검색어 / 정확한 참조<input id="remote-query" type="search" autocomplete="off" placeholder="redis 또는 library/redis:7 또는 sha256:..."></label>
               <label>저장소 (태그 조회 · 선택)<input id="remote-repository" autocomplete="off" placeholder="library/redis 또는 namespace/package"></label>
+              <label id="remote-arch-filter" hidden>Hub 아키텍처<select id="remote-arch"><option value="">전체</option><option value="x86_64">x86_64</option><option value="aarch64">aarch64</option></select></label>
+              <label id="remote-disk-filter" hidden>Hub 디스크 형식<select id="remote-disk-format"><option value="">전체</option><option value="qcow2">qcow2</option><option value="raw">raw</option></select></label>
+              <label id="remote-parent-filter" hidden>Hub 부모 레이어 (선택)<input id="remote-parent" autocomplete="off" spellcheck="false" placeholder="sha256:..."></label>
               <button id="btn-remote-search" type="submit">조회 · 검색</button>
             </form>
+            <nav id="remote-repository-breadcrumb" class="remote-breadcrumb" aria-label="원격 저장소 탐색" hidden><button id="btn-remote-back" type="button">← 저장소 목록으로</button><span id="remote-repository-name" class="mono"></span></nav>
             <p id="remote-results-state" class="muted" role="status">연결을 선택하고 조회하세요. 원격 목록은 자동 갱신하지 않습니다.</p><div id="remote-results"></div>
             <button id="btn-remote-next" type="submit" form="form-remote-search" hidden>다음 결과</button>
             <details id="remote-upload-controls" class="management" hidden><summary>로컬 빌드 · 아티팩트를 Palimpsest Hub에 업로드</summary>
@@ -209,16 +261,36 @@
       <section id="resource-section" hidden role="tabpanel" aria-labelledby="tab-resources" tabindex="0"><div class="resource-toolbar"><h3>Resource usage</h3><button id="btn-refresh-metrics" type="button">자원 갱신</button></div><label class="resource-device-label" for="resource-disk-select">디스크 I/O 관찰 장치<select id="resource-disk-select" disabled><option value="">표본 대기</option></select></label><p id="resource-state" class="muted" role="status"></p><div id="resource-content"></div></section>
     </div>
   </dialog>
+  <dialog id="remote-detail-dialog" aria-labelledby="remote-detail-title" aria-describedby="remote-detail-description">
+    <header class="drawer-header"><div><p class="eyebrow">REMOTE ARTIFACT</p><h2 id="remote-detail-title">원격 아티팩트 상세 정보</h2></div><button id="btn-remote-detail-close" type="button" autofocus>닫기 <kbd>Esc</kbd></button></header>
+    <div class="drawer-body">
+      <p id="remote-detail-description" class="muted">원격 메타데이터 관찰입니다. 레이어 목록은 로컬 파일의 다운로드·무결성 검증을 의미하지 않습니다.</p>
+      <div id="remote-detail-feedback" class="notice" role="status" hidden></div>
+      <div id="remote-detail-content"></div>
+      <div class="action-group"><button id="btn-remote-detail-download" type="button" disabled>다운로드</button><button id="btn-remote-detail-run" class="primary" type="button" disabled>다운로드 후 VM 설정</button></div>
+      <p id="remote-detail-limitation" class="muted"></p>
+    </div>
+  </dialog>
   <dialog id="remove-vm-dialog" aria-labelledby="remove-vm-title" aria-describedby="remove-vm-description">
     <form id="form-remove-vm" class="removal-form">
-      <p class="eyebrow">선택한 상태 / VM 제거</p><h2 id="remove-vm-title">가상머신 제거</h2>
+      <p class="eyebrow">선택한 VM / 백엔드 제거</p><h2 id="remove-vm-title">가상머신 제거</h2>
       <p id="remove-vm-description" class="muted"></p>
       <p id="remove-vm-warning" class="notice warn"></p>
       <label>제거할 VM 이름을 정확히 입력하세요<input id="remove-vm-confirmation" required autocomplete="off" spellcheck="false"></label>
-      <label class="check-label"><input id="remove-vm-files" type="checkbox">이 VM의 소유 실행 디렉터리·디스크·로그도 삭제</label>
+      <label class="check-label"><input id="remove-vm-files" type="checkbox">이 인스턴스의 루트·런타임 파일만 영구 삭제</label>
       <p id="remove-vm-file-policy" class="muted"></p>
       <div id="remove-vm-feedback" class="notice" role="status" hidden></div>
       <div class="action-group"><button id="btn-remove-vm-cancel" type="button">취소</button><button id="btn-remove-vm-submit" class="danger-button" type="submit" disabled>VM 제거</button></div>
+    </form>
+  </dialog>
+  <dialog id="delete-disk-dialog" aria-labelledby="delete-disk-title" aria-describedby="delete-disk-description">
+    <form id="form-delete-disk" class="removal-form">
+      <h2 id="delete-disk-title">볼륨 / 아티팩트 영구 삭제</h2>
+      <p id="delete-disk-description" class="notice warn"></p>
+      <p id="delete-disk-name" class="mono"></p>
+      <label>위 이름을 정확히 입력하세요<input id="delete-disk-confirmation" required autocomplete="off" spellcheck="false"></label>
+      <p id="delete-disk-feedback" class="notice" role="status" hidden></p>
+      <div class="action-group"><button id="btn-delete-disk-cancel" type="button">취소</button><button id="btn-delete-disk-submit" class="danger-button" type="submit" disabled>영구 삭제</button></div>
     </form>
   </dialog>
   <dialog id="console-drawer" aria-labelledby="console-title" aria-describedby="console-description">

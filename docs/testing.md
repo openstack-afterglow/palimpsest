@@ -1,5 +1,53 @@
 # Fast feedback without dropping coverage
 
+## 0.3.6 full-feature readiness candidate — 2026-10-17
+
+Owner approved the isolated feature source's full release and existing Kolla
+rollout, not native/GPU qualification. Durable receipts are under
+`~/.local/share/palimpsest-proofs/release-036-20261017/`.
+
+- Actual original `pieroot/Default/test` SDK→verified public HTTPS `/v1/me` and
+  layer inventory returned200; real local CLI inventory exited0. Existing
+  production0.3.5 liveness200, readiness404; API/export running, dedicated worker
+  restarting with preserved `claim_pending` uncertainty. This is a baseline,
+  not new-version rollout success.
+- Hub full suite **573 passed,2 skipped in89.12s**. New readiness regressions
+  include actual temporary SQLite/store, Redis failure/recovery, bounded shared
+  probes/caller cancellation and secret sanitization. A dangling existing child
+  link initially returned200, then failed closed after the regression/fix.
+- Canonical amd64 API + real isolated MariaDB11.4/Redis7: normal readiness200,
+  Redis outage503 with process liveness200, recovery200; SQL outage503 and
+  recovery200, all readiness responses `Cache-Control:no-store`. Docker Desktop
+  did not allocate an internal-only network's dynamic API publication; corrected
+  harness added a separate API bridge and loopback-only host publication. DB and
+  Redis stayed internal; API egress isolation is not claimed.
+- All three canonical API/export/build-worker targets built and executed as
+  **linux/amd64 andlinux/arm64**, importing Hub0.3.6 onx86_64/aarch64. Build-worker
+  also imported client0.3.6 and executed bubblewrap0.12.0/qemu-img10.0.13.
+  Production image automation still declaresamd64; these local source builds
+  are not published arm64 manifests or native VM/runtime qualification.
+- A real qemu-img QCOW disk with external data bytes was rejected before native
+  launch; external bytes preserved and cleanup completed. Its consumer regression
+  failed before the guard; complete experimental module **24passed** after.
+- Canonical root0.3.6 sdist→wheel build and isolated minimum-Python3.11 install/
+  CLI version/help smoke passed; independent Hub wheel/sdist built. Initial scoped
+  root selection **634passed/27failed**: every failure was absent
+  `ansible-playbook` on PATH, not an Ansible product failure. The installed venv
+  executable was then verified and supplied to the full gate.
+- Full root gate **7,390passed/264skipped/3failed in369.29s** exposed stale
+  completion enumeration and cloud-retain rejection expectations, plus a
+  source-text architecture false positive on named-volume inventory equality
+  (not backend routing). Removed obsolete reject/source-text assertions; retain
+  behavior remains covered by CLI/runtime consumers. Completion now exercises
+  new-backend prefix matching and an invalid prefix rather than copying the
+  complete incidental choices list. Corrected consumer checks and exact-ref
+  hosted verdicts are recorded after they execute, not inferred here.
+- Release diff secret scan: **no leaks** in765,952 scanned bytes. CLI reference,
+  lane manifest and JS syntax passed; repository-native import sorting corrected
+  LSP's differing worktree classification, and seven changed files formatted.
+  No native checks were enabled or skipped-as-success; policy remains explicit
+  `PALIMPSEST_KVM_ENABLED=false`.
+
 ## Full-source 0.3.5 integration — local verification
 
 Integration began on the 0.3.4 base `ad1674e842c6cefaf4e2d38705b109a579f56040`.
@@ -1277,6 +1325,64 @@ proves HTTP/browser/transport behavior only, not VM launch or guest exec.
 Stop the owned server/browser afterward; this is not native VM/control or Hub
 qualification.
 
+#### Local connected catalog acceptance — 2026-10-15
+
+Source is the uncommitted `feature/local-hub-catalog-20261015` worktree at base
+`3868e527df1bb14f33aee5b6066faf760ad213c2`, not a new published package or Hub
+deployment. The original dirty checkout/index was not used for these edits.
+Use the feature worktree's `src` explicitly if reusing an existing virtualenv:
+
+```sh
+umask 022
+PYTHONPATH=src .venv/bin/python -m pytest -q \
+  tests/unit/test_docker_hub.py tests/unit/test_remote_artifacts.py \
+  tests/unit/test_web_operations.py tests/unit/test_ui.py tests/unit/test_inventory.py
+```
+
+The first attempt imported the original checkout's editable package and failed
+collection (`docker_hub` missing). The corrected invocation prints/asserts its
+import path before testing; that environmental failure is not a provider failure.
+Ruff found strict-zip, an unused port-validation expression and fixture import
+spacing; those were corrected without changing input or authorization policy.
+Final focused/check receipts are recorded in the dated handoff.
+
+Real Chromium exercised both control and read-only foreground apps using private
+scratch state/config and an empty Docker auth directory. It observed public
+Docker search pages (`redis`, then `alpine`), repository→tags→Back, changed-query
+pagination reset, exact Alpine index, selected amd64 config and compressed-layer
+descriptors, retained platform keyboard focus and a successful Skopeo download of
+the pinned child. Docker's live config endpoint returned307: the original strict
+no-redirect implementation failed; the final one-hop anonymous allowlisted CDN
+path resolved real config bytes and verified their descriptor digest/size.
+
+The original SDK-issued caller connected to the actual HTTPS Palimpsest Hub;
+identity/project matched the original account, six artifact rows were visible,
+and `aarch64`/`qcow2` filters selected one cloud image. Details resolved the ARM64
+base and SquashFS chain. Download verified both actual base and layer bytes;
+completion closed the modal, populated the VM form and focused `run-image`.
+No VM execution was requested. Wrong project assertion was rejected (remote403,
+local409) without losing dashboard authentication. Read-only connection/search/
+inspection worked; a direct authenticated transfer POST returned403. Disconnect
+cleared results; the Hub password field cleared and no Hub credentials appeared
+in local/session storage or transfer receipts. Only the loopback dashboard token
+remained in session storage. Browser network observations contained only127.0.0.1.
+
+Desktop1440×1000 and mobile390×844 were observed; actual DPR varied1.25/2 despite
+helper requests, so no nominal-DPR/performance claim is made. Screenshots show
+wrapped full digests and scrollable details. No JavaScript exceptions were
+observed; five cancelled/socket-reset resource requests during reload/transition
+were retained, not reported as a clean network run. An unrelated pre-existing
+libvirt missing-disk diagnostic was not repaired or used as feature evidence.
+Both owned servers and the browser were stopped; the private SDK token was cleared.
+
+Sanitized receipts and screenshots are under
+`~/.local/share/palimpsest-proofs/local-hub-catalog-20261015/`
+(`browser-smoke.json`, `hub-layer-chain-desktop.webp`,
+`docker-platform-desktop.webp`, `hub-layer-chain-mobile.webp`). This is actual
+metadata/download proof, not a new build, upload, native KVM, OCI-root VM,
+production mutation, formal publication or Astra approval.
+
+
 Acquisition changes additionally need real Docker inspect/save and Skopeo smoke
 against disposable owned state. Cover qualified-only local Docker hits,
 conflicting image IDs, hard daemon failures, Docker `credsStore` and per-host
@@ -1703,3 +1809,129 @@ resource bounds, and non-GPU scope.
 
 Keep the SHA, selected lanes/shards, platform, pass/skip counts and elapsed time
 with each result. Do not report a selected subset as a full regression.
+
+
+## External host VM removal — 2026-10-16
+
+Source: uncommitted `feature/local-hub-catalog-20261015` at base
+`3868e527df1bb14f33aee5b6066faf760ad213c2`, isolated from the original dirty
+checkout. No real VM was created, stopped, removed or adopted for this work.
+
+- Final focused command: `PYTHONPATH=src .venv/bin/python -m pytest -q tests/unit/test_host_inventory.py tests/unit/test_ui.py tests/unit/test_inventory.py`
+  → **301 passed in 57.05s**. This is the selected inventory/web/native-adapter
+  suite, not full portable or native-daemon qualification.
+- Changed Python Ruff lint/format, JavaScript syntax, portable lane manifest and
+  generated CLI reference were checked. The earlier asynchronous check receipts
+  were not delivered; only the subsequent explicit synchronous results are used.
+- An owned real Chromium drove the actual loopback application against isolated
+  native boundaries: unmarked Lima/libvirt selection, exact-name confirmation,
+  hidden external run-file cleanup, changed-directory dialog invalidation,
+  stale direct DELETE409, read-only403, confirmed Lima deletion and Unicode
+  libvirt deletion. Ten browser assertions passed; independent disk and
+  libvirt disk/NVRAM files remained, with no selected run ledger created.
+- Native safety review exposed uncertain XML/OCI classification, TPM retention
+  and optional marker-transition gaps. Final source requires matching full XML,
+  rejects malformed/duplicate/OCI markers and compares optional run IDs on every
+  native check. Persistent emulator TPMs require explicit KEEP_TPM; unsafe
+  transient TPM retention is rejected before stop. Regression coverage includes
+  absent→UUID, UUID→absent and UUID-A→UUID-B at both pre-stop checks.
+- A final real loopback HTTP smoke after those fixes returned200 for a marked
+  external libvirt selection, with native flags75 and disk/NVRAM/TPM bytes
+  preserved; an earlier-marker request returned409 without stopping it. The
+  libvirt adapter was synthetic, not a real daemon storage proof.
+- Read-only observation of the actual host reported **15 observed / 15
+  removable / 0 blocked** after the final guard. The actual dashboard had also
+  rendered all15 Remove buttons enabled; none was clicked. The missing inactive
+  HVF overlay now skips its native blockInfo query instead of emitting recurring
+  ENOENT stderr; no global libvirt error handler suppression was added.
+- Lima still offers native by-name deletion, not atomic identity compare/delete.
+  A pinned directory and final checks do not exclude an independent concurrent
+  Lima mutation. A deliberately reused libvirt UUID/name is not an incarnation
+  counter. These native limits are not represented as stronger guarantees.
+
+Sanitized screenshots and receipts:
+`~/.local/share/palimpsest-proofs/external-vm-removal-20261016-r_yd5opx/`
+(`browser-checks.json`, `post-review-http-smoke.json`,
+`actual-host-controls.json`, `external-lima-confirmation.png`,
+`external-removal-complete.png`, `actual-host-removal-controls.png`).
+The attached-CDP browser reused a named page when opening the read-only view;
+the surviving handle was explicitly returned to the control origin before
+continuing. This tool behavior required no application workaround. Owned smoke
+servers/browser and scaffolds were stopped/removed; original VMs, original web
+process, original checkout and index were not modified.
+
+Final detail-view browser follow-through also passed: an unmarked stopped
+external libvirt VM exposed only the enabled Remove action (not Start/Stop),
+then completed detail→name confirmation→DELETE with native flags75 and all
+disk/NVRAM/TPM bytes retained. No JavaScript error was observed. See
+`detail-removal-smoke.json` and `external-detail-remove.png` in the same receipt
+directory. The last metadata regression additionally proves local lstat
+PermissionError still permits daemon blockInfo capacity/allocation; only
+positively missing inactive local disks skip that query.
+
+The reviewed persistent user dashboard was then checked in actual Chromium:
+all15 observed host VMs had enabled Remove controls and no JS errors; no real
+Remove action was submitted. See `final-host-controls.json` and
+`actual-host-removal-controls-final.png`. The browser receipt's source stamp
+predates only the final negative-test rename (adoption→missing native identity),
+whose two parameterized cases passed again in0.62s. Final working architecture
+stamp/check passed for478 files with source SHA256
+`2e4dc10fdc5bb59f58e69ca59c9fe561996a264e097daf7a82bc774716e7fdc4`.
+## Default Hub, operation motion graphics, and cross-architecture OCI execution — 2026-10-16
+
+- Default Hub fallback tested via `test_cli_contract.py::test_default_hub_keeps_authentication_required` and live browser inspection confirming `https://palimpsest.dmslab.re.kr`.
+- Motion graphics tested via browser Puppeteer session recording 70 real animation frames (`build-operation-motion.mp4`) and verifying computed style transformation during running, succeeded, paused, and prefers-reduced-motion conditions.
+- OCI multi-arch acquisition tested with real Skopeo acquiring `linux/arm64` `alpine:latest` root `sha256:294b683cb7249...`.
+- Total focused unit test coverage: **960 passed, 1 skipped in 79.19s**.
+- Static checks: Ruff lint and format clean across 278 files, CLI reference regenerated and current, test lanes manifest validated.
+
+
+## Independent data volumes and retained topology — 2026-10-16
+
+Working source is in `feature/local-hub-catalog-20261015` at base
+`3868e527df1bb14f33aee5b6066faf760ad213c2`, not a published commit. New portable
+behavioral modules are `test_cli_volumes.py`, `test_named_volumes.py`,
+`test_retained_instances.py`, and `test_oci_volume_policy.py`. They cover
+format-once/exclusive ownership, stopped reservations, exact-run removal/reuse,
+retained ordered topology/backing closure/firmware, unsafe native purge refusals,
+artifact-lock exclusion and authenticated removal receipts. Integration nodes in
+`test_inventory.py`/`test_ui.py` cover stale same-name ledger independence,
+retained-layer force refusal, malformed metadata and exact digest confirmation.
+
+Real Chromium exercised authenticated loopback HTTP with temporary state/files
+and synthetic native adapters: named-volume creation and run-form selection;
+wrong/exact VM-name gates; native removal with retained archive; forced dependent
+layer deletion HTTP409; exact-name archive purge; dependency release; and
+URL-encoded digest deletion after fixing a browser-discovered colon-decoding
+bug. An actual `volume inspect data --backend kvm` subprocess read the standalone
+temporary ledger. A throwaway runtime smoke performed reserve → durable run →
+bind → managed removal → second reservation; the same disk retained the exact
+`persistent-data-smoke` sentinel with one synthetic formatting call.
+
+Evidence: `~/.local/share/palimpsest-proofs/hub-motion-crossarch-3868e527-20261016/`
+contains `volume-lifecycle-verification.json`, `retained-layer-blocker.png` and
+`named-volume-attachment.png`. Native disk creation/attachment/mount and actual
+user VM deletion were not authorized or exercised. Native OCI-root/carrier data
+volume attachment remains explicitly unsupported. A crash between native launch
+and reservation binding can leave a fail-closed pending reservation; automatic
+crash-gap recovery is not implemented. Portable pass is not native qualification.
+
+Selected public-consumer regression run passed **764, skipped 1** in 28.87s
+(`test_cli_contract`, `test_cli_reference`, `test_test_lanes`, `test_remote_artifacts`,
+`test_oci_image`, `test_oci_source`, `test_registry_intake`, `test_experimental_oci_vm`,
+`test_web_operations`, `test_run_source`, `test_platforms`). The 17 repaired
+removal/HTTP/overlay nodes passed in 9.68s. Scoped Ruff lint and format checks
+passed (126 files already formatted); CLI reference and lane manifest checks
+passed, and JavaScript syntax passed. These counts are separate selections,
+not a full portable/native run.
+
+Final synchronous selections on the completed cancellation fix passed
+**228** inventory/cloud/process cases in4.12s and **106** HTTP/dashboard cases
+in54.00s; the independent volume/native-adapter selection passed **451**
+in4.73s. Architecture working stamp/check passed for486 source files with
+SHA-256 `45102318465c4bf5bdb14685d96c8b497d7a0d9e9b8f5cad41c69369ac96ec9e`.
+The earlier combined asynchronous result was not reliably delivered by the tool;
+these smaller synchronous receipts are authoritative. The macOS selector stall
+was fixed, not skipped: the existing real-probe deadline node and an actual
+sleeping-child smoke now return bounded timeout/cancelled (0.217s observed).
+

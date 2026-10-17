@@ -4,6 +4,27 @@ All notable changes to Palimpsest Local are documented here.
 
 ## [Unreleased]
 
+## [0.3.6] - 2026-10-17
+
+- Prepare the owner-approved full feature release and Kolla rollout; publication and production readiness remain pending until recorded verification succeeds.
+- Add unauthenticated dependency readiness at `/v1/ready`, separate from backward-compatible process liveness at `/v1/health`; return sanitized database/Redis/blob-store status with HTTP 503 on failure. Wire API container and HAProxy health probes to readiness.
+- Default the local client and dashboard to `https://palimpsest.dmslab.re.kr`, preserving explicit configuration overrides. Show operation-stage motion without invented percentages and honor reduced motion.
+- Acquire verified OCI archives for both Linux amd64 and arm64 independently of native runtime eligibility; expose explicit experimental cross-architecture VM-carrier execution without weakening native OCI-root platform guards.
+- Bind Docker download run receipts to the retained OCI root index while recording the selected child separately. Propagate explicit forced acquisition and the requested platform through Docker-cache exports, validate exported amd64/arm64 configs, and preserve native runtime preflight for normal runs.
+- Reject QCOW2 carriers with external data files before any VM launch, matching the existing self-contained backing-file guard; digesting the carrier alone cannot authorize mutable external data.
+- Clear only an exact matching removed-run archive pointer when deleting its retained root from the dashboard. Preserve run/CAS references until explicit CLI purge, use already-run-locked deletion in adapters, and reject ambiguous native persistence/inventory and aliased reattachments.
+- Add an explicit connected catalog to the local web dashboard: tab-scoped original-token Palimpsest Hub identity, filtered image/layer inventory and complete dependency details, plus real Docker Hub repository/tag/platform/config/layer inspection through the local client.
+- Keep metadata independent of Docker/Skopeo, credentials out of browser storage/global environment/operation receipts, and verified downloads behind `--allow-control`. Selected Docker platforms download the immutable child manifest without losing the pinned parent index used for inspection.
+- Verify bounded Docker manifest/config metadata and permit only one anonymous allowlisted config-CDN hop; reject foreign child digests, insecure redirects and corrupt descriptors. Preserve canonical acquisition/runtime platform restrictions.
+- Default unconfigured dashboards to Docker Hub, reset provider-specific queries and changed-filter pagination, preserve platform keyboard focus, and expose the verified VM-setup form without leaving it behind a detail modal. No VM is launched by a download.
+- Choose Docker downloads from the verified selected config/manifest platform, or the actual host architecture for an unselected multiarch root, never an arbitrary sibling. Submit forced VM-carrier runs in foreground with disposable roots; reject explicit retained roots in force mode while keeping native and conventional runs detached.
+- Enable exact-name/native-identity confirmed removal of observed Lima VZ/QEMU/krunkit and libvirt VMs without adopting foreign state. Stale same-name ledgers no longer disable a verified native selection; host-host ambiguity still fails closed.
+- Retain conventional instance root bytes, firmware/native configuration and ordered layer/connection topology by default. Explicit instance purge removes only safely owned state, never independent data disks or shared layers; external libvirt disks remain reference-only.
+- Add standalone named ext4 data-volume create/list/delete commands and dashboard controls, with exclusive conventional VM attachments via `--volume NAME:TARGET[:ro]`. VM removal releases disks for reuse without reformatting; stopped VMs keep reservations. Native OCI-root/carrier attachments remain explicitly unsupported.
+- Protect referenced layers even after VM removal using retained topology; force cannot bypass dependencies, invalid metadata blocks deletion, and destructive HTTP actions require exact-name/digest confirmation.
+- Bound process-output selector waits so timer-thread cancellation can finish guest probes on macOS kqueue after output descriptors close; preserve genuine read errors and VM lifetime.
+
+
 ## [0.3.5] - 2026-10-14
 
 - Integrate all preserved public local/client and Hub WIP on the 0.3.4 base `ad1674e842c6cefaf4e2d38705b109a579f56040`, synchronizing root/Hub module and package versions, native-generated locks and packaged Kolla image defaults. Fresh qualification is recorded below; inherited results remain bound to their original snapshots, not this release.

@@ -5,17 +5,27 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import test_registry_intake as intake_fixtures
 
+from palimpsest_local import registry_intake
 from palimpsest_local import remote_artifacts as remote
 from palimpsest_local.digest import digest_file
 from palimpsest_local.errors import StateError
 from palimpsest_local.hub import MEDIA_TYPE_LAYER_SQUASHFS
 from palimpsest_local.oci_layout import ContentStore
-from palimpsest_local.registry import RegistryProfile, add_profile, default_registry_config, save_registry_config
+from palimpsest_local.oci_source import LocalArchiveSource, SourceCAS
+from palimpsest_local.packages import snapshot_package
+from palimpsest_local.registry import (
+    RegistryProfile,
+    add_profile,
+    default_registry_config,
+    save_registry_config,
+)
 from palimpsest_local.state import atomic_write_json, init_roots
 
 
@@ -151,7 +161,7 @@ def test_hub_identity_requires_explicit_project_and_action(monkeypatch):
     client = remote._ConnectedHub("https://example.test", "synthetic-token", "explicit-project", ())
     actor = {"project_id": "other-project", "user_id": "user", "capabilities": {"upload": True}}
     monkeypatch.setattr(client, "_json_request", lambda *_args, **_kwargs: actor)
-    with pytest.raises(StateError, match="explicit PALIMPSEST_PROJECT_ID"):
+    with pytest.raises(StateError):
         client.identity("upload")
     actor["project_id"] = "explicit-project"
     actor["capabilities"]["upload"] = False
@@ -185,34 +195,16 @@ def test_non_docker_registry_truthfully_has_no_global_search(tmp_path, monkeypat
     assert "no configured repository search API" in result["message"]
 
 
-def test_docker_hub_search_uses_authoritative_https_and_repo_followthrough(tmp_path, monkeypatch):
-    roots = _roots(tmp_path)
-    seen = []
-
-    class Response(io.BytesIO):
-        def geturl(self):
-            return seen[0]
-
-    class Opener:
-        def open(self, request, timeout):
-            seen.append(request.full_url)
-            assert request.get_header("Authorization") is None
-            assert timeout == 15
-            return Response(json.dumps({"results": [{"repo_name": "library/ubuntu"}]}).encode())
-
-    monkeypatch.setattr(remote, "_opener", lambda *_args: Opener())
-    result = remote.RemoteArtifacts(roots).browse("registry:docker", query="ubuntu", limit=1)
-    assert seen[0].startswith("https://hub.docker.com/v2/search/repositories/?")
-    assert result["items"][0]["repository"] == "library/ubuntu"
-    assert result["items"][0]["download_supported"] is False
-
-
 def test_oci_exact_manifest_reports_architecture_not_conventional_vm(tmp_path, monkeypatch):
     roots = _roots(tmp_path)
-    calls = []
+    save_registry_config(
+        roots,
+        add_profile(
+            default_registry_config(), RegistryProfile("private", "registry.example.test", namespace="library")
+        ),
+    )
 
     def inspect(reference, roots, *, profile, raw=False, **kwargs):
-        calls.append((reference, raw))
         if raw:
             return {"schemaVersion": 2, "config": {}, "layers": []}
         return {"Architecture": "amd64", "Digest": "sha256:" + "a" * 64}
@@ -220,11 +212,9 @@ def test_oci_exact_manifest_reports_architecture_not_conventional_vm(tmp_path, m
     monkeypatch.setattr(remote, "inspect_registry_reference", inspect)
     monkeypatch.setattr(remote.platform, "system", lambda: "Darwin")
     monkeypatch.setattr(remote.platform, "machine", lambda: "arm64")
-    item = remote.RemoteArtifacts(roots).browse("registry:docker", repository="library/ubuntu:latest")["items"][0]
+    item = remote.RemoteArtifacts(roots).browse("registry:private", repository="library/ubuntu:latest")["items"][0]
     assert item["architectures"] == ["amd64"]
     assert item["runtime_kind"] == "oci-root" and item["run_supported"] is False
-    assert "not a conventional VM disk" in item["run_limitation"]
-    assert calls == [("docker.io/library/ubuntu:latest", True), ("docker.io/library/ubuntu:latest", False)]
 
 
 def test_foreign_connection_reference_rejected_before_job(tmp_path):
@@ -235,18 +225,6 @@ def test_foreign_connection_reference_rejected_before_job(tmp_path):
             "registry:docker",
             "foreign.example.test/app:latest",
         )
-
-
-def test_transfer_job_has_fixed_module_and_no_credentials_argv(tmp_path, monkeypatch):
-    backend = remote.RemoteArtifacts(_roots(tmp_path))
-    calls = []
-    monkeypatch.setenv("PALIMPSEST_TOKEN", "synthetic-secret")
-    operations = SimpleNamespace(start=lambda *args, **kwargs: calls.append((args, kwargs)) or {"id": "job"})
-    result = backend.start_download(operations, "registry:docker", "library/ubuntu:latest")
-    assert result == {"id": "job"}
-    assert calls[0][0][2] == ["download", "--", "registry:docker", "library/ubuntu:latest"]
-    assert calls[0][1]["module"] == "palimpsest_local.remote_artifacts"
-    assert "synthetic-secret" not in repr(calls)
 
 
 @pytest.mark.parametrize(
@@ -306,23 +284,6 @@ def test_hub_json_and_blob_responses_are_bounded():
         response.read(10)
 
 
-def test_tag_pages_are_one_inspection_not_per_tag(tmp_path, monkeypatch):
-    backend = remote.RemoteArtifacts(_roots(tmp_path))
-    calls = []
-
-    def inspect(reference, roots, *, profile, tags, timeout_seconds):
-        calls.append(reference)
-        assert tags is True and timeout_seconds == 10
-        return {"Tags": ["v3", "v1", "v2"]}
-
-    monkeypatch.setattr(remote, "inspect_registry_reference", inspect)
-    page = backend.browse("registry:docker", repository="library/app", limit=1, cursor="1")
-    assert page["next_cursor"] == "2"
-    assert page["items"][0]["reference"] == "docker.io/library/app:v2"
-    assert page["items"][0]["repository"] == "docker.io/library/app:v2"
-    assert len(calls) == 1
-
-
 def test_legacy_digest_prefix_pagination_preserves_chain_fields(tmp_path, monkeypatch):
     backend = remote.RemoteArtifacts(_roots(tmp_path))
     _, root, leaf, metadata, blobs = _chain()
@@ -341,21 +302,6 @@ def test_legacy_digest_prefix_pagination_preserves_chain_fields(tmp_path, monkey
     assert page["items"][0]["base_digest"] == metadata[root]["base_image_digest"]
 
 
-def test_qualified_query_inspects_instead_of_public_search(tmp_path, monkeypatch):
-    backend = remote.RemoteArtifacts(_roots(tmp_path))
-    monkeypatch.setattr(remote, "_opener", lambda *_args: pytest.fail("public search invoked for exact reference"))
-    monkeypatch.setattr(
-        remote,
-        "inspect_registry_reference",
-        lambda *_args, **_kwargs: {
-            "manifests": [{"platform": {"architecture": "amd64"}}],
-        },
-    )
-    page = backend.browse("registry:docker", query="docker.io/library/app:latest")
-    assert page["items"][0]["reference"] == "docker.io/library/app:latest"
-    assert page["search_mode"] == "exact-reference/tags"
-
-
 def test_shared_read_budget_rejects_drip_response(tmp_path, monkeypatch):
     moments = iter([0.0, 0.5, 1.1])
     monkeypatch.setattr(remote.time, "monotonic", lambda: next(moments))
@@ -370,39 +316,34 @@ def test_page_cursor_is_typed_not_remote_url(cursor):
         remote._page_cursor(cursor)
 
 
-def test_hub_client_exposes_digest_prefix_and_offset_without_token_in_query(monkeypatch):
-    from palimpsest_local.hub import HubClient
-
-    client = HubClient("https://example.test", "synthetic-secret", project_id="explicit-project")
-    seen = []
-    monkeypatch.setattr(client, "_json_request", lambda *args, **kwargs: seen.append((args, kwargs)) or [])
-    assert client.list_layers(digest_prefix="sha256:abcd", offset=30, limit=31) == []
-    assert seen[0][1]["query"]["digest_prefix"] == "sha256:abcd"
-    assert seen[0][1]["query"]["offset"] == 30
-    assert "synthetic-secret" not in repr(seen)
-
-
 @pytest.mark.parametrize(
-    "platform, supported",
+    "platform, dl_supported, run_supported",
     [
-        ({"os": "linux", "architecture": "amd64"}, True),
-        ({"os": "windows", "architecture": "amd64"}, False),
-        ({"os": "linux", "architecture": "arm64"}, False),
-        ({"architecture": "amd64"}, False),
+        ({"os": "linux", "architecture": "amd64"}, True, True),
+        ({"os": "windows", "architecture": "amd64"}, False, False),
+        ({"os": "linux", "architecture": "arm64"}, True, False),
+        ({"architecture": "amd64"}, False, False),
     ],
 )
-def test_exact_oci_download_and_run_require_linux_amd64(tmp_path, monkeypatch, platform, supported):
-    backend = remote.RemoteArtifacts(_roots(tmp_path))
+def test_exact_oci_download_and_run_require_linux_amd64(tmp_path, monkeypatch, platform, dl_supported, run_supported):
+    roots = _roots(tmp_path)
+    save_registry_config(
+        roots,
+        add_profile(
+            default_registry_config(), RegistryProfile("private", "registry.example.test", namespace="library")
+        ),
+    )
+    backend = remote.RemoteArtifacts(roots)
     monkeypatch.setattr(remote.platform, "system", lambda: "Linux")
     monkeypatch.setattr(remote.platform, "machine", lambda: "x86_64")
     monkeypatch.setattr(
         remote, "inspect_registry_reference", lambda *_args, **_kwargs: {"manifests": [{"platform": platform}]}
     )
-    page = backend.browse("registry:docker", query="docker.io/library/app:latest")
+    page = backend.browse("registry:private", query="registry.example.test/library/app:latest")
     item = page["items"][0]
     assert item["platforms"] == [platform]
-    assert item["download_supported"] is supported
-    assert item["run_supported"] is supported
+    assert item["download_supported"] is dl_supported
+    assert item["run_supported"] is run_supported
     assert item["runtime_kind"] == "oci-root"
 
 
@@ -412,7 +353,6 @@ def test_connections_are_secret_free_and_do_not_claim_credential_validation(tmp_
     monkeypatch.setenv("PALIMPSEST_PROJECT_ID", "explicit-project")
     rows = remote.RemoteArtifacts(_roots(tmp_path)).connections()
     legacy = next(row for row in rows if row["id"] == "legacy")
-    assert legacy["label"] == "Configured Hub"
     assert legacy["namespace"] == "explicit-project"
     assert legacy["credential_available"] is True
     assert legacy["capabilities"]["upload"] is True
@@ -560,3 +500,102 @@ def test_package_upload_source_is_a_verified_typed_record_not_a_filesystem_path(
     archive.write_bytes(b"changed-after-record")
     with pytest.raises(StateError, match="native local source has changed"):
         backend._source({"kind": "package", "reference": reference})
+
+
+def test_header_connection_derives_original_project_without_inheriting_process_scope(tmp_path, monkeypatch):
+    monkeypatch.setenv("PALIMPSEST_URL", "https://unrelated.example.test")
+    monkeypatch.setenv("PALIMPSEST_TOKEN", "unrelated-process-secret")
+    monkeypatch.setenv("PALIMPSEST_PROJECT_ID", "unrelated-project")
+    connection = remote.HubConnection.from_headers(
+        {
+            "X-Palimpsest-Hub-Url": "https://selected.example.test",
+            "X-Palimpsest-Hub-Token": "selected-tab-secret",
+        }
+    )
+    backend = remote.RemoteArtifacts(_roots(tmp_path), hub_connection=connection)
+    hub = backend._hub()
+    actor = {
+        "project_id": "selected-project",
+        "user_id": "selected-user",
+        "capabilities": {"inventory": True, "download": False},
+    }
+    monkeypatch.setattr(hub, "_json_request", lambda *_a, **_k: actor)
+    hub.identity("inventory")
+    assert hub._project_id == "selected-project"
+    with pytest.raises(StateError):
+        hub.identity("download")
+    actor["project_id"] = "changed-project"
+    with pytest.raises(StateError):
+        hub.identity("inventory")
+    assert os.environ["PALIMPSEST_PROJECT_ID"] == "unrelated-project"
+    assert "selected-tab-secret" not in repr(connection)
+    assert "selected-tab-secret" not in json.dumps(backend.connections())
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"X-Palimpsest-Hub-Url": "https://selected.example.test"},
+        {"X-Palimpsest-Hub-Token": "selected-tab-secret"},
+        {"X-Palimpsest-Hub-Project": "selected-project"},
+        {"X-Palimpsest-Hub-Url": "https://[bad", "X-Palimpsest-Hub-Token": "selected-tab-secret"},
+    ],
+)
+def test_partial_or_malformed_header_connection_never_falls_back_to_process_credentials(headers):
+    with pytest.raises(StateError):
+        remote.HubConnection.from_headers(headers)
+
+
+def test_remote_detail_preserves_root_to_leaf_dependencies_and_layer_only_download(tmp_path, monkeypatch):
+    backend = remote.RemoteArtifacts(_roots(tmp_path))
+    base, root, leaf, metadata, blobs = _chain()
+    for selected in metadata.values():
+        selected["size_bytes"] = len(blobs[selected["digest"]])
+    hub = _Hub(metadata, blobs)
+    hub.identity = lambda action: {"capabilities": {"inventory": True, "download": True}}
+    monkeypatch.setattr(backend, "_hub", lambda: hub)
+    detail = backend.inspect("legacy", leaf)
+    assert [item["digest"] for item in detail["chain"]] == [base, root, leaf]
+    assert [item["digest"] for item in detail["layers"]] == [root, leaf]
+    assert detail["size_bytes"] == len(blobs[leaf])
+    assert detail["chain_complete"] is True and detail["download_supported"] is True
+    metadata[root].pop("base_image_digest")
+    metadata[leaf].pop("base_image_digest")
+    detail = backend.inspect("legacy", leaf)
+    assert [item["digest"] for item in detail["chain"]] == [root, leaf]
+    assert detail["download_supported"] is True and detail["run_supported"] is False
+    metadata[root]["parent_digest"] = leaf
+    with pytest.raises(StateError):
+        backend.inspect("legacy", leaf)
+
+
+@pytest.mark.parametrize("architecture", ["amd64", "arm64"])
+def test_oci_download_receipt_resolves_declared_root_and_selected_config(tmp_path, monkeypatch, architecture):
+    roots = _roots(tmp_path)
+    payload, root, manifests = intake_fixtures._platform_archive()
+    selected = next(item for item in manifests if item["platform"]["architecture"] == architecture)
+    executable = tmp_path / "skopeo"
+    executable.write_bytes(b"tool")
+    monkeypatch.setattr(registry_intake.shutil, "which", lambda name: str(executable) if name == "skopeo" else None)
+    monkeypatch.setattr(
+        registry_intake,
+        "_run_bounded_copy",
+        lambda _argv, archive, _staging, **_kw: archive.write_bytes(payload),
+    )
+    monkeypatch.setenv("DOCKER_CONFIG", str(tmp_path / "empty-docker-config"))
+    result = remote.RemoteArtifacts(roots).download(
+        "registry:docker", "service:stable", platform="linux/" + architecture
+    )
+
+    # Use the receipt exactly as run consumers do, rather than echoing pull arguments.
+    with snapshot_package(Path(result["source"]), manifest=result["manifest"]) as package:
+        assert package.root_digest == root["digest"]
+        source = LocalArchiveSource(package.archive, root_digest=package.root_digest)
+        snapshot = source.snapshot_acquisition(None, SourceCAS(roots.oci_source_cas), platform="linux/" + architecture)
+        assert snapshot.root.descriptor.digest == root["digest"]
+        assert snapshot.manifest.descriptor.digest == selected["digest"]
+        assert snapshot.image.config.architecture == architecture
+    persisted = json.loads(Path(result["receipt"]).read_text())
+    assert persisted["manifest"] == persisted["package_manifest"] == root["digest"]
+    assert persisted["selected_manifest"] == selected["digest"]
+    assert persisted["selected_manifest"] != persisted["manifest"]

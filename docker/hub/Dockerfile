@@ -41,6 +41,8 @@ RUN apt-get update \
 CMD ["python", "-m", "palimpsest_hub.build_worker"]
 
 FROM runtime AS palimpsest-hub-api
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD python -c "from urllib.request import urlopen; response = urlopen('http://127.0.0.1:8020/v1/ready', timeout=5); assert response.status == 200"
 CMD ["uvicorn", "palimpsest_hub.main:app", "--host", "0.0.0.0", "--port", "8020"]
 
 FROM runtime AS palimpsest-hub-worker

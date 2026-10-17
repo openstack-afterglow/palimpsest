@@ -53,10 +53,19 @@ class OperationManager:
         resource_name: str | None = None,
         dockerfile_text: str | None = None,
         module: str = "palimpsest_local.cli",
+        hub_environment: dict[str, str] | None = None,
     ) -> dict:
         """Inventory owns arguments; only fixed first-party job modules may execute."""
         if module not in {"palimpsest_local.cli", "palimpsest_local.remote_artifacts"}:
             raise StateError("Unsupported web operation module")
+        if hub_environment is not None:
+            if module != "palimpsest_local.remote_artifacts" or kind not in {"download", "upload"}:
+                raise StateError("Hub credentials are restricted to owned artifact transfer jobs")
+            if set(hub_environment) != {"PALIMPSEST_URL", "PALIMPSEST_TOKEN", "PALIMPSEST_PROJECT_ID"} or any(
+                not isinstance(value, str) for value in hub_environment.values()
+            ):
+                raise StateError("invalid Hub transfer credential context")
+            hub_environment = dict(hub_environment)
         with self._lock:
             if self._closed:
                 raise StateError("Web operation manager is closed")
@@ -75,6 +84,8 @@ class OperationManager:
                     recipe.write_text(dockerfile_text, encoding="utf-8")
                     args = [*args, f"--file={recipe}"]
                 environment = dict(os.environ)
+                if hub_environment is not None:
+                    environment.update(hub_environment)
                 environment["PALIMPSEST_STATE_HOME"] = str(roots.state.resolve())
                 environment["XDG_CONFIG_HOME"] = str(roots.config.resolve().parent)
                 environment["PYTHONUNBUFFERED"] = "1"

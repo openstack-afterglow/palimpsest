@@ -76,11 +76,8 @@ def test_option_and_choices_completion():
     assert "--url" not in completion.resolve_candidates(parser, ["run", "--"])
 
     # Choices completion
-    backend_choices = completion.resolve_candidates(parser, ["run", "--backend", ""])
-    assert backend_choices == ["auto", "kvm", "libvirt-hvf", "lima-vz"]
-
-    backend_filtered = completion.resolve_candidates(parser, ["run", "--backend", "l"])
-    assert backend_filtered == ["libvirt-hvf", "lima-vz"]
+    assert completion.resolve_candidates(parser, ["run", "--backend", "lima-q"]) == ["lima-qemu-oci"]
+    assert completion.resolve_candidates(parser, ["run", "--backend", "unknown-backend"]) == []
 
     arch_choices = completion.resolve_candidates(parser, ["image", "import", "--arch", ""])
     assert arch_choices == ["aarch64", "x86_64"]
@@ -90,10 +87,7 @@ def test_option_and_choices_completion():
 
     # --opt=val syntax
     assert completion.resolve_candidates(parser, ["run", "--backend=a"]) == ["--backend=auto"]
-    assert completion.resolve_candidates(parser, ["run", "--backend=l"]) == [
-        "--backend=libvirt-hvf",
-        "--backend=lima-vz",
-    ]
+    assert completion.resolve_candidates(parser, ["run", "--backend=lima-q"]) == ["--backend=lima-qemu-oci"]
 
 
 def test_prefix_filtering():

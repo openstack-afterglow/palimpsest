@@ -1,16 +1,27 @@
 from __future__ import annotations
 
 import base64
+import gzip
+import hashlib
+import io
 import json
 import os
 import sys
+import tarfile
 import time
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from palimpsest_local import cli, registry_intake
+from palimpsest_local import cli, registry_intake, state
+from palimpsest_local.errors import ArtifactValidationError
+from palimpsest_local.oci_provenance import (
+    OCI_IMAGE_CONFIG_MEDIA_TYPE,
+    OCI_IMAGE_INDEX_MEDIA_TYPE,
+    OCI_IMAGE_MANIFEST_MEDIA_TYPE,
+    OCI_LAYER_GZIP_MEDIA_TYPE,
+)
 from palimpsest_local.registry_intake import RegistryIntakeError
 from palimpsest_local.state import StatePaths
 
@@ -49,7 +60,7 @@ def test_skopeo_argv_forces_anonymous_verified_tls_and_platform(tmp_path: Path):
         "--override-arch",
         "amd64",
         "copy",
-        "--multi-arch=system",
+        "--multi-arch=all",
         "--preserve-digests",
         "--src-no-creds",
         "--src-tls-verify=true",
@@ -197,11 +208,11 @@ def test_real_subprocess_error_kills_spawned_descendant(tmp_path: Path, failure:
     archive = tmp_path / "image.oci.tar"
     pid_file = tmp_path / "child.pid"
     prefix = "pathlib.Path(sys.argv[1]).write_bytes(b'x'*2048);" if failure == "size" else ""
-    # Publish the descendant PID before the monitor can reject the oversized archive.
     program = (
         "import pathlib,subprocess,sys,time;"
-        "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)']);"
-        "pathlib.Path(sys.argv[2]).write_text(str(child.pid));" + prefix + "time.sleep(30)"
+        + prefix
+        + "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)']);"
+        + "pathlib.Path(sys.argv[2]).write_text(str(child.pid));time.sleep(30)"
     )
     with pytest.raises(RegistryIntakeError, match="size limit" if failure == "size" else "timed out"):
         registry_intake._run_bounded_copy(
@@ -299,13 +310,15 @@ def test_pull_verifies_before_nonoverwriting_publish(monkeypatch: pytest.MonkeyP
         def __init__(self, archive):
             self.archive = archive
 
-        def snapshot(self, reference, source_cas):
+        def snapshot_acquisition(self, reference, source_cas, **kwargs):
+            assert kwargs["platform"] == "linux/amd64"
             assert self.archive.read_bytes() == b"archive"
             assert reference.registry == "quay.io"
             assert source_cas._root == cas  # test-only confirmation of the selected private CAS
             events.append("verify")
             descriptor = SimpleNamespace(digest="sha256:" + "a" * 64)
             return SimpleNamespace(
+                image=SimpleNamespace(platform=SimpleNamespace(os="linux", architecture="amd64")),
                 root=SimpleNamespace(descriptor=descriptor),
                 manifest=SimpleNamespace(descriptor=descriptor),
                 cas_id="source-cas-v1:" + "b" * 64,
@@ -349,7 +362,7 @@ def test_failed_verification_never_publishes(monkeypatch: pytest.MonkeyPatch, tm
         def __init__(self, _archive):
             pass
 
-        def snapshot(self, _reference, _source_cas):
+        def snapshot_acquisition(self, _reference, _source_cas, **_kwargs):
             raise RegistryIntakeError("invalid OCI graph")
 
     monkeypatch.setattr(registry_intake, "_run_bounded_copy", copy)
@@ -406,9 +419,10 @@ def test_publish_race_never_overwrites_competing_output(monkeypatch: pytest.Monk
         def __init__(self, _archive):
             pass
 
-        def snapshot(self, _reference, _source_cas):
+        def snapshot_acquisition(self, _reference, _source_cas, **_kwargs):
             descriptor = SimpleNamespace(digest="sha256:" + "a" * 64)
             return SimpleNamespace(
+                image=SimpleNamespace(platform=SimpleNamespace(os="linux", architecture="amd64")),
                 root=SimpleNamespace(descriptor=descriptor),
                 manifest=SimpleNamespace(descriptor=descriptor),
                 cas_id="source-cas-v1:" + "b" * 64,
@@ -636,3 +650,189 @@ def test_inspection_rejects_insecure_profile_before_acquisition(tmp_path, monkey
         registry_intake.inspect_registry_reference(
             "example.test/app:latest", StatePaths(tmp_path / "config", tmp_path / "state"), profile=profile
         )
+
+
+def _platform_archive(*, architectures=("amd64", "arm64"), indexed=True, bad_diff_id=False, config_architecture=None):
+    members = {"oci-layout": b'{"imageLayoutVersion":"1.0.0"}'}
+
+    def add(value, media_type):
+        payload = value if isinstance(value, bytes) else json.dumps(value).encode()
+        digest = "sha256:" + hashlib.sha256(payload).hexdigest()
+        members["blobs/sha256/" + digest.split(":")[1]] = payload
+        return {"mediaType": media_type, "digest": digest, "size": len(payload)}
+
+    manifests = []
+    for architecture in architectures:
+        raw = ("layer for " + architecture).encode()
+        layer = add(gzip.compress(raw, mtime=0), OCI_LAYER_GZIP_MEDIA_TYPE)
+        config = add(
+            {
+                "os": "linux",
+                "architecture": config_architecture or architecture,
+                "rootfs": {
+                    "type": "layers",
+                    "diff_ids": [
+                        "sha256:" + ("0" * 64 if bad_diff_id else hashlib.sha256(raw).hexdigest()),
+                    ],
+                },
+            },
+            OCI_IMAGE_CONFIG_MEDIA_TYPE,
+        )
+        manifest = add(
+            {
+                "schemaVersion": 2,
+                "mediaType": OCI_IMAGE_MANIFEST_MEDIA_TYPE,
+                "config": config,
+                "layers": [layer],
+            },
+            OCI_IMAGE_MANIFEST_MEDIA_TYPE,
+        )
+        manifests.append({**manifest, "platform": {"os": "linux", "architecture": architecture}})
+    root = (
+        add(
+            {
+                "schemaVersion": 2,
+                "mediaType": OCI_IMAGE_INDEX_MEDIA_TYPE,
+                "manifests": manifests,
+            },
+            OCI_IMAGE_INDEX_MEDIA_TYPE,
+        )
+        if indexed
+        else manifests[0]
+    )
+    members["index.json"] = json.dumps({"schemaVersion": 2, "manifests": [root]}).encode()
+    stream = io.BytesIO()
+    with tarfile.open(fileobj=stream, mode="w") as archive:
+        for name, payload in members.items():
+            member = tarfile.TarInfo(name)
+            member.size = len(payload)
+            archive.addfile(member, io.BytesIO(payload))
+    return stream.getvalue(), root, manifests
+
+
+@pytest.mark.parametrize("anonymous", [False, True])
+@pytest.mark.parametrize("architecture", ["amd64", "arm64"])
+@pytest.mark.parametrize("pin", ["tag", "index", "child"])
+def test_selected_platform_is_verified_and_retained(tmp_path, monkeypatch, anonymous, architecture, pin):
+    payload, root, manifests = _platform_archive(
+        architectures=(architecture,) if pin == "child" else ("amd64", "arm64"),
+        indexed=pin != "child",
+    )
+    selected = next(item for item in manifests if item["platform"]["architecture"] == architecture)
+    executable = tmp_path / "skopeo"
+    executable.write_bytes(b"tool")
+    output_dir = tmp_path / "output"
+    output_dir.mkdir(mode=0o700)
+    seen = []
+
+    def copy(argv, archive, _staging, **kwargs):
+        seen.append(argv)
+        assert kwargs["timeout_seconds"] == 15
+        assert kwargs["maximum_bytes"] == 1024 * 1024
+        archive.write_bytes(payload)
+
+    monkeypatch.setattr(registry_intake, "_run_bounded_copy", copy)
+    suffix = ":stable" if pin == "tag" else "@" + root["digest"]
+    pull = registry_intake.pull_anonymous_oci_archive if anonymous else registry_intake.pull_registry_oci_archive
+    output = output_dir / "image.oci.tar"
+    roots = state.init_resolved_roots(StatePaths(tmp_path / "config", tmp_path / "state"))
+    docker_cfg = tmp_path / "docker"
+    docker_cfg.mkdir()
+    (docker_cfg / "config.json").write_text("{}", encoding="utf-8")
+    pull_kw = {"docker_config_dir": docker_cfg} if not anonymous else {}
+    receipt = pull(
+        "registry.example.com/team/app" + suffix,
+        output,
+        roots,
+        platform="linux/" + architecture,
+        skopeo=executable,
+        timeout_seconds=15,
+        maximum_bytes=1024 * 1024,
+        **pull_kw,
+    )
+    assert seen[0][seen[0].index("--override-arch") + 1] == architecture
+    assert "--multi-arch=all" in seen[0]
+    assert "--preserve-digests" in seen[0]
+    assert receipt.platform == receipt.to_dict()["platform"] == "linux/" + architecture
+    assert receipt.root_digest == root["digest"]
+    assert receipt.manifest_digest == selected["digest"]
+    assert receipt.source_cas_id.startswith("source-cas-v1:")
+    assert receipt.source_binding_digest.startswith("sha256:")
+    assert output.read_bytes() == payload
+    with pytest.raises(RegistryIntakeError, match="already exists"):
+        pull("registry.example.com/team/app" + suffix, output, roots, platform=receipt.platform, skopeo=executable)
+
+
+@pytest.mark.parametrize("platform", ["linux/386", "windows/amd64", "linux/arm64/v9", "arm64", ""])
+def test_unsupported_acquisition_platform_rejects_before_copy(tmp_path, monkeypatch, platform):
+    monkeypatch.setattr(registry_intake.shutil, "which", lambda _: pytest.fail("must reject before lookup"))
+    with pytest.raises(RegistryIntakeError, match="supports only"):
+        registry_intake.pull_registry_oci_archive(
+            "registry.example.com/team/app:stable",
+            tmp_path / "image.tar",
+            StatePaths(tmp_path / "config", tmp_path / "state"),
+            platform=platform,
+        )
+
+
+@pytest.mark.parametrize("failure", ["mismatch", "ambiguous", "diffid", "pin"])
+def test_failed_selected_platform_verification_never_publishes(tmp_path, monkeypatch, failure):
+    payload, _root, _manifests = _platform_archive(
+        architectures=("amd64",)
+        if failure == "mismatch"
+        else (("arm64", "arm64") if failure == "ambiguous" else ("arm64",)),
+        bad_diff_id=failure == "diffid",
+    )
+    executable = tmp_path / "skopeo"
+    executable.write_bytes(b"tool")
+    parent = tmp_path / "output"
+    parent.mkdir(mode=0o700)
+    monkeypatch.setattr(
+        registry_intake, "_run_bounded_copy", lambda _argv, archive, _staging, **_kw: archive.write_bytes(payload)
+    )
+    docker_cfg = tmp_path / "docker"
+    docker_cfg.mkdir()
+    (docker_cfg / "config.json").write_text("{}", encoding="utf-8")
+    suffix = "@sha256:" + "0" * 64 if failure == "pin" else ":stable"
+    with pytest.raises(
+        ArtifactValidationError,
+        match={
+            "mismatch": "no exact linux/arm64",
+            "ambiguous": "ambiguous",
+            "diffid": "DiffID mismatch",
+            "pin": "requested reference digest",
+        }[failure],
+    ):
+        registry_intake.pull_registry_oci_archive(
+            "registry.example.com/team/app" + suffix,
+            parent / "image.tar",
+            state.init_resolved_roots(StatePaths(tmp_path / "config", tmp_path / "state")),
+            platform="linux/arm64",
+            skopeo=executable,
+            docker_config_dir=docker_cfg,
+        )
+    assert list(parent.iterdir()) == []
+
+
+def test_docker_export_rejects_config_disagreeing_with_requested_platform(tmp_path, monkeypatch):
+    payload, _root, _manifests = _platform_archive(architectures=("arm64",), config_architecture="amd64")
+    executable = tmp_path / "skopeo"
+    executable.write_bytes(b"tool")
+    parent = tmp_path / "output"
+    parent.mkdir(mode=0o700)
+    roots = state.init_resolved_roots(StatePaths(tmp_path / "config", tmp_path / "state"))
+    monkeypatch.setattr(
+        registry_intake,
+        "run_docker_command",
+        lambda argv, **_kw: SimpleNamespace(returncode=0, stdout="[]", stderr=""),
+    )
+
+    def copy(argv, archive, _staging, **_kwargs):
+        archive.write_bytes(b"docker save bytes" if "save" in argv else payload)
+
+    monkeypatch.setattr(registry_intake, "_run_bounded_copy", copy)
+    with pytest.raises(ArtifactValidationError, match="image config must target exactly linux/arm64"):
+        registry_intake.export_docker_image_to_oci_archive(
+            "service:stable", parent / "image.tar", roots, platform="linux/arm64", skopeo=executable
+        )
+    assert list(parent.iterdir()) == []

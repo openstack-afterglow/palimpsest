@@ -16,8 +16,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from .errors import PalimpsestError
-from .oci_image import OCIImageRef
+from .errors import ArtifactValidationError, PalimpsestError
+from .oci_image import ACQUISITION_PLATFORMS, OCIImageRef, validate_acquisition_platform
 from .oci_source import LocalArchiveSource, SourceCAS
 from .registry import (
     RegistryProfile,
@@ -39,6 +39,13 @@ SUPPORTED_PLATFORM = "linux/amd64"
 DEFAULT_TIMEOUT_SECONDS = 300.0
 MAX_ARCHIVE_BYTES = 8 * 1024 * 1024 * 1024
 _POLL_SECONDS = 0.05
+
+
+def _selected_architecture(platform: str) -> str:
+    try:
+        return validate_acquisition_platform(platform)
+    except ArtifactValidationError as exc:
+        raise RegistryIntakeError(str(exc)) from None
 
 
 class RegistryIntakeError(PalimpsestError):
@@ -107,15 +114,22 @@ def resolve_anonymous_reference(reference: str):
         raise RegistryIntakeError(str(exc)) from None
 
 
-def skopeo_copy_argv(executable: Path, reference: str, destination: Path) -> tuple[str, ...]:
+def skopeo_copy_argv(
+    executable: Path,
+    reference: str,
+    destination: Path,
+    *,
+    platform: str = SUPPORTED_PLATFORM,
+) -> tuple[str, ...]:
+    architecture = _selected_architecture(platform)
     return (
         os.fspath(executable),
         "--override-os",
         "linux",
         "--override-arch",
-        "amd64",
+        architecture,
         "copy",
-        "--multi-arch=all" if "@" in reference else "--multi-arch=system",
+        "--multi-arch=all",
         "--preserve-digests",
         "--src-no-creds",
         "--src-tls-verify=true",
@@ -132,15 +146,19 @@ def skopeo_pull_argv(
     profile: RegistryProfile | None = None,
     docker_config_dir: Path | None = None,
     certificate_dir: Path | None = None,
+    platform: str = SUPPORTED_PLATFORM,
 ) -> tuple[str, ...]:
+    architecture = _selected_architecture(platform)
     argv: list[str] = [
         os.fspath(executable),
         "--override-os",
         "linux",
         "--override-arch",
-        "amd64",
+        architecture,
         "copy",
-        "--multi-arch=all" if "@" in reference else "--multi-arch=system",
+        # Retain the index even for tags: system-copy would hide ambiguous
+        # platform entries before our descriptor/config verifier sees them.
+        "--multi-arch=all",
         "--preserve-digests",
     ]
     if profile is not None and (profile.tls_skip_verify or profile.plain_http):
@@ -174,13 +192,15 @@ def skopeo_docker_archive_copy_argv(
     executable: Path,
     docker_archive: Path,
     destination: Path,
+    *,
+    platform: str = SUPPORTED_PLATFORM,
 ) -> tuple[str, ...]:
     return (
         os.fspath(executable),
         "--override-os",
         "linux",
         "--override-arch",
-        "amd64",
+        _selected_architecture(platform),
         "copy",
         "--multi-arch=system",
         "--preserve-digests",
@@ -385,8 +405,11 @@ def _stage_and_publish_oci_archive(
     build_staging: Callable[[Path, Path], None],
     *,
     platform: str = SUPPORTED_PLATFORM,
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    maximum_bytes: int = MAX_ARCHIVE_BYTES,
 ) -> RegistryPullReceipt:
     target, parent_before = _safe_output_parent(output)
+    deadline = time.monotonic() + timeout_seconds
     parent_fd = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
     staging: Path | None = None
     try:
@@ -402,7 +425,16 @@ def _stage_and_publish_oci_archive(
         build_staging(staging, archive)
         os.chmod(archive, 0o600, follow_symlinks=False)
         source_cas = SourceCAS(roots.oci_source_cas)
-        snapshot = LocalArchiveSource(archive).snapshot(image_ref, source_cas)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RegistryIntakeError("registry pull timed out before archive verification")
+        snapshot = LocalArchiveSource(archive).snapshot_acquisition(
+            image_ref,
+            source_cas,
+            platform=platform,
+            timeout_seconds=remaining,
+            maximum_bytes=maximum_bytes,
+        )
         parent_after = target.parent.stat(follow_symlinks=False)
         if (parent_after.st_dev, parent_after.st_ino) != (parent_before.st_dev, parent_before.st_ino):
             raise RegistryIntakeError("OCI archive output parent changed during registry pull")
@@ -421,7 +453,7 @@ def _stage_and_publish_oci_archive(
         return RegistryPullReceipt(
             reference=image_ref.requested_reference,
             output=target,
-            platform=platform,
+            platform=f"{snapshot.image.platform.os}/{snapshot.image.platform.architecture}",
             root_digest=snapshot.root.descriptor.digest,
             manifest_digest=snapshot.manifest.descriptor.digest,
             source_cas_id=snapshot.cas_id,
@@ -450,8 +482,7 @@ def pull_anonymous_oci_archive(
     skopeo: Path | None = None,
 ) -> RegistryPullReceipt:
     """Acquire anonymously, verify through SourceCAS, then publish without overwrite."""
-    if platform != SUPPORTED_PLATFORM:
-        raise RegistryIntakeError(f"registry pull supports only {SUPPORTED_PLATFORM}")
+    _selected_architecture(platform)
     resolved = resolve_anonymous_reference(reference)
     executable_text = shutil.which("skopeo") if skopeo is None else os.fspath(skopeo)
     if executable_text is None:
@@ -466,14 +497,22 @@ def pull_anonymous_oci_archive(
 
     def _build(staging: Path, archive: Path) -> None:
         _run_bounded_copy(
-            skopeo_copy_argv(executable, resolved.canonical, archive),
+            skopeo_copy_argv(executable, resolved.canonical, archive, platform=platform),
             archive,
             staging,
             timeout_seconds=timeout_seconds,
             maximum_bytes=maximum_bytes,
         )
 
-    return _stage_and_publish_oci_archive(output, roots, image_ref, _build, platform=platform)
+    return _stage_and_publish_oci_archive(
+        output,
+        roots,
+        image_ref,
+        _build,
+        platform=platform,
+        timeout_seconds=timeout_seconds,
+        maximum_bytes=maximum_bytes,
+    )
 
 
 def _stage_docker_auth(config_dir: Path, endpoint: str, staging: Path, *, timeout_seconds: float) -> Path | None:
@@ -665,8 +704,7 @@ def pull_registry_oci_archive(
     skopeo: Path | None = None,
 ) -> RegistryPullReceipt:
     """Acquire an OCI image from a registry using configured profile and credentials."""
-    if platform != SUPPORTED_PLATFORM:
-        raise RegistryIntakeError(f"registry pull supports only {SUPPORTED_PLATFORM}")
+    _selected_architecture(platform)
     config_dir = docker_config_dir or resolve_docker_config_dir()
     executable_text = shutil.which("skopeo") if skopeo is None else os.fspath(skopeo)
     if executable_text is None:
@@ -699,6 +737,7 @@ def pull_registry_oci_archive(
             profile=selected_profile,
             docker_config_dir=auth_config,
             certificate_dir=certificates,
+            platform=platform,
         )
         _run_bounded_copy(
             argv,
@@ -708,7 +747,15 @@ def pull_registry_oci_archive(
             maximum_bytes=maximum_bytes,
         )
 
-    return _stage_and_publish_oci_archive(output, roots, image_ref, _build, platform=platform)
+    return _stage_and_publish_oci_archive(
+        output,
+        roots,
+        image_ref,
+        _build,
+        platform=platform,
+        timeout_seconds=timeout_seconds,
+        maximum_bytes=maximum_bytes,
+    )
 
 
 def export_docker_image_to_oci_archive(
@@ -722,9 +769,8 @@ def export_docker_image_to_oci_archive(
     maximum_bytes: int = MAX_ARCHIVE_BYTES,
     skopeo: Path | None = None,
 ) -> RegistryPullReceipt:
-    """Export a local Docker daemon image into a verified OCI archive."""
-    if platform != SUPPORTED_PLATFORM:
-        raise RegistryIntakeError(f"Docker image export supports only {SUPPORTED_PLATFORM}")
+    """Export and verify the Docker image config against the requested platform."""
+    _selected_architecture(platform)
     config_dir = docker_config_dir or resolve_docker_config_dir()
     executable_text = shutil.which("skopeo") if skopeo is None else os.fspath(skopeo)
     if executable_text is None:
@@ -765,7 +811,7 @@ def export_docker_image_to_oci_archive(
         )
         if not docker_tar.is_file():
             raise RegistryIntakeError("docker save did not produce an archive file")
-        convert_argv = skopeo_docker_archive_copy_argv(executable, docker_tar, archive)
+        convert_argv = skopeo_docker_archive_copy_argv(executable, docker_tar, archive, platform=platform)
         _run_bounded_copy(
             convert_argv,
             archive,
@@ -774,10 +820,19 @@ def export_docker_image_to_oci_archive(
             maximum_bytes=maximum_bytes,
         )
 
-    return _stage_and_publish_oci_archive(output, roots, image_ref, _build, platform=platform)
+    return _stage_and_publish_oci_archive(
+        output,
+        roots,
+        image_ref,
+        _build,
+        platform=platform,
+        timeout_seconds=timeout_seconds,
+        maximum_bytes=maximum_bytes,
+    )
 
 
 __all__ = [
+    "ACQUISITION_PLATFORMS",
     "DEFAULT_TIMEOUT_SECONDS",
     "MAX_ARCHIVE_BYTES",
     "RegistryAuthenticationError",

@@ -58,7 +58,8 @@ The table below describes the native `/v1` endpoint surface supported by the sta
 |---|---|---|
 | `GET` | `/` | Root version discovery (OpenStack style) |
 | `GET` | `/v1/` | Version discovery document |
-| `GET` | `/v1/health` | Health check endpoint |
+| `GET` | `/v1/health` | Cheap process liveness (legacy `/health` alias retained) |
+| `GET` | `/v1/ready` | Bounded SQL, Redis and local blob-store access checks |
 | `GET` | `/v1/images` | Query boot images (`ubuntu_base`, `arch`, `os_variant`, `disk_format`, `limit`) |
 | `GET` | `/v1/layers` | Query layers (`name`, `kind`, `chain_id`, `parent_digest`, `limit`) |
 | `GET` | `/v1/layers/{digest}` | Retrieve layer metadata record |
@@ -71,6 +72,59 @@ The table below describes the native `/v1` endpoint surface supported by the sta
 | `DELETE` | `/v1/uploads/{session_id}` | Cancel active upload session |
 | `POST` | `/v1/bundles` | Generate bundle tarball for stack (`refs`, `include_base_image`) |
 | `POST` | `/v1/bundles/import` | Import OCI image-layout bundle with content-addressed digest re-verification |
+
+### Liveness and readiness
+
+`GET /v1/health` and the legacy `GET /health` remain unauthenticated process
+liveness checks returning HTTP 200 with `{"status":"ok"}`. They do not acquire
+SQL sessions, contact Redis/Keystone, or touch the blob store.
+
+`GET /v1/ready` is also unauthenticated. It returns HTTP 200 only when all three
+dependency probes succeed, otherwise HTTP 503. Both responses use
+`Cache-Control: no-store` and the same shape:
+
+```json
+{"status":"ready","checks":{"database":"ok","redis":"ok","blob_store":"ok"}}
+```
+
+On failure `status` is `not_ready`; each check is `ok`, `error`, or `timeout`.
+Errors expose neither exception details nor credentials, URLs, SQL or paths.
+The probes use the API's existing dependencies:
+
+- **database:** acquire a session from the initialized API session factory,
+  execute `SELECT 1`, verify its result, and close the session. An uninitialized
+  factory fails; engine configuration alone is not success.
+- **redis:** issue `PING` through the API's Redis client, including when that
+  client was previously initialized. Redis is required here because export
+  download tickets depend on it, even though many other routes do not.
+- **blob_store:** resolve the configured store using the normal store factory;
+  open the existing root as a directory and check effective-user read/write/
+  search access. Check existing blob, upload, export and lock directories too.
+  Missing child directories are allowed because the store creates them lazily;
+  a missing root, non-directory path or denied access fails. The probe never
+  creates directories or files, repairs permissions, or changes blob data.
+
+All probes run concurrently under **one fixed two-second response wait budget**,
+not two seconds per dependency. This budget includes waiting for SQL checkout,
+driver cleanup and filesystem thread scheduling. A probe unfinished at the
+deadline reports `timeout`; the response does not wait for cancellation or a
+blocked filesystem syscall. At most one unfinished probe per dependency is
+retained in each API process and shared by overlapping/subsequent requests.
+Timed-out work continues until it finishes, preventing repeated checks from
+queuing unbounded threads/connections. Finished results are not cached: a later
+request starts a fresh probe. Client cancellation does not cancel shared probes;
+application shutdown cancels/drains their async tasks before closing clients.
+
+This is a point-in-time dependency-access signal, **not end-to-end readiness**.
+It does not validate database schema/migrations or transaction writes, disk space,
+actual file writes/fsync/durability, blob integrity, mount identity or cross-node
+coherence. Permission checks cannot guarantee a later write will succeed.
+It performs no Keystone authentication, token minting, Trust creation, Glance
+request, or worker/KVM/build test. Authentication/authorization and worker health
+remain separate operator checks. The deadline bounds the async response wait,
+not kernel I/O or driver lifetime, shutdown time, or event-loop starvation; a
+stuck probe remains a timeout on later requests until it finishes or the process
+is restarted.
 
 ---
 

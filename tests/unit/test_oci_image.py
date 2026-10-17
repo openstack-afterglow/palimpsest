@@ -13,7 +13,11 @@ from palimpsest_local.oci_image import (
     MAX_IMAGE_JSON_BYTES,
     MAX_IMAGE_LAYERS,
     RESERVED_PATH_POLICY_ID,
+    OCIArchiveImage,
+    OCIConfig,
+    OCIImage,
     OCIImageRef,
+    resolve_archive_image,
     resolve_image,
     verify_blob_chunks,
     verify_descriptor_bytes,
@@ -533,3 +537,80 @@ def test_index_and_selected_manifest_wire_profiles_cannot_be_mixed() -> None:
     mixed = add_index(graph, [(manifest, exact_platform())], docker=False)
     with pytest.raises(ArtifactValidationError, match="different wire profiles"):
         resolve_image(ref(), mixed, graph.read)
+
+
+@pytest.mark.parametrize("docker", [False, True])
+@pytest.mark.parametrize("architecture,variant", [("amd64", None), ("arm64", None), ("arm64", "v8")])
+def test_acquisition_resolves_selected_platform_without_native_capability(docker, architecture, variant):
+    graph, manifest, config, _layers = image_graph(docker=docker, architecture=architecture)
+    platform = {"os": "linux", "architecture": architecture}
+    if variant is not None:
+        platform["variant"] = variant
+    index = add_index(graph, [(manifest, platform)], docker=docker)
+    pinned = replace(ref(), requested_reference=ref().requested_reference.split(":")[0] + "@" + index.digest)
+    image = resolve_archive_image(pinned, index, graph.read, platform="linux/" + architecture)
+    assert isinstance(image, OCIArchiveImage)
+    assert not isinstance(image, OCIImage)
+    assert not isinstance(image.config, OCIConfig)
+    assert image.manifest_descriptor == manifest
+    assert image.config.descriptor == config
+    assert image.source.platform.architecture == architecture
+    assert image.to_dict()["platform"]["architecture"] == architecture
+    if architecture == "arm64":
+        with pytest.raises(ArtifactValidationError, match="no exact linux/amd64"):
+            resolve_image(pinned, index, graph.read)
+        with pytest.raises(ArtifactValidationError, match="exactly linux/amd64"):
+            resolve_image(ref(), manifest, graph.read)
+
+
+@pytest.mark.parametrize("architecture", ["amd64", "arm64"])
+def test_acquisition_rejects_index_config_architecture_mismatch(architecture):
+    graph, manifest, _, _ = image_graph(architecture="arm64" if architecture == "amd64" else "amd64")
+    index = add_index(graph, [(manifest, {"os": "linux", "architecture": architecture})])
+    with pytest.raises(ArtifactValidationError, match="image config must target exactly linux/" + architecture):
+        resolve_archive_image(ref(), index, graph.read, platform="linux/" + architecture)
+
+
+@pytest.mark.parametrize("extra", [{"variant": "v9"}, {"os.version": "6.8"}, {"os.features": ["x"]}])
+def test_acquisition_rejects_nonbaseline_arm64_index_entries(extra):
+    graph, manifest, _, _ = image_graph(architecture="arm64")
+    index = add_index(graph, [(manifest, {"os": "linux", "architecture": "arm64", **extra})])
+    with pytest.raises(ArtifactValidationError, match="no exact linux/arm64"):
+        resolve_archive_image(ref(), index, graph.read, platform="linux/arm64")
+
+
+def test_acquisition_counts_implicit_and_v8_arm64_as_ambiguous():
+    graph, manifest, _, _ = image_graph(architecture="arm64")
+    index = add_index(
+        graph,
+        [
+            (manifest, {"os": "linux", "architecture": "arm64"}),
+            (manifest, {"os": "linux", "architecture": "arm64", "variant": "v8"}),
+        ],
+    )
+    with pytest.raises(ArtifactValidationError, match="ambiguous linux/arm64"):
+        resolve_archive_image(ref(), index, graph.read, platform="linux/arm64")
+
+
+@pytest.mark.parametrize("failure", ["digest", "size"])
+def test_acquisition_still_verifies_selected_descriptor_bytes(failure):
+    graph, manifest, _config, _layers = image_graph(architecture="arm64")
+    if failure == "digest":
+        graph.blobs[manifest.digest] = graph.blobs[manifest.digest].replace(b"schemaVersion", b"schemaVersioN")
+    else:
+        manifest = replace(manifest, size=manifest.size + 1)
+    with pytest.raises(ArtifactValidationError, match=failure + " mismatch"):
+        resolve_archive_image(ref(), manifest, graph.read, platform="linux/arm64")
+
+
+@pytest.mark.parametrize("extra", [{"variant": "v9"}, {"os.version": "6.8"}, {"os.features": ["x"]}])
+def test_acquisition_checks_direct_manifest_config_platform_metadata(extra):
+    graph, manifest, config, _layers = image_graph(architecture="arm64")
+    config_document = json.loads(graph.blobs[config.digest])
+    config_document.update(extra)
+    replacement = graph.add(config_document, config.media_type)
+    manifest_document = json.loads(graph.blobs[manifest.digest])
+    manifest_document["config"] = replacement.to_dict()
+    manifest = graph.add(manifest_document, manifest.media_type)
+    with pytest.raises(ArtifactValidationError, match="image config must target exactly linux/arm64"):
+        resolve_archive_image(ref(), manifest, graph.read, platform="linux/arm64")

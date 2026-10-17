@@ -67,6 +67,8 @@ def _lifecycle_outcome(
         state.lifecycle_revision(payload),
         warning_category,
         fallback_used,
+        storage_policy=payload.get("storage_policy"),
+        retained_instance=payload.get("retained_instance"),
     )
 
 
@@ -1309,6 +1311,49 @@ def stop(
         )
 
 
+def _instance_removal_policy(domain: Any, definition: ET.Element, rpaths: RunPaths, *, purge: bool) -> int | None:
+    """Decide ownership/TPM policy before any stop; never unlink XML references."""
+    tpm = definition.findall("./devices/tpm/backend[@type='emulator']")
+    primary_checked = False
+    if purge:
+        if tpm:
+            raise StateError("instance TPM ownership is unknown; unsafe purge refused before stopping")
+        nvram = definition.findtext("./os/nvram")
+        if nvram and Path(nvram) != rpaths.root / "nvram.fd":
+            raise StateError("instance NVRAM ownership is unknown; unsafe purge refused before stopping")
+        for disk in definition.findall("./devices/disk"):
+            source = disk.find("source")
+            path = source.get("file") if source is not None else None
+            if disk.get("device", "disk") == "disk" and disk.find("readonly") is None and not primary_checked:
+                primary_checked = True
+                if not path or Path(path) != rpaths.overlay or Path(path).resolve() != Path(path):
+                    raise StateError("instance root ownership is unknown; unsafe purge refused before stopping")
+                root_info = Path(path).lstat()
+                if not stat_module.S_ISREG(root_info.st_mode) or root_info.st_nlink != 1:
+                    raise StateError(
+                        "instance root is not an exclusive owned file; unsafe purge refused before stopping"
+                    )
+            if path and Path(path).is_relative_to(rpaths.root) and Path(path) not in {rpaths.overlay, rpaths.seed}:
+                raise StateError("additional data disk is inside instance tree; unsafe purge refused before stopping")
+    binding = kvm._libvirt() if tpm or definition.find("./os/nvram") is not None else None
+    flags = 0
+    if definition.find("./os/nvram") is not None:
+        keep_nvram = getattr(binding, "VIR_DOMAIN_UNDEFINE_KEEP_NVRAM", None)
+        if type(keep_nvram) is not int or keep_nvram <= 0:
+            raise StateError("libvirt cannot explicitly retain NVRAM; VM was not stopped")
+        flags |= keep_nvram
+    if tpm:
+        if hasattr(domain, "isPersistent") and not domain.isPersistent():
+            if any(item.get("persistent_state") != "yes" for item in tpm):
+                raise StateError("cannot retain transient emulator TPM state; VM was not stopped")
+        else:
+            keep_tpm = getattr(binding, "VIR_DOMAIN_UNDEFINE_KEEP_TPM", None)
+            if type(keep_tpm) is not int or keep_tpm <= 0:
+                raise StateError("libvirt cannot explicitly retain TPM state; VM was not stopped")
+            flags |= keep_tpm
+    return flags or None
+
+
 def rm(
     name: str,
     *,
@@ -1320,6 +1365,8 @@ def rm(
     _expected_record: ExistingRunRecord | None = None,
     _expected_snapshot: state.RunLedgerSnapshot | None = None,
 ) -> dict[str, Any] | _LifecycleAdapterOutcome:
+    from .named_volumes import release_named_volume_reservations
+
     roots = roots or (state.resolve_roots() if _expected_record is not None else state.init_roots())
     with state.locked_existing_run(
         roots, name, expected=_expected_record, expected_snapshot=_expected_snapshot
@@ -1341,6 +1388,9 @@ def rm(
         resolved_uri = kvm_uri if kvm_uri is not None else resolved_profile.uri
         conn_obj = _get_conn(conn, resolved_uri)
 
+        from . import retained_instances
+
+        archive = curr_state.get("retained_instance")
         domain = None
         if conn_obj is not None:
             try:
@@ -1357,8 +1407,48 @@ def rm(
                     f"domain '{name}' is foreign (domain run_id {domain_run_id!r} != owner run_id {mutation.record.run_id!r})"
                 )
 
+            definition = ET.fromstring(domain.XMLDesc())
+            selected_uuid = domain.UUIDString()
+            if curr_state.get("domain_uuid") not in {None, selected_uuid}:
+                raise LifecycleError("domain UUID changed before removal")
+            if any(
+                "contract" in marker.attrib
+                for marker in definition.findall(f"./metadata/{{{kvm.DOMAIN_MARKER_NAMESPACE}}}run")
+            ):
+                raise StateError("OCI-root native definition cannot be removed by the cloud runtime")
+            if not volumes and hasattr(domain, "isPersistent") and not domain.isPersistent():
+                raise StateError("cannot snapshot a stopped transient managed root before native undefinition")
+            flags = _instance_removal_policy(domain, definition, mutation.paths, purge=volumes)
             mutation.verify_binding()
-            _destroy_and_undefine_domain(domain, profile=resolved_profile)
+            if domain.isActive():
+                domain.destroy()
+                if domain.isActive():
+                    raise LifecycleError("domain did not stop; refusing inconsistent root retention")
+            if not volumes:
+                sources = [path for path in (mutation.paths.overlay, mutation.paths.root / "nvram.fd") if path.exists()]
+                archive = retained_instances.retain_libvirt(
+                    roots,
+                    name=name,
+                    backend=mutation.record.dispatch_key.backend.value,
+                    identity=selected_uuid,
+                    definition=definition,
+                    ledger={**curr_state, "run_id": mutation.record.run_id},
+                    owned_sources=sources,
+                )
+                curr_state["retained_instance"] = archive
+                curr_state["storage_policy"] = "instance-root-and-topology-retained"
+            mutation.verify_binding()
+            if (
+                kvm.get_domain_run_id(domain) != mutation.record.run_id
+                or domain.UUIDString() != selected_uuid
+                or conn_obj.lookupByName(name).UUIDString() != selected_uuid
+            ):
+                raise LifecycleError("domain UUID or run marker changed before undefinition")
+            if not hasattr(domain, "isPersistent") or domain.isPersistent():
+                if flags is not None:
+                    domain.undefineFlags(flags)
+                else:
+                    domain.undefine()
             try:
                 remaining = conn_obj.lookupByName(name)
             except Exception as exc:
@@ -1367,14 +1457,44 @@ def rm(
                 remaining = None
             if remaining is not None:
                 raise LifecycleError(f"domain '{name}' was not removed")
+            if archive is not None and not volumes:
+                retained_instances.mark_native_removed(roots, archive)
 
+        if not volumes and archive is None and mutation.paths.overlay.exists():
+            definition = ET.Element("domain")
+            ET.SubElement(definition, "name").text = name
+            archive = retained_instances.retain_libvirt(
+                roots,
+                name=name,
+                backend=mutation.record.dispatch_key.backend.value,
+                identity=mutation.record.run_id,
+                definition=definition,
+                ledger={**curr_state, "run_id": mutation.record.run_id},
+                owned_sources=[mutation.paths.overlay],
+            )
+            retained_instances.mark_native_removed(roots, archive)
+            curr_state["retained_instance"] = archive
+            curr_state["storage_policy"] = "instance-root-and-topology-retained"
         if not volumes:
-            if original_status == "removed":
+            if original_status == "removed" and curr_state == mutation.mutable_state():
+                release_named_volume_reservations(roots, name=name, run_id=mutation.record.run_id)
                 return _lifecycle_outcome(mutation, curr_state, _expected_record)
             result = mutation.write_state("removed", {**curr_state, "updated_at": state.utc_now_iso()})
+            release_named_volume_reservations(roots, name=name, run_id=mutation.record.run_id)
             return _lifecycle_outcome(mutation, result, _expected_record)
         updated = mutation.write_state("removed", {**curr_state, "updated_at": state.utc_now_iso()})
-        outcome = _lifecycle_outcome(mutation, updated, _expected_record)
+        release_named_volume_reservations(roots, name=name, run_id=mutation.record.run_id)
+        outcome = _lifecycle_outcome(
+            mutation,
+            {
+                **updated,
+                "storage_policy": "instance-root-and-topology-purged",
+                "retained_instance": None,
+            },
+            _expected_record,
+        )
+        if archive:
+            retained_instances.delete_retained_instance_for_run(roots, archive, mutation=mutation, _connection=conn_obj)
         mutation.delete_run_tree()
         return outcome
 

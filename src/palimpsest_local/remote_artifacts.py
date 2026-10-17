@@ -24,12 +24,13 @@ import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from .digest import digest_file, digest_hex, require_digest
+from .docker_hub import DockerHubCatalog
 from .errors import PalimpsestError, StateError
-from .hub import DISK_FORMAT_MEDIA_TYPES, MEDIA_TYPE_LAYER_SQUASHFS, HubClient
+from .hub import DEFAULT_HUB_URL, DISK_FORMAT_MEDIA_TYPES, MEDIA_TYPE_LAYER_SQUASHFS, HubClient
 from .oci_layout import ContentStore
 from .package_credentials import get_package_key
 from .package_reference import read_package_reference, write_package_reference
@@ -106,7 +107,11 @@ def _read_json(response):
 
 
 def _safe_url(value: str) -> str:
-    parsed = urllib.parse.urlsplit(value)
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        _ = parsed.port
+    except ValueError:
+        raise StateError("invalid Hub URL") from None
     if (
         parsed.username is not None
         or parsed.password is not None
@@ -168,12 +173,46 @@ class _BoundedResponse:
         self.response.close()
 
 
+@dataclass(frozen=True, repr=False)
+class HubConnection:
+    """One tab's original Keystone authority, never persisted or shared globally."""
+
+    url: str
+    token: str
+    project_id: str | None = None
+
+    @classmethod
+    def from_headers(cls, headers) -> HubConnection | None:
+        url = headers.get("X-Palimpsest-Hub-Url")
+        token = headers.get("X-Palimpsest-Hub-Token")
+        project = headers.get("X-Palimpsest-Hub-Project")
+        if url is None and token is None and project is None:
+            return None
+        if not url or not token:
+            raise StateError("Hub URL and original Keystone token must be supplied together")
+        url = _safe_url(_text(url, "Hub URL", maximum=4096))
+        token = _text(token, "Hub token", maximum=8192)
+        if not token.isascii() or not token.strip():
+            raise StateError("invalid Hub token")
+        return cls(url, token, validate_keystone_id(project, "project ID") if project else None)
+
+    def environment(self) -> dict[str, str]:
+        return {
+            "PALIMPSEST_URL": self.url,
+            "PALIMPSEST_TOKEN": self.token,
+            "PALIMPSEST_PROJECT_ID": self.project_id or "",
+        }
+
+
 class _ConnectedHub(HubClient):
     """Reuse resumable blob protocol, but bound JSON and suppress remote error text."""
 
-    def __init__(self, url: str, token: str, project: str, ca: tuple[str, ...]):
+    def __init__(self, url: str, token: str, project: str | None, ca: tuple[str, ...]):
         super().__init__(
-            _safe_url(url), token, project_id=validate_keystone_id(project, "project ID"), timeout_seconds=60
+            _safe_url(url),
+            token,
+            project_id=validate_keystone_id(project, "project ID") if project else None,
+            timeout_seconds=60,
         )
         self._opener = _opener(ca)
 
@@ -207,16 +246,19 @@ class _ConnectedHub(HubClient):
         ) as response:
             return _read_json(response)
 
-    def identity(self, action: str) -> dict:
+    def identity(self, action: str | None = None) -> dict:
         actor = self._json_request("GET", "/me")
-        if (
-            not isinstance(actor, dict)
-            or validate_keystone_id(actor.get("project_id"), "project ID") != self._project_id
-        ):
-            raise StateError("Hub identity does not match explicit PALIMPSEST_PROJECT_ID")
+        if not isinstance(actor, dict):
+            raise StateError("invalid Hub identity response")
+        project = validate_keystone_id(actor.get("project_id"), "project ID")
+        if self._project_id is not None and project != self._project_id:
+            raise StateError("Hub identity does not match the requested project assertion")
         validate_keystone_id(actor.get("user_id"), "user ID")
-        if not isinstance(actor.get("capabilities"), dict) or actor["capabilities"].get(action) is not True:
+        if not isinstance(actor.get("capabilities"), dict):
+            raise StateError("invalid Hub identity capabilities")
+        if action is not None and actor["capabilities"].get(action) is not True:
             raise StateError("Hub identity does not authorize the requested artifact action")
+        self._project_id = project
         return actor
 
 
@@ -238,13 +280,22 @@ def _linux_amd64(platforms: list[dict] | None) -> bool:
     )
 
 
+def _acquisition_supported(platforms: list[dict] | None) -> bool:
+    return bool(platforms) and any(
+        isinstance(item, dict)
+        and item.get("os") == "linux"
+        and item.get("architecture") in {"amd64", "x86_64", "arm64", "aarch64"}
+        for item in platforms
+    )
+
+
 def _run_info(kind: str, architectures: list[str], platforms: list[dict] | None = None) -> dict:
     host_arch = {"arm64": "aarch64", "amd64": "x86_64"}.get(platform.machine().lower(), platform.machine().lower())
     host_system = platform.system()
     archs = [{"amd64": "x86_64", "arm64": "aarch64"}.get(a, a) for a in architectures]
     if kind == "oci-image":
         supported = host_system == "Linux" and host_arch == "x86_64" and _linux_amd64(platforms)
-        limitation = "Linux amd64 OCI container root requires the OCI-root runtime, not a conventional VM disk; Darwin arm64 native OCI-root is unsupported. Runtime preflight still applies."
+        limitation = "Native OCI-root requires Linux amd64 KVM. On Darwin arm64 or foreign architectures, explicit force-architecture execution is required."
         runtime = "oci-root"
     else:
         supported = (
@@ -326,9 +377,24 @@ def _merge_local_metadata(store: ContentStore, metadata: dict) -> dict:
     return {**metadata, **existing}
 
 
+def _catalog_descriptor(raw: dict, expected: str | None = None) -> dict:
+    metadata = _descriptor(raw, expected)
+    size = raw.get("size_bytes")
+    if size is not None:
+        if type(size) is not int or size < 0:
+            raise StateError("invalid Hub artifact size")
+        metadata["size_bytes"] = size
+    if isinstance(raw.get("created_at"), str):
+        metadata["created_at"] = _text(raw["created_at"], "creation time", maximum=128)
+    if type(raw.get("is_published")) is bool:
+        metadata["is_published"] = raw["is_published"]
+    return metadata
+
+
 class RemoteArtifacts:
-    def __init__(self, roots: StatePaths):
+    def __init__(self, roots: StatePaths, *, hub_connection: HubConnection | None = None):
         self.roots = roots
+        self.hub_connection = hub_connection
 
     def _legacy_config(self) -> tuple[str | None, tuple[str, ...]]:
         path = self.roots.config / "config.toml"
@@ -345,7 +411,11 @@ class RemoteArtifacts:
         hub = config.get("hub", {})
         if not isinstance(hub, dict):
             raise StateError("invalid Hub configuration")
-        url = os.environ.get("PALIMPSEST_URL") or config.get("url") or hub.get("url")
+        url = (
+            self.hub_connection.url
+            if self.hub_connection is not None
+            else (os.environ.get("PALIMPSEST_URL") or config.get("url") or hub.get("url") or DEFAULT_HUB_URL)
+        )
         ca = hub.get("ca", [])
         if (
             not isinstance(ca, list)
@@ -359,11 +429,32 @@ class RemoteArtifacts:
         url, ca = self._legacy_config()
         if not url:
             raise StateError("legacy Hub connection is not configured")
-        token = os.environ.get("PALIMPSEST_TOKEN")
-        project = os.environ.get("PALIMPSEST_PROJECT_ID")
-        if not token or not project:
-            raise StateError("legacy Hub requires PALIMPSEST_TOKEN and explicit PALIMPSEST_PROJECT_ID")
+        token = self.hub_connection.token if self.hub_connection is not None else os.environ.get("PALIMPSEST_TOKEN")
+        project = (
+            self.hub_connection.project_id
+            if self.hub_connection is not None
+            else os.environ.get("PALIMPSEST_PROJECT_ID")
+        )
+        if not token:
+            raise StateError("Hub requires an original project-scoped Keystone token")
         return _ConnectedHub(url, token, project, ca)
+
+    def hub_identity(self) -> dict:
+        hub = self._hub()
+        hub._timeout_seconds = 10
+        hub._browse_deadline = time.monotonic() + 15
+        actor = hub.identity()
+        return {
+            "connection_id": "legacy",
+            "endpoint": hub._base_url,
+            "project_id": actor["project_id"],
+            "user_id": actor["user_id"],
+            "capabilities": {
+                key: actor["capabilities"].get(key) is True
+                for key in ("inventory", "download", "upload", "build", "delete")
+            },
+            "credential_source": "tab-memory" if self.hub_connection is not None else "process-environment",
+        }
 
     def _profile(self, connection_id: str) -> RegistryProfile:
         _text(connection_id, "connection")
@@ -394,29 +485,37 @@ class RemoteArtifacts:
         return resolved
 
     def connections(self) -> list[dict]:
-        items = []
         url, _ = self._legacy_config()
-        if url:
-            items.append(
-                {
-                    "id": "legacy",
-                    "label": "Configured Hub",
-                    "protocol": "legacy",
-                    "endpoint": url,
-                    "api_base": url,
-                    "namespace": os.environ.get("PALIMPSEST_PROJECT_ID"),
-                    "search_mode": "inventory",
-                    "credential_available": bool(os.environ.get("PALIMPSEST_TOKEN")),
-                    "capabilities": {"inventory": True, "download": True, "upload": True},
-                    "project_configured": bool(os.environ.get("PALIMPSEST_PROJECT_ID")),
-                    "kinds": ["cloud-image", "squashfs"],
-                }
-            )
+        project = (
+            self.hub_connection.project_id
+            if self.hub_connection is not None
+            else os.environ.get("PALIMPSEST_PROJECT_ID")
+        )
+        token_available = self.hub_connection is not None or bool(os.environ.get("PALIMPSEST_TOKEN"))
+        items = [
+            {
+                "id": "legacy",
+                "label": "Palimpsest Hub",
+                "protocol": "legacy",
+                "endpoint": url or "",
+                "api_base": url or "",
+                "namespace": project,
+                "configured": bool(url),
+                "search_mode": "inventory",
+                "credential_available": token_available,
+                "credential_source": "tab-memory" if self.hub_connection is not None else "process-environment",
+                "capabilities": {"inventory": True, "download": True, "upload": True},
+                "project_configured": bool(project),
+                "kinds": ["cloud-image", "squashfs"],
+            }
+        ]
         for alias, profile in sorted(load_registry_config(self.roots).registries.items()):
             items.append(
                 {
                     "id": "registry:" + alias,
-                    "label": alias,
+                    "label": "Docker Hub"
+                    if profile.protocol == "oci" and profile.endpoint in _HUB_ENDPOINTS
+                    else alias,
                     "protocol": profile.protocol,
                     "endpoint": profile.endpoint,
                     "api_base": profile.api_base,
@@ -434,6 +533,9 @@ class RemoteArtifacts:
                     "kinds": ["oci-image", "runtime-bundle"] if profile.protocol == "palimpsest" else ["oci-image"],
                 }
             )
+        for item in items:
+            if item.get("download_supported") is None:
+                item["download_supported"] = True
         return items
 
     def browse(
@@ -445,6 +547,9 @@ class RemoteArtifacts:
         repository: str = "",
         limit: int = 30,
         cursor: str | None = None,
+        arch: str = "",
+        disk_format: str = "",
+        parent: str = "",
     ) -> dict:
         if kind not in _KINDS:
             raise StateError("unsupported remote artifact kind")
@@ -453,6 +558,12 @@ class RemoteArtifacts:
             _text(repository, "repository", empty=True),
             _limit(limit),
         )
+        if arch not in {"", "x86_64", "aarch64"} or disk_format not in {"", "qcow2", "raw"}:
+            raise StateError("invalid Hub architecture or disk format filter")
+        if parent:
+            parent = require_digest(parent)
+        if connection_id != "legacy" and (arch or disk_format or parent):
+            raise StateError("cloud-image filters require the Palimpsest Hub connection")
         deadline = time.monotonic() + 40
         if connection_id == "legacy":
             hub = self._hub()
@@ -464,13 +575,19 @@ class RemoteArtifacts:
             filters = {"digest_prefix": query} if digest_query else {"name": query or None}
             if query.startswith("sha256:") and not digest_query:
                 raise StateError("digest search requires 4–64 hexadecimal characters")
+            if arch:
+                filters["arch"] = arch
+            if disk_format:
+                filters["disk_format"] = disk_format
+            if parent:
+                filters["parent_digest"] = parent
             rows = hub.list_layers(**filters, kind=None if kind == "all" else kind, limit=limit + 1, offset=offset)
             if not isinstance(rows, list) or len(rows) > limit + 1:
                 raise StateError("invalid or over-limit Hub inventory")
             items = []
             for row in rows[:limit]:
                 if isinstance(row, dict) and row.get("kind") in {"cloud-image", "squashfs"}:
-                    metadata = _descriptor(row)
+                    metadata = _catalog_descriptor(row)
                     archs = [metadata["arch"]] if metadata.get("arch") else []
                     items.append(
                         {
@@ -479,6 +596,10 @@ class RemoteArtifacts:
                             "kind": metadata["kind"],
                             "architectures": archs,
                             "download_supported": True,
+                            "details_supported": True,
+                            "digest": metadata["digest"],
+                            "size_bytes": metadata.get("size_bytes"),
+                            "disk_format": metadata.get("disk_format"),
                             "base_digest": metadata.get("base_image_digest"),
                             "parent_digest": metadata.get("parent_digest"),
                             **_run_info(metadata["kind"], archs),
@@ -571,52 +692,28 @@ class RemoteArtifacts:
             }
         if not repository and (_has_explicit_registry(query) or "@sha256:" in query or ":" in query.rsplit("/", 1)[-1]):
             repository, query = query, ""
-        if not repository:
-            if profile.endpoint not in _HUB_ENDPOINTS:
-                return {
-                    "connection_id": connection_id,
-                    "search_mode": "exact-reference/tags",
-                    "items": [],
-                    "next_cursor": None,
-                    "message": "This OCI registry has no configured repository search API. Enter an exact repository or reference to inspect tags/manifests.",
-                }
-            page = _page_cursor(cursor) + 1
-            url = "https://hub.docker.com/v2/search/repositories/?" + urllib.parse.urlencode(
-                {"query": query, "page_size": limit, "page": page}
-            )
-            try:
-                with _opener().open(
-                    urllib.request.Request(url, headers={"Accept": "application/json"}), timeout=15
-                ) as response:
-                    if response.geturl() != url:
-                        raise StateError("Docker Hub search redirected")
-                    data = _read_json(_BoundedResponse(response, deadline=deadline))
-            except (urllib.error.URLError, OSError):
-                raise StateError("Docker Hub public repository search failed") from None
-            if not isinstance(data, dict) or not isinstance(data.get("results"), list) or len(data["results"]) > limit:
-                raise StateError("invalid Docker Hub repository search response")
-            items = []
-            for row in data["results"]:
-                if not isinstance(row, dict):
-                    raise StateError("invalid Docker Hub repository result")
-                name = _text(row.get("repo_name"), "Hub repository")
-                resolved = self._reference(profile, profile.endpoint + "/" + name + ":latest")
-                items.append(
-                    {
-                        "repository": resolved.repository,
-                        "name": resolved.repository,
-                        "reference": None,
-                        "kind": "oci-image",
-                        "architectures": [],
-                        "download_supported": False,
-                        **_run_info("oci-image", []),
-                    }
-                )
+        if profile.endpoint in _HUB_ENDPOINTS:
+            catalog = DockerHubCatalog(profile)
+            if not repository:
+                return catalog.search(query, limit=limit, cursor=cursor)
+            resolved = self._reference(profile, repository)
+            explicit = "@" in repository or ":" in repository.rsplit("/", 1)[-1]
+            if not explicit:
+                return catalog.tags(resolved.repository, query=query, limit=limit, cursor=cursor)
+            detail = catalog.inspect(resolved.canonical)
             return {
                 "connection_id": connection_id,
-                "search_mode": "public-repository-search",
-                "items": items,
-                "next_cursor": str(page) if data.get("next") else None,
+                "search_mode": "exact-reference/tags",
+                "items": [{**detail, "details_supported": True}],
+                "next_cursor": None,
+            }
+        if not repository:
+            return {
+                "connection_id": connection_id,
+                "search_mode": "exact-reference/tags",
+                "items": [],
+                "next_cursor": None,
+                "message": "This OCI registry has no configured repository search API. Enter an exact repository or reference to inspect tags/manifests.",
             }
         resolved = self._reference(profile, repository)
         explicit = "@" in repository or ":" in repository.rsplit("/", 1)[-1]
@@ -679,8 +776,8 @@ class RemoteArtifacts:
                     "digest": digest,
                     "architectures": archs,
                     "platforms": platforms,
-                    "download_supported": _linux_amd64(platforms),
-                    "download_limitation": "OCI registry acquisition currently supports only linux/amd64; native package transfer preserves all supported package platforms.",
+                    "download_supported": _acquisition_supported(platforms),
+                    "download_limitation": "OCI registry acquisition supports linux/amd64 and linux/arm64 container roots.",
                     **_run_info("oci-image", archs, platforms),
                 }
             )
@@ -689,6 +786,59 @@ class RemoteArtifacts:
             "search_mode": "exact-reference/tags",
             "items": items,
             "next_cursor": None,
+        }
+
+    def inspect(self, connection_id: str, reference: str, *, manifest: str | None = None) -> dict:
+        """Read selected remote metadata; never download layers or execute an image."""
+        _text(reference, "reference")
+        if connection_id != "legacy":
+            profile = self._profile(connection_id)
+            if profile.protocol != "oci" or profile.endpoint not in _HUB_ENDPOINTS:
+                raise StateError("artifact inspection supports Palimpsest Hub and Docker Hub")
+            resolved = self._reference(profile, reference)
+            return DockerHubCatalog(profile).inspect(resolved.canonical, manifest=manifest)
+        if manifest is not None:
+            raise StateError("platform manifest selection requires a Docker Hub image")
+        digest = require_digest(reference)
+        hub = self._hub()
+        hub._timeout_seconds = 10
+        hub._browse_deadline = time.monotonic() + 40
+        actor = hub.identity("inventory")
+        observed = {}
+
+        def metadata(selected: str) -> dict:
+            if selected not in observed:
+                observed[selected] = hub.get_layer(selected)
+            return observed[selected]
+
+        chain = self._legacy_chain(digest, metadata, require_base=False)
+        chain = [_catalog_descriptor(observed[item["digest"]], item["digest"]) for item in chain]
+        leaf = chain[-1]
+        has_base = chain[0]["kind"] == "cloud-image"
+        archs = _architectures([item["arch"] for item in chain if item.get("arch")])
+        compatibility = _run_info(leaf["kind"], archs)
+        if not has_base:
+            compatibility.update(
+                run_supported=False,
+                run_limitation="Layer-only chain has no bootable cloud-image base; download is available without VM execution.",
+            )
+        return {
+            **leaf,
+            **compatibility,
+            "connection_id": connection_id,
+            "reference": digest,
+            "immutable_reference": digest,
+            "architectures": archs,
+            "platforms": [],
+            "chain": chain,
+            "chain_complete": True,
+            "base_digest": leaf.get("base_image_digest"),
+            "parent_digest": leaf.get("parent_digest"),
+            "layers": [
+                {**item, "ordinal": index}
+                for index, item in enumerate(item for item in chain if item["kind"] == "squashfs")
+            ],
+            "download_supported": actor["capabilities"].get("download") is True,
         }
 
     def _legacy_chain(self, leaf: str, get_metadata, *, require_base: bool = True) -> list[dict]:
@@ -792,7 +942,7 @@ class RemoteArtifacts:
             **_run_info("runtime-bundle", archs),
         }
 
-    def download(self, connection_id: str, reference: str) -> dict:
+    def download(self, connection_id: str, reference: str, *, platform: str = "linux/amd64") -> dict:
         _text(reference, "reference")
         if connection_id == "legacy":
             hub = self._hub()
@@ -891,9 +1041,16 @@ class RemoteArtifacts:
                 )
                 destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
                 # Acquisition deliberately refuses overwrite; retain uniquely and record the verified reference.
+                norm_platform = "linux/arm64" if platform in {"linux/arm64", "arm64", "aarch64"} else "linux/amd64"
                 with tempfile.TemporaryDirectory(prefix=".transfer-", dir=destination.parent) as temporary:
                     output = Path(temporary) / "image.oci.tar"
-                    receipt = pull_registry_oci_archive(resolved.canonical, output, self.roots, profile=profile)
+                    receipt = pull_registry_oci_archive(
+                        resolved.canonical,
+                        output,
+                        self.roots,
+                        profile=profile,
+                        platform=norm_platform,
+                    )
                     archive_digest = digest_file(output)
                     destination = destination.parent / (digest_hex(archive_digest) + ".oci.tar")
                     if destination.exists():
@@ -901,22 +1058,25 @@ class RemoteArtifacts:
                             raise StateError("retained registry source identity mismatch")
                     else:
                         os.replace(output, destination)
+                target_arch = "arm64" if "arm64" in receipt.platform else "amd64"
+                target_platform = [{"os": "linux", "architecture": target_arch}]
                 result = {
                     "connection_id": connection_id,
                     "reference": receipt.reference,
                     "source": str(destination),
                     "image": str(destination),
-                    "manifest": receipt.manifest_digest,
+                    "manifest": receipt.root_digest,
                     "kind": "oci-image",
                     "layers": [],
                     "archive": str(destination),
                     "archive_digest": archive_digest,
                     "package_manifest": receipt.root_digest,
-                    "architectures": ["amd64"],
+                    "selected_manifest": receipt.manifest_digest,
+                    "architectures": [target_arch],
                     "source_cas_id": receipt.source_cas_id,
                     "source_binding_digest": receipt.source_binding_digest,
-                    "platforms": [{"os": "linux", "architecture": "amd64"}],
-                    **_run_info("oci-image", ["amd64"], [{"os": "linux", "architecture": "amd64"}]),
+                    "platforms": target_platform,
+                    **_run_info("oci-image", [target_arch], target_platform),
                 }
         result["requested_reference"] = reference
         identity = hashlib.sha256((connection_id + "\0" + reference).encode()).hexdigest()
@@ -1069,7 +1229,7 @@ class RemoteArtifacts:
             "receipt": str(path),
         }
 
-    def start_download(self, operations, connection_id: str, reference: str) -> dict:
+    def start_download(self, operations, connection_id: str, reference: str, *, platform: str = "linux/amd64") -> dict:
         if connection_id == "legacy":
             require_digest(reference)
             self._hub()
@@ -1078,8 +1238,11 @@ class RemoteArtifacts:
         return operations.start(
             self.roots,
             "download",
-            ["download", "--", connection_id, reference],
+            ["download", f"--platform={platform}", "--", connection_id, reference],
             module="palimpsest_local.remote_artifacts",
+            hub_environment=self.hub_connection.environment()
+            if connection_id == "legacy" and self.hub_connection is not None
+            else None,
         )
 
     def start_upload(self, operations, connection_id: str, source: dict, target: str) -> dict:
@@ -1105,6 +1268,9 @@ class RemoteArtifacts:
             "upload",
             ["upload", "--", connection_id, json.dumps(source, separators=(",", ":")), target],
             module="palimpsest_local.remote_artifacts",
+            hub_environment=self.hub_connection.environment()
+            if connection_id == "legacy" and self.hub_connection is not None
+            else None,
         )
 
 
@@ -1112,6 +1278,7 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Fixed remote artifact transfer job")
     commands = parser.add_subparsers(dest="operation", required=True)
     download = commands.add_parser("download")
+    download.add_argument("--platform", default="linux/amd64")
     download.add_argument("connection")
     download.add_argument("reference")
     upload = commands.add_parser("upload")
@@ -1126,7 +1293,7 @@ def main(argv=None) -> int:
     try:
         backend = RemoteArtifacts(init_roots())
         if args.operation == "download":
-            result = backend.download(args.connection, args.reference)
+            result = backend.download(args.connection, args.reference, platform=args.platform)
         else:
             result = backend.upload(args.connection, json.loads(args.source), args.target)
         print(json.dumps(result, allow_nan=False))

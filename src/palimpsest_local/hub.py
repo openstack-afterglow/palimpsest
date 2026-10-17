@@ -29,6 +29,7 @@ from .errors import DigestMismatchError, HubError
 from .state import delete_transfer, fingerprint, read_transfer, write_transfer
 
 HUB_API_PREFIX = "/v1"
+DEFAULT_HUB_URL = "https://palimpsest.dmslab.re.kr"
 
 MEDIA_TYPE_LAYER_SQUASHFS = "application/vnd.afterglow.palimpsest.layer.squashfs.v1"
 MEDIA_TYPE_LAYER_CONFIG = "application/vnd.afterglow.palimpsest.layer.config.v1+json"
@@ -261,12 +262,18 @@ class HubClient:
         kind: str | None = None,
         chain_id: str | None = None,
         parent_digest: str | None = None,
+        arch: str | None = None,
+        disk_format: str | None = None,
         limit: int = 50,
     ) -> list[dict[str, Any]]:
         if not 1 <= limit <= 200:
             raise HubError("limit must be between 1 and 200")
         if type(offset) is not int or offset < 0:
             raise HubError("offset must be a nonnegative integer")
+        if arch is not None and arch not in {"x86_64", "aarch64"}:
+            raise HubError("unsupported cloud-image architecture filter")
+        if disk_format is not None and disk_format not in DISK_FORMAT_MEDIA_TYPES:
+            raise HubError("unsupported cloud-image disk format filter")
         if digest_prefix is not None and (
             not isinstance(digest_prefix, str) or re.fullmatch(r"(?:sha256:)?[0-9a-fA-F]{4,64}", digest_prefix) is None
         ):
@@ -281,6 +288,8 @@ class HubClient:
             "kind": kind,
             "chain_id": normalized_chain,
             "parent_digest": normalized_parent,
+            "arch": arch,
+            "disk_format": disk_format,
             "limit": limit,
         }
         return self._json_request("GET", "/layers", query=query)

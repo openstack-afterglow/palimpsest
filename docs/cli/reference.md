@@ -3,7 +3,7 @@
 
 This file is generated from `palimpsest_local.cli.build_parser`. It inventories every command, positional, option, choice, and parser default. For behavior, examples, and runtime restrictions, read [the usage guide](usage.md). Every command except raw `docker` pass-through accepts automatic `-h`/`--help`.
 
-Coverage: **78 command paths**, **238 positional/option definitions** (excluding automatic `-h/--help`).
+Coverage: **82 command paths**, **250 positional/option definitions** (excluding automatic `-h/--help`).
 
 ## `palimpsest`
 
@@ -12,10 +12,10 @@ Coverage: **78 command paths**, **238 positional/option definitions** (excluding
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest [-h] [--url URL] [--version] {image,layer,bundle,oci,build,registry,login,logout,pull,push,tag,images,history,rmi,save,load,docker,run,compose,ps,volumes,networks,inspect,logs,shell,exec,start,stop,rm,commit,web,store,completion} ...
+usage: palimpsest [-h] [--url URL] [--version] {image,layer,bundle,oci,build,registry,login,logout,pull,push,tag,images,history,rmi,save,load,docker,run,compose,ps,volumes,networks,volume,inspect,logs,shell,exec,start,stop,rm,commit,web,store,completion} ...
 ```
 
-Subcommands: `image`, `layer`, `bundle`, `oci`, `build`, `registry`, `login`, `logout`, `pull`, `push`, `tag`, `images`, `history`, `rmi`, `save`, `load`, `docker`, `run`, `compose`, `ps`, `volumes`, `networks`, `inspect`, `logs`, `shell`, `exec`, `start`, `stop`, `rm`, `commit`, `web`, `store`, `completion`.
+Subcommands: `image`, `layer`, `bundle`, `oci`, `build`, `registry`, `login`, `logout`, `pull`, `push`, `tag`, `images`, `history`, `rmi`, `save`, `load`, `docker`, `run`, `compose`, `ps`, `volumes`, `networks`, `volume`, `inspect`, `logs`, `shell`, `exec`, `start`, `stop`, `rm`, `commit`, `web`, `store`, `completion`.
 
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
@@ -825,7 +825,7 @@ usage: palimpsest docker ...
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest run [-h] [--name NAME] [--registry REGISTRY] [--layer LAYER] [--memory MEMORY] [--vcpus VCPUS] [--network NETWORK] [-p [HOST_IP:]HOST_PORT:GUEST_PORT[/tcp|/udp]] [--backend {auto,kvm,lima-vz,libvirt-hvf}] [--runtime-kind {cloud-image,oci-root}] [-d] [--manifest MANIFEST] [--user USER] [--root-retention {delete,retain}] [--root-volume ROOT_VOLUME] image_or_bundle [-- COMMAND [ARG...]]
+usage: palimpsest run [-h] [--name NAME] [--registry REGISTRY] [--layer LAYER] [--volume NAME:/guest/path[:ro]] [--memory MEMORY] [--vcpus VCPUS] [--network NETWORK] [-p [HOST_IP:]HOST_PORT:GUEST_PORT[/tcp|/udp]] [--backend {auto,kvm,lima-vz,libvirt-hvf,lima-qemu-oci}] [--runtime-kind {cloud-image,oci-root}] [-d] [--manifest MANIFEST] [--user USER] [--platform {linux/amd64,linux/arm64}] [--force-architecture] [--vm-image VM_IMAGE] [--vm-image-digest VM_IMAGE_DIGEST] [--root-retention {delete,retain}] [--root-volume ROOT_VOLUME] image_or_bundle [-- COMMAND [ARG...]]
 ```
 
 | Argument | Value | Parser default | Description |
@@ -834,15 +834,20 @@ usage: palimpsest run [-h] [--name NAME] [--registry REGISTRY] [--layer LAYER] [
 | `--name` | string | `None` | unique local VM/run name (default: auto-generated) |
 | `--registry` | string | `None` | explicit registry alias to search or pull from |
 | `--layer` | string; repeatable | `[]` | cloud-image SquashFS layer digest (repeatable; not for OCI-root) |
+| `--volume` | _parse_run_volume; repeatable | `[]` | attach an existing named data volume (repeatable; no host paths) |
 | `--memory` | int | `4096` | guest memory in MiB (256-1048576; default: 4096) |
 | `--vcpus` | int | `2` | guest virtual CPUs (1-256; default: 2) |
 | `--network` | string | `None` | backend network; OCI-root: nat, host-only, or none |
 | `-p`, `--publish` | string; repeatable | `[]` | publish one OCI-root guest port on the host (default host address 127.0.0.1) |
-| `--backend` | one of: `auto`, `kvm`, `lima-vz`, `libvirt-hvf` | `'auto'` | VM backend (default: select for host and image architecture) |
+| `--backend` | one of: `auto`, `kvm`, `lima-vz`, `libvirt-hvf`, `lima-qemu-oci` | `'auto'` | VM backend (default: select for host and image architecture) |
 | `--runtime-kind` | one of: `cloud-image`, `oci-root` | `None` | explicit input/runtime type; required for OCI layout directories |
 | `-d`, `--detach` | flag | `False` | leave an OCI-root VM running after READY |
 | `--manifest` | string | `None` | pin the root descriptor of a local OCI image |
 | `--user` | string | `None` | run a local OCI image as USER[:GROUP] |
+| `--platform` | one of: `linux/amd64`, `linux/arm64` | `'linux/amd64'` | selected OCI image platform |
+| `--force-architecture` | flag | `False` | explicit experimental OCI container-in-Lima/QEMU VM attempt; not native OCI-root |
+| `--vm-image` | Path | `None` | matching local Linux carrier disk with preinstalled nerdctl/containerd (force mode only) |
+| `--vm-image-digest` | string | `None` | SHA-256 of the local experimental carrier disk |
 | `--root-retention` | one of: `delete`, `retain` | `None` | OCI writable-root removal policy (default: delete) |
 | `--root-volume` | string | `None` | reuse an explicitly retained OCI writable-root UUID |
 
@@ -1026,6 +1031,64 @@ usage: palimpsest networks [-h] [--format {table,json}]
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
 | `--format` | one of: `table`, `json` | `'table'` | output format |
+
+## `palimpsest volume`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest volume [-h] {create,inspect,rm} ...
+```
+
+Subcommands: `create`, `inspect`, `rm`.
+
+### `palimpsest volume create`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest volume create [-h] --backend {kvm,lima-vz,libvirt-hvf} --size SIZE name
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `name` | string | required | Managed object, run, profile, or publication name. |
+| `--backend` | one of: `kvm`, `lima-vz`, `libvirt-hvf` | required | explicit volume backend |
+| `--size` | _parse_volume_size | required | capacity in MiB or with a MiB/GiB suffix |
+
+### `palimpsest volume inspect`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest volume inspect [-h] --backend {kvm,lima-vz,libvirt-hvf} name
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `name` | string | required | Managed object, run, profile, or publication name. |
+| `--backend` | one of: `kvm`, `lima-vz`, `libvirt-hvf` | required | explicit volume backend |
+
+### `palimpsest volume rm`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest volume rm [-h] --backend {kvm,lima-vz,libvirt-hvf} name
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `name` | string | required | Managed object, run, profile, or publication name. |
+| `--backend` | one of: `kvm`, `lima-vz`, `libvirt-hvf` | required | explicit volume backend |
 
 ## `palimpsest inspect`
 

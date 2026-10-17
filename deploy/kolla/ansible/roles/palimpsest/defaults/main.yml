@@ -1,7 +1,7 @@
 ---
 # Palimpsest kolla role defaults
 
-palimpsest_image_tag: "0.3.5"
+palimpsest_image_tag: "0.3.6"
 palimpsest_image_namespace: "ghcr.io/openstack-afterglow"
 palimpsest_api_image: "{{ palimpsest_image_namespace }}/palimpsest-hub-api"
 palimpsest_worker_image: "{{ palimpsest_image_namespace }}/palimpsest-hub-worker"
@@ -163,7 +163,7 @@ palimpsest_hub_api_service:
     OS_INTERFACE: "{{ palimpsest_keystone_interface }}"
     SSL_VERIFY: "{{ (not (openstack_insecure | default(false) | bool)) | string }}"
   healthcheck:
-    test: ["CMD", "python", "-c", "from urllib.request import urlopen; response = urlopen('http://{{ palimpsest_api_listen_address }}:{{ palimpsest_api_listen_port }}/v1/health', timeout=5); assert response.status == 200"]
+    test: ["CMD", "python", "-c", "from urllib.request import urlopen; response = urlopen('http://{{ palimpsest_api_listen_address }}:{{ palimpsest_api_listen_port }}/v1/ready', timeout=5); assert response.status == 200"]
     interval: 30s
     timeout: 10s
     retries: 3
@@ -249,7 +249,7 @@ palimpsest_public_haproxy_services:
         frontend_http_extra:
           - "option forwardfor"
         backend_http_extra:
-          - "option httpchk GET /v1/health"
+          - "option httpchk GET /v1/ready"
           - "http-check expect status 200"
 
 # HAProxy consumes routing metadata only, never a DB-bearing service payload.
@@ -267,6 +267,6 @@ palimpsest_haproxy_services:
         frontend_http_extra:
           - "option forwardfor"
         backend_http_extra:
-          - "option httpchk GET /v1/health"
+          - "option httpchk GET /v1/ready"
           - "http-check expect status 200"
   palimpsest-public: "{{ palimpsest_public_haproxy_services['palimpsest-public'] }}"

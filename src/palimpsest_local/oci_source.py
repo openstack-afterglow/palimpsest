@@ -20,7 +20,9 @@ import sys
 import tarfile
 import tempfile
 import threading
+import time
 import uuid
+import zlib
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -31,13 +33,19 @@ from typing import Any, Protocol, runtime_checkable
 from .errors import ArtifactValidationError
 from .oci_image import (
     MAX_IMAGE_JSON_BYTES,
+    OCIArchiveImage,
     OCIImage,
     OCIImageRef,
+    resolve_archive_image,
     resolve_image,
     strict_json_object,
+    validate_acquisition_platform,
+    verify_acquisition_platform_metadata,
 )
 from .oci_provenance import (
+    DOCKER_LAYER_GZIP_MEDIA_TYPE,
     OCI_IMAGE_INDEX_MEDIA_TYPE,
+    OCI_LAYER_GZIP_MEDIA_TYPE,
     SUPPORTED_IMAGE_INDEX_MEDIA_TYPES,
     SUPPORTED_IMAGE_MANIFEST_MEDIA_TYPES,
     Descriptor,
@@ -452,18 +460,18 @@ class SourceSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
-class SnapshottedOCIImage:
+class _SnapshottedGraph:
     """A selected OCI graph whose complete source payload set is in one CAS."""
 
-    image: OCIImage
+    image: OCIImage | OCIArchiveImage
     root: SourceSnapshot
     manifest: SourceSnapshot
     config: SourceSnapshot
     layers: tuple[SourceSnapshot, ...]
 
     def __post_init__(self) -> None:
-        if not isinstance(self.image, OCIImage):
-            raise ArtifactValidationError("snapshotted image must contain an OCIImage")
+        if not isinstance(self.image, (OCIImage, OCIArchiveImage)):
+            raise ArtifactValidationError("snapshotted image must contain a validated OCI graph")
         if any(not isinstance(item, SourceSnapshot) for item in (self.root, self.manifest, self.config)):
             raise ArtifactValidationError("snapshotted image metadata members must be SourceSnapshot values")
         if not isinstance(self.layers, tuple) or any(not isinstance(item, SourceSnapshot) for item in self.layers):
@@ -510,6 +518,26 @@ class SnapshottedOCIImage:
             "root": self.root.descriptor.to_dict(),
         }
         return f"sha256:{hashlib.sha256(canonical_json_bytes(members)).hexdigest()}"
+
+
+@dataclass(frozen=True, slots=True)
+class SnapshottedOCIImage(_SnapshottedGraph):
+    """Source snapshot accepted by the native materializer."""
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.image, OCIImage):
+            raise ArtifactValidationError("snapshotted image must contain an OCIImage")
+        super(SnapshottedOCIImage, self).__post_init__()
+
+
+@dataclass(frozen=True, slots=True)
+class SnapshottedOCIArchive(_SnapshottedGraph):
+    """Acquisition receipt, distinct from the native materialization input."""
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.image, OCIArchiveImage):
+            raise ArtifactValidationError("snapshotted archive must contain an OCIArchiveImage")
+        super(SnapshottedOCIArchive, self).__post_init__()
 
 
 @dataclass(slots=True)
@@ -1074,7 +1102,7 @@ class SourceCAS:
     @contextmanager
     def lease_layer(
         self,
-        image: SnapshottedOCIImage,
+        image: SnapshottedOCIImage | SnapshottedOCIArchive,
         ordinal: int,
     ) -> Iterator[LeasedSourceLayer]:
         """Lease one exact image-layer occurrence from its pinned source blob.
@@ -1083,7 +1111,7 @@ class SourceCAS:
         ``chunks()`` to EOF.  Body exceptions abort the lease without masking
         the original exception.
         """
-        if not isinstance(image, SnapshottedOCIImage) or image.cas_id != self._cas_id:
+        if not isinstance(image, (SnapshottedOCIImage, SnapshottedOCIArchive)) or image.cas_id != self._cas_id:
             raise SourceLeaseError("snapshotted image belongs to a different source CAS")
         if type(ordinal) is not int or not 0 <= ordinal < len(image.layers):
             raise SourceLeaseError("source layer ordinal is out of range")
@@ -1140,8 +1168,8 @@ class SourceCAS:
                 lease._abort()
                 _close_noerror(file_fd)
 
-    def verify_image(self, snapshot: SnapshottedOCIImage) -> None:
-        if not isinstance(snapshot, SnapshottedOCIImage) or snapshot.cas_id != self._cas_id:
+    def verify_image(self, snapshot: SnapshottedOCIImage | SnapshottedOCIArchive) -> None:
+        if not isinstance(snapshot, (SnapshottedOCIImage, SnapshottedOCIArchive)) or snapshot.cas_id != self._cas_id:
             raise ArtifactValidationError("snapshotted image belongs to a different CAS")
         with self._authority() as authority:
             seen: set[tuple[str, int]] = set()
@@ -1152,6 +1180,63 @@ class SourceCAS:
                 if self._read_target(authority, member.descriptor, capture=False) is None:
                     raise ArtifactValidationError(f"source-CAS blob is missing or corrupt: {member.descriptor.digest}")
                 seen.add(identity)
+
+
+def _acquisition_deadline(timeout_seconds: float, maximum_bytes: int) -> float:
+    if not 0 < timeout_seconds <= 3600:
+        raise ArtifactValidationError("OCI acquisition timeout must be between 0 and 3600 seconds")
+    if type(maximum_bytes) is not int or not 0 < maximum_bytes <= 8 * 1024 * 1024 * 1024:
+        raise ArtifactValidationError("OCI acquisition byte limit must be between 1 and 8 GiB")
+    return time.monotonic() + timeout_seconds
+
+
+def _check_acquisition_deadline(deadline: float) -> None:
+    if time.monotonic() >= deadline:
+        raise ArtifactValidationError("OCI acquisition verification timed out")
+
+
+def _verify_archive_diff_ids(
+    cas: SourceCAS,
+    snapshot: SnapshottedOCIArchive,
+    *,
+    deadline: float,
+    maximum_bytes: int,
+) -> None:
+    """Hash decompressed bytes only; do not import native filesystem policy."""
+    total = 0
+    for ordinal, occurrence in enumerate(snapshot.image.layers):
+        hasher = hashlib.sha256()
+        decoder = (
+            zlib.decompressobj(16 + zlib.MAX_WBITS)
+            if occurrence.compressed.media_type in {OCI_LAYER_GZIP_MEDIA_TYPE, DOCKER_LAYER_GZIP_MEDIA_TYPE}
+            else None
+        )
+        with cas.lease_layer(snapshot, ordinal) as lease:
+            for chunk in lease.chunks():
+                pending = chunk
+                while pending:
+                    _check_acquisition_deadline(deadline)
+                    if decoder is None:
+                        payload, pending = pending, b""
+                    else:
+                        if decoder.eof:
+                            raise ArtifactValidationError("OCI layer contains trailing or concatenated gzip data")
+                        try:
+                            payload = decoder.decompress(pending, min(_READ_CHUNK, maximum_bytes - total + 1))
+                        except zlib.error:
+                            raise ArtifactValidationError("OCI layer is not valid gzip data") from None
+                        pending = decoder.unconsumed_tail
+                        if decoder.unused_data:
+                            raise ArtifactValidationError("OCI layer contains trailing or concatenated gzip data")
+                    total += len(payload)
+                    if total > maximum_bytes:
+                        raise ArtifactValidationError("OCI layer uncompressed bytes exceed acquisition size limit")
+                    hasher.update(payload)
+        if decoder is not None and not decoder.eof:
+            raise ArtifactValidationError("OCI layer gzip stream is truncated")
+        if f"sha256:{hasher.hexdigest()}" != occurrence.diff_id:
+            raise ArtifactValidationError("OCI layer DiffID mismatch")
+    _check_acquisition_deadline(deadline)
 
 
 @runtime_checkable
@@ -1197,6 +1282,32 @@ class LocalLayoutSource:
         return cls(layout=path, root_digest=digest, _checkpoint=checkpoint)
 
     def snapshot(self, reference: OCIImageRef | None, cas: SourceCAS) -> SnapshottedOCIImage:
+        return self._snapshot(reference, cas)
+
+    def snapshot_acquisition(
+        self,
+        reference: OCIImageRef | None,
+        cas: SourceCAS,
+        *,
+        platform: str,
+        timeout_seconds: float = 300.0,
+        maximum_bytes: int = 8 * 1024 * 1024 * 1024,
+    ) -> SnapshottedOCIArchive:
+        validate_acquisition_platform(platform)
+        deadline = _acquisition_deadline(timeout_seconds, maximum_bytes)
+        return self._snapshot(
+            reference, cas, acquisition_platform=platform, deadline=deadline, maximum_bytes=maximum_bytes
+        )
+
+    def _snapshot(
+        self,
+        reference: OCIImageRef | None,
+        cas: SourceCAS,
+        *,
+        acquisition_platform: str | None = None,
+        deadline: float | None = None,
+        maximum_bytes: int = 8 * 1024 * 1024 * 1024,
+    ) -> SnapshottedOCIImage | SnapshottedOCIArchive:
         if (reference is not None and not isinstance(reference, OCIImageRef)) or not isinstance(cas, SourceCAS):
             raise ArtifactValidationError("local OCI snapshot requires an OCIImageRef and SourceCAS")
         with _open_absolute_directory(self.layout, self._checkpoint) as layout_fd:
@@ -1235,6 +1346,12 @@ class LocalLayoutSource:
                 if self.root_digest is None or parsed_descriptor.digest == self.root_digest:
                     if "data" in raw_descriptor:
                         raise ArtifactValidationError("pinned OCI layout root uses unsupported embedded data")
+                    if acquisition_platform is not None and not pinned_top_index and "platform" in raw_descriptor:
+                        verify_acquisition_platform_metadata(
+                            raw_descriptor["platform"],
+                            acquisition_platform,
+                            "OCI layout root platform",
+                        )
                     roots.append(parsed_descriptor)
             if pinned_top_index:
                 root_descriptor = Descriptor(
@@ -1270,15 +1387,23 @@ class LocalLayoutSource:
                 memo: dict[str, SourceSnapshot] = {}
 
                 def ensure(descriptor: Descriptor) -> SourceSnapshot:
+                    if deadline is not None:
+                        _check_acquisition_deadline(deadline)
+
+                    def checkpoint(event: SnapshotCheckpoint) -> None:
+                        self._checkpoint(event)
+                        if deadline is not None:
+                            _check_acquisition_deadline(deadline)
+
                     existing = memo.get(descriptor.digest)
                     if existing is not None:
                         if existing.descriptor != descriptor:
                             raise ArtifactValidationError("same OCI digest has contradictory descriptor metadata")
                         return existing
                     if pinned_top_index and descriptor == root_descriptor:
-                        created = cas.import_source_blob(layout_fd, descriptor, self._checkpoint, _fixed_index=True)
+                        created = cas.import_source_blob(layout_fd, descriptor, checkpoint, _fixed_index=True)
                     else:
-                        created = cas.import_source_blob(sha256_fd, descriptor, self._checkpoint)
+                        created = cas.import_source_blob(sha256_fd, descriptor, checkpoint)
                     memo[descriptor.digest] = created
                     return created
 
@@ -1289,11 +1414,16 @@ class LocalLayoutSource:
                     _notify(self._checkpoint, SnapshotStage.BEFORE_CAS_REOPEN, digest=descriptor.digest)
                     return cas.read_metadata(member)
 
-                image = resolve_image(reference, root_descriptor, reader)
+                image = (
+                    resolve_image(reference, root_descriptor, reader)
+                    if acquisition_platform is None
+                    else resolve_archive_image(reference, root_descriptor, reader, platform=acquisition_platform)
+                )
                 manifest_snapshot = ensure(image.manifest_descriptor)
                 config_snapshot = ensure(image.config.descriptor)
                 layer_snapshots = tuple(ensure(occurrence.compressed) for occurrence in image.layers)
-                result = SnapshottedOCIImage(
+                snapshot_type = SnapshottedOCIImage if acquisition_platform is None else SnapshottedOCIArchive
+                result = snapshot_type(
                     image=image,
                     root=root_snapshot,
                     manifest=manifest_snapshot,
@@ -1302,6 +1432,8 @@ class LocalLayoutSource:
                 )
                 _notify(self._checkpoint, SnapshotStage.BEFORE_RESULT, digest=root_descriptor.digest)
                 cas.verify_image(result)
+                if acquisition_platform is not None:
+                    _verify_archive_diff_ids(cas, result, deadline=deadline, maximum_bytes=maximum_bytes)
                 return result
             finally:
                 _close_noerror(sha256_fd)
@@ -1329,7 +1461,13 @@ def _canonical_archive_member(member: tarfile.TarInfo) -> str:
     return canonical
 
 
-def _write_archive_member(archive: tarfile.TarFile, member: tarfile.TarInfo, target: Path) -> None:
+def _write_archive_member(
+    archive: tarfile.TarFile,
+    member: tarfile.TarInfo,
+    target: Path,
+    *,
+    deadline: float | None = None,
+) -> None:
     source = archive.extractfile(member)
     if source is None:
         raise ArtifactValidationError("local OCI archive member cannot be read")
@@ -1338,6 +1476,8 @@ def _write_archive_member(archive: tarfile.TarFile, member: tarfile.TarInfo, tar
     try:
         target_fd = os.open(target, _TEMP_FLAGS, _PRIVATE_TEMP_MODE)
         while copied < member.size:
+            if deadline is not None:
+                _check_acquisition_deadline(deadline)
             chunk = source.read(min(_READ_CHUNK, member.size - copied))
             if not chunk:
                 raise ArtifactValidationError("local OCI archive member ended before its declared size")
@@ -1386,6 +1526,32 @@ class LocalArchiveSource:
         return cls(archive=path, root_digest=digest, _checkpoint=checkpoint)
 
     def snapshot(self, reference: OCIImageRef | None, cas: SourceCAS) -> SnapshottedOCIImage:
+        return self._snapshot(reference, cas)
+
+    def snapshot_acquisition(
+        self,
+        reference: OCIImageRef | None,
+        cas: SourceCAS,
+        *,
+        platform: str,
+        timeout_seconds: float = 300.0,
+        maximum_bytes: int = 8 * 1024 * 1024 * 1024,
+    ) -> SnapshottedOCIArchive:
+        validate_acquisition_platform(platform)
+        deadline = _acquisition_deadline(timeout_seconds, maximum_bytes)
+        return self._snapshot(
+            reference, cas, acquisition_platform=platform, deadline=deadline, maximum_bytes=maximum_bytes
+        )
+
+    def _snapshot(
+        self,
+        reference: OCIImageRef | None,
+        cas: SourceCAS,
+        *,
+        acquisition_platform: str | None = None,
+        deadline: float | None = None,
+        maximum_bytes: int = 8 * 1024 * 1024 * 1024,
+    ) -> SnapshottedOCIImage | SnapshottedOCIArchive:
         if (reference is not None and not isinstance(reference, OCIImageRef)) or not isinstance(cas, SourceCAS):
             raise ArtifactValidationError("local OCI snapshot requires an OCIImageRef and SourceCAS")
         with _open_absolute_regular_file(self.archive) as (archive_fd, archive_metadata):
@@ -1402,6 +1568,8 @@ class LocalArchiveSource:
                 try:
                     with tarfile.open(fileobj=stream, mode="r:") as tar:
                         for member_index, member in enumerate(tar, start=1):
+                            if deadline is not None:
+                                _check_acquisition_deadline(deadline)
                             if member_index > _MAX_LOCAL_ARCHIVE_MEMBERS:
                                 raise ArtifactValidationError("local OCI archive contains too many members")
                             name = _canonical_archive_member(member)
@@ -1428,7 +1596,7 @@ class LocalArchiveSource:
                                 raise ArtifactValidationError("local OCI archive marker exceeds its size limit")
                             if name == "index.json" and member.size > MAX_IMAGE_JSON_BYTES:
                                 raise ArtifactValidationError("local OCI archive index exceeds its size limit")
-                            _write_archive_member(tar, member, layout.joinpath(*name.split("/")))
+                            _write_archive_member(tar, member, layout.joinpath(*name.split("/")), deadline=deadline)
                 except (tarfile.TarError, EOFError):
                     raise ArtifactValidationError("local OCI archive is not a valid uncompressed tar archive") from None
                 finally:
@@ -1439,4 +1607,10 @@ class LocalArchiveSource:
                     layout=layout,
                     root_digest=self.root_digest,
                     _checkpoint=self._checkpoint,
-                ).snapshot(reference, cas)
+                )._snapshot(
+                    reference,
+                    cas,
+                    acquisition_platform=acquisition_platform,
+                    deadline=deadline,
+                    maximum_bytes=maximum_bytes,
+                )

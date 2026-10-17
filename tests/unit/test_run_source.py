@@ -9,8 +9,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import test_registry_intake as intake_fixtures
 
-from palimpsest_local import cli, run_source, state
+from palimpsest_local import cli, registry_intake, run_source, state
 from palimpsest_local.errors import PalimpsestError, StateError
 from palimpsest_local.oci_layout import (
     MEDIA_TYPE_IMAGE_QCOW2,
@@ -21,6 +22,9 @@ from palimpsest_local.oci_layout import (
     canonical_json,
     config_digest,
 )
+from palimpsest_local.oci_source import LocalArchiveSource, SourceCAS
+from palimpsest_local.packages import snapshot_package
+from palimpsest_local.platforms import HostPlatform
 from palimpsest_local.registry import (
     RegistryConfig,
     RegistryError,
@@ -29,6 +33,8 @@ from palimpsest_local.registry import (
     save_registry_config,
 )
 from palimpsest_local.registry_intake import RegistryIntakeError, RegistryPullReceipt
+from palimpsest_local.run_source import preflight_oci_capabilities as native_preflight
+from palimpsest_local.runtime_types import RuntimePreflightError
 
 
 @pytest.fixture
@@ -386,3 +392,65 @@ def test_genuine_docker_absence_diagnostics_are_misses(roots, docker, diagnostic
     docker.failures["service"] = diagnostic
     assert run_source.find_docker_daemon_source(roots, ["service"]) is None
     assert docker.events == [("inspect", "service")]
+
+
+@pytest.mark.parametrize("architecture", ["amd64", "arm64"])
+def test_forced_darwin_docker_cache_acquisition_retains_consumable_platform(roots, tmp_path, monkeypatch, architecture):
+    archives = {arch: intake_fixtures._platform_archive(architectures=(arch,)) for arch in ("amd64", "arm64")}
+    _payload, root, manifests = archives[architecture]
+    executable = tmp_path / "skopeo"
+    executable.write_bytes(b"tool")
+    monkeypatch.setattr(
+        run_source.shutil, "which", lambda name: str(executable) if name in {"docker", "skopeo"} else None
+    )
+    monkeypatch.setattr(run_source, "preflight_oci_capabilities", native_preflight)
+    monkeypatch.setattr(run_source, "detect_host", lambda: HostPlatform("Darwin", "aarch64"))
+
+    def inspect(argv, **_kwargs):
+        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps([{"Id": "sha256:" + "a" * 64}]), stderr="")
+
+    def copy(argv, archive, _staging, **_kwargs):
+        if "save" in argv:
+            archive.write_bytes(b"docker save bytes")
+        else:
+            # Model conversion selection, not the caller's requested platform.
+            exported_architecture = argv[argv.index("--override-arch") + 1]
+            archive.write_bytes(archives[exported_architecture][0])
+
+    monkeypatch.setattr(run_source, "run_docker_command", inspect)
+    monkeypatch.setattr(registry_intake, "run_docker_command", inspect)
+    monkeypatch.setattr(registry_intake, "_run_bounded_copy", copy)
+    monkeypatch.setattr(
+        run_source, "export_docker_image_to_oci_archive", registry_intake.export_docker_image_to_oci_archive
+    )
+    reference = "docker.io/library/service:stable"
+    resolved = run_source.resolve_run_source(
+        roots, reference, platform="linux/" + architecture, force_architecture=True, backend="lima-qemu-oci"
+    )
+    assert resolved.source_type == "docker-daemon"
+    assert resolved.manifest_digest == root["digest"]
+    # Both declared-root package resolution and acquisition config verification are real.
+    with snapshot_package(resolved.target, manifest=resolved.manifest_digest) as package:
+        snapshot = LocalArchiveSource(package.archive, root_digest=package.root_digest).snapshot_acquisition(
+            None, SourceCAS(roots.oci_source_cas), platform="linux/" + architecture
+        )
+        assert snapshot.image.config.architecture == architecture
+        assert snapshot.manifest.descriptor.digest == manifests[0]["digest"]
+    retained = run_source.find_retained_oci_source(roots, reference)
+    assert retained.platform == "linux/" + architecture
+    assert retained.root_digest == root["digest"]
+    assert retained.manifest_digest == manifests[0]["digest"]
+
+
+@pytest.mark.parametrize("direct_cache_lookup", [False, True])
+def test_native_darwin_docker_cache_keeps_native_preflight(roots, docker, monkeypatch, direct_cache_lookup):
+    reference = "docker.io/library/service:stable"
+    docker.images[reference] = "sha256:" + "a" * 64
+    monkeypatch.setattr(run_source, "preflight_oci_capabilities", native_preflight)
+    monkeypatch.setattr(run_source, "detect_host", lambda: HostPlatform("Darwin", "aarch64"))
+    with pytest.raises(RuntimePreflightError):
+        if direct_cache_lookup:
+            run_source.find_docker_daemon_source(roots, [reference])
+        else:
+            run_source.resolve_run_source(roots, reference)
+    assert docker.events == ([("inspect", reference)] if direct_cache_lookup else [])
