@@ -1237,9 +1237,9 @@ Release blocker follow-through: selected verified config/child descriptors now d
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "2cd220727a341d3a3586c42461bcf8e8eb1c26aa60a94dc3484446bda4633520",
-  "reviewed_at": "2026-10-17T13:22:13Z",
-  "summary": "Review full0.3.6 release readiness and Kolla, verified platform/root-index acquisition and disposable carriers, retained-run archive lock coherence/native aliases; remove obsolete policy/source-text assertions and exercise consumer completion boundaries; no native qualification"
+  "source_sha256": "af4ae179c7c349eaaeccf00074d3908dbec252605dc104dd4f5d06e220e2cfa7",
+  "reviewed_at": "2026-10-17T13:58:38Z",
+  "summary": "Review 0.3.6 release boundary fixes and hermetic retained-run purge regression; synthetic native profile resolution no longer probes host UEFI; production firmware and removal policy unchanged; no native qualification"
 }
 ```
 <!-- architecture-review:end -->

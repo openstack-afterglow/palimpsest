@@ -565,6 +565,11 @@ def test_managed_rm_dashboard_archive_delete_then_cli_purge_releases_layers(nati
         )
         monkeypatch.setattr(kvm, "connect", lambda uri: connection)
         monkeypatch.setattr(kvm, "_libvirt", lambda: SimpleNamespace())
+        monkeypatch.setattr(
+            cloud_runtime,
+            "_resolve_ledger_profile",
+            lambda ledger: SimpleNamespace(backend=backend, uri="qemu:///fixture"),
+        )
 
     # Exercise real CLI dispatch/receipts and runtime/native removal; only host
     # capability discovery and the native transport are synthetic.
