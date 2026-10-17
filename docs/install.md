@@ -369,10 +369,12 @@ With the corresponding updated Afterglow role, this explicit endpoint defaults
 trusted HTTPS transport URL can override the Afterglow variable. Unset/empty
 values preserve detailed Afterglow operator TOML, not a catalog fallback.
 `palimpsest_package_public_origin` is still a separate package-key gateway origin
-(the Afterglow origin in the DMS Lab example), not the Hub routing URL. Apply the
-reviewed roles through normal `kolla-ansible reconfigure --tags palimpsest,afterglow`
-after preserving image pins and data. A correct HAProxy route does not install
-new package APIs; verify Hub version and authenticated `/v1/projects/current`.
+(the Afterglow origin in the DMS Lab example), not the Hub routing URL. For
+Hub-only rollout, follow the [current production procedure](#current-production-rollout-procedure-and-gates),
+including controller1 limits and `--skip-tags haproxy`. Applying Afterglow or
+shared load-balancer changes is a separate approval-gated operation, not part of
+the Hub-only command. A correct HAProxy route does not install new package APIs;
+verify Hub version and authenticated `/v1/projects/current` separately.
 
 Repository tags label both
 `ghcr.io/openstack-afterglow/palimpsest-hub-api` and
