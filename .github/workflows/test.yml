@@ -306,3 +306,33 @@ jobs:
               exit 1
               ;;
           esac
+
+  serial-release-diagnostic:
+    name: Nonshipping serial release diagnostics
+    if: github.event_name == 'pull_request' && github.head_ref == 'diagnostics/serial-release-038'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: uv sync --frozen --extra dev
+      - name: Exact release collection with bounded stack evidence
+        env:
+          PYTHONFAULTHANDLER: '1'
+        run: |
+          set -o pipefail
+          timeout --signal=ABRT --kill-after=20s 900s uv run python -m pytest tests/unit tests/test_kolla_assets.py tests/test_kolla_palimpsest_image_ref.py tests/test_kolla_role_contracts.py -v -o faulthandler_timeout=30 --junitxml="$RUNNER_TEMP/serial-release.xml" 2>&1 | tee "$RUNNER_TEMP/serial-release.log"
+      - name: Retain serial release evidence even on timeout
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nonshipping-serial-release-evidence
+          path: |
+            ${{ runner.temp }}/serial-release.log
+            ${{ runner.temp }}/serial-release.xml
+          if-no-files-found: error

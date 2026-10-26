@@ -1249,9 +1249,9 @@ Maintenance review — 2026-10-18, approved 0.3.7 controller HA: reviewed Sentin
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "5de3f42ab2a3b816e1638f28fe5c259f15fc3db02e9331517862025f5c887b28",
-  "reviewed_at": "2026-10-26T13:09:03Z",
-  "summary": "Release0.3.8: isolated catalog/unpack extraction preserves latest project/package auth and schema; fresh human/system-only catalog policy, complete visible base DAG and independently digest-bound optional config identity reviewed. Full root7471/265skip andHub654/2skip, real CLI/Uvicorn synthetic authority and both-architecture three-target execution passed. Native KVM/production qualification separate."
+  "source_sha256": "e2ec8bba0c542fd87a9c5048aff9584306c13202fbe87c13aff84599e62796b5",
+  "reviewed_at": "2026-10-26T14:57:55Z",
+  "summary": "Nonshipping diagnostic only: bounded exact serial release pytest with faulthandler and retained evidence after two hosted verification stalls; no application/source behavior, gate selection, native policy or immutable tag changed. This branch must not be merged or shipped."
 }
 ```
 <!-- architecture-review:end -->
