@@ -241,6 +241,8 @@ class SupervisorJournal:
         self._directory_identity: tuple[int, int] | None = None
         self._file_identity: tuple[int, int] | None = None
         self._tail_position = _JournalPosition(0, len(_JOURNAL_HEADER), _JOURNAL_SEAL_SEED)
+        # Trusted chain commitments, not cached payloads or timestamp-derived authority.
+        self._record_seals = bytearray()
         self._ready_position_value: _JournalPosition | None = None
         self._verified_content_state: tuple[int, int, int] | None = None
         self._phase = SupervisorPhase.STARTING
@@ -520,6 +522,7 @@ class SupervisorJournal:
         candidate_cursor = 0
         candidate_ready_position: _JournalPosition | None = None
         candidate_seal = _JOURNAL_SEAL_SEED
+        candidate_seals = bytearray()
         self._phase = SupervisorPhase.STARTING
         self._ready_cursor = None
         self._exit = None
@@ -536,6 +539,7 @@ class SupervisorJournal:
                 self._apply_semantics(record)
                 offset += frame_length
                 candidate_seal = hashlib.sha256(candidate_seal + frame).digest()
+                candidate_seals.extend(candidate_seal)
                 if record.kind is SupervisorRecordKind.READY:
                     candidate_ready_position = _JournalPosition(candidate_cursor, offset, candidate_seal)
             try:
@@ -548,6 +552,7 @@ class SupervisorJournal:
             raise
         self._tail_position = _JournalPosition(candidate_cursor, offset, candidate_seal)
         self._ready_position_value = candidate_ready_position
+        self._record_seals = candidate_seals
         self._verified_content_state = _content_state(after)
 
     def _verify_stamp(self) -> None:
@@ -646,6 +651,7 @@ class SupervisorJournal:
                 offset + len(frame),
                 hashlib.sha256(self._tail_position.chain_checksum + frame).digest(),
             )
+            self._record_seals.extend(next_position.chain_checksum)
             self._tail_position = next_position
             if candidate.kind is SupervisorRecordKind.READY:
                 self._ready_position_value = next_position
@@ -691,12 +697,16 @@ class SupervisorJournal:
                         current.cursor + 1,
                         file_size=self._tail_position.end_offset,
                     )
-                    result.append(record)
+                    next_seal = hashlib.sha256(current.chain_checksum + frame).digest()
+                    seal_offset = current.cursor * _CHECKSUM_BYTES
+                    if next_seal != self._record_seals[seal_offset : seal_offset + _CHECKSUM_BYTES]:
+                        raise SupervisorError(SupervisorErrorCategory.JOURNAL_CORRUPT)
                     current = _JournalPosition(
                         current.cursor + 1,
                         current.end_offset + frame_length,
-                        hashlib.sha256(current.chain_checksum + frame).digest(),
+                        next_seal,
                     )
+                    result.append(record)
                 if current.cursor == self._tail_position.cursor and current != self._tail_position:
                     raise SupervisorError(SupervisorErrorCategory.JOURNAL_CORRUPT)
                 self._verify_stamp()
@@ -710,6 +720,7 @@ class SupervisorJournal:
             if self._closed:
                 return
             self._closed = True
+            self._record_seals.clear()
             for descriptor_name in ("_file_fd", "_directory_fd"):
                 descriptor = getattr(self, descriptor_name)
                 if descriptor >= 0:

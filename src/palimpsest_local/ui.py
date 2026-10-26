@@ -742,10 +742,13 @@ def serve(
             print("Browser unavailable; open the printed URL manually.", file=sys.stderr)
 
     main_thread = threading.current_thread() is threading.main_thread()
-    previous_sigterm = signal.getsignal(signal.SIGTERM) if main_thread else None
+    previous_handlers = (
+        {signum: signal.getsignal(signum) for signum in (signal.SIGINT, signal.SIGTERM)} if main_thread else {}
+    )
     try:
         if main_thread:
-            signal.signal(signal.SIGTERM, stop_requested)
+            for signum in previous_handlers:
+                signal.signal(signum, stop_requested)
         if open_browser:
             # GenericBrowser can wait for a foreground browser to exit.
             threading.Thread(target=launch_browser, name="palimpsest-web-browser", daemon=True).start()
@@ -757,8 +760,8 @@ def serve(
             server.RequestHandlerClass.close_transports()
         finally:
             try:
-                if main_thread:
-                    signal.signal(signal.SIGTERM, previous_sigterm)
+                for signum, previous_handler in previous_handlers.items():
+                    signal.signal(signum, previous_handler)
             finally:
                 server.server_close()
 

@@ -4,6 +4,13 @@ All notable changes to Palimpsest Local are documented here.
 
 ## [Unreleased]
 
+## [0.3.9] - 2026-10-27
+
+- Reject rewritten non-tail supervisor output even when size/mtime/ctime are unchanged and its payload checksum is recomputed. Keep compact trusted per-record chain seals from startup verification and successful own durable appends; compare each requested frame before returning it.
+- Preserve one-frame incremental I/O, descriptor/path binding, permanent corruption latching and the existing journal format. Memory is O(record count), 32 bytes per record plus bytearray capacity overhead; cursor metadata checks are not whole-history audits of unrequested payloads.
+- Make foreground web shutdown handle SIGINT even when inherited as ignored from its launcher; main-thread serving explicitly installs the existing stop callback for both SIGINT and SIGTERM and restores each actual original disposition on exit. Preserve deadlines, browser threading and socket/transport cleanup.
+- Make timestamp-change regressions deterministic and replace incidental operation-count assertions with bounded-byte and ordered consumer-output contracts. Prepare root/Hub metadata, generated locks and Kolla image defaults for patch 0.3.9; publication and production qualification are separate.
+
 ## [0.3.8] - 2026-10-26
 
 - Add SQL-only visible named-leaf asset discovery and separately authorized global administrator layer ancestry/provenance catalog. Preserve the current0.3.7 project/package/publication authority; only global catalog reads use fresh human/system graph validation and targetless native `system:manage` policy.
