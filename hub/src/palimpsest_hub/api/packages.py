@@ -104,9 +104,10 @@ async def inventory(
     limit: int = Query(50, ge=1, le=100),
     cursor: str | None = None,
     package_type: Literal["oci-image", "runtime-bundle"] | None = None,
+    q: str | None = Query(None, max_length=128),
     actor: registry.Actor = Depends(read_actor),
 ):
-    return await registry.inventory(actor, namespace, limit, cursor, package_type)
+    return await registry.inventory(actor, namespace, limit, cursor, package_type, q)
 
 
 @router.get("/projects/{namespace}/package")

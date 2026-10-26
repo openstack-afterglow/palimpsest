@@ -52,6 +52,7 @@ from palimpsest_hub.package_dto import (
     canonical_package,
 )
 from palimpsest_hub.services.blob_references import blob_referenced
+from palimpsest_hub.services.catalog import search_pattern
 from palimpsest_hub.services.hub_store import (
     HubStoreError,
     HubStoreLimit,
@@ -1063,12 +1064,14 @@ def make_cursor(binding, after):
     )
 
 
-async def inventory(actor, namespace, limit, cursor, package_type):
+async def inventory(actor, namespace, limit, cursor, package_type, q=None):
     if actor.namespace != namespace:
         raise RegistryError(403, "PROJECT_SCOPE_MISMATCH", "namespace does not match actor")
     if "packages:inventory" not in actor.actions:
         raise RegistryError(403, "ACTION_DENIED", "package inventory not delegated")
-    binding = cursor_binding(actor, "packages", package_type)
+    pattern = search_pattern(q)
+    # Preserve legacy cursor bindings byte-for-byte when no search is requested.
+    binding = cursor_binding(actor, "packages", package_type if pattern is None else [package_type, q.lower()])
     after = read_cursor(cursor, binding)
     if after is not None and not isinstance(after, str):
         raise RegistryError(422, "INVALID_CURSOR", "invalid package cursor")
@@ -1077,6 +1080,16 @@ async def inventory(actor, namespace, limit, cursor, package_type):
         stmt = stmt.where(RegistryPackage.name.in_(actor.scope.get("packages", [])))
     if package_type:
         stmt = stmt.where(RegistryPackage.package_type == package_type)
+    if pattern is not None:
+        matching_tag = (
+            select(PackageTag.package_id)
+            .where(
+                PackageTag.package_id == RegistryPackage.id,
+                func.lower(PackageTag.tag).like(pattern, escape="\\"),
+            )
+            .exists()
+        )
+        stmt = stmt.where(func.lower(RegistryPackage.name).like(pattern, escape="\\") | matching_tag)
     if after:
         stmt = stmt.where(RegistryPackage.name > after)
     async with factory()() as session:

@@ -300,3 +300,107 @@ def test_extract_rejects_descriptor_size_mismatch_without_promoting(tmp_path: Pa
     with pytest.raises(ArtifactValidationError, match="descriptor size mismatch"):
         extract_bundle_tar(archive, destination)
     assert not destination.exists()
+
+
+@pytest.mark.parametrize("location", ["top", "config-only"])
+def test_content_metadata_cannot_erase_or_reassign_known_architecture(tmp_path: Path, location: str):
+    store = ContentStore(tmp_path / "store")
+    digest = config_digest(b"same artifact")
+    store.write_stream([b"same artifact"], expected_digest=digest)
+    store.write_metadata(digest, {"kind": "squashfs", "arch": "aarch64"})
+    if location == "config-only":
+        from palimpsest_local.state import atomic_write_json
+
+        legacy = store.read_metadata(digest)
+        legacy.pop("arch")
+        legacy["config_json"] = {"arch": "aarch64"}
+        atomic_write_json(store.metadata_path(digest), legacy)
+    store.write_metadata(digest, {"kind": "squashfs", "arch": None, "name": "downloaded"})
+    assert store.read_metadata(digest)["arch"] == "aarch64"
+    with pytest.raises(ArtifactValidationError, match="architecture conflicts"):
+        store.write_metadata(digest, {"kind": "squashfs", "arch": "x86_64"})
+    assert store.read_metadata(digest)["arch"] == "aarch64"
+    with pytest.raises(ArtifactValidationError, match="architecture conflicts"):
+        store.write_metadata(digest, {"arch": "aarch64", "config_json": {"arch": "x86_64"}})
+    assert store.read_metadata(digest)["arch"] == "aarch64"
+
+
+@pytest.mark.parametrize("arch", ["aarch64", "x86_64"])
+@pytest.mark.parametrize("conflicting_manifest", [False, True])
+def test_bundle_runtime_uses_each_artifacts_digest_bound_architecture(
+    tmp_path: Path, arch: str, conflicting_manifest: bool
+):
+    from palimpsest_local.cli import _resolve_runtime_stack
+
+    blobs = {}
+
+    def blob(payload):
+        digest = config_digest(payload)
+        blobs[f"blobs/sha256/{digest[7:]}"] = payload
+        return digest
+
+    layers = []
+    configs = []
+    for payload, kind, media_type in [
+        (b"base", "cloud-image", MEDIA_TYPE_IMAGE_QCOW2),
+        (b"layer", "squashfs", MEDIA_TYPE_LAYER_SQUASHFS),
+    ]:
+        digest = blob(payload)
+        config = canonical_json({"blob_digest": digest, "kind": kind, "arch": arch})
+        config_id = blob(config)
+        configs.append((config_id, len(config)))
+        layers.append(
+            {
+                "mediaType": media_type,
+                "digest": digest,
+                "size": len(payload),
+                "annotations": {"dev.afterglow.palimpsest.config-digest": config_id},
+            }
+        )
+    leaf_config, config_size = configs[-1]
+    if conflicting_manifest:
+        wrong_config = canonical_json(
+            {
+                "blob_digest": layers[-1]["digest"],
+                "kind": "squashfs",
+                "arch": "x86_64" if arch == "aarch64" else "aarch64",
+            }
+        )
+        leaf_config, config_size = blob(wrong_config), len(wrong_config)
+    manifest = canonical_json(
+        {
+            "schemaVersion": 2,
+            "mediaType": MEDIA_TYPE_MANIFEST,
+            "config": {"mediaType": MEDIA_TYPE_LAYER_CONFIG, "digest": leaf_config, "size": config_size},
+            "layers": layers,
+        }
+    )
+    manifest_id = blob(manifest)
+    blobs["oci-layout"] = b'{"imageLayoutVersion":"1.0.0"}'
+    blobs["index.json"] = canonical_json(
+        {
+            "schemaVersion": 2,
+            "mediaType": MEDIA_TYPE_INDEX,
+            "manifests": [{"mediaType": MEDIA_TYPE_MANIFEST, "digest": manifest_id, "size": len(manifest)}],
+        }
+    )
+    archive = tmp_path / "bundle.tar"
+    archive.write_bytes(build_bundle_tar_bytes(blobs))
+    directory = tmp_path / "layout"
+    if conflicting_manifest:
+        with pytest.raises(ArtifactValidationError, match="configs conflict"):
+            extract_bundle_tar(archive, directory)
+        assert not directory.exists()
+        directory.mkdir()
+        for name, payload in blobs.items():
+            path = directory / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(payload)
+        with pytest.raises(ArtifactValidationError, match="configs conflict"):
+            verify_layout_dir(directory)
+        return
+    extracted = extract_bundle_tar(archive, directory)
+    assert [entry.arch for entry in extracted.manifests[0].entries] == [arch, arch]
+    stack = _resolve_runtime_stack(ContentStore(tmp_path / "store"), directory, (), None)
+    assert stack.base.arch == arch
+    assert stack.layers[0].arch == arch

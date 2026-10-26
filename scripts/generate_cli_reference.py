@@ -117,6 +117,8 @@ DESCRIPTIONS = {
 
 
 PATH_DESCRIPTIONS = {
+    (("bundle", "unpack"), "archive"): "Local OCI runtime-bundle tar archive to verify and unpack.",
+    (("bundle", "unpack"), "output"): "Destination directory; must be absent or empty before atomic publication.",
     (("registry", "add"), "protocol"): "Select Docker/OCI Distribution or native Palimpsest package transport.",
     (("login",), "server"): "Registry authority or configured profile name; native transport requires a profile.",
     (("logout",), "server"): "Registry authority or configured profile name; native transport requires a profile.",

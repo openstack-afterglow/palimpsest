@@ -23,6 +23,7 @@ from sqlalchemy import text
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from palimpsest_hub.api.builds import router as build_router
+from palimpsest_hub.api.catalog import router as catalog_router
 from palimpsest_hub.api.hub import configure_blocking_operations
 from palimpsest_hub.api.hub import router as hub_router
 from palimpsest_hub.api.packages import router as package_router
@@ -101,6 +102,7 @@ app.add_middleware(SlowAPIMiddleware)
 app.include_router(hub_router, prefix="/v1", tags=["hub"])
 app.include_router(build_router, prefix="/v1", tags=["builds"])
 app.include_router(package_router, prefix="/v1", tags=["packages"])
+app.include_router(catalog_router, prefix="/v1")
 
 
 def _package_path(request: Request) -> bool:

@@ -127,7 +127,11 @@ def _layout(path: Path, *, native: bool) -> Path:
         return {"mediaType": media_type, "digest": digest, "size": len(payload)}
 
     config = (
-        {"chain_id": "ordinary-cloud-bundle"}
+        {
+            "chain_id": "ordinary-cloud-bundle",
+            "blob_digest": config_digest(b"cloud disk bytes"),
+            "arch": "x86_64",
+        }
         if native
         else {
             "architecture": "amd64",
