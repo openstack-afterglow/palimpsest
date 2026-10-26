@@ -324,9 +324,28 @@ jobs:
       - name: Exact release collection with bounded stack evidence
         env:
           PYTHONFAULTHANDLER: '1'
+          PYTHONUNBUFFERED: '1'
         run: |
-          set -o pipefail
-          timeout --signal=ABRT --kill-after=20s 900s uv run python -m pytest tests/unit tests/test_kolla_assets.py tests/test_kolla_palimpsest_image_ref.py tests/test_kolla_role_contracts.py -v -o faulthandler_timeout=30 --junitxml="$RUNNER_TEMP/serial-release.xml" 2>&1 | tee "$RUNNER_TEMP/serial-release.log"
+          python3 - <<'PY'
+          import os, pathlib, signal, subprocess, sys, time
+          root = pathlib.Path(os.environ['RUNNER_TEMP'])
+          command = ['uv', 'run', 'python', '-m', 'pytest', 'tests/unit', 'tests/test_kolla_assets.py', 'tests/test_kolla_palimpsest_image_ref.py', 'tests/test_kolla_role_contracts.py', '-v', '-o', 'faulthandler_timeout=30', '--junitxml=' + str(root / 'serial-release.xml')]
+          with (root / 'serial-release.log').open('wb', buffering=0) as log:
+              child = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+              print('Isolated serial pytest pid=' + str(child.pid), flush=True)
+              try:
+                  result = child.wait(timeout=900)
+              except subprocess.TimeoutExpired:
+                  os.killpg(child.pid, signal.SIGCONT)
+                  os.killpg(child.pid, signal.SIGABRT)
+                  try:
+                      child.wait(timeout=10)
+                  except subprocess.TimeoutExpired:
+                      os.killpg(child.pid, signal.SIGKILL)
+                      child.wait(timeout=10)
+                  result = 124
+          sys.exit(result if result >= 0 else 128 - result)
+          PY
       - name: Retain serial release evidence even on timeout
         if: always()
         uses: actions/upload-artifact@v4

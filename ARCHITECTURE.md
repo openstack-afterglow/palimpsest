@@ -1249,9 +1249,9 @@ Maintenance review — 2026-10-18, approved 0.3.7 controller HA: reviewed Sentin
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "e2ec8bba0c542fd87a9c5048aff9584306c13202fbe87c13aff84599e62796b5",
-  "reviewed_at": "2026-10-26T14:57:55Z",
-  "summary": "Nonshipping diagnostic only: bounded exact serial release pytest with faulthandler and retained evidence after two hosted verification stalls; no application/source behavior, gate selection, native policy or immutable tag changed. This branch must not be merged or shipped."
+  "source_sha256": "e16a46b18bda52d97715969ac97576ec0b69bff87f323987cff543adf968b0aa",
+  "reviewed_at": "2026-10-26T15:35:35Z",
+  "summary": "Nonshipping diagnostic only: independent watchdog outside serial pytest session and unbuffered file evidence; no application/test/selection/protected-policy/tag changes. Must not merge or ship."
 }
 ```
 <!-- architecture-review:end -->
