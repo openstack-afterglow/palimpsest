@@ -1525,6 +1525,7 @@ def test_console_routes_lifecycle_and_precancellation(
     assert closed["status"] == "disconnected"
 
 
+@pytest.mark.parametrize("inherit_ignored_sigint", [False, True])
 @pytest.mark.parametrize(("open_browser", "blocking_browser"), [(False, False), (True, False), (True, True)])
 @pytest.mark.parametrize("stop_signal", [signal.SIGINT, signal.SIGTERM])
 def test_web_process_browser_choice_and_shutdown(
@@ -1532,6 +1533,7 @@ def test_web_process_browser_choice_and_shutdown(
     open_browser: bool,
     blocking_browser: bool,
     stop_signal: int,
+    inherit_ignored_sigint: bool,
 ) -> None:
     roots = _setup_roots(tmp_path)
     marker = tmp_path / "browser-url"
@@ -1555,6 +1557,14 @@ def test_web_process_browser_choice_and_shutdown(
     args = [sys.executable, "-m", "palimpsest_local.cli", "web"]
     if not open_browser:
         args.append("--no-browser")
+    if inherit_ignored_sigint:
+        args = [
+            sys.executable,
+            "-c",
+            "import os, signal, sys; signal.signal(signal.SIGINT, signal.SIG_IGN); "
+            "os.execv(sys.executable, [sys.executable, *sys.argv[1:]])",
+            *args[1:],
+        ]
     process = subprocess.Popen(args, env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     try:
         assert process.stdout is not None
@@ -1588,6 +1598,48 @@ def test_web_process_browser_choice_and_shutdown(
         if process.poll() is None:
             process.kill()
             process.communicate(timeout=10)
+
+
+@pytest.mark.parametrize("stop_signal", [signal.SIGINT, signal.SIGTERM])
+@pytest.mark.parametrize("ignore_original", [False, True])
+def test_web_serve_restores_actual_original_signal_handlers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stop_signal: int, ignore_original: bool
+) -> None:
+    roots = _setup_roots(tmp_path)
+
+    def original_interrupt(_signum, _frame):
+        pytest.fail("original interrupt handler ran while web server owned signals")
+
+    def original_terminate(_signum, _frame):
+        pytest.fail("original terminate handler ran while web server owned signals")
+
+    originals = {
+        signal.SIGINT: signal.SIG_IGN if ignore_original else original_interrupt,
+        signal.SIGTERM: signal.SIG_IGN if ignore_original else original_terminate,
+    }
+    saved = {signum: signal.getsignal(signum) for signum in originals}
+    observed_server = []
+
+    def serve_until_signalled(server):
+        observed_server.append(server)
+        for signum, original in originals.items():
+            assert callable(signal.getsignal(signum))
+            assert signal.getsignal(signum) != original
+        os.kill(os.getpid(), stop_signal)
+        pytest.fail("web stop signal returned without interrupting serve loop")
+
+    monkeypatch.setattr(ui._LoopbackHTTPServer, "serve_forever", serve_until_signalled)
+    try:
+        for signum, original in originals.items():
+            signal.signal(signum, original)
+        port = ui.serve(roots, open_browser=False)
+        assert {signum: signal.getsignal(signum) for signum in originals} == originals
+        assert observed_server[0].socket.fileno() == -1
+        with socket.socket() as connection:
+            assert connection.connect_ex(("127.0.0.1", port)) != 0
+    finally:
+        for signum, original in saved.items():
+            signal.signal(signum, original)
 
 
 def test_dashboard_bind_does_not_reverse_resolve_loopback(monkeypatch: pytest.MonkeyPatch) -> None:

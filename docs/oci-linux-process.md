@@ -1,5 +1,9 @@
 # Linux OCI process metadata
 
+## Current host supervisor journal integrity
+
+The inactive host supervisor journal retains compact trusted per-record chain seals from its full startup verification stream and successful own durable appends. Every requested output frame is checked against its indexed seal before exposure, including non-tail frames under unchanged size/mtime/ctime and recomputed payload checksums. The index uses32 bytes per record plus bytearray capacity overhead; it retains no decoded historical payloads and steady append/pull never rescans the prefix. Descriptor/path/owner/mode binding, early metadata-change rejection and permanent corruption latching remain unchanged, as does the version-1 disk/wire format. Cursor and snapshot metadata checks are not whole-history audits: an unrequested same-stamp historical rewrite is detected when that frame is requested. Reopen performs independent full-stream validation but has no external witness for pre-startup bytes. This contract does not activate the supervisor or establish native KVM/guest qualification.
+
 ## Current self-FD compatibility contract
 
 The approved follow-up to the MySQL `/dev/fd/63` initialization failure adds

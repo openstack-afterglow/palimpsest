@@ -593,7 +593,10 @@ def test_journal_rejects_duplicate_semantic_transition_and_oversized_output(tmp_
     journal.close()
 
 
-def test_journal_position_pull_is_bounded_and_rechecks_checksum_after_refresh(tmp_path: Path) -> None:
+def test_journal_position_pull_is_bounded_and_rechecks_checksum_after_refresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(supervisor, "_content_state", lambda metadata: (metadata.st_size, 0, 0))
     directory = tmp_path / "journal"
     journal = _journal(directory)
     journal.append(SupervisorRecordKind.READY)
@@ -612,7 +615,7 @@ def test_journal_position_pull_is_bounded_and_rechecks_checksum_after_refresh(tm
     path.write_bytes(changed)
     path.chmod(0o600)
     with pytest.raises(SupervisorError) as checksum:
-        journal._pull_from_position(position, limit=1)
+        journal._pull_from_position(journal._ready_position(), limit=1)
     assert checksum.value.category is SupervisorErrorCategory.JOURNAL_CORRUPT
 
 
@@ -658,6 +661,8 @@ def test_live_journal_stamp_changes_latch_corruption(tmp_path: Path, attack: str
         ).digest()
         path.write_bytes(changed)
         path.chmod(0o600)
+        metadata = path.stat()
+        os.utime(path, ns=(metadata.st_atime_ns, metadata.st_mtime_ns + 1_000_000))
     assert path.stat().st_ino == inode
     with pytest.raises(SupervisorError) as corrupted:
         _ = journal.cursor
@@ -669,6 +674,116 @@ def test_live_journal_stamp_changes_latch_corruption(tmp_path: Path, attack: str
     assert latched.value.category is SupervisorErrorCategory.JOURNAL_CORRUPT
 
 
+@pytest.mark.parametrize("recompute_checksum", [False, True])
+@pytest.mark.parametrize("consumed", [0, 1])
+@pytest.mark.parametrize("consumer", ["position", "session"])
+def test_same_stamp_rewritten_non_tail_output_is_never_returned(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    recompute_checksum: bool,
+    consumed: int,
+    consumer: str,
+) -> None:
+    monkeypatch.setattr(supervisor, "_content_state", lambda metadata: (metadata.st_size, 0, 0))
+    core, journal, _port = _core(tmp_path / "journal")
+    core.mark_ready()
+    session = core.attached_result().session
+    assert session is not None
+    iterator = iter(session.events())
+    outputs = (b"x", b"y", b"z")
+    for value in outputs:
+        core.append_output(ProcessStream.STDOUT, value)
+    position = journal._ready_position()
+    for index in range(consumed):
+        if consumer == "position":
+            records, position = journal._pull_from_position(position, limit=1)
+            assert tuple(record.data for record in records) == (outputs[index],)
+        else:
+            assert next(iterator) == ProcessOutputEvent(ProcessStream.STDOUT, outputs[index])
+    path = tmp_path / "journal" / supervisor._JOURNAL_NAME
+    original = path.read_bytes()
+    offset = len(supervisor._JOURNAL_HEADER)
+    for _ in range(consumed + 1):
+        length = supervisor._FRAME_LENGTH.unpack_from(original, offset)[0]
+        offset += supervisor._FRAME_LENGTH.size + length + supervisor._CHECKSUM_BYTES
+    length = supervisor._FRAME_LENGTH.unpack_from(original, offset)[0]
+    payload_offset = offset + supervisor._FRAME_LENGTH.size
+    payload = original[payload_offset : payload_offset + length]
+    changed_payload = payload.replace(b"eA==" if consumed == 0 else b"eQ==", b"dw==", 1)
+    assert changed_payload != payload
+    changed = bytearray(original)
+    changed[payload_offset : payload_offset + length] = changed_payload
+    if recompute_checksum:
+        checksum_offset = payload_offset + length
+        changed[checksum_offset : checksum_offset + supervisor._CHECKSUM_BYTES] = supervisor.hashlib.sha256(
+            changed_payload
+        ).digest()
+    before = path.stat()
+    path.write_bytes(changed)
+    assert path.stat().st_ino == before.st_ino
+    assert supervisor._content_state(path.stat()) == supervisor._content_state(before)
+    assert journal.cursor == 4  # A cheap cursor is not an audit of unrequested historical bytes.
+    with pytest.raises(SupervisorError) as corrupted:
+        if consumer == "position":
+            journal._pull_from_position(position, limit=1)
+        else:
+            next(iterator)
+    assert corrupted.value.category is SupervisorErrorCategory.JOURNAL_CORRUPT
+    path.write_bytes(original)
+    for action in (
+        lambda: journal.cursor,
+        lambda: journal._pull_from_position(position, limit=1),
+        lambda: journal.append(SupervisorRecordKind.OUTPUT, stream=ProcessStream.STDOUT, data=b"restored"),
+    ):
+        with pytest.raises(SupervisorError) as latched:
+            action()
+        assert latched.value.category is SupervisorErrorCategory.JOURNAL_CORRUPT
+    journal.close()
+
+
+@pytest.mark.parametrize("prefix_count", [8, 256])
+def test_reopened_journal_indexes_seals_and_pulls_only_requested_new_frames(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, prefix_count: int
+) -> None:
+    directory = tmp_path / "journal"
+    journal = _journal(directory)
+    identity = journal.identity
+    journal.append(SupervisorRecordKind.READY)
+    for _ in range(prefix_count):
+        journal.append(SupervisorRecordKind.OUTPUT, stream=ProcessStream.STDOUT, data=b"old")
+    journal.close()
+    descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        journal = SupervisorJournal(descriptor, identity)
+    finally:
+        os.close(descriptor)
+    slow = journal._ready_position()
+    fast = slow
+    for _ in range(prefix_count):
+        records, fast = journal._pull_from_position(fast, limit=1)
+        assert records[0].data == b"old"
+    reads: list[tuple[int, int]] = []
+    original_pread = supervisor.os.pread
+
+    def counted_pread(descriptor: int, length: int, offset: int) -> bytes:
+        content = original_pread(descriptor, length, offset)
+        reads.append((offset, len(content)))
+        return content
+
+    monkeypatch.setattr(supervisor.os, "pread", counted_pread)
+    new = journal.append(SupervisorRecordKind.OUTPUT, stream=ProcessStream.STDERR, data=b"new")
+    assert reads == []
+    records, advanced = journal._pull_from_position(fast, limit=1)
+    assert records == (new,)
+    assert sum(length for _offset, length in reads) == advanced.end_offset - fast.end_offset
+    assert all(offset >= fast.end_offset for offset, _length in reads)
+    reads.clear()
+    records, _ = journal._pull_from_position(slow, limit=1)
+    assert records[0].data == b"old"
+    assert sum(length for _offset, length in reads) < 1024
+    journal.close()
+
+
 def test_incremental_append_and_session_pull_never_reread_prefix(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -677,45 +792,30 @@ def test_incremental_append_and_session_pull_never_reread_prefix(
     core.mark_ready()
     session = core.attached_result().session
     assert session is not None
-    counts = {"pread": 0, "hash": 0, "decode": 0}
+    reads: list[tuple[int, int]] = []
     original_pread = supervisor.os.pread
-    original_sha256 = supervisor.hashlib.sha256
-    original_decode = SupervisorJournal._decode_payload
 
     def counted_pread(descriptor: int, length: int, offset: int) -> bytes:
-        counts["pread"] += 1
-        return original_pread(descriptor, length, offset)
-
-    def counted_sha256(content: bytes = b""):
-        counts["hash"] += 1
-        return original_sha256(content)
-
-    def counted_decode(self, payload: bytes, expected_cursor: int):
-        counts["decode"] += 1
-        return original_decode(self, payload, expected_cursor)
+        content = original_pread(descriptor, length, offset)
+        reads.append((offset, len(content)))
+        return content
 
     monkeypatch.setattr(supervisor.os, "pread", counted_pread)
-    monkeypatch.setattr(supervisor.hashlib, "sha256", counted_sha256)
-    monkeypatch.setattr(SupervisorJournal, "_decode_payload", counted_decode)
     output_count = 256
     for index in range(output_count):
         core.append_output(ProcessStream.STDOUT, bytes([index % 251 + 1]))
     terminal = ProcessExit(0, 0, None, ProcessExitCategory.EXITED)
     core.mark_exit(terminal)
-    new_frame_count = output_count + 1
-    assert counts == {"pread": 0, "hash": new_frame_count * 2, "decode": new_frame_count}
-    assert not any(isinstance(value, (list, dict)) for value in vars(journal).values())
-    assert not any(isinstance(value, (list, dict)) for value in vars(session).values())
-
-    counts.update(pread=0, hash=0, decode=0)
+    assert reads == []
     events = tuple(session.events())
-    assert len(events) == new_frame_count
-    assert events[-1] == ProcessStatusEvent(terminal)
-    assert counts == {
-        "pread": new_frame_count * 3,
-        "hash": new_frame_count * 2,
-        "decode": new_frame_count,
-    }
+    assert events == tuple(
+        ProcessOutputEvent(ProcessStream.STDOUT, bytes([index % 251 + 1])) for index in range(output_count)
+    ) + (ProcessStatusEvent(terminal),)
+    assert (
+        sum(length for _offset, length in reads)
+        == journal._tail_position.end_offset - journal._ready_position().end_offset
+    )
+    assert all(offset >= journal._ready_position().end_offset for offset, _length in reads)
 
 
 def test_existing_journal_is_stream_verified_once_at_open(
@@ -731,37 +831,27 @@ def test_existing_journal_is_stream_verified_once_at_open(
         first.append(SupervisorRecordKind.OUTPUT, stream=ProcessStream.STDOUT, data=b"x")
     first.close()
 
-    counts = {"pread": 0, "hash": 0, "decode": 0}
+    reads: list[tuple[int, int]] = []
     original_pread = supervisor.os.pread
-    original_sha256 = supervisor.hashlib.sha256
-    original_decode = SupervisorJournal._decode_payload
 
     def counted_pread(descriptor: int, length: int, offset: int) -> bytes:
-        counts["pread"] += 1
-        return original_pread(descriptor, length, offset)
-
-    def counted_sha256(content: bytes = b""):
-        counts["hash"] += 1
-        return original_sha256(content)
-
-    def counted_decode(self, payload: bytes, expected_cursor: int):
-        counts["decode"] += 1
-        return original_decode(self, payload, expected_cursor)
+        content = original_pread(descriptor, length, offset)
+        reads.append((offset, len(content)))
+        return content
 
     monkeypatch.setattr(supervisor.os, "pread", counted_pread)
-    monkeypatch.setattr(supervisor.hashlib, "sha256", counted_sha256)
-    monkeypatch.setattr(SupervisorJournal, "_decode_payload", counted_decode)
     directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
     try:
         reopened = SupervisorJournal(directory_fd, identity)
     finally:
         os.close(directory_fd)
     frame_count = output_count + 1
-    assert counts == {"pread": frame_count * 3 + 1, "hash": frame_count * 2, "decode": frame_count}
-    counts.update(pread=0, hash=0, decode=0)
+    assert sum(length for _offset, length in reads) == reopened._tail_position.end_offset
+    assert [offset for offset, _length in reads] == sorted(offset for offset, _length in reads)
+    reads.clear()
     assert reopened.cursor == frame_count
     assert reopened.snapshot.journal_cursor == frame_count
-    assert counts == {"pread": 0, "hash": 0, "decode": 0}
+    assert reads == []
     reopened.close()
 
 
