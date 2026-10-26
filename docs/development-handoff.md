@@ -24,6 +24,13 @@ files_modified:
 [ARCHITECTURE.md](../ARCHITECTURE.md), 실행 경계는 [testing.md](testing.md),
 세부 결과는 아래 링크된 문서와 source다.
 
+## Isolated catalog/unpack assessment — 2026-10-26 (unqualified, unpublished)
+
+- Fresh origin/dev and highest remote release are `89758077aa8c32fd84b4b8a02287bf4b7f483140` / `v0.3.7` (no tag was created). The next available patch slot observed was0.3.8, not reserved. Integration checkout: `/Users/pieroot/code/palimpsest-release-integration-20261026`, local `dev`.
+- Preserved original shared checkout/index and separate evidence under `~/.local/share/afterglow-proofs/palimpsest-release-integration-20261026/`. Integrated catalog DTO/router/service, bounded private package search, isolated fixtures/auth regressions, local unpack and direct architecture/digest helpers/tests/docs. No private settings, unrelated Nova/GPU/benchmark/observer changes or runtime writes.
+- Ported only the completed global catalog human/system primitives into catalog-specific modules. Existing0.3.7 `auth.py`, package/key/publication authority, models/bootstrap and workers remain unchanged. Global reads freshly validate original human/user/home/project/service/delegation and complete raw direct/group system authority before targetless native system:manage policy; consumer authority adapts to current capability labels rather than cutting over package policy. SQL provenance key nullability remains unchanged; catalog test fixtures now carry real synthetic key rows. Metadata/module/Kolla image tag and native-generated locks prepare0.3.8, unpublished.
+- No build/test/lint/format/architecture verification was requested or run. CLI-reference generation and root/Hub `uv lock --offline` alone ran; the lock resolver reported only root/Hub version bumps and newly required oslo-context/oslo-policy packages, preserving the stronger current dependency set. Main owns independent review, fresh qualification, commit/release and production. Commands and gates are below in [testing](testing.md#isolated-catalogunpack-assessment--2026-10-26).
+
 ## Full-source 0.3.5 integration — 2026-10-14 (released, production rollout recorded)
 
 - Integration clone: `/Users/pieroot/code/afterglow-release-all-20261014T073153Z-c2ba90/palimpsest`, based on 0.3.4 `ad1674e842c6cefaf4e2d38705b109a579f56040`. Release PR #24 merged into protected dev as `04d51ad6e1bf00c4b6e5bf82050383d0bb0a10cf`. Original `/Users/pieroot/code/palimpsest` and its index/branch remain outside this documentation assignment. All latest native authority/private build protections plus original public local/client and distributed-role work are preserved; older dated candidates/receipts below do not describe this release's state.

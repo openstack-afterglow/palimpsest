@@ -422,6 +422,9 @@ def _layer_refs_from_store(
 ) -> tuple[LayerRef, ...]:
     refs: list[LayerRef] = []
     previous = parent_digest
+    base_arch = (
+        store.read_metadata(base_digest).get("arch") if digests and store.metadata_path(base_digest).is_file() else None
+    )
     for digest in digests:
         normalized = require_digest(digest)
         blob = store.blob_path(normalized)
@@ -436,7 +439,10 @@ def _layer_refs_from_store(
                 raise PalimpsestError(f"root layer {normalized} does not belong to base image {base_digest}")
         elif actual_parent != previous:
             raise PalimpsestError(f"layer {normalized} does not continue parent {previous}")
-        refs.append(LayerRef(digest=normalized, media_type=MEDIA_TYPE_LAYER_SQUASHFS, local_path=blob))
+        layer_arch = metadata.get("arch")
+        if layer_arch is not None and base_arch is not None and layer_arch != base_arch:
+            raise PalimpsestError(f"layer {normalized} architecture differs from base image {base_digest}")
+        refs.append(LayerRef(digest=normalized, media_type=MEDIA_TYPE_LAYER_SQUASHFS, local_path=blob, arch=layer_arch))
         previous = normalized
     return tuple(refs)
 
@@ -740,7 +746,7 @@ def build_parser() -> argparse.ArgumentParser:
     layer_push.add_argument("--ubuntu-base")
     layer_push.add_argument("--publish", action="store_true")
 
-    bundle = commands.add_parser("bundle", help="download and verify cloud-image/layer bundles")
+    bundle = commands.add_parser("bundle", help="download, unpack, and verify cloud-image/layer bundles")
     bundle_commands = bundle.add_subparsers(dest="bundle_operation", required=True)
     bundle_pull = bundle_commands.add_parser("pull", help="download a Hub layer chain as a local bundle")
     bundle_pull.add_argument("leaf_digest")
@@ -748,6 +754,9 @@ def build_parser() -> argparse.ArgumentParser:
     bundle_pull.add_argument("--include-base", action="store_true")
     bundle_verify = bundle_commands.add_parser("verify", help="verify every descriptor and blob in a local bundle")
     bundle_verify.add_argument("directory", type=Path)
+    bundle_unpack = bundle_commands.add_parser("unpack", help="atomically unpack and verify a local bundle archive")
+    bundle_unpack.add_argument("archive", type=Path)
+    bundle_unpack.add_argument("--output", required=True, type=Path)
 
     oci = commands.add_parser("oci", help="acquire/materialize local OCI images and inspect OCI-root runtimes")
     oci_commands = oci.add_subparsers(dest="oci_operation", required=True)
@@ -1653,15 +1662,19 @@ def _resolve_runtime_stack(
             raise PalimpsestError("first bundle artifact must be a qcow2 or raw cloud-image")
         if any(entry.media_type != MEDIA_TYPE_LAYER_SQUASHFS for entry in entries[1:]):
             raise PalimpsestError("bundle layers must all be SquashFS descriptors")
+        if base_entry.arch is None:
+            raise PalimpsestError(
+                "bundle base architecture is unknown; use a bundle with per-artifact architecture metadata"
+            )
         base_ref = ImageRef(
             digest=base_entry.digest,
             disk_format=disk_format,
-            arch="x86_64",
+            arch=base_entry.arch,
             os_variant=None,
             local_path=base_entry.local_path,
         )
         bundle_layers = tuple(
-            LayerRef(digest=entry.digest, media_type=entry.media_type, local_path=entry.local_path)
+            LayerRef(digest=entry.digest, media_type=entry.media_type, local_path=entry.local_path, arch=entry.arch)
             for entry in entries[1:]
         )
         continuation_parent = bundle_layers[-1].digest if bundle_layers else None
@@ -2653,6 +2666,14 @@ def dispatch_args(args: argparse.Namespace) -> int:
                 tmp_tar = Path(tmpdir) / "bundle.tar"
                 client.pull_bundle(norm_leaf, tmp_tar, include_base_image=args.include_base)
                 extract_bundle_tar(tmp_tar, args.output)
+            print(str(args.output))
+        elif bnd_op == "unpack":
+            import tarfile
+
+            try:
+                extract_bundle_tar(args.archive, args.output)
+            except (OSError, tarfile.TarError) as exc:
+                raise PalimpsestError(f"cannot unpack bundle archive {args.archive}: {exc}") from exc
             print(str(args.output))
         elif bnd_op == "verify":
             layout = verify_layout_dir(args.directory)

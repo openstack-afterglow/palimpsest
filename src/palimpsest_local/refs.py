@@ -177,10 +177,13 @@ class LayerRef:
     digest: str
     media_type: str
     local_path: Path
+    arch: Literal["x86_64", "aarch64"] | None = None
 
     def __post_init__(self) -> None:
         if not self.media_type:
             raise ArtifactValidationError("layer media type must be nonempty")
+        if self.arch is not None and self.arch not in {"x86_64", "aarch64"}:
+            raise ArtifactValidationError(f"unsupported layer architecture: {self.arch!r}")
         object.__setattr__(self, "digest", require_digest(self.digest))
         path = self.local_path.resolve()
         if not path.is_file():
@@ -200,6 +203,8 @@ class StackRef:
         digests = [layer.digest for layer in self.layers]
         if len(set(digests)) != len(digests):
             raise ArtifactValidationError("a stack cannot attach duplicate layer digests")
+        if any(layer.arch is not None and layer.arch != self.base.arch for layer in self.layers):
+            raise ArtifactValidationError("layer architecture differs from its base image")
 
 
 @dataclass(frozen=True)
@@ -268,4 +273,6 @@ class BuildSpec:
             raise ArtifactValidationError(f"recipe is not a file: {recipe}")
         if len(self.parent_layers) > 25:
             raise ArtifactValidationError("a build supports at most 25 parent layers")
+        if any(layer.arch is not None and layer.arch != self.base.arch for layer in self.parent_layers):
+            raise ArtifactValidationError("parent layer architecture differs from the build base image")
         object.__setattr__(self, "recipe", recipe)

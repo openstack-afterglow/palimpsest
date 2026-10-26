@@ -47,6 +47,8 @@ class Settings(DatabaseSettings):
     redis_sentinel_addresses: tuple[tuple[str, int], ...] = ()
     redis_sentinel_master: str = ""
     redis_sentinel_password: SecretStr = SecretStr("")
+    oslo_policy_policy_file: str = "/etc/palimpsest/policy.yaml"
+    oslo_policy_policy_dirs: tuple[str, ...] = ()
 
     palimpsest_hub_local_path: str
     palimpsest_hub_max_blob_bytes: int = Field(default=107374182400, ge=1)

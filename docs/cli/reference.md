@@ -3,7 +3,7 @@
 
 This file is generated from `palimpsest_local.cli.build_parser`. It inventories every command, positional, option, choice, and parser default. For behavior, examples, and runtime restrictions, read [the usage guide](usage.md). Every command except raw `docker` pass-through accepts automatic `-h`/`--help`.
 
-Coverage: **82 command paths**, **250 positional/option definitions** (excluding automatic `-h/--help`).
+Coverage: **83 command paths**, **252 positional/option definitions** (excluding automatic `-h/--help`).
 
 ## `palimpsest`
 
@@ -288,10 +288,10 @@ usage: palimpsest layer push [-h] [--name NAME] [--parent PARENT] [--base-image 
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest bundle [-h] {pull,verify} ...
+usage: palimpsest bundle [-h] {pull,verify,unpack} ...
 ```
 
-Subcommands: `pull`, `verify`.
+Subcommands: `pull`, `verify`, `unpack`.
 
 ### `palimpsest bundle pull`
 
@@ -322,6 +322,21 @@ usage: palimpsest bundle verify [-h] directory
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
 | `directory` | Path | required | Directory to pack or verify. |
+
+### `palimpsest bundle unpack`
+
+[Behavior, restrictions, and examples](usage.md#hub-cloud-images-layers-and-bundles).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest bundle unpack [-h] --output OUTPUT archive
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `archive` | Path | required | Local OCI runtime-bundle tar archive to verify and unpack. |
+| `--output` | Path | required | Destination directory; must be absent or empty before atomic publication. |
 
 ## `palimpsest oci`
 

@@ -46,6 +46,13 @@ palimpsest bundle pull "$LAYER_DIGEST" --output ./bundle --include-base
 palimpsest bundle verify ./bundle
 ```
 
+`bundle unpack ARCHIVE --output DIRECTORY` verifies a downloaded runtime-bundle tar locally and publishes the extracted directory atomically. The destination must be absent or empty; corrupt digests, unsafe archive members and partial extraction are rejected. It does not contact Hub or execute a guest. A runnable bundle must declare its cloud-image base architecture; ordered SquashFS layers are selected automatically and incompatible architecture metadata is refused.
+
+```sh
+palimpsest bundle unpack ./palimpsest-runtime.oci.tar --output ./palimpsest-bundle
+palimpsest bundle verify ./palimpsest-bundle
+```
+
 The Docker-compatible `image inspect`, `image history`, `image rm`, `image save`, and `image load` commands are aliases for Docker-backed operations; they do not inspect or mutate Hub `/v1` cloud-image records.
 
 ## Registry profiles and Docker wrapper commands

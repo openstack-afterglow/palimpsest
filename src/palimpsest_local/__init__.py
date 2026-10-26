@@ -17,7 +17,7 @@ from .errors import (
 from .hub import HubClient
 from .refs import BuildSpec, ImageRef, LayerRef, RunSpec, StackRef
 
-__version__ = "0.3.7"
+__version__ = "0.3.8"
 
 __all__ = [
     "ArtifactValidationError",

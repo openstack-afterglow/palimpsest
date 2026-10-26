@@ -836,6 +836,10 @@ uv run python scripts/test_lanes.py run gate2
 
 Architecture maintenance는 다음 순서로 수행한다.
 
+2026-10-26 isolated catalog/unpack0.3.8 integration: latest origin/dev `89758077aa8c32fd84b4b8a02287bf4b7f483140` is the published0.3.7 baseline. Ported SQL-only visible complete named-leaf discovery, absolute global ancestry/provenance projections and bounded literal package/tag search with actor/query-bound cursors. Global catalog-only `catalog_auth.py` extracts the authored fresh original-human token, complete unique raw user/group system role graph, enabled exact identity/home/project/service vetoes and targetless `catalog_policy.py` system:manage evaluator. Existing0.3.7 `auth.py`, native package manager/key/publication authority, SQL models, private HTTPS executor, Sentinel/shared-CAS and worker recovery are intentionally unchanged; do not replace them with older whole working-source modules. Consumer reads reuse existing inventory/download ceilings and exact visible-filter policy; system-admin download eligibility reflects the existing legacy download path rather than inventing package authority. Local bundle unpack retains canonical directory-marker/digest/atomic publication and immutable per-artifact architecture, typed base/layer matching and no inferred x86_64. Root/Hub module/project/native locks and Kolla image-tag metadata are0.3.8. No build/test/lint/format/architecture verification or stamp ran; only CLI-reference generation and native offline lock resolution ran. No shared checkout, SQL/schema/IAM, runtime, publication or production writes occurred; Main owns fresh qualification and rollout.
+
+2026-10-26 qualification maintenance: real synthetic-Keystone SDK/Uvicorn/SQL policy fences found no concrete authorization integration defect requiring behavior changes. Ruff import/format repairs were mechanical. Independent source review also identified and qualification repaired two concrete contract violations: unpack now accepts the existing optional native blob identity field only through independently digest-bound annotated/leaf configs, rejects explicit mismatch and never infers an unannotated ancestor's architecture; catalog base eligibility checks every descendant declaration against the root, rejecting descendant-only/conflicting dependencies while preserving valid no-base chains. Consumer regressions exercise native package acceptance, verified unpack/runtime-stack resolution and catalog/admin completeness. No schema, authority, policy or deployment contract changes result. Current portable/runtime/container evidence and its non-native/non-production boundaries are recorded in `docs/testing.md`; independent final source review and architecture freshness stamping remain Main-owned.
+
 1. 작업을 시작하기 전에 이 root `ARCHITECTURE.md`와 영향받는 상세 문서를 읽는다.
 2. code/config/schema/dependency/deploy/test 변경이면 실제 reachable source와 테스트를 먼저 읽고, 책임/계약/제한을 이 문서와 상세 문서에 같은 변경으로 반영한다. 구조 영향이 없으면 그 이유를 summary에 기록한다.
 3. 현재 source가 문서와 다르면 source를 정본으로 보고 문서의 과거 계획/qualification 문장을 실제 구현과 분리한다.
@@ -1245,9 +1249,9 @@ Maintenance review — 2026-10-18, approved 0.3.7 controller HA: reviewed Sentin
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "ebc2598ad7d3266c25cf876be463d63b64a102ef9abd185ea7c0ee3ab98bb7be",
-  "reviewed_at": "2026-10-17T19:32:57Z",
-  "summary": "Review0.3.7 Sentinel primary-only ownership, safe parser/minimum Redis cleanup, canonical HA endpoints, qualified shared-CAS bootstrap/per-writer guards and private build context; preserve HTTPS-only build isolation, SQL fencing and native exclusions; operational cutover remains separately gated"
+  "source_sha256": "5de3f42ab2a3b816e1638f28fe5c259f15fc3db02e9331517862025f5c887b28",
+  "reviewed_at": "2026-10-26T13:09:03Z",
+  "summary": "Release0.3.8: isolated catalog/unpack extraction preserves latest project/package auth and schema; fresh human/system-only catalog policy, complete visible base DAG and independently digest-bound optional config identity reviewed. Full root7471/265skip andHub654/2skip, real CLI/Uvicorn synthetic authority and both-architecture three-target execution passed. Native KVM/production qualification separate."
 }
 ```
 <!-- architecture-review:end -->

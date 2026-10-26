@@ -121,6 +121,7 @@ class ChainEntry:
     name: str
     parent_digest: str | None
     local_path: Path
+    arch: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "digest", normalize_digest(self.digest))
@@ -145,6 +146,21 @@ class VerifiedManifest:
 @dataclass(frozen=True)
 class VerifiedLayout:
     manifests: tuple[VerifiedManifest, ...]
+
+
+def _declared_metadata_arch(metadata: dict[str, Any]) -> str | None:
+    config = metadata.get("config_json")
+    nested = config.get("arch") if isinstance(config, dict) else None
+    arch = None
+    for value in (metadata.get("arch"), nested):
+        if value is None:
+            continue
+        if value not in ("x86_64", "aarch64"):
+            raise ArtifactValidationError("artifact architecture must be x86_64 or aarch64")
+        if arch is not None and value != arch:
+            raise ArtifactValidationError("artifact architecture conflicts with config metadata")
+        arch = value
+    return arch
 
 
 class ContentStore:
@@ -177,6 +193,15 @@ class ContentStore:
             except ArtifactStoreError:
                 raise ArtifactValidationError(f"cannot record metadata for missing blob: {normalized}") from None
             record = {**metadata, "digest": normalized, "size": size}
+            incoming_arch = _declared_metadata_arch(record)
+            if incoming_arch is not None:
+                record["arch"] = incoming_arch
+            if self.metadata_path(normalized).exists():
+                previous_arch = _declared_metadata_arch(self.read_metadata(normalized))
+                if previous_arch is not None:
+                    if record.get("arch") not in (None, previous_arch):
+                        raise ArtifactValidationError("artifact architecture conflicts with existing metadata")
+                    record["arch"] = previous_arch
             atomic_write_json(self.metadata_path(normalized), record)
         return self.metadata_path(normalized)
 
@@ -355,13 +380,36 @@ def extract_bundle_tar(tar_path: Path, destination: Path) -> VerifiedLayout:
             raise ArtifactValidationError(f"bundle member count ({len(members)}) exceeds max ({MAX_BUNDLE_MEMBERS})")
 
         by_name: dict[str, tarfile.TarInfo] = {}
+        seen_names: set[str] = set()
         for m in members:
-            if not m.isfile():
+            # Native package archives include these two empty directory markers.
+            # Never extract their paths or apply archive-controlled permissions.
+            if m.isdir():
+                if m.name not in ("blobs", "blobs/sha256") or m.size != 0 or m.linkname:
+                    raise ArtifactValidationError(f"invalid canonical directory member: {m.name!r}")
+                # TarInfo strips every trailing slash from directory names; check
+                # the original header too, rather than accepting aliases like //.
+                position = tar.fileobj.tell()
+                try:
+                    tar.fileobj.seek(m.offset_data - TAR_BLOCK)
+                    header = tar.fileobj.read(TAR_BLOCK)
+                finally:
+                    tar.fileobj.seek(position)
+                raw_name = header[:100].split(b"\0", 1)[0]
+                prefix = header[345:500].split(b"\0", 1)[0]
+                canonical = m.name.encode("ascii")
+                if prefix or raw_name not in (canonical, canonical + b"/"):
+                    raise ArtifactValidationError(f"invalid canonical directory member: {m.name!r}")
+                safe_name = m.name
+            elif m.isfile():
+                safe_name = _safe_member_name(m.name)
+            else:
                 raise ArtifactValidationError(f"bundle member is not a regular file: {m.name!r}")
-            safe_name = _safe_member_name(m.name)
-            if safe_name in by_name:
+            if safe_name in seen_names:
                 raise ArtifactValidationError(f"duplicate member name in bundle: {safe_name!r}")
-            by_name[safe_name] = m
+            seen_names.add(safe_name)
+            if m.isfile():
+                by_name[safe_name] = m
 
         if "oci-layout" not in by_name:
             raise ArtifactValidationError("bundle missing oci-layout member")
@@ -533,6 +581,7 @@ def extract_bundle_tar(tar_path: Path, destination: Path) -> VerifiedLayout:
                             name=name,
                             parent_digest=prev_digest,
                             local_path=l_path,
+                            arch=_bundle_entry_arch(l_desc, c_desc.digest, blobs_dir, leaf=l_desc is layer_descs[-1]),
                         )
                     )
                     prev_digest = l_desc.digest
@@ -568,6 +617,7 @@ def extract_bundle_tar(tar_path: Path, destination: Path) -> VerifiedLayout:
                         name=e.name,
                         parent_digest=e.parent_digest,
                         local_path=dest_path / "blobs" / "sha256" / digest_hex(e.digest),
+                        arch=e.arch,
                     )
                     for e in vm.entries
                 ]
@@ -585,6 +635,44 @@ def extract_bundle_tar(tar_path: Path, destination: Path) -> VerifiedLayout:
         except Exception:
             shutil.rmtree(tmp_work_dir, ignore_errors=True)
             raise
+
+
+def _read_bundle_config(digest: str, blobs_dir: Path) -> dict[str, Any]:
+    path = blobs_dir / digest_hex(digest)
+    if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_JSON_BYTES:
+        raise ArtifactValidationError("bundle layer config is missing or unsafe")
+    payload = path.read_bytes()
+    if config_digest(payload) != digest:
+        raise DigestMismatchError("bundle layer config digest mismatch")
+    try:
+        config = json.loads(payload)
+    except (ValueError, UnicodeError) as exc:
+        raise ArtifactValidationError("bundle layer config must be a JSON object") from exc
+    if not isinstance(config, dict):
+        raise ArtifactValidationError("bundle layer config must be a JSON object")
+    return config
+
+
+def _bundle_entry_arch(layer: Descriptor, fallback_config: str, blobs_dir: Path, *, leaf: bool) -> str | None:
+    """Use per-layer or leaf config bindings; never infer an unlabelled ancestor's arch."""
+    annotation = layer.annotations.get("dev.afterglow.palimpsest.config-digest")
+    selected = normalize_digest(annotation) if annotation is not None else fallback_config
+    config = _read_bundle_config(selected, blobs_dir)
+    if (
+        leaf
+        and annotation is not None
+        and selected != fallback_config
+        and config != _read_bundle_config(fallback_config, blobs_dir)
+    ):
+        raise ArtifactValidationError("bundle leaf annotation and manifest configs conflict")
+    if annotation is None and not leaf and config.get("blob_digest") != layer.digest:
+        return None
+    if config.get("blob_digest", layer.digest) != layer.digest:
+        raise ArtifactValidationError("bundle layer config names a different blob")
+    arch = config.get("arch")
+    if arch is not None and arch not in ("x86_64", "aarch64"):
+        raise ArtifactValidationError("bundle layer architecture is unsupported")
+    return arch
 
 
 def verify_layout_dir(directory: Path) -> VerifiedLayout:
@@ -701,6 +789,9 @@ def verify_layout_dir(directory: Path) -> VerifiedLayout:
                     name=name,
                     parent_digest=prev_digest,
                     local_path=l_path,
+                    arch=_bundle_entry_arch(
+                        l_desc, c_desc.digest, dir_path / "blobs" / "sha256", leaf=l_desc is layer_descs[-1]
+                    ),
                 )
             )
             prev_digest = l_desc.digest

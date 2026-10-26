@@ -4,6 +4,15 @@ All notable changes to Palimpsest Local are documented here.
 
 ## [Unreleased]
 
+## [0.3.8] - 2026-10-26
+
+- Add SQL-only visible named-leaf asset discovery and separately authorized global administrator layer ancestry/provenance catalog. Preserve the current0.3.7 project/package/publication authority; only global catalog reads use fresh human/system graph validation and targetless native `system:manage` policy.
+- Add bounded literal package/tag search with query-bound cursors while preserving existing no-search cursor identity, package scope and immutable provenance/schema.
+
+- Add local `bundle unpack ARCHIVE --output DIRECTORY` through existing atomic verified extraction; accept only canonical empty native directory markers, preserve digest/size/path checks, and reject unknown or conflicting runtime architecture rather than assuming x86_64.
+- Preserve accepted native packages whose independently bound config omits optional `blob_digest`, without accepting explicit mismatches or guessing unannotated ancestor architecture. Exclude descendant-only/conflicting base dependencies from complete catalog eligibility while retaining reusable no-base chains.
+- Prepare source-only metadata with isolated portable, real synthetic-authority/SQL HTTP, CLI-unpack and local amd64/arm64 image qualification; repair extracted import/format gate failures. Publication, independent source review, native reviewer gates and production cutover remain Main-owned; no deployment or native-runtime success is claimed.
+
 ## [0.3.7] - 2026-10-18
 
 - Support multi-controller API/export deployment with an explicitly qualified shared CAS. Reject multi-host local volumes and missing, aliased or mismatched mounts before bootstrap/each writer start; never provision or chown shared storage, and preserve stop/pull/destroy during mount outages.
