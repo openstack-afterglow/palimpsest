@@ -2,8 +2,10 @@
 
 ## Overview
 
+**Current publication —0.3.10:** protected [PR34](https://github.com/openstack-afterglow/palimpsest/pull/34) merged as `c63d9507b774220164babd1bb6e7eb450a693c26`; immutable `v0.3.10`, PyPI/GitHub client distributions and all three versioned GHCR services are published from that revision. Public package bytes and pulled image source/version labels were verified against the reviewed source. The Kolla deployment server now selects/locks/installs client0.3.10 and selects the matching immutable service digests; other packages and non-image configuration are unchanged. This is not a production service rollout, database upgrade, worker unquarantine, API workload acceptance or native/GPU qualification. Exact digests, checks and installer recovery are in the [completion handoff](docs/development-handoff.md#latest-source-formal-release0310--2026-10-28-published-operator-selection-updated-no-service-rollout). Later documentation-only follow-through never moves the release tag or changes its code.
+
 **Historical publication snapshot — 0.3.1:** the next paragraph records that
-release's metadata, pins and held rollout; current 0.3.5 integration contracts follow it.
+release's metadata, pins and held rollout; dated0.3.5 integration contracts follow it, not the current publication state.
 
 Palimpsest Local은 검증된 cloud image, SquashFS layer, OCI-layout bundle을 로컬에서 보관하고, 선언형 VM 프로젝트와 OCI-root 실행을 제공하는 독립 Python CLI다. root 배포판(`palimpsest-client`)의 repository는 [openstack-afterglow/palimpsest](https://github.com/openstack-afterglow/palimpsest)다. Immutable `v0.3.1` source `1458db42a1449a25b664584d144d0a97086f8f6f`의 root wheel/sdist는 PyPI와 GitHub Release에 게시됐고 별도 Hub API/worker image도 같은 revision의 Linux amd64 digest로 게시됐다. Hub Python wheel은 root release 산출물이 아니다. Root/Hub metadata/locks/module/Kolla image tag는 0.3.1로 일치하지만 운영 배포나 native KVM qualification을 뜻하지 않는다. Kolla source-build 기본 ref는 기존 검토된 Hub 0.3.0 commit `c4887f7806608e98f215abbd377d2eafe159ff76`이므로 source-mode에는 별도 검토한 release SHA를, image-mode에는 [`docs/install.md`](docs/install.md)의 정확한 API/worker digest를 pin해야 한다. 운영 cutover는 승인된 requester-project service-grade 할당·auth/storage/recovery 검토 전까지 보류됐다.
 
