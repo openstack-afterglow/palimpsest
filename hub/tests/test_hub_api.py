@@ -1333,7 +1333,7 @@ def test_cloud_image_requires_disk_format():
         HubLayerMeta(name="ubuntu", kind="cloud-image", disk_format=None)
 
 
-def test_cloud_image_requires_arch_but_generic_legacy_layer_keeps_null_arch():
+def test_new_cloud_image_requires_arch_but_legacy_layer_can_remain_unknown():
     with pytest.raises(ValueError, match="arch"):
         HubLayerMeta(name="ubuntu", kind="cloud-image", disk_format="qcow2")
     assert HubLayerMeta(name="legacy-layer", kind="squashfs").arch is None
@@ -1668,7 +1668,7 @@ async def test_export_download_ticket_resumes_real_bytes_and_rechecks_download_a
 
     def current_owner(user_id, project_id):
         assert (user_id, project_id) == ("user-1", "project-1")
-        return {"package_capabilities": frozenset(capabilities)}
+        return {"package_actions": {"packages:read"} if "palimpsest-download_user" in capabilities else set()}
 
     monkeypatch.setattr(hub_api, "get_redis", fake_get_redis)
     monkeypatch.setattr(hub_api, "get_project_export", fake_get_project_export)
@@ -1938,7 +1938,7 @@ async def test_me_http_success_and_auth_errors_are_not_cacheable(monkeypatch):
             raise HTTPException(status_code=state["status"], detail="Current authority unavailable")
         return {**token_info, "package_capabilities": frozenset({"palimpsest-inventory_reader"})}
 
-    monkeypatch.setattr(hub_api, "get_legacy_member_info", current_member)
+    monkeypatch.setattr(hub_api, "get_package_manager_info", current_member)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://fixture") as client:
         missing = await client.get("/v1/me")
         assert missing.status_code == 401 and missing.headers["cache-control"] == "no-store"
@@ -1978,20 +1978,25 @@ async def test_me_http_success_and_auth_errors_are_not_cacheable(monkeypatch):
             {"inventory": False, "download": True, "upload": False, "delete": False, "build": False},
         ),
         (False, set(), {"inventory": False, "download": False, "upload": False, "delete": False, "build": False}),
-        (True, set(), {"inventory": True, "download": True, "upload": False, "delete": True, "build": True}),
+        (True, set(), {"inventory": False, "download": False, "upload": False, "delete": True, "build": True}),
         (
             True,
             {"palimpsest-publish_editor"},
-            {"inventory": True, "download": True, "upload": True, "delete": True, "build": True},
+            {"inventory": False, "download": False, "upload": True, "delete": True, "build": True},
         ),
     ],
 )
 async def test_me_capabilities_do_not_infer_extra_authority(monkeypatch, system_admin, leaves, expected):
 
     async def current_member(token_info):
-        return {**token_info, "package_capabilities": frozenset(leaves)}
+        return {
+            **token_info,
+            "package_capabilities": frozenset(leaves),
+            "is_package_system_admin": system_admin,
+            "package_actions": {"system:manage"} if system_admin else set(),
+        }
 
-    monkeypatch.setattr(hub_api, "get_legacy_member_info", current_member)
+    monkeypatch.setattr(hub_api, "get_package_manager_info", current_member)
     identity = {"user_id": "member", "project_id": "alpha", "roles": ["admin"], "is_system_admin": system_admin}
     context = await hub_api.get_hub_identity(identity)
     assert context["capabilities"] == expected
@@ -2139,7 +2144,12 @@ async def test_declared_digest_shortcut_requires_inventory_and_write_only_repeat
         capabilities = {"palimpsest-publish_editor"}
         if inventory:
             capabilities.add("palimpsest-inventory_reader")
-        return {"project_id": "alpha", "user_id": "publisher", "package_capabilities": frozenset(capabilities)}
+        return {
+            "project_id": "alpha",
+            "user_id": "publisher",
+            "package_capabilities": frozenset(capabilities),
+            "package_actions": {"packages:write", "packages:inventory"} if inventory else {"packages:write"},
+        }
 
     app.dependency_overrides[hub_api._legacy_writer] = writer
     try:
@@ -2189,6 +2199,575 @@ async def test_declared_digest_shortcut_requires_inventory_and_write_only_repeat
             row = await session.scalar(select(PalimpsestHubLayer).where(PalimpsestHubLayer.blob_digest == digest))
             assert row.name == "private-descriptor" and row.project_id == "alpha" and row.created_by == "owner"
             assert (await session.scalars(select(PalimpsestHubUpload))).all() == []
+    finally:
+        app.dependency_overrides.clear()
+        await engine.dispose()
+
+
+async def _upload_arch_fixture(client, payload: bytes, meta: dict, *, headers: dict | None = None):
+    started = await client.post("/v1/uploads", json={}, headers=headers)
+    assert started.status_code == 200, started.text
+    upload = started.json()["session_id"]
+    patched = await client.patch(
+        f"/v1/uploads/{upload}", content=payload, headers={**(headers or {}), "Upload-Offset": "0"}
+    )
+    assert patched.status_code == 200, patched.text
+    response = await client.put(
+        f"/v1/uploads/{upload}", json=meta, headers={**(headers or {}), "Upload-Offset": str(len(payload))}
+    )
+    if response.status_code >= 400:
+        aborted = await client.delete(f"/v1/uploads/{upload}", headers=headers)
+        assert aborted.status_code == 204, aborted.text
+    return response
+
+
+@pytest.mark.asyncio
+async def test_layer_arch_survives_upload_short_circuit_filter_pagination_and_bundle(
+    store: LocalPathBlobStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    engine, _ = await _prepared_hub(tmp_path, "arch-source.sqlite", store, monkeypatch)
+
+    async def identity(request: Request):
+        return {
+            "project_id": request.headers.get("x-project-id", "alpha"),
+            "user_id": "member",
+            "package_capabilities": {"palimpsest-inventory_reader"},
+            "package_actions": {"packages:inventory", "packages:write", "packages:read"},
+        }
+
+    for dependency in (hub_api._legacy_writer, hub_api._legacy_inventory, hub_api._legacy_download):
+        app.dependency_overrides[dependency] = identity
+    destination_engine = None
+    try:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            entries = [("intel-one", "x86_64"), ("unknown", None), ("arm", "aarch64"), ("intel-two", "x86_64")]
+            digests = {}
+            for name, arch in entries:
+                response = await _upload_arch_fixture(client, name.encode(), {"name": name, "arch": arch})
+                assert response.status_code == 200, response.text
+                digest = response.json()["blob_digest"]
+                digests[name] = digest
+                detail = (await client.get(f"/v1/layers/{digest}")).json()
+                assert detail["arch"] == arch and detail["config_json"]["arch"] == arch
+                short = await client.post("/v1/uploads", json={"digest": digest})
+                assert short.status_code == 200 and short.json()["already_present"] is True
+                assert short.json()["registration"]["arch"] == arch
+                assert short.json()["registration"]["config_json"]["arch"] == arch
+                assert (await client.get(f"/v1/layers/{digest}/blob")).content == name.encode()
+
+            params = {"kind": "squashfs", "arch": "x86_64"}
+            selected = (await client.get("/v1/layers", params=params)).json()
+            assert [item["blob_digest"] for item in selected] == [digests["intel-two"], digests["intel-one"]]
+            for offset, expected in ((0, [digests["intel-two"]]), (1, [digests["intel-one"]]), (2, [])):
+                page = await client.get("/v1/layers", params={**params, "offset": offset, "limit": 1})
+                assert page.status_code == 200
+                assert [item["blob_digest"] for item in page.json()] == expected
+            arm = (await client.get("/v1/layers", params={"kind": "squashfs", "arch": "aarch64"})).json()
+            assert [item["blob_digest"] for item in arm] == [digests["arm"]]
+            assert len((await client.get("/v1/layers", params={"kind": "squashfs"})).json()) == 4
+            assert (await client.get("/v1/layers", params={**params, "arch": "unknown"})).status_code == 422
+            assert (await client.get("/v1/layers", params=params, headers={"x-project-id": "beta"})).json() == []
+
+            exported = await client.post("/v1/bundles", json={"refs": list(digests.values())})
+            assert exported.status_code == 200, exported.text
+            destination = LocalPathBlobStore(tmp_path / "arch-destination")
+            destination_engine, _ = await _prepared_hub(tmp_path, "arch-destination.sqlite", destination, monkeypatch)
+            imported = await client.post("/v1/bundles/import", files={"file": ("bundle.tar", exported.content)})
+            assert imported.status_code == 200, imported.text
+            assert imported.json()["skipped"] == [] and imported.json()["imported_count"] == 4
+            for name, arch in entries:
+                detail = (await client.get(f"/v1/layers/{digests[name]}")).json()
+                assert detail["arch"] == arch and detail["config_json"]["arch"] == arch
+                assert (await client.get(f"/v1/layers/{digests[name]}/blob")).content == name.encode()
+    finally:
+        app.dependency_overrides.clear()
+        if destination_engine is not None:
+            await destination_engine.dispose()
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_registration_rejects_known_visible_arch_conflicts_without_inheriting_unknown(
+    store: LocalPathBlobStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    engine, _ = await _prepared_hub(tmp_path, "arch-validation.sqlite", store, monkeypatch)
+
+    async def identity(request: Request):
+        return {"project_id": request.headers.get("x-project-id", "alpha"), "user_id": "member"}
+
+    app.dependency_overrides[hub_api._legacy_writer] = identity
+    app.dependency_overrides[hub_api._legacy_inventory] = identity
+    try:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            base = await _upload_arch_fixture(
+                client, b"intel base", {"name": "base", "kind": "cloud-image", "disk_format": "raw", "arch": "x86_64"}
+            )
+            assert base.status_code == 200, base.text
+            base_digest = base.json()["blob_digest"]
+            root = await _upload_arch_fixture(client, b"intel root", {"name": "root", "arch": "x86_64"})
+            assert root.status_code == 200, root.text
+            root_digest = root.json()["blob_digest"]
+            middle = await _upload_arch_fixture(
+                client, b"legacy middle", {"name": "middle", "parent_digest": root_digest}
+            )
+            assert middle.status_code == 200, middle.text
+            middle_digest = middle.json()["blob_digest"]
+            assert (await client.get(f"/v1/layers/{middle_digest}")).json()["arch"] is None
+            for index, dependencies in enumerate(
+                (
+                    {"base_image_digest": base_digest},
+                    {"parent_digest": middle_digest},
+                    {"base_image_digest": base_digest, "parent_digest": middle_digest},
+                )
+            ):
+                payload = f"contradictory-{index}".encode()
+                rejected = await _upload_arch_fixture(
+                    client, payload, {"name": "bad", "arch": "aarch64", **dependencies}
+                )
+                assert rejected.status_code == 422, rejected.text
+                assert "architecture" in rejected.json()["detail"]
+                assert (await client.get(f"/v1/layers/{_sha256(payload)}")).status_code == 404
+                assert not store.exists(_sha256(payload))
+            unknown = await _upload_arch_fixture(
+                client, b"unknown manual bytes", {"name": "unknown", "base_image_digest": base_digest}
+            )
+            assert unknown.status_code == 200, unknown.text
+            detail = (await client.get(f"/v1/layers/{unknown.json()['blob_digest']}")).json()
+            assert detail["arch"] is None and detail["config_json"]["arch"] is None
+            arm = await _upload_arch_fixture(client, b"arm root", {"name": "arm-root", "arch": "aarch64"})
+            assert arm.status_code == 200, arm.text
+            mixed = await _upload_arch_fixture(
+                client,
+                b"mixed unknown",
+                {
+                    "name": "mixed-unknown",
+                    "parent_digest": arm.json()["blob_digest"],
+                    "base_image_digest": base_digest,
+                },
+            )
+            assert mixed.status_code == 422, mixed.text
+            conflict = await _upload_arch_fixture(client, b"intel root", {"name": "root", "arch": "aarch64"})
+            assert conflict.status_code == 409 and "arch" in conflict.json()["detail"]
+            assert (await client.get(f"/v1/layers/{root_digest}")).json()["arch"] == "x86_64"
+            # Hidden and absent dependencies must produce the same observable behavior.
+            for index, dependency in enumerate((base_digest, _sha256(b"missing base"))):
+                accepted = await _upload_arch_fixture(
+                    client,
+                    f"opaque-{index}".encode(),
+                    {"name": f"opaque-{index}", "arch": "aarch64", "base_image_digest": dependency},
+                    headers={"x-project-id": "beta"},
+                )
+                assert accepted.status_code == 200, accepted.text
+            # Legacy rows remain readable, but new cloud uploads need an explicit target.
+            unlabelled_base = await _upload_arch_fixture(
+                client, b"legacy image", {"name": "legacy-base", "kind": "cloud-image", "disk_format": "raw"}
+            )
+            assert unlabelled_base.status_code == 422
+    finally:
+        app.dependency_overrides.clear()
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_bundle_import_rejects_mixed_known_arch_chain_without_publishing(
+    store: LocalPathBlobStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root_digest = _put_blob(store, b"intel parent bytes")
+    leaf_digest = _put_blob(store, b"arm child bytes")
+    chain = [
+        BundleLayer(root_digest, len(b"intel parent bytes"), "intel", {"name": "intel", "arch": "x86_64"}),
+        BundleLayer(
+            leaf_digest,
+            len(b"arm child bytes"),
+            "arm",
+            {
+                "name": "arm",
+                "arch": "aarch64",
+                "parent_digest": root_digest,
+            },
+        ),
+    ]
+    payload = _gzip_bundle(store, chain)
+    destination = LocalPathBlobStore(tmp_path / "mixed-destination")
+    engine, factory = await _prepared_hub(tmp_path, "mixed-bundle.sqlite", destination, monkeypatch)
+    try:
+        response = await _import_bundle_over_http(payload)
+        assert response.status_code == 422, response.text
+        assert "architecture" in response.json()["detail"]
+        async with factory() as session:
+            assert (await session.execute(select(PalimpsestHubLayer))).scalars().all() == []
+        assert not destination.exists(root_digest) and not destination.exists(leaf_digest)
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_bundle_import_rejects_conflicting_base_declared_in_later_manifest(
+    store: LocalPathBlobStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    base_payload, layer_payload = b"later intel image", b"earlier arm layer"
+    base_digest = _put_blob(store, base_payload)
+    layer_digest = _put_blob(store, layer_payload)
+    base = BundleLayer(
+        base_digest,
+        len(base_payload),
+        "intel-base",
+        {
+            "name": "intel-base",
+            "kind": "cloud-image",
+            "disk_format": "qcow2",
+            "arch": "x86_64",
+        },
+        media_type=MEDIA_TYPE_IMAGE_QCOW2,
+    )
+    layer = BundleLayer(
+        layer_digest,
+        len(layer_payload),
+        "arm-layer",
+        {
+            "name": "arm-layer",
+            "arch": "aarch64",
+            "base_image_digest": base_digest,
+        },
+    )
+    payload = b"".join(iter_bundle_tar(store, [[layer], [base]]))
+    destination = LocalPathBlobStore(tmp_path / "later-base-destination")
+    engine, factory = await _prepared_hub(tmp_path, "later-base.sqlite", destination, monkeypatch)
+    try:
+        response = await _import_bundle_over_http(payload)
+        assert response.status_code == 422, response.text
+        assert "architecture" in response.json()["detail"]
+        async with factory() as session:
+            assert (await session.execute(select(PalimpsestHubLayer))).scalars().all() == []
+        assert not destination.exists(base_digest) and not destination.exists(layer_digest)
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_explicit_admin_native_upload_publish_read_bundle_delete_uses_target(store, tmp_path, monkeypatch):
+    engine, factory = await _prepared_hub(tmp_path, "admin-native.sqlite", store, monkeypatch)
+    admin = {
+        "project_id": "operator-home",
+        "project_name": "Operator Home",
+        "user_id": "real-admin",
+        "token": "original-admin-token",
+        "roles": ["admin"],
+        "is_system_admin": True,
+        "is_package_system_admin": True,
+        "target_project_id": "selected-project",
+        "target_project_name": "Selected Project",
+        "package_actions": {"packages:inventory", "packages:read", "packages:write", "system:manage"},
+    }
+    original = dict(admin)
+
+    async def identity(request: Request):
+        return {**admin, "user_id": request.headers.get("x-owner", admin["user_id"])}
+
+    async def recheck(info):
+        return info
+
+    app.dependency_overrides[hub_api.get_package_manager_info] = identity
+    app.dependency_overrides[hub_api.require_admin] = identity
+    monkeypatch.setattr(hub_api, "revalidate_package_admin", recheck)
+    hidden = _put_blob(store, b"foreign private bytes")
+    public = _put_blob(store, b"foreign published bytes")
+    async with factory() as session:
+        for digest, published in ((hidden, False), (public, True)):
+            session.add(
+                PalimpsestHubLayer(
+                    blob_digest=digest,
+                    size_bytes=store.size(digest),
+                    media_type=MEDIA_TYPE_LAYER_SQUASHFS,
+                    config_digest=_sha256(b"foreign config"),
+                    name="foreign",
+                    kind="squashfs",
+                    config_json={},
+                    project_id="foreign-project",
+                    is_published=published,
+                    created_by="foreign-owner",
+                )
+            )
+        await session.commit()
+    try:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            payload = b"native admin layer"
+            started = await client.post("/v1/uploads", json={})
+            assert started.status_code == 200, started.text
+            upload_id = started.json()["session_id"]
+            async with factory() as session:
+                upload = await session.get(PalimpsestHubUpload, upload_id)
+                assert (upload.project_id, upload.created_by) == ("selected-project", "real-admin")
+            other_admin = {"X-Owner": "other-real-admin"}
+            assert (await client.get(f"/v1/uploads/{upload_id}", headers=other_admin)).status_code == 404
+            assert (await client.delete(f"/v1/uploads/{upload_id}", headers=other_admin)).status_code == 404
+            appended = await client.patch(f"/v1/uploads/{upload_id}", content=payload, headers={"Upload-Offset": "0"})
+            assert appended.status_code == 200, appended.text
+            registered = await client.put(
+                f"/v1/uploads/{upload_id}",
+                headers={"Upload-Offset": str(len(payload))},
+                json={"name": "admin-layer", "is_published": True},
+            )
+            assert registered.status_code == 200, registered.text
+            digest = registered.json()["blob_digest"]
+            detail = await client.get(f"/v1/layers/{digest}")
+            assert detail.status_code == 200, detail.text
+            assert detail.json()["project_id"] == "selected-project"
+            assert detail.json()["created_by"] == "real-admin" and detail.json()["is_published"] is True
+            assert (await client.get(f"/v1/layers/{digest}/blob")).content == payload
+            assert (await client.get(f"/v1/layers/{digest}/ancestors")).json()[0]["blob_digest"] == digest
+            bundle = await client.post("/v1/bundles", json={"refs": [digest]})
+            assert bundle.status_code == 200, bundle.text
+            with tarfile.open(fileobj=io.BytesIO(bundle.content)) as archive:
+                assert archive.extractfile(f"blobs/sha256/{digest[7:]}").read() == payload
+            listed = (await client.get("/v1/layers")).json()
+            assert hidden not in {row["blob_digest"] for row in listed}
+            assert (await client.get(f"/v1/layers/{hidden}/blob")).status_code == 404
+            assert (await client.post("/v1/bundles", json={"refs": [hidden]})).status_code == 404
+            for foreign in (hidden, public):
+                assert (await client.delete(f"/v1/layers/{foreign}")).status_code == 404
+            rejected_publish = await _upload_arch_fixture(
+                client, b"foreign private bytes", {"name": "foreign", "is_published": True}
+            )
+            assert rejected_publish.status_code == 404
+            assert (await client.delete(f"/v1/layers/{digest}")).status_code == 204
+            assert (await client.get(f"/v1/layers/{digest}")).status_code == 404
+            async with factory() as session:
+                assert (await session.execute(select(PalimpsestHubLayerAccess))).scalars().all() == []
+                assert (await session.execute(select(PalimpsestHubUpload))).scalars().all() == []
+        assert admin == original
+    finally:
+        app.dependency_overrides.clear()
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_native_gates_do_not_promote_system_flag_or_ordinary_member_capabilities():
+    raw_admin = {"project_id": "home", "user_id": "machine", "is_system_admin": True}
+    for gate in (hub_api._legacy_writer, hub_api._legacy_inventory, hub_api._legacy_download):
+        with pytest.raises(HTTPException) as denied:
+            await gate(raw_admin)
+        assert denied.value.status_code == 403
+    inventory = {**raw_admin, "is_system_admin": False, "package_actions": {"packages:inventory"}}
+    assert await hub_api._legacy_inventory(inventory) is inventory
+    for gate in (hub_api._legacy_writer, hub_api._legacy_download):
+        with pytest.raises(HTTPException) as denied:
+            await gate(inventory)
+        assert denied.value.status_code == 403
+    with pytest.raises(HTTPException) as denied:
+        await finalize_upload(
+            "a" * 32,
+            HubLayerMeta(name="not-human-admin", is_published=True),
+            Request({"type": "http", "method": "PUT", "path": "/", "headers": []}),
+            raw_admin,
+        )
+    assert denied.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_me_preserves_original_identity_and_reports_explicit_admin_target(monkeypatch):
+    original = {
+        "project_id": "operator-home",
+        "project_name": "Home",
+        "user_id": "real-admin",
+        "token": "never-return",
+        "roles": ["admin"],
+        "is_system_admin": True,
+        "target_project_id": "selected-project",
+    }
+    snapshot = dict(original)
+
+    async def manager(token_info):
+        assert token_info is original
+        return {
+            **token_info,
+            "is_package_system_admin": True,
+            "target_project_name": "Selected",
+            "package_actions": {"system:manage"},
+            "package_capabilities": {
+                "palimpsest-inventory_reader",
+                "palimpsest-download_user",
+                "palimpsest-publish_editor",
+            },
+        }
+
+    monkeypatch.setattr(hub_api, "get_package_manager_info", manager)
+    result = await hub_api.get_hub_identity(original)
+    assert result["project_id"] == "operator-home" and result["project_name"] == "Home"
+    assert result["user_id"] == "real-admin" and result["roles"] == ["admin"]
+    assert result["target_project_id"] == "selected-project" and result["target_project_name"] == "Selected"
+    assert all(result["capabilities"].values()) and "token" not in result
+    assert original == snapshot
+
+
+@pytest.mark.asyncio
+async def test_cross_target_image_export_rejected_without_calling_source_consumer(monkeypatch):
+    async def unexpected(*args):
+        pytest.fail("cross-target export reached the original-scope OpenStack consumer")
+
+    monkeypatch.setattr(hub_api, "enqueue_image_export", unexpected)
+    request = Request({"type": "http", "method": "POST", "path": "/", "headers": []})
+    info = {"project_id": "source", "target_project_id": "target", "is_package_system_admin": True}
+    with pytest.raises(HTTPException) as denied:
+        await hub_api.create_image_export.__wrapped__(
+            request,
+            hub_api.HubImageExportRequest(image_id="11111111-1111-1111-1111-111111111111", disk_format="raw"),
+            object(),
+            info,
+        )
+    assert denied.value.status_code == 403 and info["project_id"] == "source"
+
+
+@pytest.mark.asyncio
+async def test_admin_export_ticket_revalidates_original_human_context_and_target(monkeypatch):
+    export_id = UUID("33333333-3333-3333-3333-333333333333")
+    digest = _sha256(b"export")
+    captured = {}
+    admin = {
+        "project_id": "home",
+        "target_project_id": "target",
+        "user_id": "real-admin",
+        "token": "original-human-token",
+        "is_package_system_admin": True,
+    }
+
+    class TicketRedis:
+        async def setex(self, key, ttl, payload):
+            captured["payload"] = json.loads(payload)
+
+        async def get(self, key):
+            return json.dumps(captured["payload"])
+
+    async def redis():
+        return TicketRedis()
+
+    async def export(project_id, requested_id):
+        assert (project_id, requested_id) == ("target", str(export_id))
+        return SimpleNamespace(id=str(export_id))
+
+    async def revoked(context):
+        assert context == {key: admin[key] for key in ("token", "user_id", "project_id", "target_project_id")}
+        raise HTTPException(status_code=403, detail="Current human administrator required")
+
+    monkeypatch.setattr(hub_api, "get_redis", redis)
+    monkeypatch.setattr(hub_api, "get_project_export", export)
+    monkeypatch.setattr(hub_api, "_store_or_503", lambda: object())
+    monkeypatch.setattr(hub_api, "_complete_export_blob", lambda *_: (digest, 6, "x", "application/octet-stream"))
+    monkeypatch.setattr(hub_api, "revalidate_package_admin", revoked)
+    issued = await hub_api.create_image_export_download_token(export_id, Response(), admin)
+    assert "original-human-token" not in json.dumps(issued)
+    request = Request({"type": "http", "method": "GET", "path": "/", "headers": []})
+    with pytest.raises(HTTPException) as denied:
+        await hub_api.download_image_export_with_token(export_id, request, "t" * 32)
+    assert denied.value.status_code == 403
+
+    async def current_admin(context):
+        assert context["project_id"] == "home" and context["target_project_id"] == "target"
+        assert context["token"] == "original-human-token"
+        return {**context, "is_package_system_admin": True, "package_actions": {"packages:read"}}
+
+    response = object()
+    monkeypatch.setattr(hub_api, "revalidate_package_admin", current_admin)
+    monkeypatch.setattr(hub_api, "_blob_response", lambda **kwargs: response)
+    assert await hub_api.download_image_export_with_token(export_id, request, "t" * 32) is response
+    captured["payload"]["admin_context"]["target_project_id"] = "foreign"
+    with pytest.raises(HTTPException) as wrong_target:
+        await hub_api.download_image_export_with_token(export_id, request, "t" * 32)
+    assert wrong_target.value.status_code == 404
+    # A legacy machine/admin flag is not the explicit human alternative.
+    captured["payload"].pop("admin_context")
+    captured["payload"]["is_system_admin"] = True
+
+    def no_membership(user_id, project_id):
+        assert (user_id, project_id) == ("real-admin", "target")
+        raise HTTPException(status_code=403, detail="No current download membership")
+
+    monkeypatch.setattr(hub_api, "validate_package_owner", no_membership)
+    with pytest.raises(HTTPException) as denied:
+        await hub_api.download_image_export_with_token(export_id, request, "t" * 32)
+    assert denied.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_admin_upload_revoked_during_inspection_cannot_publish_cas(store, tmp_path, monkeypatch):
+    engine, factory = await _prepared_hub(tmp_path, "revoked-upload.sqlite", store, monkeypatch)
+    info = {
+        "project_id": "home",
+        "target_project_id": "target",
+        "user_id": "real-admin",
+        "token": "original-token",
+        "is_package_system_admin": True,
+    }
+    payload = b"not published after revocation"
+    digest = _sha256(payload)
+    started = await start_upload(HubUploadStartRequest(), info)
+    upload_id = started["session_id"]
+    store.upload_path(upload_id).write_bytes(payload)
+    async with factory() as session:
+        upload = await session.get(PalimpsestHubUpload, upload_id)
+        upload.received_bytes = len(payload)
+        await session.commit()
+
+    async def revoked(context):
+        assert context == info
+        raise HTTPException(status_code=403, detail="Administrator was revoked")
+
+    monkeypatch.setattr(hub_api, "revalidate_package_admin", revoked)
+    request = Request(
+        {
+            "type": "http",
+            "method": "PUT",
+            "path": "/",
+            "headers": [(b"upload-offset", str(len(payload)).encode())],
+        }
+    )
+    try:
+        with pytest.raises(HTTPException) as denied:
+            await finalize_upload(upload_id, HubLayerMeta(name="revoked", is_published=True), request, info)
+        assert denied.value.status_code == 403
+        assert not store.exists(digest) and store.upload_path(upload_id).read_bytes() == payload
+        async with factory() as session:
+            assert (await session.execute(select(PalimpsestHubLayer))).scalars().all() == []
+            upload = await session.get(PalimpsestHubUpload, upload_id)
+            assert upload.project_id == "target" and upload.created_by == "real-admin"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_admin_bundle_import_keeps_target_and_actual_creator(store, tmp_path, monkeypatch):
+    chain = _chain(store)
+    bundle = b"".join(iter_bundle_tar(store, [chain]))
+    destination = LocalPathBlobStore(tmp_path / "admin-import")
+    engine, factory = await _prepared_hub(tmp_path, "admin-import.sqlite", destination, monkeypatch)
+    info = {
+        "project_id": "home",
+        "target_project_id": "target",
+        "user_id": "real-admin",
+        "token": "original-token",
+        "is_package_system_admin": True,
+        "package_actions": {"packages:write"},
+    }
+
+    async def identity():
+        return info
+
+    async def recheck(context):
+        return context
+
+    app.dependency_overrides[hub_api.get_package_manager_info] = identity
+    monkeypatch.setattr(hub_api, "revalidate_package_admin", recheck)
+    try:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post("/v1/bundles/import", files={"file": ("bundle.tar", bundle)})
+            assert response.status_code == 200, response.text
+            assert set(response.json()["imported"]) == {item.blob_digest for item in chain}
+            async with factory() as session:
+                rows = (await session.execute(select(PalimpsestHubLayer))).scalars().all()
+                assert len(rows) == 3
+                assert all(row.project_id == "target" and row.created_by == "real-admin" for row in rows)
+                assert all(not row.is_published for row in rows)
+                assert (await session.execute(select(PalimpsestHubLayerAccess))).scalars().all() == []
     finally:
         app.dependency_overrides.clear()
         await engine.dispose()

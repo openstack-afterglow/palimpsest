@@ -10,3 +10,6 @@ build/
 *.egg-info/
 .gstack/
 clouds.yaml
+*openrc*.sh
+passwords.yml
+clouds.yml

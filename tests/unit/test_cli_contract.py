@@ -43,6 +43,50 @@ from palimpsest_local.runtime_types import (
 )
 
 
+def test_external_v2_cloud_init_cli_emits_writable_runtime(tmp_path, capsys):
+    config = tmp_path / "runtime-v2.json"
+    config.write_text(
+        json.dumps(
+            {
+                "schema": "palimpsest.external-layer-runtime.v2",
+                "arch": "x86_64",
+                "filesystem_uuid": "12345678-1234-5678-9abc-123456789abc",
+                "stacks": [{"name": "native", "layers": ["sha256:" + "a" * 64]}],
+            }
+        )
+    )
+    assert cli.main(["layer", "cloud-init", "--config", str(config)]) == 0
+    result = capsys.readouterr().out
+    assert result.startswith("#cloud-config\n")
+    assert "rw,nosuid,nodev,lowerdir=" in result
+    assert "upperdir=" in result and "workdir=" in result
+    assert "/var/lib/palimpsest/consumer" in result
+
+
+def test_layer_cloud_init_never_replaces_an_intervening_destination(tmp_path, monkeypatch):
+    config = tmp_path / "external.json"
+    config.write_text(
+        json.dumps(
+            {
+                "schema": "palimpsest.external-layer-runtime.v2",
+                "arch": "x86_64",
+                "filesystem_uuid": "12345678-1234-5678-9abc-123456789abc",
+                "stacks": [{"name": "native", "layers": ["sha256:" + "a" * 64]}],
+            }
+        )
+    )
+    output = tmp_path / "user-data.yaml"
+    mkstemp = cli.tempfile.mkstemp
+
+    def create_intervening_output(*args, **kwargs):
+        output.write_text("another actor's cloud-init policy\n")
+        return mkstemp(*args, **kwargs)
+
+    monkeypatch.setattr(cli.tempfile, "mkstemp", create_intervening_output)
+    assert cli.main(["layer", "cloud-init", "--config", str(config), "--output", str(output)]) == 1
+    assert output.read_text() == "another actor's cloud-init policy\n"
+
+
 @pytest.fixture(autouse=True)
 def _isolated_xdg_roots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep CLI state/config writes out of the developer's real XDG roots."""
@@ -586,6 +630,182 @@ def test_buildkit_offline_dispatch_reads_no_registry_profile_or_hub_client(
     assert (spec.external_cache_from, spec.external_cache_to) == ((), ())
     assert (hub_client, cache_package, runtime_hub_client, on_oci_export) == (None, None, None, None)
     assert capsys.readouterr().out.strip() == "sha256:" + "c" * 64
+
+
+@pytest.mark.parametrize("source_kind", ["directory", "archive", "retained"])
+@pytest.mark.parametrize("outcome", ["success", "solve-error", "pack-error"])
+def test_buildkit_cli_local_inputs_survive_solve_and_runtime_pack_then_release(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    source_kind: str,
+    outcome: str,
+) -> None:
+    import io
+    import subprocess
+    import tarfile
+    from functools import partial
+
+    from palimpsest_local import buildkit
+    from palimpsest_local.package_reference import LocalPackageReference, write_package_reference
+
+    roots = cli.init_roots()
+    layout = tmp_path / "base-layout"
+    blobs = layout / "blobs" / "sha256"
+    blobs.mkdir(parents=True)
+    (layout / "oci-layout").write_text('{"imageLayoutVersion":"1.0.0"}', encoding="utf-8")
+
+    def blob(media_type: str, payload: bytes) -> dict[str, object]:
+        digest = "sha256:" + hashlib.sha256(payload).hexdigest()
+        (blobs / digest.split(":", 1)[1]).write_bytes(payload)
+        return {"mediaType": media_type, "digest": digest, "size": len(payload)}
+
+    layer_stream = io.BytesIO()
+    with tarfile.open(fileobj=layer_stream, mode="w"):
+        pass
+    layer_bytes = layer_stream.getvalue()
+    layer = blob("application/vnd.oci.image.layer.v1.tar", layer_bytes)
+    config = blob(
+        "application/vnd.oci.image.config.v1+json",
+        json.dumps(
+            {
+                "architecture": "amd64",
+                "os": "linux",
+                "rootfs": {"type": "layers", "diff_ids": [layer["digest"]]},
+                "config": {},
+            }
+        ).encode(),
+    )
+    manifest = blob(
+        "application/vnd.oci.image.manifest.v1+json",
+        json.dumps({"schemaVersion": 2, "config": config, "layers": [layer]}).encode(),
+    )
+    root = manifest["digest"]
+    (layout / "index.json").write_text(json.dumps({"schemaVersion": 2, "manifests": [manifest]}), encoding="utf-8")
+    archive = tmp_path / "base.oci.tar"
+    with tarfile.open(archive, "w") as stream:
+        for path in sorted(layout.rglob("*")):
+            if path.is_file():
+                stream.add(path, arcname=str(path.relative_to(layout)), recursive=False)
+    archive_bytes = archive.read_bytes()
+    reference = f"cloud.example/project/base@{root}"
+    write_package_reference(
+        roots,
+        LocalPackageReference(
+            reference=reference,
+            authority="cloud.example",
+            api_base="https://cloud.example/v1",
+            namespace="project",
+            package="base",
+            archive=str(archive),
+            archive_digest="sha256:" + hashlib.sha256(archive_bytes).hexdigest(),
+            archive_size_bytes=len(archive_bytes),
+            root_digest=root,
+            package_type="oci-image",
+        ),
+    )
+    source = {"directory": f"{layout}@{root}", "archive": f"{archive}@{root}", "retained": reference}[source_kind]
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / "Dockerfile").write_text("FROM base\n", encoding="utf-8")
+    base_bytes = b"runtime-base"
+    base_digest = "sha256:" + hashlib.sha256(base_bytes).hexdigest()
+    store = ContentStore(roots.store)
+    store.write_stream([base_bytes], expected_digest=base_digest)
+    store.write_metadata(base_digest, {"kind": "cloud-image", "disk_format": "qcow2", "arch": "x86_64"})
+    profiles = roots.config / "registries.toml"
+    profiles.write_text("not = [valid", encoding="utf-8")
+    profiles.chmod(0o600)
+    consumed_layouts = []
+    packed_manifests = {}
+
+    def runner(argv, **kwargs):
+        command = list(map(str, argv))
+        replies = {
+            ("docker", "buildx", "inspect"): (
+                "Name: palimpsest\nDriver: docker-container\nNodes:\n"
+                "Name: palimpsest0\nEndpoint: default\nBuildKit: v0.23.2\n"
+            ),
+            ("docker", "buildx", "version"): "github.com/docker/buildx v0.28.0 test\n",
+            ("docker", "context", "show"): "default\n",
+        }
+        if tuple(command) in replies:
+            return subprocess.CompletedProcess(command, 0, stdout=replies[tuple(command)], stderr="")
+        if command[:3] == ["docker", "context", "inspect"]:
+            return subprocess.CompletedProcess(command, 0, stdout="unix:///var/run/docker.sock\n", stderr="")
+        if command[:2] == ["docker", "ps"]:
+            return subprocess.CompletedProcess(command, 0, stdout="buildkit-container\n", stderr="")
+        if command[:3] == ["docker", "inspect", "--format"]:
+            stdout = '{"none":{}}\n' if command[3] == "{{json .NetworkSettings.Networks}}" else "none\n"
+            return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+        if command[:3] == ["docker", "buildx", "build"]:
+            named = command[command.index("--build-context") + 1]
+            assert named.startswith("base=oci-layout://")
+            frozen, digest = named.removeprefix("base=oci-layout://").rsplit("@", 1)
+            assert digest == root
+            frozen = Path(frozen)
+            assert (frozen / "blobs" / "sha256" / str(layer["digest"]).split(":", 1)[1]).read_bytes() == layer_bytes
+            consumed_layouts.append(frozen)
+            if outcome == "solve-error":
+                return subprocess.CompletedProcess(command, 1, stdout="", stderr="deliberate solve failure")
+            cache = command[command.index("--cache-to") + 1]
+            cache_path = Path(dict(field.split("=", 1) for field in cache.split(","))["dest"])
+            cache_path.mkdir(parents=True)
+            (cache_path / "index.json").write_text('{"schemaVersion":2}', encoding="utf-8")
+            metadata = Path(command[command.index("--metadata-file") + 1])
+            metadata.write_text(json.dumps({"containerimage.digest": root}), encoding="utf-8")
+            for index, value in enumerate(command):
+                if value == "--output":
+                    fields = dict(field.split("=", 1) for field in command[index + 1].split(","))
+                    Path(fields["dest"]).write_bytes(archive_bytes if fields["type"] == "oci" else layer_bytes)
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+        if command == ["mksquashfs", "-version"]:
+            return subprocess.CompletedProcess(command, 0, stdout="mksquashfs version 4.7.5 (test)\n", stderr="")
+        if command[0] == "mksquashfs":
+            assert consumed_layouts[0].is_dir(), "OCI snapshot released before runtime packing"
+            if outcome == "pack-error":
+                return subprocess.CompletedProcess(command, 1, stdout=b"", stderr=b"deliberate pack failure")
+            with tarfile.open(fileobj=kwargs["stdin"], mode="r:") as stream:
+                packed_manifests[Path(command[2])] = stream.extractfile(".palimpsest/runtime-pack.json").read()
+            Path(command[2]).write_bytes(b"hsqs-packed-runtime")
+            return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
+        if command[0] == "unsquashfs":
+            return subprocess.CompletedProcess(command, 0, stdout=packed_manifests[Path(command[2])], stderr=b"")
+        pytest.fail(f"unexpected external command: {command}")
+
+    # Inject only the process boundary; execute the real resolver, spec validation,
+    # Buildx command construction, cache handling, and runtime packing path.
+    monkeypatch.setattr(cli, "build_with_buildkit", partial(buildkit.build_with_buildkit, runner=runner))
+    result = cli.main(
+        [
+            "build",
+            str(context),
+            "-t",
+            "demo",
+            "--offline",
+            "--local-image",
+            f"base={source}",
+            "--runtime-base",
+            base_digest,
+            "--runtime-tag",
+            "demo-runtime",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert len(consumed_layouts) == 1
+    if source_kind == "directory":
+        assert consumed_layouts[0] == layout
+        assert layout.is_dir()
+    else:
+        assert consumed_layouts[0] != layout
+        assert not consumed_layouts[0].exists()
+    assert archive.read_bytes() == archive_bytes
+    if outcome == "success":
+        assert result == 0
+        assert captured.out.strip() == "sha256:" + hashlib.sha256(b"hsqs-packed-runtime").hexdigest()
+    else:
+        assert result == 1
+        assert f"deliberate {'solve' if outcome == 'solve-error' else 'pack'} failure" in captured.err
 
 
 def test_buildkit_runtime_base_arch_mismatch_fails_before_build(
@@ -1515,6 +1735,7 @@ def test_cli_dispatch_stop_and_rm(monkeypatch: pytest.MonkeyPatch, capsys: pytes
         ("kvm", "cloud_runtime", RuntimeBackend.KVM),
         ("libvirt-hvf", "cloud_runtime", RuntimeBackend.LIBVIRT_HVF),
         ("lima-vz", "lima", RuntimeBackend.LIMA_VZ),
+        ("lima-krunkit", "lima", RuntimeBackend.LIMA_KRUNKIT),
     ],
 )
 @pytest.mark.parametrize(("operation", "target_name", "argv", "expected_kwargs"), _CLI_EXISTING_RUN_OPERATIONS)
@@ -1862,37 +2083,29 @@ def test_cli_dispatch_build_integrity_guard(tmp_path: Path, capsys: pytest.Captu
     assert "base digest mismatch" in err
 
 
-def test_cli_dispatch_image_push_reaches_hub_and_store(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    img = tmp_path / "ubuntu.qcow2"
-    img.write_bytes(b"qcow2 fake data")
-    monkeypatch.setenv("PALIMPSEST_URL", "http://localhost:8080")
-    monkeypatch.setenv("PALIMPSEST_TOKEN", "test-token")
-
-    pushed_args = []
-    ingested_paths = []
-
-    monkeypatch.setattr(
-        "palimpsest_local.cli.HubClient.push_blob",
-        lambda self, path, metadata, resume=True: (
-            pushed_args.append((path, metadata)),
-            {"blob_digest": "sha256:" + "c" * 64},
-        )[1],
-    )
-    monkeypatch.setattr(
-        "palimpsest_local.cli.ContentStore.ingest_file",
-        lambda self, source, expected_digest=None: (
-            ingested_paths.append(source),
-            tmp_path / "store" / "blob",
-        )[1],
-    )
-    monkeypatch.setattr("palimpsest_local.cli.ContentStore.write_metadata", lambda self, digest, metadata: None)
-
-    ret = cli.main(["image", "push", str(img), "--name", "my-img", "--disk-format", "qcow2"])
-    assert ret == 0
-    assert len(pushed_args) == 1
-    assert pushed_args[0][1]["name"] == "my-img"
-    assert len(ingested_paths) == 1
-    assert ingested_paths[0] == img
+@pytest.mark.parametrize("stored_arch, requested_arch", [(None, None), ("aarch64", "x86_64"), ("x86_64", "aarch64")])
+def test_image_push_refuses_unknown_or_conflicting_architecture_before_transport(
+    tmp_path, monkeypatch, stored_arch, requested_arch
+):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    image = tmp_path / "image.raw"
+    image.write_bytes(b"declared target fixture")
+    roots = cli.init_roots()
+    store = ContentStore(roots.store)
+    digest = cli.digest_file(image)
+    before = None
+    if stored_arch is not None:
+        store.ingest_file(image, expected_digest=digest)
+        store.write_metadata(digest, {"kind": "cloud-image", "disk_format": "raw", "arch": stored_arch})
+        before = store.read_metadata(digest)
+    monkeypatch.setattr(cli, "HubClient", lambda *a, **kw: pytest.fail("publication preceded architecture validation"))
+    arguments = ["image", "push", str(image), "--name", "target-fixture", "--disk-format", "raw"]
+    if requested_arch is not None:
+        arguments.extend(["--arch", requested_arch])
+    assert cli.main(arguments) == 1
+    if before is not None:
+        assert store.read_metadata(digest) == before
 
 
 def test_cli_dispatch_run_passes_cli_layers(
@@ -2184,8 +2397,9 @@ def test_cli_run_parser_defers_backend_network_validation_to_dispatcher():
     assert args.network == "routed"
 
 
-def test_cli_run_dispatch_hvf_warning_and_profile_plumbing(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize("backend", [RuntimeBackend.LIBVIRT_HVF, RuntimeBackend.LIMA_KRUNKIT])
+def test_cli_run_dispatch_experimental_warning_uses_result_backend(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str], backend: RuntimeBackend
 ):
     import hashlib
 
@@ -2208,7 +2422,7 @@ def test_cli_run_dispatch_hvf_warning_and_profile_plumbing(
     monkeypatch.setattr(
         runtime_dispatch.platforms,
         "select_backend",
-        lambda arch, requested="auto": (selected.append((arch, requested)), "libvirt-hvf")[1],
+        lambda arch, requested="auto": (selected.append((arch, requested)), backend.value)[1],
     )
 
     token = object()
@@ -2222,7 +2436,7 @@ def test_cli_run_dispatch_hvf_warning_and_profile_plumbing(
         assert capsys.readouterr().err == ""
         assert preflight is token
         run_calls.append(request)
-        return _fake_run_result(request.spec.name, RuntimeBackend.LIBVIRT_HVF, None)
+        return _fake_run_result(request.spec.name, backend, None)
 
     monkeypatch.setattr(cli.runtime_dispatch, "preflight_run_request", preflight)
     monkeypatch.setattr(
@@ -2231,19 +2445,23 @@ def test_cli_run_dispatch_hvf_warning_and_profile_plumbing(
         run,
     )
 
-    ret = cli.main(["run", base_digest, "--name", "hvf-vm", "--backend", "libvirt-hvf"])
+    ret = cli.main(["run", base_digest, "--name", "experimental-vm", "--backend", backend.value])
     assert ret == 0
-    assert selected == [("aarch64", "libvirt-hvf")]
-    assert preflighted == ["libvirt-hvf"]
+    assert selected == [("aarch64", backend.value)]
+    assert preflighted == [backend.value]
     assert len(run_calls) == 1
-    assert run_calls[0].dispatch_key.backend is RuntimeBackend.LIBVIRT_HVF
-    assert capsys.readouterr().out.strip() == "None"
+    assert run_calls[0].dispatch_key.backend is backend
+    captured = capsys.readouterr()
+    assert captured.err.strip() == f"warning: {backend.value} is experimental"
+    assert captured.out.strip() == ("limactl shell experimental-vm" if backend.is_lima else "None")
 
 
+@pytest.mark.parametrize("backend", [RuntimeBackend.LIMA_VZ, RuntimeBackend.LIMA_KRUNKIT])
 def test_cli_run_dispatch_lima_routing(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
+    backend: RuntimeBackend,
 ):
     import hashlib
 
@@ -2261,7 +2479,7 @@ def test_cli_run_dispatch_lima_routing(
     monkeypatch.setattr(cli, "resolve_roots", lambda: roots)
     run_requests = []
 
-    monkeypatch.setattr(runtime_dispatch.platforms, "select_backend", lambda arch, requested="auto": "lima-vz")
+    monkeypatch.setattr(runtime_dispatch.platforms, "select_backend", lambda arch, requested="auto": backend.value)
     token = object()
     monkeypatch.setattr(cli.runtime_dispatch, "preflight_run_request", lambda _request: token)
     monkeypatch.setattr(
@@ -2270,17 +2488,17 @@ def test_cli_run_dispatch_lima_routing(
         lambda request, preflight=None, roots=None: (
             (
                 run_requests.append(request),
-                _fake_run_result(request.spec.name, RuntimeBackend.LIMA_VZ, "192.0.2.10"),
+                _fake_run_result(request.spec.name, backend, "192.0.2.10"),
             )[1]
             if preflight is token
             else pytest.fail("CLI omitted preflight report")
         ),
     )
 
-    ret = cli.main(["run", base_digest, "--name", "lima-vm", "--backend", "lima-vz"])
+    ret = cli.main(["run", base_digest, "--name", "lima-vm", "--backend", backend.value])
     assert ret == 0
     assert len(run_requests) == 1
-    assert run_requests[0].dispatch_key.backend is RuntimeBackend.LIMA_VZ
+    assert run_requests[0].dispatch_key.backend is backend
     assert capsys.readouterr().out.strip() == "limactl shell lima-vm"
 
 
@@ -2322,80 +2540,6 @@ def test_cli_dispatch_store_show(monkeypatch: pytest.MonkeyPatch, capsys: pytest
     out_json = capsys.readouterr().out
     data = json.loads(out_json)
     assert data["state_root"] == "/tmp/state"
-
-
-def test_cli_dispatch_store_ls(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
-    monkeypatch.setattr(
-        "palimpsest_local.cli.inventory.list_artifacts",
-        lambda roots: {
-            "artifacts": [
-                {
-                    "digest": "sha256:" + "a" * 64,
-                    "kind": "cloud-image",
-                    "size_bytes": 1024,
-                    "tags": [{"tag": "img-tag"}],
-                },
-                {
-                    "digest": "sha256:" + "b" * 64,
-                    "kind": "squashfs",
-                    "size_bytes": 2048,
-                    "tags": [],
-                },
-            ],
-            "images": [
-                {
-                    "digest": "sha256:" + "a" * 64,
-                    "kind": "cloud-image",
-                    "size_bytes": 1024,
-                    "tags": [{"tag": "img-tag"}],
-                }
-            ],
-            "layers": [
-                {
-                    "digest": "sha256:" + "b" * 64,
-                    "kind": "squashfs",
-                    "size_bytes": 2048,
-                    "tags": [],
-                }
-            ],
-            "unknown": [],
-        },
-    )
-    ret = cli.main(["store", "ls", "--kind", "image", "--format", "json"])
-    assert ret == 0
-    data = json.loads(capsys.readouterr().out)
-    assert len(data) == 1
-    assert data[0]["digest"] == "sha256:" + "a" * 64
-
-    ret_tbl = cli.main(["store", "ls", "--kind", "layer", "--format", "table"])
-    assert ret_tbl == 0
-    out_tbl = capsys.readouterr().out
-    assert "sha256:" + "b" * 64 in out_tbl
-
-
-def test_cli_dispatch_store_ls_ignores_non_dict_and_none_tags(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-):
-    monkeypatch.setattr(
-        "palimpsest_local.cli.inventory.list_artifacts",
-        lambda roots: {
-            "artifacts": [
-                {
-                    "digest": "sha256:" + "c" * 64,
-                    "kind": "cloud-image",
-                    "size_bytes": 4096,
-                    "tags": [None, "invalid-string", {"tag": "valid-tag"}, 12345],
-                }
-            ],
-            "images": [],
-            "layers": [],
-            "unknown": [],
-        },
-    )
-    ret_tbl = cli.main(["store", "ls", "--format", "table"])
-    assert ret_tbl == 0
-    out_tbl = capsys.readouterr().out
-    assert "valid-tag" in out_tbl
 
 
 def test_cli_dispatch_store_rm(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
@@ -2838,3 +2982,82 @@ def test_cli_automatic_acquisition_fixture_is_isolated(tmp_path: Path):
         run_source.export_docker_image_to_oci_archive("service", tmp_path / "unused", None)
     with pytest.raises(pytest.fail.Exception, match="real registry acquisition"):
         run_source.pull_registry_oci_archive("service", tmp_path / "unused", None)
+
+
+def test_store_cli_filters_architecture_and_reports_unknown_without_starting(tmp_path, monkeypatch, capsys):
+    from palimpsest_local import platforms
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    roots = cli.init_roots()
+    store = ContentStore(roots.store)
+    digests = {}
+    for arch in ("aarch64", "x86_64", None):
+        digest = "sha256:" + store.write_stream([str(arch).encode()]).name
+        metadata = {"kind": "cloud-image", "disk_format": "raw", "arch": arch} if arch else {"kind": "squashfs"}
+        store.write_metadata(digest, metadata)
+        digests[arch] = digest
+    monkeypatch.setattr(platforms, "detect_host", lambda: platforms.HostPlatform("Darwin", "aarch64"))
+    assert cli.main(["store", "ls", "--compatible", "--backend", "lima-krunkit", "--format", "json"]) == 0
+    rows = json.loads(capsys.readouterr().out)
+    assert [row["digest"] for row in rows] == [digests["aarch64"]]
+    assert cli.main(["store", "check", digests["x86_64"]]) == 1
+    assert json.loads(capsys.readouterr().out)["status"] == "incompatible"
+    assert cli.main(["store", "check", digests[None]]) == 1
+    assert json.loads(capsys.readouterr().out)["status"] == "unknown"
+
+
+def test_hub_compatible_layers_scan_past_incomplete_first_page(tmp_path, monkeypatch, capsys):
+    import threading
+    import urllib.parse
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    from palimpsest_local import platforms
+
+    arch = "aarch64"
+    base, orphan, leaf = ("sha256:" + digit * 64 for digit in ("a", "b", "c"))
+    rows = [
+        {"blob_digest": orphan, "kind": "squashfs", "arch": arch, "parent_digest": None},
+        {"blob_digest": leaf, "kind": "squashfs", "arch": arch, "parent_digest": None, "base_image_digest": base},
+    ]
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            pass
+
+        def do_GET(self):
+            target = urllib.parse.urlsplit(self.path)
+            query = urllib.parse.parse_qs(target.query)
+            if target.path == "/v1/layers":
+                offset = int(query.get("offset", ["0"])[0])
+                limit = int(query.get("limit", ["50"])[0])
+                payload = rows[offset : offset + limit]
+            elif target.path == "/v1/layers/" + base:
+                payload = {"blob_digest": base, "kind": "cloud-image", "arch": arch, "disk_format": "raw"}
+            else:
+                self.send_error(404)
+                return
+            body = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("PALIMPSEST_URL", f"http://127.0.0.1:{server.server_port}")
+    monkeypatch.setenv("PALIMPSEST_TOKEN", "synthetic-loopback-token")
+    monkeypatch.setattr(platforms, "detect_host", lambda: platforms.HostPlatform("Darwin", arch))
+    try:
+        assert cli.main(["layer", "ls", "--compatible", "--limit", "1", "--format", "json"]) == 0
+        selected = json.loads(capsys.readouterr().out)
+        assert [row["blob_digest"] for row in selected] == [leaf]
+        assert selected[0]["compatibility"]["compatible"] is True
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(5)

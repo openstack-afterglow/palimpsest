@@ -111,9 +111,10 @@ class PackageLimits:
 
 @dataclass(frozen=True)
 class PackageSnapshot:
-    """One frozen package archive; ``archive`` exists only inside the context."""
+    """One verified package; ``archive`` and ``layout`` exist only inside the context."""
 
     archive: Path
+    layout: Path
     archive_digest: str
     archive_size_bytes: int
     root_digest: str
@@ -958,6 +959,7 @@ def snapshot_package(
         os.chmod(archive, 0o400)
         yield PackageSnapshot(
             archive=archive,
+            layout=layout,
             archive_digest=archive_digest,
             archive_size_bytes=archive_size,
             root_digest=root["digest"],

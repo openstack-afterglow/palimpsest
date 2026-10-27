@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, Query, Request, Response
 from pydantic import ValidationError
 
 from palimpsest_hub.api.hub import _blob_response
-from palimpsest_hub.auth import get_package_member_info, require_token
+from palimpsest_hub.auth import get_package_manager_info, package_target_project_id, require_token
 from palimpsest_hub.config import validate_keystone_id
 from palimpsest_hub.package_dto import (
     CachePartition,
@@ -31,16 +31,18 @@ def authentication_headers(request):
     return authorization, token
 
 
-async def control_member(request: Request, member: dict = Depends(get_package_member_info)):
-    authorization, token = authentication_headers(request)
+async def control_manager(request: Request, member: dict = Depends(get_package_manager_info)):
+    authorization, _ = authentication_headers(request)
     if authorization is not None:
-        raise registry.RegistryError(401, "AUTH_REQUIRED", "control operation requires original member token")
+        raise registry.RegistryError(401, "AUTH_REQUIRED", "management requires original caller token")
     registry.require_policy(member)
     return member
 
 
 async def key_actor(request: Request):
     authorization, token = authentication_headers(request)
+    if "x-target-project-id" in request.headers:
+        raise registry.RegistryError(403, "PROJECT_SCOPE_MISMATCH", "package keys cannot select a logical target")
     if not authorization or not authorization.startswith("Bearer "):
         raise registry.RegistryError(401, "AUTH_REQUIRED", "package key bearer credential required")
     actor = await registry.authenticate_key(authorization[7:])
@@ -57,18 +59,25 @@ async def read_actor(request: Request, namespace: str):
     if token is None:
         raise registry.RegistryError(401, "AUTH_REQUIRED", "member token or package key required")
     original = await require_token(request, x_auth_token=token, x_project_id=request.headers.get("x-project-id"))
-    member = await get_package_member_info(token_info=original)
+    member = await get_package_manager_info(token_info=original)
     return await registry.member_actor(namespace, member)
 
 
+async def package_writer(request: Request, namespace: str):
+    actor = await read_actor(request, namespace)
+    if actor.key_id is None and actor.admin_context is None:
+        raise registry.RegistryError(401, "AUTH_REQUIRED", "package key or human system administrator required")
+    return actor
+
+
 @router.get("/projects/current")
-async def project_context(member: dict = Depends(control_member)):
+async def project_context(member: dict = Depends(control_manager)):
     return await registry.project_context(member)
 
 
 @router.put("/projects/{project_id}/namespace")
 async def register_namespace(
-    project_id: str, response: Response, body: EmptyBody | None = None, member: dict = Depends(control_member)
+    project_id: str, response: Response, body: EmptyBody | None = None, member: dict = Depends(control_manager)
 ):
     _, created = await registry.register_namespace(project_id, member)
     response.status_code = 201 if created else 200
@@ -76,20 +85,30 @@ async def register_namespace(
 
 
 @router.post("/projects/{namespace}/keys", status_code=201)
-async def issue_key(namespace: str, body: KeyCreate, response: Response, member: dict = Depends(control_member)):
+async def issue_key(namespace: str, body: KeyCreate, response: Response, member: dict = Depends(control_manager)):
     response.headers["Cache-Control"] = "no-store"
     return await registry.issue_key(namespace, member, body)
 
 
 @router.get("/projects/{namespace}/keys")
-async def list_keys(namespace: str, member: dict = Depends(control_member)):
+async def list_keys(namespace: str, member: dict = Depends(control_manager)):
     items = await registry.list_keys(namespace, member)
-    return {"project_id": validate_keystone_id(member["project_id"]), "namespace": namespace, "items": items}
+    return {
+        "project_id": validate_keystone_id(package_target_project_id(member)),
+        "namespace": namespace,
+        "items": items,
+    }
 
 
 @router.delete("/projects/{namespace}/keys/{key_id}", status_code=204)
-async def revoke_key(namespace: str, key_id: str, member: dict = Depends(control_member)):
+async def revoke_key(namespace: str, key_id: str, member: dict = Depends(control_manager)):
     await registry.revoke_key(namespace, key_id, member)
+    return Response(status_code=204)
+
+
+@router.delete("/projects/{namespace}/package", status_code=204)
+async def delete_package(namespace: str, package: str = Query(...), actor: registry.Actor = Depends(read_actor)):
+    await registry.delete_package(actor, namespace, package)
     return Response(status_code=204)
 
 
@@ -174,8 +193,7 @@ async def download(
     package: str = Query(...),
     actor: registry.Actor = Depends(read_actor),
 ):
-    registry.authorize(actor, namespace, package, "packages:read")
-    value = await registry.version(actor, namespace, package, digest=digest)
+    value = await registry.version(actor, namespace, package, digest=digest, action="packages:read")
     return private_blob(
         request, value["archive_digest"], value["archive_size_bytes"], "application/x-tar", "package.oci.tar"
     )
@@ -190,8 +208,7 @@ async def version_blob(
     package: str = Query(...),
     actor: registry.Actor = Depends(read_actor),
 ):
-    registry.authorize(actor, namespace, package, "packages:read")
-    value = await registry.version(actor, namespace, package, digest=digest)
+    value = await registry.version(actor, namespace, package, digest=digest, action="packages:read")
     blob_digest = registry.checked_digest(blob_digest)
     descriptor = value["graph"].get(blob_digest)
     if descriptor is None:
@@ -201,14 +218,14 @@ async def version_blob(
 
 @router.post("/projects/{namespace}/uploads", status_code=201)
 async def start_upload(
-    namespace: str, body: PackageUploadStart, package: str = Query(...), actor: registry.Actor = Depends(key_actor)
+    namespace: str, body: PackageUploadStart, package: str = Query(...), actor: registry.Actor = Depends(package_writer)
 ):
     return await registry.start_upload(actor, namespace, package, body, "package")
 
 
 @router.get("/projects/{namespace}/uploads/{upload_id}")
 async def upload_status(
-    namespace: str, upload_id: str, package: str = Query(...), actor: registry.Actor = Depends(key_actor)
+    namespace: str, upload_id: str, package: str = Query(...), actor: registry.Actor = Depends(package_writer)
 ):
     return await registry.upload_status(actor, namespace, package, upload_id, "package")
 
@@ -219,7 +236,7 @@ async def append_upload(
     upload_id: str,
     request: Request,
     package: str = Query(...),
-    actor: registry.Actor = Depends(key_actor),
+    actor: registry.Actor = Depends(package_writer),
 ):
     offset = await registry.append_upload(actor, namespace, package, upload_id, "package", request)
     return Response(status_code=204, headers={"Upload-Offset": str(offset)})
@@ -232,7 +249,7 @@ async def finalize_upload(
     response: Response,
     body: EmptyBody,
     package: str = Query(...),
-    actor: registry.Actor = Depends(key_actor),
+    actor: registry.Actor = Depends(package_writer),
 ):
     result, changed = await registry.finalize_upload(actor, namespace, package, upload_id, "package")
     response.status_code = 201 if changed else 200
@@ -241,7 +258,7 @@ async def finalize_upload(
 
 @router.delete("/projects/{namespace}/uploads/{upload_id}", status_code=204)
 async def abort_upload(
-    namespace: str, upload_id: str, package: str = Query(...), actor: registry.Actor = Depends(key_actor)
+    namespace: str, upload_id: str, package: str = Query(...), actor: registry.Actor = Depends(package_writer)
 ):
     await registry.abort_upload(actor, namespace, package, upload_id, "package")
     return Response(status_code=204)

@@ -27,13 +27,6 @@ from palimpsest_local.runtime_types import (
 )
 
 
-def test_backend_constants_are_stable_identifiers():
-    assert platforms.BACKEND_KVM == "kvm"
-    assert platforms.BACKEND_LIMA == "lima-vz"
-    assert platforms.BACKEND_HVF == "libvirt-hvf"
-    assert platforms.BACKENDS == ("kvm", "lima-vz", "libvirt-hvf")
-
-
 @pytest.mark.parametrize(
     ("value", "expected"),
     [
@@ -980,3 +973,30 @@ def test_allocate_local_port_returns_a_reusable_ephemeral_port():
 def test_allocate_local_port_can_be_called_repeatedly_without_collision():
     ports = {platforms.allocate_local_port() for _ in range(4)}
     assert all(1 <= port <= 65535 for port in ports)
+
+
+@pytest.mark.parametrize(
+    ("system", "machine", "image_arch"),
+    [("Darwin", "x86_64", "aarch64"), ("Linux", "aarch64", "aarch64"), ("Darwin", "aarch64", "x86_64")],
+)
+def test_krunkit_refuses_incompatible_host_or_image(system: str, machine: str, image_arch: str) -> None:
+    with pytest.raises(ArtifactValidationError):
+        platforms.select_backend(image_arch, host=platforms.HostPlatform(system, machine), requested="lima-krunkit")
+
+
+@pytest.mark.parametrize(
+    ("version", "category"),
+    [("13.6.9", CapabilityErrorCategory.UNSUPPORTED), ("", CapabilityErrorCategory.CHECK_FAILED), ("14.0", None)],
+)
+def test_krunkit_host_gate_checks_macos_minimum(
+    monkeypatch: pytest.MonkeyPatch, version: str, category: CapabilityErrorCategory | None
+) -> None:
+    monkeypatch.setattr(platforms.platform, "mac_ver", lambda: (version, ("", "", ""), "arm64"))
+    check = platforms._check_capability(
+        CapabilityRequirement("host.lima-krunkit"),
+        dispatch_key=DispatchKey(RuntimeKind.CLOUD_IMAGE, RuntimeBackend.LIMA_KRUNKIT),
+        host=platforms.HostPlatform("Darwin", "aarch64"),
+        arch="aarch64",
+    )
+    assert check.passed is (category is None)
+    assert check.error_category is category

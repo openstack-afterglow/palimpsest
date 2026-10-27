@@ -383,6 +383,184 @@ The last complete baseline, commit `6cf198f`, passed 4,325 local tests and
 suite after every small change is no longer the default development loop.
 Full regression remains a release/integration check, not a per-edit gate.
 
+## Native dashboard catalog and bundle unpack (2026-10-25; source qualified, not deployed)
+
+Source: isolated public snapshot `/var/folders/1m/xfc726k14szbjnrlq5t68zjw0000gn/T/afterglow-palimpsest-dashboard-6m5hqfl9/palimpsest`, copied from dirty `dev` based on `aa397a0fd976e35302974a347748a9773e3084bf`. Evidence root: `~/.local/share/afterglow-proofs/palimpsest-asset-dashboard-20261025/`. HEAD/package version alone does not identify working-tree source.
+
+| Check | Actual result and boundary |
+| --- | --- |
+| Complete separate Hub suite | **710 passed, 2 skipped**, 268.36s (`native-hub-final.log`), including actual-router SQL catalog/package tests and real loopback Keystone/Hub authentication tests. Opt-in skips are not native passes. |
+| Focused CLI/layout/unpack regressions | **54 passed**, 1.43s (`native-cli-reviewed.log`). |
+| Root core-cli original attempt | **2046 passed, 2 skipped, 27 failed**, 114.44s (`native-core-cli-root-env.log`), 2075 selected. Every failure was missing `ansible-playbook`; the original failure is retained. Earlier `native-core-cli.log` incorrectly used the Hub environment without Jinja2 and is not core evidence. |
+| Only original27 missing-tool cases, genuine Ansible | **27 passed**, 18.30s (`native-kolla-missing-27-real-ansible.log`). Existing root `.venv/bin/ansible-playbook`: Core2.19.14, Python3.11.15, Jinja3.1.6. No fake binary, installation or operator changes. Together the runs qualify **2073 passed and 2 skipped**, not a new single green2075-node run. |
+| Actual source CLI extraction + runtime resolver | `local-cli-positive.log`: one qcow2 x86_64 base and two ordered dependency layers, no manual layer selection. Synthetic payload bytes; **no hypervisor/guest executed**. |
+| Final post-format canonical regressions | **22 catalog passed**,2.54s (`native-catalog-postformat.log`); **29 unpack passed**,0.42s (`native-unpack-postformat.log`). Earlier710/54/core counts are the pre-format baseline, not a full rerun of final bytes. |
+| Final restored-source checks | CLI contract/reference/lane/unpack **342passed22.58s**, actual help/reference/lane and9owned-file Ruff checks pass (`native-final-restored-source-checks.log`). Unrelated CLI/Nova/lane formatting restored exactly; their preexisting style debt excluded. Final17file alternate-index guard digest `bc918dbd56e96a552458345d7f6c2c9a4852bb94213bcf3d17846f5d78c32431` (`native-scoped-architecture-restored-source.log`). Earlier formatted-byte76b30155digest and inherited507file stamp are not final acceptance. |
+
+`hub/tests/test_catalog.py` and `test_auth.py::native_http` cover actual native response models, SQL and authentication/context fences. Temporary SQLite/CAS plus real oslo.policy fixtures replace external identity only and never load operational settings/main lifespan. Visible public/site/project/shared leaves preserve private-child/ancestor nondisclosure; global admin labels are absolute public/site/shared/private independent of original project. Recorded completed build/export outputs establish provenance; forged config and unlinked registrations remain unknown. Download policy is independent of visibility.
+
+AssetPage pagination is over ordered SQL candidates: validate at most limit plus one SQL lookahead, never rescan/fill; empty items can have advancing next_offset. Regression invalid pages advance0→5→10 before a valid leaf. LayerPage retains row pagination. Ancestor over-depth fails413 at native MAX_DEPTH64. Local metadata eligibility requires visible raw/qcow2 base plus known matching x86_64/aarch64 base/layers; no-base complete reusable chains remain discoverable but not locally runnable. size_bytes includes base+layers, excludes archive metadata; fixture torch6bytes is not a runtime image.
+
+The new `palimpsest bundle unpack ARCHIVE --output DIRECTORY` is **working-source-only**, not asserted present in published0.3.5. Verify the exact source command help. Canonical empty native blobs/blobs/sha256 directory markers are accepted without extracting permissions; noncanonical/duplicate/link/special entries, malformed input and digest errors fail without partial destination publication. `test_bundle_unpack.py` belongs to core-cli; `test_catalog.py` belongs to the separate Hub lane.
+
+Reproduce only the missing-tool completion from the isolated snapshot (do not duplicate the recorded full suites):
+
+```sh
+ROOT=/Users/pieroot/code/palimpsest
+export PATH="$ROOT/.venv/bin:$PATH" PYTHONPATH="$PWD/src"
+"$ROOT/.venv/bin/python" -m pytest -q \
+  tests/test_kolla_role_contracts.py::test_ansible_public_route_derivation_fails_closed_without_precheck \
+  tests/test_kolla_role_contracts.py::test_ansible_public_route_preserves_opt_in_and_explicit_override \
+  tests/test_kolla_role_contracts.py::test_ansible_haproxy_only_guard_rejects_invalid_explicit_origin
+"$ROOT/.venv/bin/python" -m palimpsest_local.cli bundle unpack --help
+```
+
+The loopback-only `scripts/serve_catalog_fixture.py` serves actual catalog and safe layer/blob/bundle-export routes with synthetic identity and automatically removed SQLite/CAS/policy storage. `member`/`reader` differ in download authority; `human-admin` needs no fabricated target; service/member/missing identities cannot globally read. Synthetic bytes are not genuine SquashFS/cloud images. The new catalog routes require a **matching reviewed Hub rollout**, independently authorized and verified. No deployment, package publication, schema/IAM mutation or runtime VM proof occurred. Scoped guards/fingerprints and closure evidence are recorded in the native change verification artifact; shared native index/review marker remain untouched.
+
+
+
+## Native Nova build/assets workflow — 2026-10-22
+
+Evidence root: `~/.local/share/palimpsest-proofs/nova-gpu-comparison-xt8fep1d/`.
+Source remains dirty `dev` at `aa397a0fd976e35302974a347748a9773e3084bf`;
+the new executor is not a published release or a Hub deployment.
+
+| Check | Observed scope/result |
+| --- | --- |
+| Actual installed-wheel canonical hard Linux worker | Two real OCI fixture layers converted and extracted; durable same-job reuse, contextual parents, zero-consumer byte/inode retention and actual kernel counter sampling passed |
+| Actual disk-backed build capture | Canonical overlay/chroot install/check created a real SquashFS on a fresh loop-backed ext4 disk; extracted payload matched, original root was unchanged |
+| Actual prepared immutable runtime | Asset registration, original blob-path manifest, clean RO/no-replay filesystem, blockRO=1, actual SquashFS/bind mounts, repeated activation and non-login UID65534 native command all passed |
+| Fresh Python3.11.15 wheel installation | No-dependency isolated install and actual `palimpsest cloud --help` passed; this is not a remote GPU package qualification |
+| Nova CPU worker cloud-init | Actual driver-free image on cpu.2c_8g with exclusive100GiB data volume produced checked4096-byte `sha256:c17257e73498b66f7b121a0c323bd8dbab585bcfd335022970487b6d5aa5793d`; build172.102→194.663 guest-monotonic seconds; cloud-init done/errors=[] |
+| Replacement CPU worker ML jobs | Default300s/120s policies, cpu.8c_32g: PyTorch5 layers (asset `c9d1a30e…`) and, as a new job after a generic first failure, TensorFlow18 layers (asset `289965f9…`); warm repeats were5/5 and18/18; all8 retained job records were inspected, successes with full asset verification. The first TensorFlow failure coincided with unattended-upgrade replacing `libc6` (inferred, no stable code captured). CPU-worker facts, not GPU boots |
+| Capture mount isolation | Privileged aarch64 Linux with shared-propagation peer: before8 stale mounts/`needs_recovery`/nonempty journal, after0/no/journal0. Permanent regression `test_capture_releases_store_and_journal_despite_peer_namespace` now runs in the existing `oci_fs` lane (1 passed in the privileged container); parent-layer helper isolation separately passed `ns-leak-proof/parent-after.json`. Full capture→asset→RO consumer smoke passed again |
+| New GTX1080Ti GPU attempts | NoValidHost while stopped VMs still held GPUs, then MaxRetriesExceeded on `dms-compute8` for a fresh attached-store builder, a no-data-volume direct Torch case and two zero-instance probes (`gpu.1080ti_8c_16g`, `gpu.1080ti_4c_8g`, ~25s each). No guest GPU/nvidia-smi success; **0/40** normal measurements, not a passed benchmark |
+| Source regressions | Affected Nova/assets/metrics/worker/cloud-init/build/CLI/cache/OCI selection: 1170 passed, 11 skipped after the capture isolation (`nova-final-tests-ns.xml`; earlier receipt `nova-final-tests.xml`); skipped Linux/fish cases are not native passes |
+| Scoped source guard | Only a private inherited-reviewed-cache plus explicit Nova overlay snapshot is staged/stamped; no shared index/marker, commit or publication. Exact fingerprint is in `scoped-source-review.json` |
+| RTX3060LHR substitute condition | Probe and native driver/Torch/TF builds passed; fresh native PyTorch consumer passed UID1001/boot/GPU identity, CUDA matrix+cuDNN convolution and blockRO1/ext4 no-replay. The separate initial40-boot matrix completed:30 full collector successes,31 GPU proofs,5 original registry-TF GPU failures and5 collector failures; all40 distinct VMs deleted404,40 boot volumes retained. This is not five successful repetitions of every case |
+| Post-review regressions |1244 passed/11 skipped in `nova-final-tests-review.xml`, CLI reference/lane manifest passed; earlier Nova/cloud-init/build/Lima selection261 passed. Lima builder execution itself was not live-verified. Additional-batch collector correction preserves observed NVIDIA time on subsequent metadata failure; regression failed before/passed after, metrics25 passed. An initial fixture lacking the real controller's monotonic stamp caused7 failures and was corrected without weakening the timing contract |
+| Separate registry-TF loader diagnostic | Same original relocated interpreter/loader with `TF_CPP_VMODULE=dso_loader=2,cuda_dnn=2` and `LD_DEBUG=libs`: actual `libcudnn.so.9` dlopen failed with ENOENT; libcuda/cudart/cublas/cufft/cusolver/cusparse loaded. NVML symbol lookup failure also observed. At least one blocker established for this runtime; adding cuDNN9 alone is not verified sufficient and no original bytes/matrix input were changed |
+| Additional variability batch | Initial successful first-SMI max/min ratios exceeded1.3 for all7 functioning cases; add5 fresh boots per case under a separate marker and ordinal6–10. Original registry-TF0/5 stays separate. Check quota and zero active project instances before allocation; preserve every boot/data volume and publish per-attempt results to Notion |
+
+The real immutable-runtime smoke exposed a contract mismatch: conventional
+`mksquashfs` retains its mkfs timestamp, while normalized OCI derivatives require
+zero. Native build assets now opt out only of that normalization-time condition;
+all structural/hash/FD stability checks and every existing OCI default remain.
+The raw artifact header/digest was not patched to pass. A native-header regression
+also confirms the default normalized-OCI verifier still rejects nonzero time.
+Other retained failures were the sysfs `bonding_masters` metadata file, an initially
+overbroad fixture monkeypatch, a missing container udev UUID link and inherited
+read-only loop flags. Fixture fixes are not cloud or performance claims.
+
+The runner measures first ordinary-user nvidia-smi while cloud-init/Ansible is
+still progressing, and records framework GPU readiness separately. It preserves
+failed-attempt console/counter evidence before exact-owned VM deletion; all boot
+and data volumes remain retained. Counters describe observed virtual devices and
+interfaces, not Ceph physical I/O or link capacity. The actual GPU, native sharing
+and five-repetition comparison remain blocked until Nova GPU build prerequisites
+are fixed; the Notion report contains the attempt/resource ledger and N/A matrix.
+
+Independent Astra/development-review agents were unavailable; no independent
+signoff is claimed. LSP references returned-32601; bounded caller inspection was
+the explicit fallback. gbrain CLI was unavailable and no search guidance changed.
+
+## Permanent shared layer cache — 2026-10-21 UTC
+
+Evidence root: `~/.local/share/palimpsest-proofs/layer-cache-rs9csyji/`.
+Working-source proof is on dirty `dev` at
+`aa397a0fd976e35302974a347748a9773e3084bf`; the installed wheel is an unpublished
+candidate, not that commit's clean tree or an operational storage deployment.
+
+| Check | Observed result |
+| --- | --- |
+| Final cache/intake/store/source/image/inventory/CLI/run-source/worker/handoff/lower-export selection | **1470 passed, 4 skipped**, 30.98s |
+| Scoped Ruff | Ten changed source/test/manifest files passed; four cache/publication files passed format check |
+| Generated CLI reference and lane manifest | Current; every test classified, mixed selectors exact/disjoint |
+| Installed Python3.11.15 CLI with real Skopeo1.24.1 and isolated TLS registry | One common-layer payload GET across cold A, repeated A and distinct B; retained source inode, both consumers released without deletion, offline reuse after registry shutdown |
+| Original PyTorch2.8.0 CUDA12.6 archive in final installed CLI | Five original compressed layers, seven source blobs; real Docker Hub raw-manifest refresh only, payload copy explicitly forbidden; inode/size/mtime preserved and offline reuse passed without Skopeo |
+| Final installed Python3.12.15 Linux arm64 hard workers and qualified mksquashfs | Distinct gzip digests/same DiffID produced two recipes and one real SquashFS; valid inode reused, missing/corrupt retained output refused without catalog/byte replacement, actual payload extracted with unsquashfs |
+| Restart/cross-host authority reconstruction | Copied cache has new SourceCAS/OCIStore identities; both recipes warm-hit using current receipts; zero-consumer output retained; relative symlink packer worked |
+
+The final Darwin selection skips the Linux-only openat2 case, the actual Linux
+cache converter and two unavailable fish cases. The separate network-disabled,
+read-only-container, capability-dropped Linux smoke above exercises real hard
+conversion; it does not turn those skipped nodes into test passes. The source
+fixture graph is `linux/amd64`; arm64 conversion does not execute its workload.
+
+Final test command:
+
+```sh
+umask 022
+uv run pytest -q \
+  tests/unit/test_layer_cache.py tests/unit/test_registry_intake.py \
+  tests/unit/test_oci_store.py tests/unit/test_oci_source.py \
+  tests/unit/test_oci_image.py tests/unit/test_inventory.py \
+  tests/unit/test_cli_contract.py tests/unit/test_cli_reference.py \
+  tests/unit/test_completion.py tests/unit/test_run_source.py \
+  tests/unit/test_remote_artifacts.py tests/unit/test_test_lanes.py \
+  tests/unit/test_oci_worker_protocol.py tests/unit/test_oci_run_request.py \
+  tests/unit/test_oci_store_handoff.py tests/unit/test_oci_lower_exports.py
+```
+
+Preserved failures drove corrections, not relaxed checks. Real Skopeo initially
+tried to truncate a retained `0400` manifest on a repeat tag pull; metadata-first
+selection now avoids copy for a complete known graph and copies misses by the
+resolved immutable manifest digest. Independent review identified unsafe writable
+ancestors; they now refuse before use. A later cross-recipe retention regression
+failed both missing and aged-corrupt cases before the physical publication guard,
+then passed along with valid inode reuse. A wider intermediate run had one legacy
+bundle-routing fixture without per-artifact architecture; the fixture now supplies
+its real digest binding and `x86_64`, keeping the production unknown-arch refusal.
+An early throwaway Linux harness incorrectly expected an internal error message
+past the worker's sanitized boundary; corrected harness checks the public store
+error category and unchanged inode/catalog instead. Initial failures remain in
+their separate receipts. Existing unrelated whole-file format drift in
+`scripts/test_lanes.py` was not restyled or claimed format-clean.
+
+Receipts: `registry-cache-smoke.json`, `pytorch-cache-acceptance.json`,
+`linux-retention-final-v2/result.json`,
+`final-retention-cache-consumer-tests.xml`, the before/after cross-recipe JUnit
+files, installed-wheel provenance and the scoped architecture receipt. The
+[intake contract](registry-intake.md#permanent-shared-layer-cache) separates this
+writable permanent acquisition catalog from frozen read-only guest stores.
+CephFS cross-host flock, RBD fencing, power-loss recovery, provider deployment,
+native OCI boot and GPU execution are not qualified by this local cache proof.
+No existing GPU VM, shared Cinder volume, production service, global state or
+credential domain was changed.
+
+## Service-local Hub policy verification — 2026-10-21
+
+Evidence root: `/Users/pieroot/.local/share/afterglow-proofs/service-policy-20261020-palimpsest-019qotth`. This is local working-source verification, not production Keystone/IAM, Kolla rollout, live Glance, KVM guest or release qualification. No existing local service, database, operator policy or production role was replaced.
+
+| Check | Observed result |
+| --- | --- |
+| `cd hub && uv sync --locked --extra dev` | Successful; real oslo.policy 6.0.1 installed |
+| `cd hub && uv run --frozen --extra dev pytest -q` | **650 passed, 2 skipped**, 249.85s; two opt-in MariaDB cases exercised separately below |
+| `cd hub && uv run --frozen --extra dev ruff check .` | Passed |
+| Root Kolla role contracts | **41 passed**, 21.65s |
+| Root smoke-driver/Kolla-test import lint | Three import-order findings repaired; final check/fix exit 0 |
+| Standard `oslopolicy-sample-generator --namespace palimpsest` | Exit 0, generated YAML retained in evidence root |
+| Canonical Hub API and export-worker image targets | Both **arm64 and amd64** built successfully, serially, without publication |
+| Actual registered-app Docker HTTP smoke | **185 checks per architecture; 370 total**, no failed checks or abort |
+| Exact nonroot config/mount probes | All four canonical images ran as UID:GID **1000:1000**; root:root **0640** `/app/palimpsest.conf` denied read; root:root **0644** policy-only TOML/YAML and policy.d were read and enforced |
+| Opt-in real MariaDB/multiprocess ownership smoke | **2 passed**, 27.03s, on a new labelled tmpfs-backed loopback-only database; owned container/temporary 0600 credential file removed afterward |
+| Standalone fresh human system HTTP smoke | **49 expected statuses passed**, exit0 in a clean environment; direct/group-implied raw authority, no target membership, own audit, deletion and revocation-before-I/O verified |
+
+The full Hub run includes original-subject/current-owner action intersection, zero service edges/grade-only access, project-local admin versus fresh human system administration, own-key issuance/revocation/current issuer ceilings, foreign namespace/package denial, actual loopback Uvicorn cache-only archive upload/finalize/resolve/download with **empty leaf-capability labels**, independent package-content access without inventory, YAML grant/deny/reload and policy.d behavior. Real native-parser malformed clauses under `not`/`or` return 503 in main YAML and policy.d, restore the original parser logger and recover after correction; quoted empty/`@`/`!` retain Oslo semantics. Casefold-colliding global role IDs deny before policy authority. Local SDK fixtures are synthetic Keystone HTTP, not production identity proof.
+
+The first focused integration run had **27 failures / 528 passes**: two tests still asserted the retired blanket project-admin veto; the deferred-export identity fixture omitted fresh `/users/{id}/groups` collection reads. Those fixture/expectation defects were corrected without weakening native authority. The first native MariaDB ownership smoke also failed twice: its synthetic builder omitted the current output architecture and a visible cloud-base descriptor. The fixture now supplies content-addressed synthetic base bytes/metadata and `x86_64` result architecture; production build validation remains unchanged. Initial and final receipts are retained, not overwritten as successes.
+
+Exact command/stdout/stderr receipts are `hub-full-final.log`, `hub-lint-settled.log`, `kolla-contracts.log`, `policy-generator.log`, `image-{api,worker}-{arm64,amd64}.log`, `docker-http-{arm64,amd64}.log`, `nonroot-permissions-{api,worker}-{arm64,amd64}.log`, `native-db-process-smoke-final.log` and `human-system-http.log`/`human-system-http-result.json`. Docker reports are `build/service-policy-019qotth-{arm64,amd64}/report.json`; synthetic credential material was not copied into documentation.
+
+| Task-owned image tag | Docker image ID |
+| --- | --- |
+| `palimpsest-policy-019qotth-api:arm64` | `sha256:f00a97c1acae469c6cc12a9040fb5eaf7eac512055b9e99f1545cbb2cf631889` |
+| `palimpsest-policy-019qotth-worker:arm64` | `sha256:728f2776f97d3127985ab4d9dfdddd58b1a3c7d2d038b562e4b7fdc44f5de976` |
+| `palimpsest-policy-019qotth-api:amd64` | `sha256:baf637e2ccab6efe520a7493126940c9fedf478f8fd0e7f959a8e3b59d2b415d` |
+| `palimpsest-policy-019qotth-worker:amd64` | `sha256:25889ece00f31dea27613e5057de1b74720502767b326f29ce5ed935968f150c` |
+
+The API runtime uses the registered app/routes/middleware and real Keystone SDK against synthetic identity, real Redis and retained SQLite/CAS. Its SQLite adapter intentionally bypasses production lifespan: canonical SQLite bootstrap still fails on MySQL-only connection arguments and remains recorded, not hidden by the passing MariaDB ownership test. Worker image imports/qemu validation and nonroot policy reads are exercised, not a real delegated Glance export or VM build. Retained evidence volumes are `palimpsest-scope-smoke-20261020t184422z-5f6550-{sql,blobs}` and `palimpsest-scope-smoke-20261020t184659z-ed3560-{sql,blobs}`; only run-owned containers/networks/derived smoke images were cleaned. Separate root-owned permission-fixture volume and disposable MariaDB container were label-checked and removed. No prune, Git commit/push/tag or deployment occurred.
+
 ## Everyday workflow
 
 ```sh
@@ -2125,4 +2303,473 @@ Production publication, paired cold SQL/CAS restore, migration, all-controller
 API/export cutover, narrow LB change, original-client bytes/CPU smoke and
 stability monitoring are separately recorded when exercised; this preparation
 record does not claim those gates completed.
+## Artifact architecture and client compatibility — 2026-10-16 KST
+
+The selected source is the dirty `dev` checkout at
+`aa397a0fd976e35302974a347748a9773e3084bf`, not a published package or a
+production rollout. Guest-target provenance, unknown legacy metadata,
+immutable digest architecture, root-bound dependency chains, mixed-target
+rejection, supported platform variants and client/backend restrictions are
+covered by existing consumer suites. No new test file or lane was introduced.
+
+The main portable selection passed **1,423 tests, 2 skipped** in 58.022 s:
+
+```sh
+umask 022
+PYTHONPATH=src uv run pytest -q \
+  tests/unit/test_inventory.py tests/unit/test_refs.py \
+  tests/unit/test_oci_layout.py tests/unit/test_cli_contract.py \
+  tests/unit/test_hub_contract.py tests/unit/test_remote_artifacts.py \
+  tests/unit/test_build.py tests/unit/test_lima.py \
+  tests/unit/test_cloud_runtime.py tests/unit/test_hub_builder.py \
+  tests/unit/test_buildkit.py tests/unit/test_platforms.py \
+  tests/unit/test_runtime_dispatch.py tests/unit/test_project_adapter.py \
+  tests/unit/test_project_runtime.py tests/unit/test_ui.py \
+  tests/unit/test_completion.py
+```
+
+The Hub API/build selection in `hub/` passed **118 tests** in 8.064 s
+(`uv run pytest -q tests/test_hub_api.py tests/test_builds.py`), retaining one
+existing TestClient deprecation warning. After the final compatible-list
+pagination change, the root CLI and Hub-client contract files passed **202
+tests** in 4.496 s. The separate image-publication/store-check selection
+passed **4 tests** in 0.188 s. These selections overlap; they are not additive
+full-suite counts. The broader portable result preceded the last pagination
+edit; the 202-test selection exercises that final edit.
+
+The final scoped Ruff lint check passed for 12 client modules, seven producer/
+store test files, three Hub modules and two Hub test files. The generated CLI
+reference, JavaScript syntax and test-lane manifest checks passed. The
+pre-existing seven import diagnostics in `test_cli_contract.py` remain outside
+this scoped lint result; formatting of its newly changed test ranges does
+not establish a clean whole-file lint gate.
+
+The separate 24-file format check passed for 22 files and reported remaining
+format drift in `src/palimpsest_local/remote_artifacts.py` and `ui.py`.
+Their unrelated existing layout was not rewritten; no clean full-format gate
+is claimed.
+
+### Exercised command, HTTP and browser paths
+
+- Packed real ARM and x86 SquashFS directories with `mksquashfs`, published
+  synthetic base/layer records through an isolated loopback Hub backed by
+  SQLite, queried architecture and complete compatibility, and rejected a
+  known mixed-target chain. No production identity or Hub was used.
+- Verified `image push` retains a recorded ARM target without an override and
+  rejects a conflicting x86 override. Unknown image targets require an
+  explicit declaration; manually declared targets are not binary inspection.
+- Exported/verified/extracted a bundle, downloaded the ARM image and layer
+  into a fresh client state, and obtained a compatible two-artifact dependency
+  result from the actual `store check` command.
+- Inserted an ARM candidate without a base before a valid layer and exercised
+  actual `layer ls --compatible --limit 1`: it scanned past the incomplete
+  first candidate and returned the later complete compatible layer.
+- Drove the actual local dashboard in owned Chrome/CDP against isolated
+  synthetic store state: architecture/status filters, unknown details and
+  backend/client explanations. Initially five records split into two
+  compatible, two incompatible and one unknown. The later pagination fixture
+  adds a sixth incomplete record; the compatible result remains two.
+  The settled 390 px mobile view had no global error and no horizontal page
+  overflow (`document.scrollWidth=375`). A stale operations-refresh warning
+  cleared on manual refresh; the operations and artifact endpoints returned
+  200. One favicon reset, but no JavaScript exception, was observed in the
+  exercised artifact interactions.
+
+Receipts and screenshots are retained under
+`~/.local/share/palimpsest-proofs/artifact-platform-zm70h2be/`, including
+`client-current-source-tests.xml`, `hub-final-tests.xml`,
+`pagination-final-tests.xml`, `browser-proof.json`, `platform-compatible.png`,
+`platform-unknown-details.png`, `platform-mobile.png` and
+`validated/{cli-http-proof,publication-arch-proof,pagination-proof,pull-arch-proof}.json`.
+The synthetic raw base payloads are not bootable images. This proof establishes
+metadata and consumer behavior, not a new guest build/boot, Vulkan/CUDA/ABI
+qualification, Linux KVM proof, full-suite result or deployment. Existing
+macOS GPU hardware evidence is a separate dated proof.
+
+
+## Human system administrator native management — 2026-10-17
+
+Current verification uses the settled source/tests/scripts overlay at
+`$PROOF/palimpsest-source`, where
+`PROOF=/private/var/folders/1m/xfc726k14szbjnrlq5t68zjw0000gn/T/afterglow-system-admin-f6gnvztx`.
+The base checkout is `aa397a0fd976e35302974a347748a9773e3084bf` plus preserved dirty
+changes, not a committed/released snapshot. Exact selected source hashes are in
+`$PROOF/palimpsest-final-source-manifest.json`.
+
+The coordinator's installed-dependency runner uses an empty allowlisted
+environment, loopback-only network policy, sandbox filesystem permissions and
+CPU/process/file/wall-clock bounds. No dependencies are fetched. From `hub/`,
+the focused selectors are:
+
+```sh
+python -m pytest -q tests/test_auth.py tests/test_packages.py \
+  tests/test_hub_api.py tests/test_builds.py tests/test_database_pool.py
+```
+
+The first current run finished with **483 passed, 2 failed, 2 skipped** in
+201.70 seconds (`palimpsest-final-focused.{json,stdout.log,stderr.log}`). All
+new compatibility and raw-envelope regressions passed. One failure exposed the
+remaining package fixture migration: its manager dependency still used ordinary
+member admission for the human operator. The fixture now models the distinct
+current manager context and disabled-operator revalidation without fabricating
+service leaves. The other failure is the runner's 256 MiB `RLIMIT_FSIZE` rejecting
+the existing real sparse PAX archive with logical size over 8 GiB; the sparse test
+has not been skipped, narrowed or mocked. A complete post-fixture pass is not
+claimed by this first receipt.
+
+The final complete five-file run after fixture migration **passed: 485 passed,
+2 skipped**, 207.58 seconds (runner elapsed208.41s), exit0. It used the unchanged
+selectors above through the parent-provided sparse-aware runner:
+
+```sh
+"$HUB_PYTHON" "$PROOF/run_pal_sparse.py" palimpsest-final-focused-sparse \
+  tests/test_auth.py tests/test_packages.py tests/test_hub_api.py \
+  tests/test_builds.py tests/test_database_pool.py
+```
+
+Receipts: `$PROOF/palimpsest-final-focused-sparse.{json,stdout.log,stderr.log}`.
+The two skips require the explicit disposable MariaDB ownership URL; no shared
+SQL or schema was used. The original real sparse seek/footer test ran unchanged.
+The parent-owned runner retains sandbox/network/CPU/process/wall-clock bounds,
+uses a fresh dedicated TMPDIR/pytest basetemp, and permits a bounded 9GiB logical
+file size solely to accommodate that sparse test. It monitors allocated
+`st_blocks` every10ms with a256MiB threshold and owned-process-group kill;
+observed peak was87,670,784bytes and the threshold was not exceeded. This is
+allocated-space monitoring, **not a hard filesystem quota**. Deprecation warnings
+remain (Keystone HTTPClient, Starlette test client and websockets); no warnings
+were suppressed or assertions narrowed. The unavailable `python3.12` launcher
+was replaced with the already installed Hub interpreter for the trusted wrapper,
+not a dependency installation or runtime change. No executable source changed
+between the passing smoke and this final focused run.
+
+The actual standalone command also **passed, 49/49 expected HTTP statuses**, exit
+0 in 2.12 seconds, through `run_native.py` from the overlay's `hub/` directory:
+
+```sh
+"$HUB_PYTHON" "$PROOF/run_native.py" palimpsest \
+  palimpsest-final-native-http-sdk ../scripts/smoke_system_admin.py \
+  --scratch "$PROOF/palimpsest-final-native-smoke"
+```
+
+Receipts are `$PROOF/palimpsest-final-native-http-sdk.{json,stdout.log,stderr.log}`;
+stderr is empty. This serves actual registered `palimpsest_hub.main:app`, the
+installed Keystone SDK and real loopback HTTP with fresh isolated SQLite/CAS.
+Zero-target-role admin A manages B: namespace registration, bounded OCI image
+package upload/publication/inventory/download/delete; native cloud-image/layer
+upload/publication/detail/blob/bundle/delete; own-key issue/list/revoke and bounded
+key downloads; target-bound build enqueue/list/detail with original requester
+audit. Raw direct authority transitions to group-implied authority with an empty
+effective-system view; group/edge revocation denies existing keys. Final
+revocation denies pending PATCH/new upload/build access before I/O, confirmed in
+SQL and staged bytes. Existing smoke upload-offset and package/build fixture
+repairs are preserved.
+
+Installed-SDK/loopback regressions now admit project/system/unscoped standard
+human `token` and `password`+`token` subjects with zero target roles, alongside
+password/TOTP/federation. Trust, application-credential, OAuth, bind and access-rule
+markers on the original subject deny broad administration, including explicitly
+empty markers. Original subject/project/auth reference and service/validator
+exact-ID exclusions remain intact. Existing ordinary keys never inherit later
+system elevation; admin-issued keys retain only declared actions/scope and fresh
+native owner, domain and target checks.
+
+Raw collection completeness tests exercise actual JSON envelopes, not truthiness
+flags normalized by SDK lists. Both ordinary/admin tokens and existing keys
+require `links.next` absent/null and `truncated` absent/null/literal `false` for
+roles, inference and effective-all assignments. `next=false/0/""/[]/{}` and
+`truncated=0/0.0/""/[]/{}` yield 503. Existing all-scope service-veto regressions
+still require 503 when project/domain service grants are hidden behind partial
+effective-all metadata and 403 with complete service records. Raw exact-system
+grants and native domains stay independently complete in those cases.
+
+No production endpoint, IAM or existing schema was accessed. Fresh SQLite
+bootstrap does not qualify a MySQL/MariaDB upgrade. No Redis, Docker, VM/build
+worker, KVM, provider export, deployment, full-suite or bootable-image qualification
+is claimed. Synthetic image/layer payloads prove metadata/authority only.
+Architecture stamp/guard remains parent-owned and was not run; no lint/formatter
+or gbrain indexing/search-guidance refresh is claimed.
+
+
+## Host VM removal across state roots — 2026-10-18 KST
+
+Source is the preserved dirty `dev` checkout at
+`aa397a0fd976e35302974a347748a9773e3084bf`. The user reported working detail/
+console access but disabled removal for service-created VMs. Read-only native
+inspection found16 VM rows (15 Lima, one libvirt/HVF), ten with a canonical run
+marker and six unmarked. The selected default state did not contain their run
+ledgers. No real VM was stopped, deleted, adopted or reconfigured.
+
+The regression `test_host_removal_does_not_require_selected_state_ledger`
+failed before implementation because `lifecycle.remove` was false. The first
+integrated inventory/host/HTTP selection passed **395 tests** in58.829s.
+After native-review corrections, the final selected consumer command passed
+**895 tests, zero failures/skips** in64.699s:
+
+```sh
+umask 022
+PYTHONPATH=src uv run pytest -q \
+  tests/unit/test_host_inventory.py tests/unit/test_inventory.py \
+  tests/unit/test_ui.py tests/unit/test_lima.py \
+  tests/unit/test_cloud_runtime.py tests/unit/test_runtime_dispatch.py \
+  tests/unit/test_console.py tests/unit/test_platforms.py
+```
+
+The intermediate run is retained: **888 passed, five failed**. Four failures
+exposed the invalid assumption that an unlinked, held directory has zero link
+count on Darwin/APFS; an actual throwaway-directory probe observed link count2
+after unlink. F_GETPATH followed a rename and retained the last pathname after
+unlink. The correction compares that descriptor path's current inode with the
+held inode, rather than requiring a Linux link-count invariant on Darwin.
+The fifth failure was an existing external-console ready-vm-type refusal
+reported as `transport` rather than `identity`. The final corrected-source run
+passed that selection without changing console source; this is not evidence
+that the intermediate categorization discrepancy was fixed. Counts overlap
+and are not full-suite claims.
+
+Native storage regressions cover physical/config/backend/marker changes,
+protected/OCI/refused identities, marked/unmarked and persistent/transient
+domains, strict command/SDK/absence failures, Unicode libvirt names, retained
+external disks/NVRAM, renamed-original false receipts and TPM retention. TPM
+preflight inspects both live and inactive definitions before stopping; missing
+retention support and transient emulator-TPM removal refuse before mutation.
+Fixtures model actual temporary-file retention/deletion, not forwarding echoes.
+
+### Actual HTTP and browser execution
+
+An owned executable `limactl` simulator runs as a real child process, reading
+only private synthetic instance directories. The packaged dashboard, inventory,
+native removal implementation, HTTP authentication/CSRF and frontend remain
+real. Real libvirt observation is disabled only in this proof harness; the
+simulator never delegates to a real hypervisor.
+
+- Marked running VM removal succeeded from the list; unmarked stopped VM
+  removal succeeded from Details. Exact-name confirmation enabled submission;
+  blank/wrong names did not. Host run-file deletion was hidden and disabled;
+  unmarked details offered no selected-state start/stop controls.
+- Real HTTP additionally removed a marked stopped krunkit fixture and an
+  unmarked running VZ fixture. Six missing-identity, wrong-name and run-file
+  requests returned409 without native deletion.
+- A changed same-name instance disabled an already-open confirmation before
+  DELETE. A later fresh explicit selection was distinct from that refused
+  request. Independent disk bytes and other-state record bytes were retained;
+  the selected run directory stayed empty throughout (no adoption).
+- After the Darwin correction, a fresh native selection completed the actual
+  subprocess/physical-directory absence path successfully. This smoke is
+  retained separately as `final-native-smoke.json`. Browser error collection
+  remained empty in the exercised list/detail/dialog/replacement paths.
+- Fresh read-only eligibility reported all16 real host rows with native
+  fingerprints and removal capability. A separate before/after comparison
+  retained all16 names/backends/run markers/runtime kinds/statuses unchanged.
+
+Final scoped Ruff lint passed for the four changed Python modules and three
+test files. Six selected Python format checks passed; the pre-existing
+`ui.py` whole-file format drift was not rewritten or claimed clean. JavaScript
+syntax, generated CLI reference and test-lane manifest checks passed. No new
+test file/lane, dependency, schema, workflow, commit, push or deployment was
+introduced. This is source/portable/simulated-process verification, **not real
+Lima/libvirt teardown or TPM hardware evidence**. Lima's name-addressed command
+is not atomic against arbitrary concurrent same-UID instance replacement.
+
+Secret-free JUnit, host comparison, private simulator receipts and screenshots:
+`~/.local/share/palimpsest-proofs/vm-remove-09_cakkk/`. Key files are
+`failing-before.xml`, `focused-after.xml`, `final-removal-tests.xml`,
+`final-platform-removal-tests.xml`, `host-preservation.json`,
+`host-eligibility-after.json`, `darwin-directory-absence.json`,
+`browser-proof.json`, `http-proof.json`, `final-native-smoke.json` and
+`verification.json`; screenshots are `removal-{list-after,dialog,after,replacement-blocked}.png`.
+Owned browser/dashboard proof processes were stopped and proof data retained.
+No original VM or state root was used as a destructive test target.
+
+
+## API-uploaded build inputs and NVIDIA attempt — 2026-10-21 KST
+
+`umask 022 && uv run pytest -q tests/unit/test_buildkit.py tests/unit/test_packages.py tests/unit/test_cli_contract.py` passed471 tests (zero failures/skips). Actual published Hub uploaded-base/parent CPU build and offline archive-backed PyTorch COPY-layer build passed, including full downloaded digest and derived marker consumption. FROM-only empty-cache-export rejection remains a failed attempt. No full-suite or GPU pass is claimed.
+
+Approved maximum-one3060LHR Nova attempt remained BUILD after903.88s; its create event reports compute build Error, with no attached volume or detailed reason. No guest login, standalone driver build/load, mount, CUDA/framework GPU execution or final Torch interactive access was verified. Native archive publication separately failed403 under the original human admin; no auth bypass/deployment occurred. See the dated handoff and `~/.local/share/palimpsest-proofs/api-nvidia-kms6qrv4/` for exact identities, JUnit, source guard, failures and retained resources.
+
+## Resumed NVIDIA layer and original-image diagnostics — 2026-10-21 KST
+
+After operator role separation and explicit failed-VM replacement approval,
+the bounded single3060LHR instance booted and remains ACTIVE. Actual console
+password login, pieroot sudo, pinned SSH via the existing management jump,
+cloud-init done and restored guest monitoring services were checked.
+
+Rebuilt NVIDIA535.309.01 for guest kernel6.8.0-57-generic, canonically packed
+an x86_64 SquashFS driver layer, loaded its compute modules and used its NVML.
+Mount filesystem/ro/backing-path/inode checks passed. PyTorch2.8.0+cu126 and
+CUDA12.6.3-devel performed actual assigned-GPU2x2 math (sum134, no CPU fallback)
+over5 and11 original-image-derived mounted SquashFS layers respectively.
+This is Nova-guest diagnostic chroot proof, **not original OCI-root boot**.
+
+Original TensorFlow2.21 GPU exposed type-bearing tar mode0120777. New matching
+regular/directory/symlink/hardlink acceptance cases failed before the narrow
+normalization fix. `uv run pytest -q tests/unit/test_oci_converter_first_pass.py
+tests/unit/test_oci_convert_security.py` then passed153 with7 skips; scoped
+Ruff passed. Independent source/proof review found no remaining blocker.
+Isolated two-file staged architecture guard passed; shared marker/index were
+not stamped. Corrected real conversion completed18 TensorFlow layers, but
+GPU registration failed because its build requires cuDNN9 while the unchanged
+archive contains only cuDNN8.9.6. Full original layer inventory and dlopen
+diagnostics confirmed the mismatch; no CPU fallback or library replacement.
+
+Final PyTorch environment and driver mount are retained; launcher re-entry
+with a real torch GPU command passed. No automatic reboot restoration was
+qualified. Native publication is still403 and driver API readback404; no
+native API upload/OCI-boot success, full-suite pass or production deployment
+is claimed. Exact identities, hashes, runtime receipts, errors and access
+limits are in the dated handoff and private proof root
+`~/.local/share/palimpsest-proofs/api-nvidia-kms6qrv4/resume-20261021/`.
+
+## Driver-free Ubuntu layer transfer proof — 2026-10-21 UTC
+
+After explicitly approved sequential VM replacement, exact image
+`ubuntu:24.04-server-pbr-hotplug-26-07-29` (`2a57a904-fc77-46e6-851a-148e8cb0ca98`)
+booted with no NVIDIA packages, loaded modules, nvidia-smi or firmware directory.
+The requested earlier nvidia-v3 image had already contained535.309.01; that
+prerequisite failure is separately retained in the handoff, not called clean proof.
+
+Transferred the existing canonically packed x86_64/kernel6.8.0-57 driver artifact
+unchanged, verified SHA256 plus mount/backing-file identity, loaded its compute
+modules and NVML, and directed guest firmware lookup into its read-only mount.
+RTX3060/535.309.01/12288MiB succeeded without installing NVIDIA packages.
+Actual firmware consumption, fresh compilation on this clean guest and other
+kernels were not qualified.
+
+Full original archive hashes matched before canonical materialization. PyTorch5
+and CUDA11 mounted layers each passed assigned-GPU matrix math sum134, refusing
+CPU fallback. TensorFlow18 layers materialized but GPU acceptance failed:
+cuDNN9 required, libcudnn.so.9 absent, cuDNN8.9.6 available and physical GPUs[].
+All framework runs are diagnostic guest chroots, not original OCI VM boot.
+Retained PyTorch launcher passed real GPU re-entry; password-only SSH and sudo
+passed. The final VM remains ACTIVE, with no reboot-persistence qualification.
+No new source tests or API publication claims; receipts are under
+`~/.local/share/palimpsest-proofs/api-nvidia-kms6qrv4/plain-ubuntu-hotplug-20261021/`.
+
+## Native unprivileged GPU shell correction — 2026-10-21 UTC
+
+The earlier enter-pytorch root chroot lacked the driver's bin in PATH; explicit
+GPU proof success did not cover plain interactive nvidia-smi. Replaced that usage
+with global profile/interactive-Bash PATH configuration, ldconfig registration
+of the mounted driver libraries and a read-only bind of original-image Conda
+at /opt/palimpsest/pytorch. The obsolete entry wrapper is archived, not aliased.
+
+Actual new PTY SSH login as pieroot UID1001 ran nvidia-smi directly and gpu-check
+without sudo/chroot. The single executable gpu-check.py prints real nvidia-smi
+output and checks an exact CUDA matrix product/sum134 with CPU fallback refused.
+Direct remote command, login Bash and NVML resolution without LD_LIBRARY_PATH
+also passed. No new driver packages, shell binary patch, reboot or source tests;
+runtime receipts are in the existing proof root's shell-usability directory.
+Reboot-persistence and the earlier TensorFlow/API/OCI-boot limitations remain.
+
+## Cinder-backed native runtime after reboot — 2026-10-21 UTC
+
+Added reusable account-free `layer cloud-init --config` export for prepopulated
+ext4 UUID storage under `/srv/palimpsest`, digest-bound readonly stacks and native
+prefixes, global PATH/linker configuration and runtime checks before SSH service.
+Current guest migration used a newly owned40GiB Cinder volume; no other disk was
+formatted. Generated runtime/SSH graph passed actual guest systemd verification.
+Source tests cover architecture/storage/blob/mount/collision/error boundaries,
+an unrelated Ubuntu stacked mount, repeated bootcmd without socket activation,
+and atomic output refusal with an intervening destination. Focused cloud-init/CLI
+selection passed315 tests; scoped source/cloud-init Ruff, CLI reference and lane
+manifest passed. Unrelated existing CLI test-tail lint findings remain separate.
+
+Kernel147 modules were built from a checksum-verified535.309.01 source extract
+without installing NVIDIA packages. Driver ownership was repacked rather than
+relaxing root-owned prefix validation. A distinct hash-pinned TensorFlow dependency
+layer over original PyTorch fixes the combined native runtime; the earlier original
+TensorFlow image's cuDNN9 failure remains valid.
+
+Approved same-VM reboot actually loaded6.8.0-147-generic and restored external
+storage, driver and both frameworks before SSH daemon startup. New unprivileged
+PTY login ran nvidia-smi and gpu-check; both Torch and TensorFlow GPU matrices
+returned sum134 and cuDNN convolutions passed, with CPU fallback refused. Native
+nvcc12.6 sm_86 compilation/kernel execution and pip check passed. Every active loop
+backing file is on the Cinder filesystem; no home runtime mounts remain. Historical
+home proof artifacts were archived, not deleted. Boot activation took about252s;
+the earlier240s banner wait timed out while the gate remained closed.
+
+Scope is migrated existing guest plus actual reboot/login, not fresh-instance
+cloud-init provisioning, public Nova orchestration, Manila or arbitrary GPU/kernel
+compatibility. Exact source guard, identities, failures and receipts are in the
+handoff and private `srv-cinder-runtime/` proof root; guest completion/manifest
+are `/srv/palimpsest/receipts/`.
+
+The integrated wheel also built successfully and passed a fresh Python3.11.15
+installation/actual CLI export smoke. Installed output is byte-identical to the
+verified ready cloud-init; packaged module bytes match reviewed working source.
+wheel-export-provenance.json seals the candidate hash; no publication occurred.
+
+
+
+
+
+## Fresh paired GPU guests and immutable Cinder sharing — 2026-10-21 UTC
+
+Source selection and local installed-package smoke:
+
+```sh
+umask 022
+uv run ruff format src/palimpsest_local/external_layers.py tests/unit/test_cloudinit_guest.py
+uv run ruff check src/palimpsest_local/external_layers.py tests/unit/test_cloudinit_guest.py
+uv run pytest -q tests/unit/test_cloudinit_guest.py tests/unit/test_cli_contract.py
+uv run python scripts/generate_cli_reference.py --check
+uv run python scripts/test_lanes.py list --check
+uv build --wheel --out-dir "$PROOF/wheels"
+"$PROOF/client-env/bin/palimpsest" layer cloud-init \
+  --config "$PROOF/external-runtime.json" --output "$PROOF/installed-runtime-cloud-init.yaml"
+```
+
+The source selection passed **325**, zero failures/skips; scoped Ruff/format,
+reference and manifest checks passed. The built wheel was installed without
+dependencies into fresh Python3.11.15; installed exporter bytes match source
+output. No full-suite/full-tree lint result or release is claimed. Existing
+unrelated CLI-test-tail lint findings were not rewritten.
+
+New behavioral regressions cover invalid nonboolean `storage_read_only`, refusal
+of writable storage, replay-enabled ext4 and writable block devices, accepted
+noload/norecovery aliases, and existing empty ROFS mountpoints without mkdir.
+Actual generated mount unit semantics were also exercised for true, false and
+omitted policy. Independent source review found no blocker.
+
+Fresh anonymous pull of pinned original Torch2.8.0 CUDA12.6 OCI content and five
+canonical cold materializations preceded creation of a clean root-owned ext4
+data image. On-image ownership and consistency, QCOW2 check, local/Glance MD5
+and SHA512 agreement were observed. Two fresh Nova plain-Ubuntu GPU guests then
+booted with composed account/exporter policy and the **same**20GiB Cinder
+multiattach volume. Cinder3.44 reports both attach/connection modes `ro`; each
+guest reports blockRO1 and ext4 `ro,nosuid,nodev,norecovery` at `/srv/palimpsest`.
+No writable attachment or provider/guest writer was used after finalization.
+
+Both boot-time ordinary-user checks and actual password-only pinned-host-key
+interactive SSH ran nvidia-smi, default Torch Python and gpu-check with no manual
+environment entry, sudo/chroot compute wrapper, driver package install or home
+runtime tree. GTX1080Ti535.309.01, Torch2.8.0+cu126 and cuDNN91002 performed exact
+CUDA matrices/sum134 and convolutions4 without CPU fallback. Root permission
+was verified separately with sudo, not used to count framework success.
+The first A harness encountered queued-input/sudo flushing, logout-errexit and
+ANSI marker issues; raw failed evidence is retained, and no guest repair was
+needed. B's first password/PTY session passed the corrected prompt-paced harness.
+
+Overlapping15-second CUDA workloads passed on different GPU UUIDs/guest boot
+IDs. All seven shared blob digest/size/inode/owner records and filesystem UUID
+matched. Same-path private-root markers were independent and removed afterward.
+Runtime finished before SSH startup at approximately234s/239s after boot; API
+ACTIVE and early banner timeouts alone were not treated as readiness.
+
+Both new VMs and40GiB boot disks, shared data volume, access resources and the
+original VM remain retained. Both guests are on `dms-compute8`; cross-host,
+Manila, arbitrary GPU/kernel, new-VM reboot, TensorFlow and nvcc qualification
+are outside this proof. Base-image openipmi failed on both, fwupd/refresh also
+failed on B; these were recorded rather than repaired or hidden. Full resource,
+SDK upload/attachment and harness failure details are in the latest handoff.
+Receipts: private local `multi-instance-torch-5aglh79o/` proof root and
+user-readable guest `/var/lib/palimpsest/receipts/`. Do not publish the private
+proof directory wholesale or copy credentials into documentation.
+
+## Nova readiness probe timeout regression — 2026-10-23
+
+- A30-second SSH connect budget collided with the30-second subprocess budget; `_wait_guest` let TimeoutExpired escape, so the first probe prematurely ended all20 fresh direct-stage attempts. First four observed request-to-failure elapsed55.65–58.16s. These records are not GPU failure or timing samples; all20 servers were deleted404 and boot volumes retained.
+- `test_readiness_poll_survives_probe_timeout_until_deadline` covers both timeout→later readiness and repeated timeouts→exact overall deadline with retained partial stderr/timed_out status. Both fail before the fix; focused metrics29 passed afterward. SSH ConnectTimeout returns to10s, per-probe timeouts remain at most30s and both probe/sleep are clipped to remaining readiness time. No overall readiness deadline is extended.
+- A throwaway actual Python child exceeded a .05s subprocess timeout and the next real child returned readiness; receipt `restart-readiness-runtime-smoke.json`. A fresh one-VM RTX3060 cloud-init collector qualification runs separately under sleep inhibition and is excluded from timing repetitions. Pending live result is not claimed by the local proof.
 

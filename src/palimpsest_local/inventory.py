@@ -30,6 +30,7 @@ from . import (
     state,
     vm_access,
 )
+from .artifact_compatibility import ARCHITECTURES, artifact_arch, canonical_arch, check_artifact
 from .artifact_store import ArtifactStore, ArtifactStoreError
 from .digest import digest_file, require_digest
 from .errors import ArtifactValidationError, InvalidDigestError, StateError
@@ -266,19 +267,40 @@ def browse_remote_artifacts(
     arch: str = "",
     disk_format: str = "",
     parent: str = "",
+    compatible: bool = False,
     hub_connection: HubConnection | None = None,
 ) -> dict[str, Any]:
-    return RemoteArtifacts(roots, hub_connection=hub_connection).browse(
+    if arch and arch not in ARCHITECTURES:
+        raise StateError("arch must be x86_64 or aarch64")
+    result = RemoteArtifacts(roots, hub_connection=hub_connection).browse(
         connection_id,
         kind=kind,
         query=query,
         repository=repository,
         limit=limit,
         cursor=cursor,
-        arch=arch,
+        arch=arch if connection_id == "legacy" else "",
         disk_format=disk_format,
         parent=parent,
     )
+    host = platforms.detect_host()
+    rows = result.get("items", [])
+    result["items"] = [
+        row
+        for row in rows
+        if (
+            not arch
+            or not row.get("architectures")
+            or arch in {canonical_arch(value) for value in row.get("architectures", [])}
+        )
+        and (not compatible or row.get("run_supported") is True)
+    ]
+    if arch or compatible:
+        result["message"] = (
+            "Current-page platform candidates only; unknown architectures remain navigable, not verified compatible. Follow next_cursor for more results. Download/check verifies dependencies; runtime preflight still applies."
+        )
+    result["client"] = {"system": host.system, "arch": host.machine}
+    return result
 
 
 def transfer_artifact(
@@ -484,7 +506,7 @@ def list_vms(roots: StatePaths, *, live: bool = True) -> dict[str, Any]:
             if owned is not None and owned["status"] != "removed":
                 # Libvirt domain enumeration cannot recover Palimpsest's published endpoints.
                 fields = ("status", "memory_mib", "vcpus")
-                if host_vm["backend"] == "lima-vz":
+                if host_vm["backend"] in platforms.LIMA_BACKENDS:
                     fields += ("ssh", "guest_ip", "ports")
                 for field in fields:
                     if host_vm.get(field) is not None:
@@ -492,7 +514,10 @@ def list_vms(roots: StatePaths, *, live: bool = True) -> dict[str, Any]:
                 owned["source"] = "run-ledger+host-backend"
             else:
                 for vm in vms:
-                    if vm["backend"] == host_vm["backend"] and vm["name"] == host_vm["name"]:
+                    same_namespace = vm["backend"] == host_vm["backend"] or (
+                        vm["backend"] in platforms.LIMA_BACKENDS and host_vm["backend"] in platforms.LIMA_BACKENDS
+                    )
+                    if same_namespace and vm["name"] == host_vm["name"]:
                         vm["managed"] = False
                         vm["stale"] = True
                 vms.append(host_vm)
@@ -500,16 +525,35 @@ def list_vms(roots: StatePaths, *, live: bool = True) -> dict[str, Any]:
     vms.sort(key=lambda x: (x["name"], x["backend"], x["id"]))
     for vm in vms:
         collision = any(
-            other is not vm and other["backend"] == vm["backend"] and other["name"] == vm["name"] for other in vms
+            other is not vm
+            and other["name"] == vm["name"]
+            and (
+                other["backend"] == vm["backend"]
+                or (other["backend"] in platforms.LIMA_BACKENDS and vm["backend"] in platforms.LIMA_BACKENDS)
+            )
+            for other in vms
         )
         vm["access"] = vm_access.capabilities(vm, live=live, collision=collision)
         if vm.get("managed") is False and vm.get("source") == "host-backend":
-            # For host VMs, do not let stale managed run ledgers with the same name disable native removal.
-            # Only collide with distinct host-backend records of the same ID or conflicting active host names.
+            # Same-backend stale ledgers do not prevent identity-bound host removal.
+            # Cross-Lima replacement is a backend identity conflict in one native namespace.
             host_collision = any(
                 other is not vm
-                and other.get("source") == "host-backend"
-                and (other["id"] == vm["id"] or (other["backend"] == vm["backend"] and other["name"] == vm["name"]))
+                and (
+                    (
+                        other.get("source") == "host-backend"
+                        and (
+                            other["id"] == vm["id"]
+                            or (other["backend"] == vm["backend"] and other["name"] == vm["name"])
+                        )
+                    )
+                    or (
+                        other["name"] == vm["name"]
+                        and other["backend"] != vm["backend"]
+                        and other["backend"] in platforms.LIMA_BACKENDS
+                        and vm["backend"] in platforms.LIMA_BACKENDS
+                    )
+                )
                 for other in vms
             )
             vm["lifecycle"] = _vm_lifecycle_capabilities(vm, live=live, collision=host_collision)
@@ -776,7 +820,13 @@ def vm_logs(
     }
 
 
-def list_artifacts(roots: StatePaths) -> dict[str, Any]:
+def list_artifacts(
+    roots: StatePaths, *, arch: str | None = None, compatible: bool = False, requested_backend: str = "auto"
+) -> dict[str, Any]:
+    if arch is not None and arch not in ARCHITECTURES:
+        raise StateError("arch must be x86_64 or aarch64")
+    if requested_backend not in ("auto", *platforms.BACKENDS):
+        raise StateError("unsupported compatibility backend")
     proj_index = _build_project_index(roots)
     referenced_by: dict[str, dict[str, set[str]]] = {}
     retained_metadata_valid = True
@@ -975,12 +1025,35 @@ def list_artifacts(roots: StatePaths) -> dict[str, Any]:
         oci_images[key] = retained
         artifacts.append(retained)
         images.append(retained)
+    host = platforms.detect_host()
+    local = {artifact["digest"]: artifact for artifact in artifacts if artifact.get("source") == "content-store"}
+    for artifact in artifacts:
+        artifact["compatibility"] = check_artifact(
+            artifact, lookup=local.__getitem__, host=host, requested_backend=requested_backend
+        )
+
+    def selected(artifact: dict[str, Any]) -> bool:
+        return (arch is None or artifact_arch(artifact) == arch) and (
+            not compatible or artifact["compatibility"]["compatible"]
+        )
+
     return {
-        "artifacts": artifacts,
-        "images": images,
-        "layers": layers,
-        "unknown": unknown,
+        "artifacts": [artifact for artifact in artifacts if selected(artifact)],
+        "images": [artifact for artifact in images if selected(artifact)],
+        "layers": [artifact for artifact in layers if selected(artifact)],
+        "unknown": [artifact for artifact in unknown if selected(artifact)],
+        "client": {"system": host.system, "arch": host.machine},
     }
+
+
+def check_local_artifact(roots: StatePaths, reference: str, *, requested_backend: str = "auto") -> dict[str, Any]:
+    """Inspect only selected local metadata; never download, reconcile, or start."""
+    digest = reference if reference.startswith("sha256:") else read_tag_record(roots, reference).digest
+    digest = require_digest(digest)
+    for artifact in list_artifacts(roots, requested_backend=requested_backend)["artifacts"]:
+        if artifact["digest"] == digest:
+            return {"digest": digest, **artifact["compatibility"]}
+    raise StateError("artifact is not present in the selected local inventory")
 
 
 def _retained_remote_artifacts(roots: StatePaths) -> Iterator[dict[str, Any]]:
@@ -1453,7 +1526,9 @@ def _remove_artifact_locked(roots: StatePaths, norm_digest: str, *, force: bool)
             )
         except OCIStoreError as exc:
             if exc.code == "oci-store-in-use":
-                raise StateError(f"{norm_digest} is retained by a durable OCI lease") from None
+                raise StateError(
+                    f"{norm_digest} is retained by OCI policy (durable lease or permanent layer cache)"
+                ) from None
             raise StateError("cannot prove artifact is unleased because OCI retention metadata is invalid") from None
         except ArtifactStoreError:
             raise StateError("artifact physical deletion failed descriptor verification") from None
@@ -1792,6 +1867,7 @@ def list_volumes(roots: StatePaths, *, vms_result: dict | None = None) -> dict[s
     projects = _projects(roots, warnings)
     owners = _owners(projects, warnings)
     volumes: dict[str, dict[str, Any]] = {}
+    lima_disk_rows: dict[str, set[str]] = {}
     for project in projects:
         for volume in project.volumes.values():
             key = f"project:{project.project}:{volume.backend}:{volume.name}"
@@ -1830,6 +1906,35 @@ def list_volumes(roots: StatePaths, *, vms_result: dict | None = None) -> dict[s
         if not isinstance(raw_volumes, list):
             warnings.add(_RUN_WARNING)
             raw_volumes = []
+        native_names: dict[str, str] = {}
+        if vm["backend"] in platforms.LIMA_BACKENDS and raw_volumes:
+            try:
+                snapshot = state.read_run_ledger_snapshot(roots, vm["name"])
+                record = snapshot.record
+                if (
+                    record.name != vm["name"]
+                    or record.run_id != vm["run_id"]
+                    or record.dispatch_key.backend.value != vm["backend"]
+                ):
+                    raise StateError("run identity changed")
+                native_volumes = snapshot.state.get("volumes", ())
+                if not isinstance(native_volumes, (list, tuple)):
+                    raise StateError("invalid volume metadata")
+                for native_volume in native_volumes:
+                    if not isinstance(native_volume, Mapping):
+                        raise StateError("invalid volume metadata")
+                    native_name = native_volume.get("backend_name")
+                    if native_name is None:
+                        warnings.add(_RUN_WARNING)
+                        continue
+                    native_name = project_runtime._valid_name(native_name, "Lima disk", run=True)
+                    logical_name = project_runtime._valid_name(native_volume.get("name"), "volume")
+                    if logical_name in native_names or native_name in native_names.values():
+                        raise StateError("invalid native disk identity")
+                    native_names[logical_name] = native_name
+            except _METADATA_ERRORS:
+                native_names.clear()
+                warnings.add(_RUN_WARNING)
         for attached in raw_volumes:
             try:
                 if not isinstance(attached, dict):
@@ -1869,6 +1974,9 @@ def list_volumes(roots: StatePaths, *, vms_result: dict | None = None) -> dict[s
                 }
                 if attachment not in row["attachments"]:
                     row["attachments"].append(attachment)
+                if name in native_names:
+                    native_name = native_names[name]
+                    lima_disk_rows.setdefault(native_name, set()).add(key)
             except _METADATA_ERRORS:
                 warnings.add(_RUN_WARNING)
         if vm["runtime_kind"] != "cloud-image":
@@ -1922,6 +2030,26 @@ def list_volumes(roots: StatePaths, *, vms_result: dict | None = None) -> dict[s
                 ),
                 None,
             )
+        elif host_volume["kind"] == "volume" and host_volume["backend"] == "lima":
+            identities = {
+                (item["name"], item.get("run_id")) for item in host_volume["attachments"] if item.get("run_id")
+            }
+            candidates = {
+                key
+                for key in lima_disk_rows.get(host_volume["name"], set())
+                if any((item["name"], item.get("run_id")) in identities for item in volumes[key]["attachments"])
+            }
+            if len(candidates) == 1:
+                target = volumes[next(iter(candidates))]
+                target["backend"] = "lima"
+                # Keep ledger guest mount metadata while retaining every observed
+                # attachment to this one shared native Lima disk.
+                attached = {(item["name"], item.get("run_id")): item for item in target["attachments"]}
+                for item in host_volume["attachments"]:
+                    attached.setdefault((item["name"], item.get("run_id")), item)
+                target["attachments"] = list(attached.values())
+            elif len(candidates) > 1:
+                warnings.add(_RUN_WARNING)
         if target is None:
             volumes[host_volume["id"]] = host_volume
         else:
@@ -1930,7 +2058,7 @@ def list_volumes(roots: StatePaths, *, vms_result: dict | None = None) -> dict[s
                     target[field] = host_volume[field]
     host_info = platforms.detect_host()
     create_backends = []
-    for backend in ("lima-vz", "kvm", "libvirt-hvf"):
+    for backend in platforms.BACKENDS:
         try:
             if platforms.backend_capability_report(backend, host=host_info).successful:
                 create_backends.append(backend)
@@ -2091,25 +2219,37 @@ def list_networks(roots: StatePaths, *, vms_result: dict | None = None) -> dict[
                 raise StateError("invalid network")
             isolated = network == "none"
             per_vm = isolated or backend == "libvirt-hvf"
-            if backend == "lima-vz":
-                if network in {"default", "vzNAT"}:
+            user_mode = backend == platforms.BACKEND_LIMA_KRUNKIT and network == "default"
+            per_vm = per_vm or user_mode
+            if backend in platforms.LIMA_BACKENDS:
+                if user_mode:
+                    pass
+                elif backend == platforms.BACKEND_LIMA and network in {"default", "vzNAT"}:
                     network = "vzNAT"
                 elif network.startswith("lima:"):
                     name = network.removeprefix("lima:")
                     project_runtime._valid_name(name, "Lima network", run=True)
                 elif not isolated:
                     raise StateError("invalid Lima network")
-                kind = "lima"
+                kind = "user-mode" if user_mode else "lima"
             else:
                 project_runtime._valid_name(network, "libvirt network")
                 kind = "user-hostfwd" if backend == "libvirt-hvf" else "libvirt"
-            key = f"network:{backend}:{vm['run_id']}" if per_vm else f"network:{backend}:{network}"
+            named_lima = backend in platforms.LIMA_BACKENDS and network.startswith("lima:")
+            if user_mode:
+                key = f"network:{backend}:{vm['run_id']}:{vm['name']}"
+            elif per_vm:
+                key = f"network:{backend}:{vm['run_id']}"
+            elif named_lima:
+                key = f"network:lima:{network.removeprefix('lima:')}"
+            else:
+                key = f"network:{backend}:{network}"
             row = _network(
                 key,
                 network,
                 kind,
-                backend,
-                mode="none" if isolated else "configured",
+                "lima" if named_lima else backend,
+                mode="none" if isolated else "gvisor" if user_mode else "configured",
                 status="isolated" if isolated else "configured",
                 source="run-ledger",
             )
@@ -2117,7 +2257,7 @@ def list_networks(roots: StatePaths, *, vms_result: dict | None = None) -> dict[
                 "name": vm["name"],
                 "run_id": vm["run_id"],
                 # Lima records the guest's first global address (user-mode eth0), not one on this network.
-                "guest_ip": None if isolated or backend == "lima-vz" else _address(vm.get("guest_ip")),
+                "guest_ip": None if isolated or backend in platforms.LIMA_BACKENDS else _address(vm.get("guest_ip")),
                 "ports": _ports(vm.get("ports", [])),
             }
             if isolated and attachment["ports"]:
@@ -2134,18 +2274,22 @@ def list_networks(roots: StatePaths, *, vms_result: dict | None = None) -> dict[
     observed = host_inventory.observe()
     warnings.update(observed["warnings"])
     for host_network in observed["networks"]:
-        target = next(
-            (
-                row
-                for row in networks.values()
-                if row["backend"] == host_network["backend"]
-                and (row["name"].removeprefix("lima:") if row["backend"] == "lima-vz" else row["name"])
-                == host_network["name"]
-                and row["kind"] in {"lima", "libvirt"}
-                and row["status"] != "isolated"
-            ),
-            None,
-        )
+        target = networks.get(host_network["id"])
+        if target is None:
+            target = next(
+                (
+                    row
+                    for row in networks.values()
+                    if row["backend"] == host_network["backend"]
+                    and (
+                        row["name"].removeprefix("lima:") if row["backend"] in platforms.LIMA_BACKENDS else row["name"]
+                    )
+                    == host_network["name"]
+                    and row["kind"] in {"lima", "libvirt"}
+                    and row["status"] != "isolated"
+                ),
+                None,
+            )
         if target is None:
             networks[host_network["id"]] = host_network
         else:

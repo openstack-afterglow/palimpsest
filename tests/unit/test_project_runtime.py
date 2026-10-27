@@ -131,7 +131,8 @@ def _roots(tmp_path: Path) -> state.StatePaths:
 
 
 class FakeRuntime:
-    def __init__(self) -> None:
+    def __init__(self, backend: str = "kvm") -> None:
+        self.backend = backend
         self.statuses: dict[str, str] = {}
         self.run_ids: dict[str, str] = {}
         self.backends: dict[str, str] = {}
@@ -168,7 +169,7 @@ class FakeRuntime:
             for mount in item.service.volumes:
                 volume = item.project.volumes[mount.source]
                 if not volume.external:
-                    volumes[volume.name] = ManagedVolume(volume.name, "kvm", volume.size_mib * 1024 * 1024)
+                    volumes[volume.name] = ManagedVolume(volume.name, self.backend, volume.size_mib * 1024 * 1024)
         if self.fail_prepare:
             raise ProjectPrepareError("prepare rejected", tuple(volumes.values()))
         return tuple(volumes[name] for name in sorted(volumes))
@@ -183,11 +184,12 @@ class FakeRuntime:
         if expected_identity is not None:
             assert expected_identity.name == name
             assert expected_identity.run_id == self.run_ids[name]
+            assert expected_identity.dispatch_key.backend.value == self.backends[name]
         self.events.append(("start", prepared.plan.service, prepared.plan.action))
         if prepared.plan.action in {"create", "recreate"} or name not in self.run_ids:
             self.generation += 1
             self.run_ids[name] = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{name}:{self.generation}"))
-            self.backends[name] = "kvm"
+            self.backends[name] = self.backend
         if prepared.plan.service == self.fail_start:
             self.statuses[name] = "failed"
             raise RuntimeError("start failed")
@@ -197,6 +199,7 @@ class FakeRuntime:
         if expected_identity is not None:
             assert expected_identity.name == name
             assert expected_identity.run_id == self.run_ids[name]
+            assert expected_identity.dispatch_key.backend.value == self.backends[name]
         self.events.append(("stop", name))
         if name in self.statuses:
             self.statuses[name] = "stopped"
@@ -205,6 +208,7 @@ class FakeRuntime:
         if expected_identity is not None and name in self.run_ids:
             assert expected_identity.name == name
             assert expected_identity.run_id == self.run_ids[name]
+            assert expected_identity.dispatch_key.backend.value == self.backends[name]
         self.events.append(("remove", name))
         self.statuses.pop(name, None)
         self.run_ids.pop(name, None)
@@ -754,12 +758,29 @@ def test_successful_up_refreshes_dependency_order_before_down(tmp_path: Path) ->
     assert [event[1] for event in runtime.events if event[0] == "remove"] == ["demo-a-1", "demo-b-1"]
 
 
-def test_valid_backend_accepts_known_backends_and_rejects_unknown() -> None:
-    from palimpsest_local.project_runtime import _KNOWN_BACKENDS, _valid_backend
+@pytest.mark.parametrize("backend", ["lima-vz", "lima-krunkit"])
+def test_lima_project_lifecycle_retains_owner_and_volume_backend_identity(tmp_path: Path, backend: str) -> None:
+    project = _project(tmp_path)
+    roots = _roots(tmp_path)
+    runtime = FakeRuntime(backend)
+    callbacks = runtime.callbacks()
 
-    assert _KNOWN_BACKENDS == {"kvm", "lima-vz", "libvirt-hvf"}
-    assert _valid_backend("kvm", "backend") == "kvm"
-    assert _valid_backend("lima-vz", "backend") == "lima-vz"
-    assert _valid_backend("libvirt-hvf", "backend") == "libvirt-hvf"
-    with pytest.raises(StateError, match=r"backend must be one of: kvm, libvirt-hvf, lima-vz"):
-        _valid_backend("invalid", "backend")
+    up_project(project, callbacks, roots=roots, services=["api"])
+    original = read_project_state(project, roots)
+    assert original is not None
+    assert all(service.backend == backend for service in original.services.values())
+    assert original.volumes["data"] == ManagedVolume("data", backend, 1024**3)
+
+    stop_project_services(project, callbacks, ["db", "api"], roots=roots)
+    restarted = up_project(project, callbacks, roots=roots, services=["api"])
+    assert all(action.action == "start" for action in restarted.actions)
+    preserved = read_project_state(project, roots)
+    assert preserved is not None
+    assert preserved.services == original.services
+    assert preserved.volumes == original.volumes
+
+    down_project(project, callbacks, roots=roots, volumes=True)
+    assert ("remove-volume", project.name, "data", backend, 1024**3) in runtime.events
+    emptied = read_project_state(project, roots)
+    assert emptied is not None
+    assert not emptied.services and not emptied.volumes

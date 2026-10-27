@@ -362,6 +362,21 @@ class LocalProcessSession:
                 os.killpg(self._process.pid, signal_module.SIGTERM)
             except ProcessLookupError:
                 pass
+            except PermissionError as denied:
+                # Darwin can deny signalling a PTY group while EOF exits its
+                # leader. Accept that race only after reaping and proving the
+                # entire group absent; live/uncertain permission failures stay
+                # visible, never reported as successful cancellation.
+                try:
+                    self._process.wait(timeout=_CLOSE_TIMEOUT_SECONDS)
+                except subprocess.TimeoutExpired:
+                    raise denied from None
+                try:
+                    os.killpg(self._process.pid, 0)
+                except ProcessLookupError:
+                    pass
+                else:
+                    raise denied
             try:
                 self._process.wait(timeout=_CLOSE_TIMEOUT_SECONDS)
             except subprocess.TimeoutExpired:

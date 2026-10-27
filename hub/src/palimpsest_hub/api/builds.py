@@ -13,8 +13,13 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, select
 
-from palimpsest_hub.api.hub import _factory_or_503, _load_visible, _store_or_503
-from palimpsest_hub.auth import require_admin
+from palimpsest_hub.api.hub import (
+    _factory_or_503,
+    _load_visible,
+    _store_or_503,
+    _validate_arch_dependencies,
+)
+from palimpsest_hub.auth import package_target_project_id, require_admin, revalidate_package_admin
 from palimpsest_hub.config import get_settings
 from palimpsest_hub.models import PalimpsestHubBuild, exact_identity
 from palimpsest_hub.rate_limit import limiter
@@ -104,13 +109,13 @@ async def create_hub_build(
     req: BuildRequest,
     token_info: dict = Depends(require_admin),
 ) -> dict[str, Any]:
-    """Persist a job only after checking every source against the caller's project."""
+    """Persist a job only after checking every source against the selected Hub target."""
     settings = get_settings()
     if not settings.palimpsest_hub_build_worker_key.get_secret_value():
         raise HTTPException(status_code=503, detail="isolated build worker is not configured")
     store = _store_or_503()
     factory = _factory_or_503()
-    project_id = token_info["project_id"]
+    project_id = package_target_project_id(token_info)
     async with sql_mutex(factory, "build-api:project:" + project_id) as session:
         queued = await session.scalar(
             select(func.count())
@@ -146,6 +151,13 @@ async def create_hub_build(
             previous = digest
         if input_bytes > settings.palimpsest_hub_max_blob_bytes:
             raise HTTPException(status_code=422, detail="total build inputs exceed worker byte limit")
+        await _validate_arch_dependencies(
+            session,
+            arch=base.arch,
+            parent_digest=previous,
+            base_image_digest=base.blob_digest,
+            token_info=token_info,
+        )
         for digest in (req.base_digest, *req.layer_digests):
             if not store.exists(digest):
                 raise HTTPException(status_code=409, detail="a build input blob is not available")
@@ -161,6 +173,10 @@ async def create_hub_build(
             status="queued",
             created_at=datetime.now(UTC),
         )
+        if token_info.get("is_package_system_admin"):
+            token_info = await revalidate_package_admin(token_info)
+            if "system:manage" not in token_info["package_actions"]:
+                raise HTTPException(status_code=403, detail="System management policy denied")
         session.add(row)
         await session.commit()
         return serialize_build(row)
@@ -176,7 +192,7 @@ async def list_hub_builds(
             (
                 await session.execute(
                     select(PalimpsestHubBuild)
-                    .where(exact_identity(PalimpsestHubBuild.project_id, token_info["project_id"]))
+                    .where(exact_identity(PalimpsestHubBuild.project_id, package_target_project_id(token_info)))
                     .order_by(PalimpsestHubBuild.created_at.desc(), PalimpsestHubBuild.id.desc())
                     .limit(limit)
                 )
@@ -192,7 +208,7 @@ async def get_hub_build(build_id: UUID, token_info: dict = Depends(require_admin
     factory = _factory_or_503()
     async with factory() as session:
         row = await session.get(PalimpsestHubBuild, str(build_id))
-        if row is None or row.project_id != token_info["project_id"]:
+        if row is None or row.project_id != package_target_project_id(token_info):
             raise HTTPException(status_code=404, detail="build job not found")
         return serialize_build(row)
 

@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from palimpsest_local import lima, state
-from palimpsest_local.errors import LifecycleError, StateError
+from palimpsest_local.errors import ArtifactValidationError, LifecycleError, StateError
 from palimpsest_local.refs import (
     BuildSpec,
     ImageRef,
@@ -20,7 +20,14 @@ from palimpsest_local.refs import (
     StackRef,
     VolumeAttachment,
 )
-from palimpsest_local.runtime_types import ExecRequest, RuntimeCapabilityError, RuntimeOperation
+from palimpsest_local.runtime_types import (
+    DispatchKey,
+    ExecRequest,
+    RuntimeBackend,
+    RuntimeCapabilityError,
+    RuntimeKind,
+    RuntimeOperation,
+)
 
 
 def _spec(tmp_path: Path) -> RunSpec:
@@ -46,16 +53,6 @@ def _legacy_lima_lifecycle(
         data={"backend": "lima-vz", "layers": [], "volumes": [], "guest_ip": None},
     )
     return rpaths, owner
-
-
-def test_lima_config_is_native_arm64_with_vznat(tmp_path: Path):
-    config = lima._lima_config(_spec(tmp_path))
-    assert "vmType: vz" in config
-    assert "arch: aarch64" in config
-    assert "mounts: []" in config
-    assert "- vzNAT: true" in config
-    assert "lima: vzNAT" not in config
-    assert "file:///" in config
 
 
 def test_lima_network_preflight_requires_supported_named_network(monkeypatch: pytest.MonkeyPatch):
@@ -173,6 +170,7 @@ def test_lima_run_persists_guest_ip_and_ssh_endpoint(tmp_path: Path, monkeypatch
                 "status": instance_status,
                 "sshLocalPort": 61234,
                 "sshConfigFile": "/tmp/lima-ssh",
+                "vmType": "vz",
                 "config": {"env": {"PALIMPSEST_RUN_ID": run_id}},
             }
             return subprocess.CompletedProcess(argv, 0, json.dumps([instance]), "")
@@ -220,6 +218,80 @@ def test_lima_run_persists_guest_ip_and_ssh_endpoint(tmp_path: Path, monkeypatch
     ]
 
 
+@pytest.mark.parametrize(
+    ("backend", "vm_type"), [(RuntimeBackend.LIMA_VZ, "vz"), (RuntimeBackend.LIMA_KRUNKIT, "krunkit")]
+)
+def test_dispatch_creates_selected_lima_driver_and_public_launch_hint(tmp_path, monkeypatch, backend, vm_type):
+    import yaml
+
+    from palimpsest_local import platforms, runtime_dispatch
+
+    roots = state.StatePaths(tmp_path / "config", tmp_path / "state")
+    spec = _spec(tmp_path)
+    driver = tmp_path / "lima-driver-krunkit"
+    driver.write_text("isolated executable fixture")
+    driver.chmod(0o700)
+    calls = []
+    instance = None
+    generated = None
+
+    def command(argv, **kwargs):
+        nonlocal instance, generated
+        calls.append(argv)
+        output = ""
+        if argv == ["limactl", "--version"]:
+            output = "limactl version 2.1.4\n"
+        elif argv == ["krunkit", "--version"]:
+            output = "krunkit version 1.2.1\n"
+        elif argv == ["limactl", "info"]:
+            output = json.dumps({"vmTypesEx": {"krunkit": {"location": str(driver)}}})
+        elif argv[:3] == ["limactl", "list", "--format"]:
+            output = json.dumps([] if instance is None else [instance])
+        elif argv[:2] == ["limactl", "create"]:
+            generated = yaml.safe_load(Path(argv[-1]).read_text())
+            instance = {
+                "name": spec.name,
+                "status": "Stopped",
+                "vmType": generated["vmType"],
+                "config": generated,
+                "sshLocalPort": 61234,
+                "sshConfigFile": str(tmp_path / "ssh.config"),
+            }
+        elif argv[:2] == ["limactl", "start"]:
+            assert instance is not None
+            instance["status"] = "Running"
+        elif argv[:3] == ["limactl", "shell", spec.name]:
+            if "ip" in argv:
+                output = "2: eth0    inet 192.168.64.12/24 scope global eth0\n"
+        else:
+            raise AssertionError(argv)
+        return subprocess.CompletedProcess(argv, 0, output, "")
+
+    monkeypatch.setattr(platforms, "detect_host", lambda: platforms.HostPlatform("Darwin", "aarch64"))
+    monkeypatch.setattr(lima.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(lima.platform, "machine", lambda: "arm64")
+    monkeypatch.setattr(lima.platform, "mac_ver", lambda: ("15.0", ("", "", ""), ""))
+    monkeypatch.setattr(lima.shutil, "which", lambda name: name if name in {"limactl", "krunkit"} else None)
+    monkeypatch.setattr(lima, "_run_command", command)
+    monkeypatch.setattr(lima.subprocess, "run", command)
+
+    request = runtime_dispatch.resolve_run_request(spec, requested_backend=backend.value)
+    preflight = runtime_dispatch.preflight_run_request(request)
+    result = runtime_dispatch.run(request, preflight=preflight, roots=roots)
+
+    assert result.status == "running"
+    assert result.backend is backend
+    assert result.record.dispatch_key == DispatchKey(RuntimeKind.CLOUD_IMAGE, backend)
+    assert generated["vmType"] == vm_type
+    snapshot = state.read_run_ledger_snapshot(roots, spec.name)
+    assert snapshot.record == result.record
+    assert snapshot.state["backend"] == backend.value
+    assert snapshot.state["status"] == "running"
+    assert result.launch_hint == f"limactl shell {spec.name}"
+    assert any(argv[:2] == ["limactl", "create"] for argv in calls)
+    assert any(argv[:2] == ["limactl", "start"] for argv in calls)
+
+
 def test_lima_process_adapters_are_typed_unavailable_without_backend_spawn(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -254,6 +326,7 @@ def test_legacy_lima_start_promotes_only_after_backend_success(
             instance = {
                 "name": "legacy-lima-start",
                 "status": live_status,
+                "vmType": "vz",
                 "config": {"env": {"PALIMPSEST_RUN_ID": owner.run_id}},
             }
             return subprocess.CompletedProcess(argv, 0, json.dumps([instance]), "")
@@ -296,11 +369,13 @@ def test_legacy_lima_start_and_stop_failures_preserve_exact_state_bytes(
                 {
                     "name": "legacy-lima-start-fail",
                     "status": "Stopped",
+                    "vmType": "vz",
                     "config": {"env": {"PALIMPSEST_RUN_ID": start_owner.run_id}},
                 },
                 {
                     "name": "legacy-lima-stop-fail",
                     "status": "Running",
+                    "vmType": "vz",
                     "config": {"env": {"PALIMPSEST_RUN_ID": stop_owner.run_id}},
                 },
             ]
@@ -337,6 +412,7 @@ def test_legacy_lima_stop_success_promotes_and_reconcile_discovery_does_not_writ
                 {
                     "name": name,
                     "status": live,
+                    "vmType": "vz",
                     "config": {
                         "env": {
                             "PALIMPSEST_RUN_ID": stop_owner.run_id
@@ -383,6 +459,7 @@ def test_lima_lifecycle_rejects_ambiguous_terminal_ledger_with_live_instance(
             instance = {
                 "name": name,
                 "status": "Running",
+                "vmType": "vz",
                 "config": {"env": {"PALIMPSEST_RUN_ID": owner.run_id}},
             }
             return subprocess.CompletedProcess(argv, 0, json.dumps([instance]), "")
@@ -412,6 +489,7 @@ def test_legacy_lima_start_rejects_live_intermediate_without_backend_or_state_mu
             instance = {
                 "name": "legacy-lima-starting",
                 "status": "Starting",
+                "vmType": "vz",
                 "config": {"env": {"PALIMPSEST_RUN_ID": owner.run_id}},
             }
             return subprocess.CompletedProcess(argv, 0, json.dumps([instance]), "")
@@ -451,6 +529,7 @@ def test_lima_v2_start_records_live_intermediate_before_refusing(
         instance = {
             "name": rpaths.name,
             "status": "Starting",
+            "vmType": "vz",
             "config": {"env": {"PALIMPSEST_RUN_ID": owner.run_id}},
         }
         return subprocess.CompletedProcess(argv, 0, json.dumps([instance]), "")
@@ -488,6 +567,7 @@ def test_lima_v2_stop_records_live_running_before_backend_failure(
             instance = {
                 "name": rpaths.name,
                 "status": "Running",
+                "vmType": "vz",
                 "config": {"env": {"PALIMPSEST_RUN_ID": owner.run_id}},
             }
             return subprocess.CompletedProcess(argv, 0, json.dumps([instance]), "")
@@ -550,6 +630,7 @@ def test_legacy_lima_start_keyboard_interrupt_stops_owned_backend_and_preserves_
             instance = {
                 "name": rpaths.name,
                 "status": live_status,
+                "vmType": "vz",
                 "config": {"env": {"PALIMPSEST_RUN_ID": owner.run_id}},
             }
             return subprocess.CompletedProcess(argv, 0, json.dumps([instance]), "")
@@ -683,7 +764,7 @@ def test_lima_pre_reservation_failure_creates_no_run_entry(tmp_path: Path, monke
     spec = _spec(tmp_path)
     monkeypatch.setattr(lima, "available", lambda: False)
 
-    with pytest.raises(LifecycleError, match="native Lima VZ runs require"):
+    with pytest.raises(LifecycleError):
         lima.run(spec, roots=roots)
 
     assert not (roots.runs / spec.name).exists()
@@ -724,6 +805,7 @@ def test_lima_first_use_format_is_sealed_false_before_run_succeeds(
                 "status": "Running",
                 "sshLocalPort": 61234,
                 "sshConfigFile": "/tmp/lima-ssh",
+                "vmType": "vz",
                 "config": {
                     "env": {"PALIMPSEST_RUN_ID": run_id},
                     "additionalDisks": [{"name": "abc234def56", "format": disk_format_enabled}],
@@ -764,6 +846,7 @@ def test_lima_mutations_reject_foreign_same_name_instance(
     foreign = {
         "name": "owned-run",
         "status": "Running",
+        "vmType": "vz",
         "config": {"env": {"PALIMPSEST_RUN_ID": "00000000-0000-0000-0000-000000000000"}},
     }
 
@@ -822,6 +905,7 @@ def test_lima_start_rejects_live_disk_format_drift_before_boot(
     instance = {
         "name": "owned-run",
         "status": "Stopped",
+        "vmType": "vz",
         "config": {
             "env": {"PALIMPSEST_RUN_ID": owner.run_id},
             "additionalDisks": [{"name": "abc234def56", "format": True}],
@@ -898,6 +982,19 @@ def test_lima_build_recovers_fixed_worker_squashfs(tmp_path: Path, monkeypatch: 
     assert record["status"] == "success"
     assert record["output_digest"] == f"sha256:{output_digest}"
     assert not started
+    from palimpsest_local.oci_layout import ContentStore
+
+    store = ContentStore(roots.store)
+    metadata = store.read_metadata(record["output_digest"])
+    assert metadata["arch"] == "aarch64"
+    assert record["arch"] == "aarch64"
+    assert state.read_json(roots.builds / record["build_id"] / "record.json")["arch"] == "aarch64"
+    layer = LayerRef(
+        record["output_digest"], metadata["media_type"], store.blob_path(record["output_digest"]), arch=metadata["arch"]
+    )
+    wrong_base = ImageRef(run_spec.stack.base.digest, "qcow2", "x86_64", None, run_spec.stack.base.local_path)
+    with pytest.raises(ArtifactValidationError, match="arch"):
+        StackRef(wrong_base, (layer,))
 
 
 def test_lima_instance_info_accepts_json_lines(monkeypatch: pytest.MonkeyPatch):
@@ -966,6 +1063,7 @@ def test_lima_logs_read_current_boot_guest_journal(tmp_path: Path, monkeypatch: 
             instance = {
                 "name": "mac-prototype",
                 "status": "Running",
+                "vmType": "vz",
                 "config": {"env": {"PALIMPSEST_RUN_ID": owner.run_id}},
             }
             return subprocess.CompletedProcess(argv, 0, json.dumps([instance]), "")
@@ -1003,6 +1101,7 @@ def test_lima_stopped_logs_use_local_console_and_cannot_follow(
         lambda _name: {
             "name": "mac-prototype",
             "status": "Stopped",
+            "vmType": "vz",
             "config": {"env": {"PALIMPSEST_RUN_ID": owner.run_id}},
         },
     )
@@ -1034,3 +1133,148 @@ def test_lima_empty_stack_still_creates_merged_directory(tmp_path: Path, monkeyp
     assert not any(
         argv[:7] == ["limactl", "shell", "mac-prototype", "sudo", "mount", "-t", "overlay"] for argv in calls
     )
+
+
+@pytest.mark.parametrize("network", ["vzNAT", "none", "lima:private"])
+def test_krunkit_unsupported_network_fails_before_reserving_a_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, network: str
+) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    base = _spec(tmp_path)
+    spec = RunSpec(**{**base.__dict__, "network": network})
+    monkeypatch.setattr(lima, "_run_command", lambda *_args, **_kwargs: pytest.fail("backend command reached"))
+
+    with pytest.raises(ArtifactValidationError):
+        lima.run(spec, roots=roots, backend=RuntimeBackend.LIMA_KRUNKIT)
+
+    assert not state.run_paths(roots, spec.name).root.exists()
+
+
+@pytest.mark.parametrize("operation", ["reconcile_run", "start", "stop", "rm"])
+@pytest.mark.parametrize(
+    ("backend", "observed_type"),
+    [
+        (RuntimeBackend.LIMA_KRUNKIT, "vz"),
+        (RuntimeBackend.LIMA_VZ, "krunkit"),
+        (RuntimeBackend.LIMA_KRUNKIT, "qemu"),
+        (RuntimeBackend.LIMA_KRUNKIT, None),
+    ],
+)
+def test_lima_same_run_marker_with_wrong_vm_type_cannot_mutate_or_reconcile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    backend: RuntimeBackend,
+    observed_type: str | None,
+) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    name = "gpu-owned"
+    with state.reserve_new_run(roots, name, DispatchKey(RuntimeKind.CLOUD_IMAGE, backend)) as reservation:
+        reservation.write_state("stopped", {"layers": [], "volumes": []})
+        run_id = reservation.record.run_id
+    rpaths = state.run_paths(roots, name)
+    before = rpaths.state.read_bytes()
+    instance = {
+        "name": name,
+        "status": "Running",
+        "vmType": observed_type,
+        "config": {"env": {"PALIMPSEST_RUN_ID": run_id}},
+    }
+    monkeypatch.setattr(lima, "_instance_info_or_none", lambda _name: instance)
+    monkeypatch.setattr(lima, "_run_command", lambda *_args, **_kwargs: pytest.fail("backend mutation reached"))
+
+    with pytest.raises(StateError):
+        getattr(lima, operation)(name, roots=roots)
+
+    assert rpaths.state.read_bytes() == before
+
+
+@pytest.mark.parametrize("backend", [RuntimeBackend.LIMA_VZ, RuntimeBackend.LIMA_KRUNKIT])
+@pytest.mark.parametrize("mismatch", ["run-id", "vm-type", "contradictory-type"])
+def test_lima_create_rechecks_native_identity_before_first_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backend: RuntimeBackend, mismatch: str
+) -> None:
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    spec = _spec(tmp_path)
+    created = False
+    marker = None
+    mutations: list[str] = []
+    vm_type = "krunkit" if backend is RuntimeBackend.LIMA_KRUNKIT else "vz"
+    other_type = "vz" if vm_type == "krunkit" else "krunkit"
+
+    def command(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal created, marker
+        if argv[:2] == ["limactl", "create"]:
+            created = True
+            config = Path(argv[-1]).read_text(encoding="utf-8")
+            marker = re.search(r'PALIMPSEST_RUN_ID: "([0-9a-f-]+)"', config).group(1)
+        if argv[:2] == ["limactl", "list"]:
+            instances = []
+            if created:
+                instances.append(
+                    {
+                        "name": spec.name,
+                        "status": "Stopped",
+                        "vmType": other_type if mismatch == "vm-type" else vm_type,
+                        "config": {
+                            "vmType": other_type
+                            if mismatch == "contradictory-type"
+                            else (other_type if mismatch == "vm-type" else vm_type),
+                            "env": {
+                                "PALIMPSEST_RUN_ID": "00000000-0000-0000-0000-000000000000"
+                                if mismatch == "run-id"
+                                else marker
+                            },
+                        },
+                    }
+                )
+            return subprocess.CompletedProcess(argv, 0, json.dumps(instances), "")
+        if argv[1] in {"start", "stop", "delete"}:
+            mutations.append(argv[1])
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(lima, "available", lambda: True)
+    monkeypatch.setattr(lima, "_require_krunkit", lambda: None)
+    monkeypatch.setattr(lima, "_run_command", command)
+
+    with pytest.raises(StateError):
+        lima.run(spec, roots=roots, backend=backend)
+
+    assert mutations == []
+    assert state.read_run_state(state.run_paths(roots, spec.name))["status"] == "failed"
+
+
+def test_direct_krunkit_run_rejects_old_macos_before_initializing_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(lima, "available", lambda: True)
+    monkeypatch.setattr(lima.platform, "mac_ver", lambda: ("13.6.9", ("", "", ""), "arm64"))
+    monkeypatch.setattr(lima, "_run_command", lambda *_args, **_kwargs: pytest.fail("backend command reached"))
+    monkeypatch.setattr(lima.state, "init_roots", lambda: pytest.fail("state initialization reached"))
+
+    with pytest.raises(LifecycleError):
+        lima.run(_spec(tmp_path), backend=RuntimeBackend.LIMA_KRUNKIT)
+
+
+def test_direct_krunkit_run_rejects_missing_driver_before_initializing_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(lima, "available", lambda: True)
+    monkeypatch.setattr(lima.platform, "mac_ver", lambda: ("14.0", ("", "", ""), "arm64"))
+    monkeypatch.setattr(lima.shutil, "which", lambda _name: "/controlled/krunkit")
+    monkeypatch.setattr(
+        lima.subprocess, "run", lambda argv, **_kwargs: subprocess.CompletedProcess(argv, 0, "krunkit 1.3.2\n", "")
+    )
+
+    def command(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        if argv == ["limactl", "--version"]:
+            return subprocess.CompletedProcess(argv, 0, "limactl version 2.2.0\n", "")
+        if argv == ["limactl", "info"]:
+            return subprocess.CompletedProcess(argv, 0, '{"vmTypesEx":{}}', "")
+        pytest.fail("VM command reached")
+
+    monkeypatch.setattr(lima, "_run_command", command)
+    monkeypatch.setattr(lima.state, "init_roots", lambda: pytest.fail("state initialization reached"))
+
+    with pytest.raises(LifecycleError):
+        lima.run(_spec(tmp_path), backend=RuntimeBackend.LIMA_KRUNKIT)

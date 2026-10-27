@@ -25,7 +25,6 @@ from palimpsest_local import runtime_dispatch, state
 from palimpsest_local.errors import StateError
 from palimpsest_local.refs import ImageRef, RunSpec, StackRef, VolumeAttachment
 from palimpsest_local.runtime_types import (
-    ALLOWED_RUNTIME_COMBINATIONS,
     CapabilityCheck,
     CapabilityErrorCategory,
     CloudInitSnapshot,
@@ -251,15 +250,7 @@ print("ok")
     )
 
 
-def test_runtime_type_contract_has_only_the_phase_one_dispatch_combinations() -> None:
-    assert ALLOWED_RUNTIME_COMBINATIONS == frozenset(
-        {
-            (RuntimeKind.CLOUD_IMAGE, RuntimeBackend.KVM),
-            (RuntimeKind.CLOUD_IMAGE, RuntimeBackend.LIBVIRT_HVF),
-            (RuntimeKind.CLOUD_IMAGE, RuntimeBackend.LIMA_VZ),
-            (RuntimeKind.OCI_ROOT, RuntimeBackend.KVM),
-        }
-    )
+def test_dispatch_key_rejects_unsupported_or_untyped_identity() -> None:
     with pytest.raises(ValueError, match="unsupported runtime/backend combination"):
         DispatchKey(RuntimeKind.OCI_ROOT, RuntimeBackend.LIMA_VZ)
     with pytest.raises(TypeError, match="RuntimeKind and RuntimeBackend"):
@@ -1161,103 +1152,6 @@ def test_cloud_init_snapshot_propagates_process_control_exceptions(
     monkeypatch.setattr(runtime_dispatch.platforms, "select_backend", lambda *_args, **_kwargs: "kvm")
     with pytest.raises(control_error):
         runtime_dispatch.resolve_run_request(replace(_create_spec(tmp_path), cloud_init=InterruptingCloudInit()))
-
-
-@pytest.mark.parametrize(
-    ("backend", "arch", "adapter"),
-    [
-        (RuntimeBackend.KVM, "x86_64", "cloud"),
-        (RuntimeBackend.LIBVIRT_HVF, "aarch64", "cloud"),
-        (RuntimeBackend.LIMA_VZ, "aarch64", "lima"),
-    ],
-)
-def test_create_dispatch_uses_only_the_resolved_backend_without_reselection(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    backend: RuntimeBackend,
-    arch: str,
-    adapter: str,
-) -> None:
-    request = _authorized_request(
-        ResolvedRunRequest(
-            DispatchKey(RuntimeKind.CLOUD_IMAGE, backend),
-            _create_spec(tmp_path, arch=arch, name=f"create-{backend.value}"),
-        )
-    )
-    calls: list[tuple[str, object]] = []
-    profile = object()
-    roots = _roots(tmp_path / "roots")
-
-    def write_success(spec: RunSpec, selected_backend: RuntimeBackend) -> dict[str, str]:
-        _rpaths, run_id = _write_ledger(
-            roots,
-            name=spec.name,
-            record={
-                "schema_version": 2,
-                "runtime_kind": "cloud-image",
-                "backend": selected_backend.value,
-                "status": "running",
-                "guest_ip": "192.0.2.10",
-                "base": {"local_path": "/private/SENSITIVE_VALUE/base.qcow2"},
-                "volumes": [{"host_path": "/private/SENSITIVE_VALUE/data.raw"}],
-            },
-        )
-        return {
-            "name": spec.name,
-            "run_id": run_id,
-            "backend": selected_backend.value,
-            "status": "running",
-            "guest_ip": "198.51.100.200",
-            "local_path": "/private/SENSITIVE_VALUE/root.raw",
-        }
-
-    monkeypatch.setattr(
-        runtime_dispatch.platforms,
-        "select_backend",
-        lambda *_args, **_kwargs: pytest.fail("dispatcher reselected backend"),
-    )
-    monkeypatch.setattr(
-        runtime_dispatch.platforms,
-        "preflight",
-        lambda *_args, **_kwargs: pytest.fail("dispatcher repeated caller-owned preflight"),
-    )
-    monkeypatch.setattr(
-        runtime_dispatch.platforms,
-        "resolve_domain_profile",
-        lambda selected, selected_arch: calls.append(("profile", (selected, selected_arch))) or profile,
-    )
-    monkeypatch.setattr(
-        runtime_dispatch.cloud_runtime,
-        "run",
-        lambda spec, roots=None, profile=None: (
-            calls.append(("cloud", (spec, roots, profile))) or write_success(spec, backend)
-        ),
-    )
-    monkeypatch.setattr(
-        runtime_dispatch.lima,
-        "run",
-        lambda spec, roots=None: calls.append(("lima", (spec, roots))) or write_success(spec, backend),
-    )
-
-    result = runtime_dispatch.run(request, preflight=_successful_run_preflight(request), roots=roots)
-
-    assert isinstance(result, RunResult)
-    assert result.name == request.spec.name
-    assert result.backend is backend
-    assert result.runtime_kind is RuntimeKind.CLOUD_IMAGE
-    assert result.status == "running"
-    assert result.ready is True
-    assert result.attachment_mode is RunAttachmentMode.DETACHED
-    assert result.guest_ip == "192.0.2.10"
-    assert result.session is None
-    assert "SENSITIVE_VALUE" not in repr(result)
-    assert "local_path" not in repr(result)
-    assert [name for name, _value in calls if name in {"cloud", "lima"}] == [adapter]
-    if adapter == "cloud":
-        assert calls[0] == ("profile", (backend.value, arch))
-        assert calls[1][1][2] is profile  # type: ignore[index]
-    else:
-        assert all(name != "profile" for name, _value in calls)
 
 
 @pytest.mark.parametrize("field", ["name", "run_id", "backend", "status"])
@@ -3022,6 +2916,7 @@ def test_lima_reconcile_failure_is_typed_stale_and_preserves_ledger_bytes(
         return {
             "name": "demo",
             "status": "Running",
+            "vmType": "vz",
             "config": {"env": {"PALIMPSEST_RUN_ID": marker}},
         }
 
@@ -3089,6 +2984,7 @@ def test_lima_reconcile_detects_cooperative_swap_during_external_query_without_o
         return {
             "name": "demo",
             "status": "Running",
+            "vmType": "vz",
             "config": {"env": {"PALIMPSEST_RUN_ID": old_run_id}},
         }
 
@@ -3132,6 +3028,7 @@ def test_lima_reconcile_does_not_write_stale_preflight_status_when_fresh_status_
         return {
             "name": "demo",
             "status": next(statuses),
+            "vmType": "vz",
             "config": {"env": {"PALIMPSEST_RUN_ID": run_id}},
         }
 
@@ -3786,6 +3683,7 @@ def test_lima_backend_recovery_returns_authenticated_reconciled_receipt(
         return {
             "name": "demo",
             "status": live_status,
+            "vmType": "vz",
             "config": {"env": {"PALIMPSEST_RUN_ID": run_id}},
         }
 

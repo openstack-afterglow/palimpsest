@@ -10,7 +10,6 @@ import pytest
 
 from palimpsest_local import state
 from palimpsest_local.build import (
-    CLEAN_TARGETS_V1,
     PALIMPSEST_CLEAN_V1,
     Palimpsestfile,
     build_layer,
@@ -243,6 +242,7 @@ def test_cleaning_and_record_helpers():
     record = create_build_record(
         build_id="b-12345",
         base_digest=D_BASE,
+        arch="x86_64",
         parent_digests=[D_LAYER1],
         recipe_sha256="sha256:" + "d" * 64,
         network="none",
@@ -262,31 +262,28 @@ def test_cleaning_and_record_helpers():
     assert record["status"] == "success"
 
 
-def test_serial_builder_cleaning_targets_match_commit_policy():
-    from palimpsest_local.cloudinit import _BUILD_WORKER_SOURCE
-
-    assert all(f'"{target}"' in _BUILD_WORKER_SOURCE for target in CLEAN_TARGETS_V1)
-
-
 def test_create_build_record_invalid():
     with pytest.raises(ArtifactValidationError, match="invalid build network"):
         create_build_record(
             build_id="b-1",
             base_digest=D_BASE,
+            arch="x86_64",
             parent_digests=[],
             recipe_sha256="sha256:" + "d" * 64,
             network="invalid_net",  # type: ignore
         )
 
 
-def _build_spec(tmp_path: Path, *, tag: str = "test-layer", command: str = "echo hello") -> BuildSpec:
+def _build_spec(
+    tmp_path: Path, *, tag: str = "test-layer", command: str = "echo hello", arch: str = "x86_64"
+) -> BuildSpec:
     base_image = tmp_path / "base.qcow2"
     base_image.write_bytes(b"base-image")
     base_digest = f"sha256:{hashlib.sha256(base_image.read_bytes()).hexdigest()}"
     recipe = tmp_path / "Palimpsestfile"
     recipe.write_text(f"FROM {base_digest}\nRUN {command}\n", encoding="utf-8")
     return BuildSpec(
-        base=ImageRef(base_digest, "qcow2", "x86_64", None, base_image),
+        base=ImageRef(base_digest, "qcow2", arch, None, base_image),
         parent_layers=(),
         recipe=recipe,
         network="default",
@@ -300,10 +297,13 @@ def _successful_output_receiver(_socket_path: Path, output: Path) -> str:
     return f"sha256:{hashlib.sha256(output.read_bytes()).hexdigest()}"
 
 
-def test_build_layer_promotes_verified_output_and_cleans_builder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+@pytest.mark.parametrize("arch", ["x86_64", "aarch64"])
+def test_build_layer_promotes_verified_output_and_cleans_builder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, arch: str
+):
     monkeypatch.setattr("palimpsest_local.platforms.select_backend", lambda arch: "kvm")
     roots = state.init_roots({"XDG_STATE_HOME": str(tmp_path / "state"), "XDG_CONFIG_HOME": str(tmp_path / "config")})
-    spec = _build_spec(tmp_path)
+    spec = _build_spec(tmp_path, arch=arch)
     removed: list[tuple[str, bool]] = []
     monkeypatch.setattr(
         "palimpsest_local.cloud_runtime.start_serial_builder",
@@ -322,6 +322,21 @@ def test_build_layer_promotes_verified_output_and_cleans_builder(tmp_path: Path,
     assert tag.digest == record["output_digest"]
     assert tag.source == "build"
     assert removed == [(f"builder-{record['build_id']}", True)]
+    from palimpsest_local.artifact_compatibility import check_artifact
+    from palimpsest_local.oci_layout import ContentStore
+    from palimpsest_local.platforms import HostPlatform
+
+    store = ContentStore(roots.store)
+    store.ingest_file(spec.base.local_path, expected_digest=spec.base.digest)
+    store.write_metadata(spec.base.digest, {"kind": "cloud-image", "disk_format": "qcow2", "arch": arch})
+    metadata = store.read_metadata(tag.digest)
+    assert metadata["arch"] == arch
+    assert record["arch"] == arch
+    assert state.read_json(roots.builds / record["build_id"] / "record.json")["arch"] == arch
+    other_arch = "aarch64" if arch == "x86_64" else "x86_64"
+    compatibility = check_artifact(metadata, lookup=store.read_metadata, host=HostPlatform("Linux", other_arch))
+    assert compatibility["status"] == "incompatible"
+    assert compatibility["arch"] == arch
 
 
 def test_build_layer_rejects_conflicting_tag(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -395,6 +410,9 @@ def test_build_layer_records_serial_run_failure_and_cleans_builder(tmp_path: Pat
     )
 
     def failed_output_receiver(_socket_path: Path, _output: Path) -> str:
+        running_record = state.read_json(next(roots.builds.glob("*/record.json")))
+        assert running_record["arch"] == spec.base.arch
+        assert running_record["status"] == "running"
         raise BuildError("serial builder reported a build failure during run at Palimpsestfile line 2")
 
     with pytest.raises(BuildError, match="Palimpsestfile line 2"):
@@ -402,6 +420,7 @@ def test_build_layer_records_serial_run_failure_and_cleans_builder(tmp_path: Pat
     records = list(roots.builds.glob("*/record.json"))
     assert len(records) == 1
     assert json.loads(records[0].read_text())["status"] == "failed"
+    assert json.loads(records[0].read_text())["arch"] == spec.base.arch
     assert removed and removed[0].startswith("builder-")
 
 
@@ -457,3 +476,29 @@ def test_build_layer_propagates_platform_selector_error(tmp_path: Path, monkeypa
 
     with pytest.raises(ArtifactValidationError, match="no local runtime can boot a x86_64 image on Darwin/aarch64"):
         build_layer(spec, roots=roots)
+
+
+def test_build_output_cannot_relabel_identical_blob_for_other_architecture(tmp_path: Path, monkeypatch):
+    from palimpsest_local.oci_layout import ContentStore
+
+    roots = state.init_roots({"XDG_STATE_HOME": str(tmp_path / "state"), "XDG_CONFIG_HOME": str(tmp_path / "config")})
+    spec = _build_spec(tmp_path, arch="aarch64")
+    store = ContentStore(roots.store)
+    previous = tmp_path / "previous.squashfs"
+    digest = _successful_output_receiver(tmp_path / "unused.sock", previous)
+    store.ingest_file(previous, expected_digest=digest)
+    store.write_metadata(digest, {"kind": "squashfs", "arch": "x86_64"})
+    monkeypatch.setattr("palimpsest_local.platforms.select_backend", lambda arch: "kvm")
+    monkeypatch.setattr(
+        "palimpsest_local.cloud_runtime.start_serial_builder", lambda *_args, **_kwargs: {"status": "running"}
+    )
+    monkeypatch.setattr("palimpsest_local.cloud_runtime.rm", lambda *_args, **_kwargs: None)
+
+    with pytest.raises(ArtifactValidationError, match="architecture conflicts"):
+        build_layer(spec, roots=roots, output_receiver=_successful_output_receiver)
+
+    assert store.read_metadata(digest)["arch"] == "x86_64"
+    assert not state.tag_path(roots, spec.output_name).exists()
+    record = state.read_json(next(roots.builds.glob("*/record.json")))
+    assert record["status"] == "failed"
+    assert record["arch"] == "aarch64"

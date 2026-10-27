@@ -17,7 +17,7 @@ This is isolated acceptance of the HTTP contract, not proof of the canonical
 database, lifespan or deployment.
 
 Identity is a synthetic Keystone HTTP directory (``keystone-serve``) with
-unique global role IDs, mutable implication edges and live assignments. The
+unique global role IDs, zero service implication edges and live assignments. The
 Hub authenticates its read-only validator with its real keystoneauth/
 keystoneclient stack; driver tokens are minted only on a separate control port.
 Redis is a real container, blobs and SQLite live in retained named volumes.
@@ -61,26 +61,27 @@ LABEL = "org.palimpsest.smoke"
 LABEL_VALUE = "scoped-package-capabilities"
 PUBLIC_ORIGIN = "https://packages.smoke.invalid"
 
-# Keystone defaults plus the Palimpsest service graph used by hub/tests/test_auth.py.
-ROLE_EDGES = (
-    ("admin", "member"),
-    ("member", "reader"),
-    ("palimpsest_admin", "palimpsest_editor"),
-    ("palimpsest_admin", "palimpsest-keys_admin"),
-    ("palimpsest_editor", "palimpsest_user"),
-    ("palimpsest_editor", "palimpsest-publish_editor"),
-    ("palimpsest_editor", "palimpsest-keys_editor"),
-    ("palimpsest_user", "palimpsest_reader"),
-    ("palimpsest_user", "palimpsest-download_user"),
-    ("palimpsest_reader", "palimpsest-inventory_reader"),
-    ("palimpsest-download_user", "palimpsest_reader"),
-    ("palimpsest-publish_editor", "palimpsest_reader"),
-    ("palimpsest-keys_editor", "palimpsest_reader"),
-    ("palimpsest-keys_admin", "palimpsest_reader"),
-)
+# Native member hierarchy is independent; service grades have no implication edges.
+ROLE_EDGES = (("admin", "member"), ("member", "reader"))
 ROLE_NAMES = sorted(
-    {"admin", "manager", "service", "member", "reader", "project_admin", "project_member"}
-    | {name for edge in ROLE_EDGES for name in edge}
+    {
+        "admin",
+        "manager",
+        "service",
+        "member",
+        "reader",
+        "project_admin",
+        "project_member",
+        "palimpsest_admin",
+        "palimpsest_editor",
+        "palimpsest_user",
+        "palimpsest_reader",
+        "palimpsest-inventory_reader",
+        "palimpsest-download_user",
+        "palimpsest-publish_editor",
+        "palimpsest-keys_editor",
+        "palimpsest-keys_admin",
+    }
 )
 ALL_ACTIONS = ["packages:inventory", "packages:read", "packages:write", "cache:read", "cache:write"]
 PLATFORM_MACHINE = {"linux/amd64": "x86_64", "linux/arm64": "aarch64"}
@@ -187,15 +188,23 @@ class SyntheticKeystone:
         self.edges = {role_id: set() for role_id in self.roles}
         for prior, implied in seed["edges"]:
             self.edges[self.ids[prior]].add(self.ids[implied])
-        self.users = {user["id"]: dict(user) for user in seed["users"]}
+        self.domains = {
+            domain["id"]: dict(domain)
+            for domain in seed.get("domains", ({"id": "default", "name": "Default", "enabled": True},))
+        }
+        self.users = {user["id"]: {"domain_id": "default", **user} for user in seed["users"]}
         self.users[self.validator["id"]] = {
             "id": self.validator["id"],
             "name": self.validator["name"],
             "label": "validator",
             "enabled": True,
+            "domain_id": self.validator.get("domain_id", "default"),
         }
-        self.projects = {project["id"]: dict(project) for project in seed["projects"]}
+        self.projects = {project["id"]: {"domain_id": "default", **project} for project in seed["projects"]}
         self.assignments: set[tuple[str, str, str, str]] = set()
+        self.groups = {group["id"]: dict(group) for group in seed.get("groups", ())}
+        self.memberships = {(item["user"], item["group"]) for item in seed.get("memberships", ())}
+        self.group_assignments: set[tuple[str, str, str, str]] = set()
         for assignment in seed["assignments"]:
             self.assign(assignment, True)
         self.tokens: dict[str, dict] = {}
@@ -204,15 +213,17 @@ class SyntheticKeystone:
 
     # -- state mutation (control port only) --------------------------------
     def assign(self, spec: dict, present: bool) -> None:
+        principal = spec.get("group") or spec["user"]
         if spec.get("system"):
-            item = (spec["user"], "system", "all", self.ids[spec["role"]])
+            item = (principal, "system", "all", self.ids[spec["role"]])
         else:
-            item = (spec["user"], "project", spec["project"], self.ids[spec["role"]])
+            item = (principal, "project", spec["project"], self.ids[spec["role"]])
+        records = self.group_assignments if spec.get("group") else self.assignments
         with self.lock:
             if present:
-                self.assignments.add(item)
+                records.add(item)
             else:
-                self.assignments.discard(item)
+                records.discard(item)
 
     def edge(self, prior: str, implied_id: str, present: bool) -> None:
         with self.lock:
@@ -255,6 +266,8 @@ class SyntheticKeystone:
             "issued_at": now,
             "expires_at": now + timedelta(hours=4),
             "label": self.users[user_id].get("label", "unknown"),
+            "user_domain_id": self.users[user_id]["domain_id"],
+            "user_domain_name": self.domains[self.users[user_id]["domain_id"]]["name"],
         }
         return token
 
@@ -282,7 +295,11 @@ class SyntheticKeystone:
             "audit_ids": [hashlib.sha256(token.encode()).hexdigest()[:22]],
             "expires_at": record["expires_at"].strftime("%Y-%m-%dT%H:%M:%S.000000Z"),
             "issued_at": record["issued_at"].strftime("%Y-%m-%dT%H:%M:%S.000000Z"),
-            "user": {"id": user["id"], "name": user["name"], "domain": {"id": "default", "name": "Default"}},
+            "user": {
+                "id": user["id"],
+                "name": user["name"],
+                "domain": {"id": record["user_domain_id"], "name": record["user_domain_name"]},
+            },
             "roles": [self._role_ref(role_id) for role_id in record["role_ids"] if role_id in self.roles],
             "catalog": [],
             "is_domain": False,
@@ -294,7 +311,10 @@ class SyntheticKeystone:
             body["project"] = {
                 "id": project["id"],
                 "name": project["name"],
-                "domain": {"id": "default", "name": "Default"},
+                "domain": {
+                    "id": project["domain_id"],
+                    "name": self.domains[project["domain_id"]]["name"],
+                },
             }
         return {"token": body}
 
@@ -399,13 +419,41 @@ class SyntheticKeystone:
         if path.startswith("/v3/roles/"):
             role = self.roles.get(path.rsplit("/", 1)[-1])
             return (200, {"role": dict(role)}, None) if role else (404, {"error": {"code": 404}}, None)
+        if path == "/v3/domains":
+            domains = [dict(domain) for domain in self.domains.values() if query.get("name") == [domain["name"]]]
+            return 200, {"domains": domains, "links": {"next": None}}, None
+        if path.startswith("/v3/domains/"):
+            domain = self.domains.get(path.rsplit("/", 1)[-1])
+            return (
+                (200, {"domain": dict(domain)}, None) if domain is not None else (404, {"error": {"code": 404}}, None)
+            )
+        if path == "/v3/users":
+            users = [
+                {"id": user["id"], "name": user["name"], "domain_id": user["domain_id"], "enabled": user["enabled"]}
+                for user in self.users.values()
+                if query.get("name") == [user["name"]] and query.get("domain_id") == [user["domain_id"]]
+            ]
+            return 200, {"users": users, "links": {"next": None}}, None
+        if path.startswith("/v3/users/") and path.endswith("/groups"):
+            user_id = path.split("/")[3]
+            if user_id not in self.users:
+                return 404, {"error": {"code": 404}}, None
+            groups = [dict(self.groups[group]) for user, group in sorted(self.memberships) if user == user_id]
+            return 200, {"groups": groups, "links": {"next": None}}, None
         if path.startswith("/v3/users/"):
             user = self.users.get(path.rsplit("/", 1)[-1])
             if user is None:
                 return 404, {"error": {"code": 404}}, None
             return (
                 200,
-                {"user": {"id": user["id"], "name": user["name"], "enabled": user["enabled"], "domain_id": "default"}},
+                {
+                    "user": {
+                        "id": user["id"],
+                        "name": user["name"],
+                        "enabled": user["enabled"],
+                        "domain_id": user["domain_id"],
+                    }
+                },
                 None,
             )
         if path.startswith("/v3/projects/"):
@@ -419,7 +467,7 @@ class SyntheticKeystone:
                         "id": project["id"],
                         "name": project["name"],
                         "enabled": project["enabled"],
-                        "domain_id": "default",
+                        "domain_id": project["domain_id"],
                         "is_domain": False,
                     }
                 },
@@ -438,22 +486,30 @@ class SyntheticKeystone:
 
     def role_assignments(self, query: dict) -> list[dict]:
         user_id = (query.get("user.id") or [None])[0]
+        group_id = (query.get("group.id") or [None])[0]
         system_only = bool(query.get("scope.system"))
         project_only = (query.get("scope.project.id") or [None])[0]
         effective = "effective" in query
+        if effective and system_only:
+            return []  # Native Keystone effective-system omission is intentional.
         result, emitted = [], set()
-        for user, kind, target, role in sorted(self.assignments):
-            if user_id is not None and user != user_id:
+        records = [("user", *item) for item in self.assignments] + [("group", *item) for item in self.group_assignments]
+        for principal_kind, principal, kind, target, role in sorted(records):
+            if effective and kind == "system":
                 continue
+            if group_id is not None and (principal_kind != "group" or principal != group_id):
+                continue
+            if user_id is not None:
+                if principal_kind == "user" and principal != user_id:
+                    continue
+                if principal_kind == "group" and (not effective or (user_id, principal) not in self.memberships):
+                    continue
             if system_only and kind != "system":
                 continue
             if project_only is not None and (kind != "project" or target != project_only):
                 continue
-            # Match Keystone's project-oriented expansion, which omits direct system grants.
-            if effective and kind == "system":
-                continue
             for role_id in self.expand([role]) if effective else [role]:
-                key = (user, kind, target, role, role_id)
+                key = (principal_kind, principal, kind, target, role_id)
                 if key in emitted or role_id not in self.roles:
                     continue
                 emitted.add(key)
@@ -468,21 +524,14 @@ class SyntheticKeystone:
                         }
                     }
                 )
-                scope_path = "system" if kind == "system" else f"projects/{target}"
-                assignment = f"http://keystone:5000/v3/{scope_path}/users/{user}/roles/{role}"
-                links = {"assignment": assignment}
-                if role_id != role:
-                    links["prior_role"] = f"http://keystone:5000/v3/roles/{role}/implies/{role_id}"
+                actor_kind = "user" if effective and user_id is not None else principal_kind
+                actor_id = user_id if effective and user_id is not None else principal
                 result.append(
                     {
-                        "user": {
-                            "id": user,
-                            "name": self.users[user]["name"],
-                            "domain": {"id": "default", "name": "Default"},
-                        },
+                        actor_kind: {"id": actor_id},
                         "scope": scope,
                         "role": self._role_ref(role_id),
-                        "links": links,
+                        "links": {"assignment": "synthetic"},
                     }
                 )
         return result
@@ -592,6 +641,8 @@ def keystone_serve(_args) -> int:
 
 def hub_serve(_args) -> int:
     """Serve unmodified main:app; replicate lifespan except the MySQL-only init_db."""
+    if os.geteuid() == 0:
+        raise RuntimeError("The policy/config smoke must run as the image's nonroot Hub user")
     import asyncio
 
     import uvicorn
@@ -1235,6 +1286,8 @@ class Smoke:
             f"{self.names['blob_volume']}:{BLOB_MOUNT}",
             "-v",
             f"{Path(__file__).resolve()}:{SCRIPT_IN_CONTAINER}:ro",
+            "-v",
+            f"{self.policy_file.parent}:/etc/palimpsest:ro",
             image,
             *command,
         ]
@@ -1266,12 +1319,20 @@ class Smoke:
             f"{Path(__file__).resolve()}:{SCRIPT_IN_CONTAINER}:ro",
             "-p",
             f"127.0.0.1::{HUB_PORT}",
+            "-v",
+            f"{self.policy_file.parent}:/etc/palimpsest:ro",
             self.names["derived_image"],
             "python",
             SCRIPT_IN_CONTAINER,
             "hub-serve",
         )
         self.wait_api()
+
+    def set_policy(self, rules):
+        pending = self.policy_file.with_suffix(".tmp")
+        pending.write_text(json.dumps(rules) + "\n")
+        pending.chmod(0o644)
+        pending.replace(self.policy_file)
 
     def wait_api(self) -> None:
         deadline = time.monotonic() + self.args.startup_timeout
@@ -1335,6 +1396,13 @@ class Smoke:
             d("pull", "--quiet", self.args.redis_image)
         images["redis"] = d.inspect_image(self.args.redis_image)
 
+        policy_dir = workdir / "policy"
+        policy_dir.mkdir(mode=0o755)
+        self.policy_file = policy_dir / "policy.yaml"
+        policy_config = policy_dir / "palimpsest.conf"
+        policy_config.write_text('[oslo_policy]\npolicy_file = "/etc/palimpsest/policy.yaml"\npolicy_dirs = []\n')
+        policy_config.chmod(0o644)
+        self.set_policy({})
         d("network", "create", *d.labels(), self.names["network"])
         self.network_created = True
         for volume in ("sql_volume", "blob_volume"):
@@ -1365,23 +1433,33 @@ class Smoke:
             "foreign": {"id": secrets.token_hex(16), "project": project_b},
         }
         assignments = {
-            "owner": ["member", "palimpsest_admin"],
-            "inventory": ["member", "palimpsest_reader"],
-            "writer": ["member", "palimpsest-publish_editor", "palimpsest-keys_editor"],
+            "owner": ["palimpsest_admin"],
+            "inventory": ["palimpsest_reader"],
+            "writer": ["palimpsest-publish_editor", "palimpsest-keys_editor"],
             "tenant_admin": ["member", "admin"],
             "system_admin": ["member"],
-            "protected": ["member", "palimpsest_admin"],
-            "service_member": ["member", "palimpsest_admin"],
-            "foreign": ["member", "palimpsest_admin"],
+            "protected": ["palimpsest_admin"],
+            "service_member": ["palimpsest_admin"],
+            "foreign": ["palimpsest_admin"],
         }
         validator = {"id": secrets.token_hex(16), "name": "palimpsest-smoke-validator", "password": validator_password}
         seed = {
             "validator": validator,
             "roles": [{"id": uuid.uuid4().hex, "name": name} for name in ROLE_NAMES],
             "edges": [list(edge) for edge in ROLE_EDGES],
+            "domains": [{"id": "default", "name": "Default", "enabled": True}],
             "users": [
-                {"id": user["id"], "name": f"smoke-{label}", "label": label, "enabled": True}
-                for label, user in self.users.items()
+                *(
+                    {"id": user["id"], "name": f"smoke-{label}", "label": label, "enabled": True}
+                    for label, user in self.users.items()
+                ),
+                {
+                    "id": secrets.token_hex(16),
+                    "name": "palimpsest-glance-unused",
+                    "label": "trustee",
+                    "domain_id": "default",
+                    "enabled": True,
+                },
             ],
             "projects": [
                 {"id": project, "name": name, "enabled": True}
@@ -1458,6 +1536,7 @@ class Smoke:
             time.sleep(1)
 
         hub_values = {
+            "PALIMPSEST_CONFIG": "/etc/palimpsest/palimpsest.conf",
             "DATABASE_URL": DATABASE_URL,
             "REDIS_URL": "redis://redis:6379/0",
             "PALIMPSEST_HUB_LOCAL_PATH": BLOB_MOUNT,
@@ -1494,9 +1573,9 @@ class Smoke:
             "exit_code": probe.returncode,
             "final_error_line": self.secrets.scrub(lines[-1])[0][:300] if lines else "",
             "interpretation": (
-                "canonical lifespan/bootstrap cannot open SQLite: init_db passes MySQL connect_timeout"
+                "canonical SQLite bootstrap failed; inspect final_error_line"
                 if probe.returncode
-                else "canonical bootstrap unexpectedly succeeded with SQLite"
+                else "canonical SQLite bootstrap completed; this is not MySQL/MariaDB deployment proof"
             ),
         }
         self.start_api()
@@ -1615,25 +1694,41 @@ class Smoke:
             ("tenant_admin", tenant_admin),
         ):
             self.http(
-                f"{label} cannot use package control", label, "GET", "/v1/projects/current", expect=403, auth=token
+                f"{label} explicit package management context",
+                label,
+                "GET",
+                "/v1/projects/current",
+                expect=200 if label in {"system_admin", "tenant_admin"} else 403,
+                auth=token,
             )
-            self.http(
-                f"{label} cannot become package key owner",
+            key_result = self.http(
+                f"{label} bounded own-key issuance",
                 label,
                 "POST",
                 base + "/keys",
-                expect=403,
+                expect=201 if label in {"system_admin", "tenant_admin"} else 403,
                 auth=token,
                 json_body={"name": "denied", "scope": {"packages": ["smoke/app"]}, "actions": ["packages:inventory"]},
             )
-        self.http(
-            "system privilege alone cannot upload legacy artifacts",
+            if key_result is not None and key_result.status == 201:
+                self.secrets.add(key_result.json()["secret"])
+        system_upload = self.http(
+            "human system admin starts legacy upload without service membership",
             "system_admin",
             "POST",
             "/v1/uploads",
-            expect=403,
+            expect=200,
             auth=system_admin,
             json_body={},
+            require=True,
+        )
+        self.http(
+            "human system admin aborts proof-only legacy upload",
+            "system_admin",
+            "DELETE",
+            "/v1/uploads/" + system_upload.json()["session_id"],
+            expect=204,
+            auth=system_admin,
         )
         self.http(
             "foreign project cannot read namespace", "foreign", "GET", base + "/packages", expect=403, auth=foreign
@@ -2279,24 +2374,24 @@ class Smoke:
             "owner granted system admin: key fails closed", "key:full", "GET", "/v1/auth/me", expect=403, auth=full
         )
         self.http(
-            "owner granted system admin: token fails closed",
+            "owner granted system admin: explicit management context",
             "owner",
             "GET",
             "/v1/projects/current",
-            expect=403,
+            expect=200,
             auth=owner,
         )
         self.http(
-            "system promotion retains independent ordinary legacy publication",
+            "system promotion reports fresh human publication authority",
             "owner",
             "GET",
             "/v1/me",
             expect=200,
             auth=owner,
-            validate=lambda r: ensure(r.json()["capabilities"]["upload"] is True, "ordinary publication lost"),
+            validate=lambda r: ensure(r.json()["capabilities"]["upload"] is True, "human publication lost"),
         )
         promoted_upload = self.http(
-            "promoted owner starts legacy upload as original project user",
+            "promoted human owner starts legacy upload",
             "owner",
             "POST",
             "/v1/uploads",
@@ -2306,7 +2401,7 @@ class Smoke:
             require=True,
         )
         self.http(
-            "promoted owner aborts its proof-only legacy session",
+            "promoted human owner aborts proof-only legacy session",
             "owner",
             "DELETE",
             "/v1/uploads/" + promoted_upload.json()["session_id"],
@@ -2453,10 +2548,10 @@ class Smoke:
                 params=app,
             )
 
-        # Removing a Keystone implication edge revokes the retained parent token/key.
-        self.control("edge", prior="palimpsest_editor", implied="palimpsest-publish_editor", present=False)
+        # Operator YAML, not Keystone service-edge removal, attenuates actual operations.
+        self.set_policy({"packages:write": "!"})
         self.http(
-            "edge removed: key cannot start upload",
+            "policy deny: key cannot start upload",
             "key:full",
             "POST",
             base + "/uploads",
@@ -2466,7 +2561,7 @@ class Smoke:
             json_body=body(pending_archive, pending_root, "v3"),
         )
         self.http(
-            "edge removed: retained token cannot legacy-write",
+            "policy deny: retained token cannot legacy-write",
             "owner",
             "POST",
             "/v1/uploads",
@@ -2475,7 +2570,7 @@ class Smoke:
             json_body={},
         )
         self.http(
-            "edge removed: retained token cannot delegate write",
+            "policy deny: key ceiling forbids write delegation",
             "owner",
             "POST",
             base + "/keys",
@@ -2484,7 +2579,7 @@ class Smoke:
             json_body={"name": "w", "scope": {"packages": ["smoke/app"]}, "actions": ["packages:write"]},
         )
         self.http(
-            "edge removed: retained token cannot register namespace",
+            "policy deny: namespace registration denied",
             "owner",
             "PUT",
             f"/v1/projects/{project}/namespace",
@@ -2493,20 +2588,16 @@ class Smoke:
             json_body={},
         )
         self.http(
-            "edge removed: context reports no write",
+            "policy deny: capability endpoint matches",
             "owner",
             "GET",
-            "/v1/projects/current",
+            "/v1/policy/capabilities",
             expect=200,
             auth=owner,
-            validate=lambda r: ensure(
-                not r.json()["capabilities"]["packages_write"] and r.json()["capabilities"]["packages_download"],
-                "write still granted",
-                r.json()["capabilities"],
-            ),
+            validate=lambda r: ensure("packages:write" not in r.json()["actions"], "write still granted", r.json()),
         )
         self.http(
-            "edge removed: unrelated download remains",
+            "policy deny: unrelated download remains",
             "key:full",
             "GET",
             version + "/download",
@@ -2515,27 +2606,59 @@ class Smoke:
             params=app,
             validate=self.bytes_equal(archive),
         )
-        self.control("edge", prior="palimpsest_editor", implied="palimpsest-publish_editor", present=True)
+        self.set_policy(
+            {
+                "packages:inventory": "!",
+                "packages:write": "role:palimpsest_reader",
+                "keys:issue": "role:palimpsest_reader",
+            }
+        )
+        self.http(
+            "policy grant: reader writer without inventory",
+            "inventory",
+            "GET",
+            "/v1/policy/capabilities",
+            expect=200,
+            auth=inventory,
+            validate=lambda r: ensure(
+                "packages:write" in r.json()["actions"] and "packages:inventory" not in r.json()["actions"],
+                "grant mismatch",
+                r.json(),
+            ),
+        )
+        granted_secret, _ = issue("inventory", inventory, "yaml-reader", ["packages:write"], ["smoke/app"])
+        granted = {"Authorization": "Bearer " + granted_secret}
         started = self.http(
-            "edge restored: key can start upload",
-            "key:full",
+            "policy grant: reader key starts upload",
+            "key:yaml-reader",
             "POST",
             base + "/uploads",
             expect=201,
-            auth=full,
+            auth=granted,
             params=app,
             json_body=body(pending_archive, pending_root, "v3"),
         )
         if started.status == 201:
             self.http(
-                "edge restored: probe upload aborted",
-                "key:full",
+                "policy grant: reader key aborts own upload",
+                "key:yaml-reader",
                 "DELETE",
                 base + "/uploads/" + started.json()["upload_id"],
                 expect=204,
-                auth=full,
+                auth=granted,
                 params=app,
             )
+        self.set_policy({})
+        self.http(
+            "policy restored: current reader loses issued write",
+            "key:yaml-reader",
+            "POST",
+            base + "/uploads",
+            expect=403,
+            auth=granted,
+            params=app,
+            json_body=body(pending_archive, pending_root, "v3"),
+        )
 
         # Current role directory integrity: ambiguous IDs and dangling metadata fail closed (503).
         self.control("duplicate_role", name="palimpsest_admin", present=True)
@@ -2814,15 +2937,15 @@ class Smoke:
                 "server": "uvicorn, lifespan=off, plain HTTP on loopback-published port",
                 "harness": "hub-serve: configure_logging + configure_blocking_operations + SQLite engine/"
                 "session factory installed in palimpsest_hub.database; no dependency or auth overrides",
-                "identity": "synthetic Keystone HTTP directory: unique global role IDs, live implication edges and "
-                "assignments; Hub uses its real keystoneauth/keystoneclient validator",
+                "identity": "synthetic Keystone HTTP directory: unique global role IDs, zero service implication edges and "
+                "live assignments; Hub uses its real keystoneauth/keystoneclient validator",
                 "redis": self.args.redis_image,
             },
             "limitations": [
                 "Isolated acceptance only: not proof of canonical MySQL/MariaDB, production lifespan, Redis "
                 "credentials or deployment.",
-                "Canonical lifespan/bootstrap cannot use SQLite (see observations.canonical_sqlite_bootstrap); "
-                "production database code was not changed.",
+                "Canonical SQLite bootstrap is probed separately (see observations.canonical_sqlite_bootstrap); "
+                "the served smoke app still uses the isolated factory/lifespan-off harness.",
                 "MariaDB/MySQL persistence was not exercised by this script.",
                 "No real KVM, Glance, Nova or OpenStack cloud was contacted; the export row is seeded with real CAS "
                 "bytes and no conversion ran; the builder is unconfigured (503 after admin auth).",

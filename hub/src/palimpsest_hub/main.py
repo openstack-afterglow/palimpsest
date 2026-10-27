@@ -27,6 +27,7 @@ from palimpsest_hub.api.catalog import router as catalog_router
 from palimpsest_hub.api.hub import configure_blocking_operations
 from palimpsest_hub.api.hub import router as hub_router
 from palimpsest_hub.api.packages import router as package_router
+from palimpsest_hub.api.policy import router as policy_router
 from palimpsest_hub.cache import close_redis, get_redis
 from palimpsest_hub.config import get_settings
 from palimpsest_hub.database import close_db, get_session_factory, init_db
@@ -102,12 +103,13 @@ app.add_middleware(SlowAPIMiddleware)
 app.include_router(hub_router, prefix="/v1", tags=["hub"])
 app.include_router(build_router, prefix="/v1", tags=["builds"])
 app.include_router(package_router, prefix="/v1", tags=["packages"])
+app.include_router(policy_router, prefix="/v1")
 app.include_router(catalog_router, prefix="/v1")
 
 
 def _package_path(request: Request) -> bool:
     path = request.scope.get("path", "")
-    return path == "/v1/auth/me" or path == "/v1/projects" or path.startswith("/v1/projects/")
+    return path in {"/v1/auth/me", "/v1/policy/capabilities", "/v1/projects"} or path.startswith("/v1/projects/")
 
 
 def _package_error(

@@ -143,43 +143,55 @@
           </details>
         </section>
         <section id="panel-artifacts" hidden aria-labelledby="view-title">
-          <div id="artifacts-list"></div>
-          <details id="import-controls" class="card management" hidden><summary>클라우드 이미지 가져오기</summary><p class="muted">호스트의 기존 파일을 로컬 저장소에 가져옵니다.</p>
-            <form id="form-import" class="form-grid"><label>파일 경로<input id="import-path" required autocomplete="off"></label><label>디스크 형식<select id="import-format"><option value="qcow2">qcow2</option><option value="raw">raw</option></select></label><label>아키텍처<select id="import-arch"><option value="x86_64">x86_64</option><option value="aarch64">aarch64</option></select></label><label>OS 변형 (선택)<input id="import-variant" autocomplete="off"></label><button class="primary" type="submit">이미지 가져오기</button></form>
-          </details>
-          <section id="remote-artifacts" class="card" aria-labelledby="remote-artifacts-title">
-            <div class="panel-heading"><div><p class="eyebrow">CONNECTED REGISTRIES</p><h2 id="remote-artifacts-title">원격 이미지 · 레이어</h2></div><button id="btn-remote-connections" type="button">연결 다시 읽기</button></div>
-            <p class="muted">Palimpsest Hub는 아래에서 이 탭에 연결하거나 서버 환경의 인증을 사용합니다. Docker Hub는 별도 연결입니다. OCI 이미지와 부팅용 클라우드 VM 이미지는 서로 다른 런타임입니다.</p>
-            <form id="form-hub-connect" class="remote-connection-bar" autocomplete="off">
-              <label>Palimpsest Hub URL<input id="hub-url" type="url" required autocomplete="off" spellcheck="false" placeholder="https://hub.example"></label>
-              <label>원래 Keystone 토큰<input id="hub-token" type="password" required autocomplete="off" spellcheck="false"></label>
-              <label>프로젝트 ID (선택 · 원래 범위 확인)<input id="hub-project" autocomplete="off" spellcheck="false"></label>
-              <button id="btn-hub-connect" type="submit">연결</button><button id="btn-hub-disconnect" type="button" hidden>연결 해제</button>
-              <p class="muted remote-connection-note">토큰은 이 탭의 메모리에만 보관하며 연결 해제 시 지웁니다. <span id="hub-connection-status" class="badge" role="status">탭 연결 없음 · 서버 설정 사용</span></p>
-            </form>
-            <div id="remote-connection-feedback" class="notice" role="status"></div>
-            <form id="form-remote-search" class="remote-search-form">
-              <label>연결<select id="remote-connection"><option value="">연결 불러오는 중</option></select></label>
-              <label>분류<select id="remote-kind"><option value="all">전체</option><option value="cloud-image">클라우드 이미지</option><option value="squashfs">SquashFS 레이어</option><option value="oci-image">OCI 이미지</option><option value="runtime-bundle">런타임 번들</option></select></label>
-              <label>검색어 / 정확한 참조<input id="remote-query" type="search" autocomplete="off" placeholder="redis 또는 library/redis:7 또는 sha256:..."></label>
-              <label>저장소 (태그 조회 · 선택)<input id="remote-repository" autocomplete="off" placeholder="library/redis 또는 namespace/package"></label>
-              <label id="remote-arch-filter" hidden>Hub 아키텍처<select id="remote-arch"><option value="">전체</option><option value="x86_64">x86_64</option><option value="aarch64">aarch64</option></select></label>
-              <label id="remote-disk-filter" hidden>Hub 디스크 형식<select id="remote-disk-format"><option value="">전체</option><option value="qcow2">qcow2</option><option value="raw">raw</option></select></label>
-              <label id="remote-parent-filter" hidden>Hub 부모 레이어 (선택)<input id="remote-parent" autocomplete="off" spellcheck="false" placeholder="sha256:..."></label>
-              <button id="btn-remote-search" type="submit">조회 · 검색</button>
-            </form>
-            <nav id="remote-repository-breadcrumb" class="remote-breadcrumb" aria-label="원격 저장소 탐색" hidden><button id="btn-remote-back" type="button">← 저장소 목록으로</button><span id="remote-repository-name" class="mono"></span></nav>
-            <p id="remote-results-state" class="muted" role="status">연결을 선택하고 조회하세요. 원격 목록은 자동 갱신하지 않습니다.</p><div id="remote-results"></div>
-            <button id="btn-remote-next" type="submit" form="form-remote-search" hidden>다음 결과</button>
-            <details id="remote-upload-controls" class="management" hidden><summary>로컬 빌드 · 아티팩트를 Palimpsest Hub에 업로드</summary>
-              <p class="muted">로컬 출력의 다이제스트와 그래프를 다시 검증합니다. OCI 빌드는 프로젝트 키 기반 native Hub, 클라우드 이미지·SquashFS는 원래 Keystone 토큰 기반 Hub를 사용합니다.</p>
-              <form id="form-remote-upload" class="form-grid">
-                <label>Hub 연결<select id="upload-connection" required></select></label><label>로컬 출력<select id="upload-source" required></select></label>
-                <label>Hub 대상 이름 / 패키지:태그<input id="upload-target" required autocomplete="off" spellcheck="false" placeholder="demo-layer 또는 namespace/app:v1"></label><button id="btn-remote-upload" class="primary" type="submit">Hub 업로드 요청 (HTTP 202)</button>
-              </form><p id="remote-upload-feedback" class="muted" role="status"></p>
+          <div class="detail-tabs artifacts-tabs" role="tablist">
+            <button type="button" id="tab-artifacts-local" role="tab" aria-selected="true">로컬 아티팩트</button>
+            <button type="button" id="tab-artifacts-remote" role="tab" aria-selected="false">원격 Hub 탐색 (Docker Hub · Palimpsest Hub)</button>
+          </div>
+          <div id="artifacts-local-view">
+            <div id="artifacts-list"></div>
+            <details id="import-controls" class="card management" hidden><summary>클라우드 이미지 가져오기</summary><p class="muted">호스트의 기존 파일을 로컬 저장소에 가져옵니다.</p>
+              <form id="form-import" class="form-grid"><label>파일 경로<input id="import-path" required autocomplete="off"></label><label>디스크 형식<select id="import-format"><option value="qcow2">qcow2</option><option value="raw">raw</option></select></label><label>아키텍처<select id="import-arch"><option value="x86_64">x86_64</option><option value="aarch64">aarch64</option></select></label><label>OS 변형 (선택)<input id="import-variant" autocomplete="off"></label><button class="primary" type="submit">이미지 가져오기</button></form>
             </details>
-          </section>
-          <div id="transfer-operations-card" class="card" hidden><h2>최근 다운로드 · 업로드</h2><div id="transfer-operations-list"></div></div>
+          </div>
+          <div id="artifacts-remote-view" hidden>
+            <section id="remote-artifacts" class="card" aria-labelledby="remote-artifacts-title">
+              <div class="panel-heading"><div><p class="eyebrow">CONNECTED REGISTRIES</p><h2 id="remote-artifacts-title">원격 이미지 · 레이어</h2></div><button id="btn-remote-connections" type="button">연결 다시 읽기</button></div>
+              <p class="muted">Palimpsest Hub는 아래에서 이 탭에 연결하거나 서버 환경의 인증을 사용합니다. Docker Hub는 별도 연결입니다. OCI 이미지와 부팅용 클라우드 VM 이미지는 서로 다른 런타임입니다.</p>
+              <form id="form-hub-connect" class="remote-connection-bar" autocomplete="off">
+                <label>Palimpsest Hub URL<input id="hub-url" type="url" required autocomplete="off" spellcheck="false" placeholder="https://hub.example"></label>
+                <label>원래 Keystone 토큰<input id="hub-token" type="password" required autocomplete="off" spellcheck="false"></label>
+                <label>프로젝트 ID (선택 · 원래 범위 확인)<input id="hub-project" autocomplete="off" spellcheck="false"></label>
+                <button id="btn-hub-connect" type="submit">연결</button><button id="btn-hub-disconnect" type="button" hidden>연결 해제</button>
+                <p class="muted remote-connection-note">토큰은 이 탭의 메모리에만 보관하며 연결 해제 시 지웁니다. <span id="hub-connection-status" class="badge" role="status">탭 연결 없음 · 서버 설정 사용</span></p>
+              </form>
+              <div id="remote-connection-feedback" class="notice" role="status"></div>
+              <form id="form-remote-search" class="remote-search-form">
+                <label>연결<select id="remote-connection"><option value="">연결 불러오는 중</option></select></label>
+                <label>분류<select id="remote-kind"><option value="all">전체</option><option value="cloud-image">클라우드 이미지</option><option value="squashfs">SquashFS 레이어</option><option value="oci-image">OCI 이미지</option><option value="runtime-bundle">런타임 번들</option></select></label>
+                <label>검색어 / 정확한 참조<input id="remote-query" type="search" autocomplete="off" placeholder="redis 또는 library/redis:7 또는 sha256:..."></label>
+                <label>저장소 (태그 조회 · 선택)<input id="remote-repository" autocomplete="off" placeholder="library/redis 또는 namespace/package"></label>
+                <label>대상 아키텍처<select id="remote-arch"><option value="">전체</option><option value="aarch64">aarch64 · ARM64</option><option value="x86_64">x86_64 · AMD64</option></select></label>
+                <label id="remote-disk-filter" hidden>Hub 디스크 형식<select id="remote-disk-format"><option value="">전체</option><option value="qcow2">qcow2</option><option value="raw">raw</option></select></label>
+                <label id="remote-parent-filter" hidden>Hub 부모 레이어 (선택)<input id="remote-parent" autocomplete="off" spellcheck="false" placeholder="sha256:..."></label>
+                <label>이 클라이언트 플랫폼<select id="remote-compatible"><option value="false">전체</option><option value="true">호환 후보만 · 다운로드 후 의존 체인 검증</option></select></label>
+                <div class="remote-search-actions">
+                  <button id="btn-remote-search" type="submit">조회 · 검색</button>
+                  <button id="btn-remote-catalog" type="button" class="btn-subtle" title="저장소·검색어를 지우고 Hub 전체 카탈로그로 돌아갑니다">카탈로그 전체</button>
+                </div>
+              </form>
+              <nav id="remote-repository-breadcrumb" class="remote-breadcrumb" aria-label="원격 저장소 탐색" hidden><button id="btn-remote-back" type="button">← 저장소 목록으로</button><span id="remote-repository-name" class="mono"></span></nav>
+              <p id="remote-results-state" class="muted" role="status">원격 카탈로그를 조회 중입니다…</p><div id="remote-results"></div>
+              <button id="btn-remote-next" type="submit" form="form-remote-search" hidden>다음 결과</button>
+              <details id="remote-upload-controls" class="management" hidden><summary>로컬 빌드 · 아티팩트를 Palimpsest Hub에 업로드</summary>
+                <p class="muted">로컬 출력의 다이제스트와 그래프를 다시 검증합니다. OCI 빌드는 프로젝트 키 기반 native Hub, 클라우드 이미지·SquashFS는 원래 Keystone 토큰 기반 Hub를 사용합니다.</p>
+                <form id="form-remote-upload" class="form-grid">
+                  <label>Hub 연결<select id="upload-connection" required></select></label><label>로컬 출력<select id="upload-source" required></select></label>
+                  <label>Hub 대상 이름 / 패키지:태그<input id="upload-target" required autocomplete="off" spellcheck="false" placeholder="demo-layer 또는 namespace/app:v1"></label><button id="btn-remote-upload" class="primary" type="submit">Hub 업로드 요청 (HTTP 202)</button>
+                </form><p id="remote-upload-feedback" class="muted" role="status"></p>
+              </details>
+            </section>
+            <div id="transfer-operations-card" class="card" hidden><h2>최근 다운로드 · 업로드</h2><div id="transfer-operations-list"></div></div>
+          </div>
         </section>
         <section id="panel-networks" hidden aria-labelledby="view-title"></section>
         <section id="panel-builds" hidden aria-labelledby="view-title">

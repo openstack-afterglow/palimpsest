@@ -13,7 +13,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from . import cloud_runtime, kvm, lima, runtime_dispatch, state
+from . import cloud_runtime, kvm, lima, platforms, runtime_dispatch, state
 from .digest import digest_file, require_file_digest
 from .errors import ArtifactValidationError, LifecycleError, StateError
 from .project import Project, ServiceSpec, resolve_cloud_init, resolve_service_environment
@@ -98,8 +98,8 @@ def _network_for_service(project: Project, service: ServiceSpec, backend: str) -
             f"managed project network {logical_name!r} is not implemented yet; use default or external: true"
         )
     external_name = network.external_name or logical_name
-    if backend == "lima-vz":
-        if external_name == "vzNAT":
+    if backend in platforms.LIMA_BACKENDS:
+        if external_name in {"vzNAT", "vznat"}:
             return "vzNAT"
         return f"lima:{external_name}"
     return external_name
@@ -387,7 +387,13 @@ def build_project_callbacks(
             environment=inputs.environment,
             cloud_init=inputs.cloud_init,
         )
-        provisional = runtime_dispatch.resolve_run_request(provisional_spec)
+        requested_backend = "auto"
+        if state.run_entry_present_or_ambiguous(roots, run_name):
+            # Restart and recreation must not migrate an owner-bound run or
+            # its named volumes just because the host's auto choice differs.
+            existing = state.read_run_dispatch_record(roots, run_name)
+            requested_backend = existing.dispatch_key.backend.value
+        provisional = runtime_dispatch.resolve_run_request(provisional_spec, requested_backend=requested_backend)
         network = _network_for_service(project, service, provisional.dispatch_key.backend.value)
         logical_spec = RunSpec(
             name=run_name,
@@ -446,7 +452,7 @@ def build_project_callbacks(
             ) from exc
 
     def _reject_lima_owned_paths(item: PreparedService, resolved: ResolvedProjectService) -> None:
-        if resolved.backend != "lima-vz":
+        if resolved.backend not in platforms.LIMA_BACKENDS:
             return
         protected = "/mnt/lima-"
         for mount in item.service.volumes:
@@ -490,7 +496,7 @@ def build_project_callbacks(
             PortForward(port.host_ip, port.host_port, port.guest_port, port.protocol) for port in item.service.ports
         )
         lima_volumes: tuple[VolumeAttachment, ...] = ()
-        if resolved.backend == "lima-vz":
+        if resolved.backend in platforms.LIMA_BACKENDS:
             lima_volumes = tuple(
                 VolumeAttachment(
                     mount.source,
@@ -513,8 +519,8 @@ def build_project_callbacks(
             environment=resolved.environment,
             cloud_init=resolved.cloud_init,
         )
-        if resolved.backend == "lima-vz":
-            lima.validate_run_spec(spec)
+        if resolved.backend in platforms.LIMA_BACKENDS:
+            lima.validate_run_spec(spec, backend=resolved.backend)
         elif (
             len(resolved.stack.layers) + sum(mount.type == "volume" for mount in item.service.volumes)
             > kvm.MAX_LAYER_DISKS
@@ -545,7 +551,7 @@ def build_project_callbacks(
         rpaths = state.run_paths(roots, item.plan.run_name)
         record = state.read_run_state(rpaths)
         backend = record.get("backend", "kvm")
-        if backend not in {"kvm", "lima-vz", "libvirt-hvf"}:
+        if backend not in platforms.BACKENDS:
             raise StateError(f"owned run has unsupported backend {backend!r}")
         _preflight_applied_host_shares(item, record, backend)
         if item.plan.action == "noop":
@@ -560,7 +566,7 @@ def build_project_callbacks(
             if backend in {"kvm", "libvirt-hvf"}:
                 kvm.validate_network(network)
             else:
-                lima.validate_network(network)
+                lima.validate_network(network, backend=backend)
             checked_networks.add(network_key)
 
         base = record.get("base")
@@ -754,7 +760,7 @@ def build_project_callbacks(
                     raise ArtifactValidationError(
                         "external KVM block-volume lookup is not implemented: " + ", ".join(sorted(external))
                     )
-            if resolved.backend == "lima-vz" and any(
+            if resolved.backend in platforms.LIMA_BACKENDS and any(
                 project.volumes[mount.source].external for mount in item.service.volumes if mount.type == "volume"
             ):
                 raise ArtifactValidationError(
@@ -765,8 +771,8 @@ def build_project_callbacks(
             if network_key not in checked_networks:
                 if resolved.backend in {"kvm", "libvirt-hvf"}:
                     kvm.validate_network(resolved.network)
-                elif resolved.backend == "lima-vz":
-                    lima.validate_network(resolved.network)
+                elif resolved.backend in platforms.LIMA_BACKENDS:
+                    lima.validate_network(resolved.network, backend=resolved.backend)
                 else:
                     raise ArtifactValidationError(f"unsupported project backend: {resolved.backend!r}")
                 checked_networks.add(network_key)
@@ -859,7 +865,7 @@ def build_project_callbacks(
                         continue
                     size_bytes = volume.size_mib * _MIB
                     volume_key = (item.service.name, volume.name)
-                    if resolved.backend == "lima-vz":
+                    if resolved.backend in platforms.LIMA_BACKENDS:
                         if volume_key in preexisting_volume_keys:
                             existing = verify_lima_volume(
                                 roots,
@@ -971,7 +977,7 @@ def build_project_callbacks(
         else:
             spec = logical_request.spec
             request = logical_request
-        if resolved.backend == "lima-vz":
+        if resolved.backend in platforms.LIMA_BACKENDS:
             try:
                 return runtime_dispatch.run(request, preflight=preflight, roots=roots)
             except Exception as exc:
@@ -1029,7 +1035,7 @@ def build_project_callbacks(
                 if path.exists() or path.is_symlink():
                     verify_kvm_volume(roots, project.name, volume.name, volume.size_bytes)
                     _validate_kvm_volume_references(path, allowed_kvm_run_ids)
-            elif volume.backend == "lima-vz":
+            elif volume.backend in platforms.LIMA_BACKENDS:
                 preflight_delete_lima_volume(
                     roots,
                     project.name,
@@ -1041,7 +1047,7 @@ def build_project_callbacks(
                 raise StateError(f"managed volume {volume.name!r} has unsupported backend {volume.backend!r}")
 
     def remove_volume(_project_name: str, volume_name: str, backend: str, size_bytes: int) -> object:
-        if backend == "lima-vz":
+        if backend in platforms.LIMA_BACKENDS:
             return delete_lima_volume(roots, project.name, volume_name, size_bytes)
         if backend in {"kvm", "libvirt-hvf"}:
             path = kvm_volume_path(roots, project.name, volume_name)

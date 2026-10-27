@@ -697,12 +697,15 @@ def _root_arguments(staged: StagedLayer, policy: SquashFSPackPolicy = DEFAULT_SQ
     return arguments
 
 
-def verify_squashfs_fd(fd: int, image_size: int, maximum: int) -> None:
+def verify_squashfs_fd(fd: int, image_size: int, maximum: int, *, require_zero_mkfs_time: bool = True) -> None:
     """Verify one already-pinned SquashFS image without resolving a path.
 
     Derived-cache hits use the same structural gate as freshly packed output;
     callers must additionally verify the complete digest and stable file
     identity around this check.
+    Native cloud-image captures may retain their real mkfs timestamp. Only those
+    callers explicitly disable the OCI normalization-time check; all byte/table,
+    padding and immutable OCI recipe/cache checks retain their existing defaults.
     """
     if not SQUASHFS_BLOCK_DEVICE_ALIGNMENT <= image_size <= maximum or image_size % SQUASHFS_BLOCK_DEVICE_ALIGNMENT:
         raise SquashFSPackError("oci-pack-output-size", "packed image size is outside its policy")
@@ -733,7 +736,12 @@ def verify_squashfs_fd(fd: int, image_size: int, maximum: int) -> None:
         fragment_table_start,
         export_table_start,
     )
-    if magic != _SQUASHFS_MAGIC or inodes < 1 or mkfs_time != 0 or (major, minor) != (4, 0):
+    if (
+        magic != _SQUASHFS_MAGIC
+        or inodes < 1
+        or (require_zero_mkfs_time and mkfs_time != 0)
+        or (major, minor) != (4, 0)
+    ):
         raise SquashFSPackError("oci-pack-superblock", "SquashFS identity or deterministic time is invalid")
     if block_size < 4096 or block_size > 1024 * 1024 or block_size & (block_size - 1):
         raise SquashFSPackError("oci-pack-superblock", "SquashFS block size is invalid")

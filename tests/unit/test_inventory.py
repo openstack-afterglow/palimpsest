@@ -1924,16 +1924,17 @@ def test_host_same_name_different_run_id_is_not_managed(tmp_path, monkeypatch):
     assert inventory.vm_logs(roots, external["id"], expected_run_id=external["run_id"])["reason"] == "identity"
 
 
-def test_host_exact_identity_updates_runtime_and_disk_without_duplicate(tmp_path, monkeypatch):
+@pytest.mark.parametrize("backend", ["lima-vz", "lima-krunkit"])
+def test_host_exact_identity_updates_runtime_and_disk_without_duplicate(tmp_path, monkeypatch, backend):
     roots = _setup_roots(tmp_path)
-    run_id = _resource_run(roots, "owned", network="vzNAT")
-    vm = _observed_vm("owned", run_id)
+    run_id = _resource_run(roots, "owned", backend=backend, network="default" if backend == "lima-krunkit" else "vzNAT")
+    vm = _observed_vm("owned", run_id, backend=backend)
     attachment = {"name": "owned", "run_id": run_id, "mount_path": "/", "read_only": False}
     disk = {
-        "id": "host-disk:lima-vz:owned",
+        "id": f"host-disk:{backend}:owned",
         "name": "owned",
         "kind": "vm-disk",
-        "backend": "lima-vz",
+        "backend": backend,
         "status": "observed-file",
         "source": "host-backend",
         "size_bytes": 30 * 1024**3,
@@ -1942,11 +1943,11 @@ def test_host_exact_identity_updates_runtime_and_disk_without_duplicate(tmp_path
         "attachments": [attachment],
     }
     network = {
-        "id": "host-network:lima-vz:vzNAT",
-        "name": "vzNAT",
-        "kind": "lima",
-        "backend": "lima-vz",
-        "mode": "vzNAT",
+        "id": f"network:lima-krunkit:{run_id}:owned" if backend == "lima-krunkit" else "host-network:lima-vz:vzNAT",
+        "name": "default" if backend == "lima-krunkit" else "vzNAT",
+        "kind": "user-mode" if backend == "lima-krunkit" else "lima",
+        "backend": backend,
+        "mode": "gvisor" if backend == "lima-krunkit" else "vzNAT",
         "subnet": None,
         "gateway": None,
         "status": "configured",
@@ -1962,6 +1963,8 @@ def test_host_exact_identity_updates_runtime_and_disk_without_duplicate(tmp_path
     vms = inventory.list_vms(roots)["vms"]
     assert [(row["id"], row["status"], row["managed"]) for row in vms] == [("owned", "running", True)]
     assert vms[0]["run_id"] == run_id
+    assert vms[0]["access"]["transport"] == "lima"
+    assert vms[0]["lifecycle"]["stop"] is True
     volumes = inventory.list_volumes(roots)["volumes"]
     assert len(volumes) == 1
     assert volumes[0]["id"] == f"vm-disk:{run_id}"
@@ -2073,7 +2076,7 @@ def _vm_access_fixture(
         "name": "redis",
         "status": "Running" if status == "running" else "Stopped",
         "dir": str(directory),
-        "vmType": "vz",
+        "vmType": "krunkit" if backend == "lima-krunkit" else "vz",
         "config": {"env": {"PALIMPSEST_RUN_ID": run_id}},
     }
     monkeypatch.setattr(vm_access, "_instance", lambda name: instance)
@@ -2090,10 +2093,11 @@ def _spawn_lima_guest(tmp_path, argv, code, **kw):
     return LocalProcessSession(("sh", "-c", gate, "sh", sys.executable, "-c", code), tty=kw["tty"], stdin=True)
 
 
-def test_guest_measurements_cross_real_process_consumer_boundary(tmp_path, monkeypatch):
+@pytest.mark.parametrize("backend", ["lima-vz", "lima-krunkit"])
+def test_guest_measurements_cross_real_process_consumer_boundary(tmp_path, monkeypatch, backend):
     from palimpsest_local import vm_access
 
-    roots, row, _, _ = _vm_access_fixture(tmp_path, monkeypatch)
+    roots, row, _, _ = _vm_access_fixture(tmp_path, monkeypatch, backend=backend)
 
     def spawn(argv, **kw):
         return _spawn_lima_guest(tmp_path, argv, f"import os; os.write(1, {_LINUX_METRICS!r})", **kw)
@@ -2154,8 +2158,9 @@ def test_guest_measurement_unavailable_never_becomes_zero(source, bad):
     assert parsed[key] is None
 
 
-def test_stopped_lima_logs_are_native_identity_bound_console(tmp_path, monkeypatch):
-    roots, row, directory, _ = _vm_access_fixture(tmp_path, monkeypatch, status="stopped")
+@pytest.mark.parametrize("backend", ["lima-vz", "lima-krunkit"])
+def test_stopped_lima_logs_are_native_identity_bound_console(tmp_path, monkeypatch, backend):
+    roots, row, directory, _ = _vm_access_fixture(tmp_path, monkeypatch, status="stopped", backend=backend)
     (directory / "serial.log").write_text("old\nredis ready\nshutdown\n")
     result = inventory.vm_logs(roots, row["id"], tail=2, expected_run_id=row["run_id"])
     assert result == {
@@ -2413,15 +2418,17 @@ def test_remove_vm_replacement_fences_original_uuid_before_backend(tmp_path, mon
     assert replacement.state["status"] == "running"
 
 
-@pytest.mark.parametrize("identifier", ["external", "host:lima-vz:external"])
-def test_remove_vm_external_identity_is_forbidden_without_native_identity(tmp_path, monkeypatch, identifier):
+@pytest.mark.parametrize("backend", ["lima-vz", "lima-krunkit"])
+@pytest.mark.parametrize("native_id", [False, True])
+def test_remove_vm_external_identity_is_forbidden_without_adoption(tmp_path, monkeypatch, backend, native_id):
+    identifier = f"host:{backend}:external" if native_id else "external"
     roots = _setup_roots(tmp_path)
     run_id = "11111111-1111-4111-8111-111111111111"
     monkeypatch.setattr(
         inventory.host_inventory,
         "observe",
         lambda: {
-            "vms": [_observed_vm("external", run_id)],
+            "vms": [_observed_vm("external", run_id, backend=backend)],
             "volumes": [],
             "networks": [],
             "warnings": [],
@@ -2609,6 +2616,7 @@ def test_vm_lifecycle_stop_returns_durable_safe_receipt(tmp_path, monkeypatch):
         lambda name: {
             "name": "selected",
             "status": "Stopped",
+            "vmType": "vz",
             "config": {"env": {"PALIMPSEST_RUN_ID": run_id}},
         },
     )
@@ -2681,3 +2689,287 @@ def test_corrupt_retained_metadata_blocks_layer_deletion_and_inventory_action(tm
         inventory.remove_artifact(roots, digest, force=True)
     assert store.exists(digest)
     assert inventory.list_artifacts(roots)["artifacts"][0]["delete_supported"] is False
+
+
+@pytest.mark.parametrize(
+    ("selected_backend", "native_backend"),
+    [
+        ("lima-vz", "lima-krunkit"),
+        ("lima-krunkit", "lima-vz"),
+    ],
+)
+def test_same_native_lima_name_replaced_with_other_backend_refuses_access_and_control(
+    tmp_path, monkeypatch, selected_backend, native_backend
+):
+    roots = _setup_roots(tmp_path)
+    run_id = _resource_run(roots, "replaced", backend=selected_backend)
+    observed = _observed_vm("replaced", run_id, backend=native_backend)
+    observed["removal_identity"] = "native-backend-selection"
+    monkeypatch.setattr(inventory.runtime_dispatch, "reconcile", _live_ledger_projection)
+    monkeypatch.setattr(
+        inventory.host_inventory,
+        "observe",
+        lambda: {
+            "vms": [observed],
+            "volumes": [],
+            "networks": [],
+            "warnings": [],
+        },
+    )
+    rows = inventory.list_vms(roots)["vms"]
+    assert len(rows) == 2
+    assert all(not row["managed"] and row["access"]["reason"] == "identity" for row in rows)
+    assert all(not any(row["lifecycle"].values()) for row in rows)
+    with pytest.raises(StateError, match="ambiguous"):
+        inventory.get_vm(roots, "replaced")
+
+
+def test_krunkit_default_networks_do_not_merge_or_claim_vznat(tmp_path, monkeypatch):
+    roots = _setup_roots(tmp_path)
+    for name in ("one", "two"):
+        _resource_run(roots, name, backend="lima-krunkit", network="default")
+    result = inventory.list_networks(roots)
+    assert result["warnings"] == []
+    assert len(result["networks"]) == 2
+    assert all(row["mode"] == "gvisor" and row["kind"] == "user-mode" for row in result["networks"])
+    assert {tuple(item["name"] for item in row["attachments"]) for row in result["networks"]} == {("one",), ("two",)}
+
+
+@pytest.mark.parametrize("observed_run_matches", [False, True])
+@pytest.mark.parametrize("native_name", ["project-data", "data"])
+@pytest.mark.parametrize("selected_identity_matches", [False, True])
+def test_lima_named_disk_joins_by_native_name_and_run_not_display_name(
+    tmp_path, monkeypatch, observed_run_matches, native_name, selected_identity_matches
+):
+    roots = _setup_roots(tmp_path)
+    run_id = _resource_run(
+        roots,
+        "krun",
+        backend="lima-krunkit",
+        volumes=[
+            {
+                "name": "data",
+                "backend_name": "project-data",
+                "mount_path": "/srv/data",
+                "read_only": False,
+            }
+        ],
+    )
+    attachment = {
+        "name": "krun",
+        "run_id": run_id if observed_run_matches else "33333333-3333-4333-8333-333333333333",
+        "mount_path": "",
+        "read_only": False,
+    }
+    native = {
+        "id": f"volume:lima:{native_name}",
+        "name": native_name,
+        "backend": "lima",
+        "kind": "volume",
+        "source": "host-backend",
+        "status": "attached",
+        "size_bytes": 4096,
+        "allocated_bytes": 512,
+        "attachments": [
+            attachment,
+            {
+                "name": "external-vz",
+                "run_id": "44444444-4444-4444-8444-444444444444",
+                "mount_path": "",
+                "read_only": False,
+            },
+        ],
+    }
+    monkeypatch.setattr(
+        inventory.host_inventory,
+        "observe",
+        lambda: {
+            "vms": [],
+            "volumes": [native],
+            "networks": [],
+            "warnings": [],
+        },
+    )
+    supplied = inventory.list_vms(roots, live=False)
+    assert "backend_name" not in repr(supplied) and "project-data" not in repr(supplied)
+    if not selected_identity_matches:
+        path = roots.runs / "krun" / "state.json"
+        payload = state.read_json(path)
+        payload["backend"] = "lima-vz"
+        state.atomic_write_json(path, payload)
+    rows = inventory.list_volumes(roots, vms_result=supplied)["volumes"]
+    declared = next(row for row in rows if row["id"] == f"run-volume:{run_id}:data")
+    assert next(item for item in declared["attachments"] if item["name"] == "krun")["mount_path"] == "/srv/data"
+    assert sum(row.get("allocated_bytes") or 0 for row in rows) == 512
+    joined = observed_run_matches and native_name == "project-data" and selected_identity_matches
+    assert (native["id"] in {row["id"] for row in rows}) is not joined
+    assert declared["size_bytes"] == (4096 if joined else None)
+    physical = declared if joined else next(row for row in rows if row["id"] == native["id"])
+    assert {item["name"] for item in physical["attachments"]} == {"krun", "external-vz"}
+    assert physical["backend"] == "lima"
+    if joined:
+        assert next(item for item in physical["attachments"] if item["name"] == "krun")["mount_path"] == "/srv/data"
+
+
+def test_krunkit_same_name_replacement_keeps_default_network_identity_separate(tmp_path, monkeypatch):
+    roots = _setup_roots(tmp_path)
+    original = _resource_run(roots, "krun", backend="lima-krunkit", network="default")
+    replacement = "33333333-3333-4333-8333-333333333333"
+    native = {
+        "id": f"network:lima-krunkit:{replacement}:krun",
+        "name": "default",
+        "kind": "user-mode",
+        "backend": "lima-krunkit",
+        "mode": "gvisor",
+        "status": "configured",
+        "source": "host-backend",
+        "attachments": [{"name": "krun", "run_id": replacement, "ports": [], "guest_ip": None}],
+    }
+    monkeypatch.setattr(
+        inventory.host_inventory,
+        "observe",
+        lambda: {
+            "vms": [],
+            "volumes": [],
+            "networks": [native],
+            "warnings": [],
+        },
+    )
+    networks = inventory.list_networks(roots)["networks"]
+    assert len(networks) == 2
+    assert {tuple(item["run_id"] for item in row["attachments"]) for row in networks} == {(original,), (replacement,)}
+
+
+def test_named_lima_network_is_one_native_network_across_backends(tmp_path):
+    roots = _setup_roots(tmp_path)
+    _resource_run(roots, "vz", backend="lima-vz", network="lima:shared")
+    _resource_run(roots, "krun", backend="lima-krunkit", network="lima:shared")
+    result = inventory.list_networks(roots)
+    assert result["warnings"] == []
+    assert len(result["networks"]) == 1
+    network = result["networks"][0]
+    assert network["id"] == "network:lima:shared" and network["backend"] == "lima"
+    assert {item["name"] for item in network["attachments"]} == {"vz", "krun"}
+
+
+@pytest.mark.parametrize(
+    ("damage", "expected"),
+    [
+        (None, "compatible"),
+        ("unknown-parent", "unknown"),
+        ("missing-root-binding", "unknown"),
+        ("foreign-parent", "incompatible"),
+        ("missing-parent", "unknown"),
+        ("cycle", "incompatible"),
+        ("foreign-base", "incompatible"),
+        ("missing-base", "unknown"),
+        ("missing-bytes", "unknown"),
+    ],
+)
+def test_artifact_platform_check_requires_complete_matching_chain(tmp_path, monkeypatch, damage, expected):
+    from palimpsest_local import platforms
+
+    roots = _setup_roots(tmp_path)
+    store = ContentStore(roots.store)
+
+    def publish(payload, metadata):
+        digest = "sha256:" + store.write_stream([payload]).name
+        store.write_metadata(digest, metadata)
+        return digest
+
+    base = publish(
+        b"base",
+        {"kind": "cloud-image", "arch": "x86_64" if damage == "foreign-base" else "aarch64", "disk_format": "raw"},
+    )
+    parent = publish(
+        b"parent",
+        {
+            "kind": "squashfs",
+            "media_type": MEDIA_TYPE_LAYER_SQUASHFS,
+            "arch": None if damage == "unknown-parent" else "x86_64" if damage == "foreign-parent" else "aarch64",
+            "base_image_digest": base,
+        },
+    )
+    leaf = publish(
+        b"leaf",
+        {
+            "kind": "squashfs",
+            "media_type": MEDIA_TYPE_LAYER_SQUASHFS,
+            "arch": "aarch64",
+            "base_image_digest": base,
+            "parent_digest": parent,
+        },
+    )
+    if damage == "missing-root-binding":
+        metadata = store.read_metadata(parent)
+        metadata.pop("base_image_digest")
+        store.write_metadata(parent, metadata)
+    if damage == "missing-parent":
+        store.metadata_path(parent).unlink()
+    elif damage == "missing-base":
+        store.metadata_path(base).unlink()
+    elif damage == "missing-bytes":
+        store.blob_path(base).unlink()
+    elif damage == "cycle":
+        store.write_metadata(parent, {**store.read_metadata(parent), "parent_digest": leaf})
+    monkeypatch.setattr(platforms, "detect_host", lambda: platforms.HostPlatform("Darwin", "aarch64"))
+    monkeypatch.setattr(
+        platforms, "_check_capability", lambda *a, **kw: pytest.fail("metadata inspection probed a runtime")
+    )
+    checked = inventory.check_local_artifact(roots, leaf)
+    assert checked["status"] == expected
+    filtered = inventory.list_artifacts(roots, compatible=True)["layers"]
+    assert (leaf in {item["digest"] for item in filtered}) == (expected == "compatible")
+    assert store.read_metadata(leaf)["arch"] == "aarch64"
+
+
+@pytest.mark.parametrize(
+    ("kind", "arch", "platform", "system", "machine", "backend", "expected"),
+    [
+        ("cloud-image", "aarch64", None, "Darwin", "aarch64", "lima-krunkit", "compatible"),
+        ("cloud-image", "x86_64", None, "Darwin", "aarch64", "lima-vz", "incompatible"),
+        ("cloud-image", "aarch64", None, "Linux", "aarch64", "auto", "compatible"),
+        ("cloud-image", "aarch64", None, "Windows", "aarch64", "auto", "incompatible"),
+        ("oci-image", "amd64", "linux/amd64", "Linux", "x86_64", "kvm", "compatible"),
+        ("oci-image", "arm64", "linux/arm64", "Darwin", "aarch64", "auto", "incompatible"),
+        ("cloud-image", None, None, "Darwin", "aarch64", "auto", "unknown"),
+    ],
+)
+def test_artifact_platform_check_retains_runtime_boundaries(kind, arch, platform, system, machine, backend, expected):
+    from palimpsest_local.artifact_compatibility import check_artifact
+    from palimpsest_local.platforms import HostPlatform
+
+    result = check_artifact(
+        {"kind": kind, "arch": arch, "platform": platform, "disk_format": "raw"},
+        host=HostPlatform(system, machine),
+        requested_backend=backend,
+    )
+    assert result["status"] == expected
+    assert result["compatible"] == (expected == "compatible")
+
+
+def test_local_artifact_architecture_filter_does_not_assume_legacy_target(tmp_path, monkeypatch):
+    from palimpsest_local import platforms
+
+    roots = _setup_roots(tmp_path)
+    store = ContentStore(roots.store)
+    for arch in ("aarch64", "x86_64", None):
+        digest = "sha256:" + store.write_stream([str(arch).encode()]).name
+        store.write_metadata(digest, {"kind": "squashfs", "arch": arch, "media_type": MEDIA_TYPE_LAYER_SQUASHFS})
+    monkeypatch.setattr(platforms, "detect_host", lambda: platforms.HostPlatform("Darwin", "aarch64"))
+    assert [item["arch"] for item in inventory.list_artifacts(roots, arch="aarch64")["layers"]] == ["aarch64"]
+    assert inventory.list_artifacts(roots, compatible=True)["layers"] == []
+    legacy = next(item for item in inventory.list_artifacts(roots)["layers"] if item.get("arch") is None)
+    assert legacy["compatibility"]["status"] == "unknown"
+
+
+def test_runtime_pack_platform_variant_keeps_conventional_and_oci_boundaries():
+    from palimpsest_local.artifact_compatibility import check_artifact
+    from palimpsest_local.platforms import HostPlatform
+
+    base = "sha256:" + "a" * 64
+    layer = {"kind": "squashfs", "arch": "aarch64", "platform": "linux/arm64/v8", "base_image_digest": base}
+    metadata = {base: {"digest": base, "kind": "cloud-image", "arch": "aarch64", "disk_format": "raw"}}
+    host = HostPlatform("Darwin", "aarch64")
+    assert check_artifact(layer, lookup=metadata.__getitem__, host=host)["compatible"] is True
+    assert check_artifact({"kind": "oci-image", "platform": "linux/arm64/v8"}, host=host)["status"] == "incompatible"

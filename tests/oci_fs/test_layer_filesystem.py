@@ -947,3 +947,75 @@ def test_build_layer_filesystem_refuses_output_symlink_inserted_during_pack(tmp_
     assert output.is_symlink()
     assert victim.read_bytes() == b"untouched"
     assert list(tmp_path.glob(".layer.squashfs.*")) == []
+
+
+@pytest.mark.oci_fs
+def test_capture_releases_store_and_journal_despite_peer_namespace(tmp_path):
+    """A successful capture must not leave peer mounts or an unreplayed journal."""
+    import sys
+
+    from palimpsest_local.cloudinit import _BUILD_WORKER_SOURCE
+
+    required = os.environ.get("PALIMPSEST_REQUIRE_OCI_FS") == "1"
+    tools = ("unshare", "mount", "umount", "mksquashfs", "unsquashfs", "mkfs.ext4", "losetup", "blockdev", "dumpe2fs")
+    available = sys.platform == "linux" and os.geteuid() == 0 and all(shutil.which(tool) for tool in tools)
+    if available:
+        available = (
+            subprocess.run(["unshare", "--mount", "--propagation", "private", "true"], capture_output=True).returncode
+            == 0
+        )
+    if not available:
+        if required:
+            pytest.fail("capture release proof requires privileged Linux mount namespaces and filesystem tools")
+        pytest.skip("capture release proof requires privileged Linux mount namespaces and filesystem tools")
+    source = tmp_path / "capture-source.py"
+    source.write_text(_BUILD_WORKER_SOURCE)
+    harness = tmp_path / "namespace-proof.py"
+    harness.write_text(r"""
+import json, os, subprocess, sys, time
+from pathlib import Path
+root=Path(sys.argv[1]); source=Path(sys.argv[2]); store=root/'store'; store.mkdir()
+def run(argv):
+    return subprocess.run(argv,check=True,capture_output=True,text=True)
+image=root/'ext4.img'
+with image.open('xb') as stream: stream.truncate(128*1024**2)
+run(['mkfs.ext4','-F',str(image)])
+loop=run(['losetup','--find','--show',str(image)]).stdout.strip()
+peer=None
+try:
+    run(['blockdev','--setrw',loop]); run(['mount','--make-rshared','/'])
+    run(['mount',loop,str(store)])
+    peer=subprocess.Popen(['unshare','--mount','--propagation','unchanged','sleep','120'])
+    deadline=time.monotonic()+10
+    while os.readlink('/proc/%d/ns/mnt'%peer.pid)==os.readlink('/proc/self/ns/mnt'):
+        if time.monotonic()>deadline: raise RuntimeError('peer namespace did not start')
+        time.sleep(.01)
+    job=root/'job.json'
+    job.write_text(json.dumps({'network':'none','capture_tmpfs':False,'parent_mounts':[],
+        'runs':[{'line':1,'command':'printf captured > /capture-proof-value','env':{},'workdir':'/'}]}))
+    worker=root/'worker.py'
+    worker.write_text("from pathlib import Path\nn={'__name__':'capture_test'}\nexec(Path("+repr(str(source))+").read_text(),n)\nn['JOB_PATH']="+repr(str(job))+"\nn['_build']()\n")
+    env=dict(os.environ,PALIMPSEST_BUILD_CAPTURE=str(store/'capture'),PALIMPSEST_BUILD_OUTPUT=str(store/'layer.squashfs'))
+    subprocess.run([sys.executable,str(worker)],env=env,check=True,capture_output=True,text=True,timeout=60)
+    assert run(['unsquashfs','-cat',str(store/'layer.squashfs'),'capture-proof-value']).stdout=='captured'
+    run(['sync']); run(['umount',str(store)])
+    mounts=Path('/proc/%d/mountinfo'%peer.pid).read_text().splitlines()
+    assert not any(str(store) in line for line in mounts), 'peer retained the capture/store mounts'
+    header=run(['dumpe2fs','-h',loop]).stdout
+    features=next(line for line in header.splitlines() if line.startswith('Filesystem features:'))
+    assert 'needs_recovery' not in features
+    assert next(line.split(':',1)[1].strip() for line in header.splitlines() if line.startswith('Journal start:'))=='0'
+finally:
+    if peer is not None:
+        peer.kill(); peer.wait()
+    subprocess.run(['umount','-R',str(store)],capture_output=True)
+    subprocess.run(['losetup','--detach',loop],capture_output=True)
+""")
+    # The harness changes propagation only inside its own private outer namespace.
+    completed = subprocess.run(
+        ["unshare", "--mount", "--propagation", "private", sys.executable, str(harness), str(tmp_path), str(source)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr

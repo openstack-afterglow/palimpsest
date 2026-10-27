@@ -326,6 +326,8 @@ def keystone(monkeypatch: pytest.MonkeyPatch):
                         "links": {"next": None},
                     },
                 )
+            elif parsed.path == f"/v3/users/{USER}/groups":
+                self.send_json(200, {"groups": [], "links": {"next": None}})
             elif parsed.path == f"/v3/users/{USER}":
                 self.send_json(200, {"user": {"id": USER, "name": "requester", "enabled": state["user_enabled"]}})
             elif parsed.path == f"/v3/projects/{PROJECT}":
@@ -342,7 +344,7 @@ def keystone(monkeypatch: pytest.MonkeyPatch):
                         for name in state["project_roles"]
                     ]
                 )
-                self.send_json(200, {"role_assignments": assignments})
+                self.send_json(200, {"role_assignments": assignments, "links": {"next": None}})
             else:
                 self.send_json(404, {"error": {"message": "unknown"}})
 

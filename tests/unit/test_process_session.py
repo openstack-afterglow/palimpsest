@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import signal
 import sys
 import threading
 import time
@@ -199,3 +200,58 @@ def test_constructor_setup_failure_reaps_spawned_child(
     child_pid = int(pid_path.read_text())
     with pytest.raises(ProcessLookupError):
         os.kill(child_pid, 0)
+
+
+@pytest.mark.parametrize("exit_on_eof", [True, False])
+def test_close_signal_permission_denial_requires_reaped_child_and_absent_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exit_on_eof: bool
+) -> None:
+    ready = tmp_path / "ready"
+    release = tmp_path / "release"
+    body = (
+        "sys.stdin.buffer.read()\nwhile not pathlib.Path(sys.argv[2]).exists(): time.sleep(0.005)\n"
+        if exit_on_eof
+        else "time.sleep(60)\n"
+    )
+    session = spawn_process_session(
+        [
+            sys.executable,
+            "-c",
+            "import pathlib,sys,time\npathlib.Path(sys.argv[1]).touch()\n" + body,
+            str(ready),
+            str(release),
+        ],
+        stdin=True,
+    )
+    real_killpg = os.killpg
+
+    def deny_termination(group: int, requested: int) -> None:
+        if group == session._process.pid and requested == signal.SIGTERM:
+            if exit_on_eof:
+                release.touch()
+                session._process.wait(timeout=2)
+            raise PermissionError("signal permission denied")
+        real_killpg(group, requested)
+
+    try:
+        deadline = time.monotonic() + 2
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists()
+        monkeypatch.setattr(process_session.os, "killpg", deny_termination)
+        if exit_on_eof:
+            session.close()
+            assert session._process.poll() == 0
+            with pytest.raises(ProcessLookupError):
+                real_killpg(session._process.pid, 0)
+            assert session.wait().category is ProcessExitCategory.CANCELLED
+        else:
+            with pytest.raises(PermissionError):
+                session.close()
+            assert session._process.poll() is None
+            real_killpg(session._process.pid, 0)
+    finally:
+        if session._process.poll() is None:
+            real_killpg(session._process.pid, signal.SIGTERM)
+        session._process.wait(timeout=2)
+        session.close()

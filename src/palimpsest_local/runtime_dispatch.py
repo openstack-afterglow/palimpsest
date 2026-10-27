@@ -489,7 +489,7 @@ def bind_run_request_volumes(
         raise StateError("prepared volume attachments changed logical volume intent")
     backend = request.dispatch_key.backend
     sources_match = all(
-        (volume.backend_name is not None if backend is RuntimeBackend.LIMA_VZ else volume.host_path is not None)
+        (volume.backend_name is not None if backend.is_lima else volume.host_path is not None)
         for volume in final_spec.volumes
     )
     if not sources_match:
@@ -602,8 +602,8 @@ def _run_with_named_volumes(request: ResolvedRunRequest, roots: StatePaths) -> R
 
 
 def _run_bound_request(request: ResolvedRunRequest, resolved_roots: StatePaths) -> RunResult:
-    if request.dispatch_key.backend is RuntimeBackend.LIMA_VZ:
-        raw_result = lima.run(request.spec, roots=resolved_roots)
+    if request.dispatch_key.backend.is_lima:
+        raw_result = lima.run(request.spec, roots=resolved_roots, backend=request.dispatch_key.backend)
     else:
         profile = platforms.resolve_domain_profile(
             request.dispatch_key.backend.value,
@@ -707,7 +707,7 @@ def _adapter_for(record: ExistingRunRecord, operation: RuntimeOperation) -> Any:
         if operation in {RuntimeOperation.STOP, RuntimeOperation.RM}:
             return _oci_adapter()
         raise RuntimeCapabilityError(operation, record.dispatch_key)
-    if record.dispatch_key.backend is RuntimeBackend.LIMA_VZ:
+    if record.dispatch_key.backend.is_lima:
         return lima
     return cloud_runtime
 

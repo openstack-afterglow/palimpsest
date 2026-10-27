@@ -66,6 +66,7 @@ fixed recipe embedded in the read-only NoCloud seed and emits a framed result on
 after it has produced the verified candidate SquashFS image.
 """
 
+import ctypes
 import hashlib
 import json
 import os
@@ -79,14 +80,26 @@ import traceback
 CHANNEL = os.environ.get("PALIMPSEST_BUILD_CHANNEL")
 RESULT_PATH = os.environ.get("PALIMPSEST_BUILD_RESULT", "/tmp/palimpsest-build-result.json")
 JOB_PATH = "/etc/palimpsest/build-job.json"
-CAPTURE = "/mnt/palimpsest/capture"
+CAPTURE = os.environ.get("PALIMPSEST_BUILD_CAPTURE", "/mnt/palimpsest/capture")
 _STAGE = "initializing"
 _RUN_LINE = None
-OUTPUT = "/tmp/palimpsest-output.squashfs"
+OUTPUT = os.environ.get("PALIMPSEST_BUILD_OUTPUT", "/tmp/palimpsest-output.squashfs")
 
 
 def _run(argv, *, env=None):
     subprocess.run(argv, check=True, stdin=subprocess.DEVNULL, env=env)
+
+
+def _private_mount_namespace():
+    # Capture overlay/chroot mounts must not propagate to peer namespaces such as
+    # services started during the build. A stale peer copy keeps the attached
+    # filesystem alive with an unflushed journal after the host-side umount; this
+    # namespace and everything mounted in it disappear with the process.
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.unshare(0x00020000) != 0:  # CLONE_NEWNS
+        number = ctypes.get_errno()
+        raise OSError(number, os.strerror(number), "unshare mount namespace")
+    _run(["mount", "--make-rprivate", "/"])
 
 
 def _write_all(stream, data):
@@ -164,12 +177,17 @@ def _seed_upper_root(upper, root="/"):
 
 def _build():
     global _RUN_LINE, _STAGE
+    _private_mount_namespace()
     with open(JOB_PATH, encoding="utf-8") as fp:
         job = json.load(fp)
+    temporary_capture = job.get("capture_tmpfs", True)
+    if type(temporary_capture) is not bool:
+        raise RuntimeError("capture_tmpfs must be a boolean")
     parents = job["parent_mounts"]
     lowerdir = ":".join(reversed(parents)) + ":/" if parents else "/"
     os.makedirs(CAPTURE, mode=0o700, exist_ok=True)
-    _run(["mount", "-t", "tmpfs", "-o", "mode=0700", "tmpfs", CAPTURE])
+    if temporary_capture:
+        _run(["mount", "-t", "tmpfs", "-o", "mode=0700", "tmpfs", CAPTURE])
     try:
         for path in ("upper", "work", "merged"):
             os.makedirs(os.path.join(CAPTURE, path), mode=0o700, exist_ok=True)
@@ -202,7 +220,8 @@ def _build():
         _STAGE = "pack"
         _run(["mksquashfs", CAPTURE + "/upper", OUTPUT, "-comp", "zstd", "-Xcompression-level", "3", "-noappend", "-no-exports"])
     finally:
-        subprocess.run(["umount", CAPTURE], stdin=subprocess.DEVNULL, check=False)
+        if temporary_capture:
+            subprocess.run(["umount", CAPTURE], stdin=subprocess.DEVNULL, check=False)
     with open(OUTPUT, "rb") as fp:
         if fp.read(4) != b"hsqs":
             raise RuntimeError("mksquashfs output has invalid magic")

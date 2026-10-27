@@ -27,6 +27,7 @@ import urllib.request
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from .artifact_compatibility import check_artifact
 from .digest import digest_file, digest_hex, require_digest
 from .docker_hub import DockerHubCatalog
 from .errors import PalimpsestError, StateError
@@ -882,8 +883,6 @@ class RemoteArtifacts:
             if config.get("kind", "squashfs") == "squashfs" and len(bases) == 1:
                 if not config.get("base_image_digest"):
                     config["base_image_digest"] = bases[0]
-                if not config.get("arch"):
-                    config["arch"] = configs[bases[0]].get("arch")
         parents = {config.get("parent_digest") for config in configs.values()}
         leaves = [
             digest
@@ -934,12 +933,17 @@ class RemoteArtifacts:
 
         _layer_refs_from_store(store, [descriptor["digest"] for descriptor in chain[1:]], chain[0]["digest"])
         archs = [chain[0]["arch"]]
+        checked = check_artifact(chain[-1], lookup={row["digest"]: row for row in chain}.__getitem__)
         return {
             "source": chain[0]["digest"],
             "image": chain[0]["digest"],
             "layers": [m["digest"] for m in chain[1:]],
             "architectures": archs,
-            **_run_info("runtime-bundle", archs),
+            "compatibility": checked,
+            "runtime_kind": "cloud-image",
+            "run_supported": checked["compatible"],
+            "run_limitation": "; ".join(checked["reasons"])
+            or "Platform metadata matches; runtime preflight still applies.",
         }
 
     def download(self, connection_id: str, reference: str, *, platform: str = "linux/amd64") -> dict:
@@ -966,15 +970,21 @@ class RemoteArtifacts:
 
                 _layer_refs_from_store(store, layers, chain[0]["digest"])
             archs = _architectures([metadata["arch"] for metadata in chain if metadata.get("arch")])
-            compatibility = (
-                _run_info(chain[-1]["kind"], archs)
-                if has_base
-                else {
+            if has_base:
+                checked = check_artifact(chain[-1], lookup={row["digest"]: row for row in chain}.__getitem__)
+                compatibility = {
+                    "run_supported": checked["compatible"],
+                    "runtime_kind": "cloud-image",
+                    "compatibility": checked,
+                    "run_limitation": "; ".join(checked["reasons"])
+                    or "Platform metadata matches; runtime preflight still applies.",
+                }
+            else:
+                compatibility = {
                     "run_supported": False,
                     "runtime_kind": "cloud-image",
                     "run_limitation": "Verified layer parent chain retained, but no complete cloud-image base dependency is available; Run is unsupported for this artifact.",
                 }
-            )
             result = {
                 "connection_id": connection_id,
                 "reference": require_digest(reference),

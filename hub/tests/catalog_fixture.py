@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from palimpsest_hub import auth, catalog_auth
 from palimpsest_hub import catalog_policy as native_policy
+from palimpsest_hub import policy as service_policy
 from palimpsest_hub.api import catalog as catalog_api
 from palimpsest_hub.api import hub as hub_api
 from palimpsest_hub.api import packages
@@ -132,10 +133,21 @@ async def isolated_catalog(root, *, include_packages=False):
         }
 
     def admin_context(value, *, global_read=False):
-        if not value.get("is_system_admin"):
+        if not value.get("is_system_admin") or value.get("token") != "human-admin" or state.revoked:
             raise HTTPException(403, "Fresh human system administrator required")
         policy_file.write_text('{"system:manage": "!"}\n' if state.deny_policy else "{}\n")
-        return {**value, "package_actions": native_policy.global_admin_actions(value["user_id"])}
+        if global_read:
+            return {**value, "package_actions": native_policy.global_admin_actions(value["user_id"])}
+        target = value["project_id"]
+        actions = service_policy.allowed_actions({"admin"}, target, value["user_id"], system_admin=True)
+        return {
+            **value,
+            "is_package_system_admin": True,
+            "target_project_id": target,
+            "target_project_name": "Synthetic target",
+            "package_actions": actions,
+            "package_capabilities": service_policy.capabilities_for(actions),
+        }
 
     async def synthetic_member(token_info: dict):
         capabilities = set()
@@ -143,7 +155,18 @@ async def isolated_catalog(root, *, include_packages=False):
             capabilities.add("palimpsest-inventory_reader")
         if token_info["token"] == "member":
             capabilities.add("palimpsest-download_user")
-        return {**token_info, "package_capabilities": frozenset(capabilities)}
+        actions = set()
+        if "palimpsest-inventory_reader" in capabilities:
+            actions.add("packages:inventory")
+        if "palimpsest-download_user" in capabilities:
+            actions.add("packages:read")
+        return {**token_info, "package_capabilities": frozenset(capabilities), "package_actions": frozenset(actions)}
+
+    async def manager(request: Request):
+        value = await original(request)
+        if value.get("is_system_admin"):
+            return admin_context(validate(value["token"], value["project_id"]))
+        return await synthetic_member(value)
 
     app = FastAPI()
     app.include_router(catalog_api.router, prefix="/v1")
@@ -160,17 +183,17 @@ async def isolated_catalog(root, *, include_packages=False):
     if include_packages:
         app.include_router(packages.router, prefix="/v1")
     app.dependency_overrides[auth.require_token] = original
-    app.dependency_overrides[auth.get_token_info] = original
+    app.dependency_overrides[auth.get_package_manager_info] = manager
     state.app = app
     try:
         with (
             patch.object(hub_api, "get_session_factory", lambda: factory),
             patch.object(hub_api, "get_blob_store", lambda: store),
-            patch.object(hub_api, "get_package_member_info", synthetic_member),
             patch.object(native_policy, "get_settings", lambda: settings),
+            patch.object(service_policy, "get_settings", lambda: settings),
             patch.object(package_registry, "get_session_factory", lambda: factory),
             patch.object(catalog_auth, "validate_token", validate),
-            patch.object(catalog_auth, "_global_admin_context", admin_context),
+            patch.object(catalog_auth, "_global_admin_context", lambda value: admin_context(value, global_read=True)),
         ):
             yield state
     finally:

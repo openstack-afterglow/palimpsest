@@ -82,6 +82,28 @@ async def create_schema() -> None:
         ):
             if name not in columns:
                 await connection.execute(text(f"ALTER TABLE palimpsest_hub_builds ADD COLUMN {name} {definition} NULL"))
+        key_columns = await connection.run_sync(
+            lambda sync: {column["name"] for column in inspect(sync).get_columns("palimpsest_package_keys")}
+        )
+        if "admin_issuer_context" not in key_columns:
+            await connection.execute(
+                text("ALTER TABLE palimpsest_package_keys ADD COLUMN admin_issuer_context JSON NULL")
+            )
+        for table, column in (
+            ("palimpsest_package_uploads", "key_id"),
+            ("palimpsest_package_versions", "pushed_key_id"),
+        ):
+            metadata = await connection.run_sync(lambda sync, table=table: inspect(sync).get_columns(table))
+            current = next(item for item in metadata if item["name"] == column)
+            if current["nullable"]:
+                continue
+            if connection.dialect.name != "mysql":
+                raise RuntimeError(
+                    "Existing non-null package key audit columns require an offline MySQL/MariaDB upgrade"
+                )
+            # Existing key references and FK constraints remain intact; only real
+            # human administrator uploads may persist a null credential audit ID.
+            await connection.execute(text(f"ALTER TABLE {table} MODIFY COLUMN {column} CHAR(32) NULL"))
 
 
 async def close_db() -> None:

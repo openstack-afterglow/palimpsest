@@ -345,7 +345,7 @@ def test_open_with_client_session_id_and_pre_cancellation(manager, monkeypatch):
         manager.open(None, "vm", "exec", ["cmd"], session_id=cancelled_id)
 
 
-def _external_console(tmp_path, monkeypatch, *, status="running", stale=False):
+def _external_console(tmp_path, monkeypatch, *, status="running", stale=False, backend="lima-vz"):
     from palimpsest_local import inventory, vm_access
 
     directory = tmp_path / "redis"
@@ -353,10 +353,10 @@ def _external_console(tmp_path, monkeypatch, *, status="running", stale=False):
     run_id = "11111111-1111-4111-8111-111111111111"
     (tmp_path / "guest-environment").write_text(f"PALIMPSEST_RUN_ID={run_id}\n")
     row = {
-        "id": "host:lima-vz:redis",
+        "id": f"host:{backend}:redis",
         "name": "redis",
         "run_id": run_id,
-        "backend": "lima-vz",
+        "backend": backend,
         "status": status,
         "managed": False,
         "stale": stale,
@@ -366,7 +366,7 @@ def _external_console(tmp_path, monkeypatch, *, status="running", stale=False):
     instance = {
         "name": "redis",
         "dir": str(directory),
-        "vmType": "vz",
+        "vmType": "krunkit" if backend == "lima-krunkit" else "vz",
         "status": "Running" if status == "running" else "Stopped",
         "config": {"env": {"PALIMPSEST_RUN_ID": run_id}},
     }
@@ -381,10 +381,24 @@ def _spawn_lima_console(tmp_path, argv, code, **kw):
     return LocalProcessSession(("sh", "-c", gate, "sh", sys.executable, "-u", "-c", code), tty=kw["tty"], stdin=True)
 
 
-def test_external_lima_console_disconnect_reaps_transport_without_adoption(tmp_path, monkeypatch):
+@pytest.mark.parametrize("backend", ["lima-vz", "lima-krunkit"])
+@pytest.mark.parametrize("managed", [False, True])
+def test_external_lima_console_disconnect_reaps_transport_without_adoption(tmp_path, monkeypatch, backend, managed):
     from palimpsest_local import vm_access
 
-    row, directory, _ = _external_console(tmp_path, monkeypatch)
+    row, directory, _ = _external_console(tmp_path, monkeypatch, backend=backend)
+    if managed:
+        from contextlib import nullcontext
+
+        row["managed"] = True
+        record = SimpleNamespace(
+            name=row["name"],
+            run_id=row["run_id"],
+            dispatch_key=DispatchKey(RuntimeKind.CLOUD_IMAGE, RuntimeBackend(backend)),
+        )
+        monkeypatch.setattr(vm_access.runtime_dispatch, "resolve_existing_run", lambda *a, **kw: record)
+        monkeypatch.setattr(vm_access.state, "locked_existing_run", lambda *a, **kw: nullcontext())
+        monkeypatch.setattr(vm_access.state, "require_bound_run_dispatch_record", lambda *a: None)
     owned = []
 
     def spawn(argv, **kw):
@@ -395,11 +409,12 @@ def test_external_lima_console_disconnect_reaps_transport_without_adoption(tmp_p
         return process
 
     monkeypatch.setattr(vm_access, "spawn_process_session", spawn)
-    monkeypatch.setattr(
-        vm_access.runtime_dispatch,
-        "resolve_existing_run",
-        lambda *a, **kw: pytest.fail("external shell must not resolve/adopt a ledger"),
-    )
+    if not managed:
+        monkeypatch.setattr(
+            vm_access.runtime_dispatch,
+            "resolve_existing_run",
+            lambda *a, **kw: pytest.fail("external shell must not resolve/adopt a ledger"),
+        )
     current = console.ConsoleManager()
     try:
         opened = current.open(None, row["id"], expected_run_id=row["run_id"])
@@ -415,13 +430,57 @@ def test_external_lima_console_disconnect_reaps_transport_without_adoption(tmp_p
         current.close_all()
 
 
-@pytest.mark.parametrize("change", ["stopped", "stale", "expected", "live-marker", "guest-marker", "physical"])
-def test_external_console_denies_stopped_stale_and_identity_replacement(tmp_path, monkeypatch, change):
+@pytest.mark.parametrize("backend", ["lima-vz", "lima-krunkit"])
+@pytest.mark.parametrize(
+    "change",
+    [
+        "stopped",
+        "stale",
+        "expected",
+        "live-marker",
+        "guest-marker",
+        "physical",
+        "vm-type",
+        "spawn-vm-type",
+        "ready-vm-type",
+    ],
+)
+def test_external_console_denies_stopped_stale_and_identity_replacement(tmp_path, monkeypatch, change, backend):
     from palimpsest_local import vm_access
 
     row, directory, instance = _external_console(
-        tmp_path, monkeypatch, status="stopped" if change == "stopped" else "running", stale=change == "stale"
+        tmp_path,
+        monkeypatch,
+        status="stopped" if change == "stopped" else "running",
+        stale=change == "stale",
+        backend=backend,
     )
+    replacement_type = "vz" if backend == "lima-krunkit" else "krunkit"
+    if change == "vm-type":
+        instance["vmType"] = replacement_type
+    ready_observed = []
+    go_writes = []
+    if change == "ready-vm-type":
+        original_events = LocalProcessSession.events
+        original_write = LocalProcessSession.write_stdin
+
+        def replace_on_ready(session):
+            output = b""
+            for event in original_events(session):
+                if isinstance(event, ProcessOutputEvent) and event.stream in {ProcessStream.STDOUT, ProcessStream.PTY}:
+                    output += event.data
+                    start = output.find(b"\x1ePALIMPSEST_READY:")
+                    if start >= 0 and b"\x1f" in output[start:]:
+                        ready_observed.append(True)
+                        instance["vmType"] = replacement_type
+                yield event
+
+        def record_go(session, data):
+            go_writes.append(data)
+            return original_write(session, data)
+
+        monkeypatch.setattr(LocalProcessSession, "events", replace_on_ready)
+        monkeypatch.setattr(LocalProcessSession, "write_stdin", record_go)
     expected = row["run_id"]
     if change == "expected":
         expected = "22222222-2222-4222-8222-222222222222"
@@ -435,8 +494,10 @@ def test_external_console_denies_stopped_stale_and_identity_replacement(tmp_path
         if change == "physical":
             directory.rename(tmp_path / "replaced")
             directory.mkdir()
+        elif change == "spawn-vm-type":
+            instance["vmType"] = replacement_type
         else:
-            assert change == "guest-marker"
+            assert change in {"guest-marker", "ready-vm-type"}
         process = _spawn_lima_console(
             tmp_path, argv, f"from pathlib import Path; Path({str(tmp_path / 'command-ran')!r}).touch()", **kw
         )
@@ -452,6 +513,9 @@ def test_external_console_denies_stopped_stale_and_identity_replacement(tmp_path
         assert not current.has_active()
         assert all(process._process.poll() is not None for process in owned)
         assert not (tmp_path / "command-ran").exists()
+        if change == "ready-vm-type":
+            assert ready_observed
+            assert go_writes == []
     finally:
         current.close_all()
 
@@ -464,3 +528,49 @@ def test_external_console_requires_observed_marker(tmp_path, monkeypatch):
             current.open(None, row["id"])
     finally:
         current.close_all()
+
+
+@pytest.mark.parametrize(
+    "instance",
+    [
+        {"vmType": "qemu"},
+        {},
+        {"vmType": "krunkit", "config": {"vmType": "vz"}},
+    ],
+)
+def test_lima_access_refuses_unknown_or_contradictory_native_type(monkeypatch, instance):
+    import json
+
+    from palimpsest_local import vm_access
+
+    monkeypatch.setattr(vm_access, "spawn_process_session", lambda *a, **kw: object())
+    monkeypatch.setattr(vm_access, "_collect", lambda *a, **kw: json.dumps({"name": "redis", **instance}).encode())
+    with pytest.raises(vm_access.VMAccessError) as refused:
+        vm_access._instance("redis")
+    assert refused.value.category == "identity"
+
+
+@pytest.mark.parametrize("backend", ["lima-vz", "lima-krunkit"])
+def test_lima_stopped_console_and_running_journal_use_same_backend_fence(tmp_path, monkeypatch, backend):
+    from palimpsest_local import vm_access
+
+    row, directory, instance = _external_console(tmp_path, monkeypatch, backend=backend, status="stopped")
+    (directory / "serial.log").write_text("old line\nlatest line\n")
+    access = vm_access.Access.resolve(None, row["id"], expected_run_id=row["run_id"])
+    assert access.logs(1) == {"log": "latest line", "source": "lima-serial-console", "truncated": True}
+    row["status"] = "running"
+    instance["status"] = "Running"
+    commands = []
+
+    def spawn(argv, **kwargs):
+        commands.append(tuple(argv[8:]))
+        return _spawn_lima_console(tmp_path, argv, "print('journal sample')", **kwargs)
+
+    monkeypatch.setattr(vm_access, "spawn_process_session", spawn)
+    assert access.logs(1)["log"].strip() == "journal sample"
+    assert commands == [("sudo", "-n", "journalctl", "--no-pager", "--quiet", "-n", "1", "-o", "short-iso")]
+    instance["vmType"] = "vz" if backend == "lima-krunkit" else "krunkit"
+    with pytest.raises(vm_access.VMAccessError) as refused:
+        access.probe(("true",))
+    assert refused.value.category == "identity"
+    assert len(commands) == 1

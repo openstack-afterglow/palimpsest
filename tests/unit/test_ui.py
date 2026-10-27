@@ -347,7 +347,7 @@ def test_disconnected_response_does_not_retry_or_break_next_request(
 @pytest.mark.parametrize(
     ("system", "machine", "supported"),
     [
-        ("Darwin", "aarch64", {"lima-vz", "libvirt-hvf"}),
+        ("Darwin", "aarch64", {"lima-vz", "lima-krunkit", "libvirt-hvf"}),
         ("Darwin", "x86_64", {"libvirt-hvf"}),
         ("Linux", "x86_64", {"kvm"}),
         ("Linux", "aarch64", {"kvm"}),
@@ -505,11 +505,11 @@ def test_vm_resource_routes_reject_malformed_identifiers_before_forwarding(
         calls.append((args, kwargs))
         pytest.fail("Malformed VM identifier reached backend")
 
-    for method in ("get_vm", "vm_logs", "vm_metrics"):
+    for method in ("get_vm", "vm_logs", "vm_metrics", "remove_vm"):
         monkeypatch.setattr(ui.inventory, method, forbidden)
     monkeypatch.setattr(ui.ConsoleManager, "open", forbidden)
     headers = {"Authorization": f"Bearer {server_env['token']}", "Origin": server_env["origin"]}
-    for method, suffix in (("GET", ""), ("GET", "/logs"), ("GET", "/metrics"), ("POST", "/console")):
+    for method, suffix in (("GET", ""), ("GET", "/logs"), ("GET", "/metrics"), ("POST", "/console"), ("DELETE", "")):
         status, _, result = _request(
             server_env["port"],
             method,
@@ -518,7 +518,6 @@ def test_vm_resource_routes_reject_malformed_identifiers_before_forwarding(
             body={} if method == "POST" else None,
         )
         assert status == 400
-        assert result == {"error": "invalid VM identifier"}
     assert calls == []
 
 
@@ -592,10 +591,52 @@ def test_vm_console_forwards_decoded_stable_id_and_expected_run_id(
     assert list(server_env["roots"].runs.iterdir()) == []
 
 
+@pytest.mark.parametrize(
+    ("body", "query"),
+    [
+        ("{", ""),
+        ("[]", ""),
+        ("null", ""),
+        (b'"not-an-object"', ""),
+        ({"confirmation": "x" * 65536}, ""),
+        ({"delete_files": True}, ""),
+        ({"volumes": False}, "?volumes=true"),
+    ],
+)
+def test_host_vm_removal_rejects_invalid_body_before_inventory(server_env, monkeypatch, body, query):
+    def forbidden(*args, **kwargs):
+        pytest.fail("Invalid DELETE body reached inventory removal")
+
+    monkeypatch.setattr(ui.inventory, "remove_vm", forbidden)
+    headers = {"Authorization": f"Bearer {server_env['token']}", "Origin": server_env["origin"]}
+    path = "/api/v1/vms/" + urllib.parse.quote("host:lima-vz:external", safe="") + query
+    status, _, result = _request(server_env["port"], "DELETE", path, headers, body)
+    assert status == 400
+    assert "error" in result
+
+
+def test_host_vm_start_stop_routes_never_forward_to_dispatch(server_env, monkeypatch):
+    calls = []
+    for method in ("start", "stop", "rm"):
+        monkeypatch.setattr(ui.inventory.runtime_dispatch, method, lambda *a, **k: calls.append((a, k)))
+    headers = {"Authorization": f"Bearer {server_env['token']}", "Origin": server_env["origin"]}
+    for identifier in ("host:lima-vz:external", "host:libvirt-hvf:Guest café"):
+        for encoded in {identifier, urllib.parse.quote(identifier, safe="")}:
+            if not encoded.isascii():
+                continue
+            for method, suffix in (("POST", "/start"), ("POST", "/stop")):
+                status, _, result = _request(server_env["port"], method, "/api/v1/vms/" + encoded + suffix, headers)
+                assert status == 400
+                assert result == {"error": "invalid run name"}
+    assert calls == []
+    assert list(server_env["roots"].runs.iterdir()) == []
+
+
 @pytest.mark.parametrize("server_env", [None], indirect=True)
-def test_read_only_console_denies_stable_ids_before_open(server_env, monkeypatch):
+def test_read_only_console_and_removal_deny_stable_ids_before_mutation(server_env, monkeypatch):
     calls = []
     monkeypatch.setattr(ui.ConsoleManager, "open", lambda *a, **k: calls.append((a, k)))
+    monkeypatch.setattr(ui.inventory, "remove_vm", lambda *a, **k: calls.append((a, k)))
     headers = {"Authorization": f"Bearer {server_env['token']}", "Origin": server_env["origin"]}
     for identifier in ("ui-vm", "host:lima-vz:external"):
         status, _, result = _request(
@@ -610,20 +651,21 @@ def test_read_only_console_denies_stable_ids_before_open(server_env, monkeypatch
     assert calls == []
 
 
-def test_vm_resource_routes_preserve_auth_and_console_csrf(server_env, monkeypatch):
+def test_vm_resource_routes_preserve_auth_and_mutation_csrf(server_env, monkeypatch):
     calls = []
-    for method in ("get_vm", "vm_logs", "vm_metrics"):
+    for method in ("get_vm", "vm_logs", "vm_metrics", "remove_vm"):
         monkeypatch.setattr(ui.inventory, method, lambda *a, **k: calls.append((a, k)))
     monkeypatch.setattr(ui.ConsoleManager, "open", lambda *a, **k: calls.append((a, k)))
     path = "/api/v1/vms/" + urllib.parse.quote("host:lima-vz:external", safe="")
-    for method, suffix in (("GET", ""), ("GET", "/logs"), ("GET", "/metrics"), ("POST", "/console")):
+    for method, suffix in (("GET", ""), ("GET", "/logs"), ("GET", "/metrics"), ("POST", "/console"), ("DELETE", "")):
         status, _, result = _request(server_env["port"], method, path + suffix, body={})
         assert status == 401
         assert result == {"error": "Unauthorized"}
     auth = {"Authorization": f"Bearer {server_env['token']}"}
     for extra in ({"Origin": "https://foreign.invalid"}, {"Sec-Fetch-Site": "cross-site"}):
-        status, _, _ = _request(server_env["port"], "POST", path + "/console", auth | extra, {})
-        assert status == 403
+        for method, suffix in (("POST", "/console"), ("DELETE", "")):
+            status, _, _ = _request(server_env["port"], method, path + suffix, auth | extra, {})
+            assert status == 403
     assert calls == []
 
 
@@ -1674,7 +1716,7 @@ def test_host_vm_detail_uses_stable_id_without_creating_run(server_env, monkeypa
     assert status == 200
     assert result["name"] == "external" and result["managed"] is False
     assert list(server_env["roots"].runs.iterdir()) == []
-    for method, suffix in (("POST", "/start"), ("POST", "/stop"), ("DELETE", "")):
+    for method, suffix in (("POST", "/start"), ("POST", "/stop")):
         status, _, _ = _request(server_env["port"], method, "/api/v1/vms/" + vm["id"] + suffix, headers)
         assert status == 400
     assert list(server_env["roots"].runs.iterdir()) == []

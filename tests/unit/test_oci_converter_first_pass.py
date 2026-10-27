@@ -418,6 +418,51 @@ def test_reserved_tree_is_rejected_for_pax_path_and_hardlink_target(tmp_path: Pa
                 pass
 
 
+@pytest.mark.parametrize(
+    "member_type,encoded_mode,permissions",
+    [
+        (tarfile.REGTYPE, 0o100640, 0o640),
+        (tarfile.DIRTYPE, 0o40750, 0o750),
+        (tarfile.SYMTYPE, 0o120777, 0o777),
+        (tarfile.LNKTYPE, 0o100640, 0o640),
+    ],
+)
+def test_matching_tar_mode_type_bits_preserve_permissions_and_ownership(
+    tmp_path: Path, member_type: bytes, encoded_mode: int, permissions: int
+) -> None:
+    target, payload = _file("target", b"x")
+    member = tarfile.TarInfo("entry")
+    member.type = member_type
+    member.linkname = "target" if member_type in (tarfile.SYMTYPE, tarfile.LNKTYPE) else ""
+    member.uid, member.gid = 123, 456
+    uncompressed = _replace_header_field(
+        _tar(target, member, payloads={"target": payload}), 1024, 100, 108, f"{encoded_mode:07o}".encode()
+    )
+    cas, image, _ = _snapshot(tmp_path, uncompressed, OCI_LAYER_MEDIA_TYPE)
+    with cas.lease_layer(image, 0) as lease, stage_layer(lease) as staged:
+        actual = staged.members[-1]
+        assert (actual.mode, actual.uid, actual.gid) == (permissions, 123, 456)
+        assert actual.link_target == member.linkname
+
+
+@pytest.mark.parametrize(
+    "member_type,encoded_mode",
+    [(tarfile.REGTYPE, 0o40755), (tarfile.DIRTYPE, 0o100755), (tarfile.SYMTYPE, 0o100777), (tarfile.REGTYPE, 0o200644)],
+)
+def test_contradictory_or_unknown_tar_mode_bits_are_rejected(
+    tmp_path: Path, member_type: bytes, encoded_mode: int
+) -> None:
+    member = tarfile.TarInfo("entry")
+    member.type = member_type
+    if member_type == tarfile.SYMTYPE:
+        member.linkname = "target"
+    uncompressed = _replace_first_header_field(_tar(member), 100, 108, f"{encoded_mode:07o}".encode())
+    cas, image, _ = _snapshot(tmp_path, uncompressed, OCI_LAYER_MEDIA_TYPE)
+    with pytest.raises(LayerIntakeError, match="oci-(numeric-metadata|member-mode)"):
+        with cas.lease_layer(image, 0) as lease, stage_layer(lease):
+            pass
+
+
 def test_pax_numeric_metadata_is_applied_without_parser_differential(tmp_path: Path) -> None:
     member, payload = _file("value", b"x")
     member.pax_headers = {"uid": "123", "gid": "456", "mtime": "7.000"}

@@ -99,7 +99,7 @@ _CLEANUP_LEASE = timedelta(minutes=5)
 _ROLE_LEASE_SECONDS = 120
 _CLEANUP_MAX_BACKOFF_SECONDS = 3600
 # Publishing an export is the Hub action that admits deferred export I/O.
-EXPORT_CAPABILITY = "palimpsest-publish_editor"
+EXPORT_ACTION = "packages:write"
 
 
 def _now() -> datetime:
@@ -1044,7 +1044,7 @@ def _authorized_export_connection(project_id: str, delegation: ExportDelegation)
     if (
         owner["user_id"] != delegation.trustor_user_id
         or owner["project_id"] != project_id
-        or EXPORT_CAPABILITY not in owner["package_capabilities"]
+        or EXPORT_ACTION not in owner["package_actions"]
         or not set(delegation.role_names) <= set(owner["roles"])
     ):
         raise DelegationError("authorization_revoked", "Requester no longer holds current export authority", 403)

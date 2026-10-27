@@ -44,9 +44,11 @@ from .runtime_types import (
 
 BACKEND_KVM = "kvm"
 BACKEND_LIMA = "lima-vz"
+BACKEND_LIMA_KRUNKIT = "lima-krunkit"
 BACKEND_HVF = "libvirt-hvf"
 BACKEND_LIMA_QEMU_OCI = "lima-qemu-oci"
-BACKENDS = (BACKEND_KVM, BACKEND_LIMA, BACKEND_HVF)
+LIMA_BACKENDS = (BACKEND_LIMA, BACKEND_LIMA_KRUNKIT)
+BACKENDS = (BACKEND_KVM, BACKEND_LIMA, BACKEND_HVF, BACKEND_LIMA_KRUNKIT)
 
 _QEMU_SYSTEM_X86_64 = Path("/usr/bin/qemu-system-x86_64")
 _QEMU_SYSTEM_AARCH64 = Path("/usr/bin/qemu-system-aarch64")
@@ -183,9 +185,11 @@ def capability_profile(
             identifiers = ()
         else:  # pragma: no cover - fail closed when RuntimeOperation grows
             raise RuntimeCapabilityError(operation, dispatch_key)
-    elif backend is RuntimeBackend.LIMA_VZ:
+    elif backend.is_lima:
         if operation in _LIMA_LIVE_OPERATIONS:
-            identifiers = ("host.lima-vz", "tool.limactl")
+            identifiers = (f"host.{backend.value}", "tool.limactl")
+            if backend is RuntimeBackend.LIMA_KRUNKIT:
+                identifiers += ("tool.krunkit", "driver.lima-krunkit")
         elif operation in _READ_ONLY_STATE_OPERATIONS:
             identifiers = ()
         else:  # pragma: no cover - fail closed when RuntimeOperation grows
@@ -198,7 +202,7 @@ def capability_profile(
             if network != OCI_NETWORK_MODE_NONE:
                 requirements += (CapabilityRequirement("network.oci-user-mode", network),)
         elif not (backend is RuntimeBackend.KVM and network == "none"):
-            if backend is RuntimeBackend.LIMA_VZ:
+            if backend.is_lima:
                 network_capability = "network.lima"
             elif backend is RuntimeBackend.LIBVIRT_HVF:
                 network_capability = "network.user-hostfwd"
@@ -292,15 +296,38 @@ def _check_capability(
             CapabilityErrorCategory.UNSUPPORTED,
             "Hypervisor.framework is unavailable on this host",
         )
-    if identifier == "host.lima-vz":
-        if host.system == "Darwin" and host.machine == "aarch64":
-            return _passed(requirement, "supported")
-        return _failed(
-            requirement,
-            "unsupported-host",
-            CapabilityErrorCategory.UNSUPPORTED,
-            "Lima is required on macOS; install it with: brew install lima",
-        )
+    if identifier in {"host.lima-vz", "host.lima-krunkit"}:
+        if host.system != "Darwin" or host.machine != "aarch64":
+            return _failed(
+                requirement,
+                "unsupported-host",
+                CapabilityErrorCategory.UNSUPPORTED,
+                "Lima requires macOS on Apple Silicon",
+            )
+        if identifier == "host.lima-krunkit":
+            try:
+                major = int(platform.mac_ver()[0].split(".", 1)[0])
+            except (TypeError, ValueError):
+                return _failed(
+                    requirement,
+                    "unknown-macos-version",
+                    CapabilityErrorCategory.CHECK_FAILED,
+                    "cannot determine macOS version; lima-krunkit requires macOS 14 or newer",
+                )
+            if major < 14:
+                return _failed(
+                    requirement,
+                    "unsupported-macos-version",
+                    CapabilityErrorCategory.UNSUPPORTED,
+                    "lima-krunkit requires macOS 14 or newer",
+                )
+        return _passed(requirement, "supported")
+    if identifier == "driver.lima-krunkit":
+        try:
+            lima._require_krunkit()
+        except LifecycleError as exc:
+            return _failed(requirement, "unavailable", CapabilityErrorCategory.CHECK_FAILED, str(exc))
+        return _passed(requirement, "installed")
     if identifier.startswith("tool."):
         tool = identifier.removeprefix("tool.")
         if tool == "qemu-system":
@@ -448,7 +475,7 @@ def _check_capability(
     if identifier == "network.lima":
         assert requirement.selector is not None
         try:
-            lima.validate_network(requirement.selector)
+            lima.validate_network(requirement.selector, backend=dispatch_key.backend)
         except (ArtifactValidationError, LifecycleError):
             return _failed(
                 requirement,
@@ -800,10 +827,12 @@ def select_backend(
         return BACKEND_KVM
     if runtime_kind != "cloud-image" or force_architecture or requested == BACKEND_LIMA_QEMU_OCI:
         raise ArtifactValidationError("--force-architecture is supported only for local OCI images, not cloud disks")
-    if requested == BACKEND_LIMA:
+    if requested in LIMA_BACKENDS:
         if not (host.system == "Darwin" and host.machine == "aarch64"):
-            raise ArtifactValidationError("the lima-vz backend requires macOS on Apple Silicon")
-        return BACKEND_LIMA
+            raise ArtifactValidationError(f"the {requested} backend requires macOS on Apple Silicon")
+        if requested == BACKEND_LIMA_KRUNKIT and arch != "aarch64":
+            raise ArtifactValidationError("the lima-krunkit backend requires an aarch64 cloud image")
+        return requested
 
     if requested == BACKEND_HVF:
         if host.system != "Darwin":
@@ -952,9 +981,12 @@ def preflight(backend: str, *, host: HostPlatform | None = None) -> None:
             raise LifecycleError(str(exc)) from exc
         return
 
-    if backend == BACKEND_LIMA:
+    if backend in LIMA_BACKENDS:
         if not (lima.available() and shutil.which("limactl")):
             raise LifecycleError("Lima is required on macOS; install it with: brew install lima")
+        if backend == BACKEND_LIMA_KRUNKIT:
+            _require_tools("krunkit")
+            lima._require_krunkit()
         return
 
     raise ArtifactValidationError(f"unknown backend: {backend}")

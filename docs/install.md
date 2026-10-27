@@ -6,18 +6,18 @@ initial configuration, upgrades, and administrator-owned Linux deployment.
 Released installations use pinned published bytes; trusted local installation below uses the actual checkout's bytes.
 
 Palimpsest Local requires Python 3.11 or newer; Hub requires Python 3.12+.
-Palimpsest 0.3.5 was released on 2026-10-14 from protected dev merge
-`04d51ad6e1bf00c4b6e5bf82050383d0bb0a10cf`. At that release, root/Hub
-metadata, modules, native-generated locks and Kolla image defaults were 0.3.5. Install released
-client bytes with `uv tool install --python 3.11 palimpsest-client==0.3.5`, or
-install the actual trusted local checkout with
-`uv tool install --force --python 3.11 .`. A root wheel upgrade neither
-deploys Hub nor qualifies native execution. Git/outbound GitHub HTTPS is
-needed only for VCS installation.
+This release source prepares0.3.10 on published0.3.9
+(`5c0fef0604ca631bef40ed505a0d02d742ccba9a`). Root/Hub metadata, module versions,
+generated locks and Kolla image defaults move together. After formal publication,
+install exact client bytes with
+`uv tool install --python 3.11 palimpsest-client==0.3.10`, or install a trusted
+local checkout with `uv tool install --force --python 3.11 .`.
+A root wheel upgrade neither deploys Hub nor qualifies actual build/run behavior.
+Git/outbound GitHub HTTPS is needed only for VCS installation.
 
 **0.3.5 release and production:** retains the latest HTTPS-only private build plane and authorization while integrating distributed export ownership and local/client work. PyPI/GHCR publication and the controller1 Hub plus dedicated build-worker VM rollout completed on 2026-10-14; see [CI, publication and production receipts](testing.md#full-source-035-integration--local-verification), including evidence-based `claim_pending` recovery. Native KVM proof was NOT performed (repository-policy skip, as for 0.3.4); idle polling does not prove live recipe execution. Historical approval, deployment, publication and authentication receipts below retain their dated ref/resource boundary. The API never runs recipes; the CPU-only service VM receives verified HTTPS, a private keyfile and local scratch only. Follow the offline drain/schema/paired-storage restore checklist before any separately authorized rollout.
 
-The inspected DMS Lab deployment uses `dms-controller1` for both API and export worker, private listen port `18021`, internal VIP port `8021`, and public `https://palimpsest.dmslab.re.kr`. Preserve these actual overrides; do not replace them with role defaults. Historical transport/validator checks observed Afterglow's Hub transport as `https://palimpsest.dmslab.re.kr`, certificate-verified backend requests returning HTTP 200, and a dedicated Hub validator authenticated with only system `reader`; these do not qualify current requester reads/writes. The 0.3.5 rollout separately observed Hub health 200 direct/public and unauthenticated `/v1/me` 401.
+Historical DMS Lab deployment receipts preserve private listen port `18021`, internal VIP port `8021` and public `https://palimpsest.dmslab.re.kr`; later0.3.7 receipts record the shared-CAS three-controller layout. Preserve actual current operator overrides rather than infer placement from old single-controller records or role defaults. Package pinning and image selection do not restart services. Verify public readiness and authenticated build/consumer behavior after a separately authorized Kolla rollout.
 
 Package references require a separate trusted `palimpsest_package_public_origin`; it was empty in the inspected runtime. For the Afterglow key-gateway deployment, use the approved `https://cloud.dmslab.re.kr` origin rather than inferring it from Hub Host or the internal transport. Verify nonempty exact protected IDs, current requester service leaves and original-token `/v1/projects/current` through Afterglow. Do not use admin/service credentials for package acceptance, grant ordinary users automatically, or claim health 200 proves authenticated reads/writes.
 
@@ -384,6 +384,7 @@ not an IAM mutation performed by source preparation.
 | --- | --- | --- | --- |
 | `palimpsest-client` | repository root | `palimpsest` | Local artifact, build, registry, VM, Compose, store, and UI CLI |
 | `palimpsest-client[kvm]` | repository root plus `kvm` extra | `palimpsest` | Local CLI plus `libvirt-python>=10.0.0` for libvirt backends |
+| `palimpsest-client[cloud]` | reviewed working source plus `cloud` extra | `palimpsest build --executor nova`, `palimpsest cloud` | Native Nova orchestration using OpenStack SDK and YAML; project resources, writable build storage, GPU flavor and SSH trust remain explicit operator inputs |
 | `palimpsest-hub` | `#subdirectory=hub` | `palimpsest-hub`, `palimpsest-hub-worker`, `palimpsest-hub-build-worker`, `palimpsest-hub-bootstrap`, `palimpsest-hub-migrate-data` | Standalone Hub API and web console, separate export/build workers, schema bootstrap, migration |
 
 The distribution rename does not change the Python module `palimpsest_local`
@@ -393,6 +394,8 @@ The base Local distribution has no required Python runtime dependencies. The
 Hub distribution is separate and installs FastAPI, Uvicorn, SQLAlchemy/asyncmy,
 Redis, OpenStack SDK/Keystone, Pydantic, multipart, and rate-limit dependencies.
 Use the same reviewed Git ref for Local and Hub to prevent source skew.
+
+For the unreleased Nova workflow, install the current trusted checkout with `uv tool install --force --python 3.11 '.[cloud]'`. This adds `openstacksdk>=3.3,<5` and PyYAML only to the optional client environment. Controller authentication comes from the selected SDK cloud profile, is TLS-verified and is never embedded in guest cloud-init. Install the same reviewed wheel on the internal acquisition worker before running its `cloud registry-worker` command; a local client upgrade does not deploy a Hub API/worker or authorize host GPU changes. See [Nova workflows](cli/workflows.md#9-native-nova-builds-and-internal-layer-workers).
 
 The root wheel also installs the `palimpsest` Kolla-Ansible role as shared data
 under `share/kolla-ansible/ansible/roles/palimpsest`. It does not install
@@ -483,6 +486,7 @@ published artifact proves an operator deployment.
 | --- | --- | --- | --- |
 | macOS Apple Silicon with Lima/VZ | Supported default | `palimpsest-client` | Lima 2.1+; conventional cloud-image VMs |
 | macOS Apple Silicon with QEMU/libvirt HVF | Experimental | `palimpsest-client[kvm]` | `qemu:///session`; conventional cloud-image VMs only |
+| macOS Apple Silicon with Lima/krunkit | Experimental | `palimpsest-client` | Lima 2.1+, krunkit 1.2.1+; guest Vulkan GPU remoted to host Metal |
 | Linux `x86_64` with libvirt/KVM | Supported | `palimpsest-client[kvm]` | `qemu:///system`; conventional cloud-image VMs and the narrower OCI-root runtime |
 | Linux `aarch64` with libvirt/KVM | Supported | `palimpsest-client[kvm]` | `virt` + EFI; conventional cloud-image VMs |
 | Linux `x86_64`/`amd64` OCI-root | Supported narrow runtime | `palimpsest-client[kvm]` | OCI content becomes guest `/`; Linux KVM and qualified runtime assets required |
@@ -855,6 +859,15 @@ Package installation or successful preflight alone does not prove a guest can
 boot; Lima/VZ remains the macOS default. The latest handoff records separately
 scoped live boot, SSH, console and measurement evidence.
 
+### macOS Apple Silicon GPU acceleration via krunkit
+
+- Lima 2.1 or newer with the `krunkit` driver (`limactl info | jq .vmTypesEx.krunkit`).
+- Host `krunkit` 1.2.1 or newer (`brew tap slp/krun && brew install slp/krun/krunkit`).
+- macOS 14 or newer on Apple Silicon (`arm64`).
+- ARM64 Linux cloud image with Mesa Venus Vulkan support (e.g. Fedora with `slp/mesa-libkrun-vulkan` COPR).
+
+Select `--backend lima-krunkit` explicitly. Default selection (`auto`) remains `lima-vz`. The krunkit driver exposes a paravirtualized `virtio-gpu` device, remoting guest Vulkan commands to host Metal. Direct Hypervisor.framework integration remains an optional alternative if libvirt is bypassed. This does not expose CUDA or the Apple Neural Engine to Linux guests.
+
 ### Linux conventional cloud-image runtime
 
 - `/dev/kvm`, QEMU, libvirt, and access to `qemu:///system`.
@@ -964,11 +977,11 @@ The required settings are:
 | `REDIS_URL` | Redis connection URL |
 | `PALIMPSEST_HUB_LOCAL_PATH` | Hub-owned local blob/cache directory |
 | `OS_AUTH_URL` | Keystone authentication endpoint |
-| `OS_USERNAME` / `OS_PASSWORD` | Export Trust trustee identity. It authenticates only to its own service project (to resolve its user ID) and through requester-created Trusts; it needs no tenant role assignment and is never scoped to a tenant project |
+| `OS_USERNAME` / `OS_PASSWORD` | Export Trust trustee identity. Deferred export authenticates only to its own service project and requester-created Trusts, never a tenant password scope. Human-admin exclusion independently resolves the configured domain/user to exact native IDs through the read-only validator; it never logs in as the trustee. |
 | `OS_PROJECT_NAME` | The trustee's own service project |
 | `OS_READER_USERNAME` / `OS_READER_PASSWORD` | Separate read-only Keystone validation identity. It must authenticate system-scoped (`all`) with `reader` and no `admin`, `manager` or `service` role. Missing/unavailable or elevated validator authority fails token validation with 503. |
-| `PALIMPSEST_HUB_PACKAGE_FORBIDDEN_PROJECT_IDS` | JSON array of exact protected project IDs, for example `'["<project-id>"]'`. A comma-separated list does not parse. If empty, every package endpoint returns 503. |
-| `PALIMPSEST_HUB_PACKAGE_FORBIDDEN_USER_IDS` | JSON array of exact protected administrator/service principal IDs, for example `'["<user-id>"]'`. If empty, every package endpoint returns 503. |
+| `PALIMPSEST_HUB_PACKAGE_FORBIDDEN_PROJECT_IDS` | JSON array of exact protected project IDs, for example `'["<project-id>"]'`. A comma-separated list does not parse. Empty policy disables ordinary member/key authority with 503; independently verified human system management supersedes these mixed protected-owner exclusions. |
+| `PALIMPSEST_HUB_PACKAGE_FORBIDDEN_USER_IDS` | JSON array of exact protected administrator/service principal IDs, for example `'["<user-id>"]'`. Empty policy disables ordinary member/key authority with 503. Human system management independently excludes actual validator/trustee IDs and service/delegated authentication. |
 
 Optional settings and defaults:
 
@@ -1065,6 +1078,67 @@ policy verification was run during source preparation.
 
 
 The canonical Kolla role renders `palimpsest_export_delegated_roles` (default `["member"]`) and `palimpsest_export_delegation_ttl_seconds` (default `21600`) into the API environment. Its precheck rejects empty or administrative role lists and lifetimes outside 900–86400 seconds. The export worker container receives the same `OS_READER_*` and protected-ID inputs as the API. The service user's Kolla registration remains limited to its own `palimpsest_service_project_name`, where it still holds the existing `admin` grant. Do not add it to tenant projects. Existing manual tenant grants are no longer used by the Hub; removing them, or reducing the service-project grant, is a separate operator-approved change.
+
+### Hub service-local authorization policy
+
+Locally verified service-local policy: registered `oslo.policy` defaults replace required Keystone service-grade implication edges. Grade-only roles need no member/reader co-role; downstream provider credential prerequisites remain independent. Final Hub650, Kolla41, two real MariaDB/process cases and 370 actual multi-architecture Docker HTTP checks are recorded in [the scoped evidence checkpoint](testing.md#service-local-hub-policy-verification--2026-10-21). This is not production IAM/Kolla rollout qualification.
+
+The Hub reads this nonsecret section from `PALIMPSEST_CONFIG` (default `/etc/palimpsest/palimpsest.conf`), not the secret-bearing `/app/palimpsest.conf`:
+
+```toml
+[oslo_policy]
+policy_file = "/etc/palimpsest/policy.yaml"
+policy_dirs = []
+```
+
+`OSLO_POLICY_POLICY_FILE` and JSON-array `OSLO_POLICY_POLICY_DIRS` override the TOML fields. Configuration/path changes need process restart. Native oslo.policy reload checks changed YAML files/directories on subsequent requests; use atomic replacement with a changed mtime and a directory mount (not a single bind-mounted inode). Remove loaded overrides by writing `{}`, not deleting the file. Missing default YAML uses registered defaults; explicitly configured missing non-default paths, invalid YAML/document types, native parser diagnostics and undefined/cyclic rule references return 503. Corrected files recover subsequent requests, never stale allow.
+
+An existing file must map nonempty string rule names to string checks. Quote `"@"`, `"!"` and `""` for native allow/deny/empty-string semantics. Null/boolean/list values and empty/nonmapping documents return 503. The Enforcer reload hook validates document types and observes the real parser's error/exception reports in the loading thread, restoring its logger in `finally`; it never implements a grammar or evaluator. Native malformed checks under `not`/`or` therefore cannot turn parser failure into allow. Both main-file and policy.d recovery were exercised; unchanged files are not reread per action.
+
+The packaged `palimpsest_hub/policy.yaml.sample` lists the defaults. From `hub/`, regenerate through the standard `palimpsest` namespace:
+
+```sh
+uv run --frozen oslopolicy-sample-generator --config-file etc/palimpsest-policy-generator.conf
+```
+
+The standard sample generator comments default rules. Before installing a newly generated comment-only sample, uncomment the desired string rules or use `{}` for defaults; empty YAML documents are deliberately invalid. The shipped active sample is regression-checked against every registered default.
+
+Kolla mounts `{{ palimpsest_config_dir }}/policy` read-only at `/etc/palimpsest` into API and export worker. Its directory is 0755, nonsecret TOML/YAML 0644. The role initializes `{}` only when absent, preserving operator YAML; set `palimpsest_policy_source` only for deliberate managed replacement. Policy variables render the separate policy-only TOML. Put policy.d files beneath the mount or supply an explicit mount. Keep API/worker policy identical. Canonical images and nonroot policy reads were locally exercised; Kolla rollout remains unperformed.
+
+`policy.conf.j2` renders `{{ palimpsest_config_dir }}/policy/palimpsest.conf` as root:root 0644. Both services explicitly set `PALIMPSEST_CONFIG=/etc/palimpsest/palimpsest.conf`. Original `/app/palimpsest.conf` remains root:root 0640 and is never read by the default bridge. All four canonical API/worker architecture images were exercised as UID:GID1000:1000 against actual root-owned files: secret reads failed with PermissionError while policy-only TOML/YAML/policy.d enforcement succeeded, without runtime user/group overrides or relaxed secrets. The full root Kolla contract selection passed41; see linked receipts.
+
+Because standard oslo.policy role matching is case-insensitive, trusted global role binding uniqueness is checked by casefold before policy evaluation. Actual role names remain unchanged. Distinct `custom_policy_writer` and `Custom_Policy_Writer` IDs cannot borrow one another's YAML authority; the native real-engine HTTP regression covers the collision.
+
+Authenticated `GET /v1/policy/capabilities` returns `service: "palimpsest"` and sorted `capabilities`/`actions` using original-token/current-owner decisions; empty arrays are legitimate. It never exchanges tokens or returns file paths/credentials. Project actions are `packages:inventory`, `packages:read`, `packages:write`, `cache:read`, `cache:write`, `keys:issue`, `keys:list`, `keys:revoke`. Separately human-system-verified actions are `packages:delete` and `system:manage` (existing build/delete/legacy administration). Leaf capability names are UI labels, not minted native roles. `@` cannot bypass project/key/package/user ownership, reduced-credential restrictions or fresh human system-only gates.
+
+The following focused rerun commands cover actual loopback Uvicorn/Keystone SDK YAML reload, key ceilings and project/system constraints. The final complete Hub suite passed650 with two opt-in database skips; these subsets are not separately claimed as a final counted run:
+
+```sh
+# From hub/
+uv run --frozen --extra dev pytest -q tests/test_auth.py -k 'native_policy or grade_and_exact_leaf or removed_service_edges'
+uv run --frozen --extra dev pytest -q tests/test_auth.py tests/test_packages.py tests/test_hub_api.py tests/test_builds.py tests/test_image_exports.py tests/test_export_delegation.py
+```
+
+The standalone registered-app Docker driver uses zero service edges, grade-only identities and a read-only operator policy mount. Both architectures were built and exercised with task-owned `palimpsest-policy-019qotth-{api,worker}` tags, passing185 HTTP checks each. These are reproducible disposable-only commands; use fresh tags/evidence directories for another run:
+
+```sh
+for ARCH in arm64 amd64; do
+  docker buildx build --platform "linux/$ARCH" -f docker/hub/Dockerfile --target palimpsest-hub-api --load -t "palimpsest-policy-api:$ARCH" .
+  docker buildx build --platform "linux/$ARCH" -f docker/hub/Dockerfile --target palimpsest-hub-worker --load -t "palimpsest-policy-worker:$ARCH" .
+  python3 scripts/smoke_package_capabilities.py run --api-image "palimpsest-policy-api:$ARCH" --worker-image "palimpsest-policy-worker:$ARCH" --platform "linux/$ARCH" --evidence-dir "build/service-local-policy-$ARCH"
+done
+```
+
+Each evidence directory must be new or empty. The driver retains its owned SQL/CAS evidence volumes and never contacts production; its SQLite/lifespan-off adapter is not canonical MariaDB/deployment proof. Historical image/HTTP counts are not results for the new policy engine.
+
+For a separately authorized disposable deployed Hub, using its trusted HTTPS origin and original grade-only human subject:
+
+```sh
+curl --fail-with-body --silent --show-error "$HUB/v1/policy/capabilities" -H "X-Auth-Token: $SUBJECT" -H "X-Project-Id: $PROJECT_ID"
+curl --fail-with-body --silent --show-error "$HUB/v1/projects/current" -H "X-Auth-Token: $SUBJECT" -H "X-Project-Id: $PROJECT_ID"
+```
+
+In that disposable policy only, grant `packages:write` and `keys:issue` to `role:palimpsest_reader`, deny `packages:inventory` with `!`, and repeat capability/key/upload requests: allowed publication must not require an inventory leaf. Deny `packages:write` and retain `cache:write`; an already-issued key must immediately lose package publication without losing its independently allowed cache action. Request an undelegated download or another package/namespace, remove current membership, or call `/v1/builds` as project `admin`: each must deny. Replace every registered rule with `!`: a still-authenticated member sees empty capability/action arrays. Never edit production policy/IAM to run these probes without separate authorization.
 
 ### Deferred Glance export delegation
 

@@ -131,7 +131,7 @@ def test_volume_operations_reject_host_paths_and_invalid_names(
         ["volume", "rm", "data"],
         ["volume", "rm", "--backend", "kvm"],
         ["volume", "inspect", "data", "--backend", "auto"],
-        ["volume", "inspect", "data", "--backend", "lima-krunkit"],
+        ["volume", "inspect", "data", "--backend", "lima-qemu-oci"],
         ["volume", "inspect", "data", "--backend", "kvm", "--size", "1GiB"],
         ["volume", "rm", "data", "--backend", "kvm", "--yes"],
     ],
@@ -145,7 +145,7 @@ def test_volume_requires_explicit_identity_and_does_not_ignore_options(
     assert capsys.readouterr().err
 
 
-@pytest.mark.parametrize("backend", ["kvm", "lima-vz", "libvirt-hvf"])
+@pytest.mark.parametrize("backend", ["kvm", "lima-vz", "lima-krunkit", "libvirt-hvf"])
 def test_volume_inspect_filters_exact_name_and_backend(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], backend: str
 ) -> None:

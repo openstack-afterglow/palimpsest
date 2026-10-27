@@ -306,7 +306,7 @@
   }
   function listHost(key) { return ['artifacts', 'vms', 'volumes', 'builds'].includes(key) ? $(key + '-list') : $('panel-' + key); }
   function createList(key) {
-    filters[key] = { search: '', status: '', source: '', signature: null };
+    filters[key] = { search: '', status: '', source: '', arch: '', compatibility: '', signature: null };
     const host = listHost(key);
     const warning = node('div'); warning.id = key + '-warnings'; host.appendChild(warning);
     const controls = node('div', 'filters');
@@ -325,6 +325,14 @@
       source.append(new Option('전체', ''), new Option('로컬 빌드 출력', 'built'), new Option('빌드 연결 없는 아티팩트', 'other'));
       source.addEventListener('change', () => { filters[key].source = source.value; renderList(key, true); });
       sourceLabel.appendChild(source); controls.appendChild(sourceLabel);
+      const archLabel = node('label', '', '아키텍처'); const arch = node('select'); arch.id = 'artifacts-arch-filter';
+      arch.append(new Option('전체', ''), new Option('aarch64 · ARM64', 'aarch64'), new Option('x86_64 · AMD64', 'x86_64'));
+      arch.addEventListener('change', () => { filters[key].arch = arch.value; renderList(key, true); });
+      archLabel.appendChild(arch); controls.appendChild(archLabel);
+      const compatibilityLabel = node('label', '', '이 클라이언트 플랫폼'); const compatibility = node('select'); compatibility.id = 'artifacts-compatibility-filter';
+      compatibility.append(new Option('전체', ''), new Option('호환', 'compatible'), new Option('비호환', 'incompatible'), new Option('확인 불가', 'unknown'));
+      compatibility.addEventListener('change', () => { filters[key].compatibility = compatibility.value; renderList(key, true); });
+      compatibilityLabel.appendChild(compatibility); controls.appendChild(compatibilityLabel);
     }
     const result = node('span', 'result-count'); result.id = key + '-result-count'; controls.appendChild(result);
     host.appendChild(controls);
@@ -343,7 +351,7 @@
       $(key + '-table-content').replaceChildren(node('p', 'empty-state', entry.error ? '불러오지 못했습니다. 지금 갱신으로 다시 시도하세요.' : '리소스를 불러오는 중입니다.'));
       return;
     }
-    const signature = JSON.stringify([rows, canControl(), actionBusy, entry.error, settings.search, settings.status, settings.source]);
+    const signature = JSON.stringify([rows, canControl(), actionBusy, entry.error, settings.search, settings.status, settings.source, settings.arch, settings.compatibility]);
     if (!force && settings.signature === signature) return;
     settings.signature = signature;
     const select = $(key + '-status-filter');
@@ -353,8 +361,11 @@
     for (const value of options) select.appendChild(new Option(key === 'artifacts' ? artifactKind(value) : value === 'stale' ? '오래된 관찰' : statusText(value), value));
     select.value = settings.status;
     const query = settings.search.trim().toLocaleLowerCase();
-    const selected = rows.filter(item => (!settings.status || itemStatus(key, item) === settings.status) && (!settings.source || (item.source === 'build-record' || items(item.builds).length > 0 ? 'built' : 'other') === settings.source) && (!query || searchText(key, item).includes(query)));
+    const selected = rows.filter(item => (!settings.status || itemStatus(key, item) === settings.status) && (!settings.source || (item.source === 'build-record' || items(item.builds).length > 0 ? 'built' : 'other') === settings.source) && (!settings.arch || item.compatibility?.arch === settings.arch) && (!settings.compatibility || item.compatibility?.status === settings.compatibility) && (!query || searchText(key, item).includes(query)));
     $(key + '-result-count').textContent = selected.length + ' / ' + rows.length + '개';
+    if (key === 'artifacts' && $('tab-artifacts-local')) {
+      $('tab-artifacts-local').textContent = `로컬 아티팩트 (${rows.length})`;
+    }
     const container = $(key + '-table-content');
     const focused = captureFocus(container);
     if (!selected.length) {
@@ -376,6 +387,8 @@
         const runBtn = node('button', 'btn-row-action btn-run-action', 'VM 실행');
         runBtn.type = 'button';
         runBtn.title = '이 이미지로 새 VM 실행 설정';
+        runBtn.disabled = item.compatibility?.compatible !== true;
+        if (runBtn.disabled) runBtn.title = array(item.compatibility?.reasons).join(' · ') || '플랫폼 호환성 확인 필요';
         runBtn.addEventListener('click', e => {
           e.stopPropagation();
           setupRunFromArtifact(item);
@@ -388,6 +401,8 @@
       if (key === 'artifacts') {
         name.appendChild(node('small', 'cell-note mono', digest(item.digest)));
         name.appendChild(node('small', 'cell-note', (items(item.builds).length || item.source === 'build-record' ? '로컬 빌드 · ' : '') + artifactAvailability(item)));
+        const compatibility = object(item.compatibility);
+        name.appendChild(node('small', 'cell-note', '플랫폼 ' + ({ compatible: '호환', incompatible: '비호환', unknown: '확인 불가' }[compatibility.status] || '확인 불가')));
       }
       if (key === 'builds') name.appendChild(node('small', 'cell-note', tags(item.output_tags)));
       if (key === 'vms') {
@@ -473,7 +488,7 @@
     const grid = node('div', 'two-columns');
     const host = node('div', 'card'); host.appendChild(node('h2', '', '호스트 및 실행 환경'));
     const summary = object(state.summary.data); const machine = object(summary.host);
-    host.appendChild(infoList([['운영체제', machine.system], ['아키텍처', machine.machine], ['관찰 범위', '호스트 백엔드 발견 · 선택한 상태의 관리 기록'], ['제어 모드', canControl() ? '명시적 콘솔 허용 · 선택한 관리 VM 수명 주기 제어' : '관찰 전용']]));
+    host.appendChild(infoList([['운영체제', machine.system], ['아키텍처', machine.machine], ['관찰 범위', '호스트 백엔드 발견 · 선택한 상태의 관리 기록'], ['제어 모드', canControl() ? '명시적 콘솔 · 확인된 호스트 VM 제거 · 선택한 관리 VM 시작·중지' : '관찰 전용']]));
     const backends = object(summary.backends);
     const backendSection = node('div', 'detail-subsection'); backendSection.appendChild(node('h3', '', '백엔드 가용성'));
     if (!Object.keys(backends).length) backendSection.appendChild(node('p', 'muted', '백엔드 정보 없음'));
@@ -714,6 +729,9 @@
       for (const attachment of items(data.attachments)) { const section = detailSection('연결 구성 · ' + text(attachment.name), [['VM 이름', attachment.name], ['실행 ID', attachment.run_id], ['기록된 게스트 주소', attachment.guest_ip]]); renderPorts(attachment.ports, section); target.appendChild(section); }
     } else if (key === 'artifacts') {
       target.appendChild(infoList([['다이제스트', data.digest], ['다이제스트 대상', digestType(data.digest_type || 'cas')], ['분류', artifactKind(data.display_kind)], ['부팅 이미지 여부', data.display_kind === 'image' ? '부팅 가능 이미지 (VM 실행 지원)' : data.display_kind === 'layer' ? 'SquashFS 레이어 (단독 부팅 불가)' : '기타 아티팩트'], ['저장소 유형', data.kind], ['이름', data.name], ['로컬 CAS 태그', tags(data.tags)], ['출처', data.source === 'build-record' ? '로컬 빌드 기록' : data.source === 'content-store' ? '로컬 콘텐츠 저장소' : data.source], ['파일 관찰', artifactAvailability(data)], ['로컬 CAS 변경 지원', data.editable === true ? '지원 · --allow-control 필요' : '지원하지 않음'], ['빌드 출력 태그 (CAS 태그 아님)', tags(data.output_tags)], ['연결된 빌드 ID', joined(data.build_ids)], ['크기 (OCI 이미지는 아카이브 크기)', bytes(data.size_bytes)], ['아키텍처', data.arch], ['플랫폼', data.platform], ['디스크 형식', data.disk_format], ['미디어 유형', data.media_type], ['OCI manifest 다이제스트', data.output_oci_manifest_digest], ['OCI 아카이브 다이제스트', data.output_oci_archive_digest], ['OCI 아카이브 크기', bytes(data.output_oci_archive_size_bytes)], ['VM 런타임 블록 다이제스트', data.runtime_block_digest], ['부모 다이제스트', data.parent_digest], ['생성 시각', date(data.created_at)], ['VM 참조', joined(object(data.referenced_by).runs)], ['프로젝트 참조', joined(object(data.referenced_by).projects)]]));
+      const compatibility = object(data.compatibility);
+      target.appendChild(detailSection('클라이언트 플랫폼 호환성', [['상태', ({ compatible: '호환', incompatible: '비호환', unknown: '확인 불가' })[compatibility.status] || '확인 불가'], ['클라이언트', [compatibility.client?.system, compatibility.client?.arch, compatibility.client?.backend].filter(Boolean).join(' / ')], ['이유', array(compatibility.reasons).join(' · ') || '선언된 대상 아키텍처 및 의존 체인 일치']]));
+      target.appendChild(node('p', 'notice', '플랫폼 메타데이터 검사입니다. GPU·Vulkan·CUDA, 게스트 ABI 및 실제 부팅 성공을 보장하지 않습니다. 실행 시 런타임 사전 검증은 별도로 적용됩니다.'));
       if (data.kind === 'oci-image' || items(data.builds).length) target.appendChild(node('p', 'notice', 'OCI manifest는 이미지 내용의 식별자, OCI 아카이브는 내보낸 파일 바이트의 식별자입니다. VM 런타임 블록은 별도의 변환 결과입니다. 파일 관찰은 다이제스트 검증이나 실행 가능성을 보장하지 않습니다. 빌드 출력 태그는 로컬 CAS 태그나 Hub 게시 여부를 보장하지 않습니다.'));
       target.appendChild(detailSection('볼륨 / 루트 의존성', [['참조', references(data)], ['삭제 제한', diskDeleteReason(key, data) || '참조 없음 · 서버가 삭제 시 다시 검증합니다.']]));
       for (const build of items(data.builds)) target.appendChild(detailSection('로컬 빌드 출처 · ' + text(build.build_id), buildFields(build)));
@@ -1041,7 +1059,7 @@
   $('btn-refresh-log').addEventListener('click', loadLogs);
   $('log-tail-select').addEventListener('change', loadLogs);
 
-  function canAct(current) {
+  function canAct(current, action = 'remove') {
     if (!canControl() || inspector !== current || state[current.key]?.error || current.error) return false;
     if (current.data.stale === true) return false;
     if (current.key === 'artifacts') {
@@ -1305,7 +1323,7 @@
   });
   function updateRemoteControls() {
     const busy = actionBusy || remoteState.loading || remoteState.searching || hubState.connecting;
-    for (const id of ['btn-remote-connections', 'remote-connection', 'remote-kind', 'remote-query', 'remote-repository', 'remote-arch', 'remote-disk-format', 'remote-parent', 'btn-remote-search', 'btn-remote-back']) $(id).disabled = busy || authFailed;
+    for (const id of ['btn-remote-connections', 'remote-connection', 'remote-kind', 'remote-query', 'remote-repository', 'remote-arch', 'remote-disk-format', 'remote-parent', 'remote-compatible', 'btn-remote-search', 'btn-remote-back', 'btn-remote-catalog']) $(id).disabled = busy || authFailed;
     for (const button of $('remote-results').querySelectorAll('button')) button.disabled = busy || authFailed || (button.dataset.read !== 'true' && !canControl()) || button.dataset.supported !== 'true';
     $('btn-remote-next').disabled = busy || authFailed;
     for (const id of ['hub-url', 'hub-token', 'hub-project', 'btn-hub-connect']) $(id).disabled = busy || authFailed || !!hubState.connection;
@@ -1323,7 +1341,7 @@
     $('remote-query').value = '';
     $('remote-repository').value = ''; remoteRepositoryQuery = ''; updateRemoteBreadcrumb();
     for (const id of ['remote-arch', 'remote-disk-format', 'remote-parent']) $(id).value = '';
-    for (const id of ['remote-arch-filter', 'remote-disk-filter', 'remote-parent-filter']) $(id).hidden = selected?.protocol !== 'legacy';
+    for (const id of ['remote-disk-filter', 'remote-parent-filter']) $(id).hidden = selected?.protocol !== 'legacy';
     if (!selected) { updateRemoteControls(); return; }
     const tabHub = selected.protocol === 'legacy' && hubState.connection;
     const instructions = selected.protocol === 'legacy' ? '원래 Keystone 토큰을 이 탭에 연결하거나 웹 프로세스의 Hub 환경 설정을 사용합니다. 프로젝트 ID는 원래 범위 확인용이며 재지정하지 않습니다.' : selected.protocol === 'palimpsest' ? '정확한 API base/namespace의 credential helper에 저장한 프로젝트 패키지 키를 사용합니다.' : 'Docker 인증 설정·helper를 사용합니다. Docker Hub 저장소 검색은 공개 검색이며 비공개 이미지는 정확한 참조로 조회하세요.';
@@ -1333,6 +1351,7 @@
     for (const option of $('remote-kind').options) option.disabled = option.value !== 'all' && !kinds.has(option.value);
     $('remote-kind').value = 'all';
     updateRemoteControls();
+    $('form-remote-search').requestSubmit();
   }
   async function loadRemoteConnections(preferred) {
     if (remoteState.loading || authFailed) return;
@@ -1510,8 +1529,33 @@
     for (const title of ['참조 / 이름', '분류 · 아키텍처', '실행 호환성', 'Actions']) { const th = node('th', '', title); th.scope = 'col'; header.appendChild(th); }
     head.appendChild(header); table.appendChild(head); const body = node('tbody');
     for (const item of rows) {
-      const row = node('tr'); const name = cell(row, item.name || item.repository || item.reference);
-      name.appendChild(node('small', 'cell-note mono', item.reference));
+      const row = node('tr');
+      const isCatalogRepo = !item.reference && item.repository;
+      const name = cell(row);
+      if (isCatalogRepo) {
+        const repoBtn = node('button', 'row-open', item.name || item.repository);
+        repoBtn.type = 'button';
+        repoBtn.dataset.supported = 'true';
+        repoBtn.dataset.read = 'true';
+        repoBtn.title = `${item.repository} 태그 조회`;
+        repoBtn.addEventListener('click', () => {
+          $('remote-repository').value = item.repository;
+          $('remote-query').value = '';
+          $('form-remote-search').requestSubmit();
+        });
+        name.appendChild(repoBtn);
+      } else {
+        name.appendChild(document.createTextNode(item.name || item.repository || item.reference));
+      }
+      if (item.description) name.appendChild(node('small', 'cell-note', item.description));
+      if (item.star_count != null || item.pull_count != null) {
+        const stats = [];
+        if (item.star_count != null) stats.push(`★ ${item.star_count.toLocaleString()}`);
+        if (item.pull_count != null) stats.push(`다운로드 ${item.pull_count >= 1e9 ? (item.pull_count / 1e9).toFixed(1) + 'B' : item.pull_count >= 1e6 ? (item.pull_count / 1e6).toFixed(1) + 'M' : item.pull_count.toLocaleString()}`);
+        if (item.last_updated) stats.push(`갱신 ${item.last_updated.slice(0, 10)}`);
+        name.appendChild(node('small', 'cell-note', stats.join(' · ')));
+      }
+      if (item.reference) name.appendChild(node('small', 'cell-note mono', item.reference));
       if (item.digest) name.appendChild(node('small', 'cell-note mono', digest(item.digest)));
       cell(row, text(item.kind) + ' / ' + (array(item.architectures).join(', ') || '정보 없음'));
       cell(row, item.run_supported === true ? '다운로드 후 VM 실행 설정 가능' : item.run_limitation || item.download_limitation || '다운로드만 가능 · 실행 조건 확인 필요');
@@ -1575,15 +1619,40 @@
   $('btn-remote-back').addEventListener('click', () => {
     $('remote-repository').value = ''; $('remote-query').value = remoteRepositoryQuery; updateRemoteBreadcrumb(); $('form-remote-search').requestSubmit();
   });
+  $('btn-remote-catalog')?.addEventListener('click', () => {
+    $('remote-repository').value = '';
+    $('remote-query').value = '';
+    $('form-remote-search').requestSubmit();
+  });
+  function switchArtifactsTab(tab) {
+    const isLocal = tab === 'local';
+    $('tab-artifacts-local')?.setAttribute('aria-selected', String(isLocal));
+    $('tab-artifacts-remote')?.setAttribute('aria-selected', String(!isLocal));
+    const localView = $('artifacts-local-view');
+    const remoteView = $('artifacts-remote-view');
+    if (localView) localView.hidden = !isLocal;
+    if (remoteView) remoteView.hidden = isLocal;
+    if (!isLocal) {
+      if (!remoteState.loaded && !remoteState.loading) {
+        loadRemoteConnections();
+      } else if (!remoteState.result && !remoteState.searching && $('remote-connection')?.value) {
+        $('form-remote-search')?.requestSubmit();
+      }
+    }
+  }
+  $('tab-artifacts-local')?.addEventListener('click', () => switchArtifactsTab('local'));
+  $('tab-artifacts-remote')?.addEventListener('click', () => switchArtifactsTab('remote'));
   $('form-remote-search').addEventListener('submit', async event => {
     event.preventDefault(); if (actionBusy || hubState.connecting || remoteState.loading || remoteState.searching || !remoteState.loaded || authFailed || !$('remote-connection').value) return;
     closeRemoteDetail(); updateRemoteBreadcrumb();
     const generation = ++remoteState.generation; remoteState.abort?.abort(); remoteState.abort = new AbortController();
     const parameters = new URLSearchParams({ connection: $('remote-connection').value, kind: $('remote-kind').value, query: $('remote-query').value.trim(), repository: $('remote-repository').value.trim(), limit: '30' });
     const selected = remoteState.connections.find(item => item.id === $('remote-connection').value);
+    if ($('remote-arch').value) parameters.set('arch', $('remote-arch').value);
     if (selected?.protocol === 'legacy') {
-      for (const [key, id] of [['arch', 'remote-arch'], ['disk_format', 'remote-disk-format'], ['parent', 'remote-parent']]) if ($(id).value.trim()) parameters.set(key, $(id).value.trim());
+      for (const [key, id] of [['disk_format', 'remote-disk-format'], ['parent', 'remote-parent']]) if ($(id).value.trim()) parameters.set(key, $(id).value.trim());
     }
+    parameters.set('compatible', $('remote-compatible').value);
     if (event.submitter === $('btn-remote-next') && remoteState.result?.next_cursor) parameters.set('cursor', remoteState.result.next_cursor);
     remoteState.result = null; remoteState.searching = true; updateRemoteControls(); $('btn-remote-next').hidden = true; $('remote-results-state').textContent = '원격 API 조회 중…';
     try {
@@ -1726,6 +1795,7 @@
   }
 
   function setupRunFromArtifact(item) {
+    if (item.compatibility && item.compatibility.compatible !== true) { feedback('플랫폼 호환성: ' + (array(item.compatibility.reasons).join(' · ') || '확인 불가'), true); return; }
     if (item.run_supported === false) { feedback(item.run_limitation || '이 아티팩트의 VM 실행은 현재 호스트에서 지원되지 않습니다.', true); return; }
     if (item.source === 'remote-transfer') { setupRunFromReceipt(item); return; }
     navigate('vms');

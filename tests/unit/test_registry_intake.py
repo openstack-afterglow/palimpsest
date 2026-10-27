@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import sys
 import tarfile
 import time
@@ -15,7 +16,7 @@ from types import SimpleNamespace
 import pytest
 
 from palimpsest_local import cli, registry_intake, state
-from palimpsest_local.errors import ArtifactValidationError
+from palimpsest_local.errors import ArtifactValidationError, PalimpsestError
 from palimpsest_local.oci_provenance import (
     OCI_IMAGE_CONFIG_MEDIA_TYPE,
     OCI_IMAGE_INDEX_MEDIA_TYPE,
@@ -836,3 +837,278 @@ def test_docker_export_rejects_config_disagreeing_with_requested_platform(tmp_pa
             "service:stable", parent / "image.tar", roots, platform="linux/arm64", skopeo=executable
         )
     assert list(parent.iterdir()) == []
+
+
+def _cached_image(layout: Path, label: str) -> tuple[dict, dict]:
+    """Two distinct image graphs with one identical compressed layer."""
+    blobs = layout / "blobs" / "sha256"
+    blobs.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+    def blob(payload, media_type):
+        if not isinstance(payload, bytes):
+            payload = json.dumps(payload, separators=(",", ":")).encode()
+        digest = "sha256:" + hashlib.sha256(payload).hexdigest()
+        path = blobs / digest.split(":")[1]
+        if not path.exists():
+            path.write_bytes(payload)
+        return {"mediaType": media_type, "digest": digest, "size": len(payload)}
+
+    layer = blob(gzip.compress(b"shared payload", mtime=0), "application/vnd.oci.image.layer.v1.tar+gzip")
+    config = blob(
+        {
+            "architecture": "amd64",
+            "os": "linux",
+            "config": {"Env": ["LABEL=" + label]},
+            "rootfs": {"type": "layers", "diff_ids": ["sha256:" + hashlib.sha256(b"shared payload").hexdigest()]},
+        },
+        "application/vnd.oci.image.config.v1+json",
+    )
+    manifest = blob(
+        {
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": config,
+            "layers": [layer],
+        },
+        "application/vnd.oci.image.manifest.v1+json",
+    )
+    selected = {**manifest, "annotations": {"org.opencontainers.image.ref.name": "selected"}}
+    (layout / "oci-layout").write_text('{"imageLayoutVersion":"1.0.0"}')
+    (layout / "index.json").write_text(json.dumps({"schemaVersion": 2, "manifests": [selected]}))
+    return manifest, layer
+
+
+def _cached_roots(tmp_path: Path) -> tuple[StatePaths, Path]:
+    roots = StatePaths(tmp_path / "config", tmp_path / "state")
+    roots.oci_source_cas.parent.mkdir(parents=True, mode=0o700)
+    executable = tmp_path / "skopeo"
+    executable.write_bytes(b"tool")
+    executable.chmod(0o700)
+    return roots, executable
+
+
+def _stub_layout_inspection(monkeypatch, source_for_reference):
+    def inspect(_executable, reference, _home, **_kwargs):
+        source = source_for_reference(reference)
+        root = json.loads((source / "index.json").read_bytes())["manifests"][0]
+        payload = (source / "blobs/sha256" / root["digest"].split(":")[1]).read_bytes()
+        return registry_intake.Descriptor(root["mediaType"], root["digest"], root["size"]), payload
+
+    monkeypatch.setattr(registry_intake, "_inspect_anonymous_root", inspect)
+
+
+def test_layout_pulls_deduplicate_different_images_without_archive_or_cas_reimport(tmp_path, monkeypatch):
+    roots, executable = _cached_roots(tmp_path)
+    transfers = []
+
+    def remote(_reference):
+        source = tmp_path / ("remote-" + str(len(transfers)))
+        _cached_image(source, str(len(transfers)))
+        return source
+
+    _stub_layout_inspection(monkeypatch, remote)
+
+    def transfer(argv, layout, staging, *, incremental_bytes, **_kwargs):
+        assert layout == roots.oci_source_cas
+        assert not staging.is_relative_to(layout)
+        assert argv[-1] == f"oci:{layout}:selected"
+        manifest, layer = _cached_image(layout, str(len(transfers)))
+        Path(argv[argv.index("--digestfile") + 1]).write_text(manifest["digest"] + "\n")
+        assert 0 < incremental_bytes() < 4096
+        transfers.append((manifest, layer))
+
+    def no_import(*_args, **_kwargs):
+        pytest.fail("retained OCI blobs must not be copied through SourceCAS import temporaries")
+
+    monkeypatch.setattr(registry_intake, "_run_bounded_copy", transfer)
+    monkeypatch.setattr(registry_intake.SourceCAS, "import_source_blob", no_import)
+    first = registry_intake.pull_anonymous_oci_layout("quay.io/acme/first:v1", roots, skopeo=executable)
+    layer_path = roots.oci_source_cas / "blobs" / "sha256" / transfers[0][1]["digest"].split(":")[1]
+    before = layer_path.stat()
+    # The retained cache may grow beyond the maximum permitted *new* download.
+    retained = roots.oci_source_cas / "retained-previous-transfer"
+    retained.write_bytes(b"x" * 8192)
+    second = registry_intake.pull_anonymous_oci_layout(
+        "quay.io/acme/second:v1",
+        roots,
+        skopeo=executable,
+        maximum_bytes=4096,
+    )
+    assert first.root_digest != second.root_digest
+    assert second.output == roots.oci_source_cas
+    assert first.source_cas_id == second.source_cas_id
+    assert first.source_binding_digest != second.source_binding_digest
+    assert layer_path.stat().st_ino == before.st_ino
+    assert layer_path.stat().st_nlink == 1
+    assert len(list((roots.oci_source_cas / "blobs" / "sha256").iterdir())) == 5
+    assert all(path.stat().st_mode & 0o777 == 0o400 for path in (roots.oci_source_cas / "blobs" / "sha256").iterdir())
+    assert (roots.oci_source_cas / "index.json").stat().st_mode & 0o777 == 0o600
+    assert (roots.oci_source_cas / "oci-layout").stat().st_mode & 0o777 == 0o600
+    assert retained.read_bytes() == b"x" * 8192
+    assert (roots.oci_source_cas / "blobs" / "sha256" / first.root_digest.split(":")[1]).exists()
+
+
+@pytest.mark.parametrize("damage", ["blob", "selected", "digest", "marker", "index", "symlink"])
+def test_layout_pull_rejects_damaged_graph_without_removing_retained_bytes(tmp_path, monkeypatch, damage):
+    roots, executable = _cached_roots(tmp_path)
+    registry_intake.SourceCAS(roots.oci_source_cas)
+    retained = roots.oci_source_cas / "prior-content"
+    retained.write_bytes(b"keep")
+    remote = tmp_path / "remote"
+    _cached_image(remote, "bad")
+    _stub_layout_inspection(monkeypatch, lambda _reference: remote)
+
+    def transfer(argv, layout, _staging, **_kwargs):
+        manifest, layer = _cached_image(layout, "bad")
+        digest = manifest["digest"]
+        if damage == "blob":
+            path = layout / "blobs" / "sha256" / layer["digest"].split(":")[1]
+            path.write_bytes(b"x" * layer["size"])
+        elif damage == "selected":
+            index = json.loads((layout / "index.json").read_bytes())
+            index["manifests"][0]["annotations"] = {}
+            (layout / "index.json").write_text(json.dumps(index))
+        elif damage == "digest":
+            digest = "sha256:" + "f" * 64
+        elif damage == "marker":
+            (layout / "oci-layout").write_text('{"imageLayoutVersion":"0.9.0"}')
+        elif damage == "index":
+            index = json.loads((layout / "index.json").read_bytes())
+            index["mediaType"] = "application/invalid"
+            (layout / "index.json").write_text(json.dumps(index))
+        else:
+            (layout / "unsafe").symlink_to(retained)
+        Path(argv[argv.index("--digestfile") + 1]).write_text(digest)
+
+    monkeypatch.setattr(registry_intake, "_run_bounded_copy", transfer)
+    with pytest.raises(PalimpsestError, match="corrupt|selected root|layout version|unsafe layout|media type"):
+        registry_intake.pull_anonymous_oci_layout("quay.io/acme/app:v1", roots, skopeo=executable)
+    assert retained.read_bytes() == b"keep"
+
+
+def test_layout_transfer_failure_preserves_previous_graph_and_partial_bytes(tmp_path, monkeypatch):
+    roots, executable = _cached_roots(tmp_path)
+    registry_intake.SourceCAS(roots.oci_source_cas)
+    manifest, layer = _cached_image(roots.oci_source_cas, "existing")
+    layer_path = roots.oci_source_cas / "blobs" / "sha256" / layer["digest"].split(":")[1]
+    before = layer_path.read_bytes()
+    remote = tmp_path / "remote"
+    _cached_image(remote, "next")
+    _stub_layout_inspection(monkeypatch, lambda _reference: remote)
+
+    def transfer(_argv, layout, staging, **_kwargs):
+        (layout / "partial-new-download").write_bytes(b"partial")
+        assert not staging.is_relative_to(layout)
+        raise RegistryIntakeError("registry pull timed out")
+
+    monkeypatch.setattr(registry_intake, "_run_bounded_copy", transfer)
+    with pytest.raises(RegistryIntakeError, match="timed out"):
+        registry_intake.pull_anonymous_oci_layout("quay.io/acme/next:v1", roots, skopeo=executable)
+    assert layer_path.read_bytes() == before
+    assert (roots.oci_source_cas / "partial-new-download").read_bytes() == b"partial"
+    assert (roots.oci_source_cas / "blobs" / "sha256" / manifest["digest"].split(":")[1]).exists()
+
+
+def test_real_subprocess_bounds_new_layout_bytes_plus_private_scratch(tmp_path):
+    layout = tmp_path / "layout"
+    layout.mkdir()
+    staging = tmp_path / "scratch"
+    staging.mkdir()
+    existing = layout / "cached"
+    existing.write_bytes(b"x" * 8192)
+    program = (
+        "import pathlib,sys,time; "
+        "pathlib.Path(sys.argv[1]).write_bytes(b'x'*600); "
+        "pathlib.Path(sys.argv[2]).write_bytes(b'x'*600); time.sleep(10)"
+    )
+
+    def incremental_bytes():
+        return sum(path.stat().st_size for path in layout.iterdir() if path != existing)
+
+    with pytest.raises(RegistryIntakeError, match="size limit"):
+        registry_intake._run_bounded_copy(
+            (sys.executable, "-c", program, os.fspath(layout / "new"), os.fspath(staging / "new")),
+            layout,
+            staging,
+            timeout_seconds=5,
+            maximum_bytes=1024,
+            incremental_bytes=incremental_bytes,
+        )
+    assert existing.read_bytes() == b"x" * 8192
+
+
+def test_real_skopeo_reuses_shared_blob_unavailable_from_second_source(tmp_path, monkeypatch):
+    skopeo = shutil.which("skopeo")
+    if skopeo is None:
+        pytest.skip("requires real skopeo OCI layout transport")
+    roots, _executable = _cached_roots(tmp_path)
+    first_source = tmp_path / "first-source"
+    second_source = tmp_path / "second-source"
+    first_manifest, shared = _cached_image(first_source, "first")
+    second_manifest, _ = _cached_image(second_source, "second")
+    # This graph cannot be freshly downloaded. Only destination blob reuse can
+    # make Skopeo's second independent copy succeed.
+    (second_source / "blobs" / "sha256" / shared["digest"].split(":")[1]).unlink()
+    build_argv = registry_intake.skopeo_layout_copy_argv
+    _stub_layout_inspection(monkeypatch, lambda reference: first_source if "/first" in reference else second_source)
+
+    def local_source(executable, reference, destination, digest_file):
+        argv = list(build_argv(executable, reference, destination, digest_file))
+        source = first_source if "/first@" in reference else second_source
+        argv[-2] = f"oci:{source}:selected"
+        return tuple(argv)
+
+    monkeypatch.setattr(registry_intake, "skopeo_layout_copy_argv", local_source)
+    first = registry_intake.pull_anonymous_oci_layout("quay.io/acme/first:v1", roots, skopeo=Path(skopeo))
+    shared_path = roots.oci_source_cas / "blobs" / "sha256" / shared["digest"].split(":")[1]
+    before = shared_path.stat()
+    same = registry_intake.pull_anonymous_oci_layout("quay.io/acme/first:v1", roots, skopeo=Path(skopeo))
+    assert same.root_digest == first.root_digest
+    assert shared_path.stat().st_ino == before.st_ino
+    assert (roots.oci_source_cas / "blobs/sha256" / first.root_digest.split(":")[1]).stat().st_mode & 0o777 == 0o400
+    second = registry_intake.pull_anonymous_oci_layout("quay.io/acme/second:v1", roots, skopeo=Path(skopeo))
+    assert first.root_digest == first_manifest["digest"]
+    assert second.root_digest == second_manifest["digest"]
+    assert shared_path.stat().st_ino == before.st_ino
+    assert shared_path.stat().st_nlink == 1
+    assert shared_path.stat().st_mode & 0o777 == 0o400
+    assert len(list((roots.oci_source_cas / "blobs" / "sha256").iterdir())) == 5
+
+
+def test_new_pinned_index_reuses_known_child_without_rewriting_sealed_manifest(tmp_path, monkeypatch):
+    skopeo = shutil.which("skopeo")
+    if skopeo is None:
+        pytest.skip("requires real skopeo OCI layout transport")
+    roots, _ = _cached_roots(tmp_path)
+    source = tmp_path / "remote"
+    manifest, _ = _cached_image(source, "first")
+    _stub_layout_inspection(monkeypatch, lambda _reference: source)
+    original = registry_intake.skopeo_layout_copy_argv
+
+    def local_source(executable, reference, destination, digest_file):
+        argv = list(original(executable, reference, destination, digest_file))
+        argv[-2] = f"oci:{source}:selected"
+        return tuple(argv)
+
+    monkeypatch.setattr(registry_intake, "skopeo_layout_copy_argv", local_source)
+    first = registry_intake.pull_anonymous_oci_layout("quay.io/acme/app:v1", roots, skopeo=Path(skopeo))
+    inode = (roots.oci_source_cas / "blobs/sha256" / first.root_digest.split(":")[1]).stat().st_ino
+    index = {
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": [{**manifest, "platform": {"os": "linux", "architecture": "amd64"}}],
+    }
+    payload = json.dumps(index, separators=(",", ":")).encode()
+    digest = "sha256:" + hashlib.sha256(payload).hexdigest()
+    descriptor = {"mediaType": index["mediaType"], "digest": digest, "size": len(payload)}
+    (source / "blobs/sha256" / digest.split(":")[1]).write_bytes(payload)
+    (source / "index.json").write_text(json.dumps({"schemaVersion": 2, "manifests": [descriptor]}))
+
+    def no_copy(*_args, **_kwargs):
+        pytest.fail("known selected graph must not be recopied under its sealed manifest")
+
+    monkeypatch.setattr(registry_intake, "_run_bounded_copy", no_copy)
+    pinned = registry_intake.pull_anonymous_oci_layout(f"quay.io/acme/app@{digest}", roots, skopeo=Path(skopeo))
+    assert pinned.root_digest == digest and pinned.manifest_digest == first.manifest_digest
+    assert (roots.oci_source_cas / "blobs/sha256" / first.root_digest.split(":")[1]).stat().st_ino == inode
+    assert (roots.oci_source_cas / "blobs/sha256" / digest.split(":")[1]).read_bytes() == payload

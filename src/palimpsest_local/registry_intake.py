@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import re
@@ -17,8 +18,17 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .errors import ArtifactValidationError, PalimpsestError
-from .oci_image import ACQUISITION_PLATFORMS, OCIImageRef, validate_acquisition_platform
-from .oci_source import LocalArchiveSource, SourceCAS
+from .oci_image import (
+    ACQUISITION_PLATFORMS,
+    MAX_IMAGE_JSON_BYTES,
+    Descriptor,
+    OCIImageRef,
+    resolve_image,
+    strict_json_object,
+    validate_acquisition_platform,
+)
+from .oci_provenance import OCI_IMAGE_INDEX_MEDIA_TYPE, SUPPORTED_IMAGE_MANIFEST_MEDIA_TYPES
+from .oci_source import LocalArchiveSource, SnapshottedOCIImage, SourceCAS, SourceSnapshot
 from .registry import (
     RegistryProfile,
     add_profile,
@@ -136,6 +146,17 @@ def skopeo_copy_argv(
         f"docker://{reference}",
         f"oci-archive:{destination}",
     )
+
+
+def skopeo_layout_copy_argv(
+    executable: Path,
+    reference: str,
+    destination: Path,
+    digest_file: Path,
+) -> tuple[str, ...]:
+    """Use the destination's digest store, rather than a fresh OCI archive."""
+    archive_argv = skopeo_copy_argv(executable, reference, destination)
+    return (*archive_argv[:-2], "--digestfile", os.fspath(digest_file), archive_argv[-2], f"oci:{destination}:selected")
 
 
 def skopeo_pull_argv(
@@ -348,11 +369,16 @@ def _run_bounded_copy(
     environment: dict[str, str] | None = None,
     stdin=subprocess.DEVNULL,
     stdout=subprocess.DEVNULL,
+    incremental_bytes: Callable[[], int] | None = None,
 ) -> None:
     if not 0 < timeout_seconds <= 3600:
         raise RegistryIntakeError("registry pull timeout must be between 0 and 3600 seconds")
     if type(maximum_bytes) is not int or not 1 <= maximum_bytes <= MAX_ARCHIVE_BYTES:
         raise RegistryIntakeError("registry pull archive limit is invalid")
+
+    def staged_bytes() -> int:
+        return _staged_bytes(private_home) + (0 if incremental_bytes is None else incremental_bytes())
+
     stderr_path = private_home / "stderr.log"
     stderr_file = None
     process = None
@@ -373,7 +399,7 @@ def _run_bounded_copy(
                 raise RegistryIntakeError("cannot execute the required OCI acquisition tool") from None
         deadline = time.monotonic() + timeout_seconds
         while process.poll() is None:
-            if _staged_bytes(private_home) > maximum_bytes:
+            if staged_bytes() > maximum_bytes:
                 raise RegistryIntakeError("registry response exceeds the OCI archive size limit")
             if time.monotonic() >= deadline:
                 raise RegistryIntakeError("registry pull timed out")
@@ -382,7 +408,7 @@ def _run_bounded_copy(
             stderr_file.seek(0)
             captured = stderr_file.read(16384).decode("utf-8", errors="replace")
             raise _classify_skopeo_error(captured, process.returncode)
-        if _staged_bytes(private_home) > maximum_bytes:
+        if staged_bytes() > maximum_bytes:
             raise RegistryIntakeError("registry response exceeds the OCI archive size limit")
     finally:
         with defer_web_cancellation():
@@ -513,6 +539,358 @@ def pull_anonymous_oci_archive(
         timeout_seconds=timeout_seconds,
         maximum_bytes=maximum_bytes,
     )
+
+
+def _layout_files(layout: Path) -> dict[str, os.stat_result]:
+    """Inspect without following client-created links, including temporary blobs."""
+    files: dict[str, os.stat_result] = {}
+
+    def visit(directory_fd: int, prefix: str) -> None:
+        for entry in os.scandir(directory_fd):
+            try:
+                metadata = entry.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            name = prefix + entry.name
+            if metadata.st_uid != os.geteuid() or metadata.st_mode & 0o022:
+                raise RegistryIntakeError("registry client created an unsafe layout entry")
+            if stat.S_ISDIR(metadata.st_mode):
+                child_fd = os.open(entry.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory_fd)
+                try:
+                    if (os.fstat(child_fd).st_dev, os.fstat(child_fd).st_ino) != (metadata.st_dev, metadata.st_ino):
+                        raise RegistryIntakeError("registry layout directory changed")
+                    visit(child_fd, name + "/")
+                finally:
+                    os.close(child_fd)
+            elif stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 1:
+                files[name] = metadata
+            else:
+                raise RegistryIntakeError("registry client created an unsafe layout entry")
+
+    root_fd = os.open(layout, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        visit(root_fd, "")
+    finally:
+        os.close(root_fd)
+    return files
+
+
+def _layout_file_signature(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_nlink,
+    )
+
+
+def _read_layout_file(path: Path, maximum_bytes: int) -> bytes:
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        before = os.fstat(stream.fileno())
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_uid != os.geteuid()
+            or before.st_size > maximum_bytes
+        ):
+            raise RegistryIntakeError("registry layout metadata is unsafe or exceeds its size limit")
+        payload = stream.read(maximum_bytes + 1)
+        after = os.fstat(stream.fileno())
+        visible = path.stat(follow_symlinks=False)
+        if (
+            len(payload) > maximum_bytes
+            or _layout_file_signature(before) != _layout_file_signature(after)
+            or _layout_file_signature(after) != _layout_file_signature(visible)
+        ):
+            raise RegistryIntakeError("registry layout metadata changed during verification")
+        return payload
+
+
+def _inspect_anonymous_root(
+    executable: Path,
+    reference: str,
+    home: Path,
+    *,
+    timeout_seconds: float,
+    maximum_bytes: int,
+    incremental_bytes: Callable[[], int],
+) -> tuple[Descriptor, bytes]:
+    """Read bounded fresh tag/index metadata, never an image-layer payload."""
+    response = home / "root.json"
+    with response.open("x+b") as stream:
+        _run_bounded_copy(
+            (os.fspath(executable), "inspect", "--raw", "--no-creds", "--tls-verify=true", f"docker://{reference}"),
+            response,
+            home,
+            timeout_seconds=timeout_seconds,
+            maximum_bytes=min(maximum_bytes, MAX_IMAGE_JSON_BYTES),
+            incremental_bytes=incremental_bytes,
+            stdout=stream,
+        )
+    payload = _read_layout_file(response, MAX_IMAGE_JSON_BYTES)
+    document = strict_json_object(payload, "registry root metadata")
+    media_type = document.get("mediaType")
+    if media_type is None and "manifests" in document:
+        media_type = OCI_IMAGE_INDEX_MEDIA_TYPE
+    return Descriptor(
+        media_type=media_type, digest="sha256:" + hashlib.sha256(payload).hexdigest(), size=len(payload)
+    ), payload
+
+
+def pull_anonymous_oci_layout(
+    reference: str,
+    roots: StatePaths,
+    *,
+    platform: str = SUPPORTED_PLATFORM,
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    maximum_bytes: int = MAX_ARCHIVE_BYTES,
+    skopeo: Path | None = None,
+) -> RegistryPullReceipt:
+    """Pull into a retained source CAS; the caller holds its whole-cache lock.
+
+    Only private tool scratch and newly written destination bytes consume the
+    transfer budget. Existing blobs are never removed, even after a failed pull.
+    The mutable ``selected`` label is a transfer result, not retained image history.
+    """
+    if platform != SUPPORTED_PLATFORM:
+        raise RegistryIntakeError(f"registry pull supports only {SUPPORTED_PLATFORM}")
+    resolved = resolve_anonymous_reference(reference)
+    executable_text = shutil.which("skopeo") if skopeo is None else os.fspath(skopeo)
+    if executable_text is None:
+        raise RegistryIntakeError("skopeo is required for OCI registry pull")
+    try:
+        executable = Path(executable_text).expanduser().resolve(strict=True)
+        if not executable.is_file():
+            raise RegistryIntakeError("skopeo executable is not a regular file")
+        layout = roots.oci_source_cas.absolute()
+        if ":" in os.fspath(layout):
+            raise RegistryIntakeError("OCI layout destination cannot contain a transport delimiter")
+        source_cas = SourceCAS(layout)
+        root_before = layout.stat(follow_symlinks=False)
+        baseline = _layout_files(layout)
+
+        def incremental_bytes() -> int:
+            root_after = layout.stat(follow_symlinks=False)
+            if (root_after.st_dev, root_after.st_ino) != (root_before.st_dev, root_before.st_ino):
+                raise RegistryIntakeError("registry layout root changed during pull")
+            current = _layout_files(layout)
+            # Skopeo may replace its top-level metadata, but never retained blobs.
+            for name, before in baseline.items():
+                if name in {"index.json", "oci-layout"}:
+                    continue
+                after = current.get(name)
+                if after is None or _layout_file_signature(before) != _layout_file_signature(after):
+                    raise RegistryIntakeError("registry client changed retained cache content")
+            return sum(
+                metadata.st_size
+                for name, metadata in current.items()
+                if name not in baseline or name in {"index.json", "oci-layout"}
+            )
+
+        with tempfile.TemporaryDirectory(prefix="palimpsest-oci-layout-") as temporary:
+            staging = Path(temporary)
+            started = time.monotonic()
+
+            def remaining() -> float:
+                value = timeout_seconds - (time.monotonic() - started)
+                if value <= 0:
+                    raise RegistryIntakeError("registry pull timed out")
+                return value
+
+            def budget(home: Path) -> int:
+                return incremental_bytes() + _staged_bytes(staging) - _staged_bytes(home)
+
+            inspect_home = staging / "inspect"
+            inspect_home.mkdir(mode=0o700)
+            descriptor, root_payload = _inspect_anonymous_root(
+                executable,
+                resolved.canonical,
+                inspect_home,
+                timeout_seconds=remaining(),
+                maximum_bytes=maximum_bytes,
+                incremental_bytes=lambda: budget(inspect_home),
+            )
+            root_digest = descriptor.digest
+            if resolved.digest is not None and resolved.digest != root_digest:
+                raise RegistryIntakeError("registry metadata does not match the requested immutable pin")
+            image_ref = OCIImageRef(resolved.endpoint, resolved.repository, resolved.canonical)
+            selected_descriptor = descriptor
+
+            class MissingMetadata(Exception):
+                pass
+
+            def member(value: Descriptor) -> SourceSnapshot:
+                return SourceSnapshot(descriptor=value, cas_id=source_cas.identity)
+
+            def metadata(value: Descriptor) -> bytes:
+                nonlocal selected_descriptor
+                if value.media_type in SUPPORTED_IMAGE_MANIFEST_MEDIA_TYPES:
+                    selected_descriptor = value
+                if value == descriptor:
+                    return root_payload
+                if "blobs/sha256/" + value.digest.split(":")[1] not in baseline:
+                    raise MissingMetadata
+                return source_cas.read_metadata(member(value))
+
+            try:
+                resolve_image(image_ref, descriptor, metadata)
+            except MissingMetadata:
+                pass
+
+            selected_name = "blobs/sha256/" + selected_descriptor.digest.split(":")[1]
+            if selected_name in baseline:
+                # A published manifest must already have its complete verified graph.
+                # Re-copying it would truncate a sealed inode; missing bytes are corruption.
+                selected_ref = OCIImageRef(
+                    resolved.endpoint, resolved.repository, resolved.name + "@" + selected_descriptor.digest
+                )
+                selected_image = resolve_image(
+                    selected_ref, selected_descriptor, lambda value: source_cas.read_metadata(member(value))
+                )
+                selected_snapshot = SnapshottedOCIImage(
+                    image=selected_image,
+                    root=member(selected_descriptor),
+                    manifest=member(selected_image.manifest_descriptor),
+                    config=member(selected_image.config.descriptor),
+                    layers=tuple(member(layer.compressed) for layer in selected_image.layers),
+                )
+                source_cas.verify_image(selected_snapshot)
+            else:
+                copy_home = staging / "copy"
+                copy_home.mkdir(mode=0o700)
+                digest_file = copy_home / "result.digest"
+                _run_bounded_copy(
+                    skopeo_layout_copy_argv(
+                        executable, resolved.name + "@" + selected_descriptor.digest, layout, digest_file
+                    ),
+                    layout,
+                    copy_home,
+                    timeout_seconds=remaining(),
+                    maximum_bytes=maximum_bytes,
+                    incremental_bytes=lambda: budget(copy_home),
+                )
+                transferred = _read_layout_file(digest_file, 128).decode("ascii").strip()
+                if transferred != selected_descriptor.digest:
+                    raise RegistryIntakeError("registry client returned an inconsistent selected root digest")
+            incremental_bytes()
+            copied = selected_name not in baseline
+            if copied or "oci-layout" in baseline:
+                marker = strict_json_object(_read_layout_file(layout / "oci-layout", 4096), "OCI layout marker")
+                if marker != {"imageLayoutVersion": "1.0.0"}:
+                    raise RegistryIntakeError("unsupported OCI image layout version")
+            if copied or "index.json" in baseline:
+                index = strict_json_object(
+                    _read_layout_file(layout / "index.json", MAX_IMAGE_JSON_BYTES), "OCI layout index"
+                )
+                if type(index.get("schemaVersion")) is not int or index["schemaVersion"] != 2:
+                    raise RegistryIntakeError("OCI layout index must use schemaVersion 2")
+                if index.get("mediaType") not in (None, OCI_IMAGE_INDEX_MEDIA_TYPE):
+                    raise RegistryIntakeError("OCI layout index has an unsupported media type")
+                manifests = index.get("manifests")
+                if not isinstance(manifests, list):
+                    raise RegistryIntakeError("OCI layout index manifests must be an array")
+                selected = [
+                    entry
+                    for entry in manifests
+                    if isinstance(entry, dict)
+                    and isinstance(entry.get("annotations"), dict)
+                    and entry["annotations"].get("org.opencontainers.image.ref.name") == "selected"
+                ]
+                if copied and (
+                    len(selected) != 1
+                    or selected[0].get("digest") != selected_descriptor.digest
+                    or "data" in selected[0]
+                ):
+                    raise RegistryIntakeError("OCI layout selected root does not match the transfer result")
+            # Freeze in place before SourceCAS opens the graph. Never reimport a
+            # retained layer through a second temporary copy of its full payload.
+            for name, metadata in _layout_files(layout).items():
+                if name in {"index.json", "oci-layout"}:
+                    mode = 0o600
+                elif re.fullmatch(r"blobs/sha256/[0-9a-f]{64}", name):
+                    mode = 0o400
+                else:
+                    continue
+                if stat.S_IMODE(metadata.st_mode) == mode:
+                    continue
+                fd = os.open(layout / name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                try:
+                    if _layout_file_signature(os.fstat(fd)) != _layout_file_signature(metadata):
+                        raise RegistryIntakeError("registry blob changed before sealing")
+                    os.fchmod(fd, mode)
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+            for directory in (layout / "blobs" / "sha256", layout):
+                fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+            root_name = "blobs/sha256/" + root_digest.split(":")[1]
+            if root_name not in _layout_files(layout):
+                metadata_home = staging / "root-metadata"
+                metadata_home.mkdir(mode=0o700)
+                (metadata_home / root_digest.split(":")[1]).write_bytes(root_payload)
+                fd = os.open(metadata_home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                try:
+                    source_cas.import_source_blob(fd, descriptor)
+                finally:
+                    os.close(fd)
+            else:
+                source_cas.read_metadata(member(descriptor))
+            # Publish only the small transport pointer; retained blob inodes stay sealed.
+            pointer = {
+                "schemaVersion": 2,
+                "manifests": [
+                    {**descriptor.to_dict(), "annotations": {"org.opencontainers.image.ref.name": "selected"}}
+                ],
+            }
+            for name, value in (("oci-layout", {"imageLayoutVersion": "1.0.0"}), ("index.json", pointer)):
+                pointer_file = layout / (".control-" + os.urandom(16).hex())
+                try:
+                    with pointer_file.open("xb") as stream:
+                        os.fchmod(stream.fileno(), 0o600)
+                        stream.write(json.dumps(value, separators=(",", ":")).encode())
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    os.replace(pointer_file, layout / name)
+                finally:
+                    pointer_file.unlink(missing_ok=True)
+            layout_fd = os.open(layout, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                os.fsync(layout_fd)
+            finally:
+                os.close(layout_fd)
+            incremental_bytes()
+            if _staged_bytes(staging) + incremental_bytes() > maximum_bytes:
+                raise RegistryIntakeError("registry response exceeds the OCI archive size limit")
+
+            image = resolve_image(image_ref, descriptor, lambda value: source_cas.read_metadata(member(value)))
+            snapshot = SnapshottedOCIImage(
+                image=image,
+                root=member(descriptor),
+                manifest=member(image.manifest_descriptor),
+                config=member(image.config.descriptor),
+                layers=tuple(member(layer.compressed) for layer in image.layers),
+            )
+            source_cas.verify_image(snapshot)
+            return RegistryPullReceipt(
+                reference=resolved.canonical,
+                output=layout,
+                platform=platform,
+                root_digest=root_digest,
+                manifest_digest=snapshot.manifest.descriptor.digest,
+                source_cas_id=snapshot.cas_id,
+                source_binding_digest=snapshot.binding_digest,
+            )
+    except (OSError, UnicodeError):
+        raise RegistryIntakeError("registry layout filesystem boundary failed") from None
 
 
 def _stage_docker_auth(config_dir: Path, endpoint: str, staging: Path, *, timeout_seconds: float) -> Path | None:
@@ -844,10 +1222,12 @@ __all__ = [
     "SUPPORTED_PLATFORM",
     "export_docker_image_to_oci_archive",
     "pull_anonymous_oci_archive",
+    "pull_anonymous_oci_layout",
     "pull_registry_oci_archive",
     "inspect_registry_reference",
     "resolve_anonymous_reference",
     "skopeo_copy_argv",
+    "skopeo_layout_copy_argv",
     "skopeo_docker_archive_copy_argv",
     "skopeo_pull_argv",
 ]

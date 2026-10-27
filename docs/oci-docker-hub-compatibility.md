@@ -38,6 +38,15 @@ source manifest also binds the original image config and ordered compressed
 layer descriptors. Archive SHA256 is a separate transport identity. None of
 this is a publisher signature or a guarantee that arbitrary images are safe.
 
+OCI tar intake accepts permission-only modes and modes carrying POSIX file-type
+bits only when those bits agree with the tar entry type. It normalizes the
+validated mode to permission/special bits while preserving UID/GID, timestamps
+and link semantics. Contradictory/unknown type bits still fail closed; device,
+whiteout, reserved-path and traversal checks are unchanged. This handles the
+`bin` symlink mode `0120777` in the original TensorFlow 2.21 GPU base layer
+without rewriting the downloaded archive or relaxing filesystem safety.
+
+
 ## Compatibility matrix and separately selected tests
 
 Three independent opt-in checks target an unchanged foreground `hello-world`,

@@ -78,6 +78,15 @@ def test_option_and_choices_completion():
     # Choices completion
     assert completion.resolve_candidates(parser, ["run", "--backend", "lima-q"]) == ["lima-qemu-oci"]
     assert completion.resolve_candidates(parser, ["run", "--backend", "unknown-backend"]) == []
+    commands = next(action for action in parser._actions if isinstance(action, cli.argparse._SubParsersAction))
+    backend = next(action for action in commands.choices["run"]._actions if action.dest == "backend")
+    expected = sorted(backend.choices)
+    assert completion.resolve_candidates(parser, ["run", "--backend", ""]) == expected
+    filtered = [choice for choice in expected if choice.startswith("l")]
+    assert completion.resolve_candidates(parser, ["run", "--backend", "l"]) == filtered
+    assert completion.resolve_candidates(parser, ["run", "--backend=l"]) == [
+        f"--backend={choice}" for choice in filtered
+    ]
 
     arch_choices = completion.resolve_candidates(parser, ["image", "import", "--arch", ""])
     assert arch_choices == ["aarch64", "x86_64"]
