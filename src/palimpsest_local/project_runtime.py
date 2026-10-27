@@ -61,7 +61,7 @@ _KNOWN_RUNTIME_STATUSES = {
     "removed",
     "failed",
 }
-_KNOWN_BACKENDS = {"kvm", "lima-vz", "libvirt-hvf"}
+_KNOWN_BACKENDS = {"kvm", "lima-vz", "lima-krunkit", "libvirt-hvf"}
 
 UpAction = Literal["noop", "create", "start", "recreate"]
 

@@ -111,6 +111,7 @@ def _write_project_service_ledger(
     *,
     run_name: str,
     run_id: str,
+    backend: str = "kvm",
 ) -> Path:
     project_name = project.name
     ppaths = state.project_paths(roots, project_name)
@@ -128,7 +129,7 @@ def _write_project_service_ledger(
                     "run_name": run_name,
                     "config_digest": "sha256:" + "b" * 64,
                     "run_id": run_id,
-                    "backend": "kvm",
+                    "backend": backend,
                 }
             ],
             "order": ["api"],
@@ -329,7 +330,7 @@ services:
 
 @pytest.mark.parametrize(
     ("backend", "arch"),
-    [("kvm", "x86_64"), ("lima-vz", "aarch64")],
+    [("kvm", "x86_64"), ("lima-vz", "aarch64"), ("lima-krunkit", "aarch64")],
 )
 @pytest.mark.parametrize("with_volume", [False, True])
 def test_project_create_preserves_signed_request_and_cloud_init_snapshot_through_start(
@@ -376,8 +377,8 @@ def test_project_create_preserves_signed_request_and_cloud_init_snapshot_through
             monkeypatch.setattr(project_adapter, "ensure_kvm_volume", ensure_kvm)
     else:
         monkeypatch.setattr(project_adapter.lima, "available", lambda: True)
-        monkeypatch.setattr(project_adapter.lima, "validate_network", lambda _name: None)
-        monkeypatch.setattr(project_adapter.lima, "validate_run_spec", lambda _spec: None)
+        monkeypatch.setattr(project_adapter.lima, "validate_network", lambda _name, **_kwargs: None)
+        monkeypatch.setattr(project_adapter.lima, "validate_run_spec", lambda _spec, **_kwargs: None)
         if with_volume:
             backend_name = project_adapter.lima_backend_name(project.name, "data")
             monkeypatch.setattr(project_adapter, "verify_lima_volume", lambda *_args, **_kwargs: None)
@@ -510,7 +511,7 @@ services:
     assert spec.volumes[0].mount_path == "/var/lib/data"
 
 
-@pytest.mark.parametrize("backend", ["kvm", "lima-vz", "libvirt-hvf"])
+@pytest.mark.parametrize("backend", ["kvm", "lima-vz", "lima-krunkit", "libvirt-hvf"])
 def test_directory_share_is_not_prepared_or_owned_as_block_volume(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -811,32 +812,82 @@ def test_preserved_service_still_requires_its_applied_source_before_restart(
     assert not (tmp_path / "absent-data").exists()
 
 
-def test_stopped_service_restarts_its_existing_backend_not_new_resolution(
+@pytest.mark.parametrize("network", ["default", "vzNAT"])
+def test_stopped_krunkit_project_restarts_owned_disk_without_auto_backend_migration(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    network: str,
 ) -> None:
+    network_section = "" if network == "default" else "networks:\n  default:\n    external: true\n    name: vznat\n"
     project = _project(
         tmp_path,
-        f"""services:
+        f"""{network_section}volumes:
+  data:
+    size: 1GiB
+services:
   api:
     image: sha256:{"a" * 64}
+    volumes: [data:/srv/data]
 """,
     )
     roots = _roots(tmp_path)
-    _write_run_ledger(roots, "demo-api-1", backend="lima-vz")
-    monkeypatch.setattr(project_adapter.runtime_dispatch.platforms, "select_backend", lambda _arch, **_kw: "kvm")
-    monkeypatch.setattr(project_adapter.lima, "available", lambda: False)
-    monkeypatch.setattr(
-        project_adapter.lima,
-        "is_lima_run",
-        lambda _paths: pytest.fail("project callback used the legacy Lima heuristic"),
+    stack = _stack(tmp_path, arch="aarch64")
+    run_name = service_run_name(project, "api")
+    backend_name = project_adapter.lima_backend_name(project.name, "data")
+    rpaths = _write_run_ledger(roots, run_name, backend="lima-krunkit")
+    applied = state.read_run_state(rpaths)
+    applied.update(
+        network=network,
+        base={"local_path": str(stack.base.local_path), "digest": stack.base.digest},
+        layers=[],
+        ports=[],
+        volumes=[
+            {
+                "name": "data",
+                "backend_name": backend_name,
+                "mount_path": "/srv/data",
+                "filesystem": "ext4",
+                "read_only": False,
+            }
+        ],
     )
+    state.atomic_write_json(rpaths.state, applied)
+    monkeypatch.setattr(platforms, "detect_host", lambda: platforms.HostPlatform("Darwin", "aarch64"))
+    assert platforms.select_backend("aarch64") == "lima-vz"
+    monkeypatch.setattr(project_adapter.lima, "available", lambda: True)
+    monkeypatch.setattr(project_adapter.lima, "_require_supported_version", lambda: None)
+    callbacks = project_adapter.build_project_callbacks(project, roots, lambda _service: stack)
+    project_state = _write_project_service_ledger(
+        project, roots, run_name=run_name, run_id=state.read_owner_record(rpaths).run_id, backend="lima-krunkit"
+    )
+    ledger = state.read_json(project_state)
+    ledger["services"][0]["config_digest"] = callbacks.desired_digest(project, project.services["api"])
+    ledger["volumes"] = [{"name": "data", "backend": "lima-krunkit", "size_bytes": 1024**3}]
+    state.atomic_write_json(project_state, ledger)
+    original = project_runtime.read_project_state(project, roots)
+    before = (rpaths.owner.read_bytes(), rpaths.state.read_bytes(), project_state.read_bytes())
+    verifications: list[tuple[object, ...]] = []
+
+    def verify(*args: object, **kwargs: object) -> SimpleNamespace:
+        verifications.append((*args, kwargs))
+        return SimpleNamespace(backend_name=backend_name)
+
+    monkeypatch.setattr(project_adapter, "verify_lima_volume", verify)
+
+    def forbidden(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("restart must not create storage or use a new VM/backend")
+
+    monkeypatch.setattr(project_adapter, "ensure_lima_volume", forbidden)
+    monkeypatch.setattr(project_adapter, "ensure_kvm_volume", forbidden)
+    monkeypatch.setattr(project_adapter.runtime_dispatch, "run", forbidden)
+    monkeypatch.setattr(project_adapter.runtime_dispatch.cloud_runtime, "start", forbidden)
     calls: list[str] = []
 
     def start_existing(name: str, **kwargs: object) -> _LifecycleAdapterOutcome:
         calls.append(name)
         expected = kwargs["_expected_record"]
         assert isinstance(expected, ExistingRunRecord)
+        assert expected.dispatch_key.backend is RuntimeBackend.LIMA_KRUNKIT
         expected_snapshot = kwargs["_expected_snapshot"]
         assert isinstance(expected_snapshot, state.RunLedgerSnapshot)
         with state.locked_existing_run(roots, name, expected=expected, expected_snapshot=expected_snapshot) as mutation:
@@ -850,29 +901,27 @@ def test_stopped_service_restarts_its_existing_backend_not_new_resolution(
                 state.lifecycle_revision(written),
             )
 
-    monkeypatch.setattr(
-        project_adapter.runtime_dispatch.lima,
-        "start",
-        start_existing,
-    )
-    monkeypatch.setattr(
-        project_adapter.runtime_dispatch.cloud_runtime,
-        "start",
-        lambda *_args, **_kwargs: pytest.fail("wrong backend"),
-    )
-    callbacks = project_adapter.build_project_callbacks(project, roots, lambda _service: _stack(tmp_path))
-    service = project.services["api"]
-    resolved = callbacks.resolve(project, service, "demo-api-1")
-    prepared = PreparedService(
-        project,
-        service,
-        ServicePlan("api", "demo-api-1", "start", "sha256:" + "b" * 64, "stopped"),
-        resolved,
-    )
+    monkeypatch.setattr(project_adapter.runtime_dispatch.lima, "start", start_existing)
+    if network == "vzNAT":
+        with pytest.raises(ArtifactValidationError, match="vzNAT requires lima-vz"):
+            up_project(project, callbacks, roots=roots)
+        assert calls == [] and verifications == []
+        assert (rpaths.owner.read_bytes(), rpaths.state.read_bytes(), project_state.read_bytes()) == before
+        return
 
-    callbacks.start(prepared)
-
-    assert calls == ["demo-api-1"]
+    result = up_project(project, callbacks, roots=roots)
+    assert [action.action for action in result.actions] == ["start"]
+    assert calls == [run_name]
+    assert len(verifications) == 2
+    assert all(call[:4] == (roots, project.name, "data", 1024**3) for call in verifications)
+    assert all(call[-1]["allowed_instance"] == run_name for call in verifications)
+    preserved = project_runtime.read_project_state(project, roots)
+    assert preserved.services == original.services
+    assert preserved.volumes == original.volumes
+    assert rpaths.owner.read_bytes() == before[0]
+    restarted = state.read_run_state(rpaths)
+    assert restarted["backend"] == "lima-krunkit"
+    assert restarted["volumes"] == applied["volumes"]
 
 
 @pytest.mark.parametrize(
@@ -881,6 +930,7 @@ def test_stopped_service_restarts_its_existing_backend_not_new_resolution(
         ("kvm", "cloud_runtime", RuntimeBackend.KVM),
         ("libvirt-hvf", "cloud_runtime", RuntimeBackend.LIBVIRT_HVF),
         ("lima-vz", "lima", RuntimeBackend.LIMA_VZ),
+        ("lima-krunkit", "lima", RuntimeBackend.LIMA_KRUNKIT),
     ],
 )
 @pytest.mark.parametrize("operation", ["inspect", "start", "stop", "remove"])
@@ -1008,7 +1058,7 @@ def test_existing_project_callbacks_route_from_durable_run_ledger(
     assert kwargs == expected_options
 
 
-@pytest.mark.parametrize("backend", ["kvm", "libvirt-hvf", "lima-vz"])
+@pytest.mark.parametrize("backend", ["kvm", "libvirt-hvf", "lima-vz", "lima-krunkit"])
 def test_project_logs_callback_returns_dispatcher_owned_typed_console_stream(
     tmp_path: Path,
     backend: str,
@@ -1731,9 +1781,11 @@ services:
     assert created == []
 
 
+@pytest.mark.parametrize("backend", ["lima-vz", "lima-krunkit"])
 def test_lima_new_disk_formats_once_and_existing_disk_never_formats(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    backend: str,
 ) -> None:
     project = _project(
         tmp_path,
@@ -1754,11 +1806,11 @@ services:
     monkeypatch.setattr(
         project_adapter.runtime_dispatch.platforms,
         "select_backend",
-        lambda _arch, **_kwargs: "lima-vz",
+        lambda _arch, **_kwargs: backend,
     )
     monkeypatch.setattr(project_adapter.lima, "available", lambda: True)
-    monkeypatch.setattr(project_adapter.lima, "validate_network", lambda _name: None)
-    monkeypatch.setattr(project_adapter.lima, "validate_run_spec", lambda _spec: None)
+    monkeypatch.setattr(project_adapter.lima, "validate_network", lambda _name, **_kwargs: None)
+    monkeypatch.setattr(project_adapter.lima, "validate_run_spec", lambda _spec, **_kwargs: None)
     monkeypatch.setattr(
         project_adapter.runtime_dispatch.platforms,
         "detect_host",
@@ -1777,11 +1829,13 @@ services:
         lambda *_args, **_kwargs: SimpleNamespace(backend_name=backend_name, created=True),
     )
     received: list[object] = []
-    monkeypatch.setattr(
-        project_adapter.runtime_dispatch,
-        "run",
-        lambda request, **_kwargs: received.append(request.spec) or {"status": "running"},
-    )
+
+    def consume(request: ResolvedRunRequest, **_kwargs: object) -> dict[str, str]:
+        assert request.dispatch_key.backend.value == backend
+        received.append(request.spec)
+        return {"status": "running"}
+
+    monkeypatch.setattr(project_adapter.runtime_dispatch, "run", consume)
     callbacks = project_adapter.build_project_callbacks(
         project,
         roots,
@@ -1795,7 +1849,8 @@ services:
         resolved,
     )
     callbacks.preflight((prepared,))
-    callbacks.prepare((prepared,))
+    managed = callbacks.prepare((prepared,))
+    assert managed == (project_runtime.ManagedVolume("app_data", backend, 1024**3),)
     callbacks.start(prepared)
     assert received[-1].volumes[0].name == "app_data"
     assert received[-1].volumes[0].backend_name == backend_name
@@ -1826,6 +1881,32 @@ services:
     )
     with pytest.raises(LifecycleError, match="ssh handshake failed.*inspect the original failure"):
         callbacks.start(prepared)
+
+    rpaths = _write_run_ledger(roots, run_name, backend=backend)
+    project_state = _write_project_service_ledger(
+        project, roots, run_name=run_name, run_id=state.read_owner_record(rpaths).run_id, backend=backend
+    )
+    ledger = state.read_json(project_state)
+    ledger["volumes"] = [{"name": "app_data", "backend": backend, "size_bytes": 1024**3}]
+    state.atomic_write_json(project_state, ledger)
+    deleted: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        project_adapter,
+        "preflight_delete_lima_volume",
+        lambda *args, **kwargs: deleted.append(("preflight", *args, kwargs)),
+    )
+    monkeypatch.setattr(
+        project_adapter,
+        "delete_lima_volume",
+        lambda *args: deleted.append(("delete", *args)),
+    )
+    targets = (project_runtime.DownTarget("api", run_name, "stopped"),)
+    callbacks.preflight_down(targets, managed)
+    callbacks.remove_volume(project.name, "app_data", backend, 1024**3)
+    assert deleted == [
+        ("preflight", roots, project.name, "app_data", 1024**3, {"allowed_instances": (run_name,)}),
+        ("delete", roots, project.name, "app_data", 1024**3),
+    ]
 
 
 def test_applied_read_only_volume_and_port_reservations_block_new_service_claim(
@@ -2344,3 +2425,69 @@ services:
     with pytest.raises(ArtifactValidationError, match="attached immutable"):
         callbacks.preflight((prepared,))
     assert not state.run_paths(roots, service_run_name(project, "api")).root.exists()
+
+
+@pytest.mark.parametrize(
+    ("network_name", "error", "message"),
+    [
+        ("vznat", ArtifactValidationError, "vzNAT requires lima-vz"),
+        ("custom-net", ArtifactValidationError, "lima-krunkit networks"),
+        ("shared", LifecycleError, "Lima network does not exist: shared"),
+    ],
+)
+def test_krunkit_project_rejects_incompatible_or_missing_network_before_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    network_name: str,
+    error: type[Exception],
+    message: str,
+) -> None:
+    project = _project(
+        tmp_path,
+        f"""networks:
+  external:
+    external: true
+    name: {network_name}
+volumes:
+  data:
+    size: 1GiB
+services:
+  api:
+    image: sha256:{"a" * 64}
+    networks: [external]
+    volumes: [data:/srv/data]
+""",
+    )
+    roots = _roots(tmp_path)
+    monkeypatch.setattr(
+        project_adapter.runtime_dispatch.platforms, "select_backend", lambda *_args, **_kw: "lima-krunkit"
+    )
+    monkeypatch.setattr(project_adapter.lima, "available", lambda: True)
+    monkeypatch.setattr(project_adapter.lima, "inspect_instance_status", lambda _name: None)
+    monkeypatch.setattr(project_adapter.lima, "_require_supported_version", lambda: None)
+    network_queries: list[list[str]] = []
+
+    def list_networks(argv: list[str], **_kwargs: object) -> SimpleNamespace:
+        network_queries.append(argv)
+        return SimpleNamespace(returncode=0, stdout="[]", stderr="")
+
+    monkeypatch.setattr(project_adapter.lima, "_run_command", list_networks)
+
+    def forbidden(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("network rejection must precede storage and VM mutation")
+
+    monkeypatch.setattr(project_adapter, "ensure_lima_volume", forbidden)
+    monkeypatch.setattr(project_adapter, "ensure_kvm_volume", forbidden)
+    monkeypatch.setattr(project_adapter.runtime_dispatch, "run", forbidden)
+    monkeypatch.setattr(project_adapter.runtime_dispatch, "stop", forbidden)
+    monkeypatch.setattr(project_adapter.runtime_dispatch, "rm", forbidden)
+    callbacks = project_adapter.build_project_callbacks(
+        project, roots, lambda _service: _stack(tmp_path, arch="aarch64")
+    )
+
+    with pytest.raises(error, match=message):
+        up_project(project, callbacks, roots=roots)
+
+    assert not state.project_paths(roots, project.name).state.exists()
+    assert not state.run_paths(roots, service_run_name(project, "api")).root.exists()
+    assert network_queries == ([["limactl", "network", "list", "--json"]] if network_name == "shared" else [])

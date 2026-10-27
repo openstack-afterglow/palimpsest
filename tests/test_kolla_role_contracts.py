@@ -279,3 +279,51 @@ def test_reader_provisioning_preserves_return_shape_and_verified_least_privilege
     for args in (identity_args, assignment_args):
         assert args["interface"] == "{{ openstack_interface | default('internal') }}"
         assert args["validate_certs"] == "{{ not (openstack_insecure | default(false) | bool) }}"
+
+
+def test_nonroot_hub_policy_config_is_readable_without_exposing_secret_toml():
+    import tomllib
+
+    from jinja2 import Environment, StrictUndefined
+
+    tasks = yaml.safe_load((ROLE_DIR / "tasks" / "config.yml").read_text())
+    templates = {
+        task["ansible.builtin.template"]["src"]: task["ansible.builtin.template"]
+        for task in tasks
+        if "ansible.builtin.template" in task
+    }
+    secret = templates["palimpsest.conf.j2"]
+    assert (secret["owner"], secret["group"], secret["mode"]) == ("root", "root", "0640")
+    readable = templates["policy.conf.j2"]
+    assert readable["dest"] == "{{ palimpsest_config_dir }}/policy/palimpsest.conf"
+    assert (readable["owner"], readable["group"], readable["mode"]) == ("root", "root", "0644")
+    policy_directory = next(
+        task["ansible.builtin.file"]
+        for task in tasks
+        if task.get("ansible.builtin.file", {}).get("path") == "{{ palimpsest_config_dir }}/policy"
+    )
+    assert policy_directory["mode"] == "0755"
+    engine = Environment(undefined=StrictUndefined)
+    engine.filters["to_json"] = json.dumps
+    rendered = engine.from_string((ROLE_DIR / "templates" / "policy.conf.j2").read_text()).render(
+        palimpsest_policy_file="/etc/palimpsest/policy.yaml",
+        palimpsest_policy_dirs=["/etc/palimpsest/policy.d"],
+    )
+    assert tomllib.loads(rendered) == {
+        "oslo_policy": {
+            "policy_file": "/etc/palimpsest/policy.yaml",
+            "policy_dirs": ["/etc/palimpsest/policy.d"],
+        }
+    }
+    assert "password" not in rendered and "database" not in rendered and "keystone" not in rendered
+    image = (REPO_ROOT / "docker" / "hub" / "Dockerfile").read_text()
+    assert "USER palimpsest" in image
+    for name in ("palimpsest_hub_api_service", "palimpsest_hub_worker_service"):
+        service = defaults_yaml[name]
+        assert service["environment"]["PALIMPSEST_CONFIG"] == "/etc/palimpsest/palimpsest.conf"
+        assert "{{ palimpsest_config_dir }}/policy:/etc/palimpsest:ro" in service["volumes"]
+        assert "{{ palimpsest_config_dir }}/palimpsest.conf:/app/palimpsest.conf:ro" in service["volumes"]
+        assert "user" not in service and "group_add" not in service
+    worker = defaults_yaml["palimpsest_hub_build_worker_service"]
+    assert "PALIMPSEST_CONFIG" not in worker["environment"]
+    assert not any("/policy:" in mount or "/palimpsest.conf:" in mount for mount in worker["volumes"])

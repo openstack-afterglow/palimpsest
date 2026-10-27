@@ -28,13 +28,19 @@ from palimpsest_local.buildkit import (
     extract_cache_tar,
     image_arch_for_platform,
     preflight_buildx_oci_exporter,
+    resolve_named_oci_contexts,
     validate_offline_dockerfile,
     validate_online_dockerfile,
 )
 from palimpsest_local.digest import digest_file
 from palimpsest_local.errors import DigestMismatchError, HubError, PalimpsestError, StateError
-from palimpsest_local.oci_layout import MEDIA_TYPE_LAYER_SQUASHFS, ContentStore
-from palimpsest_local.package_reference import LocalPackageReference, read_package_reference, write_package_reference
+from palimpsest_local.oci_layout import MEDIA_TYPE_LAYER_CONFIG, MEDIA_TYPE_LAYER_SQUASHFS, ContentStore
+from palimpsest_local.package_reference import (
+    LocalPackageReference,
+    package_reference_path,
+    read_package_reference,
+    write_package_reference,
+)
 from palimpsest_local.package_source import snapshot_package
 from palimpsest_local.state import init_roots, read_tag_record
 
@@ -144,6 +150,189 @@ def _add_oci_index(layout: Path, manifests: list[dict[str, object]]) -> str:
             separators=(",", ":"),
         ).encode(),
     )
+
+
+def _write_package_context(tmp_path: Path, *, onbuild: bool = False, runtime: bool = False):
+    layout = _write_minimal_oci_layout(tmp_path / "package-layout")
+    layer = io.BytesIO()
+    with tarfile.open(fileobj=layer, mode="w") as archive:
+        payload = b"package application bytes"
+        info = tarfile.TarInfo("app")
+        info.size = len(payload)
+        archive.addfile(info, io.BytesIO(payload))
+    layer_bytes = layer.getvalue()
+    layer_digest = "sha256:" + hashlib.sha256(layer_bytes).hexdigest()
+    config = json.dumps(
+        {
+            "architecture": "amd64",
+            "os": "linux",
+            "rootfs": {"type": "layers", "diff_ids": [layer_digest]},
+            "config": {"OnBuild": ["RUN false"] if onbuild else []},
+        }
+    ).encode()
+    root = _add_oci_descriptor(layout, layer_bytes, config=config)
+    if runtime:
+        runtime_config = json.dumps({"kind": "squashfs", "arch": "x86_64"}).encode()
+        config_digest = _add_oci_blob(layout, runtime_config)
+        root = _add_oci_blob(
+            layout,
+            json.dumps(
+                {
+                    "schemaVersion": 2,
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "config": _oci_descriptor(layout, config_digest, MEDIA_TYPE_LAYER_CONFIG),
+                    "layers": [_oci_descriptor(layout, layer_digest, MEDIA_TYPE_LAYER_SQUASHFS)],
+                }
+            ).encode(),
+        )
+    (layout / "index.json").write_text(
+        json.dumps(
+            {
+                "schemaVersion": 2,
+                "manifests": [_oci_descriptor(layout, root, "application/vnd.oci.image.manifest.v1+json")],
+            }
+        ),
+        encoding="utf-8",
+    )
+    archive = tmp_path / "package.oci.tar"
+    create_deterministic_tar(layout, archive)
+    return layout, archive, root, layer_digest
+
+
+def _retain_package_context(roots, archive: Path, root: str, *, tag: str | None = None):
+    with snapshot_package(archive, manifest=root) as snapshot:
+        record = LocalPackageReference(
+            reference="cloud.example/example-project/example/app" + (f":{tag}" if tag else f"@{root}"),
+            authority="cloud.example",
+            api_base="https://cloud.example/v1",
+            namespace="example-project",
+            package="example/app",
+            archive=str(archive),
+            archive_digest=snapshot.archive_digest,
+            archive_size_bytes=snapshot.archive_size_bytes,
+            root_digest=snapshot.root_digest,
+            package_type=snapshot.package_type,
+            project_id=PROJECT_ID,
+            published_digest=root,
+        )
+    write_package_reference(roots, record)
+    return record
+
+
+def test_package_archive_context_is_frozen_for_solve_and_removed_afterward(tmp_path: Path):
+    roots = init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    layout, archive, root, layer_digest = _write_package_context(tmp_path)
+    source_files = {path.relative_to(layout): path.read_bytes() for path in layout.rglob("*") if path.is_file()}
+    archive_bytes = archive.read_bytes()
+    with resolve_named_oci_contexts([f"base={archive}@{root}"], roots) as contexts:
+        frozen = contexts[0].layout
+        assert frozen != layout
+        spec = _spec(
+            tmp_path, "FROM base\nCOPY app.txt /app.txt\n", local_images=contexts, offline=True, network="none"
+        )
+        buildx = _SuccessfulBuildxRunner(spec)
+
+        def runner(argv, **kwargs):
+            if list(argv)[:3] == ["docker", "buildx", "build"]:
+                assert _option_values(list(argv), "--build-context") == [f"base=oci-layout://{frozen}@{root}"]
+                assert (frozen / "blobs" / "sha256" / layer_digest.split(":", 1)[1]).read_bytes() == source_files[
+                    Path("blobs/sha256") / layer_digest.split(":", 1)[1]
+                ]
+            return buildx(argv, **kwargs)
+
+        build_with_buildkit(spec, roots, runner=runner)
+        assert frozen.is_dir()
+    assert not frozen.exists()
+    assert archive.read_bytes() == archive_bytes
+    assert {path.relative_to(layout): path.read_bytes() for path in layout.rglob("*") if path.is_file()} == source_files
+
+
+def test_retained_context_binds_exact_immutable_receipt_without_mutable_tag_fallback(tmp_path: Path):
+    roots = init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    _, archive, root, _ = _write_package_context(tmp_path)
+    tagged = _retain_package_context(roots, archive, root, tag="latest")
+    reference = tagged.reference.rsplit(":", 1)[0] + "@" + root
+    with pytest.raises(PalimpsestError, match="no native local package reference"):
+        with resolve_named_oci_contexts([f"base={reference}"], roots):
+            pytest.fail("a mutable tag receipt must not authorize an immutable reference")
+    record = _retain_package_context(roots, archive, root)
+    with resolve_named_oci_contexts([f"base={record.reference}"], roots) as contexts:
+        frozen = contexts[0].layout
+        assert contexts[0].manifest_digest == root
+        assert frozen.is_dir()
+    assert not frozen.exists()
+
+
+@pytest.mark.parametrize("field", ["archive_digest", "archive_size_bytes", "package_type", "root_digest", "reference"])
+def test_retained_context_rejects_receipt_identity_or_archive_mismatch(tmp_path: Path, field: str):
+    roots = init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    _, archive, root, _ = _write_package_context(tmp_path)
+    record = _retain_package_context(roots, archive, root)
+    receipt = package_reference_path(roots, record.reference)
+    data = json.loads(receipt.read_bytes())
+    data[field] = {
+        "archive_digest": D_OTHER_IMAGE,
+        "archive_size_bytes": record.archive_size_bytes + 1,
+        "package_type": "runtime-bundle",
+        "root_digest": D_OTHER_IMAGE,
+        "reference": "other.example/example-project/example/app@" + root,
+    }[field]
+    receipt.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(PalimpsestError):
+        with resolve_named_oci_contexts([f"base={record.reference}"], roots):
+            pytest.fail("a mismatched retained receipt must never reach solve")
+
+
+def test_package_context_rejects_same_size_transitive_corruption(tmp_path: Path):
+    roots = init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    layout, archive, root, layer_digest = _write_package_context(tmp_path)
+    layer = layout / "blobs" / "sha256" / layer_digest.split(":", 1)[1]
+    layer.write_bytes(b"x" + layer.read_bytes()[1:])
+    create_deterministic_tar(layout, archive)
+    with pytest.raises(PalimpsestError, match="digest mismatch"):
+        with resolve_named_oci_contexts([f"base={archive}@{root}"], roots):
+            pytest.fail("corrupt package bytes must never reach solve")
+
+
+@pytest.mark.parametrize("source_kind", ["archive", "retained", "directory", "indexed-directory"])
+@pytest.mark.parametrize("kind", ["onbuild", "runtime"])
+def test_package_context_rejects_non_buildable_packages_before_solve(tmp_path: Path, source_kind: str, kind: str):
+    roots = init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    layout, archive, root, _ = _write_package_context(tmp_path, onbuild=kind == "onbuild", runtime=kind == "runtime")
+    if source_kind == "retained":
+        source = _retain_package_context(roots, archive, root).reference
+    elif source_kind == "archive":
+        source = f"{archive}@{root}"
+    else:
+        if source_kind == "indexed-directory":
+            root = _add_oci_index(layout, [_oci_descriptor(layout, root, "application/vnd.oci.image.manifest.v1+json")])
+        source = f"{layout}@{root}"
+    with pytest.raises(PalimpsestError, match="OnBuild triggers|oci-image"):
+        with resolve_named_oci_contexts([f"base={source}"], roots):
+            pytest.fail("non-buildable packages must never reach solve")
+
+
+def test_package_context_selected_layout_index_keeps_exact_bytes_and_exception_cleanup(tmp_path: Path):
+    roots = init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    layout, archive, _, _ = _write_package_context(tmp_path)
+    root = digest_file(layout / "index.json")
+    index_bytes = (layout / "index.json").read_bytes()
+    with pytest.raises(RuntimeError, match="solve failed"):
+        with resolve_named_oci_contexts([f"base={archive}@{root}"], roots) as contexts:
+            frozen = contexts[0].layout
+            assert (frozen / "blobs" / "sha256" / root.split(":", 1)[1]).read_bytes() == index_bytes
+            raise RuntimeError("solve failed")
+    assert not frozen.exists()
+    assert not (layout / "blobs" / "sha256" / root.split(":", 1)[1]).exists()
+
+
+def test_resolver_preserves_existing_directory_context_behavior(tmp_path: Path):
+    roots = init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    layout = _write_minimal_oci_layout(tmp_path / "base-layout")
+    root = _add_oci_descriptor(layout, b"existing opaque layer bytes")
+    with resolve_named_oci_contexts([f"base={layout}@{root}"], roots) as contexts:
+        assert contexts == (NamedOCIContext.parse(f"base={layout}@{root}"),)
+    assert layout.is_dir()
 
 
 def _spec(

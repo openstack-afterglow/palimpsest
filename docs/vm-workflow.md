@@ -27,12 +27,17 @@ guest VM
 A layer never grows the guest device count per Dockerfile instruction: one
 built layer is one SquashFS artifact, attached once.
 
+The external-volume alternative keeps immutable blobs, RO layer mounts and writable
+runtime mountpoints beneath `/srv/palimpsest`; private upper/work live on each
+consumer's boot disk (or explicitly owned writable scratch), never in that store.
+
 ## Platforms and backends
 
 | Host | Backend | Image arch | Layer attachment |
 |---|---|---|---|
 | macOS arm64 | `lima-vz` (default) | `aarch64` | SquashFS copied into the guest, loop-mounted read-only |
 | macOS arm64 | `libvirt-hvf` (experimental) | `aarch64` | QEMU/HVF via `qemu:///session`, SLIRP `hostfwd` |
+| macOS arm64 | `lima-krunkit` (experimental) | `aarch64` | SquashFS copied into the guest; virtio-gpu Venus Vulkan to host Metal |
 | Linux x86_64 | `kvm` | `x86_64` | Read-only `virtio-blk` disks `vdb`..`vdz` |
 | Linux aarch64 | `kvm` | `aarch64` | Read-only `virtio-blk` disks `vdb`..`vdz` |
 
@@ -50,6 +55,8 @@ device. UEFI variables live under the owned run tree and are removed with
 `palimpsest rm NAME --volumes`; the network does not need a libvirt `default`
 network. This is a conventional cloud-image path, not Linux OCI-root.
 
+For macOS GPU acceleration on Linux guests, pass `--backend lima-krunkit` explicitly. It launches via `krunkit` and `libkrun`, exposing a `virtio-gpu` device whose Vulkan calls are remoted to host Metal via Mesa Venus. Default selection (`auto`) remains `lima-vz`; direct Hypervisor.framework integration remains an optional alternative if libvirt is bypassed. This does not expose CUDA or the Apple Neural Engine to Linux guests.
+
 The first boot emits readiness after project initialization and records a
 bootstrap marker. Guest helpers write to the serial port captured by libvirt:
 `/dev/ttyS0` for x86_64, `/dev/ttyAMA0` for aarch64. `/dev/console` may
@@ -62,6 +69,90 @@ If the guest was bootstrapped and then cloud-init was disabled with
 readiness after layer activation. The fallback does not cover other methods
 of disabling cloud-init. Attaching the cloud-final-dependent unit directly
 to `multi-user.target` creates an ordering cycle on Ubuntu.
+
+## External-volume runtime provider workflow
+
+`palimpsest layer cloud-init --config runtime.json` exports guest boot policy;
+it does not create a Nova VM, allocate storage, attach a volume, download Hub
+blobs, or configure user accounts. The local `palimpsest run` workflow in the
+numbered sections below remains separate. See the
+[manifest contract and example](cli/usage.md#external-copy-on-write-runtime-user-data)
+for the complete input schema.
+
+Acquire and convert reusable OCI inputs with the explicit
+[`oci cache --root PATH` persistent cache](registry-intake.md#permanent-shared-layer-cache)
+before preparing consumer storage. It keeps source blobs, derived recipes and
+consumer records after the last release. A writable CephFS acquisition cache or
+single-writer RBD filesystem is not the finalized read-only multiattach volume;
+do not write a live consumer ext4 store to add another image. This command does
+not add Manila guest mounting or automatic Nova attachment.
+
+For a provider-managed cloud VM:
+
+1. Pack and qualify the native runtime and its dependencies as SquashFS layers
+   for the chosen base image and `x86_64` or `aarch64` guest. A matching CPU
+   architecture alone does not establish ABI, GPU, CUDA, Vulkan, driver, or
+   kernel compatibility. Include explicit runtime checks in the manifest.
+2. With external provider/storage tooling, create and populate an ext4 block
+   volume. Place each blob at `blobs/sha256/<hex>` relative to that filesystem's
+   root and record its actual canonical filesystem UUID. Blob files must be
+   regular, not symlinks, and match their SHA-256 names. Preserve root ownership
+   and protect the volume from untrusted writers. This version selects
+   externally managed **Cinder block storage**, not a Manila share; no Cinder,
+   Nova, or Manila provisioning backend is implemented by the exporter.
+   For a Cinder multiattach store, finalize a clean immutable filesystem and
+   precreate root-owned, non-group/world-writable `blobs/sha256`,
+   `layers/<hex>` and `runtimes/<name>` directories. Layer/stack mountpoints
+   must be empty. Set manifest `storage_read_only: true` and make **all**
+   provider attachments block-level read-only before either guest boots.
+   No writable guest or external writer may share that filesystem. This uses
+   `ro,noload,nosuid,nodev`, not clustered writable ext4; `noload` must not
+   substitute for clean filesystem preparation. Each guest has private boot-disk
+   upper/work, overlay mount state, native configuration, homes and caches.
+3. Write the manifest with that UUID, base-to-top layer digests, named stacks,
+   explicit exported subtrees beneath `/opt` or `/usr/local`, PATH directories,
+   library directories, and checks. Any activation/check argv is trusted
+   operator-authored root boot policy, not an instruction taken from Hub
+   metadata. Keep secrets and SSH account policy outside this manifest.
+4. Generate a new user-data fragment:
+
+   ```sh
+   palimpsest layer cloud-init --config ./runtime.json --output ./runtime-cloud-init.yaml
+   ```
+
+   Compose its `write_files` and boot commands with your independently managed
+   cloud-init account/SSH configuration, using proper cloud-init YAML merging
+   or MIME composition rather than concatenating YAML documents or replacing
+   the generated lists. The exporter itself includes no users or credentials.
+5. Use external Nova/provider tooling to create the VM with the composed
+   user-data and attach the prepared volume as a data disk available on first
+   boot. Select a cloud image with cloud-init, systemd, ext4, SquashFS,
+   OverlayFS, loop-device support, and the required native runtime prerequisites.
+   Do not expect this command to install missing guest packages or create the
+   external filesystem.
+6. Watch the provider console for activation/check failures. After successful
+   activation, use an ordinary first SSH login and run the configured tools
+   directly. No sudo/chroot wrapper, manual environment-entry script, or
+   home-directory runtime root is needed.
+
+At boot, `/srv/palimpsest` is mounted by filesystem UUID without formatting.
+Verified blobs become read-only `nosuid,nodev` SquashFS mounts at
+`/srv/palimpsest/layers/<hex>`; writable OverlayFS stacks appear at
+`/srv/palimpsest/runtimes/<name>` with the top layer first in the lowerdir list
+and consumer-private same-filesystem upper/work under `/var/lib/palimpsest/consumer`.
+Only explicitly declared root-owned prefixes bind-export that writable merged
+view into the guest's native filesystem. PATH registration
+covers login shells and interactive Bash; library directories are registered
+with `ldconfig`, so native executables do not depend on an SSH wrapper.
+
+The runtime systemd service requires the external mount and runs the trusted
+activation commands followed by checks. SSH daemon activation/login requires
+successful runtime activation; the socket may listen earlier without enabling
+login. Missing storage, bad digests, architecture
+mismatch, failed checks, or unknown/conflicting mounts fail closed rather than
+silently offering a partially configured login. Keep provider-console recovery
+available. On restart, activation verifies existing mount identities and does
+not adopt unrelated exports, repair storage, or format the volume.
 
 ## 1. Import a base image
 
@@ -119,6 +210,15 @@ The build runs in a disposable guest: `--network none` (the default) gives the
 builder no interface, and `--network default` attaches the named network for
 recipes that install packages. Output is a verified SquashFS blob in the content
 store plus a tag; the command prints the layer digest.
+
+The layer descriptor and build record retain `arch` from the verified base
+(`aarch64` here), including Lima/macOS builds. Commit output uses the recorded
+guest base too. Known foreign-architecture parents are refused before a build
+or VM launch. BuildKit runtime packs retain their chosen `--platform`; the
+host architecture is never substituted for that target. `palimpsest store ls
+--compatible` lists complete local chains matching this client, and
+`palimpsest store check hello-vm-layer` explains incompatible or unknown
+dependencies without booting a VM. See the [full metadata-check contract](cli/usage.md#target-architecture-and-client-compatibility).
 
 Layer digests are content-addressed but not reproducible across runs:
 `mksquashfs` records image creation time. Verify a layer by its returned digest

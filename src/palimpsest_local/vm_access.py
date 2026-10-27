@@ -17,7 +17,7 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from . import lima, runtime_dispatch, state
+from . import lima, platforms, runtime_dispatch, state
 from .errors import PalimpsestError
 from .process_session import bind_process_session_context, spawn_process_session
 from .runtime_types import ExpectedRunIdentity, ProcessOutputEvent, ProcessStatusEvent, ProcessStream
@@ -44,7 +44,7 @@ def capabilities(row: dict, *, live: bool = True, collision: bool = False) -> di
         reason, message = "unobserved", "Live VM identity has not been observed"
     elif row.get("stale") or collision:
         reason, message = "identity", "VM identity is stale or collides with a selected run"
-    elif row.get("backend") == "lima-vz":
+    elif row.get("backend") in platforms.LIMA_BACKENDS:
         if not row.get("managed") and row.get("run_id") is None:
             reason, message = "identity", "Unmarked external Lima identity cannot be authenticated"
         else:
@@ -109,15 +109,13 @@ def _instance(name: str) -> dict:
         if len(matches) != 1:
             raise ValueError
         instance = matches[0]
-        config = instance.get("config")
-        vm_type = instance.get("vmType") or (config.get("vmType") if isinstance(config, dict) else None)
-        if vm_type != "vz":
+        if lima.instance_backend(instance) is None:
             raise ValueError
         # Strict parser rejects malformed markers, including ones hidden by observation.
         lima._instance_run_id(instance)
         return instance
     except (ValueError, UnicodeError, PalimpsestError):
-        raise VMAccessError("identity", "Current Lima VZ identity is unavailable") from None
+        raise VMAccessError("identity", "Current Lima identity is unavailable") from None
 
 
 def _directory(instance: dict) -> str:
@@ -143,7 +141,7 @@ class _AuthenticatedLimaSession:
         self._pending = b""
         self._pending_stream = ProcessStream.STDOUT
         self._consumed = False
-        timer = threading.Timer(5, session.close)
+        timer = threading.Timer(PROBE_TIMEOUT_SECONDS, session.close)
         timer.daemon = True
         timer.start()
         try:
@@ -174,6 +172,7 @@ class _AuthenticatedLimaSession:
                 self._pending_stream = event.stream
                 return
             pending = pending[-len(marker) :]
+        self._check()
         raise VMAccessError("transport", "Cannot authenticate VM transport")
 
     @property
@@ -254,7 +253,7 @@ class Access:
                 raise VMAccessError("identity", "Selected VM identity changed")
             if (
                 row["status"] == "running"
-                and row["backend"] != "lima-vz"
+                and row["backend"] not in platforms.LIMA_BACKENDS
                 and record.dispatch_key.runtime_kind.value == "cloud-image"
             ):
                 paths = state.run_paths(roots, record.name)
@@ -274,7 +273,8 @@ class Access:
     def _check(self, path, identity, *, running):
         current = _instance(self.row["name"])
         if (
-            _directory(current) != path
+            lima.instance_backend(current) != self.row["backend"]
+            or _directory(current) != path
             or lima._instance_run_id(current) != self.row.get("run_id")
             or _safe_stat(os.stat(path, follow_symlinks=False)) != identity
         ):
@@ -288,7 +288,9 @@ class Access:
     def _lima_authority(self, *, running=True):
         with ExitStack() as resources:
             first = _instance(self.row["name"])
-            if lima._instance_run_id(first) != self.row.get("run_id"):
+            if lima.instance_backend(first) != self.row["backend"] or lima._instance_run_id(first) != self.row.get(
+                "run_id"
+            ):
                 raise VMAccessError("identity", "Lima VM identity changed")
             path = _directory(first)
             fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
@@ -299,7 +301,7 @@ class Access:
 
     def open(self, mode="shell", argv=(), *, probe=False):
         self._require_running()
-        if self.row["backend"] != "lima-vz":
+        if self.row["backend"] not in platforms.LIMA_BACKENDS:
             identity = ExpectedRunIdentity(self.record.name, self.record.run_id, self.record.dispatch_key)
             if mode == "shell":
                 return runtime_dispatch.shell(self.row["name"], roots=self.roots, expected_identity=identity)
@@ -356,7 +358,7 @@ class Access:
         if self.row["status"] == "running":
             data = self.probe(("sudo", "-n", "journalctl", "--no-pager", "--quiet", "-n", str(tail), "-o", "short-iso"))
             return {"log": data.decode("utf-8", "replace"), "source": "guest-journal", "truncated": False}
-        if self.record is not None and self.row["backend"] != "lima-vz":
+        if self.record is not None and self.row["backend"] not in platforms.LIMA_BACKENDS:
             console = state.open_pinned_run_console(self.roots, self.record)
             try:
                 console.current_status()
@@ -376,7 +378,7 @@ class Access:
                 }
             finally:
                 console.close()
-        if self.row["backend"] != "lima-vz":
+        if self.row["backend"] not in platforms.LIMA_BACKENDS:
             raise VMAccessError("stopped", "Guest journal is unavailable while the VM is stopped")
         # Native Lima's fixed serial console, never a guessed home/instance path.
         with self._lima_authority(running=False) as (directory, check):

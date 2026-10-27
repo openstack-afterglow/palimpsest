@@ -249,7 +249,8 @@ def test_cross_process_claims_have_one_winner(disks):
     assert len(volumes.list_named_volumes(roots)[0]["attachments"]) == 1
 
 
-def test_lima_precreation_formats_once_and_attachment_never_requests_mkfs(disks, tmp_path, monkeypatch):
+@pytest.mark.parametrize("backend", ["lima-vz", "lima-krunkit"])
+def test_lima_precreation_formats_once_and_attachment_never_requests_mkfs(disks, tmp_path, monkeypatch, backend):
     roots, runner, formats, _ = disks
     home = tmp_path / "lima"
     monkeypatch.setenv("LIMA_HOME", str(home))
@@ -269,12 +270,17 @@ def test_lima_precreation_formats_once_and_attachment_never_requests_mkfs(disks,
 
     monkeypatch.setattr(volumes.physical, "ensure_lima_volume", ensure)
     monkeypatch.setattr(volumes.physical, "list_lima_disks", lambda **kwargs: tuple(native.values()))
-    row = create(disks, backend="lima-vz")
+    row = create(disks, backend=backend)
+    sibling_backend = "lima-krunkit" if backend == "lima-vz" else "lima-vz"
+    with pytest.raises(StateError, match="shared backend namespace"):
+        create(disks, backend=sibling_backend)
+    assert len(volumes.list_named_volumes(roots)) == 1
+    assert len(formats) == 1
     attachment = volumes.reserve_named_volumes(
         roots,
         name="lima-first",
         run_id="pending-lima",
-        backend="lima-vz",
+        backend=backend,
         intents=(RunVolumeIntent("data", "/srv/data", read_only=True),),
         runner=runner,
     )[0]
@@ -283,6 +289,18 @@ def test_lima_precreation_formats_once_and_attachment_never_requests_mkfs(disks,
     assert attachment.host_path is None and attachment.read_only and not attachment.format
     disk = Path(native[attachment.backend_name].directory) / "datadisk"
     assert volumes.physical._has_ext4_superblock(disk, expected_label="lima-" + attachment.backend_name)
+    assert len(formats) == 1
+    with pytest.raises(StateError, match="already reserved"):
+        volumes.reserve_named_volumes(
+            roots,
+            name="lima-second",
+            run_id="pending-other",
+            backend=backend,
+            intents=(RunVolumeIntent("data", "/srv/data"),),
+            runner=runner,
+        )
+    volumes.release_named_volume_reservations(roots, name="lima-first", run_id="pending-lima", runner=runner)
+    assert volumes.list_named_volumes(roots)[0]["status"] == "available"
     assert len(formats) == 1
 
 

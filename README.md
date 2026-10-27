@@ -8,40 +8,45 @@ run state, and build records live
 under XDG state directories. The base package has no required Python runtime
 dependencies; Linux KVM support is an opt-in extra.
 
+The cloud-service goal is distinct from this local execution mode: deploy the
+reviewed Palimpsest services through Kolla-Ansible, control them externally via
+authenticated APIs, and prove actual server-owned build and consumer execution.
+External users do not need infrastructure-node SSH. Local SDK/SSH experiments
+are not deployed-service acceptance; see the [control-plane boundaries](ARCHITECTURE.md#cloud-service-goal-and-control-planes).
+
 ## Status
 
-- **macOS Apple Silicon:** supported default runtime through Lima 2.1+ and VZ (`lima-vz`); QEMU/libvirt Hypervisor.framework (`libvirt-hvf`) is experimental.
+- **macOS Apple Silicon:** supported default runtime through Lima 2.1+ and VZ (`lima-vz`); QEMU/libvirt Hypervisor.framework (`libvirt-hvf`) and Lima krunkit Vulkan GPU (`lima-krunkit`) are experimental.
 - **Linux:** supported libvirt/KVM runtime for conventional cloud-image VMs on `x86_64` and `aarch64`; the OCI-root runtime is narrower and supports Linux `x86_64`/`amd64` KVM only.
 - **Declarative projects:** a strict `palimpsest.yml` workflow reconciles multiple VM services with dependencies, environment, typed cloud-init, persistent block volumes, networks, and Lima TCP forwarding.
-- **Release baseline:** 0.3.5 was released on 2026-10-14 from protected dev merge `04d51ad6e1bf00c4b6e5bf82050383d0bb0a10cf`, including preserved local/client and distributed export work. PyPI/GHCR publication and production Hub/build-worker rollout are recorded in [release receipts](docs/testing.md#full-source-035-integration--local-verification); native KVM proof was skipped by repository policy, not performed. Historical live pins and receipts remain bound to their dated snapshots; see [deployment boundaries](docs/install.md) and [development status](#development).
+- **Release source:** 0.3.10 integrates the remaining public cloud, cache, compatibility and service-policy work on released0.3.9 (`5c0fef0604ca631bef40ed505a0d02d742ccba9a`). It preserves the HTTPS build worker, HA/readiness, catalog/unpack and journal-integrity releases. Publication, operator package selection and actual Kolla rollout are separate gates; see the [latest handoff](docs/development-handoff.md).
 
 ## Install from PyPI
 
 Requires Python 3.11 or newer. Prefer an isolated uv tool, or a pip virtual environment:
 
 ```sh
-uv tool install --python 3.11 "palimpsest-client==0.3.5"
+uv tool install --python 3.11 "palimpsest-client==0.3.10"
 palimpsest --version
 
 # Alternative: pip, without modifying the system Python.
 python3.11 -m venv .venv
-.venv/bin/python -m pip install "palimpsest-client==0.3.5"
+.venv/bin/python -m pip install "palimpsest-client==0.3.10"
 .venv/bin/palimpsest --version
 ```
 
 If uv's tool directory is not on `PATH`, run `uv tool update-shell` explicitly
 and open a new terminal. One-off use: `uvx --python 3.11 --from
-palimpsest-client==0.3.5 palimpsest --version`.
+palimpsest-client==0.3.10 palimpsest --version`.
 
-The published 0.3.5 package includes the integrated local/client behavior.
-Hub services are separate and must be deployed as reviewed API and worker
-images; updating the root wheel alone does not update running Kolla containers.
+Root client installation and Hub service deployment are separate. API, export
+worker and build-worker images must match the reviewed release; updating the
+root wheel alone does not update running Kolla containers.
 
-The commands above target released 0.3.5. Current publication and production
-receipts are in [testing](docs/testing.md#full-source-035-integration--local-verification).
-The dated 0.3.3 operator installation and image receipts remain in the
-[handoff](docs/development-handoff.md#pypi-operator-transition-and-read-only-cloud-prerequisites);
-they are historical, not current production state.
+The commands above select version0.3.10 after its formal publication. Check the
+[release handoff](docs/development-handoff.md) for actual PyPI/image receipts and
+the deployment-server package/lock selection. Older release and production
+receipts remain historical and do not establish the currently running version.
 
 ### Use a trusted source checkout
 
@@ -217,7 +222,7 @@ docker build --file docker/hub/Dockerfile --target palimpsest-hub-build-worker .
 
 ### Client Hub Configuration
 
-Legacy Hub artifact CLI commands use a base URL (`PALIMPSEST_URL` or `--url`) and the original Keystone token from `PALIMPSEST_TOKEN` over `X-Auth-Token`. This token is separate from native package/cache keys and cannot authorize BuildKit-cache writes. Keep credentials in approved secret handling, not documentation, shell history or state files. Hub token validation requires a separate read-only Keystone validator identity; package access additionally requires protected project/principal policy and fresh owner membership checks. See [Hub service settings](docs/install.md#hub-service-settings).
+Legacy Hub artifact CLI commands use a base URL (`PALIMPSEST_URL` or `--url`) and the original Keystone token from `PALIMPSEST_TOKEN` over `X-Auth-Token`. This token is separate from native package/cache keys and cannot authorize BuildKit-cache writes. Keep credentials in approved secret handling, not documentation, shell history or state files. Token validation uses a separate read-only Keystone validator. Ordinary package owners retain protected-principal and fresh membership checks; human native package/layer/build administration instead accepts a freshly verified `system:all` administrator without target membership/service leaves. `X-Project-Id` always asserts the original caller project; `X-Target-Project-Id` independently selects an administrator's logical target, never a replacement provider scope. See [Hub service settings](docs/install.md#hub-service-settings) and [the native registry contract](docs/project-package-registry.md#31-original-identity-and-explicit-human-administration).
 
 ```sh
 export PALIMPSEST_URL="http://hub.example:8020"
@@ -262,6 +267,8 @@ palimpsest registry add hub packages.example.invalid \
 
 Native transport verifies the system CA trust plus profile `--ca` files and refuses redirects; mirrors, plain HTTP, TLS-skip and Docker cache exporters are not supported. A project member with current Palimpsest publish and keys-editor capabilities uses the original project-scoped token to register the operator-bound namespace and issue a secret-once key scoped to exact packages/actions. Plain member/reader roles do not grant service authority; see the [capability matrix and isolated HTTP smoke](docs/project-package-registry.md#3-identity-and-authorization). Native login checks `/auth/me` before saving that key through an **installed** Docker credential helper at `api_base.rstrip('/') + '/projects/' + namespace` (exact `credHelpers` entry, then `credsStore`, with no host-only/plaintext fallback). `--username` must match the key's public UUID; secrets enter through `--password-stdin` or a prompt. An ephemeral `PALIMPSEST_PACKAGE_KEY` can instead serve the native client, never the legacy runtime client.
 
+Verified personal-project owners are the project-local exception: native services re-read the exact owner marker, enabled native `Personal` domain/user/home/project and direct member provenance, then allow project package/cache/own-key actions through operator policy without extra Keystone roles. Original personal humans may also delete their exact-project package metadata through the existing endpoint after fresh original-token/owner/provenance/policy checks, without deleting shared CAS bytes. Ordinary members and keys cannot delete packages; operator deny, delegated key/package ceilings and system-only shared artifact deletion/build/settings boundaries still apply.
+
 Native `build --output ARCHIVE` produces a verified OCI export and typed, immutable-byte-bound local reference, not a Docker image. Deferred `push` reads that reference; `push --input LAYOUT_OR_ARCHIVE --manifest sha256:...` can supply another source (manifest required for multiple roots). Native `pull --output ARCHIVE` downloads and verifies original bytes without `docker load`. Receipts are owner-only under `state/package-references/`; frozen exports are under `state/package-artifacts/`, separate from SquashFS runtime tags. Native transfers reject `--all-tags`/`--platform`; native builds reject `--load`/external Docker caches and native `tag` is not supported.
 
 See [registry profiles](docs/registries.md) for the complete secret-once login → build → push → pull flow. Its `cloud.dmslab.re.kr/openstack-afterglow/test:v1` example remains conditional on operator binding and deployment of the separate Afterglow key gateway. The [isolated container acceptance](docs/project-package-registry.md#docker-backed-registered-http-acceptance) exercised the scoped native routes on arm64 and amd64 with persistent SQLite/blob bytes and synthetic current Keystone; it is not production deployment, canonical database/lifespan, cloud or KVM qualification.
@@ -280,13 +287,29 @@ palimpsest image import ./ubuntu-24.04-server-cloudimg-arm64.img \
   --disk-format qcow2 --arch aarch64 --os-variant ubuntu-24.04
 
 # Create and publish a layer.
-palimpsest layer pack ./rootfs --tag app-v1
+palimpsest layer pack ./rootfs --tag app-v1 --arch aarch64
 palimpsest layer push app-v1 --base-image sha256:<image-digest>
 
 # Download or inspect an OCI-layout bundle.
 palimpsest bundle pull sha256:<leaf-layer-digest> --include-base --output ./bundle
 palimpsest bundle verify ./bundle
 ```
+
+VM builds and commits record the guest base architecture on each layer; they
+do not label cross-platform outputs from the host CPU. Filter the local store
+or Hub inventory for the current client, or inspect a whole dependency chain:
+
+```sh
+palimpsest store ls --compatible --format json
+palimpsest image ls --compatible
+palimpsest layer ls --compatible
+palimpsest store check app-v1 --backend lima-krunkit
+palimpsest layer check sha256:<leaf-layer-digest>
+```
+
+Legacy unlabelled layers remain `unknown`, not implicitly portable. Platform
+compatibility does not prove GPU support or successful boot; see the
+[architecture and compatibility contract](docs/cli/usage.md#target-architecture-and-client-compatibility).
 
 Local artifacts live below the selected state root. Ordinary Linux users and
 macOS default to `~/.local/state/palimpsest`; Linux root and the dedicated
@@ -305,6 +328,9 @@ runtime-packs/ base/platform/packer-bound SquashFS conversion indexes
 tags/        local layer tags
 transfers/   Hub transfer progress
 ```
+
+
+Native OpenStack builds are explicit: `palimpsest build --executor nova --nova-config ./nova-build.json -t runtime-layer` uses Nova's selected GPU flavor and original cloud-init, not nested libvirt on the Mac. The internal worker records checked outputs and canonical registry layers on retained storage; `palimpsest cloud` exposes permanent assets, inspection and immutable-lower/private-writable consumer preparation. Each external runtime stack now has its own consumer-local upper/work, never in a shared lower store. Install the reviewed working source with `.[cloud]` and follow the [Nova/worker workflow](docs/cli/workflows.md#9-native-nova-builds-and-internal-layer-workers). This is an unreleased path; historical GPU results and current qualification limits are recorded separately in the development handoff.
 
 ## Dockerfile cache and runtime-block workflow
 
@@ -330,6 +356,13 @@ The explicit anonymous `oci pull` command remains available. See the
 [anonymous registry intake contract](docs/registry-intake.md) and
 [Docker Hub compatibility](docs/oci-docker-hub-compatibility.md) for the
 digest-preserving local-archive workflow and its real-image verification scope.
+
+Repeated image acquisition can use the explicit
+[`oci cache --root PATH` permanent shared cache](docs/registry-intake.md#permanent-shared-layer-cache)
+on already mounted CephFS or a single-writer RBD/Cinder filesystem. It reuses
+compressed layer digests and qualified SquashFS recipes, records consumers and
+keeps bytes even after their last release. Cache initialization, storage
+provisioning and immutable guest runtime exports are separate operations.
 
 OCI-root runs accept an explicit `--user USER[:GROUP]` (name or canonical
 numeric ID), for example `palimpsest run ./redis.oci.tar --name redis-demo
@@ -422,6 +455,21 @@ palimpsest rm ubuntu-hvf --volumes
 ```
 
 This does not enable the Linux-only OCI-root runtime on macOS.
+
+### Hardware accelerator on macOS (Vulkan GPU via krunkit)
+
+Apple's [ParavirtualizedGraphics framework](https://developer.apple.com/documentation/paravirtualizedgraphics) accelerates macOS guests. For Linux guests on Apple Silicon, experimental `--backend lima-krunkit` runs a lightweight VM through `krunkit` and `libkrun`, exposing a `virtio-gpu` device to the guest. Mesa's Venus Vulkan driver remotes compute commands to the host Apple Silicon GPU via Metal:
+
+```sh
+brew tap slp/krun
+brew install krunkit
+
+palimpsest run sha256:<image-digest> --name fedora-gpu \
+  --memory 4096 --vcpus 2 --backend lima-krunkit
+limactl shell fedora-gpu
+```
+
+Direct Hypervisor.framework integration remains an optional alternative if libvirt is bypassed; default selection (`auto`) remains `lima-vz`. This does not expose CUDA or the Apple Neural Engine to Linux guests.
 
 A macOS build uses a disposable Lima guest and produces the same portable SquashFS layer artifact used by the content store:
 
@@ -710,7 +758,7 @@ Pressing `<Tab><Tab>` completes commands, subcommands, and flags directly matchi
 
 - `palimpsest <Tab><Tab>` → suggests top-level command groups (`image`, `layer`, `bundle`, `build`, `run`, `compose`, `web`, `store`, etc.)
 - `palimpsest image <Tab><Tab>` → suggests subcommands (`inspect`, `history`, `rm`, `save`, `load`, `ls`, `pull`, `verify`, `import`, `push`)
-- `palimpsest run --backend <Tab><Tab>` → suggests backend choices (`auto`, `kvm`, `lima-vz`, `libvirt-hvf`)
+- `palimpsest run --backend <Tab><Tab>` → suggests backend choices (`auto`, `kvm`, `lima-vz`, `libvirt-hvf`, `lima-krunkit`)
 - `palimpsest docker <Tab><Tab>` → native Docker commands and descriptions
 - `palimpsest docker run --<Tab><Tab>` → native run options and descriptions
 - `palimpsest docker buildx build --p<Tab>` → installed Buildx options
@@ -718,6 +766,28 @@ Pressing `<Tab><Tab>` completes commands, subcommands, and flags directly matchi
 Use `palimpsest docker run --help` for the installed Docker version's full help.
 Docker completion requires a CLI supporting `__complete`; it does not install
 Docker, start a daemon, or turn Docker containers into Palimpsest VMs.
+
+## Performance benchmarks
+
+`palimpsest benchmark local` measures explicit regular-file disk and external/internal
+network targets. `palimpsest benchmark openstack` API-verifies an exact owned Nova
+guest and measures inside it. `benchmark workflow` requires this qualification before
+all five installation/build/import/allocation/Ansible methods, and emits success-only
+tables/HTML plus a separate issue report. `benchmark submit/worker/status` supports a
+private always-on controller queue without automatic resource allocations or replay.
+See [benchmark contracts and controller operation](docs/benchmarks.md). Disk results
+describe the measured filesystem/Cinder path, not physical Ceph OSD throughput.
+
+The completed two-node k3s comparison is recorded in the
+[existing measurement report](https://app.notion.com/p/403067c015d0816ebcb9c2e5fd58eaec)
+with native tables and a self-contained scope HTML. Five selected same-event
+server-request→full-workload intervals are available, n1 each; the new Ansible
+case's raw execution remains **failed after proof**, while its already-closed
+workload interval was independently adjudicated valid after local cleanup.
+Original failed/N/A histories and preparation/consumer/first-use clocks stay
+separate. Final cleanup left0 experiment VMs and four retained read-only16GiB
+payload stores; see the dated evidence/limits in the benchmark documentation.
+These observations are not variance, SLA, VM-reboot or OCI-container parity claims.
 
 ## Development
 

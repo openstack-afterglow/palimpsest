@@ -27,6 +27,7 @@ from palimpsest_hub.api.hub import (
     _registration_conflicts,
     _run_blocking,
     _store_or_503,
+    _validate_arch_dependencies,
     _visible_filter,
 )
 from palimpsest_hub.config import get_settings
@@ -125,6 +126,13 @@ async def _inputs(session, store, job: PalimpsestHubBuild) -> list[PalimpsestHub
         ):
             raise HTTPException(status_code=409, detail="invalid build input chain")
         previous = layer.blob_digest
+    await _validate_arch_dependencies(
+        session,
+        arch=base.arch,
+        parent_digest=layers[-1].blob_digest if layers else None,
+        base_image_digest=base.blob_digest,
+        token_info={"project_id": job.project_id},
+    )
     if "sha256:" + hashlib.sha256(job.recipe.encode()).hexdigest() != job.recipe_digest:
         raise HTTPException(status_code=409, detail="build recipe changed")
     return rows
@@ -322,13 +330,14 @@ async def upload_output(build_id: str, lease: str, request: Request, expected: s
                         raise HTTPException(status_code=409, detail="completed build output conflicts")
                     return job
                 job = await _live(session, build_id, lease)
+                base, *_ = await _inputs(session, store, job)
                 parent = job.layer_digests[-1] if job.layer_digests else None
                 meta = HubLayerMeta(
                     name=job.name,
                     kind="squashfs",
                     parent_digest=parent,
                     base_image_digest=job.base_digest,
-                    arch="x86_64",
+                    arch=base.arch,
                 )
                 existing = await session.scalar(
                     select(PalimpsestHubLayer).where(PalimpsestHubLayer.blob_digest == expected)

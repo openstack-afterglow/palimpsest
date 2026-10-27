@@ -18,7 +18,7 @@ from pathlib import Path
 from urllib.parse import urlencode, urlsplit
 
 from fastapi import HTTPException
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 
 # Reuse the existing cancellation-safe bounded filesystem workers and sorted flock protocol.
@@ -29,7 +29,14 @@ from palimpsest_hub.api.hub import (
     _run_blocking,
     _wait_without_releasing,
 )
-from palimpsest_hub.auth import package_actions, package_capabilities, validate_package_owner
+from palimpsest_hub.auth import (
+    get_package_member_info,
+    package_target_project_id,
+    revalidate_package_admin,
+    validate_admin_key_owner,
+    validate_package_owner,
+    validate_token,
+)
 from palimpsest_hub.config import default_project_namespace, get_settings, validate_keystone_id
 from palimpsest_hub.database import get_session_factory
 from palimpsest_hub.models import (
@@ -51,6 +58,7 @@ from palimpsest_hub.package_dto import (
     canonical_namespace,
     canonical_package,
 )
+from palimpsest_hub.policy import KEY_ACTIONS, capabilities_for
 from palimpsest_hub.services.blob_references import blob_referenced
 from palimpsest_hub.services.catalog import search_pattern
 from palimpsest_hub.services.hub_store import (
@@ -110,6 +118,8 @@ def store():
 
 def require_policy(member=None):
     settings = get_settings()
+    if member is not None and member.get("is_package_system_admin"):
+        return settings
     try:
         projects = settings.palimpsest_hub_package_forbidden_project_ids
         users = settings.palimpsest_hub_package_forbidden_user_ids
@@ -122,11 +132,7 @@ def require_policy(member=None):
     if member is not None:
         if validate_keystone_id(member["project_id"]) in projects or validate_keystone_id(member["user_id"]) in users:
             raise RegistryError(403, "ADMIN_CREDENTIAL_FORBIDDEN", "protected principals cannot use package authority")
-        if member.get("is_system_admin") or {str(r).lower() for r in member.get("roles", [])} & {
-            "admin",
-            "manager",
-            "service",
-        }:
+        if member.get("is_system_admin") or {str(role).casefold() for role in member.get("roles", [])} & {"service"}:
             raise RegistryError(403, "ADMIN_CREDENTIAL_FORBIDDEN", "administrator or service authority forbidden")
     return settings
 
@@ -141,6 +147,8 @@ class Actor:
     actions: tuple[str, ...] = ()
     credential: str | None = field(default=None, repr=False)
     capabilities: frozenset[str] = frozenset()
+    admin_context: dict | None = field(default=None, repr=False, compare=False)
+    personal_token: str | None = field(default=None, repr=False, compare=False)
 
 
 async def namespace_row(session, namespace):
@@ -173,31 +181,34 @@ def package_authority():
 
 async def project_context(member):
     require_policy(member)
-    actions = package_actions(member["package_capabilities"])
-    project = validate_keystone_id(member["project_id"])
+    admin = bool(member.get("is_package_system_admin"))
+    actions = member["package_actions"]
+    project = validate_keystone_id(package_target_project_id(member))
     async with factory()() as session:
         row = await session.get(PackageNamespace, project)
     return {
         "project_id": project,
-        "project_name": member["project_name"],
+        "project_name": member["target_project_name"] if admin else member["project_name"],
         "namespace": row.namespace if row else None,
         "package_authority": package_authority(),
         "capabilities": {
             "packages_read": "packages:inventory" in actions,
             "packages_download": "packages:read" in actions,
             "packages_write": "packages:write" in actions,
-            "keys_issue": "palimpsest-keys_editor" in member["package_capabilities"],
-            "keys_revoke": "palimpsest-keys_admin" in member["package_capabilities"],
+            "keys_issue": "keys:issue" in actions,
+            "keys_revoke": "keys:revoke" in actions,
         },
     }
 
 
 async def register_namespace(project_id, member):
     settings = require_policy(member)
-    project = validate_keystone_id(member["project_id"])
+    admin = bool(member.get("is_package_system_admin"))
+    project = validate_keystone_id(package_target_project_id(member))
+    project_name = member["target_project_name"] if admin else member["project_name"]
     if project_id != project:
         raise RegistryError(403, "PROJECT_SCOPE_MISMATCH", "project does not match original token")
-    require_capability(member["package_capabilities"], "palimpsest-publish_editor")
+    require_capability(member["package_actions"], "packages:write")
     # A readable namespace is only a trusted configuration binding, never a display-name guess.
     try:
         bindings = settings.palimpsest_hub_package_namespace_bindings
@@ -224,13 +235,14 @@ async def register_namespace(project_id, member):
         if existing:
             return {
                 "project_id": project,
-                "project_name": member["project_name"],
+                "project_name": project_name,
                 "namespace": existing.namespace,
             }, False
-        row = PackageNamespace(
-            project_id=project, namespace=name, project_name=member["project_name"], created_at=now()
-        )
+        row = PackageNamespace(project_id=project, namespace=name, project_name=project_name, created_at=now())
         session.add(row)
+        if admin:
+            current = await revalidate_package_admin(member)
+            require_capability(current["package_actions"], "packages:write")
         try:
             await session.commit()
         except IntegrityError:
@@ -242,15 +254,17 @@ async def member_actor(namespace, member):
     require_policy(member)
     async with factory()() as session:
         row = await namespace_row(session, namespace)
-    if row.project_id != validate_keystone_id(member["project_id"]):
+    if row.project_id != validate_keystone_id(package_target_project_id(member)):
         raise RegistryError(403, "PROJECT_SCOPE_MISMATCH", "namespace does not match current project")
-    capabilities = member["package_capabilities"]
+    actions = member["package_actions"]
     return Actor(
         row.project_id,
         validate_keystone_id(member["user_id"]),
         namespace,
-        actions=tuple(sorted(package_actions(capabilities))),
-        capabilities=capabilities,
+        actions=tuple(sorted(actions)),
+        capabilities=capabilities_for(actions),
+        admin_context=member if member.get("is_package_system_admin") else None,
+        personal_token=member["token"] if member.get("personal_project_owner") is True else None,
     )
 
 
@@ -276,8 +290,9 @@ def require_capability(capabilities, capability):
 
 async def issue_key(namespace, member, request: KeyCreate):
     actor = await member_actor(namespace, member)
-    require_capability(actor.capabilities, "palimpsest-keys_editor")
-    if not set(request.actions) <= set(actor.actions):
+    require_capability(actor.actions, "keys:issue")
+    available = set(actor.actions) & KEY_ACTIONS
+    if not set(request.actions) <= available:
         raise RegistryError(403, "ACTION_DENIED", "key actions exceed current owner authority")
     scope = request.scope.model_dump(exclude_none=True)
     for package in scope.get("packages", []):
@@ -292,10 +307,20 @@ async def issue_key(namespace, member, request: KeyCreate):
         name=request.name,
         scope=scope,
         actions=request.actions,
+        admin_issuer_context=(
+            {key: member[key] for key in ("project_id", "auth_methods", "user_domain_id", "user_domain_name")}
+            if actor.admin_context is not None
+            else None
+        ),
         created_at=now(),
         expires_at=now() + timedelta(days=request.expires_in_days),
     )
     async with factory()() as session:
+        if actor.admin_context is not None:
+            current = await revalidate_package_admin(actor.admin_context)
+            require_capability(current["package_actions"], "keys:issue")
+            if not set(request.actions) <= current["package_actions"] & KEY_ACTIONS:
+                raise RegistryError(403, "ACTION_DENIED", "key actions exceed current owner authority")
         session.add(row)
         await session.commit()
     wire = f"ppk_v1_{key_id}." + base64.urlsafe_b64encode(secret).decode().rstrip("=")
@@ -304,8 +329,7 @@ async def issue_key(namespace, member, request: KeyCreate):
 
 async def list_keys(namespace, member):
     actor = await member_actor(namespace, member)
-    if not actor.capabilities & {"palimpsest-keys_editor", "palimpsest-keys_admin"}:
-        raise RegistryError(403, "ACTION_DENIED", "key metadata requires key editor or admin authority")
+    require_capability(actor.actions, "keys:list")
     async with factory()() as session:
         rows = (
             await session.scalars(
@@ -319,7 +343,7 @@ async def list_keys(namespace, member):
 
 async def revoke_key(namespace, key_id, member):
     actor = await member_actor(namespace, member)
-    require_capability(actor.capabilities, "palimpsest-keys_admin")
+    require_capability(actor.actions, "keys:revoke")
     key_id = canonical_uuid(key_id)
     async with factory()() as session:
         row = await session.scalar(select(PackageKey).where(PackageKey.id == key_id).with_for_update())
@@ -327,6 +351,9 @@ async def revoke_key(namespace, key_id, member):
             raise RegistryError(404, "NOT_FOUND", "key not found")
         if row.revoked_at is None:
             row.revoked_at = now()
+        if actor.admin_context is not None:
+            current = await revalidate_package_admin(actor.admin_context)
+            require_capability(current["package_actions"], "keys:revoke")
         await session.commit()
 
 
@@ -341,7 +368,6 @@ def decode_credential(credential):
 
 
 async def authenticate_key(credential, *, session=None, lock=False):
-    require_policy()
     key_id, secret_hash = decode_credential(credential)
     if session is None:
         async with factory()() as own:
@@ -357,10 +383,23 @@ async def authenticate_key(credential, *, session=None, lock=False):
         raise RegistryError(401, "KEY_REVOKED", "package key revoked")
     if row.expires_at <= now():
         raise RegistryError(401, "KEY_EXPIRED", "package key expired")
-    member = await asyncio.to_thread(validate_package_owner, row.owner_user_id, row.project_id)
-    require_policy(member)
+    if row.admin_issuer_context is not None:
+        member = await asyncio.to_thread(
+            validate_admin_key_owner,
+            row.owner_user_id,
+            row.project_id,
+            row.admin_issuer_context,
+        )
+        available = member["package_actions"] & KEY_ACTIONS
+        capabilities = capabilities_for(available)
+    else:
+        require_policy()
+        member = await asyncio.to_thread(validate_package_owner, row.owner_user_id, row.project_id)
+        require_policy(member)
+        available = member["package_actions"] & KEY_ACTIONS
+        capabilities = capabilities_for(available)
     if (
-        validate_keystone_id(member["project_id"]) != row.project_id
+        validate_keystone_id(package_target_project_id(member)) != row.project_id
         or validate_keystone_id(member["user_id"]) != row.owner_user_id
     ):
         raise RegistryError(403, "PROJECT_SCOPE_MISMATCH", "owner identity mismatch")
@@ -375,12 +414,11 @@ async def authenticate_key(credential, *, session=None, lock=False):
     namespace = await session.get(PackageNamespace, row.project_id)
     if namespace is None:
         raise RegistryError(404, "NOT_FOUND", "namespace not registered")
-    capabilities = package_capabilities(member["roles"])
     delegated = set(row.actions)
     # Download delegation includes metadata, independently attenuated by current owner roles.
     if "packages:read" in delegated:
         delegated.add("packages:inventory")
-    actions = delegated & package_actions(capabilities)
+    actions = delegated & available
     return Actor(
         row.project_id,
         row.owner_user_id,
@@ -419,9 +457,23 @@ def authorize(actor, namespace, package, action):
 
 
 async def fresh_actor(actor, namespace, package, action, *, session=None, lock=False):
-    if actor.key_id is None:
-        raise RegistryError(401, "AUTH_REQUIRED", "package key required")
-    current = await authenticate_key(actor.credential, session=session, lock=lock)
+    if actor.admin_context is not None:
+        context = await revalidate_package_admin(actor.admin_context)
+        current = await member_actor(namespace, context)
+        if (current.project_id, current.user_id) != (actor.project_id, actor.user_id):
+            raise RegistryError(403, "PROJECT_SCOPE_MISMATCH", "administrative target or requester changed")
+    elif actor.personal_token is not None and action == "packages:delete":
+        original = await asyncio.to_thread(validate_token, actor.personal_token, actor.project_id)
+        if (original["project_id"], original["user_id"]) != (actor.project_id, actor.user_id):
+            raise RegistryError(403, "PROJECT_SCOPE_MISMATCH", "personal requester or original project changed")
+        context = await get_package_member_info(token_info=original)
+        if context.get("personal_project_owner") is not True:
+            raise RegistryError(403, "ACTION_DENIED", "current native personal owner required")
+        current = await member_actor(namespace, context)
+    elif actor.key_id is not None:
+        current = await authenticate_key(actor.credential, session=session, lock=lock)
+    else:
+        raise RegistryError(401, "AUTH_REQUIRED", "package key or human system administrator required")
     authorize(current, namespace, package, action)
     return current
 
@@ -464,7 +516,7 @@ def upload_view(row, namespace):
         "project_id": row.project_id,
         "namespace": namespace,
         "package": row.package,
-        "key_id": str(uuid.UUID(row.key_id)),
+        "key_id": str(uuid.UUID(row.key_id)) if row.key_id is not None else None,
         "owner_user_id": row.owner_user_id,
         "received_bytes": row.received_bytes,
         "expires_at": iso(row.expires_at),
@@ -492,7 +544,7 @@ def upload_action(resource):
 
 async def start_upload(actor, namespace, package, request, resource):
     actor = await fresh_actor(actor, namespace, package, upload_action(resource))
-    settings = require_policy()
+    settings = require_policy(actor.admin_context)
     if request.archive_size_bytes > settings.palimpsest_hub_max_blob_bytes:
         raise RegistryError(413, "SIZE_LIMIT", "archive exceeds configured byte limit")
     blob_store = store()
@@ -584,6 +636,7 @@ async def append_upload(actor, namespace, package, upload_id, resource, request)
     blob_store = store()
     async with _locked_file(blob_store, lambda: blob_store.acquire_upload_lock(upload_id, blocking=False)):
         async with factory()() as session:
+            await fresh_actor(actor, namespace, package, upload_action(resource), session=session, lock=True)
             row = await owned_upload(session, upload_id, actor, package, resource)
             resumable(row)
             already = row.received_bytes
@@ -684,7 +737,7 @@ async def finalize_upload(actor, namespace, package, upload_id, resource):
     authorize(actor, namespace, package, upload_action(resource))
     upload_id = canonical_uuid(upload_id)
     blob_store = store()
-    settings = require_policy()
+    settings = require_policy(actor.admin_context)
     async with _locked_file(blob_store, lambda: blob_store.acquire_upload_lock(upload_id, blocking=False)):
         async with factory()() as session:
             await fresh_actor(actor, namespace, package, upload_action(resource), session=session, lock=True)
@@ -908,7 +961,7 @@ async def commit_package(session, actor, namespace, package, data, validated):
         "platforms": validated.platforms,
         "already_published": same,
         "pushed_by": actor.user_id,
-        "pushed_key_id": str(uuid.UUID(actor.key_id)),
+        "pushed_key_id": str(uuid.UUID(actor.key_id)) if actor.key_id is not None else None,
         "web_url": publication_url(namespace, package, validated.root_digest),
     }, not same
 
@@ -1123,7 +1176,7 @@ def version_view(row, actor, package):
         "total_bytes": row.total_bytes,
         "provenance": row.provenance,
         "pushed_by": row.pushed_by,
-        "pushed_key_id": str(uuid.UUID(row.pushed_key_id)),
+        "pushed_key_id": str(uuid.UUID(row.pushed_key_id)) if row.pushed_key_id is not None else None,
         "pushed_at": iso(row.pushed_at),
         "root_descriptor": {
             "digest": row.root_digest,
@@ -1168,8 +1221,8 @@ async def versions(actor, namespace, package, limit, cursor):
     }
 
 
-async def version(actor, namespace, package, *, digest=None, tag=None):
-    authorize(actor, namespace, package, "packages:inventory")
+async def version(actor, namespace, package, *, digest=None, tag=None, action="packages:inventory"):
+    authorize(actor, namespace, package, action)
     async with factory()() as session:
         row = await package_row(session, actor, package)
         if tag is not None:
@@ -1188,3 +1241,53 @@ async def version(actor, namespace, package, *, digest=None, tag=None):
             result["tag"] = tag
             result["digest"] = value.root_digest
         return result
+
+
+async def delete_package(actor, namespace, package):
+    """Delete target-owned metadata only; shared CAS remains reference-aware GC's job."""
+    if (actor.admin_context is None and actor.personal_token is None) or actor.key_id is not None:
+        raise RegistryError(403, "ACTION_DENIED", "human system administrator or native personal owner required")
+    authorize(actor, namespace, package, "packages:delete")
+    blob_store = store()
+    package_lock = actor.project_id + "/" + package
+    async with (
+        _locked_file(blob_store, lambda: blob_store.acquire_package_lock(package_lock, blocking=False)),
+        factory()() as session,
+    ):
+        await fresh_actor(actor, namespace, package, "packages:delete", session=session, lock=True)
+        active = await session.scalar(
+            select(func.count())
+            .select_from(PackageUpload)
+            .where(
+                PackageUpload.project_id == actor.project_id,
+                PackageUpload.package == package,
+                PackageUpload.status.in_(_ACTIVE),
+            )
+        )
+        if active:
+            raise RegistryError(409, "UPLOAD_STATE_CONFLICT", "active uploads must be aborted before deletion")
+        row = await session.scalar(
+            select(RegistryPackage)
+            .where(
+                RegistryPackage.project_id == actor.project_id,
+                RegistryPackage.name == package,
+            )
+            .with_for_update()
+        )
+        if row is None:
+            raise RegistryError(404, "NOT_FOUND", "package not found")
+        await session.execute(delete(PackageTag).where(PackageTag.package_id == row.id))
+        await session.execute(delete(PackageBlobReference).where(PackageBlobReference.package_id == row.id))
+        await session.execute(delete(PackageVersion).where(PackageVersion.package_id == row.id))
+        await session.execute(
+            update(PackageUpload)
+            .where(
+                PackageUpload.project_id == actor.project_id,
+                PackageUpload.package == package,
+                PackageUpload.status == "complete",
+            )
+            .values(status="aborted", result=None)
+        )
+        await session.delete(row)
+        await fresh_actor(actor, namespace, package, "packages:delete", session=session, lock=True)
+        await session.commit()

@@ -27,7 +27,8 @@ import uuid
 import xml.etree.ElementTree as ET
 from typing import Any
 
-from . import cloud_runtime, host_vm_control, kvm, platforms
+from . import cloud_runtime, host_vm_control, kvm, lima, platforms
+from .errors import StateError
 from .runtime_types import RuntimeBackend
 
 _BACKEND_LIMA = platforms.BACKEND_LIMA
@@ -236,7 +237,7 @@ def _observe_lima() -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[di
                     net_name = net.get("name")
                     if not isinstance(net_name, str) or not net_name:
                         continue
-                    net_id = f"network:{_BACKEND_LIMA}:{net_name}"
+                    net_id = f"network:lima:{net_name}"
                     mode = net.get("mode") if isinstance(net.get("mode"), str) else None
                     gateway = net.get("gateway") if isinstance(net.get("gateway"), str) else None
                     netmask = net.get("netmask") if isinstance(net.get("netmask"), str) else None
@@ -250,7 +251,7 @@ def _observe_lima() -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[di
                         "id": net_id,
                         "name": net_name,
                         "kind": "lima",
-                        "backend": _BACKEND_LIMA,
+                        "backend": "lima",
                         "mode": mode,
                         "subnet": subnet,
                         "gateway": gateway,
@@ -295,10 +296,18 @@ def _observe_lima() -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[di
         name = instance.get("name")
         if not isinstance(name, str) or not name:
             continue
-
         config = instance.get("config") if isinstance(instance.get("config"), dict) else {}
-        vm_type = instance.get("vmType") or config.get("vmType", "vz")
-        instance_backend = f"lima-{vm_type}"
+        try:
+            native_backend = lima.instance_backend(instance)
+        except StateError:
+            warnings.append(_WARN_LIMA_QUERY_FAILED)
+            continue
+        vm_type = instance.get("vmType") or config.get("vmType")
+        if native_backend is None and vm_type != "qemu":
+            warnings.append(_WARN_LIMA_QUERY_FAILED)
+            continue
+        backend = native_backend.value if native_backend is not None else "lima-qemu"
+        instance_backend = backend
         run_id = _safe_instance_run_id(instance)
         runtime_kind = "cloud-image" if run_id is not None else "external"
         status = _safe_instance_status(instance)
@@ -336,9 +345,11 @@ def _observe_lima() -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[di
         lima_named_nets = [n.get("lima") for n in all_nets if isinstance(n, dict) and isinstance(n.get("lima"), str)]
 
         if has_vznat:
-            primary_net = "vzNAT"
+            primary_net = "vzNAT" if backend == _BACKEND_LIMA else "unknown"
         elif lima_named_nets:
             primary_net = f"lima:{lima_named_nets[0]}"
+        elif backend == platforms.BACKEND_LIMA_KRUNKIT:
+            primary_net = "default"
         else:
             primary_net = "none"
 
@@ -383,9 +394,24 @@ def _observe_lima() -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[di
             "source": "host-backend",
         }
         vms.append(vm_row)
+        if backend == platforms.BACKEND_LIMA_KRUNKIT and primary_net == "default":
+            net_id = f"network:{backend}:{run_id or 'instance'}:{name}"
+            networks_by_id[net_id] = {
+                "id": net_id,
+                "name": "default",
+                "kind": "user-mode",
+                "backend": backend,
+                "mode": "gvisor",
+                "subnet": None,
+                "gateway": None,
+                "status": "configured",
+                "source": "host-backend",
+                "external": None,
+                "attachments": [{"name": name, "run_id": run_id, "guest_ip": None, "ports": ports_list}],
+            }
 
         # Synthesize vzNAT network only when an attached VM actually configures vzNAT
-        if has_vznat:
+        if has_vznat and backend == _BACKEND_LIMA:
             vznat_id = f"network:{_BACKEND_LIMA}:vzNAT"
             if vznat_id not in networks_by_id:
                 networks_by_id[vznat_id] = {
@@ -411,13 +437,13 @@ def _observe_lima() -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[di
             )
 
         for lnet in lima_named_nets:
-            lid = f"network:{_BACKEND_LIMA}:{lnet}"
+            lid = f"network:lima:{lnet}"
             if lid not in networks_by_id:
                 networks_by_id[lid] = {
                     "id": lid,
                     "name": lnet,
                     "kind": "lima",
-                    "backend": _BACKEND_LIMA,
+                    "backend": "lima",
                     "mode": None,
                     "subnet": None,
                     "gateway": None,
@@ -442,10 +468,10 @@ def _observe_lima() -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[di
         # Never fallback capacity = file_size: file_size is apparent byte length, not virtual capacity
 
         primary_disk = {
-            "id": f"disk:{instance_backend}:{name}:primary",
+            "id": f"disk:{backend}:{name}:primary",
             "name": name,
             "kind": "vm-disk",
-            "backend": instance_backend,
+            "backend": backend,
             "project": None,
             "status": disk_status,
             "size_bytes": capacity,
@@ -466,7 +492,7 @@ def _observe_lima() -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[di
 
     # 5. Process additional Lima disks in the volume: namespace
     for d_name, d_info in additional_disks_by_name.items():
-        disk_id = f"volume:{_BACKEND_LIMA}:{d_name}"
+        disk_id = f"volume:lima:{d_name}"
         capacity = _parse_bytes(d_info.get("size"))
         file_size = None
         allocated = None
@@ -503,7 +529,7 @@ def _observe_lima() -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[di
                 "id": disk_id,
                 "name": d_name,
                 "kind": "volume",
-                "backend": _BACKEND_LIMA,
+                "backend": "lima",
                 "project": None,
                 "status": disk_status,
                 "size_bytes": capacity,
@@ -527,10 +553,14 @@ def _observe_libvirt() -> tuple[list[dict[str, Any]], list[dict[str, Any]], list
 
     try:
         import libvirt
+
+        try:
+            libvirt.registerErrorHandler(lambda ctx, err: None, None)
+        except Exception:
+            pass
     except ImportError:
         # libvirt is not installed: clean return without warning
         return vms, volumes, list(networks_by_id.values()), warnings
-
     host = platforms.detect_host()
     if host.system == "Linux":
         backend = _BACKEND_KVM
@@ -709,7 +739,6 @@ def _observe_libvirt() -> tuple[list[dict[str, Any]], list[dict[str, Any]], list
                                                 disk_allocated = binfo[1]
                                     except Exception:
                                         pass
-
                                 file_size = None
                                 disk_status = "unavailable"
                                 if file_path and os.path.isabs(file_path):

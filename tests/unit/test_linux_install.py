@@ -43,6 +43,9 @@ def test_existing_valid_identity_and_directories_are_idempotent(
     log_root.mkdir(parents=True, mode=0o700)
     os.chmod(state_root, 0o700)
     os.chmod(log_root, 0o700)
+    # BSD temp directories inherit the parent group; model a real non-root account.
+    os.chown(state_root, os.getuid(), os.getgid())
+    os.chown(log_root, os.getuid(), os.getgid())
     user, group = _identity(os.getuid(), os.getgid())
     user.pw_dir = str(state_root)
     monkeypatch.setattr(linux_install, "STATE_ROOT", state_root)

@@ -122,3 +122,18 @@ def test_host_share_policy_rejects_unencodable_paths(tmp_path: Path) -> None:
 def test_host_share_policy_normalizes_guest_path_errors(tmp_path: Path, target: str) -> None:
     with pytest.raises(ArtifactValidationError, match="host share target"):
         HostDirectoryShare(tmp_path.resolve(), "data", target)
+
+
+@pytest.mark.parametrize("consumer", ["stack", "build"])
+def test_known_foreign_layer_is_rejected_before_runtime_or_build(tmp_path: Path, consumer: str):
+    base_path, base_digest = _artifact(tmp_path, "base", b"base")
+    layer_path, layer_digest = _artifact(tmp_path, "layer", b"layer")
+    base = ImageRef(base_digest, "raw", "aarch64", None, base_path)
+    layer = LayerRef(layer_digest, "application/test", layer_path, arch="x86_64")
+    recipe = tmp_path / "Palimpsestfile"
+    recipe.write_text(f"FROM {base_digest}\nRUN true\n")
+    with pytest.raises(ArtifactValidationError, match="architecture"):
+        if consumer == "stack":
+            StackRef(base, (layer,))
+        else:
+            BuildSpec(base, (layer,), recipe)

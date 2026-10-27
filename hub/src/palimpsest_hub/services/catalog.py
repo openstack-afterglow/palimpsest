@@ -303,8 +303,7 @@ async def assets(token_info, q, offset, limit):
                     "visibility": _visibility(row, token_info, True),
                     "layer_count": len(chain),
                     "chain_complete": True,
-                    "download_allowed": bool(token_info.get("is_system_admin"))
-                    or "palimpsest-download_user" in token_info.get("package_capabilities", ()),
+                    "download_allowed": "packages:read" in token_info.get("package_actions", ()),
                     "base_image_digest": base.blob_digest if base else None,
                     "local_supported": local_supported,
                     "local_reason": local_reason,

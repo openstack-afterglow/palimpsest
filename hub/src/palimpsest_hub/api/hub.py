@@ -25,19 +25,27 @@ from pathlib import Path
 from typing import Any, Literal, NoReturn
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, UploadFile
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    UploadFile,
+)
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import func, select
 
 from palimpsest_hub.auth import (
-    _is_system_admin,
-    get_legacy_member_info,
     get_os_conn,
+    get_package_manager_info,
     get_package_member_info,
-    get_token_info,
+    package_target_project_id,
     require_admin,
     require_token,
+    revalidate_package_admin,
     validate_package_owner,
 )
 from palimpsest_hub.cache import get_redis
@@ -405,61 +413,70 @@ class HubBundleImportResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-async def _legacy_writer(token_info: dict = Depends(get_legacy_member_info)) -> dict:
-    """Publication uses ordinary project service authority, never administrative power."""
-    if "palimpsest-publish_editor" not in token_info.get("package_capabilities", ()):
+async def _legacy_writer(token_info: dict = Depends(get_package_manager_info)) -> dict:
+    """Accept publish membership or the separately verified human admin alternative."""
+    if "packages:write" not in token_info.get("package_actions", ()):
         raise HTTPException(status_code=403, detail="Palimpsest publish authority required")
     return token_info
 
 
 async def _export_writer(token_info: dict = Depends(get_package_member_info)) -> dict:
-    """Deferred Trust exports retain their separately qualified non-admin owner policy."""
+    """Trust exports retain their separately qualified non-administrative owner policy."""
+    if token_info.get("is_system_admin") or {
+        str(role).casefold() for role in (*token_info.get("roles", ()), *token_info.get("current_roles", ()))
+    } & {"admin", "manager", "service"}:
+        raise HTTPException(
+            status_code=403, detail="Administrative or service identities cannot authorize image exports"
+        )
     return await _legacy_writer(token_info)
 
 
-async def _legacy_inventory(token_info: dict = Depends(get_token_info)) -> dict:
-    # Verified global builder/GC operators retain their pre-existing legacy artifact read path.
-    if token_info.get("is_system_admin"):
-        return token_info
-    member = await get_package_member_info(token_info=token_info)
-    if "palimpsest-inventory_reader" not in member["package_capabilities"]:
+async def _legacy_inventory(token_info: dict = Depends(get_package_manager_info)) -> dict:
+    if "packages:inventory" not in token_info.get("package_actions", ()):
         raise HTTPException(status_code=403, detail="Palimpsest inventory authority required")
-    return member
+    return token_info
 
 
-async def _legacy_download(token_info: dict = Depends(get_token_info)) -> dict:
-    if token_info.get("is_system_admin"):
-        return token_info
-    member = await get_package_member_info(token_info=token_info)
-    if "palimpsest-download_user" not in member["package_capabilities"]:
+async def _legacy_download(token_info: dict = Depends(get_package_manager_info)) -> dict:
+    if "packages:read" not in token_info.get("package_actions", ()):
         raise HTTPException(status_code=403, detail="Palimpsest download authority required")
-    return member
+    return token_info
 
 
 @router.get("/me", operation_id="get_hub_identity")
 async def get_hub_identity(token_info: dict = Depends(require_token)) -> dict[str, Any]:
     """Describe the original token scope and freshly checked legacy artifact authority."""
-    is_system_admin = bool(token_info.get("is_system_admin"))
+    is_system_admin = False
     capabilities = frozenset()
+    target_info = token_info
     try:
-        member = await get_legacy_member_info(token_info=token_info)
+        target_info = await get_package_manager_info(token_info=token_info)
     except HTTPException as exc:
         if exc.status_code != 403:
             raise
     else:
-        capabilities = member["package_capabilities"]
+        is_system_admin = bool(target_info.get("is_package_system_admin"))
+        capabilities = target_info.get("package_capabilities", frozenset())
     return {
         "user_id": token_info["user_id"],
         "project_id": token_info["project_id"],
         "project_name": token_info.get("project_name", ""),
         "roles": token_info.get("roles", []),
         "is_system_admin": is_system_admin,
+        **(
+            {
+                "target_project_id": package_target_project_id(target_info),
+                "target_project_name": target_info.get("target_project_name", token_info.get("project_name", "")),
+            }
+            if is_system_admin
+            else {}
+        ),
         "capabilities": {
-            "inventory": is_system_admin or "palimpsest-inventory_reader" in capabilities,
-            "download": is_system_admin or "palimpsest-download_user" in capabilities,
+            "inventory": "palimpsest-inventory_reader" in capabilities,
+            "download": "palimpsest-download_user" in capabilities,
             "upload": "palimpsest-publish_editor" in capabilities,
-            "delete": is_system_admin,
-            "build": is_system_admin,
+            "delete": is_system_admin and "system:manage" in target_info.get("package_actions", ()),
+            "build": is_system_admin and "system:manage" in target_info.get("package_actions", ()),
         },
     }
 
@@ -504,7 +521,7 @@ def _complete_export_blob(row: PalimpsestImageExport, store: LocalPathBlobStore)
 
 
 def _project_id(token_info: dict) -> str | None:
-    return token_info.get("project_id")
+    return package_target_project_id(token_info)
 
 
 def _visible_filter(stmt, token_info: dict):
@@ -579,9 +596,9 @@ def _layer_dict(row: PalimpsestHubLayer, token_info: dict | None = None) -> dict
         "ubuntu_base": row.ubuntu_base,
         "python_version": row.python_version,
         "config_json": config,
-        "project_id": row.project_id if token_info and row.project_id == token_info.get("project_id") else None,
+        "project_id": row.project_id if token_info and row.project_id == _project_id(token_info) else None,
         "is_published": row.is_published,
-        "created_by": row.created_by if token_info and row.project_id == token_info.get("project_id") else None,
+        "created_by": row.created_by if token_info and row.project_id == _project_id(token_info) else None,
         "created_at": row.created_at.isoformat() if row.created_at else None,
     }
 
@@ -714,6 +731,40 @@ async def _ancestor_chain(session, row: PalimpsestHubLayer, token_info: dict) ->
         chain.append(parent)
         current = parent
     return list(reversed(chain))
+
+
+async def _validate_arch_dependencies(
+    session, *, arch: str | None, parent_digest: str | None, base_image_digest: str | None, token_info: dict
+) -> None:
+    """Reject contradictory known targets, without inferring a target for uploaded bytes.
+
+    Missing and hidden dependencies are indistinguishable here, just as in ancestor
+    discovery. Builds separately require their complete execution inputs to be visible.
+    """
+    architectures = {arch} if arch is not None else set()
+    pending = [digest for digest in (parent_digest, base_image_digest) if digest]
+    seen: set[str] = set()
+    while pending:
+        digest = pending.pop()
+        if digest in seen:
+            continue
+        seen.add(digest)
+        row = (
+            await session.execute(
+                _visible_filter(select(PalimpsestHubLayer).where(PalimpsestHubLayer.blob_digest == digest), token_info)
+            )
+        ).scalar_one_or_none()
+        if row is None:
+            continue
+        if row.arch is not None:
+            architectures.add(row.arch)
+        if row.parent_digest:
+            pending.append(row.parent_digest)
+        base = normalize_digest((row.config_json or {}).get("base_image_digest") or "")
+        if base:
+            pending.append(base)
+    if len(architectures) > 1:
+        raise HTTPException(status_code=422, detail="layer architecture conflicts with visible dependencies")
 
 
 # ---------------------------------------------------------------------------
@@ -849,6 +900,12 @@ async def create_image_export(
     conn: Any = Depends(get_os_conn),
     token_info: dict = Depends(_export_writer),
 ) -> dict[str, Any]:
+    # Export admission and delegation consume the original caller-scoped Glance source.
+    # A logical Hub target must not relabel that source or re-scope its token.
+    if _required_project_id(token_info) != token_info["project_id"]:
+        raise HTTPException(
+            status_code=403, detail="Image export creation requires the original token project as target"
+        )
     _store_or_503()
     try:
         row = await enqueue_image_export(conn, token_info, str(req.image_id), req.disk_format)
@@ -937,7 +994,11 @@ async def create_image_export_download_token(
             "digest": digest,
             "expires_at": expires_at,
             "user_id": token_info["user_id"],
-            "is_system_admin": bool(token_info.get("is_system_admin")),
+            "admin_context": (
+                {key: token_info[key] for key in ("token", "user_id", "project_id", "target_project_id")}
+                if token_info.get("is_package_system_admin")
+                else None
+            ),
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -989,9 +1050,26 @@ async def download_image_export_with_token(
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise HTTPException(status_code=404, detail="다운로드 토큰이 유효하지 않습니다") from exc
     # A download ticket is not independent authority after its issuer is downgraded.
-    if not (payload.get("is_system_admin") is True and await asyncio.to_thread(_is_system_admin, user_id)):
+    if payload.get("admin_context") is not None:
+        context = payload["admin_context"]
+        if (
+            not isinstance(context, dict)
+            or not isinstance(context.get("project_id"), str)
+            or not all(
+                isinstance(context.get(key), str) and context[key] for key in ("token", "user_id", "target_project_id")
+            )
+        ):
+            raise HTTPException(status_code=404, detail="Invalid administrator ticket binding")
+        if context["user_id"] != user_id or context["target_project_id"] != project_id:
+            raise HTTPException(status_code=404, detail="Invalid administrator ticket binding")
+        current = await revalidate_package_admin(context)
+        if "packages:read" not in current["package_actions"]:
+            raise HTTPException(status_code=403, detail="Current Palimpsest download authority required")
+        if package_target_project_id(current) != project_id:
+            raise HTTPException(status_code=403, detail="Administrator ticket target changed")
+    else:
         owner = await asyncio.to_thread(validate_package_owner, user_id, project_id)
-        if "palimpsest-download_user" not in owner["package_capabilities"]:
+        if "packages:read" not in owner["package_actions"]:
             raise HTTPException(status_code=403, detail="Current Palimpsest download authority required")
 
     try:
@@ -1118,7 +1196,7 @@ async def start_upload(req: HubUploadStartRequest, token_info: dict = Depends(_l
     store = _store_or_503()
     project_id = _required_project_id(token_info)
 
-    if req.digest and store.exists(req.digest):
+    if req.digest and "packages:inventory" in token_info.get("package_actions", ()) and store.exists(req.digest):
         async with factory() as session:
             existing = (
                 await session.execute(
@@ -1131,15 +1209,14 @@ async def start_upload(req: HubUploadStartRequest, token_info: dict = Depends(_l
         if existing is not None:
             if existing.kind == KIND_BUILDKIT_CACHE:
                 raise HTTPException(status_code=422, detail="legacy cache registration is retired")
-            if "palimpsest-inventory_reader" in token_info.get("package_capabilities", ()):
-                return {
-                    "session_id": None,
-                    "completed": True,
-                    "blob_digest": req.digest,
-                    "already_present": True,
-                    "registered": True,
-                    "registration": _layer_dict(existing, token_info),
-                }
+            return {
+                "session_id": None,
+                "completed": True,
+                "blob_digest": req.digest,
+                "already_present": True,
+                "registered": True,
+                "registration": _layer_dict(existing, token_info),
+            }
 
     session_id = uuid.uuid4().hex
     async with _locked_file(store, lambda: store.acquire_project_upload_lock(project_id, blocking=False)):
@@ -1340,7 +1417,9 @@ async def finalize_upload(
     session_id: str, meta: HubLayerMeta, request: Request, token_info: dict = Depends(_legacy_writer)
 ) -> dict[str, Any]:
     """수신 바이트의 digest 를 재계산해 검증하고 레이어로 등록한다."""
-    if meta.is_published and not token_info.get("is_system_admin"):
+    if meta.is_published and (
+        not token_info.get("is_package_system_admin") or "system:manage" not in token_info.get("package_actions", ())
+    ):
         raise HTTPException(status_code=403, detail="공개 레이어 등록은 시스템 관리자만 허용됩니다")
     return await _finalize_upload_locked(session_id, meta, request, token_info)
 
@@ -1419,6 +1498,11 @@ async def _finalize_upload_locked(
     created = False
     existing: PalimpsestHubLayer | None = None
     async with _locked_blob(store, finalized.blob_digest):
+        if token_info.get("is_package_system_admin"):
+            token_info = await revalidate_package_admin(token_info)
+            await _legacy_writer(token_info)
+            if meta.is_published and "system:manage" not in token_info["package_actions"]:
+                raise HTTPException(status_code=403, detail="System publication policy denied")
         created = await _run_blocking(store.publish_verified, store.upload_path(session_id), finalized)
         try:
             async with factory() as session:
@@ -1428,6 +1512,13 @@ async def _finalize_upload_locked(
                     )
                 ).scalar_one_or_none()
                 if existing is None:
+                    await _validate_arch_dependencies(
+                        session,
+                        arch=meta.arch,
+                        parent_digest=meta.parent_digest,
+                        base_image_digest=meta.base_image_digest,
+                        token_info=token_info,
+                    )
                     session.add(
                         PalimpsestHubLayer(
                             blob_digest=finalized.blob_digest,
@@ -1451,6 +1542,8 @@ async def _finalize_upload_locked(
                         )
                     )
                 else:
+                    if meta.is_published and existing.project_id != _required_project_id(token_info):
+                        raise HTTPException(status_code=404, detail="레이어를 찾을 수 없습니다")
                     conflicts = _registration_conflicts(existing, meta)
                     if conflicts:
                         raise HTTPException(
@@ -1460,12 +1553,24 @@ async def _finalize_upload_locked(
                                 + ", ".join(conflicts)
                             ),
                         )
+                    await _validate_arch_dependencies(
+                        session,
+                        arch=meta.arch,
+                        parent_digest=meta.parent_digest,
+                        base_image_digest=meta.base_image_digest,
+                        token_info=token_info,
+                    )
                     await _grant_layer_access(session, finalized.blob_digest, token_info)
                     if meta.is_published:
                         existing.is_published = True
                 upload = await session.get(PalimpsestHubUpload, session_id)
                 if upload is not None:
                     await session.delete(upload)
+                if token_info.get("is_package_system_admin"):
+                    token_info = await revalidate_package_admin(token_info)
+                    await _legacy_writer(token_info)
+                    if meta.is_published and "system:manage" not in token_info["package_actions"]:
+                        raise HTTPException(status_code=403, detail="System publication policy denied")
                 await session.commit()
         except BaseException:
             if created:
@@ -1690,6 +1795,9 @@ async def import_bundle(file: UploadFile, token_info: dict = Depends(_legacy_wri
             created: list[str] = []
             async with _locked_blobs(store, [finalized.blob_digest for _, finalized, _ in publishable]):
                 try:
+                    if token_info.get("is_package_system_admin"):
+                        token_info = await revalidate_package_admin(token_info)
+                        await _legacy_writer(token_info)
                     await _run_blocking(
                         _publish_staged_bundle,
                         store,
@@ -1715,8 +1823,22 @@ async def import_bundle(file: UploadFile, token_info: dict = Depends(_legacy_wri
                                         }
                                     )
                                     continue
+                                await _validate_arch_dependencies(
+                                    session,
+                                    arch=meta.arch,
+                                    parent_digest=meta.parent_digest,
+                                    base_image_digest=meta.base_image_digest,
+                                    token_info=token_info,
+                                )
                                 await _grant_layer_access(session, finalized.blob_digest, token_info)
                             else:
+                                await _validate_arch_dependencies(
+                                    session,
+                                    arch=meta.arch,
+                                    parent_digest=meta.parent_digest,
+                                    base_image_digest=meta.base_image_digest,
+                                    token_info=token_info,
+                                )
                                 config = {
                                     "name": meta.name,
                                     "kind": meta.kind,
@@ -1753,6 +1875,21 @@ async def import_bundle(file: UploadFile, token_info: dict = Depends(_legacy_wri
                                     )
                                 )
                             imported.append(finalized.blob_digest)
+                        # Validate again with every accepted descriptor visible in this
+                        # transaction: bundle manifests may list a child before its base.
+                        accepted = set(imported)
+                        for _, finalized, meta in publishable:
+                            if finalized.blob_digest in accepted:
+                                await _validate_arch_dependencies(
+                                    session,
+                                    arch=meta.arch,
+                                    parent_digest=meta.parent_digest,
+                                    base_image_digest=meta.base_image_digest,
+                                    token_info=token_info,
+                                )
+                        if token_info.get("is_package_system_admin"):
+                            token_info = await revalidate_package_admin(token_info)
+                            await _legacy_writer(token_info)
                         await session.commit()
                 except BaseException:
                     imported.clear()
@@ -1768,10 +1905,8 @@ async def import_bundle(file: UploadFile, token_info: dict = Depends(_legacy_wri
 # ---------------------------------------------------------------------------
 
 
-@router.delete(
-    "/layers/{digest}", status_code=204, dependencies=[Depends(require_admin)], operation_id="delete_hub_layer"
-)
-async def delete_hub_layer(digest: str) -> None:
+@router.delete("/layers/{digest}", status_code=204, operation_id="delete_hub_layer")
+async def delete_hub_layer(digest: str, token_info: dict = Depends(require_admin)) -> None:
     """관리자 전용. 자식이 있으면 거부하고 blob 정리는 지연 GC에 맡긴다."""
     normalized = normalize_digest(digest)
     if normalized is None:
@@ -1780,7 +1915,12 @@ async def delete_hub_layer(digest: str) -> None:
 
     async with factory() as session:
         row = (
-            await session.execute(select(PalimpsestHubLayer).where(PalimpsestHubLayer.blob_digest == normalized))
+            await session.execute(
+                select(PalimpsestHubLayer).where(
+                    PalimpsestHubLayer.blob_digest == normalized,
+                    exact_identity(PalimpsestHubLayer.project_id, _required_project_id(token_info)),
+                )
+            )
         ).scalar_one_or_none()
         if row is None:
             raise HTTPException(status_code=404, detail="레이어를 찾을 수 없습니다")
@@ -1791,5 +1931,9 @@ async def delete_hub_layer(digest: str) -> None:
         ).scalar_one_or_none()
         if child is not None:
             raise HTTPException(status_code=409, detail="자식 레이어가 있어 삭제할 수 없습니다")
+        if token_info.get("is_package_system_admin"):
+            token_info = await revalidate_package_admin(token_info)
+            if "system:manage" not in token_info["package_actions"]:
+                raise HTTPException(status_code=403, detail="System management policy denied")
         await session.delete(row)
         await session.commit()

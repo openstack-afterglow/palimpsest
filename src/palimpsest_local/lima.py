@@ -1,10 +1,11 @@
-"""Native Apple Silicon Ubuntu VM lifecycle through the Lima VZ backend."""
+"""Apple Silicon cloud-image VM lifecycle through Lima VZ or krunkit."""
 
 from __future__ import annotations
 
 import hashlib
 import ipaddress
 import json
+import os
 import platform
 import re
 import shlex
@@ -38,7 +39,7 @@ from .state import RunPaths, StatePaths
 if TYPE_CHECKING:
     from .oci_run_request import LocalOCIRunRequest
 
-_BACKEND = "lima-vz"
+_LIMA_VM_TYPES = {RuntimeBackend.LIMA_VZ: "vz", RuntimeBackend.LIMA_KRUNKIT: "krunkit"}
 _CONFIG_NAME = "lima.yaml"
 _TIMEOUT_SECONDS = 600
 _LIMA_NETWORK_RE = re.compile(r"^lima:[a-z0-9][a-z0-9-]{0,62}$")
@@ -118,13 +119,43 @@ def _lifecycle_outcome(
     )
 
 
+def backend_vm_type(backend: str | RuntimeBackend) -> str:
+    """Resolve only supported Lima backends without probing or changing the host."""
+
+    try:
+        return _LIMA_VM_TYPES[RuntimeBackend(backend)]
+    except (KeyError, TypeError, ValueError):
+        raise ArtifactValidationError("the Lima runtime requires lima-vz or lima-krunkit") from None
+
+
+def _instance_vm_type(instance: Mapping[str, Any]) -> Any:
+    """Read the reported VM type, rejecting contradictory native observations."""
+
+    config = instance.get("config")
+    nested = config.get("vmType") if isinstance(config, Mapping) else None
+    direct = instance.get("vmType")
+    if direct is not None and nested is not None and direct != nested:
+        raise StateError("Lima instance has contradictory VM types")
+    return direct if direct is not None else nested
+
+
+def instance_backend(instance: Mapping[str, Any]) -> RuntimeBackend | None:
+    """Map native cloud VM types without relabelling QEMU or unknown instances."""
+
+    vm_type = _instance_vm_type(instance)
+    for backend, expected in _LIMA_VM_TYPES.items():
+        if vm_type == expected:
+            return backend
+    return None
+
+
 def available() -> bool:
     return platform.system() == "Darwin" and platform.machine() in {"arm64", "aarch64"}
 
 
 def is_lima_run(rpaths: RunPaths) -> bool:
     try:
-        return state.read_run_state(rpaths).get("backend") == _BACKEND
+        return RuntimeBackend(state.read_run_state(rpaths).get("backend")).is_lima
     except Exception:
         return False
 
@@ -158,6 +189,43 @@ def _require_supported_version() -> None:
         )
 
 
+def _require_krunkit() -> None:
+    """Check the GPU VMM and Lima plugin before reserving a run."""
+
+    hint = "install krunkit with: brew tap slp/krun && brew install slp/krun/krunkit"
+    try:
+        major = int(platform.mac_ver()[0].split(".", 1)[0])
+    except (TypeError, ValueError):
+        raise LifecycleError("cannot determine macOS version; lima-krunkit requires macOS 14 or newer") from None
+    if major < 14:
+        raise LifecycleError("lima-krunkit requires macOS 14 or newer")
+    _require_supported_version()
+    executable = shutil.which("krunkit")
+    if executable is None:
+        raise LifecycleError(f"krunkit is not on PATH; {hint}")
+    try:
+        result = subprocess.run([executable, "--version"], capture_output=True, text=True, check=False, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        raise LifecycleError("krunkit version check failed; verify that krunkit --version succeeds") from None
+    match = _LIMA_VERSION_RE.search(result.stdout)
+    if result.returncode != 0 or match is None or tuple(int(part) for part in match.groups()) < (1, 2, 1):
+        raise LifecycleError(f"krunkit 1.2.1 or newer is required; {hint}")
+    info = _run_command(["limactl", "info"], timeout_seconds=30)
+    if info.returncode != 0:
+        raise LifecycleError("Lima driver discovery failed; verify that limactl info succeeds")
+    try:
+        decoded = json.loads(info.stdout)
+        location = decoded["vmTypesEx"]["krunkit"]["location"]
+    except (KeyError, TypeError, json.JSONDecodeError):
+        raise LifecycleError(
+            "Lima's krunkit driver is missing; install a Lima build with lima-driver-krunkit"
+        ) from None
+    if not isinstance(location, str) or not Path(location).is_absolute() or not Path(location).is_file():
+        raise LifecycleError("Lima's krunkit driver path is not an installed executable")
+    if not os.access(location, os.X_OK):
+        raise LifecycleError("Lima's krunkit driver is not executable")
+
+
 def _decode_json_objects(output: str, context: str) -> list[dict[str, Any]]:
     raw = output.strip()
     if not raw:
@@ -181,18 +249,32 @@ def _decode_json_objects(output: str, context: str) -> list[dict[str, Any]]:
     return result
 
 
-def validate_network(name: str) -> None:
-    """Fail closed unless Lima VZ can provide the requested network."""
+def _validate_network_name(name: str, backend: str | RuntimeBackend) -> None:
+    vm_type = backend_vm_type(backend)
+    if name == "default" or (vm_type == "vz" and name == "vzNAT"):
+        return
+    if _LIMA_NETWORK_RE.fullmatch(name) is not None:
+        if vm_type == "vz" or name in {"lima:shared", "lima:bridged", "lima:user-v2"}:
+            return
+    if vm_type == "krunkit":
+        raise ArtifactValidationError(
+            "lima-krunkit networks must be 'default', 'lima:shared', 'lima:bridged', or 'lima:user-v2'; "
+            "vzNAT requires lima-vz"
+        )
+    raise ArtifactValidationError(
+        "Lima networks must be 'default', 'vzNAT', or 'lima:NAME' with a lowercase hyphen-only NAME"
+    )
 
+
+def validate_network(name: str, *, backend: str | RuntimeBackend = RuntimeBackend.LIMA_VZ) -> None:
+    """Fail closed unless the selected Lima driver can provide this network."""
+
+    _validate_network_name(name, backend)
     if not available():
-        raise LifecycleError("Lima VZ networks require macOS on Apple Silicon")
+        raise LifecycleError("Lima networks require macOS on Apple Silicon")
     _require_supported_version()
     if name in {"default", "vzNAT"}:
         return
-    if _LIMA_NETWORK_RE.fullmatch(name) is None:
-        raise ArtifactValidationError(
-            "Lima networks must be 'default', 'vzNAT', or 'lima:NAME' with a lowercase hyphen-only NAME"
-        )
     result = _run_command(["limactl", "network", "list", "--json"], timeout_seconds=30)
     _require_success(result, "network list")
     values = _decode_json_objects(result.stdout, "network")
@@ -209,13 +291,17 @@ def validate_network(name: str) -> None:
         raise LifecycleError(f"Lima network does not exist: {backend_name}")
 
 
-def _lima_config(spec: RunSpec, *, run_id: str | None = None) -> str:
+def _lima_config(
+    spec: RunSpec, *, run_id: str | None = None, backend: str | RuntimeBackend = RuntimeBackend.LIMA_VZ
+) -> str:
     if spec.host_shares:
         raise ArtifactValidationError("host directory binds require the conventional Linux KVM cloud-image backend")
+    vm_type = backend_vm_type(backend)
+    _validate_network_name(spec.network, backend)
     image_uri = spec.stack.base.local_path.resolve().as_uri()
     lines = [
         'minimumLimaVersion: "2.0.0"',
-        "vmType: vz",
+        f"vmType: {vm_type}",
         "arch: aarch64",
         f"cpus: {spec.vcpus}",
         f'memory: "{spec.memory_mib}MiB"',
@@ -224,14 +310,13 @@ def _lima_config(spec: RunSpec, *, run_id: str | None = None) -> str:
         "  system: false",
         "  user: false",
         "mounts: []",
-        "networks:",
     ]
-    if spec.network in {"default", "vzNAT"}:
-        lines.append("  - vzNAT: true")
-    elif _LIMA_NETWORK_RE.fullmatch(spec.network):
-        lines.extend([f"  - lima: {json.dumps(spec.network.split(':', 1)[1])}"])
+    if vm_type == "krunkit" and spec.network == "default":
+        lines.append("networks: []")
+    elif spec.network in {"default", "vzNAT"}:
+        lines.extend(["networks:", "  - vzNAT: true"])
     else:
-        raise ArtifactValidationError("Lima networks must be 'default', 'vzNAT', or an existing 'lima:NAME' network")
+        lines.extend(["networks:", f"  - lima: {json.dumps(spec.network.split(':', 1)[1])}"])
     lines.extend(
         [
             "hostResolver:",
@@ -346,10 +431,10 @@ def _lima_config(spec: RunSpec, *, run_id: str | None = None) -> str:
     return "\n".join(lines) + "\n"
 
 
-def validate_run_spec(spec: RunSpec) -> None:
+def validate_run_spec(spec: RunSpec, *, backend: str | RuntimeBackend = RuntimeBackend.LIMA_VZ) -> None:
     """Render and validate a Lima run definition without touching backend state."""
 
-    _lima_config(spec, run_id="00000000-0000-0000-0000-000000000000")
+    _lima_config(spec, run_id="00000000-0000-0000-0000-000000000000", backend=backend)
 
 
 def _list_instances() -> list[dict[str, Any]]:
@@ -395,12 +480,17 @@ def _instance_run_id(instance: dict[str, Any]) -> str | None:
     return value
 
 
-def _require_owned_instance(instance: dict[str, Any], expected_run_id: str, name: str) -> None:
+def _require_owned_instance(
+    instance: dict[str, Any], expected_run_id: str, name: str, *, backend: str | RuntimeBackend
+) -> None:
     actual = _instance_run_id(instance)
     if actual != expected_run_id:
         raise StateError(
             f"Lima instance {name!r} is foreign: expected run marker {expected_run_id!r}, found {actual!r}"
         )
+    expected_type = "qemu" if backend == "lima-qemu-oci" else backend_vm_type(backend)
+    if _instance_vm_type(instance) != expected_type:
+        raise StateError(f"Lima instance {name!r} VM type does not match the owned backend")
 
 
 def _require_disk_format_sealed(
@@ -508,7 +598,7 @@ def _require_lima_snapshot(
     if snapshot.record != expected:
         raise StateError("run ledger changed during Lima reconciliation")
     record = _mutable_snapshot_state(snapshot)
-    if record.get("backend") != _BACKEND:
+    if record.get("backend") != expected.dispatch_key.backend.value or not expected.dispatch_key.backend.is_lima:
         raise StateError("run is not a Lima-managed macOS VM")
     return record
 
@@ -525,21 +615,18 @@ def reconcile_run(
     expected = _expected_record or state.read_run_dispatch_record(roots, name)
     if expected.name != name:
         raise StateError("run dispatch identity does not match requested name")
-    if (
-        expected.dispatch_key.runtime_kind is not RuntimeKind.CLOUD_IMAGE
-        or expected.dispatch_key.backend is not RuntimeBackend.LIMA_VZ
-    ):
+    if expected.dispatch_key.runtime_kind is not RuntimeKind.CLOUD_IMAGE or not expected.dispatch_key.backend.is_lima:
         raise StateError("run is not managed by the Lima runtime")
 
     def observe(record: dict[str, Any]) -> str:
-        if record.get("backend") != _BACKEND:
+        if record.get("backend") != expected.dispatch_key.backend.value:
             raise StateError("run is not a Lima-managed macOS VM")
         instance = _instance_info_or_none(name)
         if instance is None:
             reconciled = "removed"
         else:
             live = _instance_runtime_status(instance)
-            _require_owned_instance(instance, expected.run_id, name)
+            _require_owned_instance(instance, expected.run_id, name, backend=expected.dispatch_key.backend)
             if record.get("status") in {"removed", "failed"}:
                 raise StateError(f"foreign or ambiguous Lima instance uses owned run name: {name}")
             reconciled = live
@@ -611,16 +698,27 @@ def _guest_ipv4(name: str) -> str:
     raise LifecycleError("Lima guest did not report an IPv4 address")
 
 
-def run(spec: RunSpec, *, roots: StatePaths | None = None, timeout_seconds: float = _TIMEOUT_SECONDS) -> dict[str, Any]:
-    """Create and start a verified ARM64 Ubuntu cloud image through Lima VZ."""
+def run(
+    spec: RunSpec,
+    *,
+    roots: StatePaths | None = None,
+    timeout_seconds: float = _TIMEOUT_SECONDS,
+    backend: str | RuntimeBackend = RuntimeBackend.LIMA_VZ,
+) -> dict[str, Any]:
+    """Create and start a verified ARM64 cloud image through the selected Lima driver."""
     if spec.host_shares:
         raise ArtifactValidationError("host directory binds require the conventional Linux KVM cloud-image backend")
+    backend_vm_type(backend)
+    selected_backend = RuntimeBackend(backend)
+    validate_run_spec(spec, backend=selected_backend)
     if not available():
-        raise LifecycleError("native Lima VZ runs require macOS on Apple Silicon")
+        raise LifecycleError("native Lima runs require macOS on Apple Silicon")
     if spec.stack.base.arch != "aarch64":
-        raise ArtifactValidationError("native macOS Lima runs require an aarch64 Ubuntu cloud image")
+        raise ArtifactValidationError("native macOS Lima runs require an aarch64 cloud image")
     if spec.network == "none":
         raise ArtifactValidationError("native macOS Lima prototype requires a managed network for SSH access")
+    if selected_backend is RuntimeBackend.LIMA_KRUNKIT:
+        _require_krunkit()
     try:
         require_file_digest(spec.stack.base.local_path, spec.stack.base.digest)
         for layer in spec.stack.layers:
@@ -636,7 +734,7 @@ def run(spec: RunSpec, *, roots: StatePaths | None = None, timeout_seconds: floa
             raise
     else:
         raise StateError(f"a Lima instance named '{spec.name}' already exists and is not owned by this run")
-    dispatch_key = DispatchKey(RuntimeKind.CLOUD_IMAGE, RuntimeBackend.LIMA_VZ)
+    dispatch_key = DispatchKey(RuntimeKind.CLOUD_IMAGE, selected_backend)
     with state.reserve_new_run(roots, spec.name, dispatch_key) as reservation:
         rpaths = reservation.paths
         config_path = rpaths.root / _CONFIG_NAME
@@ -653,7 +751,8 @@ def run(spec: RunSpec, *, roots: StatePaths | None = None, timeout_seconds: floa
                     "arch": spec.stack.base.arch,
                 },
                 "layers": [
-                    {"digest": layer.digest, "local_path": str(layer.local_path)} for layer in spec.stack.layers
+                    {"digest": layer.digest, "local_path": str(layer.local_path), "arch": layer.arch}
+                    for layer in spec.stack.layers
                 ],
                 "layer_attachment": {
                     "delivery": "scp-copy",
@@ -687,7 +786,9 @@ def run(spec: RunSpec, *, roots: StatePaths | None = None, timeout_seconds: floa
                 "cleanup_flags": {},
             }
             _write_state(rpaths, "creating", record, reservation=reservation)
-            reservation.write_file(_CONFIG_NAME, _lima_config(spec, run_id=owner.run_id).encode("utf-8"))
+            reservation.write_file(
+                _CONFIG_NAME, _lima_config(spec, run_id=owner.run_id, backend=selected_backend).encode("utf-8")
+            )
             created = _run_command(
                 ["limactl", "create", "--tty=false", "--name", spec.name, str(config_path)],
                 timeout_seconds=timeout_seconds,
@@ -700,13 +801,14 @@ def run(spec: RunSpec, *, roots: StatePaths | None = None, timeout_seconds: floa
                 reservation=reservation,
             )
             reservation.verify_binding()
+            _require_owned_instance(_instance_info(spec.name), owner.run_id, spec.name, backend=selected_backend)
             started = _run_command(
                 ["limactl", "start", "--timeout", f"{int(timeout_seconds)}s", spec.name],
                 timeout_seconds=timeout_seconds + 30,
             )
             _require_success(started, "start")
             instance = _instance_info(spec.name)
-            _require_owned_instance(instance, owner.run_id, spec.name)
+            _require_owned_instance(instance, owner.run_id, spec.name, backend=selected_backend)
             if instance.get("status") != "Running":
                 raise LifecycleError(f"Lima instance '{spec.name}' did not reach Running state")
             port = instance.get("sshLocalPort")
@@ -740,7 +842,7 @@ def run(spec: RunSpec, *, roots: StatePaths | None = None, timeout_seconds: floa
                         f"disable repeated formatting for disk {volume.backend_name}",
                     )
                 sealed_instance = _instance_info(spec.name)
-                _require_owned_instance(sealed_instance, owner.run_id, spec.name)
+                _require_owned_instance(sealed_instance, owner.run_id, spec.name, backend=selected_backend)
                 _require_disk_format_sealed(sealed_instance, initializing, spec.name)
                 safe_spec = replace(
                     spec,
@@ -748,7 +850,7 @@ def run(spec: RunSpec, *, roots: StatePaths | None = None, timeout_seconds: floa
                 )
                 reservation.write_file(
                     _CONFIG_NAME,
-                    _lima_config(safe_spec, run_id=owner.run_id).encode("utf-8"),
+                    _lima_config(safe_spec, run_id=owner.run_id, backend=selected_backend).encode("utf-8"),
                 )
                 restarted = _run_command(
                     ["limactl", "start", "--timeout", f"{int(timeout_seconds)}s", spec.name],
@@ -756,7 +858,7 @@ def run(spec: RunSpec, *, roots: StatePaths | None = None, timeout_seconds: floa
                 )
                 _require_success(restarted, "restart after first-use disk formatting")
                 instance = _instance_info(spec.name)
-                _require_owned_instance(instance, owner.run_id, spec.name)
+                _require_owned_instance(instance, owner.run_id, spec.name, backend=selected_backend)
                 if instance.get("status") != "Running":
                     raise LifecycleError(f"Lima instance '{spec.name}' did not restart after disabling disk formatting")
                 port = instance.get("sshLocalPort")
@@ -791,7 +893,7 @@ def run(spec: RunSpec, *, roots: StatePaths | None = None, timeout_seconds: floa
             try:
                 cleanup_instance = _instance_info_or_none(spec.name)
                 if cleanup_instance is not None:
-                    _require_owned_instance(cleanup_instance, owner.run_id, spec.name)
+                    _require_owned_instance(cleanup_instance, owner.run_id, spec.name, backend=selected_backend)
                     _run_command(["limactl", "delete", "--force", spec.name], timeout_seconds=60)
             except BaseException:
                 pass
@@ -822,7 +924,7 @@ def shell_session(
 
     roots = roots or (state.resolve_roots() if _expected_record is not None else state.init_roots())
     expected = _expected_record or state.read_run_dispatch_record(roots, name)
-    if expected.dispatch_key != DispatchKey(RuntimeKind.CLOUD_IMAGE, RuntimeBackend.LIMA_VZ):
+    if expected.dispatch_key.runtime_kind is not RuntimeKind.CLOUD_IMAGE or not expected.dispatch_key.backend.is_lima:
         raise StateError("run is not managed by the Lima runtime")
     state.require_bound_run_dispatch_record(roots, expected)
     raise RuntimeCapabilityError(RuntimeOperation.SHELL, expected.dispatch_key)
@@ -841,7 +943,7 @@ def exec_session(
         raise TypeError("Lima exec requires an ExecRequest")
     roots = roots or (state.resolve_roots() if _expected_record is not None else state.init_roots())
     expected = _expected_record or state.read_run_dispatch_record(roots, name)
-    if expected.dispatch_key != DispatchKey(RuntimeKind.CLOUD_IMAGE, RuntimeBackend.LIMA_VZ):
+    if expected.dispatch_key.runtime_kind is not RuntimeKind.CLOUD_IMAGE or not expected.dispatch_key.backend.is_lima:
         raise StateError("run is not managed by the Lima runtime")
     state.require_bound_run_dispatch_record(roots, expected)
     raise RuntimeCapabilityError(RuntimeOperation.EXEC, expected.dispatch_key)
@@ -917,7 +1019,7 @@ def stop(
     ) as mutation:
         if (
             mutation.record.dispatch_key.runtime_kind is not RuntimeKind.CLOUD_IMAGE
-            or mutation.record.dispatch_key.backend is not RuntimeBackend.LIMA_VZ
+            or not mutation.record.dispatch_key.backend.is_lima
         ):
             raise StateError("run is not managed by the Lima runtime")
         record = mutation.mutable_state()
@@ -927,7 +1029,7 @@ def stop(
             if not mutation.is_legacy and record.get("status") != "removed":
                 mutation.write_state("removed", {**record, "updated_at": state.utc_now_iso()})
             raise StateError(f"owned Lima instance is missing: {name}")
-        _require_owned_instance(instance, mutation.record.run_id, name)
+        _require_owned_instance(instance, mutation.record.run_id, name, backend=mutation.record.dispatch_key.backend)
         live_status = _instance_runtime_status(instance)
         backend_reconciled = initial_status == "stopped" and live_status != "stopped"
         if record.get("status") in {"failed", "removed"}:
@@ -949,7 +1051,9 @@ def stop(
         final_instance = _instance_info_or_none(name)
         if final_instance is None:
             raise StateError(f"owned Lima instance is missing after stop: {name}")
-        _require_owned_instance(final_instance, mutation.record.run_id, name)
+        _require_owned_instance(
+            final_instance, mutation.record.run_id, name, backend=mutation.record.dispatch_key.backend
+        )
         if _instance_runtime_status(final_instance) != "stopped":
             raise LifecycleError(f"Lima instance '{name}' did not stop")
         result = mutation.write_state("stopped", {**record, "updated_at": state.utc_now_iso()})
@@ -978,7 +1082,7 @@ def start(
     ) as mutation:
         if (
             mutation.record.dispatch_key.runtime_kind is not RuntimeKind.CLOUD_IMAGE
-            or mutation.record.dispatch_key.backend is not RuntimeBackend.LIMA_VZ
+            or not mutation.record.dispatch_key.backend.is_lima
         ):
             raise StateError("run is not managed by the Lima runtime")
         rpaths = mutation.paths
@@ -989,7 +1093,7 @@ def start(
             if not mutation.is_legacy and record.get("status") != "removed":
                 mutation.write_state("removed", {**record, "updated_at": state.utc_now_iso()})
             raise StateError(f"owned Lima instance is missing: {name}")
-        _require_owned_instance(instance, mutation.record.run_id, name)
+        _require_owned_instance(instance, mutation.record.run_id, name, backend=mutation.record.dispatch_key.backend)
         live_status = _instance_runtime_status(instance)
         backend_reconciled = initial_status == "running" and live_status == "stopped"
         if record.get("status") in {"failed", "removed"}:
@@ -1022,7 +1126,9 @@ def start(
             )
             _require_success(result, "start")
             instance = _instance_info(name)
-            _require_owned_instance(instance, mutation.record.run_id, name)
+            _require_owned_instance(
+                instance, mutation.record.run_id, name, backend=mutation.record.dispatch_key.backend
+            )
             if instance.get("status") != "Running":
                 raise LifecycleError(f"Lima instance '{name}' did not reach Running state")
             layers = tuple(
@@ -1030,6 +1136,7 @@ def start(
                     digest=item["digest"],
                     media_type="application/vnd.afterglow.palimpsest.layer.squashfs.v1",
                     local_path=Path(item["local_path"]),
+                    arch=item.get("arch"),
                 )
                 for item in record.get("layers", [])
             )
@@ -1037,7 +1144,9 @@ def start(
             mutation.verify_binding()
             guest_ip = _guest_ipv4(name)
             final_instance = _instance_info(name)
-            _require_owned_instance(final_instance, mutation.record.run_id, name)
+            _require_owned_instance(
+                final_instance, mutation.record.run_id, name, backend=mutation.record.dispatch_key.backend
+            )
             if final_instance.get("status") != "Running":
                 raise LifecycleError(f"Lima instance '{name}' did not remain Running")
             result = mutation.write_state(
@@ -1056,7 +1165,9 @@ def start(
                 try:
                     cleanup_instance = _instance_info_or_none(name)
                     if cleanup_instance is not None:
-                        _require_owned_instance(cleanup_instance, mutation.record.run_id, name)
+                        _require_owned_instance(
+                            cleanup_instance, mutation.record.run_id, name, backend=mutation.record.dispatch_key.backend
+                        )
                         if _instance_runtime_status(cleanup_instance) != "stopped":
                             _require_success(
                                 _run_command(["limactl", "stop", "--force", name], timeout_seconds=60),
@@ -1096,13 +1207,15 @@ def rm(
     ) as mutation:
         if (
             mutation.record.dispatch_key.runtime_kind is not RuntimeKind.CLOUD_IMAGE
-            or mutation.record.dispatch_key.backend is not RuntimeBackend.LIMA_VZ
+            or not mutation.record.dispatch_key.backend.is_lima
         ):
             raise StateError("run is not managed by the Lima runtime")
         record = mutation.mutable_state()
         instance = _instance_info_or_none(name)
         if instance is not None:
-            _require_owned_instance(instance, mutation.record.run_id, name)
+            _require_owned_instance(
+                instance, mutation.record.run_id, name, backend=mutation.record.dispatch_key.backend
+            )
             mutation.verify_binding()
             from . import host_vm_control
 
@@ -1342,6 +1455,7 @@ def build_layer(spec: BuildSpec, *, roots: StatePaths | None = None) -> dict[str
     record_data = create_build_record(
         build_id=build_id,
         base_digest=spec.base.digest,
+        arch=spec.base.arch,
         parent_digests=parent_digests,
         recipe_sha256=recipe.recipe_sha256,
         network=spec.network,
@@ -1489,6 +1603,7 @@ def build_layer(spec: BuildSpec, *, roots: StatePaths | None = None) -> dict[str
         failed_record = create_build_record(
             build_id=build_id,
             base_digest=spec.base.digest,
+            arch=spec.base.arch,
             parent_digests=parent_digests,
             recipe_sha256=recipe.recipe_sha256,
             network=spec.network,

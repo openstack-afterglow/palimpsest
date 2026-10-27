@@ -285,6 +285,10 @@ html[data-activity-paused="true"] .flow-slab, html[data-activity-paused="true"] 
 .panel-heading { display: flex; justify-content: space-between; gap: 16px; align-items: center; margin-bottom: 14px; }
 .panel-heading h2 { margin: 0; }
 .remote-search-form { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); align-items: end; gap: 12px; margin: 18px 0; }
+.remote-search-actions { display: flex; gap: 8px; align-items: center; }
+button.btn-subtle { background: #1c2736; border: 1px solid var(--line); color: var(--muted); }
+button.btn-subtle:hover { background: #243346; color: var(--ink); }
+.artifacts-tabs { margin: 0 0 18px; }
 #remote-results .row-actions { white-space: normal; flex-wrap: wrap; }
 #remote-upload-controls { margin-top: 22px; padding-top: 18px; border-top: 1px solid var(--line); }
 #remote-upload-controls summary { cursor: pointer; font-weight: 650; }

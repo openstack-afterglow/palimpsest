@@ -47,7 +47,8 @@ PORTABLE_FILES = {
     ),
     "host-runtime": _units("""
         cloud_runtime cloud_runtime_arch cloudinit_guest experimental_oci_vm kvm_contract lima pci_preflight
-        named_volumes retained_instances oci_volume_policy
+        named_volumes retained_instances oci_volume_policy nova_build nova_metrics
+        environment_benchmark benchmark_workflow benchmark_openstack benchmark_reporting
         platforms process_session project project_adapter project_runtime project_volumes oci_host
         oci_run_request oci_run_adapter oci_public_cli oci_resource_status oci_docker_hub_cli_live_contract
         oci_docker_hub_services_live_contract oci_ml_cpu_live_contract oci_network oci_network_live_contract
@@ -58,8 +59,8 @@ PORTABLE_FILES = {
     ),
     "oci-store": _units("""
         oci_changeset oci_convert_security oci_converter_first_pass oci_image oci_root_volume_inventory
-        oci_layout oci_metrics oci_provenance oci_source oci_store oci_store_handoff
-        oci_worker_protocol
+        oci_layout oci_metrics oci_provenance oci_source oci_store oci_store_handoff layer_cache
+        oci_worker_protocol nova_assets registry_worker
     """),
     "oci-guest": _units("""
         oci_control_protocol oci_control_protocol_v2 oci_fs_fixtures
@@ -234,6 +235,7 @@ MIXED = {
             test_hard_worker_materializes_then_reuses_a_local_oci_layer
             test_hard_worker_materializes_all_ordered_image_occurrences_cold_then_warm
             test_erofs_reference_retains_timestamp_failure
+            test_capture_releases_store_and_journal_despite_peer_namespace
         """.split()
         ),
         "oci-store": tuple(
@@ -250,6 +252,21 @@ MIXED = {
         """.split()
         ),
     },
+    "tests/unit/test_oci_build_assets.py": {
+        "oci-store": (
+            "test_paired_build_roundtrip_uses_original_canonical_paths_and_occurrences",
+            "test_wrong_build_provenance_refuses_asset_publication",
+            "test_wrong_materialized_graph_cannot_register",
+            "test_build_oci_remains_strictly_zero_time_normalized",
+            "test_source_kind_requires_complete_build_and_occurrence_provenance",
+            "test_evidence_change_during_conversion_refuses_registration",
+            "test_replaced_export_with_same_source_build_key_is_not_source_output",
+            "test_source_oci_hardlink_handoff_uses_validated_carrier_bytes",
+            "test_source_oci_ancestor_whiteout_or_opaque_hides_lower_handoff",
+            "test_source_commit_requires_real_pristine_matching_checkout",
+        ),
+        "filesystem": ("test_real_oci_fixture_materialization_registers_canonical_paths_without_replacement",),
+    },
 }
 
 PORTABLE = tuple(PORTABLE_FILES)
@@ -259,6 +276,11 @@ LANES = (*PORTABLE, *SPECIAL_FILES)
 # an import graph or a guarantee. Shared infrastructure/unknown changes fall
 # back to every portable lane. Suggested external proofs still need opt-in.
 DEPENDENCIES = (
+    (
+        "environment_benchmark benchmark_openstack benchmark_workflow benchmark_worker benchmark_cli benchmark_reporting",
+        ("core-cli", "host-runtime"),
+        (),
+    ),
     ("pci_preflight", ("host-runtime",), ()),
     ("oci_root_volume_inventory", ("core-cli", "host-runtime", "oci-store"), ()),
     ("oci_resource_status", ("host-runtime", "core-cli"), ()),

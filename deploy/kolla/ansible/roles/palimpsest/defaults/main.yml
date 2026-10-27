@@ -1,7 +1,7 @@
 ---
 # Palimpsest kolla role defaults
 
-palimpsest_image_tag: "0.3.9"
+palimpsest_image_tag: "0.3.10"
 palimpsest_image_namespace: "ghcr.io/openstack-afterglow"
 palimpsest_api_image: "{{ palimpsest_image_namespace }}/palimpsest-hub-api"
 palimpsest_worker_image: "{{ palimpsest_image_namespace }}/palimpsest-hub-worker"
@@ -97,6 +97,10 @@ palimpsest_hub_shared_path: ""
 palimpsest_hub_shared_fstype: ""
 palimpsest_hub_shared_source: ""
 palimpsest_config_dir: "{{ node_config_directory }}/palimpsest"
+palimpsest_policy_file: "/etc/palimpsest/policy.yaml"
+palimpsest_policy_dirs: []
+# Optional controller-side YAML copied only when explicitly supplied.
+palimpsest_policy_source: ""
 palimpsest_hub_max_blob_bytes: 107374182400
 palimpsest_hub_max_bundle_expanded_bytes: 107374182400
 palimpsest_hub_max_blocking_operations: 2
@@ -149,9 +153,11 @@ palimpsest_hub_api_service:
   restart_policy: unless-stopped
   volumes:
     - "{{ palimpsest_config_dir }}/palimpsest.conf:/app/palimpsest.conf:ro"
+    - "{{ palimpsest_config_dir }}/policy:/etc/palimpsest:ro"
     - "{{ palimpsest_hub_shared_path if palimpsest_hub_storage_mode == 'shared' else palimpsest_hub_volume }}:{{ palimpsest_hub_path }}"
     - "kolla_logs:/var/log/kolla/"
   environment:
+    PALIMPSEST_CONFIG: "/etc/palimpsest/palimpsest.conf"
     PALIMPSEST_HUB_BUILD_WORKER_KEY: "{{ palimpsest_build_worker_key if (enable_palimpsest_hub_build_worker | bool) else '' }}"
     DATABASE_URL: "{{ palimpsest_database_url }}"
     REDIS_URL: "{{ palimpsest_redis_url }}"
@@ -226,9 +232,11 @@ palimpsest_hub_worker_service:
   restart_policy: unless-stopped
   volumes:
     - "{{ palimpsest_config_dir }}/palimpsest.conf:/app/palimpsest.conf:ro"
+    - "{{ palimpsest_config_dir }}/policy:/etc/palimpsest:ro"
     - "{{ palimpsest_hub_shared_path if palimpsest_hub_storage_mode == 'shared' else palimpsest_hub_volume }}:{{ palimpsest_hub_path }}"
     - "kolla_logs:/var/log/kolla/"
   environment:
+    PALIMPSEST_CONFIG: "/etc/palimpsest/palimpsest.conf"
     DATABASE_URL: "{{ palimpsest_database_url }}"
     REDIS_URL: "{{ palimpsest_redis_url }}"
     REDIS_SENTINEL_ADDRESSES: "{{ palimpsest_redis_sentinel_addresses | to_json }}"

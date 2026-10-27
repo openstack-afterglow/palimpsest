@@ -3,7 +3,9 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import math
+import os
 import re
+import tomllib
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -254,7 +256,14 @@ class BuildWorkerSettings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
-    return Settings()
+    path = Path(os.environ.get("PALIMPSEST_CONFIG", "/etc/palimpsest/palimpsest.conf"))
+    policy_options = tomllib.loads(path.read_text()).get("oslo_policy", {}) if path.is_file() else {}
+    values = {
+        "oslo_policy_" + name: value
+        for name, value in policy_options.items()
+        if name in {"policy_file", "policy_dirs"} and "OSLO_POLICY_" + name.upper() not in os.environ
+    }
+    return Settings(**values)
 
 
 @lru_cache

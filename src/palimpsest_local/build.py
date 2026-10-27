@@ -335,6 +335,7 @@ def create_build_record(
     *,
     build_id: str,
     base_digest: str,
+    arch: str,
     parent_digests: Sequence[str],
     recipe_sha256: str,
     network: Literal["none", "default"] = "none",
@@ -352,6 +353,8 @@ def create_build_record(
     rec_sha = require_digest(recipe_sha256)
     if network not in {"none", "default"}:
         raise ArtifactValidationError(f"invalid build network: {network!r}")
+    if arch not in {"x86_64", "aarch64"}:
+        raise ArtifactValidationError(f"invalid build architecture: {arch!r}")
     if output_digest is not None:
         output_digest = require_digest(output_digest)
 
@@ -361,6 +364,7 @@ def create_build_record(
         "schema_version": 1,
         "build_id": build_id,
         "base_digest": base,
+        "arch": arch,
         "parent_digests": parents,
         "recipe_sha256": rec_sha,
         "cleaning_policy": PALIMPSEST_CLEAN_V1,
@@ -408,6 +412,7 @@ def _finalize_build_output(
         {
             "kind": "squashfs",
             "media_type": MEDIA_TYPE_LAYER_SQUASHFS,
+            "arch": spec.base.arch,
             "parent_digest": spec.parent_layers[-1].digest if spec.parent_layers else None,
             "base_image_digest": spec.base.digest,
         },
@@ -428,6 +433,7 @@ def _finalize_build_output(
     final_record = create_build_record(
         build_id=record_data["build_id"],
         base_digest=spec.base.digest,
+        arch=spec.base.arch,
         parent_digests=parent_digests,
         recipe_sha256=recipe.recipe_sha256,
         network=spec.network,
@@ -488,6 +494,7 @@ def build_layer(
     record_data = create_build_record(
         build_id=build_id,
         base_digest=spec.base.digest,
+        arch=spec.base.arch,
         parent_digests=parent_digests,
         recipe_sha256=recipe.recipe_sha256,
         network=spec.network,
@@ -576,6 +583,7 @@ def build_layer(
         failed_record = create_build_record(
             build_id=build_id,
             base_digest=spec.base.digest,
+            arch=spec.base.arch,
             parent_digests=parent_digests,
             recipe_sha256=recipe.recipe_sha256,
             network=spec.network,

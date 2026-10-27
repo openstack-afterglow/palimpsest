@@ -1,0 +1,11 @@
+# Project-local rules. Scope, current identity, key attenuation and ownership are not overridable.
+"packages:inventory": "personal_project_owner:True or role:admin or role:palimpsest_admin or role:palimpsest_editor or role:palimpsest_user or role:palimpsest_reader or role:palimpsest-inventory_reader or role:palimpsest-download_user or role:palimpsest-publish_editor or role:palimpsest-keys_editor or role:palimpsest-keys_admin"
+"packages:read": "personal_project_owner:True or role:admin or role:palimpsest_admin or role:palimpsest_editor or role:palimpsest_user or role:palimpsest-download_user"
+"packages:write": "personal_project_owner:True or role:admin or role:palimpsest_admin or role:palimpsest_editor or role:palimpsest-publish_editor"
+"cache:read": "personal_project_owner:True or role:admin or role:palimpsest_admin or role:palimpsest_editor or role:palimpsest_user or role:palimpsest-download_user"
+"cache:write": "personal_project_owner:True or role:admin or role:palimpsest_admin or role:palimpsest_editor or role:palimpsest-publish_editor"
+"keys:issue": "personal_project_owner:True or role:admin or role:palimpsest_admin or role:palimpsest_editor or role:palimpsest-keys_editor"
+"keys:list": "personal_project_owner:True or role:admin or role:palimpsest_admin or role:palimpsest_editor or role:palimpsest-keys_editor or role:palimpsest-keys_admin"
+"keys:revoke": "personal_project_owner:True or role:admin or role:palimpsest_admin or role:palimpsest-keys_admin"
+"system:manage": "role:admin"
+"packages:delete": "personal_project_owner:True or role:admin"

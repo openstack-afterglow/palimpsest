@@ -27,12 +27,32 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TextIO
 
-from . import __version__, completion, host_journal, inventory, runtime_dispatch, ui
+from . import (
+    __version__,
+    completion,
+    host_journal,
+    inventory,
+    platforms,
+    runtime_dispatch,
+    ui,
+)
+from .artifact_compatibility import artifact_arch, check_artifact
 from .build import build_layer, parse_palimpsestfile, verify_build_integrity
-from .buildkit import BuildKitSpec, NamedOCIContext, build_with_buildkit, image_arch_for_platform
+from .buildkit import (
+    BuildKitSpec,
+    build_with_buildkit,
+    image_arch_for_platform,
+    resolve_named_oci_contexts,
+)
 from .digest import digest_file, digest_hex, require_digest
 from .errors import ArtifactValidationError, PalimpsestError
-from .hub import DEFAULT_HUB_URL, DISK_FORMAT_MEDIA_TYPES, KIND_CLOUD_IMAGE, MEDIA_TYPE_LAYER_SQUASHFS, HubClient
+from .hub import (
+    DEFAULT_HUB_URL,
+    DISK_FORMAT_MEDIA_TYPES,
+    KIND_CLOUD_IMAGE,
+    MEDIA_TYPE_LAYER_SQUASHFS,
+    HubClient,
+)
 from .inventory import import_cloud_image
 from .oci_image import OCIImageRef
 from .oci_layout import ContentStore, extract_bundle_tar, verify_layout_dir
@@ -51,7 +71,11 @@ from .package_credentials import (
     validate_package_key,
     validate_package_username,
 )
-from .package_reference import LocalPackageReference, read_package_reference, write_package_reference
+from .package_reference import (
+    LocalPackageReference,
+    read_package_reference,
+    write_package_reference,
+)
 from .packages import NativePackageClient, PackageSnapshot, snapshot_package
 from .project import (
     DEFAULT_PROJECT_FILE,
@@ -248,7 +272,7 @@ def _inspect_json_payload(inspected: InspectRecord) -> dict[str, object]:
 def _render_run_warnings(result: RunResult) -> None:
     for warning in result.warnings:
         if warning is RunWarningCategory.EXPERIMENTAL_BACKEND:
-            print("warning: libvirt-hvf is experimental", file=sys.stderr)
+            print(f"warning: {result.backend.value} is experimental", file=sys.stderr)
 
 
 def _render_compose_log_event(
@@ -467,6 +491,75 @@ def _add_limit(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--limit", type=int, default=50, help="maximum Hub results (1-200; default: 50)")
 
 
+def _add_artifact_filters(parser: argparse.ArgumentParser, *, include_arch: bool = True) -> None:
+    if include_arch:
+        parser.add_argument("--arch", choices=("x86_64", "aarch64"), help="filter by declared guest architecture")
+    parser.add_argument(
+        "--compatible",
+        action="store_true",
+        help="only complete artifact chains matching this client's platform; runtime preflight still applies",
+    )
+    parser.add_argument(
+        "--backend",
+        choices=("auto", *platforms.BACKENDS),
+        default="auto",
+        help="client backend for platform compatibility (default: auto)",
+    )
+
+
+def _hub_artifact_items(client: HubClient, args: argparse.Namespace, *, images: bool) -> list[dict]:
+    host = platforms.detect_host()
+    arch = args.arch
+    if args.compatible:
+        if arch is not None and arch != host.machine:
+            raise PalimpsestError("--arch conflicts with this client's architecture for --compatible")
+        arch = host.machine
+        if arch not in {"x86_64", "aarch64"}:
+            return []
+    metadata: dict[str, dict] = {}
+
+    def lookup(digest: str) -> dict:
+        if digest not in metadata:
+            metadata[digest] = client.get_layer(digest)
+        return metadata[digest]
+
+    result = []
+    offset = 0
+    while True:
+        if images:
+            rows = client.list_images(
+                ubuntu_base=args.ubuntu_base,
+                arch=arch,
+                os_variant=args.os_variant,
+                disk_format=args.disk_format,
+                limit=args.limit,
+                offset=offset,
+            )
+        else:
+            rows = client.list_layers(
+                name=args.name,
+                kind=args.kind or "squashfs",
+                parent_digest=args.parent,
+                arch=arch,
+                limit=args.limit,
+                offset=offset,
+            )
+        metadata.update({row.get("blob_digest") or row.get("digest"): row for row in rows if isinstance(row, dict)})
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            compatibility = check_artifact(
+                row, lookup=lookup if args.compatible else None, host=host, requested_backend=args.backend
+            )
+            if not args.compatible or compatibility["compatible"]:
+                result.append({**row, "compatibility": compatibility})
+                if len(result) == args.limit:
+                    return result
+        if not args.compatible or len(rows) < args.limit:
+            return result
+        offset += len(rows)
+
+
 def _write_process_bytes(target: object, data: bytes) -> None:
     stream = getattr(target, "buffer", target)
     try:
@@ -648,6 +741,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--url", help="Hub API URL (overrides PALIMPSEST_URL and config.toml)")
     parser.add_argument("--version", action="version", version=__version__, help="show the client version and exit")
     commands = parser.add_subparsers(dest="operation", required=True)
+    from .cloud_cli import add_parser as add_cloud_parser
+
+    add_cloud_parser(commands)
+    from .benchmark_cli import add_parser as add_benchmark_parser
+
+    add_benchmark_parser(commands)
 
     image = commands.add_parser(
         "image",
@@ -665,10 +764,17 @@ def build_parser() -> argparse.ArgumentParser:
         description="Query Hub boot-image inventory. Use store ls for local artifacts or images for local Docker images.",
     )
     image_ls.add_argument("--ubuntu-base", help="filter by Ubuntu base release")
-    image_ls.add_argument("--arch", help="filter by guest architecture, such as x86_64 or aarch64")
+    image_ls.add_argument("--arch", choices=("x86_64", "aarch64"), help="filter by declared guest architecture")
     image_ls.add_argument("--os-variant", help="filter by operating-system variant")
     image_ls.add_argument("--disk-format", choices=("qcow2", "raw"), help="filter by boot disk format")
     _add_limit(image_ls)
+    _add_artifact_filters(image_ls, include_arch=False)
+    image_ls.add_argument("--format", choices=("table", "json"), default="table")
+    image_check = image_commands.add_parser(
+        "check", help="check Hub boot-image platform compatibility without downloading or starting a VM"
+    )
+    image_check.add_argument("digest")
+    image_check.add_argument("--backend", choices=("auto", *platforms.BACKENDS), default="auto")
     image_pull = image_commands.add_parser("pull", help="download a Hub boot image into the local store")
     image_pull.add_argument("digest", help="Hub boot-image SHA-256 digest")
     image_pull.add_argument("--output", type=Path, help="also copy the downloaded image to this path")
@@ -687,7 +793,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--disk-format", choices=("qcow2", "raw"), default="qcow2", help="input disk format (default: qcow2)"
     )
     image_push.add_argument(
-        "--arch", choices=("x86_64", "aarch64"), default="x86_64", help="guest architecture (default: x86_64)"
+        "--arch",
+        choices=("x86_64", "aarch64"),
+        help="guest architecture; required unless already recorded for this file",
     )
     image_push.add_argument("--os-variant", help="operating-system variant, such as ubuntu-24.04")
     image_push.add_argument("--ubuntu-base", help="Ubuntu base release metadata")
@@ -725,19 +833,36 @@ def build_parser() -> argparse.ArgumentParser:
     )
     image_load.add_argument("-q", "--quiet", action="store_true", help="suppress Docker progress")
 
-    layer = commands.add_parser("layer", help="list, pack, pull, and publish SquashFS layers")
+    layer = commands.add_parser("layer", help="list, pack, pull, publish, and export SquashFS layers")
     layer_commands = layer.add_subparsers(dest="layer_operation", required=True)
+    layer_cloud_init = layer_commands.add_parser(
+        "cloud-init", help="export cloud-init for prepopulated external runtime storage (no provisioning)"
+    )
+    layer_cloud_init.add_argument("--config", required=True, type=Path, help="external layer runtime JSON manifest")
+    layer_cloud_init.add_argument(
+        "--output", type=Path, help="new owner-only cloud-init file (default: standard output; never overwrite)"
+    )
     layer_ls = layer_commands.add_parser("ls", help="list SquashFS layers available from Hub")
     layer_ls.add_argument("--name")
     layer_ls.add_argument("--kind")
     layer_ls.add_argument("--parent")
     _add_limit(layer_ls)
+    _add_artifact_filters(layer_ls)
+    layer_ls.add_argument("--format", choices=("table", "json"), default="table")
+    layer_check = layer_commands.add_parser("check", help="check a Hub layer's full base/parent chain for this client")
+    layer_check.add_argument("digest")
+    layer_check.add_argument("--backend", choices=("auto", *platforms.BACKENDS), default="auto")
     layer_pull = layer_commands.add_parser("pull", help="download a Hub layer into the local store")
     layer_pull.add_argument("digest")
     layer_pull.add_argument("--output", type=Path)
     layer_pack = layer_commands.add_parser("pack", help="pack a local directory as a tagged SquashFS layer")
     layer_pack.add_argument("directory", type=Path)
     layer_pack.add_argument("--tag", required=True)
+    layer_pack.add_argument(
+        "--arch",
+        choices=("x86_64", "aarch64"),
+        help="declare the directory's target architecture; omitted means unknown, not host architecture",
+    )
     layer_push = layer_commands.add_parser("push", help="upload a local layer tag or file to Hub")
     layer_push.add_argument("value")
     layer_push.add_argument("--name")
@@ -745,6 +870,11 @@ def build_parser() -> argparse.ArgumentParser:
     layer_push.add_argument("--base-image")
     layer_push.add_argument("--ubuntu-base")
     layer_push.add_argument("--publish", action="store_true")
+    layer_push.add_argument(
+        "--arch",
+        choices=("x86_64", "aarch64"),
+        help="declare a file's target architecture; must agree with stored metadata",
+    )
 
     bundle = commands.add_parser("bundle", help="download, unpack, and verify cloud-image/layer bundles")
     bundle_commands = bundle.add_subparsers(dest="bundle_operation", required=True)
@@ -776,6 +906,30 @@ def build_parser() -> argparse.ArgumentParser:
     oci_materialize.add_argument("--packer", type=Path, default=Path("/usr/bin/mksquashfs"))
     oci_materialize.add_argument("--timeout", type=float, default=300.0)
     oci_materialize.add_argument("--output", type=Path)
+    oci_cache = oci_commands.add_parser(
+        "cache", help="retain and reuse content-addressed layers on pre-mounted persistent storage"
+    )
+    oci_cache.add_argument("--root", required=True, type=Path, help="existing operator-owned private cache directory")
+    cache_commands = oci_cache.add_subparsers(dest="cache_operation", required=True)
+    cache_commands.add_parser("init", help="initialize an empty cache only after verifying its external mount")
+    cache_pull = cache_commands.add_parser("pull", help="cache an anonymous OCI image, reusing downloaded layer blobs")
+    cache_pull.add_argument("reference")
+    cache_pull.add_argument("--offline", action="store_true", help="use only the previously verified reference binding")
+    cache_pull.add_argument("--timeout", type=float, default=REGISTRY_PULL_TIMEOUT)
+    cache_import = cache_commands.add_parser("import", help="cache a verified existing OCI archive or layout")
+    cache_import.add_argument("source", type=Path)
+    cache_import.add_argument("--manifest", help="select an exact OCI root digest")
+    cache_materialize = cache_commands.add_parser("materialize", help="reuse or convert cached layers into SquashFS")
+    cache_materialize.add_argument("digest", help="cached immutable OCI root digest")
+    cache_materialize.add_argument("--packer", type=Path, default=Path("/usr/bin/mksquashfs"))
+    cache_materialize.add_argument("--timeout", type=float, default=300.0)
+    cache_retain = cache_commands.add_parser("retain", help="record an exact consumer without copying its layers")
+    cache_retain.add_argument("digest", help="cached immutable OCI root digest")
+    cache_retain.add_argument("--consumer", required=True, help="stable instance or deployment identity")
+    cache_release = cache_commands.add_parser("release", help="release only a consumer record; keep all cached bytes")
+    cache_release.add_argument("--consumer", required=True, help="exact retained consumer identity")
+    cache_inspect = cache_commands.add_parser("inspect", help="inspect persistent layers and consumer references")
+    cache_inspect.add_argument("--manifest", help="select one cached immutable OCI root digest")
     oci_root_proof = oci_commands.add_parser("root-proof", help="inspect an OCI-root run's recorded root proof")
     oci_root_proof.add_argument("name")
     oci_exec_status = oci_commands.add_parser("exec-status", help="inspect an OCI-root run's execution status")
@@ -810,6 +964,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="recipe frontend (default: infer from inputs)",
     )
     build.add_argument("--base", help="cloud-image SHA-256 digest for a Palimpsestfile build")
+    build.add_argument(
+        "--executor",
+        choices=("local", "nova"),
+        default="local",
+        help="local runtime or native Nova cloud-init layer build",
+    )
+    build.add_argument(
+        "--nova-config", type=Path, help="explicit project-bound Nova build and attached storage configuration"
+    )
     build.add_argument("--tag", "-t", action="append", required=True, help="output tag; repeat for Dockerfile builds")
     build.add_argument(
         "-f", "--file", dest="recipe", type=Path, help="recipe path (default: Palimpsestfile or Dockerfile)"
@@ -830,7 +993,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--build-arg", action="append", default=[], help="Dockerfile build argument KEY=VALUE (repeatable)"
     )
     build.add_argument(
-        "--local-image", action="append", default=[], help="named local OCI context NAME=PATH (repeatable)"
+        "--local-image",
+        action="append",
+        default=[],
+        help=(
+            "named OCI input NAME=LAYOUT@sha256:DIGEST, NAME=ARCHIVE.oci.tar@sha256:DIGEST, "
+            "or NAME=AUTHORITY/NAMESPACE/PACKAGE@sha256:DIGEST (repeatable); "
+            "native references require an explicit pull first"
+        ),
     )
     build.add_argument("--cache-scope", help="local BuildKit cache partition")
     build.add_argument(
@@ -1039,7 +1209,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument(
         "--backend",
-        choices=("auto", "kvm", "lima-vz", "libvirt-hvf", "lima-qemu-oci"),
+        choices=("auto", "kvm", "lima-vz", "lima-krunkit", "libvirt-hvf", "lima-qemu-oci"),
         default="auto",
         help="VM backend (default: select for host and image architecture)",
     )
@@ -1129,7 +1299,7 @@ def build_parser() -> argparse.ArgumentParser:
         volume_command.add_argument("name")
         volume_command.add_argument(
             "--backend",
-            choices=("kvm", "lima-vz", "libvirt-hvf"),
+            choices=platforms.BACKENDS,
             required=True,
             help="explicit volume backend",
         )
@@ -1196,6 +1366,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--kind", choices=("image", "layer", "all"), default="all", help="artifact kind to list (default: all)"
     )
     store_ls.add_argument("--format", choices=("table", "json"), default="table", help="output format (default: table)")
+    _add_artifact_filters(store_ls)
+    store_check = store_commands.add_parser(
+        "check", help="check a local digest or tag and all dependencies for this client's platform"
+    )
+    store_check.add_argument("reference", help="local artifact SHA-256 digest or layer tag")
+    store_check.add_argument("--backend", choices=("auto", *platforms.BACKENDS), default="auto")
     store_rm = store_commands.add_parser("rm", help="remove a local artifact and its tags")
     store_rm.add_argument("digest", help="local artifact SHA-256 digest")
     store_rm.add_argument(
@@ -1252,6 +1428,13 @@ def _validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
             parser.error("--port must be 0 or between 1024 and 65535")
     if args.operation == "oci" and args.oci_operation == "materialize" and not 0 < args.timeout < float("inf"):
         parser.error("--timeout must be a positive finite number")
+    if (
+        args.operation == "oci"
+        and args.oci_operation == "cache"
+        and args.cache_operation in {"pull", "materialize"}
+        and not 0 < args.timeout <= 3600
+    ):
+        parser.error("cache --timeout must be finite and between 0 and 3600 seconds")
     if args.operation == "exec":
         if args.command[:1] == ["--"]:
             args.command = args.command[1:]
@@ -1268,6 +1451,44 @@ def _validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
         if args.compose_operation == "up" and args.no_recreate and args.force_recreate:
             parser.error("--no-recreate and --force-recreate are mutually exclusive")
     if args.operation == "build":
+        if args.executor == "nova":
+            if args.nova_config is None or len(args.tag) != 1:
+                parser.error("Nova builds require --nova-config and exactly one --tag")
+            if args.context is not None or args.base or args.layer or args.recipe or args.frontend != "auto":
+                parser.error("Nova recipes, base and parents belong in the explicit --nova-config")
+            if (
+                args.offline
+                or args.push
+                or args.load
+                or args.local_image
+                or args.build_arg
+                or args.platform
+                or args.target
+            ):
+                parser.error("Nova builds do not accept Dockerfile/offline/push options")
+            if (
+                args.output is not None
+                or args.rootfs_output is not None
+                or args.runtime_tag is not None
+                or args.runtime_base is not None
+                or args.runtime_block_size is not None
+                or args.runtime_push
+                or args.cache_scope is not None
+                or args.cache_mode != "native"
+                or args.registry is not None
+                or args.cache_registry is not None
+                or args.cache_package is not None
+                or args.cache_from
+                or args.cache_to
+                or args.no_cache
+                or args.pull
+                or args.progress != "plain"
+                or args.network != "none"
+            ):
+                parser.error("Nova output, network and cache policy belong in --nova-config, not local executor flags")
+            return
+        if args.nova_config is not None:
+            parser.error("--nova-config requires --executor nova")
         frontend = _selected_build_frontend(args)
         if frontend == "palimpsestfile":
             if len(args.tag) != 1:
@@ -1606,7 +1827,12 @@ def _write_generated_config(path: Path, content: str, *, force: bool) -> None:
             stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, target)
+        if force:
+            os.replace(temporary, target)
+        else:
+            # Commit without replacing a destination created after the preflight.
+            os.link(temporary, target)
+            Path(temporary).unlink()
         os.chmod(target, 0o600)
         fsync_directory(target.parent)
     except Exception:
@@ -2031,6 +2257,22 @@ def _dispatch_compose(
 
 def dispatch_args(args: argparse.Namespace) -> int:
     op = args.operation
+    if op == "benchmark":
+        from .benchmark_cli import dispatch as dispatch_benchmark
+
+        return dispatch_benchmark(args)
+    if op == "cloud":
+        from .cloud_cli import dispatch as dispatch_cloud
+
+        return dispatch_cloud(args)
+    if op == "build" and args.executor == "nova":
+        from .cloud_cli import _json as read_cloud_config
+        from .cloud_cli import run_nova_build
+
+        print(
+            json.dumps(run_nova_build(read_cloud_config(args.nova_config), name=args.tag[0]), indent=2, sort_keys=True)
+        )
+        return 0
     if op == "completion":
         try:
             if args.install:
@@ -2039,6 +2281,44 @@ def dispatch_args(args: argparse.Namespace) -> int:
                 print(completion.generate_completion_script(args.shell))
         except (ValueError, OSError) as exc:
             raise PalimpsestError(f"cannot prepare {args.shell} completion: {exc}") from exc
+        return 0
+    if op == "layer" and args.layer_operation == "cloud-init":
+        from .external_layers import build_external_layer_user_data
+
+        try:
+            manifest = json.loads(args.config.expanduser().read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, ValueError, RecursionError) as exc:
+            raise PalimpsestError(f"cannot read external layer runtime JSON config: {exc}") from exc
+        rendered = build_external_layer_user_data(manifest)
+        if args.output is None:
+            sys.stdout.write(rendered)
+        else:
+            try:
+                _write_generated_config(args.output, rendered, force=False)
+            except (OSError, ValueError) as exc:
+                raise PalimpsestError(f"cannot write external layer cloud-init: {exc}") from exc
+            print(args.output.expanduser().resolve(strict=False))
+        return 0
+    if op == "oci" and args.oci_operation == "cache":
+        from .layer_cache import LayerCache
+
+        cache = LayerCache(args.root, initialize=args.cache_operation == "init")
+        cache_op = args.cache_operation
+        if cache_op == "pull":
+            payload = cache.pull(args.reference, offline=args.offline, timeout_seconds=args.timeout)
+        elif cache_op == "import":
+            payload = cache.import_source(args.source, manifest_digest=args.manifest)
+        elif cache_op == "materialize":
+            payload = cache.materialize(args.digest, packer_path=args.packer, timeout_seconds=args.timeout)
+        elif cache_op == "retain":
+            payload = cache.retain(args.digest, args.consumer)
+        elif cache_op == "release":
+            payload = cache.release(args.consumer)
+        elif cache_op == "inspect":
+            payload = cache.inspect(args.manifest)
+        else:
+            payload = cache.inspect()
+        print(json.dumps(payload, indent=2, sort_keys=True))
         return 0
     if op == "docker":
         argv = docker_command_argv(resolve_docker_config_dir(), *(args.docker_args or ["--help"]))
@@ -2133,7 +2413,6 @@ def dispatch_args(args: argparse.Namespace) -> int:
             payload = named_volumes.delete_named_volume(roots, name=args.name, backend=args.backend)
         print(json.dumps(payload, indent=2, sort_keys=True))
         return 0
-
     if op == "oci":
         if args.oci_operation == "pull":
             receipt = pull_anonymous_oci_archive(
@@ -2429,22 +2708,22 @@ def dispatch_args(args: argparse.Namespace) -> int:
             return run_docker_passthrough(argv).returncode
         if img_op == "ls":
             client = HubClient(resolve_url(args.url), resolve_token())
-            items = client.list_images(
-                ubuntu_base=args.ubuntu_base,
-                arch=args.arch,
-                os_variant=args.os_variant,
-                disk_format=args.disk_format,
-                limit=args.limit,
-            )
-            for item in items:
-                if isinstance(item, dict):
-                    digest_val = item.get("digest", "")
-                    name_val = item.get("name", "")
-                    df_val = item.get("disk_format", "")
-                    arch_val = item.get("arch", "")
-                    print(f"{digest_val}\t{name_val}\t{df_val}\t{arch_val}".strip())
-                else:
-                    print(str(item))
+            items = _hub_artifact_items(client, args, images=True)
+            if args.format == "json":
+                print(json.dumps(items, indent=2))
+            else:
+                for item in items:
+                    print(
+                        "\t".join(str(item.get(key) or "-") for key in ("blob_digest", "name", "disk_format", "arch"))
+                    )
+        elif img_op == "check":
+            client = HubClient(resolve_url(args.url), resolve_token())
+            metadata = client.get_layer(require_digest(args.digest))
+            if metadata.get("kind") != KIND_CLOUD_IMAGE:
+                raise PalimpsestError("image check requires a cloud-image digest")
+            result = check_artifact(metadata, lookup=client.get_layer, requested_backend=args.backend)
+            print(json.dumps(result, indent=2))
+            return 0 if result["compatible"] else 1
         elif img_op == "pull":
             norm_digest = require_digest(args.digest)
             client = HubClient(resolve_url(args.url), resolve_token())
@@ -2486,18 +2765,28 @@ def dispatch_args(args: argparse.Namespace) -> int:
         elif img_op == "push":
             if not args.path.is_file():
                 raise PalimpsestError(f"image path not found: {args.path}")
+            image_digest = digest_file(args.path)
+            known_arch = (
+                artifact_arch(store.read_metadata(image_digest))
+                if store.metadata_path(image_digest).is_file()
+                else None
+            )
+            if args.arch is not None and known_arch is not None and args.arch != known_arch:
+                raise PalimpsestError("--arch conflicts with the stored image architecture")
+            image_arch = args.arch or known_arch
+            if image_arch is None:
+                raise PalimpsestError("image architecture is unknown; specify --arch x86_64 or --arch aarch64")
             client = HubClient(resolve_url(args.url), resolve_token())
             metadata = {
                 "name": args.name,
                 "kind": KIND_CLOUD_IMAGE,
                 "disk_format": args.disk_format,
-                "arch": args.arch,
+                "arch": image_arch,
                 "os_variant": args.os_variant,
                 "ubuntu_base": args.ubuntu_base,
                 "is_published": args.publish,
             }
             res = client.push_blob(args.path, metadata)
-            image_digest = digest_file(args.path)
             store.ingest_file(args.path, expected_digest=image_digest)
             store.write_metadata(image_digest, metadata)
             print(res.get("blob_digest", image_digest))
@@ -2514,20 +2803,20 @@ def dispatch_args(args: argparse.Namespace) -> int:
         lyr_op = args.layer_operation
         if lyr_op == "ls":
             client = HubClient(resolve_url(args.url), resolve_token())
-            items = client.list_layers(
-                name=args.name,
-                kind=args.kind,
-                parent_digest=args.parent,
-                limit=args.limit,
-            )
-            for item in items:
-                if isinstance(item, dict):
-                    digest_val = item.get("digest", "")
-                    name_val = item.get("name", "")
-                    kind_val = item.get("kind", "")
-                    print(f"{digest_val}\t{name_val}\t{kind_val}".strip())
-                else:
-                    print(str(item))
+            items = _hub_artifact_items(client, args, images=False)
+            if args.format == "json":
+                print(json.dumps(items, indent=2))
+            else:
+                for item in items:
+                    print("\t".join(str(item.get(key) or "-") for key in ("blob_digest", "name", "kind", "arch")))
+        elif lyr_op == "check":
+            client = HubClient(resolve_url(args.url), resolve_token())
+            metadata = client.get_layer(require_digest(args.digest))
+            if metadata.get("kind") != "squashfs":
+                raise PalimpsestError("layer check requires a SquashFS digest")
+            result = check_artifact(metadata, lookup=client.get_layer, requested_backend=args.backend)
+            print(json.dumps(result, indent=2))
+            return 0 if result["compatible"] else 1
         elif lyr_op == "pull":
             norm_digest = require_digest(args.digest)
             client = HubClient(resolve_url(args.url), resolve_token())
@@ -2543,6 +2832,7 @@ def dispatch_args(args: argparse.Namespace) -> int:
                     "parent_digest": meta.get("parent_digest"),
                     "base_image_digest": meta.get("base_image_digest"),
                     "name": meta.get("name"),
+                    "arch": meta.get("arch"),
                 },
             )
             if args.output:
@@ -2570,6 +2860,7 @@ def dispatch_args(args: argparse.Namespace) -> int:
                         "media_type": MEDIA_TYPE_LAYER_SQUASHFS,
                         "parent_digest": None,
                         "base_image_digest": None,
+                        "arch": args.arch,
                     },
                 )
                 record = TagRecord(
@@ -2640,6 +2931,13 @@ def dispatch_args(args: argparse.Namespace) -> int:
                 base_image_digest = require_digest(args.base_image) if args.base_image else None
                 chain_id = None
                 arch = None
+                known_digest = digest_file(path)
+                if store.metadata_path(known_digest).is_file():
+                    arch = store.read_metadata(known_digest).get("arch")
+            if args.arch is not None:
+                if arch is not None and arch != args.arch:
+                    raise PalimpsestError("--arch conflicts with the stored layer architecture")
+                arch = args.arch
             metadata = {
                 "name": name,
                 "kind": "squashfs",
@@ -2788,90 +3086,90 @@ def dispatch_args(args: argparse.Namespace) -> int:
             safe_tag = safe_tag[:48] or "image"
             timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
             output = args.output or (roots.builds / "outputs" / f"{safe_tag}-{timestamp}.oci.tar")
-            local_images = tuple(NamedOCIContext.parse(value) for value in args.local_image)
-            init_resolved_roots(roots)
-            runtime_client = (
-                HubClient(resolve_url(args.url), resolve_token()) if not args.offline and args.runtime_tag else None
-            )
-            if args.runtime_base:
-                if args.offline:
-                    runtime_base_ref = _image_ref_from_store(store, args.runtime_base)
-                else:
-                    runtime_base_ref = _resolve_image_ref(store, args.runtime_base, args.url)
-                target_arch = image_arch_for_platform(platform)
-                if runtime_base_ref.arch != target_arch:
-                    raise PalimpsestError(
-                        f"--platform {platform} targets {target_arch}, but --runtime-base "
-                        f"{runtime_base_ref.digest} is {runtime_base_ref.arch}"
+            with resolve_named_oci_contexts(args.local_image, roots) as local_images:
+                init_resolved_roots(roots)
+                runtime_client = (
+                    HubClient(resolve_url(args.url), resolve_token()) if not args.offline and args.runtime_tag else None
+                )
+                if args.runtime_base:
+                    if args.offline:
+                        runtime_base_ref = _image_ref_from_store(store, args.runtime_base)
+                    else:
+                        runtime_base_ref = _resolve_image_ref(store, args.runtime_base, args.url)
+                    target_arch = image_arch_for_platform(platform)
+                    if runtime_base_ref.arch != target_arch:
+                        raise PalimpsestError(
+                            f"--platform {platform} targets {target_arch}, but --runtime-base "
+                            f"{runtime_base_ref.digest} is {runtime_base_ref.arch}"
+                        )
+
+                def retain_native_export(build_id: str, manifest: str | None) -> None:
+                    """Freeze package bytes and receipts before later cache/publication failures."""
+                    with snapshot_package(output, manifest=manifest) as snapshot:
+                        archive = _retain_package_archive(roots, snapshot)
+                        for resolved in resolved_tags:
+                            record = _local_package_record(
+                                selected_registry,
+                                resolved,
+                                snapshot,
+                                archive,
+                                project_id=cache_client.project_id
+                                if cache_client is not None
+                                and cache_client.namespace == native_namespace
+                                and cache_client.profile == selected_registry
+                                else None,
+                                build_id=build_id,
+                            )
+                            write_package_reference(roots, record)
+
+                def execute_build(
+                    rootfs_output: Path | None,
+                    runtime_rootfs_archive: Path | None,
+                ) -> dict[str, object]:
+                    return build_with_buildkit(
+                        BuildKitSpec(
+                            context=context,
+                            dockerfile=dockerfile,
+                            tag=primary_tag,
+                            additional_tags=build_tags[1:],
+                            output=output,
+                            rootfs_output=rootfs_output,
+                            runtime_rootfs_archive=runtime_rootfs_archive,
+                            platform=platform,
+                            target=args.target,
+                            build_args=tuple(args.build_arg),
+                            local_images=local_images,
+                            network=args.network,
+                            offline=args.offline,
+                            no_cache=args.no_cache,
+                            push_cache=not args.offline,
+                            cache_scope=cache_scope,
+                            cache_mode=args.cache_mode,
+                            external_cache_from=external_cache_from,
+                            external_cache_to=external_cache_to,
+                            registry_profile=selected_registry.alias if selected_registry is not None else None,
+                            registry_config_digest=selected_registry_digest,
+                            pull=args.pull,
+                            load=args.load if not native_build else False,
+                            push_image=args.push if not native_build else False,
+                            progress=args.progress,
+                            runtime_tag=args.runtime_tag,
+                            runtime_base_digest=args.runtime_base,
+                            runtime_block_size=runtime_block_size,
+                            push=args.runtime_push,
+                        ),
+                        roots,
+                        hub_client=cache_client,
+                        cache_package=cache_package,
+                        runtime_hub_client=runtime_client,
+                        on_oci_export=retain_native_export if native_build else None,
                     )
 
-            def retain_native_export(build_id: str, manifest: str | None) -> None:
-                """Freeze package bytes and receipts before later cache/publication failures."""
-                with snapshot_package(output, manifest=manifest) as snapshot:
-                    archive = _retain_package_archive(roots, snapshot)
-                    for resolved in resolved_tags:
-                        record = _local_package_record(
-                            selected_registry,
-                            resolved,
-                            snapshot,
-                            archive,
-                            project_id=cache_client.project_id
-                            if cache_client is not None
-                            and cache_client.namespace == native_namespace
-                            and cache_client.profile == selected_registry
-                            else None,
-                            build_id=build_id,
-                        )
-                        write_package_reference(roots, record)
-
-            def execute_build(
-                rootfs_output: Path | None,
-                runtime_rootfs_archive: Path | None,
-            ) -> dict[str, object]:
-                return build_with_buildkit(
-                    BuildKitSpec(
-                        context=context,
-                        dockerfile=dockerfile,
-                        tag=primary_tag,
-                        additional_tags=build_tags[1:],
-                        output=output,
-                        rootfs_output=rootfs_output,
-                        runtime_rootfs_archive=runtime_rootfs_archive,
-                        platform=platform,
-                        target=args.target,
-                        build_args=tuple(args.build_arg),
-                        local_images=local_images,
-                        network=args.network,
-                        offline=args.offline,
-                        no_cache=args.no_cache,
-                        push_cache=not args.offline,
-                        cache_scope=cache_scope,
-                        cache_mode=args.cache_mode,
-                        external_cache_from=external_cache_from,
-                        external_cache_to=external_cache_to,
-                        registry_profile=selected_registry.alias if selected_registry is not None else None,
-                        registry_config_digest=selected_registry_digest,
-                        pull=args.pull,
-                        load=args.load if not native_build else False,
-                        push_image=args.push if not native_build else False,
-                        progress=args.progress,
-                        runtime_tag=args.runtime_tag,
-                        runtime_base_digest=args.runtime_base,
-                        runtime_block_size=runtime_block_size,
-                        push=args.runtime_push,
-                    ),
-                    roots,
-                    hub_client=cache_client,
-                    cache_package=cache_package,
-                    runtime_hub_client=runtime_client,
-                    on_oci_export=retain_native_export if native_build else None,
-                )
-
-            if args.runtime_tag:
-                with tempfile.TemporaryDirectory(prefix="buildkit-rootfs-", dir=roots.builds) as tmpdir:
-                    build_record = execute_build(args.rootfs_output, Path(tmpdir) / "rootfs.tar")
-            else:
-                build_record = execute_build(args.rootfs_output, None)
+                if args.runtime_tag:
+                    with tempfile.TemporaryDirectory(prefix="buildkit-rootfs-", dir=roots.builds) as tmpdir:
+                        build_record = execute_build(args.rootfs_output, Path(tmpdir) / "rootfs.tar")
+                else:
+                    build_record = execute_build(args.rootfs_output, None)
             if native_build:
                 retained = read_package_reference(roots, resolved_tags[0].canonical)
                 with snapshot_package(Path(retained.archive), manifest=retained.root_digest) as snapshot:
@@ -3214,7 +3512,9 @@ def dispatch_args(args: argparse.Namespace) -> int:
                 for name, size in payload["directories"].items():
                     print(f"{f'dir:{name}':<20}\t{size}")
         elif sub == "ls":
-            payload = inventory.list_artifacts(roots)
+            payload = inventory.list_artifacts(
+                roots, arch=args.arch, compatible=args.compatible, requested_backend=args.backend
+            )
             if args.kind == "image":
                 items = payload["images"]
             elif args.kind == "layer":
@@ -3224,7 +3524,7 @@ def dispatch_args(args: argparse.Namespace) -> int:
             if args.format == "json":
                 print(json.dumps(items, indent=2))
             else:
-                print(f"{'DIGEST':<20}\t{'KIND':<16}\t{'SIZE':<12}\t{'TAGS':<24}")
+                print(f"{'DIGEST':<20}\t{'KIND':<16}\t{'ARCH':<10}\t{'COMPATIBILITY':<14}\t{'SIZE':<12}\t{'TAGS':<24}")
                 for item in items:
                     raw_tags = item.get("tags")
                     tags_list = raw_tags if isinstance(raw_tags, list) else []
@@ -3233,8 +3533,13 @@ def dispatch_args(args: argparse.Namespace) -> int:
                     )
                     print(
                         f"{item['digest']:<20}\t{str(item.get('kind', '-')):<16}\t"
+                        f"{str(artifact_arch(item) or 'unknown'):<10}\t{item['compatibility']['status']:<14}\t"
                         f"{str(item.get('size_bytes', 0)):<12}\t{tags_str:<24}"
                     )
+        elif sub == "check":
+            result = inventory.check_local_artifact(roots, args.reference, requested_backend=args.backend)
+            print(json.dumps(result, indent=2))
+            return 0 if result["compatible"] else 1
         elif sub == "rm":
             result = inventory.remove_artifact(roots, args.digest, force=args.force)
             print(json.dumps(result, indent=2))
@@ -3313,7 +3618,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.operation == "run":
             args.command_override = command_override
         _validate_args(args, parser)
-        if args.operation == "completion" or (args.operation == "docker" and _docker_help_requested(args.docker_args)):
+        if (
+            args.operation == "completion"
+            or args.operation == "cloud"
+            or (args.operation == "build" and args.executor == "nova")
+            or (args.operation == "layer" and args.layer_operation == "cloud-init")
+            or (args.operation == "oci" and args.oci_operation == "cache")
+            or (args.operation == "docker" and _docker_help_requested(args.docker_args))
+        ):
             return dispatch_args(args)
         journal = host_journal.begin(args.operation)
         try:

@@ -71,6 +71,16 @@ async def test_bootstrap_upgrades_legacy_build_ownership_without_inventing_an_ow
             assert "lease_expires_at" in columns and "execution_node" not in columns
             row = (await connection.execute(text("SELECT id, lease_expires_at FROM palimpsest_hub_builds"))).one()
             assert tuple(row) == ("retained", None)
+            for table, key_column in (
+                ("palimpsest_package_uploads", "key_id"),
+                ("palimpsest_package_versions", "pushed_key_id"),
+            ):
+                metadata = await connection.run_sync(lambda sync, table=table: inspect(sync).get_columns(table))
+                assert next(column for column in metadata if column["name"] == key_column)["nullable"] is True
+            key_columns = await connection.run_sync(
+                lambda sync: {column["name"]: column for column in inspect(sync).get_columns("palimpsest_package_keys")}
+            )
+            assert key_columns["admin_issuer_context"]["nullable"] is True
         async with async_sessionmaker(engine)() as session:
             assert await session.get(PalimpsestWorkerLease, "export-maintenance") is None
     finally:
@@ -101,6 +111,7 @@ def _ownership_process(url, root, lock_path, mode, channel, gate):
             palimpsest_hub_build_timeout_seconds=60,
             palimpsest_hub_max_blob_bytes=1024 * 1024,
         )
+
         owner = f"smoke-{os.getpid()}"
         try:
             if gate is not None:
@@ -212,6 +223,8 @@ async def test_shared_sql_process_ownership_smoke(tmp_path, worker_count):
         PalimpsestImageExportDelegation,
         PalimpsestWorkerLease,
     )
+    from palimpsest_hub.services.digest import compute_config_digest
+    from palimpsest_hub.services.hub_store import LocalPathBlobStore
     from palimpsest_hub.services.worker_leases import RoleLease, role_lease
 
     url = os.environ.get("PALIMPSEST_OWNERSHIP_SQL_URL")
@@ -226,6 +239,8 @@ async def test_shared_sql_process_ownership_smoke(tmp_path, worker_count):
     context = multiprocessing.get_context("spawn")
     children = []
     owns_schema = False
+    base_bytes = b"synthetic ownership-proof base image"
+    base_digest = "sha256:" + hashlib.sha256(base_bytes).hexdigest()
 
     def start(mode, gate=None):
         parent, child = context.Pipe()
@@ -280,6 +295,28 @@ async def test_shared_sql_process_ownership_smoke(tmp_path, worker_count):
             assert (await connection.scalar(text("SELECT @@default_storage_engine"))).lower() == "innodb"
             await connection.run_sync(Base.metadata.create_all)
             owns_schema = True
+        store = LocalPathBlobStore(tmp_path / "store")
+        base_path = store.blob_path(base_digest)
+        base_path.parent.mkdir(parents=True, exist_ok=True)
+        base_path.write_bytes(base_bytes)
+        base_config = {"name": "ownership-base", "kind": "cloud-image", "arch": "x86_64", "disk_format": "raw"}
+        async with factory() as session, session.begin():
+            session.add(
+                PalimpsestHubLayer(
+                    blob_digest=base_digest,
+                    size_bytes=len(base_bytes),
+                    media_type="application/octet-stream",
+                    config_digest=compute_config_digest(base_config),
+                    config_json=base_config,
+                    name="ownership-base",
+                    kind="cloud-image",
+                    arch="x86_64",
+                    disk_format="raw",
+                    project_id="smoke-project",
+                    created_by="smoke-user",
+                    is_published=False,
+                )
+            )
 
         base = b"raw ownership input"
         base_digest = "sha256:" + hashlib.sha256(base).hexdigest()

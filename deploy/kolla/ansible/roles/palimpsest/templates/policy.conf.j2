@@ -1,0 +1,4 @@
+# Nonsecret policy-only configuration, readable by the nonroot Hub image user.
+[oslo_policy]
+policy_file = {{ palimpsest_policy_file | to_json }}
+policy_dirs = {{ palimpsest_policy_dirs | to_json }}

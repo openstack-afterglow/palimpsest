@@ -639,6 +639,7 @@ def run(
                 {
                     "digest": layer.digest,
                     "local_path": str(layer.local_path),
+                    "arch": layer.arch,
                     "serial": disk.serial,
                     "target_dev": disk.target_dev,
                 }
@@ -1004,6 +1005,7 @@ def start_serial_builder(
                 {
                     "digest": layer.digest,
                     "local_path": str(layer.local_path),
+                    "arch": layer.arch,
                     "serial": disk.serial,
                     "target_dev": disk.target_dev,
                 }
@@ -2082,11 +2084,13 @@ def commit(
     host, port = _ssh_endpoint(name, st_data)
 
     base_info = st_data.get("base")
+    base_arch = None
     if isinstance(base_info, dict) and "local_path" in base_info and "digest" in base_info:
         base_path = Path(base_info["local_path"])
         base_digest = base_info["digest"]
         try:
             require_file_digest(base_path, base_digest)
+            base_arch = base_info.get("arch")
         except Exception as exc:
             raise LifecycleError(f"recorded base image digest mismatch: {exc}") from exc
     else:
@@ -2237,6 +2241,7 @@ def commit(
             {
                 "kind": "squashfs",
                 "media_type": MEDIA_TYPE_LAYER_SQUASHFS,
+                "arch": base_arch,
                 "parent_digest": parent_digest,
                 "base_image_digest": base_digest,
             },
@@ -2267,6 +2272,7 @@ def commit(
             "size_bytes": output_size,
             "parent_digest": parent_digest,
             "base_image_digest": base_digest,
+            "arch": base_arch,
             "source": "commit",
         }
     finally:

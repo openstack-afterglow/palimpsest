@@ -35,3 +35,47 @@
   no_log: true
   diff: false
   when: '"palimpsest-hub-build-worker" in palimpsest_local_services'
+
+
+- name: Config | Ensure nonsecret policy directory is readable by Hub
+  become: true
+  ansible.builtin.file:
+    path: "{{ palimpsest_config_dir }}/policy"
+    state: directory
+    mode: "0755"
+    owner: root
+    group: root
+  when: '"palimpsest-hub-api" in palimpsest_local_services or "palimpsest-hub-worker" in palimpsest_local_services'
+
+- name: Config | Render nonsecret policy-only TOML for nonroot Hub
+  become: true
+  ansible.builtin.template:
+    src: policy.conf.j2
+    dest: "{{ palimpsest_config_dir }}/policy/palimpsest.conf"
+    mode: "0644"
+    owner: root
+    group: root
+  when: '"palimpsest-hub-api" in palimpsest_local_services or "palimpsest-hub-worker" in palimpsest_local_services'
+
+- name: Config | Install explicitly supplied operator policy
+  become: true
+  ansible.builtin.copy:
+    src: "{{ palimpsest_policy_source }}"
+    dest: "{{ palimpsest_config_dir }}/policy/policy.yaml"
+    mode: "0644"
+    owner: root
+    group: root
+  when:
+    - '"palimpsest-hub-api" in palimpsest_local_services or "palimpsest-hub-worker" in palimpsest_local_services'
+    - palimpsest_policy_source | length > 0
+
+- name: Config | Initialize empty policy without replacing operator edits
+  become: true
+  ansible.builtin.copy:
+    content: "{}\n"
+    dest: "{{ palimpsest_config_dir }}/policy/policy.yaml"
+    force: false
+    mode: "0644"
+    owner: root
+    group: root
+  when: '"palimpsest-hub-api" in palimpsest_local_services or "palimpsest-hub-worker" in palimpsest_local_services'

@@ -212,13 +212,17 @@ class OCIImageMaterializationReceipt:
         return f"sha256:{hashlib.sha256(canonical_json_bytes(self.to_dict())).hexdigest()}"
 
 
-def _fixed_env() -> dict[str, str]:
+def _fixed_env(scratch: Path) -> dict[str, str]:
     return {
         "LANG": "C",
         "LC_ALL": "C",
         "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
         "PYTHONHASHSEED": "0",
         "TZ": "UTC",
+        # tempfile otherwise chooses global /tmp on the worker boot disk even
+        # though cwd is the pinned service scratch. Large ML layers must keep
+        # both anonymous tar spools on the explicitly selected data filesystem.
+        "TMPDIR": os.fspath(scratch),
     }
 
 
@@ -386,7 +390,7 @@ def _spawn_and_exchange(
                 process = subprocess.Popen(
                     selected_command,
                     cwd=scratch,
-                    env=_fixed_env(),
+                    env=_fixed_env(scratch),
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.DEVNULL,

@@ -3,7 +3,7 @@
 
 This file is generated from `palimpsest_local.cli.build_parser`. It inventories every command, positional, option, choice, and parser default. For behavior, examples, and runtime restrictions, read [the usage guide](usage.md). Every command except raw `docker` pass-through accepts automatic `-h`/`--help`.
 
-Coverage: **83 command paths**, **252 positional/option definitions** (excluding automatic `-h/--help`).
+Coverage: **125 command paths**, **333 positional/option definitions** (excluding automatic `-h/--help`).
 
 ## `palimpsest`
 
@@ -12,15 +12,447 @@ Coverage: **83 command paths**, **252 positional/option definitions** (excluding
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest [-h] [--url URL] [--version] {image,layer,bundle,oci,build,registry,login,logout,pull,push,tag,images,history,rmi,save,load,docker,run,compose,ps,volumes,networks,volume,inspect,logs,shell,exec,start,stop,rm,commit,web,store,completion} ...
+usage: palimpsest [-h] [--url URL] [--version] {cloud,benchmark,image,layer,bundle,oci,build,registry,login,logout,pull,push,tag,images,history,rmi,save,load,docker,run,compose,ps,volumes,networks,volume,inspect,logs,shell,exec,start,stop,rm,commit,web,store,completion} ...
 ```
 
-Subcommands: `image`, `layer`, `bundle`, `oci`, `build`, `registry`, `login`, `logout`, `pull`, `push`, `tag`, `images`, `history`, `rmi`, `save`, `load`, `docker`, `run`, `compose`, `ps`, `volumes`, `networks`, `volume`, `inspect`, `logs`, `shell`, `exec`, `start`, `stop`, `rm`, `commit`, `web`, `store`, `completion`.
+Subcommands: `cloud`, `benchmark`, `image`, `layer`, `bundle`, `oci`, `build`, `registry`, `login`, `logout`, `pull`, `push`, `tag`, `images`, `history`, `rmi`, `save`, `load`, `docker`, `run`, `compose`, `ps`, `volumes`, `networks`, `volume`, `inspect`, `logs`, `shell`, `exec`, `start`, `stop`, `rm`, `commit`, `web`, `store`, `completion`.
 
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
 | `--url` | string | `None` | Hub API URL (overrides PALIMPSEST_URL and config.toml) |
 | `--version` | flag | — | show the client version and exit |
+
+## `palimpsest cloud`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest cloud [-h] {build-user-data,build,instance,launch-batch,assets,prepare-runtime,registry-worker} ...
+```
+
+Subcommands: `build-user-data`, `build`, `instance`, `launch-batch`, `assets`, `prepare-runtime`, `registry-worker`.
+
+### `palimpsest cloud build-user-data`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest cloud build-user-data [-h] [--output OUTPUT] config
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `config` | Path | required | Explicit operator-authored cloud/worker JSON configuration; no inferred cloud resources. |
+| `--output` | Path | `None` | Write or copy output at this path. |
+
+### `palimpsest cloud build`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest cloud build [-h] --name NAME config
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `config` | Path | required | Explicit operator-authored cloud/worker JSON configuration; no inferred cloud resources. |
+| `--name` | string | required | immutable output asset name |
+
+### `palimpsest cloud instance`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest cloud instance [-h] --config CONFIG {create,inspect,wait-active,stop,delete} ...
+```
+
+Subcommands: `create`, `inspect`, `wait-active`, `stop`, `delete`.
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `--config` | Path | required | Explicit operator-authored cloud/worker JSON configuration; no inferred cloud resources. |
+
+### `palimpsest cloud instance create`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest cloud instance create [-h] --user-data USER_DATA
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `--user-data` | Path | required | Complete original first-boot cloud-init input; cloud credentials must not be embedded. |
+
+### `palimpsest cloud instance inspect`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest cloud instance inspect [-h] job_id
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `job_id` | string | required | Exact durable worker/Nova job identifier; uncertain creates are never replayed. |
+
+### `palimpsest cloud instance wait-active`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest cloud instance wait-active [-h] job_id
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `job_id` | string | required | Exact durable worker/Nova job identifier; uncertain creates are never replayed. |
+
+### `palimpsest cloud instance stop`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest cloud instance stop [-h] job_id
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `job_id` | string | required | Exact durable worker/Nova job identifier; uncertain creates are never replayed. |
+
+### `palimpsest cloud instance delete`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest cloud instance delete [-h] job_id
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `job_id` | string | required | Exact durable worker/Nova job identifier; uncertain creates are never replayed. |
+
+### `palimpsest cloud launch-batch`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest cloud launch-batch [-h] config
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `config` | Path | required | Explicit operator-authored cloud/worker JSON configuration; no inferred cloud resources. |
+
+### `palimpsest cloud assets`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest cloud assets [-h] --root ROOT --project-id PROJECT_ID {init,ls,inspect,verify,register-build,bind-store,retain,release} ...
+```
+
+Subcommands: `init`, `ls`, `inspect`, `verify`, `register-build`, `bind-store`, `retain`, `release`.
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `--root` | Path | required | Existing private, operator-owned directory on explicitly mounted retained storage. |
+| `--project-id` | string | required | Exact Keystone project binding for the mounted cloud asset catalog. |
+
+### `palimpsest cloud assets init`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest cloud assets init [-h]
+```
+
+### `palimpsest cloud assets ls`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest cloud assets ls [-h]
+```
+
+### `palimpsest cloud assets inspect`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest cloud assets inspect [-h] asset
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `asset` | string | required | Immutable cloud asset SHA-256 identity or its non-rebindable local catalog name. |
+
+### `palimpsest cloud assets verify`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest cloud assets verify [-h] asset
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `asset` | string | required | Immutable cloud asset SHA-256 identity or its non-rebindable local catalog name. |
+
+### `palimpsest cloud assets register-build`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest cloud assets register-build [-h] --result RESULT [--name NAME]
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `--result` | Path | required | Successful boot-bound Nova capture result whose actual SquashFS payloads will be verified. |
+| `--name` | string | `None` | Managed object, run, profile, or publication name. |
+
+### `palimpsest cloud assets bind-store`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest cloud assets bind-store [-h] --volume-id VOLUME_ID --filesystem-uuid FILESYSTEM_UUID asset
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `asset` | string | required | Immutable cloud asset SHA-256 identity or its non-rebindable local catalog name. |
+| `--volume-id` | string | required | Exact retained OCI root-volume UUID. |
+| `--filesystem-uuid` | string | required | Complete UUID of the already prepared external filesystem. |
+
+### `palimpsest cloud assets retain`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest cloud assets retain [-h] --volume-id VOLUME_ID asset consumers [consumers ...]
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `asset` | string | required | Immutable cloud asset SHA-256 identity or its non-rebindable local catalog name. |
+| `--volume-id` | string | required | Exact retained OCI root-volume UUID. |
+| `consumers` | string (one or more) | required | Exact consumer identifiers to reserve atomically after asset verification. |
+
+### `palimpsest cloud assets release`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest cloud assets release [-h] consumer
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `consumer` | string | required | Exact consumer metadata binding; release never deletes retained bytes. |
+
+### `palimpsest cloud prepare-runtime`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest cloud prepare-runtime [-h] --assets-root ASSETS_ROOT --project-id PROJECT_ID config
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `--assets-root` | Path | required | Existing project-bound cloud asset catalog directory beside canonical retained payloads. |
+| `--project-id` | string | required | Exact Keystone project binding for the mounted cloud asset catalog. |
+| `config` | Path | required | Explicit operator-authored cloud/worker JSON configuration; no inferred cloud resources. |
+
+### `palimpsest cloud registry-worker`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest cloud registry-worker [-h] --cache-root CACHE_ROOT --jobs-root JOBS_ROOT --assets-root ASSETS_ROOT request
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `--cache-root` | Path | required | Pre-mounted permanent LayerCache directory initialized explicitly by its operator. |
+| `--jobs-root` | Path | required | Existing private directory for durable worker intent, error and success receipts. |
+| `--assets-root` | Path | required | Existing project-bound cloud asset catalog directory beside canonical retained payloads. |
+| `request` | Path | required | Validated internal OCI acquisition request JSON; executed in the worker instance. |
+
+## `palimpsest benchmark`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest benchmark [-h] {local,openstack,workflow,report,init,submit,worker,status} ...
+```
+
+Subcommands: `local`, `openstack`, `workflow`, `report`, `init`, `submit`, `worker`, `status`.
+
+### `palimpsest benchmark local`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest benchmark local [-h] --config CONFIG --output OUTPUT
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `--config` | Path | required | operator-owned benchmark JSON configuration |
+| `--output` | Path | required | new private evidence directory; existing jobs never replay |
+
+### `palimpsest benchmark openstack`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest benchmark openstack [-h] --config CONFIG --output OUTPUT
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `--config` | Path | required | operator-owned benchmark JSON configuration |
+| `--output` | Path | required | new private evidence directory; existing jobs never replay |
+
+### `palimpsest benchmark workflow`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest benchmark workflow [-h] --config CONFIG --output OUTPUT
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `--config` | Path | required | operator-owned benchmark JSON configuration |
+| `--output` | Path | required | new private evidence directory; existing jobs never replay |
+
+### `palimpsest benchmark report`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest benchmark report [-h] --output OUTPUT results [results ...]
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `results` | Path (one or more) | required | recorded environment/workflow result JSON files |
+| `--output` | Path | required | new directory for report.md, overview.html and issues.md |
+
+### `palimpsest benchmark init`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest benchmark init [-h] --root ROOT
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `--root` | Path | required | private durable benchmark controller queue directory |
+
+### `palimpsest benchmark submit`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest benchmark submit [-h] --root ROOT --config CONFIG
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `--root` | Path | required | private durable benchmark controller queue directory |
+| `--config` | Path | required | operator-authored workflow or standalone benchmark request JSON |
+
+### `palimpsest benchmark worker`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest benchmark worker [-h] --root ROOT [--once]
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `--root` | Path | required | private durable benchmark controller queue directory |
+| `--once` | flag | `False` | process current queue once, without waiting for future requests |
+
+### `palimpsest benchmark status`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest benchmark status [-h] --root ROOT job_id
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `--root` | Path | required | private durable benchmark controller queue directory |
+| `job_id` | string | required | original queued benchmark request ID; inspection never replays it |
 
 ## `palimpsest image`
 
@@ -29,10 +461,10 @@ Subcommands: `image`, `layer`, `bundle`, `oci`, `build`, `registry`, `login`, `l
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest image [-h] {ls,pull,verify,import,push,inspect,history,rm,save,load} ...
+usage: palimpsest image [-h] {ls,check,pull,verify,import,push,inspect,history,rm,save,load} ...
 ```
 
-Subcommands: `ls`, `pull`, `verify`, `import`, `push`, `inspect`, `history`, `rm`, `save`, `load`.
+Subcommands: `ls`, `check`, `pull`, `verify`, `import`, `push`, `inspect`, `history`, `rm`, `save`, `load`.
 
 ### `palimpsest image ls`
 
@@ -41,16 +473,34 @@ Subcommands: `ls`, `pull`, `verify`, `import`, `push`, `inspect`, `history`, `rm
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest image ls [-h] [--ubuntu-base UBUNTU_BASE] [--arch ARCH] [--os-variant OS_VARIANT] [--disk-format {qcow2,raw}] [--limit LIMIT]
+usage: palimpsest image ls [-h] [--ubuntu-base UBUNTU_BASE] [--arch {x86_64,aarch64}] [--os-variant OS_VARIANT] [--disk-format {qcow2,raw}] [--limit LIMIT] [--compatible] [--backend {auto,kvm,lima-vz,libvirt-hvf,lima-krunkit}] [--format {table,json}]
 ```
 
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
 | `--ubuntu-base` | string | `None` | filter by Ubuntu base release |
-| `--arch` | string | `None` | filter by guest architecture, such as x86_64 or aarch64 |
+| `--arch` | one of: `x86_64`, `aarch64` | `None` | filter by declared guest architecture |
 | `--os-variant` | string | `None` | filter by operating-system variant |
 | `--disk-format` | one of: `qcow2`, `raw` | `None` | filter by boot disk format |
 | `--limit` | int | `50` | maximum Hub results (1-200; default: 50) |
+| `--compatible` | flag | `False` | only complete artifact chains matching this client's platform; runtime preflight still applies |
+| `--backend` | one of: `auto`, `kvm`, `lima-vz`, `libvirt-hvf`, `lima-krunkit` | `'auto'` | client backend for platform compatibility (default: auto) |
+| `--format` | one of: `table`, `json` | `'table'` | Select the output representation or Docker format template. |
+
+### `palimpsest image check`
+
+[Behavior, restrictions, and examples](usage.md#hub-cloud-images-layers-and-bundles).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest image check [-h] [--backend {auto,kvm,lima-vz,libvirt-hvf,lima-krunkit}] digest
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `digest` | string | required | Expected or selected SHA-256 content digest. |
+| `--backend` | one of: `auto`, `kvm`, `lima-vz`, `libvirt-hvf`, `lima-krunkit` | `'auto'` | Select or automatically detect the runtime backend. |
 
 ### `palimpsest image pull`
 
@@ -114,7 +564,7 @@ usage: palimpsest image push [-h] --name NAME [--disk-format {qcow2,raw}] [--arc
 | `path` | Path | required | local cloud boot-image file to upload |
 | `--name` | string | required | Hub display name for the image |
 | `--disk-format` | one of: `qcow2`, `raw` | `'qcow2'` | input disk format (default: qcow2) |
-| `--arch` | one of: `x86_64`, `aarch64` | `'x86_64'` | guest architecture (default: x86_64) |
+| `--arch` | one of: `x86_64`, `aarch64` | `None` | guest architecture; required unless already recorded for this file |
 | `--os-variant` | string | `None` | operating-system variant, such as ubuntu-24.04 |
 | `--ubuntu-base` | string | `None` | Ubuntu base release metadata |
 | `--publish` | flag | `False` | mark the uploaded boot image as published in Hub |
@@ -210,10 +660,25 @@ usage: palimpsest image load [-h] [-i INPUT_PATH] [--platform PLATFORM] [-q]
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest layer [-h] {ls,pull,pack,push} ...
+usage: palimpsest layer [-h] {cloud-init,ls,check,pull,pack,push} ...
 ```
 
-Subcommands: `ls`, `pull`, `pack`, `push`.
+Subcommands: `cloud-init`, `ls`, `check`, `pull`, `pack`, `push`.
+
+### `palimpsest layer cloud-init`
+
+[Behavior, restrictions, and examples](usage.md#hub-cloud-images-layers-and-bundles).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest layer cloud-init [-h] --config CONFIG [--output OUTPUT]
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `--config` | Path | required | external layer runtime JSON manifest |
+| `--output` | Path | `None` | new owner-only cloud-init file (default: standard output; never overwrite) |
 
 ### `palimpsest layer ls`
 
@@ -222,7 +687,7 @@ Subcommands: `ls`, `pull`, `pack`, `push`.
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest layer ls [-h] [--name NAME] [--kind KIND] [--parent PARENT] [--limit LIMIT]
+usage: palimpsest layer ls [-h] [--name NAME] [--kind KIND] [--parent PARENT] [--limit LIMIT] [--arch {x86_64,aarch64}] [--compatible] [--backend {auto,kvm,lima-vz,libvirt-hvf,lima-krunkit}] [--format {table,json}]
 ```
 
 | Argument | Value | Parser default | Description |
@@ -231,6 +696,25 @@ usage: palimpsest layer ls [-h] [--name NAME] [--kind KIND] [--parent PARENT] [-
 | `--kind` | string | `None` | Filter by artifact kind. |
 | `--parent` | string | `None` | Record or filter by the parent layer digest. |
 | `--limit` | int | `50` | maximum Hub results (1-200; default: 50) |
+| `--arch` | one of: `x86_64`, `aarch64` | `None` | filter by declared guest architecture |
+| `--compatible` | flag | `False` | only complete artifact chains matching this client's platform; runtime preflight still applies |
+| `--backend` | one of: `auto`, `kvm`, `lima-vz`, `libvirt-hvf`, `lima-krunkit` | `'auto'` | client backend for platform compatibility (default: auto) |
+| `--format` | one of: `table`, `json` | `'table'` | Select the output representation or Docker format template. |
+
+### `palimpsest layer check`
+
+[Behavior, restrictions, and examples](usage.md#hub-cloud-images-layers-and-bundles).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest layer check [-h] [--backend {auto,kvm,lima-vz,libvirt-hvf,lima-krunkit}] digest
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `digest` | string | required | Expected or selected SHA-256 content digest. |
+| `--backend` | one of: `auto`, `kvm`, `lima-vz`, `libvirt-hvf`, `lima-krunkit` | `'auto'` | Select or automatically detect the runtime backend. |
 
 ### `palimpsest layer pull`
 
@@ -254,13 +738,14 @@ usage: palimpsest layer pull [-h] [--output OUTPUT] digest
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest layer pack [-h] --tag TAG directory
+usage: palimpsest layer pack [-h] --tag TAG [--arch {x86_64,aarch64}] directory
 ```
 
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
 | `directory` | Path | required | Directory to pack or verify. |
 | `--tag` | string | required | Tag to assign to the produced artifact. |
+| `--arch` | one of: `x86_64`, `aarch64` | `None` | declare the directory's target architecture; omitted means unknown, not host architecture |
 
 ### `palimpsest layer push`
 
@@ -269,7 +754,7 @@ usage: palimpsest layer pack [-h] --tag TAG directory
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest layer push [-h] [--name NAME] [--parent PARENT] [--base-image BASE_IMAGE] [--ubuntu-base UBUNTU_BASE] [--publish] value
+usage: palimpsest layer push [-h] [--name NAME] [--parent PARENT] [--base-image BASE_IMAGE] [--ubuntu-base UBUNTU_BASE] [--publish] [--arch {x86_64,aarch64}] value
 ```
 
 | Argument | Value | Parser default | Description |
@@ -280,6 +765,7 @@ usage: palimpsest layer push [-h] [--name NAME] [--parent PARENT] [--base-image 
 | `--base-image` | string | `None` | Cloud-image digest anchoring the layer chain. |
 | `--ubuntu-base` | string | `None` | Filter or record the Ubuntu base release. |
 | `--publish` | flag | `False` | Make the uploaded Hub artifact publicly visible. |
+| `--arch` | one of: `x86_64`, `aarch64` | `None` | declare a file's target architecture; must agree with stored metadata |
 
 ## `palimpsest bundle`
 
@@ -345,10 +831,10 @@ usage: palimpsest bundle unpack [-h] --output OUTPUT archive
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest oci [-h] {init-runtime,pull,materialize,root-proof,exec-status,network,exec-record,resource-status,root-volumes,root-volume} ...
+usage: palimpsest oci [-h] {init-runtime,pull,materialize,cache,root-proof,exec-status,network,exec-record,resource-status,root-volumes,root-volume} ...
 ```
 
-Subcommands: `init-runtime`, `pull`, `materialize`, `root-proof`, `exec-status`, `network`, `exec-record`, `resource-status`, `root-volumes`, `root-volume`.
+Subcommands: `init-runtime`, `pull`, `materialize`, `cache`, `root-proof`, `exec-status`, `network`, `exec-record`, `resource-status`, `root-volumes`, `root-volume`.
 
 ### `palimpsest oci init-runtime`
 
@@ -399,6 +885,122 @@ usage: palimpsest oci materialize [-h] [--manifest MANIFEST] [--platform {linux/
 | `--packer` | Path | `/usr/bin/mksquashfs` | Absolute SquashFS packer executable (verified before use). |
 | `--timeout` | float | `300.0` | Materializer timeout in seconds; must be positive and finite. |
 | `--output` | Path | `None` | New file for the canonical materialization receipt; stdout if omitted. |
+
+### `palimpsest oci cache`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest oci cache [-h] --root ROOT {init,pull,import,materialize,retain,release,inspect} ...
+```
+
+Subcommands: `init`, `pull`, `import`, `materialize`, `retain`, `release`, `inspect`.
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `--root` | Path | required | existing operator-owned private cache directory |
+
+### `palimpsest oci cache init`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest oci cache init [-h]
+```
+
+### `palimpsest oci cache pull`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest oci cache pull [-h] [--offline] [--timeout TIMEOUT] reference
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `reference` | string | required | Docker image reference or ID. |
+| `--offline` | flag | `False` | use only the previously verified reference binding |
+| `--timeout` | float | `300.0` | Materializer timeout in seconds; must be positive and finite. |
+
+### `palimpsest oci cache import`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest oci cache import [-h] [--manifest MANIFEST] source
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `source` | Path | required | Local OCI archive or image-layout source. |
+| `--manifest` | string | `None` | select an exact OCI root digest |
+
+### `palimpsest oci cache materialize`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest oci cache materialize [-h] [--packer PACKER] [--timeout TIMEOUT] digest
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `digest` | string | required | cached immutable OCI root digest |
+| `--packer` | Path | `/usr/bin/mksquashfs` | Absolute SquashFS packer executable (verified before use). |
+| `--timeout` | float | `300.0` | Materializer timeout in seconds; must be positive and finite. |
+
+### `palimpsest oci cache retain`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest oci cache retain [-h] --consumer CONSUMER digest
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `digest` | string | required | cached immutable OCI root digest |
+| `--consumer` | string | required | stable instance or deployment identity |
+
+### `palimpsest oci cache release`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest oci cache release [-h] --consumer CONSUMER
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `--consumer` | string | required | exact retained consumer identity |
+
+### `palimpsest oci cache inspect`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest oci cache inspect [-h] [--manifest MANIFEST]
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `--manifest` | string | `None` | select one cached immutable OCI root digest |
 
 ### `palimpsest oci root-proof`
 
@@ -497,7 +1099,7 @@ usage: palimpsest oci root-volume [-h] volume_id
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest build [-h] [--frontend {auto,palimpsestfile,dockerfile}] [--base BASE] --tag TAG [-f RECIPE] [--layer LAYER] [--network {none,default}] [--offline] [--platform PLATFORM] [--target TARGET] [--build-arg BUILD_ARG] [--local-image LOCAL_IMAGE] [--cache-scope CACHE_SCOPE] [--cache-mode {native,local}] [--registry REGISTRY] [--cache-registry CACHE_REGISTRY] [--cache-package CACHE_PACKAGE] [--cache-from CACHE_FROM] [--cache-to CACHE_TO] [--no-cache] [--pull] [--load] [--progress {auto,none,plain,quiet,rawjson,tty}] [--output OUTPUT] [--rootfs-output ROOTFS_OUTPUT] [--runtime-tag RUNTIME_TAG] [--runtime-base RUNTIME_BASE] [--runtime-block-size RUNTIME_BLOCK_SIZE] [--push] [--runtime-push] [context]
+usage: palimpsest build [-h] [--frontend {auto,palimpsestfile,dockerfile}] [--base BASE] [--executor {local,nova}] [--nova-config NOVA_CONFIG] --tag TAG [-f RECIPE] [--layer LAYER] [--network {none,default}] [--offline] [--platform PLATFORM] [--target TARGET] [--build-arg BUILD_ARG] [--local-image LOCAL_IMAGE] [--cache-scope CACHE_SCOPE] [--cache-mode {native,local}] [--registry REGISTRY] [--cache-registry CACHE_REGISTRY] [--cache-package CACHE_PACKAGE] [--cache-from CACHE_FROM] [--cache-to CACHE_TO] [--no-cache] [--pull] [--load] [--progress {auto,none,plain,quiet,rawjson,tty}] [--output OUTPUT] [--rootfs-output ROOTFS_OUTPUT] [--runtime-tag RUNTIME_TAG] [--runtime-base RUNTIME_BASE] [--runtime-block-size RUNTIME_BLOCK_SIZE] [--push] [--runtime-push] [context]
 ```
 
 | Argument | Value | Parser default | Description |
@@ -505,6 +1107,8 @@ usage: palimpsest build [-h] [--frontend {auto,palimpsestfile,dockerfile}] [--ba
 | `context` | Path (optional) | `None` | Dockerfile context directory (default: current directory) |
 | `--frontend` | one of: `auto`, `palimpsestfile`, `dockerfile` | `'auto'` | recipe frontend (default: infer from inputs) |
 | `--base` | string | `None` | cloud-image SHA-256 digest for a Palimpsestfile build |
+| `--executor` | one of: `local`, `nova` | `'local'` | local runtime or native Nova cloud-init layer build |
+| `--nova-config` | Path | `None` | explicit project-bound Nova build and attached storage configuration |
 | `--tag`, `-t` | string; repeatable | required | output tag; repeat for Dockerfile builds |
 | `-f`, `--file` | Path | `None` | recipe path (default: Palimpsestfile or Dockerfile) |
 | `--layer` | string; repeatable | `None` | parent layer digest for a Palimpsestfile build |
@@ -513,7 +1117,7 @@ usage: palimpsest build [-h] [--frontend {auto,palimpsestfile,dockerfile}] [--ba
 | `--platform` | string | `None` | Dockerfile target platform, such as linux/amd64 or linux/arm64 |
 | `--target` | string | `None` | Dockerfile target stage |
 | `--build-arg` | string; repeatable | `[]` | Dockerfile build argument KEY=VALUE (repeatable) |
-| `--local-image` | string; repeatable | `[]` | named local OCI context NAME=PATH (repeatable) |
+| `--local-image` | string; repeatable | `[]` | named OCI input NAME=LAYOUT@sha256:DIGEST, NAME=ARCHIVE.oci.tar@sha256:DIGEST, or NAME=AUTHORITY/NAMESPACE/PACKAGE@sha256:DIGEST (repeatable); native references require an explicit pull first |
 | `--cache-scope` | string | `None` | local BuildKit cache partition |
 | `--cache-mode` | one of: `native`, `local` | `'native'` | managed cache authority: native Hub (default) or local-only cache |
 | `--registry` | string | `None` | registry profile used to resolve output tags |
@@ -840,7 +1444,7 @@ usage: palimpsest docker ...
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest run [-h] [--name NAME] [--registry REGISTRY] [--layer LAYER] [--volume NAME:/guest/path[:ro]] [--memory MEMORY] [--vcpus VCPUS] [--network NETWORK] [-p [HOST_IP:]HOST_PORT:GUEST_PORT[/tcp|/udp]] [--backend {auto,kvm,lima-vz,libvirt-hvf,lima-qemu-oci}] [--runtime-kind {cloud-image,oci-root}] [-d] [--manifest MANIFEST] [--user USER] [--platform {linux/amd64,linux/arm64}] [--force-architecture] [--vm-image VM_IMAGE] [--vm-image-digest VM_IMAGE_DIGEST] [--root-retention {delete,retain}] [--root-volume ROOT_VOLUME] image_or_bundle [-- COMMAND [ARG...]]
+usage: palimpsest run [-h] [--name NAME] [--registry REGISTRY] [--layer LAYER] [--volume NAME:/guest/path[:ro]] [--memory MEMORY] [--vcpus VCPUS] [--network NETWORK] [-p [HOST_IP:]HOST_PORT:GUEST_PORT[/tcp|/udp]] [--backend {auto,kvm,lima-vz,lima-krunkit,libvirt-hvf,lima-qemu-oci}] [--runtime-kind {cloud-image,oci-root}] [-d] [--manifest MANIFEST] [--user USER] [--platform {linux/amd64,linux/arm64}] [--force-architecture] [--vm-image VM_IMAGE] [--vm-image-digest VM_IMAGE_DIGEST] [--root-retention {delete,retain}] [--root-volume ROOT_VOLUME] image_or_bundle [-- COMMAND [ARG...]]
 ```
 
 | Argument | Value | Parser default | Description |
@@ -854,7 +1458,7 @@ usage: palimpsest run [-h] [--name NAME] [--registry REGISTRY] [--layer LAYER] [
 | `--vcpus` | int | `2` | guest virtual CPUs (1-256; default: 2) |
 | `--network` | string | `None` | backend network; OCI-root: nat, host-only, or none |
 | `-p`, `--publish` | string; repeatable | `[]` | publish one OCI-root guest port on the host (default host address 127.0.0.1) |
-| `--backend` | one of: `auto`, `kvm`, `lima-vz`, `libvirt-hvf`, `lima-qemu-oci` | `'auto'` | VM backend (default: select for host and image architecture) |
+| `--backend` | one of: `auto`, `kvm`, `lima-vz`, `lima-krunkit`, `libvirt-hvf`, `lima-qemu-oci` | `'auto'` | VM backend (default: select for host and image architecture) |
 | `--runtime-kind` | one of: `cloud-image`, `oci-root` | `None` | explicit input/runtime type; required for OCI layout directories |
 | `-d`, `--detach` | flag | `False` | leave an OCI-root VM running after READY |
 | `--manifest` | string | `None` | pin the root descriptor of a local OCI image |
@@ -1066,13 +1670,13 @@ Subcommands: `create`, `inspect`, `rm`.
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest volume create [-h] --backend {kvm,lima-vz,libvirt-hvf} --size SIZE name
+usage: palimpsest volume create [-h] --backend {kvm,lima-vz,libvirt-hvf,lima-krunkit} --size SIZE name
 ```
 
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
 | `name` | string | required | Managed object, run, profile, or publication name. |
-| `--backend` | one of: `kvm`, `lima-vz`, `libvirt-hvf` | required | explicit volume backend |
+| `--backend` | one of: `kvm`, `lima-vz`, `libvirt-hvf`, `lima-krunkit` | required | explicit volume backend |
 | `--size` | _parse_volume_size | required | capacity in MiB or with a MiB/GiB suffix |
 
 ### `palimpsest volume inspect`
@@ -1082,13 +1686,13 @@ usage: palimpsest volume create [-h] --backend {kvm,lima-vz,libvirt-hvf} --size 
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest volume inspect [-h] --backend {kvm,lima-vz,libvirt-hvf} name
+usage: palimpsest volume inspect [-h] --backend {kvm,lima-vz,libvirt-hvf,lima-krunkit} name
 ```
 
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
 | `name` | string | required | Managed object, run, profile, or publication name. |
-| `--backend` | one of: `kvm`, `lima-vz`, `libvirt-hvf` | required | explicit volume backend |
+| `--backend` | one of: `kvm`, `lima-vz`, `libvirt-hvf`, `lima-krunkit` | required | explicit volume backend |
 
 ### `palimpsest volume rm`
 
@@ -1097,13 +1701,13 @@ usage: palimpsest volume inspect [-h] --backend {kvm,lima-vz,libvirt-hvf} name
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest volume rm [-h] --backend {kvm,lima-vz,libvirt-hvf} name
+usage: palimpsest volume rm [-h] --backend {kvm,lima-vz,libvirt-hvf,lima-krunkit} name
 ```
 
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
 | `name` | string | required | Managed object, run, profile, or publication name. |
-| `--backend` | one of: `kvm`, `lima-vz`, `libvirt-hvf` | required | explicit volume backend |
+| `--backend` | one of: `kvm`, `lima-vz`, `libvirt-hvf`, `lima-krunkit` | required | explicit volume backend |
 
 ## `palimpsest inspect`
 
@@ -1246,10 +1850,10 @@ usage: palimpsest web [-h] [--port PORT] [--no-browser] [--allow-control]
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest store [-h] {show,ls,rm,move,set} ...
+usage: palimpsest store [-h] {show,ls,check,rm,move,set} ...
 ```
 
-Subcommands: `show`, `ls`, `rm`, `move`, `set`.
+Subcommands: `show`, `ls`, `check`, `rm`, `move`, `set`.
 
 ### `palimpsest store show`
 
@@ -1272,13 +1876,31 @@ usage: palimpsest store show [-h] [--format {table,json}]
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest store ls [-h] [--kind {image,layer,all}] [--format {table,json}]
+usage: palimpsest store ls [-h] [--kind {image,layer,all}] [--format {table,json}] [--arch {x86_64,aarch64}] [--compatible] [--backend {auto,kvm,lima-vz,libvirt-hvf,lima-krunkit}]
 ```
 
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
 | `--kind` | one of: `image`, `layer`, `all` | `'all'` | artifact kind to list (default: all) |
 | `--format` | one of: `table`, `json` | `'table'` | output format (default: table) |
+| `--arch` | one of: `x86_64`, `aarch64` | `None` | filter by declared guest architecture |
+| `--compatible` | flag | `False` | only complete artifact chains matching this client's platform; runtime preflight still applies |
+| `--backend` | one of: `auto`, `kvm`, `lima-vz`, `libvirt-hvf`, `lima-krunkit` | `'auto'` | client backend for platform compatibility (default: auto) |
+
+### `palimpsest store check`
+
+[Behavior, restrictions, and examples](usage.md#local-store-and-ui).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest store check [-h] [--backend {auto,kvm,lima-vz,libvirt-hvf,lima-krunkit}] reference
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `reference` | string | required | local artifact SHA-256 digest or layer tag |
+| `--backend` | one of: `auto`, `kvm`, `lima-vz`, `libvirt-hvf`, `lima-krunkit` | `'auto'` | Select or automatically detect the runtime backend. |
 
 ### `palimpsest store rm`
 

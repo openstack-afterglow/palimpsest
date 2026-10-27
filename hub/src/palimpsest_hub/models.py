@@ -226,6 +226,7 @@ class PackageKey(Base):
     name: Mapped[str] = mapped_column(VARCHAR(128), nullable=False)
     scope: Mapped[dict] = mapped_column(JSON, nullable=False)
     actions: Mapped[list] = mapped_column(JSON, nullable=False)
+    admin_issuer_context: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False, default=_now)
     expires_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False)
     revoked_at: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6), nullable=True)
@@ -243,7 +244,7 @@ class PackageVersion(Base):
     total_bytes: Mapped[int] = mapped_column(BIGINT, nullable=False)
     provenance: Mapped[dict] = mapped_column(JSON, nullable=False)
     pushed_by: Mapped[str] = mapped_column(_binary_name(64), nullable=False)
-    pushed_key_id: Mapped[str] = mapped_column(ForeignKey("palimpsest_package_keys.id"), nullable=False)
+    pushed_key_id: Mapped[str | None] = mapped_column(ForeignKey("palimpsest_package_keys.id"), nullable=True)
     pushed_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False, default=_now)
 
 
@@ -283,7 +284,7 @@ class PackageUpload(Base):
         ForeignKey("palimpsest_package_namespaces.project_id"), nullable=False, index=True
     )
     package: Mapped[str] = mapped_column(_binary_name(255), nullable=False)
-    key_id: Mapped[str] = mapped_column(ForeignKey("palimpsest_package_keys.id"), nullable=False)
+    key_id: Mapped[str | None] = mapped_column(ForeignKey("palimpsest_package_keys.id"), nullable=True)
     owner_user_id: Mapped[str] = mapped_column(_binary_name(64), nullable=False)
     resource: Mapped[str] = mapped_column(VARCHAR(16), nullable=False)
     request: Mapped[dict] = mapped_column(JSON, nullable=False)

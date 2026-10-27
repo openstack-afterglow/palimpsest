@@ -29,7 +29,8 @@ import sys
 import tarfile
 import time
 import uuid
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
@@ -38,7 +39,9 @@ from . import state
 from .digest import digest_file, require_digest, require_file_digest
 from .errors import ArtifactValidationError, BuildError, DigestMismatchError, HubError
 from .oci_image import verify_blob_chunks
-from .oci_layout import MEDIA_TYPE_LAYER_SQUASHFS, ContentStore
+from .oci_layout import MEDIA_TYPE_LAYER_CONFIG, MEDIA_TYPE_LAYER_SQUASHFS, ContentStore
+from .package_reference import read_package_reference
+from .package_source import snapshot_package
 from .registry import RegistryError, credential_free_subprocess_environment, validate_cache_spec
 from .state import TagRecord, validate_tag, write_tag_record
 
@@ -140,6 +143,8 @@ def _verify_oci_manifest_graph(layout: Path, root_digest: str) -> None:
         layers = document.get("layers")
         if not isinstance(config, dict) or not isinstance(layers, list):
             raise ArtifactValidationError(f"OCI descriptor {digest} is neither an image manifest nor an index")
+        if config.get("mediaType") == MEDIA_TYPE_LAYER_CONFIG:
+            raise ArtifactValidationError("local OCI context requires an oci-image package, not a runtime-bundle")
         config_digest, config_blob = _verify_oci_blob(layout, config, seen)
         try:
             image_config = json.loads(config_blob.read_text(encoding="utf-8"))
@@ -166,6 +171,18 @@ def _verify_oci_manifest_graph(layout: Path, root_digest: str) -> None:
     if not root_blob.is_file():
         raise ArtifactValidationError(f"OCI context does not contain referenced descriptor {root_digest}")
     visit_json_descriptor({"digest": root_digest, "size": root_blob.stat().st_size})
+
+
+def _named_oci_reference_parts(value: str) -> tuple[str, str, str]:
+    if "=" not in value:
+        raise ArtifactValidationError("--local-image must use alias=source@sha256:<digest>")
+    alias, reference = value.split("=", 1)
+    if "@" not in reference:
+        raise ArtifactValidationError("--local-image must pin an OCI descriptor with @sha256:<digest>")
+    source, digest = reference.rsplit("@", 1)
+    if not source:
+        raise ArtifactValidationError("--local-image source must be nonempty")
+    return alias, source, require_digest(digest)
 
 
 @dataclass(frozen=True)
@@ -203,19 +220,57 @@ class NamedOCIContext:
     @classmethod
     def parse(cls, value: str) -> NamedOCIContext:
         """Parse ``alias=/absolute/layout@sha256:<digest>``."""
-        if "=" not in value:
-            raise ArtifactValidationError("--local-image must use alias=/path@sha256:<digest>")
-        alias, raw_reference = value.split("=", 1)
-        if "@" not in raw_reference:
-            raise ArtifactValidationError("--local-image must pin an OCI descriptor with @sha256:<digest>")
-        raw_path, digest = raw_reference.rsplit("@", 1)
-        if not raw_path:
-            raise ArtifactValidationError("--local-image path must be nonempty")
-        return cls(alias=alias, layout=Path(raw_path), manifest_digest=digest)
+        alias, source, digest = _named_oci_reference_parts(value)
+        return cls(alias=alias, layout=Path(source), manifest_digest=digest)
 
     @property
     def buildx_value(self) -> str:
         return f"oci-layout://{self.layout}@{self.manifest_digest}"
+
+
+@contextmanager
+def resolve_named_oci_contexts(values: Sequence[str], roots: state.StatePaths) -> Iterator[tuple[NamedOCIContext, ...]]:
+    """Resolve pinned layouts, archives or exact retained receipts without network access.
+
+    Archive inputs use the package verifier's private snapshot, held until the
+    caller finishes its solve. Retained references bind the canonical name and
+    selected root as well as the complete original archive bytes and type.
+    """
+    with ExitStack() as stack:
+        contexts: list[NamedOCIContext] = []
+        for value in values:
+            alias, source, digest = _named_oci_reference_parts(value)
+            path = Path(source).expanduser()
+            if path.is_dir():
+                contexts.append(NamedOCIContext(alias, path, digest))
+                continue
+            record = None
+            if not path.exists() and not source.startswith(("/", ".", "~")):
+                reference = source + "@" + digest
+                record = read_package_reference(roots, reference)
+                if record.root_digest != digest or record.package_type != "oci-image":
+                    raise ArtifactValidationError("local OCI context requires an exact oci-image package receipt")
+                path = Path(record.archive)
+                if not path.is_file():
+                    raise ArtifactValidationError("retained local OCI context archive must be a regular file")
+            snapshot = stack.enter_context(snapshot_package(path, manifest=digest))
+            if snapshot.package_type != "oci-image":
+                raise ArtifactValidationError("local OCI context requires an oci-image package, not a runtime-bundle")
+            if record is not None and (
+                snapshot.root_digest != record.root_digest
+                or snapshot.archive_digest != record.archive_digest
+                or snapshot.archive_size_bytes != record.archive_size_bytes
+                or snapshot.package_type != record.package_type
+            ):
+                raise ArtifactValidationError("local OCI context archive does not match its retained package receipt")
+            # The package verifier also accepts index.json itself as a selected
+            # root. BuildKit requires the same exact bytes at their blob path.
+            root_blob = _oci_blob_path(snapshot.layout, snapshot.root_digest)
+            if not root_blob.exists():
+                root_blob.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(snapshot.layout / "index.json", root_blob)
+            contexts.append(NamedOCIContext(alias, snapshot.layout, snapshot.root_digest))
+        yield tuple(contexts)
 
 
 @dataclass(frozen=True)

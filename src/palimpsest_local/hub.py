@@ -240,15 +240,19 @@ class HubClient:
         os_variant: str | None = None,
         disk_format: str | None = None,
         limit: int = 50,
+        offset: int = 0,
     ) -> list[dict[str, Any]]:
         if not 1 <= limit <= 200:
             raise HubError("limit must be between 1 and 200")
+        if type(offset) is not int or offset < 0:
+            raise HubError("offset must be a nonnegative integer")
         query = {
             "ubuntu_base": ubuntu_base,
             "arch": arch,
             "os_variant": os_variant,
             "disk_format": disk_format,
             "limit": limit,
+            "offset": offset or None,
         }
         return self._json_request("GET", "/images", query=query)
 

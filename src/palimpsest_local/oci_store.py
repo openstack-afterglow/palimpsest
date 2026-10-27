@@ -906,6 +906,7 @@ class OCIStore:
         ):
             raise OCIStoreError("oci-store-policy", "derived repair age is invalid")
         self._root = _ensure_root(roots.oci_derived_store)
+        self._retention_marker = roots.state / "layer-cache.json"
         self._repair_age_ns = int(float(repair_min_age_seconds) * 1_000_000_000)
         self._clock = wall_clock_ns
         self._artifacts = ArtifactStore(
@@ -1068,7 +1069,9 @@ class OCIStore:
                     pass
                 _close_noerror(fd)
 
-    def _read_file(self, directory_fd: int, name: str) -> tuple[bytes, os.stat_result]:
+    def _read_file(
+        self, directory_fd: int, name: str, *, mode: int = _FILE_MODE, maximum: int = _MAX_RECORD_BYTES
+    ) -> tuple[bytes, os.stat_result]:
         fd: int | None = None
         try:
             entry = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
@@ -1079,9 +1082,9 @@ class OCIStore:
                 or not stat.S_ISREG(opened.st_mode)
                 or opened.st_uid != os.geteuid()
                 or opened.st_nlink != 1
-                or stat.S_IMODE(opened.st_mode) != _FILE_MODE
+                or stat.S_IMODE(opened.st_mode) != mode
                 or _identity(entry) != _identity(opened)
-                or not 0 < opened.st_size <= _MAX_RECORD_BYTES
+                or not 0 < opened.st_size <= maximum
             ):
                 raise OCIStoreError("oci-store-corrupt", "derived metadata target is unsafe")
             payload = bytearray()
@@ -1123,6 +1126,41 @@ class OCIStore:
         if not isinstance(value, dict) or _canonical(value) != payload:
             raise OCIStoreError("oci-store-corrupt", "derived metadata is not canonical")
         return value
+
+    def _assert_artifact_replaceable(self, digest: str) -> None:
+        """Refuse retained output mutation even when a different recipe produced it."""
+        try:
+            self._retention_marker.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        except OSError:
+            raise OCIStoreError("oci-store-retention", "permanent cache retention cannot be established") from None
+        try:
+            with _open_absolute_directory(self._retention_marker.parent) as state_fd:
+                payload, _metadata = self._read_file(
+                    state_fd, self._retention_marker.name, mode=0o600, maximum=32 * 1024 * 1024
+                )
+                catalog = self._decode(payload)
+            if (
+                set(catalog) != {"schema", "cache_id", "images", "references", "consumers", "derived"}
+                or catalog["schema"] != "palimpsest.layer-cache.v1"
+                or not isinstance(catalog["derived"], dict)
+            ):
+                raise OCIStoreError("oci-store-retention", "permanent cache retention catalog is invalid")
+            for record in catalog["derived"].values():
+                if not isinstance(record, dict):
+                    raise OCIStoreError("oci-store-retention", "permanent cache retained output is invalid")
+                retained = normalize_digest(record["image_digest"])
+                if retained != record["image_digest"] or not _valid_image_size(record["image_size"]):
+                    raise OCIStoreError("oci-store-retention", "permanent cache retained output is invalid")
+                if retained == digest:
+                    raise OCIStoreError(
+                        "oci-store-retained", "permanently retained output cannot be recreated or replaced"
+                    )
+        except OCIStoreError:
+            raise
+        except (ArtifactValidationError, OSError, KeyError, TypeError, ValueError, AttributeError, RecursionError):
+            raise OCIStoreError("oci-store-retention", "permanent cache retention cannot be established") from None
 
     def _old_enough(self, metadata: os.stat_result) -> bool:
         now = self._clock()
@@ -1439,6 +1477,7 @@ class OCIStore:
                         expected_digest=packed.receipt.image_digest,
                         expected_size=packed.receipt.image_size,
                         maximum=_MAX_IMAGE_BYTES,
+                        retention_guard=lambda: self._assert_artifact_replaceable(packed.receipt.image_digest),
                     )
                     record = {
                         "image_digest": stored.digest,
@@ -2402,7 +2441,7 @@ class OCIStore:
                         raise OCIStoreError("oci-store-lease-set", "lease-set intent release failed") from None
 
     def assert_artifact_unleased(self, digest: str) -> None:
-        """Fail closed when any durable derived occurrence lease retains a digest.
+        """Refuse permanent-cache deletion or any durable derived occurrence lease.
 
         Callers that mutate physical bytes must already hold ArtifactStore's
         per-digest guard.  This preserves the shared lock order used by lease
@@ -2412,6 +2451,14 @@ class OCIStore:
             normalized = normalize_digest(digest)
         except (ArtifactValidationError, TypeError, ValueError):
             raise OCIStoreError("oci-store-retention", "artifact retention digest is invalid") from None
+        try:
+            self._retention_marker.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            raise OCIStoreError("oci-store-retention", "permanent cache retention cannot be established") from None
+        else:
+            raise OCIStoreError("oci-store-in-use", "artifact belongs to a permanent shared layer cache")
         expected_fields = {
             "acquired_ns",
             "image_digest",

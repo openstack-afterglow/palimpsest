@@ -851,10 +851,14 @@ class ArtifactStore:
         expected_digest: str,
         expected_size: int,
         maximum: int,
+        retention_guard: Callable[[], None] | None = None,
     ) -> StoredArtifact:
+        """Publish or reuse bytes; guard missing/corrupt replacement under its digest lock."""
         digest_hex = _digest_hex(expected_digest)
         if type(expected_size) is not int or type(maximum) is not int or not 0 < expected_size <= maximum:
             raise ArtifactStoreError("artifact-size", "artifact publication size is invalid")
+        if retention_guard is not None and not callable(retention_guard):
+            raise ArtifactStoreError("artifact-retention", "artifact publication retention guard is invalid")
         temporary_name: str | None = None
         temporary_fd: int | None = None
         with self._authority() as authority:
@@ -898,6 +902,8 @@ class ArtifactStore:
                     state, prior = self._target_state(authority, expected_digest, expected_size, maximum)
                     if state == "valid":
                         return StoredArtifact(expected_digest, expected_size, authority.store_id)
+                    if retention_guard is not None:
+                        retention_guard()
                     if state == "corrupt":
                         assert prior is not None
                         stable = os.stat(digest_hex, dir_fd=authority.blobs_fd, follow_symlinks=False)

@@ -354,7 +354,7 @@
     versionList.replaceChildren();
     for (const item of value.items) {
       const row = node("article", "", "row"), main = node("div", "", "row-main"), actions = node("div", "", "row-actions");
-      main.append(node("code", item.root_digest), node("p", `Pushed ${item.pushed_at} by ${item.pushed_by} · key ${item.pushed_key_id}`, "meta"),
+      main.append(node("code", item.root_digest), node("p", `Pushed ${item.pushed_at} by ${item.pushed_by} · ${item.pushed_key_id === null ? "human system administrator" : `key ${item.pushed_key_id}`}`, "meta"),
         node("p", `Original archive ${item.archive_size_bytes} bytes · ${item.archive_digest}`, "meta"),
         node("p", (item.platforms || []).map((platform) => `${platform.os}/${platform.architecture}${platform.variant ? `/${platform.variant}` : ""}`).join(", ") || "No platform descriptors", "meta"));
       actions.append(button("Version details", () => inspectVersion(packageName, item.root_digest), () => canRead()),

@@ -1,0 +1,114 @@
+"""Explicit environmental benchmarks, verified workflows and split reporting."""
+
+from __future__ import annotations
+
+import json
+import signal
+from pathlib import Path
+
+from .benchmark_workflow import load_config
+
+
+def add_parser(commands) -> None:
+    parser = commands.add_parser("benchmark", help="measure disk/network baselines and five-method workflows")
+    modes = parser.add_subparsers(dest="benchmark_mode", required=True)
+    for mode, description in (
+        ("local", "measure disk and external/internal network on this execution host"),
+        ("openstack", "API-verify an explicit Nova guest and measure inside that guest"),
+        ("workflow", "require disk/network qualification before five explicit method commands"),
+    ):
+        command = modes.add_parser(mode, help=description)
+        command.add_argument("--config", required=True, type=Path, help="operator-owned benchmark JSON configuration")
+        command.add_argument(
+            "--output", required=True, type=Path, help="new private evidence directory; existing jobs never replay"
+        )
+    report = modes.add_parser("report", help="render success-only one-page tables/HTML and separate issues")
+    report.add_argument("results", nargs="+", type=Path, help="recorded environment/workflow result JSON files")
+    report.add_argument(
+        "--output", required=True, type=Path, help="new directory for report.md, overview.html and issues.md"
+    )
+    for mode in ("init", "submit", "worker", "status"):
+        command = modes.add_parser(mode, help="durable single-executor controller " + mode)
+        command.add_argument(
+            "--root", required=True, type=Path, help="private durable benchmark controller queue directory"
+        )
+        if mode == "submit":
+            command.add_argument(
+                "--config",
+                required=True,
+                type=Path,
+                help="operator-authored workflow or standalone benchmark request JSON",
+            )
+        elif mode == "worker":
+            command.add_argument(
+                "--once", action="store_true", help="process current queue once, without waiting for future requests"
+            )
+        elif mode == "status":
+            command.add_argument("job_id", help="original queued benchmark request ID; inspection never replays it")
+
+
+def dispatch(args) -> int:
+    mode = args.benchmark_mode
+    if mode in {"local", "openstack", "workflow", "worker"}:
+        signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
+    if mode in {"init", "submit", "worker", "status"}:
+        from .benchmark_worker import initialize, status, submit, work
+
+        if mode == "init":
+            initialize(args.root)
+            result = {"root": str(args.root), "phase": "initialized"}
+        elif mode == "submit":
+            result = submit(args.root, load_config(args.config))
+        elif mode == "status":
+            result = status(args.root, args.job_id)
+        else:
+            return work(args.root, once=args.once)
+        print(json.dumps(result, sort_keys=True))
+        return 0
+    if mode == "report":
+        from .benchmark_reporting import render_report
+
+        args.output.mkdir(mode=0o700, parents=False, exist_ok=False)
+        rendered = render_report([load_config(p) for p in args.results])
+        for key, name in (("markdown", "report.md"), ("html", "overview.html"), ("issues_markdown", "issues.md")):
+            (args.output / name).write_text(rendered[key])
+        print(
+            json.dumps(
+                {
+                    "report": str(args.output / "report.md"),
+                    "html": str(args.output / "overview.html"),
+                    "issues": str(args.output / "issues.md"),
+                }
+            )
+        )
+        return 0
+    config = load_config(args.config)
+    if mode == "local":
+        from .environment_benchmark import run_environment
+
+        result = run_environment(config, args.output)
+    elif mode == "openstack":
+        from .benchmark_openstack import run_openstack_environment
+
+        result = run_openstack_environment(config, args.output)
+    else:
+        from .benchmark_workflow import run_workflow
+
+        result = run_workflow(config, args.output)
+    if mode in {"local", "openstack"}:
+        from .benchmark_reporting import render_report
+
+        rendered = render_report([result])
+        for key, name in (("markdown", "report.md"), ("html", "overview.html"), ("issues_markdown", "issues.md")):
+            (args.output / name).write_text(rendered[key])
+    print(json.dumps(result, sort_keys=True, allow_nan=False))
+    return 0 if result["status"] == "success" else 1
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    add_parser(parser.add_subparsers(dest="operation", required=True))
+    dispatch_args = __import__("sys").argv[1:]
+    raise SystemExit(dispatch(parser.parse_args(["benchmark", *dispatch_args])))

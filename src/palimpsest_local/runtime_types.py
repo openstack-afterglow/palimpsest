@@ -36,6 +36,11 @@ class RuntimeBackend(StrEnum):
     KVM = "kvm"
     LIBVIRT_HVF = "libvirt-hvf"
     LIMA_VZ = "lima-vz"
+    LIMA_KRUNKIT = "lima-krunkit"
+
+    @property
+    def is_lima(self) -> bool:
+        return self is RuntimeBackend.LIMA_VZ or self is RuntimeBackend.LIMA_KRUNKIT
 
 
 @dataclass(frozen=True, slots=True)
@@ -522,6 +527,7 @@ ALLOWED_RUNTIME_COMBINATIONS = frozenset(
         (RuntimeKind.CLOUD_IMAGE, RuntimeBackend.KVM),
         (RuntimeKind.CLOUD_IMAGE, RuntimeBackend.LIBVIRT_HVF),
         (RuntimeKind.CLOUD_IMAGE, RuntimeBackend.LIMA_VZ),
+        (RuntimeKind.CLOUD_IMAGE, RuntimeBackend.LIMA_KRUNKIT),
         (RuntimeKind.OCI_ROOT, RuntimeBackend.KVM),
     }
 )
@@ -606,16 +612,12 @@ class ResolvedRunRequest:
             if bound_intents != self.volume_intents:
                 raise ValueError("bound run attachments do not match logical volume intents")
             sources_match = all(
-                (
-                    volume.backend_name is not None
-                    if self.dispatch_key.backend is RuntimeBackend.LIMA_VZ
-                    else volume.host_path is not None
-                )
+                (volume.backend_name is not None if self.dispatch_key.backend.is_lima else volume.host_path is not None)
                 for volume in self.spec.volumes
             )
             if not sources_match:
                 raise ValueError("bound volume attachment source does not match resolved backend")
-        if self.dispatch_key.backend in {RuntimeBackend.LIBVIRT_HVF, RuntimeBackend.LIMA_VZ}:
+        if self.dispatch_key.backend.is_lima or self.dispatch_key.backend is RuntimeBackend.LIBVIRT_HVF:
             if self.spec.stack.base.arch != "aarch64":
                 raise ValueError("selected runtime backend requires an aarch64 cloud image")
 
@@ -689,13 +691,13 @@ class RunResult:
             return None
         if self.runtime_kind is RuntimeKind.OCI_ROOT:
             return self.run_id
-        if self.backend is RuntimeBackend.LIMA_VZ:
+        if self.backend.is_lima:
             return f"limactl shell {self.name}"
         return self.guest_ip
 
     @property
     def warnings(self) -> tuple[RunWarningCategory, ...]:
-        if self.backend is RuntimeBackend.LIBVIRT_HVF:
+        if self.backend in {RuntimeBackend.LIBVIRT_HVF, RuntimeBackend.LIMA_KRUNKIT}:
             return (RunWarningCategory.EXPERIMENTAL_BACKEND,)
         return ()
 

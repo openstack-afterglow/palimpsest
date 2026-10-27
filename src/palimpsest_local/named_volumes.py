@@ -16,7 +16,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from . import kvm, state
+from . import kvm, platforms, state
 from . import project_volumes as physical
 from .errors import LifecycleError, StateError
 from .refs import VolumeAttachment
@@ -24,7 +24,7 @@ from .runtime_types import RunVolumeIntent
 from .state import StatePaths
 
 _SCHEMA = "palimpsest.named-volumes.v1"
-_BACKENDS = frozenset({"kvm", "libvirt-hvf", "lima-vz"})
+_BACKENDS = frozenset(platforms.BACKENDS)
 
 
 def _directory(roots: StatePaths, *, create: bool = False) -> Path:
@@ -133,13 +133,13 @@ def _lima_disk(roots: StatePaths, entry: dict[str, Any], runner: physical.Comman
 
 
 def _path(roots: StatePaths, entry: dict[str, Any], runner: physical.CommandRunner) -> Path:
-    if entry["backend"] == "lima-vz":
+    if entry["backend"] in platforms.LIMA_BACKENDS:
         return _lima_disk(roots, entry, runner)[1]
     return physical.kvm_volume_path(_physical_roots(roots, entry["backend"]), _project(roots), entry["name"])
 
 
 def _label(roots: StatePaths, entry: dict[str, Any]) -> str:
-    if entry["backend"] == "lima-vz":
+    if entry["backend"] in platforms.LIMA_BACKENDS:
         return "lima-" + physical.lima_backend_name(_project(roots), entry["name"])
     return physical.kvm_volume_label(_project(roots) + "-" + entry["backend"], entry["name"])
 
@@ -171,7 +171,7 @@ def _verify(roots: StatePaths, entry: dict[str, Any], runner: physical.CommandRu
 
 
 def _unreferenced(roots: StatePaths, entry: dict[str, Any], path: Path, runner: physical.CommandRunner) -> None:
-    if entry["backend"] == "lima-vz":
+    if entry["backend"] in platforms.LIMA_BACKENDS:
         disk, _ = _lima_disk(roots, entry, runner)
         physical._allowed_attachment(disk, None)
         return
@@ -268,8 +268,13 @@ def create_named_volume(
         ledger = _read(roots)
         if key in ledger["volumes"]:
             raise StateError("named volume already exists")
+        if backend in platforms.LIMA_BACKENDS and any(
+            entry["backend"] in platforms.LIMA_BACKENDS and entry["name"] == name
+            for entry in ledger["volumes"].values()
+        ):
+            raise StateError("named Lima volume already exists in the shared backend namespace")
         physical.preflight_kvm_volume_support(runner=runner)
-        if backend == "lima-vz":
+        if backend in platforms.LIMA_BACKENDS:
             physical.preflight_lima_volume_support(runner=runner)
         entry = {
             "name": name,
@@ -288,7 +293,7 @@ def create_named_volume(
             physical._verify_private_directory(directory, "named physical volume directory")
         # A failed native creation leaves its explicit uncertain owner row. It
         # is never adopted or silently retried under the same name.
-        if backend == "lima-vz":
+        if backend in platforms.LIMA_BACKENDS:
             created = physical.ensure_lima_volume(
                 _physical_roots(roots, backend), _project(roots), name, size_bytes, runner=runner
             )
@@ -356,7 +361,7 @@ def reserve_named_volumes(
                 read_only=intent.read_only,
                 **(
                     {"backend_name": physical.lima_backend_name(_project(roots), intent.name)}
-                    if backend == "lima-vz"
+                    if backend in platforms.LIMA_BACKENDS
                     else {"host_path": path}
                 ),
             )
@@ -381,7 +386,7 @@ def _declared_volumes(snapshot: Any) -> tuple[Mapping[str, Any], ...]:
 
 
 def _source_matches(roots: StatePaths, entry: dict[str, Any], volume: Mapping[str, Any]) -> bool:
-    if entry["backend"] == "lima-vz":
+    if entry["backend"] in platforms.LIMA_BACKENDS:
         return volume.get("backend_name") == physical.lima_backend_name(_project(roots), entry["name"])
     expected = physical.kvm_volume_path(_physical_roots(roots, entry["backend"]), _project(roots), entry["name"])
     return volume.get("host_path") == str(expected)
@@ -485,7 +490,7 @@ def delete_named_volume(
         _unreferenced(roots, entry, path, runner)
         entry["phase"] = "deleting"
         _write(roots, ledger)
-        if backend == "lima-vz":
+        if backend in platforms.LIMA_BACKENDS:
             physical.delete_lima_volume(
                 _physical_roots(roots, backend), _project(roots), name, entry["size_bytes"], runner=runner
             )

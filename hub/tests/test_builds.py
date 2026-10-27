@@ -550,3 +550,62 @@ async def test_aggregate_worker_input_limit_is_enforced_before_admission_and_cla
     async with h.factory() as session:
         row = await session.get(PalimpsestHubBuild, accepted.json()["id"])
         assert row.status == "error" and row.error_code == "build_failed" and row.lease_owner is None
+
+
+@pytest.mark.asyncio
+async def test_https_build_architecture_rechecked_at_admission_claim_input_and_publication(remote_hub):
+    h = remote_hub
+    base = await upload_base(h)
+    payload = b"hsqs architecture parent"
+    parent = digest(payload)
+    h.store.blob_path(parent).write_bytes(payload)
+    async with h.factory() as session:
+        session.add(
+            PalimpsestHubLayer(
+                blob_digest=parent,
+                size_bytes=len(payload),
+                name="parent",
+                kind="squashfs",
+                media_type=MEDIA_TYPE_LAYER_SQUASHFS,
+                arch="aarch64",
+                project_id="alpha",
+                config_digest=digest(b"parent configuration"),
+                config_json={"base_image_digest": base},
+            )
+        )
+        await session.commit()
+    rejected = await enqueue(h, base, layers=[parent])
+    assert rejected.status_code == 422
+    async with h.factory() as session:
+        row = await session.scalar(select(PalimpsestHubLayer).where(PalimpsestHubLayer.blob_digest == parent))
+        row.arch = "x86_64"
+        await session.commit()
+    queued = await enqueue(h, base, layers=[parent])
+    assert queued.status_code == 202
+    async with h.factory() as session:
+        row = await session.scalar(select(PalimpsestHubLayer).where(PalimpsestHubLayer.blob_digest == parent))
+        row.arch = "aarch64"
+        await session.commit()
+    assert (await h.client.post("/v1/build-worker/claim", headers=WORKER)).status_code == 204
+    async with h.factory() as session:
+        row = await session.scalar(select(PalimpsestHubLayer).where(PalimpsestHubLayer.blob_digest == parent))
+        row.arch = "x86_64"
+        await session.commit()
+    assert (await enqueue(h, base, layers=[parent])).status_code == 202
+    job = await claim(h)
+    async with h.factory() as session:
+        row = await session.scalar(select(PalimpsestHubLayer).where(PalimpsestHubLayer.blob_digest == parent))
+        row.arch = "aarch64"
+        await session.commit()
+    denied_input = await h.client.get(attempt_path(job) + "/inputs/" + parent, headers=attempt_headers(job))
+    assert denied_input.status_code == 422
+    result = b"hsqs output from stale architecture"
+    denied_output = await output(h, job, result)
+    assert denied_output.status_code == 422
+    assert not h.store.exists(digest(result))
+    async with h.factory() as session:
+        assert (
+            await session.scalar(select(PalimpsestHubLayer).where(PalimpsestHubLayer.blob_digest == digest(result)))
+            is None
+        )
+        assert (await session.get(PalimpsestHubBuild, job["id"])).status != "complete"

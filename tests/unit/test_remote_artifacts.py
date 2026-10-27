@@ -96,6 +96,8 @@ def test_legacy_download_complete_chain_is_canonical_run_source(tmp_path, monkey
     assert hub.actions == ["download"]
     assert receipt["image"] == base and receipt["layers"] == [root, leaf]
     assert receipt["runtime_kind"] == "cloud-image"
+    assert receipt["run_supported"] is receipt["compatibility"]["compatible"]
+    assert "reasons" in receipt["compatibility"]
     store = ContentStore(roots.store)
     for digest in (base, root, leaf):
         assert store.verify_blob(digest) == len(blobs[digest])
@@ -193,6 +195,81 @@ def test_non_docker_registry_truthfully_has_no_global_search(tmp_path, monkeypat
     assert result["items"] == []
     assert result["search_mode"] == "exact-reference/tags"
     assert "no configured repository search API" in result["message"]
+
+
+def test_inventory_docker_arch_filter_keeps_provider_pagination(tmp_path, monkeypatch):
+    from palimpsest_local import docker_hub, inventory
+
+    roots = _roots(tmp_path)
+    seen = []
+
+    class Response(io.BytesIO):
+        status = 200
+        headers = {}
+
+        def __init__(self, url):
+            super().__init__(
+                json.dumps({"results": [{"repo_name": "library/ubuntu"}], "next": "untrusted-next"}).encode()
+            )
+            self.url = url
+
+        def geturl(self):
+            return self.url
+
+    class Opener:
+        def open(self, request, timeout):
+            seen.append(request.full_url)
+            assert request.get_header("Authorization") is None
+            return Response(request.full_url)
+
+    monkeypatch.setattr(docker_hub.urllib.request, "build_opener", lambda *_args: Opener())
+    result = inventory.browse_remote_artifacts(
+        roots, connection_id="registry:docker", query="ubuntu", arch="aarch64", limit=1, cursor="1"
+    )
+    assert seen == ["https://hub.docker.com/v2/search/repositories/?query=ubuntu&page_size=1&page=2"]
+    # Repository search does not declare architectures: retain navigation without claiming compatibility.
+    assert [row["repository"] for row in result["items"]] == ["library/ubuntu"]
+    assert result["items"][0]["architectures"] == []
+    assert result["items"][0]["run_supported"] is False
+    assert result["next_cursor"] == "2"
+
+
+@pytest.mark.parametrize(("arch", "expected_names"), [("aarch64", ["app"]), ("x86_64", [])])
+def test_inventory_native_arch_filter_uses_real_bound_package_client(tmp_path, monkeypatch, arch, expected_names):
+    import urllib.parse
+
+    import test_packages as package_fixtures
+
+    from palimpsest_local import inventory
+
+    roots = _roots(tmp_path)
+    profile = RegistryProfile(
+        "team", "example.test", protocol="palimpsest", api_base=package_fixtures._BASE, namespace="team"
+    )
+    save_registry_config(roots, add_profile(default_registry_config(), profile))
+    hub = package_fixtures._Hub(package_fixtures._actor(actions=["packages:inventory"]))
+
+    def page(request):
+        assert urllib.parse.parse_qs(urllib.parse.urlsplit(request.full_url).query) == {
+            "limit": ["1"],
+            "cursor": ["previous_page"],
+        }
+        return {
+            "project_id": package_fixtures._PROJECT,
+            "namespace": "team",
+            "items": [package_fixtures._inventory_summary(platforms=[{"os": "linux", "architecture": "arm64"}])],
+            "next_cursor": "next_page",
+        }
+
+    hub.routes[("GET", "/projects/team/packages")] = page
+    monkeypatch.setattr(remote, "get_package_key", lambda *_args: package_fixtures._KEY)
+    monkeypatch.setattr(remote._ConnectedNative, "_transport", lambda self: hub)
+    result = inventory.browse_remote_artifacts(
+        roots, connection_id="registry:team", arch=arch, limit=1, cursor="previous_page"
+    )
+    assert [row["name"] for row in result["items"]] == expected_names
+    assert result["next_cursor"] == "next_page"
+    assert hub.requests == [("GET", "/auth/me"), ("GET", "/projects/team/packages")]
 
 
 def test_oci_exact_manifest_reports_architecture_not_conventional_vm(tmp_path, monkeypatch):
@@ -424,7 +501,6 @@ def test_legacy_layer_only_chain_downloads_and_reuploads_without_fake_base(tmp_p
     monkeypatch.setattr(backend, "_hub", lambda: hub)
     result = backend.download("legacy", reference)
     assert result["run_supported"] is False
-    assert "complete cloud-image base" in result["run_limitation"]
     assert result["source"] == reference and result["image"] is None
     assert result["layers"] == layers
     assert Path(result["receipt"]).is_file()

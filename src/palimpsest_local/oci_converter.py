@@ -42,6 +42,15 @@ from .oci_tar_emitter import TarEmissionReceipt, emit_normalized_overlay_tar
 _BLOCK = 512
 _ZERO_BLOCK = b"\0" * _BLOCK
 _IO_CHUNK = 1024 * 1024
+_MODE_TYPE_BY_KIND = {
+    "file": stat.S_IFREG,
+    "hardlink": stat.S_IFREG,
+    "symlink": stat.S_IFLNK,
+    "directory": stat.S_IFDIR,
+    "char": stat.S_IFCHR,
+    "block": stat.S_IFBLK,
+    "fifo": stat.S_IFIFO,
+}
 
 LAYER_INTAKE_POLICY_ID = "palimpsest.oci-layer-intake.v2"
 
@@ -523,7 +532,7 @@ def _scan_tar(
         uid = _pax_integer(pax, "uid", _tar_number(header[108:116], "uid"), 0xFFFFFFFF)
         gid = _pax_integer(pax, "gid", _tar_number(header[116:124], "gid"), 0xFFFFFFFF)
         mtime = _pax_integer(pax, "mtime", _tar_number(header[136:148], "mtime"), 0xFFFFFFFF)
-        if mode > 0o7777 or uid > 0xFFFFFFFF or gid > 0xFFFFFFFF or mtime > 0xFFFFFFFF:
+        if mode > 0o177777 or uid > 0xFFFFFFFF or gid > 0xFFFFFFFF or mtime > 0xFFFFFFFF:
             raise LayerIntakeError("oci-numeric-metadata", "tar numeric metadata is out of range")
 
         kinds = {
@@ -539,6 +548,10 @@ def _scan_tar(
         kind = kinds.get(type_flag)
         if kind is None:
             raise LayerIntakeError("oci-member-type", "tar member type is unsupported")
+        mode_type = stat.S_IFMT(mode)
+        if mode_type and mode_type != _MODE_TYPE_BY_KIND[kind]:
+            raise LayerIntakeError("oci-member-mode", "tar mode type contradicts the member type")
+        mode = stat.S_IMODE(mode)
         if normalized == "." and kind != "directory":
             raise LayerIntakeError("oci-root-metadata", "archive root member must be a directory")
         if basename == ".wh..wh..opq" or basename.startswith(".wh."):

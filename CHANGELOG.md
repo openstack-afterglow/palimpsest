@@ -4,6 +4,35 @@ All notable changes to Palimpsest Local are documented here.
 
 ## [Unreleased]
 
+## [0.3.10] - 2026-10-28
+
+### Added
+
+- Add explicit Nova cloud-init layer builds, project-bound asset registration, original allocation receipts and optional boot-volume type selection. These operator SDK workflows remain distinct from deployed Hub API builds.
+- Retain original OCI sources and verified SquashFS conversions in a permanent layer cache, with project-bound asset graphs, canonical registry-worker jobs and a BuildKit-to-OCI asset adapter. Consumer release never deletes retained payloads.
+- Export verified external-layer cloud-init with immutable read-only lowers and per-consumer writable OverlayFS state bound to guest, filesystem and ordered layer identities.
+- Add explicit experimental `lima-krunkit` execution and compatible conventional named-volume support while preserving VZ defaults, shared Lima disk-name ownership and native OCI/carrier attachment restrictions.
+- Add bounded disk/network environment qualification, OpenStack/workflow reporting and a private single-executor benchmark queue with preserved uncertain-job blocking and separate success/issue output.
+- Expose artifact architecture/compatibility checks and filters consistently across local inventory, CLI, Hub transfer and dashboard metadata without claiming boot, ABI or GPU readiness.
+- Add registered service-local authorization actions, operator policy configuration, native personal-project owner checks and fresh human system-administrator management with explicitly bounded issued-key authority.
+
+### Fixed
+
+- Enforce permanent retained-byte protection by physical SquashFS digest across distinct derivation recipes, preserving missing/corrupt retained targets rather than silently repairing them through another recipe.
+- Keep OCI converter temporary spools on their verified private scratch; isolate capture mounts from peer namespaces and preserve strict normalized timestamps except for independently verified native captures.
+- Preserve upstream tar type-bit semantics and current platform/root descriptor guards when acquiring retained OCI inputs.
+- Select workflow environment qualification from the authoritative local/OpenStack mode rather than relying on an optional CLI-injected runner.
+- Preserve typed console identity refusals when Darwin denies SIGTERM during PTY EOF exit: accept that race only after bounded leader reap and proof that its entire process group is absent; keep live or uncertain permission failures visible.
+
+### Changed
+
+- Reconcile unpublished public work onto released0.3.9, preserving the HTTPS-only service-VM build executor, shared-CAS/Sentinel readiness, catalog/unpack behavior and trusted journal-frame commitments. Private credentials and research control helpers are excluded from package bytes.
+- Synchronize client/Hub package identities and packaged Kolla image defaults. External API build/consumer acceptance and an actual Kolla service rollout remain distinct from package publication and deployment-server pinning.
+- **BREAKING (Hub credentials):** ordinary artifact/package management and system administration now require original human-authenticated subject tokens; application credentials, Trust/delegated tokens and service identities are denied for those human control paths. Automation uses explicitly issued attenuated package keys where supported, not elevated OpenStack credentials. System administrators are freshly revalidated without fabricating target membership; project-local policy replaces leaf-only defaults.
+- **Compatibility:** artifact listing/check filters use canonical `x86_64`/`aarch64` names, layer inventory is SquashFS-only by default, and old chains without declared layer architecture remain unknown/not runnable rather than inheriting a base target. Metadata compatibility does not replace runtime preflight.
+- Revalidate administrative authority and required actions after blocking CAS publication and immediately before SQL mutations; preserve rollback, retained references and unregistered-blob compensation if identity or policy is revoked during the request.
+- Preserve publication-only repeat uploads without metadata disclosure or a fabricated digest shortcut, and report terminal Nova guest failures/uncertain registration with typed retained-resource errors under the original fixed deadline.
+
 ## [0.3.9] - 2026-10-27
 
 - Reject rewritten non-tail supervisor output even when size/mtime/ctime are unchanged and its payload checksum is recomputed. Keep compact trusted per-record chain seals from startup verification and successful own durable appends; compare each requested frame before returning it.

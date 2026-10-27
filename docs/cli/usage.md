@@ -20,11 +20,18 @@ Do not treat these similarly named surfaces as interchangeable:
 
 | Surface | Examples | Backend and credentials |
 | --- | --- | --- |
-| Palimpsest Hub artifacts | `image ls`, `image pull`, `image push`, `layer *`, `bundle *` | Native Palimpsest Hub `/v1`; `PALIMPSEST_TOKEN` |
+| Palimpsest Hub artifacts | `image ls`, `image pull`, `image push`, `layer ls/check/pack/pull/push`, `bundle *` | Native Palimpsest Hub `/v1`; `PALIMPSEST_TOKEN` for Hub operations (local `layer pack` needs none) |
 | Docker wrapper | `pull`, `push`, `tag`, `images`, `history`, `rmi`, `save`, `load`, and `image inspect/history/rm/save/load` | Installed Docker CLI and external OCI registries; Docker credentials |
 | Local OCI root | `oci pull`, `oci materialize`, `run ./image.oci.tar --runtime-kind oci-root` | Anonymous TLS registry acquisition into a verified local archive; private source CAS and Linux KVM runtime |
+| Permanent shared OCI cache | `oci cache --root PATH init/pull/import/materialize/retain/release/inspect` | Explicit private directory on pre-mounted persistent storage; anonymous verified TLS for pulls, current local CAS/materializer authority |
+| External runtime user-data | `layer cloud-init --config runtime.json` | Local JSON-to-cloud-init export only; no credentials, network, or state initialization |
 
 Palimpsest Hub is not an OCI Distribution `/v2` registry. A fully qualified anonymously accessible reference such as `quay.io/example/nginx:stable` can be acquired with `palimpsest oci pull ... --output ./nginx.oci.tar`; `run` still accepts only the resulting verified local source. See [anonymous TLS OCI registry intake](../registry-intake.md) for its authentication, TLS, endpoint, platform, path, size, and timeout limits.
+
+For repeated acquisition across images/instances, use the explicit
+[permanent shared layer cache](../registry-intake.md#permanent-shared-layer-cache).
+It retains compressed and derived digest-addressed bytes after the last
+consumer is released; it does not automatically deploy a cache or attach disks.
 
 ## Hub cloud images, layers, and bundles
 
@@ -34,13 +41,13 @@ Palimpsest Hub is not an OCI Distribution `/v2` registry. A fully qualified anon
 palimpsest --url https://hub.example image ls --arch x86_64 --disk-format qcow2
 palimpsest image pull "$IMAGE_DIGEST" --output ./downloads
 palimpsest image import ./ubuntu.qcow2 --disk-format qcow2 --arch x86_64 --os-variant ubuntu24.04
-palimpsest image push ./ubuntu.qcow2 --name ubuntu-dev --publish
+palimpsest image push ./ubuntu.qcow2 --name ubuntu-dev --arch x86_64 --publish
 ```
 
 `layer pack DIRECTORY --tag TAG` produces a local SquashFS layer with the fixed zstd recipe. `layer push VALUE` accepts a local tag/digest and optionally supplies Hub chain metadata; `--parent`, `--base-image`, and `--ubuntu-base` describe that chain. `layer ls` has the same 1–200 `--limit` restriction. `bundle pull` exports a Hub chain as an OCI image-layout directory and can include its base image. `bundle verify` verifies an extracted bundle directory.
 
 ```sh
-palimpsest layer pack ./rootfs-overlay --tag app-v1
+palimpsest layer pack ./rootfs-overlay --tag app-v1 --arch x86_64
 palimpsest layer push app-v1 --name app-v1 --base-image "$IMAGE_DIGEST"
 palimpsest bundle pull "$LAYER_DIGEST" --output ./bundle --include-base
 palimpsest bundle verify ./bundle
@@ -51,7 +58,176 @@ palimpsest bundle verify ./bundle
 ```sh
 palimpsest bundle unpack ./palimpsest-runtime.oci.tar --output ./palimpsest-bundle
 palimpsest bundle verify ./palimpsest-bundle
+palimpsest run ./palimpsest-bundle --name bundled
 ```
+
+Run only on a compatible host with documented backend prerequisites and a matching raw/qcow2 base plus known matching base/layer architecture. The verified bundle resolves base and ordered layers automatically; no manual `--layer` selection is required. No-base chains remain reusable/discoverable but not locally runnable. Catalog local_supported is metadata eligibility, not byte/guest readiness; download authority remains independent of public/site/project/shared visibility. New catalog routes require matching Hub rollout. Neither rollout nor VM boot was performed for source qualification.
+
+
+### External copy-on-write runtime user-data
+
+`layer cloud-init --config PATH [--output PATH]` validates a local JSON manifest
+and calls `build_external_layer_user_data` to generate `#cloud-config`. Without
+`--output`, stdout is exactly the generated configuration, without a receipt or
+an extra newline. `--output` writes an owner-only file, refuses an existing
+destination, and prints its path. There is no `--force` option. Invalid JSON or
+manifest policy fails before any Palimpsest state initialization, journal,
+network request, or authentication.
+
+For example, save this as `runtime.json`. The UUID and digests are illustrative:
+replace them with the prepared filesystem UUID and hashes of your actual
+SquashFS blobs. The packed layers must contain the shown runtime subtree and
+all its required native dependencies for the chosen guest image and architecture.
+
+```json
+{
+  "schema": "palimpsest.external-layer-runtime.v2",
+  "arch": "x86_64",
+  "filesystem_uuid": "12345678-1234-4123-8123-123456789abc",
+  "stacks": [
+    {
+      "name": "example",
+      "layers": [
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      ]
+    }
+  ],
+  "exports": [
+    {"stack": "example", "path": "opt/example-runtime", "target": "/opt/example-runtime"}
+  ],
+  "paths": ["/opt/example-runtime/bin"],
+  "library_paths": ["/opt/example-runtime/lib"],
+  "activation_commands": [],
+  "checks": [
+    ["/opt/example-runtime/bin/python3", "-c", "import ssl; print(ssl.OPENSSL_VERSION)"]
+  ]
+}
+```
+
+```sh
+palimpsest layer cloud-init --config ./runtime.json --output ./runtime-cloud-init.yaml
+```
+
+The versioned manifest accepts only these fields:
+
+| Field | Contract |
+| --- | --- |
+| `schema` | Exactly `palimpsest.external-layer-runtime.v2`; old v1 read-only runtime policies must be regenerated explicitly. |
+| `arch` | `x86_64` or `aarch64`; activation rejects a different guest architecture. |
+| `filesystem_uuid` | Canonical UUID identifying an already populated ext4 filesystem; never a device name or a formatting request. |
+| `storage_read_only` | Optional boolean, default `false`. `true` mounts the ext4 store `ro,noload,nosuid,nodev`, requires a read-only block device, and refuses journal replay. Use only a clean, finalized filesystem with all blob/layer/runtime mountpoints already present. Every provider attachment must be read-only; no external writer may modify shared bytes. |
+| `consumer_state_root` | Optional, default `/var/lib/palimpsest/consumer` on the guest's writable boot filesystem. An explicit path strictly under `/mnt` or `/var/lib` must use a separate, operator-owned whole writable ext4/XFS block filesystem. Never shared across consumers, in the lower store, on a network filesystem, through symlinks or bind aliases. The exporter does not allocate or format scratch. |
+| `stacks` | Nonempty list of objects containing only unique lowercase-slug `name` and nonempty `layers`, ordered base to top. Layers are canonical `sha256:<64 lowercase hex>` digests. Repeated physical digests within one stack are refused (kernel lower-dentry overlap); catalog occurrence graphs may preserve repetitions but cannot be silently deduplicated for consumption. Mount options must fit the bounded kernel input. |
+| `exports` | List of objects containing only `stack`, safe relative subtree `path`, and absolute `target` beneath `/opt` or `/usr/local`. Stack references must exist; export targets must not overlap. |
+| `paths`, `library_paths` | Lists of absolute directories inside a configured export or `/srv/palimpsest/runtimes/<stack>`. No home-directory runtime roots, traversal, or arbitrary host directories. |
+| `activation_commands`, `checks` | Lists of nonempty argv arrays of strings without NUL or newline; no implicit shell expansion. These are explicitly trusted operator-authored root boot policy, never automatically imported Hub commands. Checks run after activation commands. |
+| `blob_paths` | Optional digest-to-relative-store-path map for canonical cache reuse. Only declared digests are allowed and each path ends in its full hex digest; no copies or hardlinks. |
+| `command_links` | Optional native command-name to executable path map within a configured stack/export; generated `/usr/local/bin` links refuse unrelated existing files and escaping source links. |
+
+Optional lists may be empty. Unknown keys, unsafe paths, collisions, and invalid
+digests are errors. The exporter does not inspect binary ABI or certify GPU,
+CUDA, Vulkan, driver, or guest-kernel compatibility; pack and qualify those
+dependencies explicitly.
+
+The guest mounts the external ext4 filesystem at `/srv/palimpsest`, verifies
+regular non-symlink blobs at `blobs/sha256/<hex>`, and checks each SHA-256 before
+mounting it read-only with `nosuid,nodev` at `layers/<hex>`. Stacks appear at
+`runtimes/<name>` as writable OverlayFS mounts with top-first read-only lowerdirs
+and consumer-private upper/work directories, including single-layer stacks.
+Declared root-owned native prefixes bind-export this same writable merged view.
+Existing mounts/exports must match the exact expected identity; unrelated mounts
+are not adopted or overwritten. Upper/work share one filesystem and live beneath
+root-private per-stack state; an owner record binds the stack, ordered lower
+digests, store UUID, state filesystem UUID, upper/work inodes, machine-id and VM
+UUID. A DMI product UUID or aarch64 device-tree `vm,uuid` is required; absence fails
+closed. Changed identities, missing/replaced recorded state and legacy RO views
+are refused rather than repaired. Writes/copy-up/deletion whiteouts never modify
+the SquashFS blobs. Space consumption is bounded by the selected boot/scratch
+volume's capacity, not an implicit memory tmpfs or inherited `TMPDIR`.
+
+For multiple guests sharing the same Cinder multiattach volume, set
+`storage_read_only: true` and precreate `blobs/sha256`, every `layers/<hex>`, and
+every `runtimes/<name>` directory before finalizing the clean filesystem.
+Mountpoint directories must be empty, root-owned and not group/world-writable.
+Each guest owns its own loop/overlay mount state, upper/work and native configuration;
+the shared filesystem contains only immutable bytes and empty mountpoints.
+Do not multiattach a writable ext4 filesystem or use `noload` to hide a dirty
+filesystem. A guest-local read-only mount alone does not prove the other
+attachments are read-only; verify provider attachment policy separately.
+
+For an already frozen v1 store, write the v2 policy and generated activation files
+outside that store. Quiesce all runtime users, then unmount the old exports and
+runtime stack mounts before applying the generated helper and systemd files;
+keep the verified RO lower loops and provider seal. Activation does not unmount
+or replace old views automatically. Restarting the new service verifies and reuses
+the same private state, retaining copy-up changes. To discard a consumer, quiesce
+its users, unmount exports then runtime, and remove only that consumer's owned
+state; never erase or rewrite canonical blobs. Boot-volume deletion also discards
+default state. This is an image-derived native view, not OCI-root isolation/parity.
+
+`paths` are registered through `/etc/profile.d/palimpsest-runtime.sh`, including
+interactive Bash, and `library_paths` through
+`/etc/ld.so.conf.d/palimpsest-runtime.conf` and `ldconfig`. After successful boot
+activation, an ordinary first SSH login can invoke the configured native tools
+without sudo, chroot, a manual entry script, or a user-home runtime tree. The
+systemd runtime service requires the external mount and successful checks. SSH
+daemon activation/login requires successful runtime activation; the socket may
+listen earlier but cannot start a working daemon before that prerequisite.
+Failure remains closed to SSH, with provider console recovery available. Restarts verify expected
+existing mounts rather than formatting or repairing storage.
+
+This command is **not a Nova provisioning backend**. Prepare and attach the
+prepopulated volume with external provider tooling, compose the generated
+cloud-config with your separately managed SSH/account policy, and supply that
+user-data when creating the VM. This version selects an externally managed
+Cinder-style ext4 block volume; it does not provision Cinder resources or mount
+Manila shares, and no Manila provisioning backend is implemented. See the
+[provider workflow](../vm-workflow.md#external-volume-runtime-provider-workflow).
+
+### Target architecture and client compatibility
+
+Cloud images and VM-built SquashFS layers use canonical `arch: x86_64` or
+`arch: aarch64`. Palimpsestfile builds and commits take the target from the
+verified guest base, not the host running the CLI; BuildKit runtime packs keep
+their selected Linux platform (including supported variants). Upload/download
+and per-artifact bundle configs preserve the declaration. Known conflicting
+architectures cannot silently replace an existing local blob descriptor or mix
+within a runtime stack.
+
+For arbitrary directories/files, `layer pack/push --arch` is a declaration by
+the publisher, not binary analysis. Omission leaves a legacy layer unknown.
+`image push` reuses the file's recorded architecture; an unrecorded image
+requires `--arch`, and a conflicting override fails before publication.
+
+```sh
+# Local inventory; no Hub or virtualization tools required.
+palimpsest store ls --compatible --format json
+palimpsest store ls --kind layer --arch aarch64
+palimpsest store check app-v1 --backend lima-krunkit
+
+# Hub inventory and full dependency checks; metadata only, no blob download.
+palimpsest image ls --compatible --format json
+palimpsest layer ls --compatible --backend lima-krunkit --format json
+palimpsest image check "$IMAGE_DIGEST"
+palimpsest layer check "$LAYER_DIGEST"
+```
+
+`check` emits JSON with `status` (`compatible`, `incompatible`, or `unknown`),
+`compatible`, declared architecture/platform, client/backend, dependency
+descriptors and reasons. Exit status is 0 only for `compatible`, otherwise 1.
+A layer needs a complete root-bound cloud-image base and known matching target
+on every parent; missing/invisible metadata, missing local bytes, or a legacy
+unlabelled layer never count as compatible. `--arch` alone can browse foreign
+targets; `--compatible` evaluates the current runtime client and optional
+`--backend` without probing or starting VMs. Hub architecture filters apply
+server-side; compatible CLI queries continue through candidate pages until the
+requested number of complete compatible results is found or inventory ends.
+
+These are platform-metadata checks, not GPU/Vulkan/CUDA, guest ABI, hardware
+availability or boot qualification. Runtime preflight remains mandatory.
+OCI-root remains restricted to Linux amd64 KVM; an ARM64 OCI image does not
+become executable on macOS merely because its CPU architecture matches.
 
 The Docker-compatible `image inspect`, `image history`, `image rm`, `image save`, and `image load` commands are aliases for Docker-backed operations; they do not inspect or mutate Hub `/v1` cloud-image records.
 
@@ -106,7 +282,7 @@ Build restrictions enforced before execution:
 - `--offline` requires `--network none` and rejects `--pull`, `--push`, `--runtime-push`, `--registry`, and external `--cache-from`/`--cache-to`.
 - `--no-cache` requires `--offline` or `--cache-mode local`; online native-cache builds must reuse Hub cache.
 - `--runtime-tag` and `--runtime-base` must appear together; `--runtime-push` also requires both.
-- `--local-image` uses `ALIAS=/absolute/layout@sha256:DIGEST`; the layout and pinned manifest graph are verified. `--runtime-block-size` defaults semantically to 131072 bytes and must be a power of two from 4096 through 1048576.
+- `--local-image` accepts `ALIAS=/absolute/layout@sha256:DIGEST`, `ALIAS=/absolute/image.oci.tar@sha256:DIGEST`, or `ALIAS=AUTHORITY/NAMESPACE/PACKAGE@sha256:DIGEST` after an explicit native `pull`. Archive/reference inputs use a private verified layout held through solve/runtime packing, then removed. Exact retained receipts bind archive hash/size, root and package type; mutable tags, runtime bundles and OnBuild triggers are refused. This does not make Hub a Docker `/v2` registry or grant server-build authority. `--runtime-block-size` defaults semantically to 131072 bytes and must be a power of two from 4096 through 1048576.
 - `--output` is an OCI archive path, not arbitrary BuildKit exporter syntax; omission creates an invocation-unique archive beneath local build state.
 - Dockerfile builds reject legacy `--base`/`--layer`; use `--runtime-base` and `--local-image` instead.
 - `--progress` defaults to `plain`; build networking defaults to `none`.
@@ -174,7 +350,7 @@ Without an explicit runtime kind, `run IMAGE` checks local cloud CAS/tags, succe
 
 An explicit authority or `--registry` restricts reference resolution to that authority/profile, including local named bindings; explicit local paths/digests remain local. Unqualified remote lookup tries the configured default (or `PALIMPSEST_REGISTRY`) first, then other OCI aliases in sorted order. Only a genuine image miss advances to another profile: Docker daemon, authentication, TLS, transport and verification failures stop. Native Palimpsest package profiles are not Docker `/v2` registries; pull those packages explicitly before running their local OCI receipt. See [automatic run acquisition](../registries.md#automatic-run-acquisition).
 
-Cloud-image runs accept a local/Hub image digest or a Palimpsest bundle directory. Extra `--layer` values must continue the verified SquashFS parent chain. Backend `auto` selects KVM on Linux and Lima/VZ on macOS; experimental `libvirt-hvf` must be selected explicitly. Conventional cloud runs attach the image and layers but do not pivot the guest root.
+Cloud-image runs accept a local/Hub image digest or a Palimpsest bundle directory. Extra `--layer` values must continue the verified SquashFS parent chain. Backend `auto` selects KVM on Linux and Lima/VZ on macOS; experimental `libvirt-hvf` and `lima-krunkit` must be selected explicitly. Conventional cloud runs attach the image and layers but do not pivot the guest root.
 
 OCI-root runs accept local OCI archives/layouts, verified build/package/retained bindings, or OCI registry references acquired through Skopeo. The public runtime is limited to Linux x86_64/amd64 KVM with `qemu:///system` and qualified absolute kernel/config/packer paths with digest proof. Unsupported hosts fail capability checks before Docker export, registry acquisition or runtime-state mutation. `--network` selects `nat` (the default when omitted), `host-only`, or `none`, and OCI-root-only `--publish` adds explicit loopback-by-default forwarding; see [OCI-root guest networking](../oci-network.md). The runtime remains capabilityless and is not a general hostile-container sandbox.
 
@@ -285,9 +461,36 @@ is unaffected by table presentation.
 
 `web` replaces the former `ui` command. It is a foreground process, not a daemon or an installation-time service: ordinary CLI commands never start it. The packaged dashboard binds only `127.0.0.1` and stops serving when the command exits, including Ctrl-C/SIGINT or SIGTERM. It opens a browser by default; `--no-browser` only prints the URL. If no browser is available, open that printed URL manually. No Hub URL, token or connection is required; remote Hub requests happen only on explicit connection, catalog or transfer actions.
 
+The web artifact list provides architecture and client-platform status filters;
+details show the client/backend and refusal reasons. The authenticated local API
+supports `GET /api/v1/store/artifacts?arch=aarch64&compatible=true&backend=lima-krunkit`
+and `GET /api/v1/store/artifacts/REFERENCE/compatibility` (URL-encode the digest
+or local tag). Remote Hub/registry filters select platform **candidates on the
+current page** and retain the next-page cursor; an empty filtered page is not
+proof that no compatible version exists. Downloads verify the full dependency
+chain before offering Run.
+
 The printed URL carries a per-process token. The page removes it from the address bar and keeps it in the tab session, so reloading works while the process runs; a restarted process needs its new URL. Assets and `/api/v1` require the token as a bearer header. Run it as the UID that owns the selected state root. For a remote host, keep the loopback bind and forward it, for example `ssh -L 8080:127.0.0.1:8080 HOST`.
 
 The dashboard is read-only by default: every `POST`/`DELETE` returns `403` before any side effect, and the page hides management controls. Read-only does not mean the VM view is a static snapshot: it live-reconciles each run against its backend, and when observed status differs the reconciliation records that status in the run ledger. `--allow-control` enables image build/run, connected consoles, VM start/stop/remove, cloud-image import, verified local CAS tag assignment, unreferenced CAS artifact removal, and state-root move/set with confirmations. Tags cannot silently be reassigned to another digest. Artifact bytes and build identities remain immutable; build-record and retained-source OCI archives are not edited or deleted through the CAS controls.
+
+VM removal is available from both list and detail views after exact-name
+confirmation. A host-only row does not need a run ledger in the selected state
+directory or a historical Palimpsest UUID: it needs a fresh, verified native
+instance identity. The DELETE request uses the encoded stable row ID plus
+`expected_instance_id`, its original `expected_run_id` (including null for an
+unmarked instance), exact `confirmation` and `volumes: false`. It revalidates
+the backend identity immediately before mutation. Stale, ambiguous, replaced,
+protected or physically unsafe identities and OCI-root VMs remain ineligible.
+Host-only removal never adopts a run or edits another state's ledger and has
+no run-file deletion option. Lima deletes its own instance directory/disks;
+independent/additional disks remain outside that removal. Libvirt removal
+retains disk files, NVRAM and persistent emulator-TPM state. Transient emulator
+TPM domains, or a persistent TPM definition without required retention support,
+are refused before stopping. Start/stop and optional owned-run-tree deletion
+still require an exact selected managed run. Restart a previously running
+`palimpsest web` process after upgrading source; refreshing its page alone does
+not reload Python lifecycle handlers.
 
 Build and run forms submit `POST /api/v1/builds` and `POST /api/v1/vms`, returning `202` with operation IDs. `GET /api/v1/operations` exposes completion and bounded output while views refresh without replacing their output panels. At most two operations are active, with 32 retained records and a 128 KiB raw output tail per operation. The build form supports inline Dockerfile editing and local-cache builds with no Hub connection. Run uses the same CLI source resolver and platform checks. Closing the dashboard cancels owned preparation tools, not an already launched VM; use Stop/Remove for VM lifecycle changes.
 
@@ -316,7 +519,7 @@ While the tab is visible it refreshes resource views every five seconds without 
 
 | View | Source | Not a claim of |
 | --- | --- | --- |
-| VMs | live Lima/libvirt host observation plus selected-state reconciliation; explicit detail probes read the Linux guest journal, `/proc` counters and `df` through an authenticated transport | automatic deletion, adopted ownership of another state, or measurements from an unavailable transport |
+| VMs | live Lima/libvirt host observation plus selected-state reconciliation; explicit detail probes read the Linux guest journal, `/proc` counters and `df` through an authenticated transport | service readiness, adopted ownership or lifecycle authority from discovery alone, or measurements from an unavailable transport |
 | Volumes | host primary/additional disks and selected project/OCI root-volume records; backend-reported capacity, backing-file length and allocated host bytes are distinct measurements | verified filesystem contents or capacity when the backend did not report it |
 | Layers and images | local CAS metadata/tags and run/project references, successful BuildKit exports and retained sources; separate explicit Hub/Docker Hub catalog requests | automatic remote refresh, layer-file integrity from metadata alone, or OCI-root runnability |
 | Networks | backend network definitions and VM attachments plus selected-state committed OCI plans; Lima configuration is marked configured, not live traffic | successful packet delivery, guest address discovery, or an open published listener |

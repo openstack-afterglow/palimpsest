@@ -118,18 +118,24 @@ palimpsest image import ./ubuntu.qcow2 \
   --disk-format qcow2 --arch x86_64 --os-variant ubuntu24.04
 
 # Upload a local cloud image to Hub.
-palimpsest image push ./ubuntu.qcow2 --name ubuntu-dev --publish
+palimpsest image push ./ubuntu.qcow2 --name ubuntu-dev --arch x86_64 --publish
 ```
 
 `image import` is local-store ingestion, not upload. `image push` is the Hub
 upload. `image verify` checks local bytes and requires an expected digest.
+
+`image push` uses an already-recorded architecture or requires explicit `--arch`;
+it never silently relabels ARM images as x86_64. For per-client inventory and
+read-only chain checks, use `image/layer ls --compatible`, `store ls
+--compatible`, and `store/image/layer check`; see the
+[compatibility contract](usage.md#target-architecture-and-client-compatibility).
 
 ### Layer flow
 
 ```sh
 palimpsest layer ls --limit 20
 palimpsest layer pull "$LAYER_DIGEST" --output ./layers
-palimpsest layer pack ./rootfs-overlay --tag app-v1
+palimpsest layer pack ./rootfs-overlay --tag app-v1 --arch x86_64
 palimpsest layer push app-v1 --name app-v1 --base-image "$IMAGE_DIGEST"
 ```
 
@@ -304,7 +310,7 @@ palimpsest run ./bundle --name bundled --layer "$LAYER_DIGEST"
 ```
 
 Backend `auto` selects Linux KVM or macOS Lima/VZ. Select experimental
-`libvirt-hvf` explicitly. Conventional runs retain the cloud image as the guest
+`libvirt-hvf` or `lima-krunkit` explicitly. Conventional runs retain the cloud image as the guest
 root and attach validated Palimpsest layers; they do not pivot `/` to OCI
 content.
 
@@ -507,3 +513,221 @@ palimpsest completion fish > "$HOME/.config/fish/completions/palimpsest.fish"
 Creating those parent directories and sourcing completion are explicit user
 shell operations. `palimpsest __complete` is an internal protocol and is not a
 public command.
+
+## 9. Native Nova builds and internal layer workers
+
+This unreleased path does not use local libvirt, nested KVM, or host PCI rebind.
+Install the reviewed working wheel with the `cloud` extra on the controller;
+install the same wheel and Skopeo/mksquashfs on the internal Linux worker.
+The existing `run` backend defaults remain unchanged. The Hub's legacy build
+API is not silently redirected to this executor and no Hub deployment is implied.
+
+### Create a cloud-init build
+
+```sh
+palimpsest build --executor nova --nova-config ./nova-build.json -t torch-runtime
+# The same explicit controller workflow is also available as:
+palimpsest cloud build ./nova-build.json --name torch-runtime
+```
+
+Choose one of these invocations for a new job, not both. An existing create
+intent is deliberately not replayable after a lost response. Inspect the
+receipt and exact provider identity instead of creating an unrecorded retry.
+
+The operator-authored JSON has these required sections:
+
+| Section | Exact contract |
+| --- | --- |
+| `cloud`, `project_id`, `receipts`, `assets_root` | SDK profile name, exact Keystone target, existing private controller receipt directory, and worker catalog below `/srv/palimpsest` |
+| `spec` | `schema=palimpsest.nova-build.v1`, unique `job_id`, same `project_id`, explicit `arch` and `base_image_id`, `commands` and nonempty `checks` argv arrays |
+| `spec.storage` | Exact `volume_id`, full `filesystem_uuid`, integer `size_gib`, boolean `initialize`; formatting occurs only for an explicitly approved serial/size-matched blank new disk |
+| `spec.parent_layers` | Optional base-to-leaf `{digest,size}` descriptors already present on the attached filesystem; mismatches refuse before installation |
+| `launch` | Matching `job_id`/image, name, exact GPU flavor/network/project-owned security group IDs and retained boot size; data volume binding comes from `spec.storage` |
+| `cloud_init` | Explicit account/SSH policy and same-wheel worker bootstrap; never cloud tokens, application credentials or registry activation commands |
+| `ssh` | `user`, existing private `identity_file`, `known_hosts`, absolute worker `python`, optional `jump`. The known-hosts entry uses `spec.job_id` as `HostKeyAlias`, so trust is pinned before a private IP is allocated. |
+
+For emitter-only review, use `palimpsest cloud build-user-data ./build-spec.json
+--output ./new-user-data.yaml`. It emits account-free cloud-init and refuses
+overwrite. Capture uses the canonical overlay/chroot cleaning policy but puts
+upper/work/output on attached ext4 instead of memory. Checks execute before
+success is recorded. Kernel-specific NVIDIA modules and CUDA/cuDNN compatibility
+remain actual workload requirements, not properties inferred from an image tag.
+
+### Acquire and inspect OCI layers inside the worker
+
+After verifying the intended external mount, create empty mode0700 directories
+for `/srv/palimpsest/cache`, `/srv/palimpsest/assets` and `/srv/palimpsest/jobs`.
+Initialize once, never after a missing mount:
+
+```sh
+palimpsest oci cache --root /srv/palimpsest/cache init
+palimpsest cloud assets --root /srv/palimpsest/assets --project-id "$PROJECT_ID" init
+palimpsest cloud registry-worker \
+  --cache-root /srv/palimpsest/cache --assets-root /srv/palimpsest/assets \
+  --jobs-root /srv/palimpsest/jobs ./registry-job.json
+palimpsest cloud assets --root /srv/palimpsest/assets --project-id "$PROJECT_ID" ls
+palimpsest cloud assets --root /srv/palimpsest/assets --project-id "$PROJECT_ID" verify "$ASSET_ID"
+```
+
+`registry-job.json` contains `schema=palimpsest.registry-worker-job.v1`, unique
+`job_id`, exact `project_id` and fully qualified OCI `reference`; optional
+`timeout_seconds` is 1–3600 per stage, `packer` is an absolute worker executable,
+and `consumer` records an exact permanent cache binding. This command executes
+the real canonical acquisition/materialization on that worker, preserving original
+manifest/config/compressed layers and recording each contextual parent occurrence,
+DiffID, conversion key and SquashFS result. Its catalog is not a second blob store.
+Completed identical jobs verify/reuse their bytes; failed/uncertain jobs are retained
+and require a new explicit job ID. There is no CPU-image execution or implicit
+Docker/Hub authentication fallback. Current OCI conversion is Linux amd64 only.
+
+The outer acquisition/image deadline does not relax the versioned intake300-second
+or packer120-second policies. Canonical worker tar spools stay in its pinned private
+scratch on the selected retained-storage filesystem, not the boot disk's global
+`/tmp`; no caller-provided temporary path or credentials are inherited. Treat a
+policy-limit failure as a failed job and inspect its evidence before selecting
+adequate worker resources, not as permission to bypass the isolated converter.
+
+The worker binds `mksquashfs` and every linked library (including the C library)
+before conversion, re-verifies them while it runs, and includes their digests in each
+derived-layer key. Package managers must not replace them during a job. On the
+2026-10-22 replacement worker a TensorFlow job failed with the generic boundary
+error about two seconds after unattended upgrades began replacing `libc6`; the same
+request succeeded as a new job once the apt timers were stopped and the running
+package transaction had finished. The boundary reports no stable code to the
+controller, so that cause is inferred from timing and counters, not captured.
+Mask `apt-daily*.timer` or use an immutable image on dedicated workers. A toolchain
+change is a new conversion identity: layers lacking a record under it are derived
+again (identical SquashFS bytes are reused by physical digest) and the asset ID
+differs. Inspect any retained job, successful or failed, later with:
+
+```sh
+python -m palimpsest_local.registry_worker \
+  --cache-root /srv/palimpsest/cache --assets-root /srv/palimpsest/assets \
+  --jobs-root /srv/palimpsest/jobs inspect "$JOB_ID" --project-id "$PROJECT_ID"
+```
+
+A successful job additionally re-inspects its cached graph and fully verifies the
+registered asset's bytes.
+
+### Prepare shared immutable lowers and private writable consumers
+
+`cloud prepare-runtime --assets-root /srv/palimpsest/assets --project-id
+"$PROJECT_ID" ./runtime-policy.json` runs on the single-writer worker. Policy
+maps `stacks` names to verified asset identities and supplies the filesystem UUID,
+exports/native paths/library paths and trusted activation/check argv. It returns
+an account-free manifest and cloud-init, precreates only empty mountpoints and
+uses canonical `blob_paths` in place—no duplicate layer copies or hardlinks that
+invalidate the source CAS link-count invariant.
+
+Cleanly unmount the worker filesystem, detach its writer and mark the provider
+multiattach volume read-only before consumers. Keep original/derived/catalog bytes.
+
+An `umount` in the shell is not proof of release. The capture worker now runs in a
+private mount namespace, but earlier capture workers, operator shells and services
+can still hold stale copies of the store or its overlay/`/sys`/`/dev` binds (observed
+before that change: `systemd-logind` on the 2026-10-22 worker). Such a copy keeps the
+ext4 superblock alive and its journal unflushed even though `umount` succeeded in
+the main namespace. Before detaching the writer, list every `/proc/*/mountinfo` that
+still names the store, run `nsenter --target PID --mount -- umount -R
+/srv/palimpsest` for each holder, then require `dumpe2fs -h` to show
+`Filesystem state: clean`, no `needs_recovery` feature and `Journal start: 0`. A VM
+deleted with `needs_recovery` set leaves a journal that read-only no-replay
+consumers cannot use.
+
+Bind this already sealed volume using `cloud assets … bind-store`, then use
+`cloud launch-batch ./consumer-batch.json` from a controller that can verify the
+same pre-mounted catalog/bytes. The explicit batch contains `cloud`, `project_id`,
+`receipts`, `assets_root`, `asset_id`, `volume_id`, and `instances` with complete
+instance requests plus cloud-init paths. Verification and atomic consumer reservation
+precede concurrent creation. Creation returns `created-not-ready`, never guest/GPU
+success. Every guest independently requires full UUID, blockRO=1, ext4 no-replay,
+content hashes and read-only lower identities, then mounts private writable
+OverlayFS stacks and exports using boot-local upper/work. Optional
+`consumer_state_root` selects an explicitly owned separate ext4/XFS scratch
+filesystem; it is not a provisioning request. State binds the exact guest, store,
+ordered lowers, writable filesystem UUID and upper/work inodes. V2 policies reject
+legacy RO stack mounts: quiesce/unmount old exports and stacks before applying a
+new consumer policy outside a frozen v1 store. Never multiattach writable ext4.
+
+`cloud assets … release CONSUMER` only removes metadata. Last-consumer release,
+instance stop/delete and failed acquisition do not remove permanent layer bytes.
+An explicit `cloud instance --config … delete JOB` additionally verifies fresh
+delete-on-termination=false attachment flags before deleting that exact Nova VM.
+It does not delete its boot/data volumes.
+
+### Register locally built OCI outputs
+
+The source-only `oci_build_assets.LocalBuildEvidence` and
+`register_local_oci_build` Python API accepts the actual paired successful
+BuildKit-v2 source/package records and original OCI archives, not fabricated
+registry requests or job receipts. It verifies build keys/specs, archive sizes and
+digests before and after canonical acquisition, the unchanged package Dockerfile,
+and the exact local-export artifact passed into the assembly. That handoff must
+also equal the artifact resolved from the first solve's canonical source OCI
+layers; rootfs-export bytes alone are not trusted. Full source commit, both
+context/Dockerfile/record identities and the handoff digest bind `source.kind =
+oci-build`. Original runtime layer occurrences retain compressed, DiffID, recipe
+and physical SquashFS identities; existing LayerCache bytes are reused in place.
+Only native `nova-build` assets opt out of zero mkfs time; `oci-build` stays strict.
+The original source context must be the exact pristine Git worktree top-level:
+HEAD must equal the pinned commit and tracked, untracked and ignored dirt all
+fail before/after registration. Keep OCI archives and local build exports outside
+that context. The original `COMMIT` file must agree; it is not authority by itself.
+
+Source handoff scanning reuses bounded normalized changesets in the registration
+caller and ambient temporary scratch. It is **not** the hard materializer worker's
+RLIMIT/hard-deadline boundary; runtime conversion still uses that unchanged hard
+worker. These local receipts are not signed Git/build attestations. Callers own
+source acquisition/authentication and retain real build evidence. Catalog support
+for repeated physical output digests does not imply external runtime support:
+check actual lower digest uniqueness before preparation; never silently dedup.
+No new public CLI or build/provisioning side effects are introduced by registration.
+
+### Sequential GPU measurement
+
+Every new comparison first runs the [disk/network environment benchmark](../benchmarks.md).
+The GPU plan supplies `environment_benchmark` (API-verified CPU qualification guest)
+and explicit `environment_release_argv`; the script requires successful disk/HTTPS/internal
+TCP measurements, then confirms no project VM remains before starting serial GPU consumers.
+Provision qualification peers separately, within their approved scope. Historical timings
+without this preflight remain historical and are never relabelled as newly qualified.
+New receipts record request-time flavor specifications and Nova allocation flavor separately.
+
+
+`scripts/benchmark_nova_gpu.py --config ./benchmark.json` requires all eight
+Torch/TensorFlow × cloud-init/Nova-layer/registry-layer/Ansible cases, five
+repetition rounds, `max_parallel_instances=1` and retained boot volumes. Every
+case supplies complete original user-data, a real native `readiness_argv` and,
+for Ansible, the actual installation playbook. Readiness emits JSON with exact
+`framework`, `uid`, `boot_id`, `gpu_uuid`, `cpu_fallback=false` after real GPU math.
+The tool polls ordinary-user `nvidia-smi` while cloud-init/Ansible installation is
+still progressing, and records that first success separately from later framework
+GPU readiness. It confirms boot/device/user identities through pinned SSH without
+login/profile, sudo, chroot or private environment overrides.
+
+Set an explicit `launch.boot_gib`; each new boot is checked against both remaining
+Cinder gigabytes and volume-count quota. Type-specific provider limits must also be
+provisioned by the operator. An optional `management_floating_ip_id` reuses only an
+unbound project-owned floating IP and exactly one owned server port; it never
+allocates a new IP. Results record `fip_bound_monotonic_seconds` and
+`fip_binding_seconds` separately. Request-to-readiness still includes routing delay;
+do not attribute that delay solely to the installation/runtime method.
+Readiness probes retain their latest actual `.stdout`, `.stderr` and `.status.json`
+beside the run result, including when the deadline expires; a failed original
+image is not replaced by a dependency-supplemented image to complete the matrix.
+An observed first-NVIDIA endpoint is retained even if the next identity collection
+fails. Such runs remain failed, with `failure_request_elapsed_seconds`, the actual
+subprocess return code and private stdout/stderr preserved; framework readiness is
+never inferred from successful `nvidia-smi` alone.
+
+Raw per-run results and one-second disk/network samples remain in the private
+evidence root. Summary retains failures/missing repetitions instead of inventing
+five successes. Disk/network rates are guest virtual-device deltas, not Ceph
+physical I/O, provider image-copy speed or link-capacity measurements. Cold
+acquisition/build preparation must be reported separately from warm consumer boot.
+Cleanup deletes only each exact new VM and retains every boot/data volume;
+uncertain cleanup, accepted-create response loss and quota exhaustion stop the
+next allocation. GTX1080Ti attempts failed before guest readiness. The separately
+approved RTX3060LHR condition passed probe and builder checks, but fresh consumers
+and the five-repetition matrix are not yet qualified; see the handoff.
+

@@ -3,8 +3,8 @@
 ## Purpose
 Separate authorized package metadata, content download, publishing and owned key administration while attenuating tokens and delegated keys to current Keystone owner authority.
 ## Requirements
-### Requirement: Exact Palimpsest service capability matrix
-Hub SHALL accept exact effective `palimpsest-inventory_reader`, `palimpsest-download_user`, `palimpsest-publish_editor`, `palimpsest-keys_editor`, `palimpsest-keys_admin` leaves. Parent assignments (`palimpsest_reader`, `palimpsest_user`, `palimpsest_editor`, `palimpsest_admin`) SHALL resolve through Keystone's current role-ID implication DAG, not hardcoded bundles. Presets initially link lower grades and their leaves, but operators can remove edges. Role bindings SHALL use a fresh complete directory of unique global IDs. Baseline effective member SHALL be required for non-reader leaves; inventory SHALL additionally accept baseline reader. Project/native roles alone grant no service entitlement, and domain aliases, ambiguous bindings or unavailable directory/graph SHALL grant no authority.
+### Requirement: Service-local policy over trusted current Keystone roles
+Hub SHALL evaluate registered service-local oslo.policy actions against the intersection of original-token and fresh current-owner authority. Exact unique global role IDs and their current Keystone implication graph SHALL establish trusted role names; domain aliases, ambiguous bindings, partial collections and unavailable metadata SHALL fail closed. Service grades (`palimpsest_reader`, `palimpsest_user`, `palimpsest_editor`, `palimpsest_admin`) SHALL work directly without requiring service implication edges or baseline member/reader grants. Exact fine-grained Palimpsest leaves SHALL remain independently usable. Ordinary native member/reader alone SHALL grant no service actions except for a separately verified personal-project owner. Project admin/manager grants SHALL be evaluated by policy, not confused with system authority; project manager has no default service grant. Capability labels SHALL project allowed actions, not fabricate Keystone roles.
 
 #### Scenario: Direct native token grades
 - **WHEN** a reader, user, editor or admin calls native Hub directly
@@ -15,12 +15,19 @@ Hub SHALL accept exact effective `palimpsest-inventory_reader`, `palimpsest-down
 - **WHEN** a publish-only or key-editor-only principal calls an action
 - **THEN** only the named leaf capability is granted; publish does not grant download and key issue does not grant publish.
 
-#### Scenario: Removed implication with retained parent
-- **WHEN** an operator removes a parent-to-leaf edge while the parent remains assigned
-- **THEN** the corresponding feature is revoked for the existing token and key unless another current actual assignment path grants it.
+#### Scenario: Grade-only authority and operator policy changes
+- **WHEN** a service grade remains assigned but its service implication edges are absent
+- **THEN** its registered default actions remain available without synthesized leaves.
+- **WHEN** an operator YAML override denies an action or the current trusted role is revoked
+- **THEN** retained tokens and keys lose that action while unrelated authorized actions remain available; key ceilings SHALL also constrain operator grants.
+
+#### Scenario: Invalid operator policy never retains a stale grant
+- **WHEN** a configured non-default policy file is missing, a policy document is malformed, or native parser/rule validation fails
+- **THEN** authorization SHALL fail closed with 503 and discard the failed enforcer cache rather than retain partially loaded or stale grants.
+
 
 ### Requirement: Current authority limits tokens and keys
-Hub SHALL revalidate current effective named Keystone assignments and enabled owner/project using its read-only validator. Issue-time key actions SHALL be a subset of both original-token and current owner capabilities. Use-time key authority SHALL be the intersection of delegated actions and current owner capabilities.
+Hub SHALL revalidate current effective named Keystone assignments and enabled owner/project using its separate read-only validator, which SHALL reject administrative, manager or service validator credentials. Issue-time key actions SHALL be a subset of both original-token and current owner actions. Use-time key authority SHALL intersect declared key actions with fresh current owner actions. Package keys SHALL never delegate key administration, system management or metadata deletion. Ordinary keys SHALL never be upgraded into human-system keys by a later owner promotion; explicitly human-admin-issued keys SHALL retain server-owned issuer provenance and revalidate that human's current system authority.
 
 #### Scenario: Downgrade during upload
 - **WHEN** a publisher's role is downgraded after starting a transfer
@@ -33,29 +40,30 @@ Hub SHALL revalidate current effective named Keystone assignments and enabled ow
 
 #### Scenario: Native key owner is promoted on system-all
 
-- **WHEN** an existing ordinary package-key owner receives a direct system-all admin, manager or service assignment that project-oriented effective expansion omits
-- **THEN** the fresh separate direct-system lookup denies native member controls, key use and upload finalization
-- **AND** the original delegated actions do not bypass the current non-administrative owner policy.
+- **WHEN** an existing ordinary package-key owner receives a direct or current-group system-all admin, manager or service assignment that project-oriented effective expansion omits
+- **THEN** separate raw system lookups deny ordinary member-key use and upload finalization
+- **AND** a verified human system administrator MAY separately use the explicit administrative token path or deliberately issue a new bounded key; an old ordinary key SHALL not inherit it.
 
 
 ### Requirement: Preserve global and credential boundaries
 
-Hub SHALL preserve verified-system-admin global builder/GC gates and key-only native package writes, without granting service admin global authority or allowing package keys to authorize OpenStack/VM launch. System administrator recognition SHALL use a fresh direct user/system-all assignment query through the separate reader, not project-oriented effective expansion, and SHALL still require an exact subject user, system-all scope and named admin role.
+Hub SHALL preserve verified-human-system-admin builder/GC gates without granting service grades, project admin/manager grants or package keys global authority. Native package writes MAY use a bounded package key, a currently authorized original human project token, or an independently revalidated human system administrator with a logical Hub target. System recognition SHALL use fresh raw exact-system user grants, current group membership and raw exact-system group grants through the separate reader and trusted role-ID inference, never project-oriented effective expansion. Human authentication methods and original delegation/binding/access-rule restrictions SHALL be checked; service/trustee/validator identities and machine/delegated credentials SHALL not become human administrators. Logical targets SHALL never exchange or re-scope the original OpenStack token.
 
 #### Scenario: Service admin and package key cannot launch
 
 - **WHEN** service admin tokens or package keys call global builder/GC or VM operations
 - **THEN** no new authority is granted.
 
-#### Scenario: Direct system administrator survives project-oriented expansion
+#### Scenario: Raw system authority survives project-oriented expansion
 
-- **WHEN** a project-scoped subject user has a direct admin assignment on system-all while effective expansion omits that assignment
-- **THEN** Hub recognizes the administrator through the direct reader lookup without exchanging or re-scoping the original subject token.
+- **WHEN** a human subject has a direct or current-group system-all admin grant, including a uniquely bound global role implying admin, while effective expansion omits system grants
+- **THEN** Hub recognizes current system authority through raw reader lookups without exchanging the original token
+- **AND** an unscoped or system-scoped human SHALL supply an explicit logical target for project-local management, while genuinely global catalog reads SHALL require no fabricated target.
 
 #### Scenario: Revocation removes global authority despite project admin
 
-- **WHEN** the direct system-all admin assignment is removed while the original token retains a project admin role
-- **THEN** the next validation no longer recognizes a system administrator and privileged requests are denied with 403.
+- **WHEN** the last actual direct/group system-all admin path is removed while the original token retains a project admin role
+- **THEN** the next validation no longer recognizes a system administrator and privileged requests are denied; missing or incomplete native metadata SHALL remain failures, not cached grants.
 
 ### Requirement: Isolated HTTP regression setup
 Regression cases SHALL exercise actual native FastAPI HTTP routes and a synthetic HTTP Keystone boundary with temporary SQL/CAS, without production Hub mutation.
@@ -70,11 +78,11 @@ Regression cases SHALL exercise actual native FastAPI HTTP routes and a syntheti
 - **THEN** it exercises the unmodified registered Hub app through HTTP using the real SDK against synthetic current Keystone, real Redis and named SQLite/blob storage
 - **AND** original upload/download bytes and owned range-resume bytes remain equal after container restart and recreation; inventory is not content-download authority, and inventory plus write publishes without read
 - **AND** current-owner downgrade revokes issued keys and export tickets while retained inventory remains available; verified-system-only builder/GC gates remain separate
-- **AND** the report distinguishes the smoke-only SQLite factory/lifespan-off setup from canonical MySQL bootstrap/deployment and records the observed SQLite connect_timeout incompatibility without claiming real cloud/KVM execution.
+- **AND** the report distinguishes the smoke-only SQLite factory/lifespan-off setup from canonical MySQL bootstrap/deployment, records canonical bootstrap observations, and does not claim real cloud or build-executor execution.
 
 ### Requirement: Original-token console capability projection
 
-Hub SHALL expose `GET /v1/me` using the original project-scoped subject identity and roles, with no token/password/auth-reference fields and `Cache-Control: no-store` on success and errors. Its independent inventory/download/upload capabilities SHALL be computed from fresh current service leaves. Verified system administrators SHALL retain legacy inventory/download/build/delete authority, but administrative privilege alone SHALL NOT grant upload or native member controls. Legacy upload SHALL require independent ordinary current-project publication authority; membership denial SHALL expose no member capabilities, and identity outages SHALL remain failures.
+Hub SHALL expose `GET /v1/me` with original subject identity and roles, no token/password/auth-reference fields, and `Cache-Control: no-store` on success and errors. Independent inventory/download/upload flags SHALL project fresh service-local allowed actions. Human system administrators SHALL use fresh policy-controlled authority and additionally receive an explicit logical target identity when applicable; administrative upload SHALL not require fabricated service membership. Build/delete flags SHALL require separately verified system-management authority. Membership denial SHALL expose no member capabilities, and identity outages SHALL remain failures. `GET /v1/policy/capabilities` SHALL expose current actions and capability labels, including an empty action set for an authenticated unentitled ordinary member.
 
 #### Scenario: Retained token loses membership
 
@@ -86,20 +94,31 @@ Hub SHALL expose `GET /v1/me` using the original project-scoped subject identity
 - **WHEN** a publish-only caller starts an upload for an already registered visible digest
 - **THEN** the server creates a normal upload session, verifies the submitted bytes and metadata at finalization, and does not return an inventory descriptor; only an inventory-authorized caller can take the verified-descriptor completion shortcut.
 
-### Requirement: Independent ordinary legacy publication authority
+### Requirement: Personal ownership and explicit human administrative authority
 
-Legacy image/layer publication SHALL preserve the original project-scoped user/token and intersect its ordinary service-role closure with fresh enabled current-project authority. Builtin admin/manager roots and their separately expanded `links.prior_role` copies SHALL NOT grant publication or baseline membership; independent ordinary direct, group or inherited roots MAY grant publication through the current unique-global role graph. Service, protected and validator identities and system/domain-scoped tokens SHALL remain denied. Native package key ownership and deferred Trust export admission/use SHALL retain their separate non-administrative owner policy; no legacy publication permission SHALL relax those boundaries.
+Personal ownership SHALL require fresh enabled native user, project and domains; the exact project marker `afterglow_personal_user_id` SHALL identify the caller, and the project domain SHALL be exactly `Personal` with an absent or exact `personal` domain-kind marker. A unique non-escalating global member role and direct, non-group, non-inherited membership provenance SHALL establish personal authority. Personal ownership MAY grant project-local policy actions, including nondelegable metadata deletion, but SHALL never grant system management. Policy denies and protected/service/delegated identity boundaries SHALL remain effective.
 
-#### Scenario: Administrator publishes only with ordinary authority
+#### Scenario: Personal member grants remain bounded
 
-- **WHEN** a verified system administrator also holds baseline membership and ordinary `palimpsest-publish_editor` authority in the original token's project
-- **THEN** `/v1/me` reports upload authority and legacy upload lifecycle requests are authorized as that original project user
-- **AND** native member/key controls and deferred Trust exports remain denied.
+- **WHEN** the original human member token and fresh native personal-project provenance agree
+- **THEN** project-local default actions are available without service grades, while system operations remain denied
+- **AND** bounded keys retain exact package/action ceilings, cannot manage keys or delete metadata, and lose authority when personal ownership or original credentials are revoked.
 
-#### Scenario: Admin implication does not substitute for an ordinary grant
+#### Scenario: Human system administrator targets a project
 
-- **WHEN** an admin implication reaches membership or publication leaves but no independent ordinary current-project assignment reaches them
-- **THEN** legacy publication is denied, including after revocation of a formerly independent grant while the token remains valid.
+- **WHEN** a fresh verified human system administrator selects an enabled logical target project
+- **THEN** policy-authorized native and legacy publication uses that target while audit attribution records the actual human and original token scope remains unchanged
+- **AND** explicitly issued keys retain bounded actions, exact namespace/package ownership and server-owned human issuer provenance; key lists/revocation remain own-key-only.
+
+#### Scenario: Service grade and delegated credentials never become system authority
+
+- **WHEN** project service grades, tenant administrative grants, machine credentials, Trusts or package keys request global build/GC or a foreign logical target
+- **THEN** no system or cross-project authority is inferred.
+
+#### Scenario: Deferred Trust export keeps its independent boundary
+
+- **WHEN** a human has publication authority but carries administrative or service roles, system authority, or a logical target different from the original token project
+- **THEN** deferred Trust-export admission SHALL remain denied; native/legacy publication and human-admin key features SHALL not relax separately qualified export ownership, delegation or worker credential isolation.
 
 
 ### Requirement: Same-origin console credential isolation

@@ -583,6 +583,29 @@ def test_parent_worker_boundary_starts_a_new_session_and_binds_stdin(tmp_path: P
     assert value == {"bytes": len(request.to_json_bytes()), "pid": process.pid, "pgrp": process.pid}
 
 
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="anonymous tempfile FD paths require Linux procfs")
+def test_worker_anonymous_spool_stays_on_private_service_filesystem(tmp_path: Path) -> None:
+    script = (
+        "import os,sys,tempfile,hashlib; from pathlib import Path; "
+        "sys.stdin.buffer.read(); "
+        "spool=tempfile.TemporaryFile(); "
+        "actual=Path(os.readlink('/proc/self/fd/'+str(spool.fileno())).removesuffix(' (deleted)')); "
+        "assert actual.parent.samefile(Path.cwd()), 'private spool escaped service scratch'; "
+        "spool.write(b'private captured payload'); spool.flush(); os.fsync(spool.fileno()); "
+        "spool.seek(0); print(hashlib.sha256(spool.read()).hexdigest()); spool.close()"
+    )
+    output, return_code, process = materializer._spawn_and_exchange(
+        _request(),
+        scratch=tmp_path,
+        timeout_seconds=5,
+        grace_seconds=0.1,
+        command=(sys.executable, "-I", "-c", script),
+    )
+    assert return_code == 0
+    assert output.decode().strip() == hashlib.sha256(b"private captured payload").hexdigest()
+    assert process.poll() == 0
+
+
 @pytest.mark.parametrize("number", [errno.EAGAIN, errno.ENOMEM, errno.EACCES, errno.ENOENT])
 def test_worker_spawn_classifies_only_known_resource_errors(tmp_path, monkeypatch, number):
     calls = []

@@ -257,6 +257,10 @@ def build_handler(
                     except ValueError:
                         self._send_json({"error": "invalid remote result limit"}, status=400)
                         return
+                    compatible = qs.get("compatible", ["false"])[0]
+                    if compatible not in {"true", "false"}:
+                        self._send_json({"error": "compatible must be true or false"}, status=400)
+                        return
                     self._send_json(
                         inventory.browse_remote_artifacts(
                             roots,
@@ -269,6 +273,7 @@ def build_handler(
                             arch=qs.get("arch", [""])[0],
                             disk_format=qs.get("disk_format", [""])[0],
                             parent=qs.get("parent", [""])[0],
+                            compatible=compatible == "true",
                             hub_connection=HubConnection.from_headers(self.headers),
                         )
                     )
@@ -363,8 +368,25 @@ def build_handler(
                     return
 
                 if path == "/api/v1/store/artifacts":
-                    res = inventory.list_artifacts(roots)
+                    compatible = qs.get("compatible", ["false"])[0]
+                    if compatible not in {"true", "false"}:
+                        self._send_json({"error": "compatible must be true or false"}, status=400)
+                        return
+                    res = inventory.list_artifacts(
+                        roots,
+                        arch=qs.get("arch", [None])[0],
+                        compatible=compatible == "true",
+                        requested_backend=qs.get("backend", ["auto"])[0],
+                    )
                     self._send_json(res)
+                    return
+                if path.startswith("/api/v1/store/artifacts/") and path.endswith("/compatibility"):
+                    reference = urllib.parse.unquote(path[len("/api/v1/store/artifacts/") : -len("/compatibility")])
+                    self._send_json(
+                        inventory.check_local_artifact(
+                            roots, reference, requested_backend=qs.get("backend", ["auto"])[0]
+                        )
+                    )
                     return
 
                 if path == "/api/v1/builds":

@@ -218,7 +218,9 @@ def _owned_instance(directory: Path, record: dict[str, Any]) -> dict[str, Any] |
         raise StateError("ambiguous experimental OCI instance identity")
     if not matches:
         return None
-    lima._require_owned_instance(matches[0], record["run_id"], record["instance"])
+    lima._require_owned_instance(
+        matches[0], record["run_id"], record["instance"], backend=platforms.BACKEND_LIMA_QEMU_OCI
+    )
     return matches[0]
 
 

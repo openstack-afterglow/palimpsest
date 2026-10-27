@@ -1108,7 +1108,11 @@ def get_cmd_name(argv: list[str]) -> str:
     return argv[0]
 
 
-def test_commit_success(tmp_path: Path):
+@pytest.mark.parametrize(
+    ("arch", "existing_arch"),
+    [(None, None), ("x86_64", None), ("aarch64", None), (None, "aarch64"), ("aarch64", "x86_64")],
+)
+def test_commit_success(tmp_path: Path, arch: str | None, existing_arch: str | None):
     env = {
         "XDG_CONFIG_HOME": str(tmp_path / "config"),
         "XDG_STATE_HOME": str(tmp_path / "state"),
@@ -1124,6 +1128,15 @@ def test_commit_success(tmp_path: Path):
     layer_digest = "sha256:" + "b" * 64
     _stub_store_blob(roots, base_digest)
     _stub_store_blob(roots, layer_digest)
+    base_info = {}
+    if arch is not None:
+        base_path = tmp_path / "base.qcow2"
+        base_path.write_bytes(b"verified guest base")
+        base_digest = _sha256_file(base_path)
+        from palimpsest_local.oci_layout import ContentStore
+
+        ContentStore(roots.store).ingest_file(base_path, expected_digest=base_digest)
+        base_info = {"base": {"digest": base_digest, "local_path": str(base_path), "arch": arch}}
     owner_rec = state.write_owner_record(rpaths)
     state.write_run_state(
         rpaths,
@@ -1132,6 +1145,7 @@ def test_commit_success(tmp_path: Path):
             "guest_ip": "192.168.122.50",
             "base_digest": base_digest,
             "layers": [{"digest": layer_digest}],
+            **base_info,
         },
     )
     conn = FakeLibvirtConn()
@@ -1158,7 +1172,25 @@ def test_commit_success(tmp_path: Path):
             return subprocess.CompletedProcess(cmd, 0, "", "")
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
-    res = commit("demo-run", "committed-tag", roots=roots, conn=conn, runner=fake_runner)
+    from palimpsest_local.oci_layout import ContentStore
+
+    store = ContentStore(roots.store)
+    output = tmp_path / "previous.squashfs"
+    output.write_bytes(b"hsqs" + b"\x00" * 100)
+    output_digest = _sha256_file(output)
+    if existing_arch is not None:
+        store.ingest_file(output, expected_digest=output_digest)
+        store.write_metadata(output_digest, {"kind": "squashfs", "arch": existing_arch})
+    # A supplied host profile is not authority for the guest target.
+    profile = platforms.resolve_domain_profile(platforms.BACKEND_KVM, "x86_64")
+    if arch is not None and existing_arch is not None and arch != existing_arch:
+        with pytest.raises(ArtifactValidationError, match="architecture conflicts"):
+            commit("demo-run", "committed-tag", roots=roots, conn=conn, runner=fake_runner, profile=profile)
+        assert store.read_metadata(output_digest)["arch"] == existing_arch
+        assert not state.tag_path(roots, "committed-tag").exists()
+        return
+
+    res = commit("demo-run", "committed-tag", roots=roots, conn=conn, runner=fake_runner, profile=profile)
     assert res["tag"] == "committed-tag"
     assert res["parent_digest"] == layer_digest
     assert res["base_image_digest"] == base_digest
@@ -1167,6 +1199,19 @@ def test_commit_success(tmp_path: Path):
     tag_rec = state.read_tag_record(roots, "committed-tag")
     assert tag_rec.digest == res["digest"]
     assert tag_rec.source == "commit"
+    metadata = store.read_metadata(tag_rec.digest)
+    assert metadata.get("arch") == (arch or existing_arch)
+    assert res["arch"] == arch
+    if arch is not None:
+        from palimpsest_local.refs import BuildSpec
+
+        layer = LayerRef(tag_rec.digest, tag_rec.media_type, store.blob_path(tag_rec.digest), arch=metadata["arch"])
+        opposite = "aarch64" if arch == "x86_64" else "x86_64"
+        wrong_base = ImageRef(base_digest, "qcow2", opposite, None, base_path)
+        recipe = tmp_path / "Palimpsestfile"
+        recipe.write_text(f"FROM {base_digest}\nLAYER {tag_rec.digest}\nRUN true\n")
+        with pytest.raises(ArtifactValidationError, match="arch"):
+            BuildSpec(wrong_base, (layer,), recipe, "none", "wrong-target")
 
 
 def test_typed_commit_binding_rejects_run_replacement_before_capture_or_publish(tmp_path: Path):

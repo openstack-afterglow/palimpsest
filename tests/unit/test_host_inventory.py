@@ -5,11 +5,13 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from palimpsest_local import host_inventory, platforms
+from palimpsest_local.errors import StateError
 
 
 @pytest.fixture(autouse=True)
@@ -61,6 +63,7 @@ def test_observe_lima_stopped_and_running_vms(monkeypatch: pytest.MonkeyPatch, t
     fake_instances = [
         {
             "name": "vm-running-1",
+            "vmType": "vz",
             "status": "Running",
             "arch": "aarch64",
             "memory": 2 * 1024 * 1024 * 1024,
@@ -77,6 +80,7 @@ def test_observe_lima_stopped_and_running_vms(monkeypatch: pytest.MonkeyPatch, t
         },
         {
             "name": "vm-stopped-2",
+            "vmType": "vz",
             "status": "Stopped",
             "arch": "aarch64",
             "memory": 1024 * 1024 * 1024,
@@ -172,6 +176,7 @@ def test_observe_secret_absence(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
 
     fake_instance = {
         "name": "secret-vm",
+        "vmType": "vz",
         "status": "Running",
         "arch": "aarch64",
         "memory": 1024 * 1024 * 1024,
@@ -233,6 +238,7 @@ def test_observe_failed_identity_invalid_markers(monkeypatch: pytest.MonkeyPatch
         fake_instances.append(
             {
                 "name": name,
+                "vmType": "vz",
                 "status": "Running",
                 "arch": "aarch64",
                 "memory": 1024 * 1024 * 1024,
@@ -275,6 +281,7 @@ def test_observe_capacity_distinct_from_file_size(monkeypatch: pytest.MonkeyPatc
 
     fake_inst = {
         "name": "disk-test-vm",
+        "vmType": "vz",
         "status": "Running",
         "arch": "aarch64",
         "memory": 1024 * 1024 * 1024,
@@ -318,6 +325,7 @@ def test_observe_same_name_disk_and_volume_no_collision(monkeypatch: pytest.Monk
 
     fake_inst = {
         "name": "shared-name",
+        "vmType": "vz",
         "status": "Running",
         "arch": "aarch64",
         "memory": 1024 * 1024 * 1024,
@@ -356,7 +364,7 @@ def test_observe_same_name_disk_and_volume_no_collision(monkeypatch: pytest.Monk
     assert len(v_primary["attachments"]) == 1
 
     v_extra = next(v for v in res["volumes"] if v["kind"] == "volume")
-    assert v_extra["id"] == "volume:lima-vz:shared-name"
+    assert v_extra["id"] == "volume:lima:shared-name"
     assert v_extra["name"] == "shared-name"
     assert v_extra["size_bytes"] == 10 * 1024 * 1024 * 1024
     assert v_extra["status"] == "detached"
@@ -371,6 +379,7 @@ def test_observe_lima_networks_configured_status(monkeypatch: pytest.MonkeyPatch
 
     fake_inst = {
         "name": "net-vm",
+        "vmType": "vz",
         "status": "Running",
         "arch": "aarch64",
         "memory": 1024 * 1024 * 1024,
@@ -534,7 +543,6 @@ def test_observe_libvirt_multi_disk_and_blockinfo(monkeypatch: pytest.MonkeyPatc
 @pytest.fixture
 def external_libvirt(tmp_path, monkeypatch):
     import sys
-    from types import SimpleNamespace
 
     from palimpsest_local import host_vm_control, state
 
@@ -612,8 +620,8 @@ def external_libvirt(tmp_path, monkeypatch):
         lookupByUUIDString=lookup,
         close=lambda: None,
         listAllDomains=lambda: [domain] if native["exists"] else [],
-        listAllNetworks=lambda: [],
-        listAllStoragePools=lambda: [],
+        listAllNetworks=list,
+        listAllStoragePools=list,
     )
     libvirt = SimpleNamespace(
         libvirtError=NativeError,
@@ -666,7 +674,6 @@ def test_observed_libvirt_removal_preserves_disks_and_nvram(
 @pytest.mark.parametrize("change", ["uuid", "name", "destroy-failure", "oci-root"])
 def test_libvirt_removal_identity_or_backend_failure_never_reports_success(external_libvirt, monkeypatch, change):
     from palimpsest_local import host_vm_control
-    from palimpsest_local.errors import StateError
 
     monkeypatch.setattr(platforms, "detect_host", lambda: platforms.HostPlatform("Darwin", "aarch64"))
     native = external_libvirt["native"]
@@ -745,7 +752,6 @@ def test_libvirt_preflight_rejects_changed_classification_or_unsafe_tpm_before_s
     external_libvirt, monkeypatch, change
 ):
     from palimpsest_local import host_vm_control
-    from palimpsest_local.errors import StateError
 
     monkeypatch.setattr(platforms, "detect_host", lambda: platforms.HostPlatform("Darwin", "aarch64"))
     native = external_libvirt["native"]
@@ -795,7 +801,6 @@ def test_libvirt_marker_presence_and_uuid_changes_are_fenced_before_stop(
     external_libvirt, monkeypatch, before, after, change_at
 ):
     from palimpsest_local import host_vm_control
-    from palimpsest_local.errors import StateError
 
     monkeypatch.setattr(platforms, "detect_host", lambda: platforms.HostPlatform("Darwin", "aarch64"))
     native = external_libvirt["native"]
@@ -870,3 +875,103 @@ def test_stopped_libvirt_local_stat_denial_still_uses_native_capacity(external_l
     volume = host_inventory.observe()["volumes"][0]
     assert volume["size_bytes"] == 4096 and volume["allocated_bytes"] == 128
     assert volume["file_size_bytes"] is None and volume["status"] == "unavailable"
+
+
+def test_observe_libvirt_inactive_domain_missing_disk_skips_blockinfo(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Inactive domains with missing disk files must not call blockInfo and report status unavailable."""
+    missing_disk_file = tmp_path / "nonexistent" / "overlay.qcow2"
+    domain_xml = f"""
+    <domain type='hvf'>
+      <name>hvf-stale-guest</name>
+      <devices>
+        <disk type='file' device='disk'>
+          <source file='{missing_disk_file}'/>
+          <target dev='vda' bus='virtio'/>
+        </disk>
+      </devices>
+    </domain>
+    """
+    mock_dom = MagicMock()
+    mock_dom.name.return_value = "hvf-stale-guest"
+    mock_dom.isActive.return_value = 0
+    mock_dom.state.return_value = (5, 0)  # stopped
+    mock_dom.info.return_value = (5, 1024 * 1024, 1024 * 1024, 1, 0)
+    mock_dom.XMLDesc.return_value = domain_xml
+    mock_dom.blockInfo.side_effect = AssertionError(
+        "blockInfo must not be called when disk file is missing on inactive domain"
+    )
+
+    mock_conn = MagicMock()
+    mock_conn.listAllDomains.return_value = [mock_dom]
+    mock_conn.listAllNetworks.return_value = []
+    mock_conn.listAllStoragePools.return_value = []
+
+    mock_libvirt = MagicMock()
+    mock_libvirt.openReadOnly.return_value = mock_conn
+
+    monkeypatch.setattr(host_inventory.platforms, "detect_host", lambda: platforms.HostPlatform("Darwin", "arm64"))
+    monkeypatch.setattr(host_inventory.shutil, "which", lambda cmd: None)
+
+    with patch.dict("sys.modules", {"libvirt": mock_libvirt}):
+        res = host_inventory.observe()
+
+    assert len(res["vms"]) == 1
+    assert res["vms"][0]["status"] == "stopped"
+    assert len(res["volumes"]) == 1
+    assert res["volumes"][0]["status"] == "unavailable"
+    assert res["volumes"][0]["size_bytes"] is None
+    assert res["warnings"] == []
+
+
+def test_lima_backends_share_named_disks_but_not_default_user_networks(monkeypatch):
+    instances = [
+        {
+            "name": name,
+            "vmType": vm_type,
+            "status": "Running",
+            "config": {
+                "env": {"PALIMPSEST_RUN_ID": run_id, "SECRET": "NEVER_PROJECT_THIS"},
+                "additionalDisks": [{"name": "shared-data"}],
+                "networks": [{"vzNAT": True}] if vm_type == "vz" else [],
+            },
+        }
+        for name, vm_type, run_id in (
+            ("vz", "vz", "11111111-1111-4111-8111-111111111111"),
+            ("krun-one", "krunkit", "22222222-2222-4222-8222-222222222222"),
+            ("krun-two", "krunkit", "33333333-3333-4333-8333-333333333333"),
+        )
+    ]
+    instances.extend(
+        [
+            {"name": "qemu", "vmType": "qemu"},
+            {"name": "unknown"},
+            {"name": "contradiction", "vmType": "vz", "config": {"vmType": "krunkit"}},
+        ]
+    )
+
+    def query(argv, **kwargs):
+        payload = (
+            instances if "--format" in argv else [{"name": "shared-data", "size": "1GiB"}] if "disk" in argv else []
+        )
+        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(payload), stderr="")
+
+    monkeypatch.setattr(host_inventory.shutil, "which", lambda _: "/bin/limactl")
+    monkeypatch.setattr(host_inventory.subprocess, "run", query)
+    vms, disks, networks, warnings = host_inventory._observe_lima()
+    assert {vm["name"]: vm["backend"] for vm in vms} == {
+        "vz": "lima-vz",
+        "krun-one": "lima-krunkit",
+        "krun-two": "lima-krunkit",
+        "qemu": "lima-qemu",
+    }
+    assert warnings and "NEVER_PROJECT_THIS" not in repr((vms, disks, networks, warnings))
+    named = [disk for disk in disks if disk["kind"] == "volume"]
+    assert len(named) == 1 and named[0]["id"] == "volume:lima:shared-data"
+    assert {item["name"] for item in named[0]["attachments"]} == {"vz", "krun-one", "krun-two"}
+    user_networks = [network for network in networks if network["mode"] == "gvisor"]
+    assert len(user_networks) == 2
+    assert {tuple(item["name"] for item in network["attachments"]) for network in user_networks} == {
+        ("krun-one",),
+        ("krun-two",),
+    }
+    assert next(network for network in networks if network["name"] == "vzNAT")["attachments"][0]["name"] == "vz"
