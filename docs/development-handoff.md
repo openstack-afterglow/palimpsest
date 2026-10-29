@@ -85,16 +85,33 @@ files_modified:
   all prior operator environment values are preserved. All three direct and public
   verified-TLS readiness checks report database+Redis+blob_store ok. Nineteen-table
   census retains five complete/one error recipes and zero new jobs/instances/contexts.
-- **Human/worker gate:** user directly logged into visible cmux surface1000010018 as
-  `pieroot`/SYSTEM; same-session native Hub project context returned200 with exact
-  project before maintenance. A service-test credential's earlier Hub403 was not
-  bypassed. That browser session expired during proof; retained REPL handles were
-  discarded without a refresh request or secret export. Fresh post-cutover human
-  GET remains pending direct user login. Worker-network verified TLS readiness and
-  new image-worker route, and every API's effective worker key matched the preserved
-  original. Fresh labelled scratch is empty/owned/exclusive; old26-byte claim_pending
-  journal hash878378605d8ce777d519b583a3471d50a48d765cecc07a6e5b63080043909347
-  remains unchanged. Claiming-worker start is held until the fresh human gate.
+- **Human gate and completed fresh worker:** user directly logged into cmux as
+  `pieroot`/SYSTEM. The first session expired during recovery; no token refresh or
+  cookie/credential export was performed. User logged in again in visible surface
+ 1000010020; native Hub `/me` and project context through the existing browser BFF
+  both returned200 with exact user0665ef750b0a4533af760d038ecc6098 and
+  projecta4da5d82465b44d5afda1dc0388b687d. Every API retained the original effective
+  worker key, and the actual worker-network verified TLS readiness/new route.
+  Only then did Wireguard run canonical dedicated-playbook `reconfigure` on the
+  existing `palimpsest-hub-build-worker-034`, return0 in80.580s, recap94ok/2changed/
+ 0failed/0unreachable. Actual container
+  `cf7642d70ebc86f733d6cee966f0e5d200b52cf9be4416e012fd977763136bfc`
+  executes approved revision1afca684/image ID3aa3265c… on the new labelled volume
+  `palimpsest_build_worker_scratch_1afca684_20261030_95b7f432`.
+- **Actual worker/runtime/data verification:** four observations over15seconds
+  retained one live PID, restart0 and no uncertain/job journal. Actual private
+  cgroup `0::/`, memory.max6442450944/swap0, pids.max512 and cpu.max200000/100000
+  match6GiB/2CPU/512PIDs; mounts are only private fresh scratch and read-only key.
+  Independent SQL observations showed both image and recipe claim mutex timestamps
+  advance, without a synthetic claim or submitted workload. Old named scratch is
+  unattached, and its26-byte claim_pending journal remains SHA
+  `878378605d8ce777d519b583a3471d50a48d765cecc07a6e5b63080043909347`.
+  Canonical replacement removed the old container object, not its preserved volume/
+  encrypted inspect/config/journal archive. Final14non-mutex table fingerprints and
+  all44CASfiles' bytes/UID/GID/modes/mtime match the cold pair; intended claim mutex
+  updates are recorded separately. The four added tables remain empty and historical
+  recipe states stay5complete/1error. This is real seven-service deployment and idle
+  protocol proof, **not** a fresh registry build/consumer/GPU/Manila qualification.
 
 
 **New owner instruction supersedes the earlier documentation-only/Hub-only scope:**

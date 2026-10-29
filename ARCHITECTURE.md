@@ -26,15 +26,22 @@ controllers execute revision1afca684 with restart0,36old effective settings pres
 and direct/public readiness passed. No protected merge, formal version/tag/PyPI,
 new cloud VM, benchmark, GPU/IAM or Manila runtime cutover occurred.
 
-Owner additionally approved preserving the old uncertain worker journal/volume
-and deploying fresh private scratch on the same dedicated VM. Original26-byte
-claim_pending SHA878378605d8ce777d519b583a3471d50a48d765cecc07a6e5b63080043909347
-is unchanged; the new labelled scratch is empty and owned. Actual worker-network
-TLS/route and every API's effective key continuity passed. Claiming-worker start
-awaits the post-cutover original-human browser gate because that user's session
-expired during recovery proof. No token refresh, journal clear/replay or fabricated
-job/workload proof substitutes for it. Dated failures and exact recovery/source
-scopes remain in the [handoff](docs/development-handoff.md). Astra is unavailable.
+Owner approved preserving the old uncertain worker journal/volume while deploying
+fresh private scratch on the same dedicated VM. Original26-byte claim_pending SHA
+878378605d8ce777d519b583a3471d50a48d765cecc07a6e5b63080043909347 remains unchanged
+on its now-unattached original volume, with encrypted original inspect/config/file
+evidence retained. After direct user re-login, original-human Hub identity/context
+GETs returned200 and all API key/worker-network TLS checks passed. The canonical
+dedicated worker playbook then reconfigured the existing host successfully.
+Actual worker revision1afca684, restart0,6GiB/2CPU/512PIDs, private `0::/` cgroup,
+fresh labelled scratch and unchanged key were verified across four observations.
+Both real image/recipe SQL claim mutexes advanced with no submitted jobs; the four
+new tables remain empty. All14non-mutex old-table fingerprints and44CASfiles'
+bytes/numeric metadata still match the cold pair. This is seven-service deployment/
+idle-protocol proof, not workload, GPU or Manila qualification. No token refresh,
+original-journal clear/replay, old-image GC rollback or fabricated result was used.
+Dated failures and exact scopes remain in the [handoff](docs/development-handoff.md).
+Astra participation remains unavailable.
 
 ### Integrated client and operator source map
 
