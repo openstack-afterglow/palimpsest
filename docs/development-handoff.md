@@ -27,6 +27,76 @@ files_modified:
 <a id="owner-contract-and-next-step-2026-10-29"></a>
 ## Full current integration and Kolla rollout — 2026-10-30
 
+### Actual publication and controller rollout
+
+- **Published source:** `1afca6843356116859de61aaa94d6d97c1567548`, branch
+  `integrate/all-current-20261030`, [PR36](https://github.com/openstack-afterglow/palimpsest/pull/36).
+  This55-file commit follows the earlier44-file Hub commit; all actual remaining
+  current changes are reconciled. Hosted [Test40908581775](https://github.com/openstack-afterglow/palimpsest/actions/runs/40908581775)
+  and PR image validation40908581864 passed; native KVM was skipped, not passed.
+  No protected merge or formal version/tag/PyPI release occurred.
+- **Fresh owner selections:** actual production maintenance plus **원장 보존 후 새
+  scratch로 재배포** on the existing dedicated worker VM. Scope includes exact
+  wheel/role and immutable images, six controller-writer drain, encrypted paired
+  recovery≤6GiB, isolated proof≤3.5GiB/3CPU/192PIDs and20minutes per unit,
+  offline four-table bootstrap and canonical Kolla. No new VM/GPU/IAM operation,
+  original uncertain claim replay, production restore/drop or unrelated restart.
+- **Operator/artifacts:** exact private wheel SHA256
+  `8dc8f65141bcc9d0db80f94a8046e97d448870ab251fb3c064b4a6a7addb9b27`
+  installed183verified members in `/etc/kolla/.venv`; all109non-target package
+  payloads and non-target lock entries preserved. The exact wheel is a persistent
+  local uv source, not relabelled as the official0.3.10 PyPI wheel. Original operator
+  payload/config/lock and symlink targets were encrypted and stream-verified before
+  mutation; the first strict regular-file preflight refused an existing secret-file
+  symlink before any install intent. No permission weakening was used.
+- **Images:** approved [manual image publisher40910605238](https://github.com/openstack-afterglow/palimpsest/actions/runs/40910605238)
+  passed after hosted CI. All three linux/amd64 images carry full revision1afca684;
+  actual native Kolla targets pulled and checked their labels/IDs. Selected index
+  digests: API `84ec6f90754f8757f37d502db7be7d94fca429e11cad4e3773007ed0be5ddb27`,
+  export `4817f5a4b6b457751f1d67a310ab8699c0f8203885b350911c9a5b21dfa2904a`,
+  build-worker `3aa3265c3a3d0759d7e5d54f3f62e3add1b73ac51789abeb0a74bc78a717e793`.
+- **Recovery:** all six original controller writers received ordinary TERM,
+  exit0/PID0 and restart=no. Root-private encrypted per-host policy/config/inspect
+  archives and original worker archive were decrypt-verified. Fresh paired SQL/CAS
+  capture R2 at `/var/backups/palimpsest/pre-current-20261030-95b7f432-r2`
+  preserved15tables/15rows and44CASfiles/884,748,288bytes including numeric
+  UID/GID/modes/mtime. Successful isolated attempt004 used a network-none database
+  and probes sharing only its private loopback namespace. Old schema/rows/CAS were
+  exact, only four expected empty tables appeared, and a second bootstrap left the
+  complete schema/rows unchanged. Temporary owned containers/tmpfs were cleaned.
+  Backup keys remain private; no offsite-recovery claim is made.
+- **Preserved failures:** first capture failed solely on nondeterministic Docker
+  mount-list order; exact canonical content equality was proved and a new R2 pair
+  created without relabelling that failure. First restore failed in local encrypted
+  CAS→tmpfs extraction amid observed host pressure; underlying cause was not proved,
+  and its cleanup's Docker timeout later settled. Attempt002 proved extraction but
+  rejected a bridge's later IPv6 link-local host address. The replacement private
+  loopback design changes no host-global sysctl/network policy. Attempt003 exposed
+  an asymmetric SQL-collation/Python `names` ordering comparator; both sides now use
+  identical normalization while all DDL/columns/indexes/FKs/rows stay exact. These
+  failed attempts remain failed; source reviews and successful004 are separate.
+- **Production schema and actual canonical deployment:** exact new-image bootstrap
+  ran only after that isolated proof, exit0; live schema15→19 with existing rows/
+  metadata preserved and the four additions empty. Wireguard `/etc/kolla` ran
+  `kolla-ansible reconfigure -i multinode --tag palimpsest --limit dms-controller1,dms-controller2,dms-controller3 --skip-tags haproxy`
+  with existing venv PATH/C.UTF-8 and typed delegate-facts=[]/preconditions=false/
+  source-mode=false. Return0 in46.932s. All six actual container image IDs match
+  approved native pulls/revision, restart0; every prior36effective settings match,
+  all prior operator environment values are preserved. All three direct and public
+  verified-TLS readiness checks report database+Redis+blob_store ok. Nineteen-table
+  census retains five complete/one error recipes and zero new jobs/instances/contexts.
+- **Human/worker gate:** user directly logged into visible cmux surface1000010018 as
+  `pieroot`/SYSTEM; same-session native Hub project context returned200 with exact
+  project before maintenance. A service-test credential's earlier Hub403 was not
+  bypassed. That browser session expired during proof; retained REPL handles were
+  discarded without a refresh request or secret export. Fresh post-cutover human
+  GET remains pending direct user login. Worker-network verified TLS readiness and
+  new image-worker route, and every API's effective worker key matched the preserved
+  original. Fresh labelled scratch is empty/owned/exclusive; old26-byte claim_pending
+  journal hash878378605d8ce777d519b583a3471d50a48d765cecc07a6e5b63080043909347
+  remains unchanged. Claiming-worker start is held until the fresh human gate.
+
+
 **New owner instruction supersedes the earlier documentation-only/Hub-only scope:**
 organize, commit and push all current changes, then perform the actual Kolla
 Ansible deployment. Integration branch `integrate/all-current-20261030` starts at

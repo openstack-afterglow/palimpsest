@@ -13,14 +13,28 @@ dependencies; the earlier exclusion is no longer the current scope.
 
 The target storage architecture below is unchanged. Deployment of the current
 HTTPS consumer implementation must not be described as a Manila/CephFS cutover.
-Read-only inspection reached `wireguardserver` `/etc/kolla`: three controller
-API/export replicas still select the official0.3.10 digests. Fresh exact-source
-images, paired SQL/CAS/config recovery proof and offline schema review precede
-replacement. Canonical controller reconfigure does not build or bootstrap SQL;
-those prerequisites must be completed explicitly. The old worker's uncertain
-claim journal is not ordinary restart authority and must not be cleared/replayed
-as a side effect. No new cloud VM, benchmark, GPU/IAM action or formal version
-release is implied. Astra participation remains unavailable.
+Actual approved source `1afca6843356116859de61aaa94d6d97c1567548` is pushed as
+`integrate/all-current-20261030` ([PR36](https://github.com/openstack-afterglow/palimpsest/pull/36));
+hosted Test/PR image checks and the separately dispatched SHA-image publisher passed.
+The existing Wireguard operator installs the exact checksum-bound candidate wheel/
+role with109non-target package payloads preserved. A fresh all-writer paired
+SQL/CAS/config capture and successful isolated recovery verified15old tables/rows,
+44CASfiles884,748,288bytes and only four empty additions; second bootstrap was
+schema/data-idempotent. Production bootstrap then verified15→19tables before actual
+canonical controller reconfigure. All six API/export containers on the three
+controllers execute revision1afca684 with restart0,36old effective settings preserved
+and direct/public readiness passed. No protected merge, formal version/tag/PyPI,
+new cloud VM, benchmark, GPU/IAM or Manila runtime cutover occurred.
+
+Owner additionally approved preserving the old uncertain worker journal/volume
+and deploying fresh private scratch on the same dedicated VM. Original26-byte
+claim_pending SHA878378605d8ce777d519b583a3471d50a48d765cecc07a6e5b63080043909347
+is unchanged; the new labelled scratch is empty and owned. Actual worker-network
+TLS/route and every API's effective key continuity passed. Claiming-worker start
+awaits the post-cutover original-human browser gate because that user's session
+expired during recovery proof. No token refresh, journal clear/replay or fabricated
+job/workload proof substitutes for it. Dated failures and exact recovery/source
+scopes remain in the [handoff](docs/development-handoff.md). Astra is unavailable.
 
 ### Integrated client and operator source map
 
