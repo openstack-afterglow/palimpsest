@@ -147,7 +147,7 @@ class HttpsTransport:
 
     @contextmanager
     def request(self, method: str, path: str, *, lease: str | None = None, body=None, headers=None, deadline=None):
-        if not path.startswith("/v1/build-worker/") or any(c in path for c in "\r\n?#"):
+        if not path.startswith(("/v1/build-worker/", "/v1/image-worker/")) or any(c in path for c in "\r\n?#"):
             raise WorkerHalted("invalid worker route")
         connection = http.client.HTTPSConnection(self.host, self.port, timeout=10, context=self.context)
         end = deadline if deadline is not None else time.monotonic() + 30
@@ -345,6 +345,8 @@ class Journal:
                 "terminal",
             }:
                 raise ValueError("invalid journal phase")
+            if value.get("protocol", "recipe") not in {"recipe", "image"}:
+                raise ValueError("invalid journal protocol")
             if value["phase"] != "claim_pending":
                 _uuid(value["id"])
                 _uuid(value["lease"])
@@ -424,10 +426,19 @@ def _terminate(child: subprocess.Popen):
     raise WorkerHalted("executor process group could not be verified stopped")
 
 
-def run_executor(arguments: list[str], timeout: float, stop: threading.Event | None = None, log: Path | None = None):
+def run_executor(
+    arguments: list[str],
+    timeout: float,
+    stop: threading.Event | None = None,
+    log: Path | None = None,
+    *,
+    module: str = "palimpsest_local.hub_builder",
+):
     """Bound both output pipes and wall time without communicate() accumulation."""
+    if module not in {"palimpsest_local.hub_builder", "palimpsest_local.hub_image_builder"}:
+        raise WorkerHalted("invalid executor module")
     child = subprocess.Popen(
-        [sys.executable, "-I", "-m", "palimpsest_local.hub_builder", *arguments],
+        [sys.executable, "-I", "-m", module, *arguments],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -512,7 +523,8 @@ class BuildWorker:
 
     @staticmethod
     def _route(record, suffix=""):
-        return "/v1/build-worker/builds/" + _uuid(record["id"]) + suffix
+        prefix = "/v1/image-worker/jobs/" if record.get("protocol") == "image" else "/v1/build-worker/builds/"
+        return prefix + _uuid(record["id"]) + suffix
 
     def _status(self, record) -> dict:
         with self.transport.request("GET", self._route(record), lease=_uuid(record["lease"])) as response:
@@ -523,6 +535,10 @@ class BuildWorker:
             raise WorkerHalted("build disposition remains uncertain")
         if result["status"] == "complete" and record.get("output") is not None:
             output = record["output"]
+            if record.get("protocol") == "image":
+                if result.get("result") != output:
+                    raise WorkerHalted("image output disposition conflicts")
+                return result
             if (
                 result.get("output_digest") != output["digest"]
                 or result.get("output_size_bytes") != output["size_bytes"]
@@ -543,7 +559,11 @@ class BuildWorker:
         if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
             raise WorkerHalted("recorded executor tree is unsafe")
         try:
-            run_executor(["cleanup", str(directory), str(os.getpid())], 30)
+            arguments = ["cleanup", str(directory), str(os.getpid())]
+            if record.get("protocol") == "image":
+                run_executor(arguments, 60, module="palimpsest_local.hub_image_builder")
+            else:
+                run_executor(arguments, 30)
         except Exception as exc:
             raise WorkerHalted("executor cleanup could not be verified") from exc
 
@@ -710,24 +730,39 @@ class BuildWorker:
         self.reconcile()
         if self.stop.is_set():
             return False
-        self.journal.save({"phase": "claim_pending"})
+        from palimpsest_hub import image_executor
+
         record = None
         try:
-            with self.transport.request("POST", "/v1/build-worker/claim") as response:
-                if response.status == 204:
-                    self.journal.clear()
-                    return False
-                if response.status != 202:
-                    raise WorkerHalted("claim outcome uncertain")
-                value = _json_response(response)
-                identity = {"phase": "claimed", "id": _uuid(value["id"]), "lease": _uuid(value["lease"])}
-                self.journal.save(identity)
-                record = identity
-                claim = validate_claim(
-                    value,
-                    self.settings.palimpsest_hub_max_blob_bytes,
-                    self.settings.palimpsest_hub_build_timeout_seconds,
-                )
+            for candidate in ("image", "recipe"):
+                self.journal.save({"phase": "claim_pending", "protocol": candidate})
+                route = "/v1/image-worker/claim" if candidate == "image" else "/v1/build-worker/claim"
+                with self.transport.request("POST", route) as response:
+                    if response.status == 204:
+                        self.journal.clear()
+                        continue
+                    if response.status != 202:
+                        raise WorkerHalted("claim outcome uncertain")
+                    value = _json_response(response)
+                    identity = {
+                        "phase": "claimed",
+                        "protocol": candidate,
+                        "id": _uuid(value["id"]),
+                        "lease": _uuid(value["lease"]),
+                    }
+                    self.journal.save(identity)
+                    record = identity
+                    if candidate == "image":
+                        claim = image_executor.validate_claim(value, self.settings)
+                    else:
+                        claim = validate_claim(
+                            value,
+                            self.settings.palimpsest_hub_max_blob_bytes,
+                            self.settings.palimpsest_hub_build_timeout_seconds,
+                        )
+                    break
+            else:
+                return False
         except Exception as exc:
             if record is None:
                 raise WorkerHalted("claim outcome uncertain; journal retained") from exc
@@ -738,7 +773,11 @@ class BuildWorker:
             return True
         deadline = time.monotonic() + claim["timeout_seconds"]
         try:
-            result = self._build(claim, record, deadline)
+            result = (
+                image_executor.build(self, claim, record, deadline)
+                if record.get("protocol") == "image"
+                else self._build(claim, record, deadline)
+            )
         except WorkerHalted:
             self._cleanup(record)
             raise
@@ -748,7 +787,10 @@ class BuildWorker:
         else:
             self._cleanup(record)
             try:
-                self._upload(record, result, deadline)
+                if record.get("protocol") == "image":
+                    image_executor.upload(self, record, result, deadline)
+                else:
+                    self._upload(record, result, deadline)
             except WorkerHalted:
                 raise
             except Exception as exc:
@@ -792,6 +834,18 @@ async def main() -> None:
             raise WorkerHalted("executor preflight failed") from exc
         worker = BuildWorker(settings, transport, journal, stop)
         await _drain_blocking(stop, worker.reconcile)
+        try:
+            await _drain_blocking(
+                stop,
+                lambda: run_executor(
+                    ["preflight", str(os.getpid()), str(journal.root), settings.palimpsest_hub_image_cgroup_root],
+                    30,
+                    stop,
+                    module="palimpsest_local.hub_image_builder",
+                ),
+            )
+        except Exception as exc:
+            raise WorkerHalted("image executor preflight failed") from exc
         while not stop.is_set():
             processed = await _drain_blocking(stop, worker.process_one)
             if not processed:
@@ -813,4 +867,8 @@ def run() -> None:
 
 
 if __name__ == "__main__":
-    run()
+    # Image adapters import the canonical worker module. Run that same module's
+    # loop so timeout/HOLD exception classes are identical under both entrypoints.
+    from palimpsest_hub.build_worker import run as worker_main
+
+    worker_main()

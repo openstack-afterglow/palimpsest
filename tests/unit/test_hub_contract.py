@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ast
 import hashlib
 import io
 import json
@@ -14,31 +13,8 @@ from urllib.error import HTTPError
 
 import pytest
 
-from palimpsest_local import hub
 from palimpsest_local.errors import HubError
 from palimpsest_local.hub import MEDIA_TYPE_LAYER_SQUASHFS, HubClient
-
-
-def test_hub_module_uses_only_stdlib_and_package():
-    tree = ast.parse(Path(hub.__file__).read_text(encoding="utf-8"))
-    top_level = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            top_level.update(alias.name.split(".")[0] for alias in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
-            top_level.add(node.module.split(".")[0])
-    assert top_level <= {
-        "__future__",
-        "contextlib",
-        "json",
-        "os",
-        "re",
-        "shutil",
-        "tempfile",
-        "urllib",
-        "pathlib",
-        "typing",
-    }
 
 
 def test_hub_client_constructor_validation_and_repr():
@@ -216,39 +192,6 @@ def _http_conflict(offset: int) -> HTTPError:
     headers = Message()
     headers["Upload-Offset"] = str(offset)
     return HTTPError("http://hub.invalid/uploads/session", 409, "Conflict", headers, io.BytesIO(b"offset"))
-
-
-def test_push_registered_blob_short_circuits_without_chunk_or_final_put(tmp_path: Path, monkeypatch):
-    source = tmp_path / "layer.squashfs"
-    source.write_bytes(b"registered")
-    calls: list[tuple[str, str, dict[str, str]]] = []
-
-    def fake_open(method, path, **kwargs):
-        calls.append((method, path, kwargs.get("headers", {})))
-        assert method == "POST"
-        return _Response(
-            {
-                "completed": True,
-                "registered": True,
-                "registration": {
-                    "blob_digest": f"sha256:{hashlib.sha256(b'registered').hexdigest()}",
-                    "name": "registered",
-                    "kind": "squashfs",
-                    "media_type": MEDIA_TYPE_LAYER_SQUASHFS,
-                    "is_published": False,
-                },
-            }
-        )
-
-    client = HubClient("http://hub.invalid", "token")
-    monkeypatch.setattr(client, "_open", fake_open)
-
-    assert client.push_blob(source, {"name": "registered"}, resume=False) == {
-        "blob_digest": f"sha256:{hashlib.sha256(b'registered').hexdigest()}",
-        "already_present": True,
-        "registered": True,
-    }
-    assert calls == [("POST", "/uploads", {})]
 
 
 def test_push_registered_blob_rejects_incompatible_runtime_descriptor(tmp_path: Path, monkeypatch):

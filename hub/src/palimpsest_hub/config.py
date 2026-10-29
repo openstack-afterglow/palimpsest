@@ -8,7 +8,9 @@ import re
 import tomllib
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 from urllib.parse import urlsplit
+from uuid import UUID
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -29,6 +31,37 @@ def default_project_namespace(project_id: str) -> str:
     if re.fullmatch(r"[0-9a-f]{32}", project_id):
         return f"p-{project_id}"
     return "p-h-" + hashlib.sha256(project_id.encode("ascii")).hexdigest()[:56]
+
+
+DEFAULT_REGISTRY_HOSTS = ("docker.io", "registry-1.docker.io", "ghcr.io", "quay.io")
+
+
+def validate_registry_hosts(values: tuple[str, ...]) -> tuple[str, ...]:
+    """Operators explicitly select registry authorities, never caller-supplied URLs."""
+    if not 1 <= len(values) <= 64 or len(set(values)) != len(values):
+        raise ValueError("registry authorities must be a distinct list of 1..64 hosts")
+    for value in values:
+        parsed = urlsplit("https://" + value)
+        try:
+            port = parsed.port
+        except ValueError:
+            raise ValueError("registry authority port is invalid") from None
+        if (
+            value != value.lower()
+            or len(value) > 259
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path
+            or parsed.query
+            or parsed.fragment
+            or any(character.isspace() for character in value)
+            or (port is not None and not 1 <= port <= 65535)
+            or not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?(?::[0-9]{1,5})?", value)
+            or any(not label or len(label) > 63 for label in parsed.hostname.split("."))
+        ):
+            raise ValueError("registry authorities must be explicit lowercase hostname[:port] values")
+    return values
 
 
 class DatabaseSettings(BaseSettings):
@@ -59,6 +92,19 @@ class Settings(DatabaseSettings):
     # The control plane admits remote builds only when a worker secret is configured.
     palimpsest_hub_build_worker_key: SecretStr = SecretStr("")
     palimpsest_hub_build_timeout_seconds: int = Field(default=3600, ge=60, le=3600)
+    palimpsest_hub_registry_hosts: tuple[str, ...] = DEFAULT_REGISTRY_HOSTS
+    palimpsest_hub_image_run_network: Literal["none", "default"] = "none"
+    palimpsest_hub_image_cgroup_root: str = "/sys/fs/cgroup"
+    palimpsest_hub_max_context_bytes: int = Field(default=16 * 1024**2, ge=1, le=1024**3)
+    palimpsest_hub_max_context_expanded_bytes: int = Field(default=256 * 1024**2, ge=1, le=32 * 1024**3)
+    palimpsest_hub_max_context_members: int = Field(default=10000, ge=1, le=250000)
+    palimpsest_hub_instance_bootstrap_ttl_seconds: int = Field(default=3600, ge=60, le=86400)
+    palimpsest_hub_max_instances_per_project: int = Field(default=16, ge=1, le=1000)
+    palimpsest_hub_instance_max_boot_gib: int = Field(default=256, ge=1, le=4096)
+    palimpsest_hub_instance_max_writable_gib: int = Field(default=64, ge=1, le=1024)
+    # Operators may qualify an unannotated Glance image only by exact content hash.
+    palimpsest_hub_instance_base_images: dict[str, dict[str, str]] = Field(default_factory=dict)
+    palimpsest_hub_instance_ca_certificates: tuple[str, ...] = ()
     palimpsest_hub_package_forbidden_project_ids: tuple[str, ...] = ()
     palimpsest_hub_package_forbidden_user_ids: tuple[str, ...] = ()
     palimpsest_hub_package_namespace_bindings: dict[str, str] = Field(default_factory=dict)
@@ -84,6 +130,56 @@ class Settings(DatabaseSettings):
     os_reader_username: str = ""
     os_reader_password: SecretStr = SecretStr("")
     os_reader_user_domain_name: str = "Default"
+
+    @field_validator("palimpsest_hub_registry_hosts")
+    @classmethod
+    def registry_hosts(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return validate_registry_hosts(value)
+
+    @field_validator("palimpsest_hub_instance_base_images")
+    @classmethod
+    def qualified_base_images(cls, value: dict[str, dict[str, str]]) -> dict[str, dict[str, str]]:
+        if len(value) > 64:
+            raise ValueError("at most 64 content-pinned instance base images are allowed")
+        for identity, record in value.items():
+            if str(UUID(identity)) != identity or set(record) != {
+                "architecture",
+                "os_type",
+                "os_hash_algo",
+                "os_hash_value",
+            }:
+                raise ValueError("qualified base image requires UUID, architecture, Linux and immutable Glance hash")
+            algorithm = record["os_hash_algo"]
+            size = {"sha256": 64, "sha512": 128}.get(algorithm)
+            if (
+                record["architecture"] != "x86_64"
+                or record["os_type"] != "linux"
+                or size is None
+                or re.fullmatch(r"[0-9a-f]{" + str(size) + r"}", record["os_hash_value"]) is None
+            ):
+                raise ValueError("qualified base image content and target are invalid")
+        return value
+
+    @field_validator("palimpsest_hub_instance_ca_certificates")
+    @classmethod
+    def instance_ca_certificates(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) > 4 or any(
+            len(cert.encode()) > 16384
+            or not cert.startswith("-----BEGIN CERTIFICATE-----\n")
+            or not cert.rstrip().endswith("-----END CERTIFICATE-----")
+            for cert in value
+        ):
+            raise ValueError("instance trust requires at most four bounded PEM CA certificates")
+        return value
+
+    @field_validator("palimpsest_hub_image_cgroup_root")
+    @classmethod
+    def image_cgroup_root(cls, value: str) -> str:
+        path = Path(value)
+        root = Path("/sys/fs/cgroup")
+        if "\x00" in value or ".." in path.parts or not (path == root or root in path.parents):
+            raise ValueError("image cgroup root must stay within the worker cgroup namespace")
+        return value
 
     @field_validator("redis_sentinel_addresses")
     @classmethod
@@ -216,13 +312,34 @@ class Settings(DatabaseSettings):
 class BuildWorkerSettings(BaseSettings):
     """A remote executor has HTTPS access and local scratch, never control-plane credentials."""
 
-    model_config = SettingsConfigDict(case_sensitive=False, extra="ignore")
+    model_config = SettingsConfigDict(case_sensitive=False, extra="ignore", hide_input_in_errors=True)
 
     palimpsest_hub_url: str
     palimpsest_hub_build_worker_key_file: str
     palimpsest_hub_build_work_path: str
     palimpsest_hub_build_timeout_seconds: int = Field(default=3600, ge=60, le=3600)
     palimpsest_hub_max_blob_bytes: int = Field(default=107374182400, ge=1)
+    palimpsest_hub_registry_hosts: tuple[str, ...] = DEFAULT_REGISTRY_HOSTS
+    palimpsest_hub_image_run_network: Literal["none", "default"] = "none"
+    palimpsest_hub_image_cgroup_root: str = "/sys/fs/cgroup"
+    palimpsest_hub_image_scratch_bytes: int = Field(default=4 * 1024**3, ge=256 * 1024**2, le=64 * 1024**3)
+    palimpsest_hub_max_context_bytes: int = Field(default=16 * 1024**2, ge=1, le=1024**3)
+    palimpsest_hub_max_context_expanded_bytes: int = Field(default=256 * 1024**2, ge=1, le=32 * 1024**3)
+    palimpsest_hub_max_context_members: int = Field(default=10000, ge=1, le=250000)
+
+    @field_validator("palimpsest_hub_registry_hosts")
+    @classmethod
+    def registry_hosts(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return validate_registry_hosts(value)
+
+    @field_validator("palimpsest_hub_image_cgroup_root")
+    @classmethod
+    def image_cgroup_root(cls, value: str) -> str:
+        path = Path(value)
+        root = Path("/sys/fs/cgroup")
+        if "\x00" in value or ".." in path.parts or not (path == root or root in path.parents):
+            raise ValueError("image cgroup root must stay within the worker cgroup namespace")
+        return value
 
     @field_validator("palimpsest_hub_url")
     @classmethod

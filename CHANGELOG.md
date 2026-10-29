@@ -4,6 +4,20 @@ All notable changes to Palimpsest Local are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- Add project-bound registry imports, bounded Dockerfile/context builds and public image-job APIs with durable request identities, fixed HTTPS worker leases and verified atomic layer publication.
+- Add original-human/project-bound instance create/list/detail/stop/delete APIs with provider-intent reconciliation, exact boot-volume checks, immutable ordered layer/runtime snapshots and bounded sealed guest results.
+- Add conditional layer metadata PATCH, retained physical-blob references, matching Hub client methods and dedicated image-worker container/Kolla policies. Current guests fetch payloads over HTTPS into read-only SquashFS lowers with private disk-backed upper/work; Manila-managed CephFS runtime access remains a separate target, not implemented by this change.
+
+### Fixed
+
+- Reject cyclic build-context symlinks on Python 3.13 as well as older supported interpreters while retaining valid dangling internal links.
+- Enforce a fully preallocated per-image workspace and packed-output budget with independent journal headroom; keep registry/tool temporary files in owned scratch and require exact cgroup/loop cleanup before publication.
+- Require separate current download and write authority before instance payload capabilities; permit only verified failed-create cleanup and retain capacity while a bound boot volume survives. Distinct definite no-create errors can be explicitly cleaned without treating an uncertain provider response as absence.
+- Bound guest result delivery by actual serialized JSON bytes, including escaped control output, while preserving identical-result retries and no workload replay.
+
+
 ## [0.3.10] - 2026-10-28
 
 ### Added

@@ -1,3 +1,5 @@
+FROM moby/buildkit:v0.34.1@sha256:99368f3e46177c6405b9740e4461d91cee004128daeecca78d4ceac50ec1da5c AS buildkit-tools
+
 FROM python:3.12-slim AS builder
 
 WORKDIR /app/hub
@@ -35,8 +37,10 @@ FROM runtime AS palimpsest-hub-build-worker
 
 USER root
 COPY --from=build-worker-builder /app/hub/.venv /app/hub/.venv
+COPY --from=buildkit-tools /usr/bin/buildctl /usr/bin/buildkitd /usr/bin/buildkit-runc /usr/bin/
+COPY --from=buildkit-tools /usr/bin/buildkit-cni-bridge /usr/bin/buildkit-cni-loopback /usr/bin/buildkit-cni-host-local /usr/bin/buildkit-cni-firewall /usr/bin/
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends bubblewrap squashfs-tools util-linux mount e2fsprogs \
+    && apt-get install -y --no-install-recommends bubblewrap squashfs-tools util-linux mount e2fsprogs skopeo iptables iproute2 ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 CMD ["python", "-m", "palimpsest_hub.build_worker"]
 

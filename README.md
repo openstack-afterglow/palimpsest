@@ -204,6 +204,41 @@ The console searches filtered, newest-first layer/image pages (`offset >= 0`, `1
 
 Hub's native `/v1` API stores Palimpsest boot images, SquashFS runtime blocks and bundles, with separate project-scoped package/BuildKit-cache APIs. Native package keys authorize only package/cache operations; legacy commands retain the original Keystone token. `POST /v1/builds` queues system-admin/project-scoped work and GET routes report project state. The retained 0.3.4 HTTPS-only dedicated CPU service-VM executor is also the 0.3.5 contract: direct recipe execution and API-registered private project outputs, no nested/per-build KVM/libvirt or API-container recipe execution. Hub is not a Docker/OCI `/v2` registry; profiles explicitly select `palimpsest` or `oci` transport.
 
+### Working-source Hub execution APIs
+
+The current source adds conditional layer metadata PATCH, project-bound registry
+imports and Dockerfile/context image jobs, plus original-human instance
+create/list/detail/stop/delete APIs. `HubClient` exposes the corresponding HTTP
+methods; the dedicated worker performs builds outside controller services.
+Request identities, retained layer/runtime snapshots and provider intent prevent
+blind mutation replay. These additions are not part of released0.3.10 or a
+production deployment. Guests currently fetch verified payloads over HTTPS and
+mount read-only SquashFS lowers with private disk-backed writable state; this is
+**not** the Manila-managed CephFS target. See the
+[current API contracts and limits](ARCHITECTURE.md#hub-execution-api-candidate--2026-10-29).
+
+The Hub test configuration includes the repository's root companion source for
+dedicated-worker tests, matching the build-worker image without adding a client
+dependency to the controller package:
+
+```sh
+uv sync --project hub --frozen --extra dev
+uv run --project hub pytest -q hub/tests
+```
+
+The API/export images remain Hub-only; the root companion is required by the
+dedicated executor, not a new API controller dependency.
+
+Image-worker scratch is explicitly bounded by
+`palimpsest_image_scratch_bytes` (`PALIMPSEST_HUB_IMAGE_SCRATCH_BYTES`), default
+4GiB, configurable256MiB–64GiB. One quarter is reserved for packed outputs
+(also capped by the blob limit); the remainder is a fully preallocated ext4
+workspace. Setup briefly reserves another8MiB for journal headroom. Backing
+storage must be non-CoW ext4/xfs/tmpfs with real allocation support; overlay,
+btrfs and sparse fallback are refused. Registry/BuildKit/cache/temp writes stay
+inside the bounded workspace, and exact process/loop cleanup precedes upload.
+
+
 ### Entrypoints & Docker Targets
 
 - **Hub API:** `uvicorn palimpsest_hub.main:app --host 0.0.0.0 --port 8020` (Docker target `palimpsest-hub-api`; `/app` serves the web console).

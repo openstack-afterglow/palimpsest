@@ -55,7 +55,7 @@ PORTABLE_FILES = {
         oci_exec_cli_live_contract oci_stdio_cli_live_contract
     """),
     "build-registry": _units(
-        "build buildkit docker_hub hub_builder hub_contract registry packages package_credentials remote_artifacts"
+        "build buildkit docker_hub hub_builder hub_image_builder hub_contract registry packages package_credentials remote_artifacts"
     ),
     "oci-store": _units("""
         oci_changeset oci_convert_security oci_converter_first_pass oci_image oci_root_volume_inventory
@@ -124,6 +124,10 @@ SPECIAL_FILES = {
             "database_pool",
             "hub_api",
             "image_exports",
+            "image_jobs",
+            "image_executor",
+            "instances",
+            "execution_boundaries",
             "export_delegation",
             "migrate",
             "upload_limits",

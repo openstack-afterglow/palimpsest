@@ -52,7 +52,10 @@ from palimpsest_hub.openstack import (
     list_image_members,
     open_trust_connection,
 )
-from palimpsest_hub.services.blob_references import package_blob_referenced
+from palimpsest_hub.services.blob_references import (
+    package_blob_referenced,
+    runtime_blob_referenced,
+)
 from palimpsest_hub.services.hub_store import (
     IMAGE_FORMAT_SPECS,
     acquire_lock_by_polling,
@@ -1761,6 +1764,8 @@ async def _run_export_maintenance(lease, max_age_seconds: int) -> None:
                 if layer_ref is not None:
                     continue
                 if await package_blob_referenced(session, digest):
+                    continue
+                if await runtime_blob_referenced(session, digest):
                     continue
                 entry.unlink(missing_ok=True)
         except LeaseLost:

@@ -1,5 +1,51 @@
 # Fast feedback without dropping coverage
 
+## Hub execution API candidate — 2026-10-29
+
+This source-only feature branch adds layer PATCH, durable image-job and instance
+APIs. It does not release a new package, deploy services or implement the target
+Manila-managed CephFS runtime. Start with the changed-node checks and canonical
+Hub environment; pytest includes `../src` for the dedicated worker's companion
+tests without adding client dependencies to the Hub controller package:
+
+```sh
+uv sync --frozen --extra dev --extra cloud
+uv sync --project hub --frozen --extra dev
+uv run --project hub pytest -q hub/tests
+uv run python scripts/test_lanes.py run build-registry
+uv run pytest -q tests/test_kolla_remote_build.py tests/unit/test_architecture_guard.py tests/unit/test_test_lanes.py
+uv run python scripts/test_lanes.py list --check
+uv run python scripts/generate_cli_reference.py --check
+```
+
+Fresh remediated-source checkpoints: Hub1127passed/2skipped, build-registry575
+passed/4skipped and Kolla/guard/lane164passed. Ruff lint/format, root/Hub
+wheel/sdist builds and minimumPython3.11 imports passed. Canonical Dockerfile
+builds and network-none real health/OpenAPI smokes covered API/export arm64 and
+amd64 plus the amd64 build worker; x86 execution used local emulation, not a
+native amd64 worker. The registered main app also served real host-loopback
+requests against temporary SQLite/CAS and synthetic identity: context bytes,
+registry request-id idempotency, Dockerfile admission, conflict409, cross-project
+404 and wrong-subject403 passed. These are not live Keystone/provider effects.
+
+The separately approved single privileged local container ran the exact
+`test_native_scratch_bounds_temp_kill_journal_and_exact_loop_cleanup` body via a
+standard-library launcher: real256MiB preallocation, many-file ENOSPC, writable
+outer journal/output reserve, killed temporary-state containment and exact loop
+detachment passed within264MiB peak new data. The container had1GiB RAM/128PIDs,
+networknone and no host binds; its settled container/private volume were removed
+and absence checked. Evidence remains private under
+`~/.local/share/palimpsest-proofs/hub-api-push-20261029/`.
+
+The permanent Linux scratch regression is opt-in via
+`PALIMPSEST_IMAGE_SCRATCH_LINUX_SMOKE=1`; it requires a separately authorized
+disposable root Linux environment with mount/loop permissions and non-CoW
+ext4/xfs/tmpfs backing. Do not enable it on a shared host implicitly. Existing
+detached-session cgroup cleanup tests need their separate delegated-cgroup
+prerequisites and were not newly qualified by the scratch proof. No cloud VM,
+GPU, production schema, Manila grant/revocation or deployment proof is claimed.
+
+
 ## Supervisor frame-commitment qualification — 2026-10-27
 
 Patch0.3.9 is prepared from fetched origin/dev `73667c8f4065215416e775f12cb0a6f578853044` (published0.3.8). Native amd64 control exposed a real equal-metadata non-tail rewrite defect despite hosted release success; the previous receipt remains unchanged under `~/.local/share/afterglow-proofs/palimpsest-qualification-20261026/release-stall/native-amd64-server/`. Compact trusted frame commitments repair requested-frame integrity, not instant auditing of unrequested history. Deterministic coarse-stamp tests preserve actual file bytes, inode/path/ownership checks; stamp-change tests explicitly advance mtime rather than depending on clock resolution.

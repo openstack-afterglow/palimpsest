@@ -312,3 +312,14 @@ class PackageCache(Base):
     __table_args__ = (
         Index("idx_package_cache_partition", "project_id", "package", "cache_scope", "platform", "builder_fingerprint"),
     )
+
+
+class RuntimeBlobReference(Base):
+    """Retained API execution inputs/results, independent of a consumer's lifecycle."""
+
+    __tablename__ = "palimpsest_runtime_blob_references"
+
+    resource_kind: Mapped[str] = mapped_column(VARCHAR(16), primary_key=True)
+    resource_id: Mapped[str] = mapped_column(VARCHAR(71), primary_key=True)
+    digest: Mapped[str] = mapped_column(VARCHAR(71), primary_key=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False, default=_now)
