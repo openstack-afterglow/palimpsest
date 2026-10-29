@@ -1889,6 +1889,10 @@ def external_lima(server_env, tmp_path, monkeypatch):
     native = home / "external-vm"
     native.mkdir(mode=0o700)
     (native / "diffdisk").write_bytes(b"native VM disk")
+    (native / "lima.yaml").write_text("vmType: vz\n")
+    monkeypatch.setattr(
+        ui.inventory.platforms, "detect_host", lambda: ui.inventory.platforms.HostPlatform("Darwin", "aarch64")
+    )
     independent = home / "independent.raw"
     independent.write_bytes(b"independent disk")
     monkeypatch.setenv("LIMA_HOME", str(home))

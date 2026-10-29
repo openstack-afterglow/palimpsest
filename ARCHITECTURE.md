@@ -1,9 +1,68 @@
 # Palimpsest Architecture
 
+## Full current integration and Kolla rollout — 2026-10-30
+
+The owner's new request expands the earlier Hub-only publication to all remaining
+current changes, followed by actual canonical Kolla-Ansible deployment. Integration
+starts at pushed `5c9a30bd5595d5c2246ca2ef823814e6537f9f88`, preserving both original
+dirty worktrees/indexes and released0.3.10 security/process/worker contracts. Older
+dirty implementations already present or superseded in the released source are
+reconciled semantically, not copied back over newer code. New scenario/station
+programs and `scripts/smoke_hub_execution.py` are now included with their complete
+dependencies; the earlier exclusion is no longer the current scope.
+
+The target storage architecture below is unchanged. Deployment of the current
+HTTPS consumer implementation must not be described as a Manila/CephFS cutover.
+Read-only inspection reached `wireguardserver` `/etc/kolla`: three controller
+API/export replicas still select the official0.3.10 digests. Fresh exact-source
+images, paired SQL/CAS/config recovery proof and offline schema review precede
+replacement. Canonical controller reconfigure does not build or bootstrap SQL;
+those prerequisites must be completed explicitly. The old worker's uncertain
+claim journal is not ordinary restart authority and must not be cleared/replayed
+as a side effect. No new cloud VM, benchmark, GPU/IAM action or formal version
+release is implied. Astra participation remains unavailable.
+
+### Integrated client and operator source map
+
+`benchmark_cli.py` registers fixed `scenario` and retained `station` commands;
+`benchmark_worker.py` admits one-shot queued scenarios without mutation replay.
+`benchmark_scenarios.py` owns original-caller admission, cumulative `ResourceBudget`,
+retained measurement references and forward-only completion/cleanup. SDK provider
+effects are isolated in `benchmark_scenario_cloud.py`, peer lifecycle in
+`benchmark_scenario_peer.py`, numerical/cluster programs in
+`benchmark_scenario_workloads.py`. Fixed repository entrypoints are
+`scripts/benchmark_scenario.py`, `scripts/benchmarks/*.py` and the public-HTTP
+functional acceptance harness `scripts/smoke_hub_execution.py`.
+
+`benchmark_station_cloud.py` owns the retained VM/data-volume identity and a
+station-wide operation lock spanning lifecycle/sample/disk/repair/cleanup.
+`benchmark_station_measurements.py` owns eligible hourly paired-provider cohorts;
+`benchmark_station_disk.py` owns independently timestamped disk checkpoints;
+`benchmark_station_cli.py` exposes bounded resident windows and status/reporting.
+`benchmark_workflow.py` accepts recent `environment_context` without reprobes;
+explicit standalone `environment` remains a distinct opt-in mode, never both.
+These are client/operator tools, not controller startup tasks or deployment-time
+benchmark instructions. The historical exact40GPU matrix is retained but is not
+the current station-based default.
+
+Native selection guards are integrated into the existing `host_vm_control.py`,
+not the old duplicate `vm_removal.py`. Lima selection binds canonical physical
+directory, owned no-follow single-link bounded config bytes, resolved config and
+protected state. Mutation rechecks selection and descriptor-pinned absence, so
+a renamed surviving directory cannot be called deleted. Libvirt selection binds
+full XML/backend/UUID/name and rejects OCI lifecycle metadata; inactive TPM and
+explicit NVRAM retention support are verified before stopping. Existing release
+retained-root/topology/named-volume policies and diagnostics remain unchanged.
+Synthetic tests and real temporary-file/directory smoke are not a live VZ or
+libvirt VM-deletion qualification.
+
+<a id="working-source-public-execution-api--2026-10-28-unpublished-native-functional-flow-verified"></a>
+
 ## Hub execution API candidate — 2026-10-29
 
 User-authorized commit/push scope on `feature/hub-execution-api-20261029`, based on `origin/dev` `49b57d34781ede527ea45965817a0078f09dc5ff`. This integrates the current Hub API/server, dedicated worker, client methods, worker child and Kolla policy changes from the separate unpublished implementation based on `977c4f297e57eb05dc53f5991bdcb4d4a95c8f23`. It does not change package versions, publish release artifacts, merge protected branches or deploy services. Original shared and release worktrees/indexes remain preserved. Benchmark scenario/station tools and their coupled live smoke harness remain outside this scoped candidate.
 
+<a id="owner-architecture-contract-2026-10-29"></a>
 ## Owner architecture contract — 2026-10-29
 
 **TARGET — 설명·그림의 현재 기준이며, 구현·배포 완료 선언이 아니다.** Docker처럼 외부 Palimpsest 제어 계층이 인증된 요청, image 취득·build·변환, VM lifecycle, ordered layer 선택과 mount 구성을 소유한다. 실행용 workload VM에 Palimpsest CLI를 설치하거나 독립 제어 계층·수동 SSH provisioning을 두지 않는다. Guest는 외부에서 확정한 구성에 필요한 최소 mount/overlay 활성화와 workload 실행만 담당한다. 별도 build/layer-creation worker와 workload VM을 혼동하지 않는다.
@@ -1081,6 +1140,27 @@ uv run python scripts/test_lanes.py run gate2
 
 ## Maintenance
 
+2026-10-30 full-current integration: the following2026-10-29 paragraph describes
+only its earlier scoped branch. This integration includes benchmark scenario/
+station source, fixed programs, the live Hub acceptance harness and visual guide.
+Original dirty variants already present or superseded by released0.3.10 are not
+restored. Fresh integration checks/source stamp and exact Kolla deployment evidence
+are recorded separately; historical native/cloud/source identities stay unchanged.
+
+Independent full-integration review found six real gaps in imported tools before
+publication. Corrections reuse hardened stdin authentication; journal bound API
+consumer deletion before effects and recover only by observation; recheck original
+expiry/deadline before image and station-data allocations; certify only synchronous
+station failures preceding both durable creation fences; and republish a validated
+completed disk checkpoint over an older pointer without reprobe or time rewrite.
+Inspection/cleanup after approval expiry remains possible, cumulative consumption
+is not refunded and conflicting/late/uncertain effects are held. Source re-review
+closed all six findings; parent fail-before/pass-after and final runtime evidence
+are separate from that review. No source recovery statement authorizes old worker
+journal disposition or production backup/DDL execution.
+
+
+
 2026-10-29 scoped Hub/API publication review: integrate original-human layer PATCH/retention, image-job admission/lease/atomic publication, provider-bound instance intent/reconciliation/result sealing, matching HTTP client and credential-free worker child with bounded Docker/Kolla inputs. Preserve the published HTTPS-only worker credential boundary rather than restoring the older shared SQL worker. Explicit strict context symlink resolution closes Python3.13's changed non-strict cycle behavior; valid dangling internal links remain accepted. Benchmark station/scenario additions and their coupled live smoke harness are not dependencies and remain outside this branch. Source review and local checks do not prove a Manila cutover, production schema upgrade, native mount isolation, cloud deployment or a new release. Astra participation is unavailable; independent scoped reviewers do not constitute Astra approval.
 
 
@@ -1706,9 +1786,9 @@ provider provisioning. Fresh multi-instance evidence is recorded separately.
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "e945fae4067723af3f958aea71bb804c031de1763f16bb426ec7072604d2a81a",
-  "reviewed_at": "2026-10-29T14:18:12Z",
-  "summary": "Reviewed Hub/API delta on 0.3.10: layer retention/PATCH, image attempts, original-human read/write instance authority, complete lifecycle and serialized results; bounded preallocated scratch/owned temp and canonical Hub-only pytest source resolution. Independent source closure,1127 Hub/575 registry tests and actual local loop/ENOSPC smoke; no cloud/Manila/deployment proof."
+  "source_sha256": "6fb894d4f3ebd53f2f7e15fe34223ce3a8d3799c64fdddfb1f7f1ed7835adbd1",
+  "reviewed_at": "2026-10-29T16:04:35Z",
+  "summary": "Reviewed all current shared/release deltas on0.3.10+5c9a30b. Integrated scenario/station/fixed API harness and native config/absence guards without old worker/security rollback. Independent review closes6auth/no-replay/expiry/no-call/disk-publication defects;18scenario+5station failing-before boundaries and actual plaintext-before/HTTPS-rejected-after proof retained. Four-table cold Kolla/paired recovery and worker disposition remain operational gates."
 }
 ```
 <!-- architecture-review:end -->

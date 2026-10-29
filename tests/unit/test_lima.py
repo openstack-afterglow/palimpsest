@@ -686,6 +686,7 @@ def test_lima_rm_volumes_cleans_up_exact_owned_failed_instance(
     home.mkdir(mode=0o700)
     native_dir = home / rpaths.name
     native_dir.mkdir(mode=0o700)
+    (native_dir / "lima.yaml").write_text("vmType: vz\n")
     monkeypatch.setenv("LIMA_HOME", str(home))
 
     def fake_command(argv: list[str], *, timeout_seconds: float = 600) -> subprocess.CompletedProcess[str]:
@@ -705,6 +706,8 @@ def test_lima_rm_volumes_cleans_up_exact_owned_failed_instance(
             return subprocess.CompletedProcess(argv, 0, json.dumps(instances), "")
         if argv[:2] == ["limactl", "delete"]:
             present = False
+            (native_dir / "lima.yaml").unlink()
+            native_dir.rmdir()
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     monkeypatch.setattr(lima, "_run_command", fake_command)

@@ -619,6 +619,95 @@ palimpsest build \
 
 The command prints the generated layer digest. Use it with `run --layer` or `layer push`.
 
+### 클라우드 목표 구조: 제어는 VM 밖에서, 레이어는 공유 저장소에서
+
+**목표 계약이며, 현재 구현·배포 완료나 실기 검증을 뜻하지 않는다.** Docker를
+외부 클라이언트로 제어하듯, Palimpsest 클라이언트·Hub API·오케스트레이터가
+워크로드 VM 밖에서 이미지 획득·빌드·변환, 레이어 선택·순서, 마운트 명세,
+접근권한·lease와 Nova 수명주기를 맡는다. 게스트에는 확정된 명세대로
+마운트하고 워크로드를 실행하는 최소 helper만 필요하며, Palimpsest CLI나
+별도 제어면을 설치해 운영하는 구조가 아니다.
+
+```mermaid
+flowchart TB
+  client["VM 밖: 클라이언트"] --> control["Hub API · 외부 오케스트레이터"]
+  control --> db["Hub DB: digest · size · 레이어 순서 · runtime · job/provenance"]
+  control --> builder["별도 빌드 worker: 획득 · 빌드 · 변환 · 검증"]
+  builder -- "RW: staging과 새 digest 발행" --> bytes["Manila가 관리하는 CephFS: SquashFS 실제 바이트"]
+  control -- "확정 mount 명세 · RO 권한 · lease · Nova 수명주기" --> helper
+  subgraph consumer["워크로드 VM: 마운트와 실행만"]
+    helper["최소 게스트 mount helper: CLI/제어면 아님"] --> lower["공유 RO → SquashFS RO lower: 지정 순서"]
+    lower --> overlay["OverlayFS → 워크로드"]
+    private["VM 전용 RW upper · work"] --> overlay
+  end
+  bytes -- "소비자는 RO 접근" --> lower
+```
+
+- **DB와 바이트는 다르다.** Hub DB가 메타데이터의 권위다. 레이어 payload는
+  Manila가 노출·관리하는 CephFS에 두며, VM별 다운로드 저장소나 로컬 catalog를
+  클라우드 메타데이터의 권위로 삼지 않는다.
+- **빌드 RW와 실행 RO는 별도 권한이다.** worker는 staging과 새 digest 발행에
+  쓸 수 있지만 이미 발행된 digest의 바이트는 덮어쓰지 않는다. 소비자는 공유
+  경로와 각 SquashFS lower를 모두 RO로 사용한다. 실행 중 변경과 copy-up은
+  VM 전용 `upper`·`work`에만 남으며 공유 CephFS에 쓰지 않는다.
+- **외부에서 결정, 게스트에서 적용.** 외부 제어가 공유·레이어·순서·권한과
+  mount 명세를 확정하고, 게스트 helper가 게스트 커널에서 실제 마운트를 수행한다.
+  export 프로토콜이나 자격증명 방식은 아직 선택하지 않았다.
+  **운영으로 확정할 Manila 공유 경로·RO 접근권한**과 tenant/workload 격리,
+  lease 해제·권한 회수는 구현 전환 및 라이브 검증이 필요하다.
+
+#### 빌드 발행부터 마운트까지의 목표 순서
+
+```mermaid
+sequenceDiagram
+  actor Client as 클라이언트 (VM 밖)
+  participant Control as Hub API · 외부 제어
+  participant DB as Hub DB (메타데이터)
+  participant Worker as 별도 빌드 worker
+  participant Share as Manila 관리 CephFS (바이트)
+  participant Guest as 워크로드 VM · 최소 helper
+  Client->>Control: 빌드 요청
+  Control->>DB: job · 입력 · provenance 기록
+  Control->>Worker: 획득 · 빌드 · 변환 · 검증
+  Worker->>Share: RW staging → 새 digest 불변 발행
+  Worker-->>Control: 검증된 digest · size · 결과
+  Control->>DB: 레이어 순서 · runtime · 결과 확정
+  Client->>Control: 선택한 레이어로 실행 요청
+  Control->>DB: 권한 · digest · 순서 · lease 확인
+  Control->>Share: 운영으로 확정할 공유 경로·RO 접근권한
+  Control->>Guest: Nova 수명주기 · 확정 mount 명세 전달
+  Guest->>Share: 지정 공유를 RO로 읽기
+  Guest->>Guest: SquashFS RO lower + VM 전용 upper/work
+  Guest->>Guest: OverlayFS에서 워크로드 실행
+  Guest-->>Control: 외부에서 실행 상태 관찰
+```
+
+**현재 구현과의 차이:** 이 통합 소스의
+`hub/src/palimpsest_hub/services/instance_bootstrap.py`의 게스트 bootstrap은
+레이어를 HTTPS로 다운로드한 뒤 RO loop mount한다. 이 경로도 게스트에서
+Palimpsest CLI를 실행하지는 않지만, 위 Manila 공유 기반 실행 경로는 아니다.
+이 체크아웃의 Nova capture/Cinder ext4 RW → 별도 봉인·RO 연결 프로토타입도
+목표 구조와 별개다. 그 소스와 과거 벤치마크는 보존하되, Manila/CephFS 목표의
+구현 또는 성능 검증으로 해석하지 않는다.
+
+**별도 선택 모드인 로컬 실행은 유지한다.** 로컬 CLI·로컬 저장소에서 Lima/VZ
+또는 KVM으로 일회성 빌드·일반 VM을 실행할 수 있다. 로컬 일반 cloud-image는
+OS `/`와 별개인 `/opt/layers/merged`에 레이어를 합치며 기본 빌드 캡처는 tmpfs다.
+OCI-root는 실제 게스트 `/`를 구성하는 별도 Linux amd64 KVM 경로다.
+로컬 모드에서 Hub가 선택적이라는 사실을 위 클라우드 목표에 적용하지 않는다.
+
+기준 계약과 현재 구현 근거:
+[목표와 구현 차이](ARCHITECTURE.md#owner-architecture-contract-2026-10-29),
+[역사적 Nova 빌드](src/palimpsest_local/nova_build.py),
+[역사적 외부 계층 마운트](src/palimpsest_local/external_layers.py).
+[한국어 시각 안내서](docs/palimpsest-source-guide.html#build-mount),
+[대화형 전체 구조도](docs/diagrams/palimpsest-source-map.architecture.html),
+[대화형 빌드→마운트 시퀀스](docs/diagrams/palimpsest-build.sequence.html)는 같은
+목표 계약을 설명한다. 안내서와 그림은 2026-10-29 `aa397a0` 작업트리 및
+별도 `977c4f2` 구현을 명시한 역사적 스냅샷 그대로 보존하며, 현재 통합 소스나
+배포 상태의 검증으로 다시 이름 붙이지 않는다. 그림 자체는 런타임 성공 증거가 아니다.
+
+
 ## Runnable Examples
 
 ### Quick rootfs layer example
@@ -909,6 +998,7 @@ opt-in lanes, not substitutes for portable tests. See the
 
 ## Project references
 
+- [Visual source guide](docs/palimpsest-source-guide.html) — Korean, locally opened HTML preserved from the 2026-10-29 snapshot: external-control/Manila target, implementation gaps and optional local mode; not current-source qualification or deployment/runtime proof
 - [Living architecture](ARCHITECTURE.md) — current source map, runtime boundaries, and update procedure
 
 - [Implementation plan](IMPLEMENTATION_PLAN.md)

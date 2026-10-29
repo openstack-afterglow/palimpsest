@@ -1,5 +1,34 @@
 # Fast feedback without dropping coverage
 
+## Full-current integration — 2026-10-30
+
+Canonical full-root entrypoint is `uv run python scripts/test_lanes.py run full`
+(`python -m pytest`), not the console-script launcher with a different import path.
+Pre-final-review baseline:8574passed/272skipped in610.63s. That result does not
+qualify the later six review corrections. Their regression cases exercise original
+API delete journals, accepted/lost responses, no early budget release, before/after
+intent expiry, station Cinder allocation expiry, definite no-call cleanup and
+interrupted disk-latest publication without reprobes. Parent demonstrated18scenario
+failures and5station failures/1control pass against the frozen pre-fix source;
+corrected scenario45 and station cloud/disk125 cases passed separately. The final
+complete root run is recorded in the latest handoff when settled.
+
+An actual owned loopback authentication smoke made1plaintext HTTP request from
+the old acceptance-script path, then the corrected shared helper rejected the HTTP
+endpoint before0requests. All credentials were synthetic; no real endpoint/token
+was used. Initial reproduction hit ambient SDK configuration instead and is not
+claimed as transport proof. The temporary config/directory guard smoke exercised
+real filesystem identity and rename/removal distinctions, not a real VM deletion.
+
+API/export source is byte-identical to pushed `5c9a30b`, so its canonical1127/2Hub
+proof remains bound to those bytes. The integrated five-image matrix passed;
+the worker alone was rebuilt after companion scenario/station fixes and its four
+corrected installed modules were hash-matched to source. All image smokes used
+networknone/read-only containers, and amd64 execution was emulated. No new
+privileged kernel, native-cloud, GPU, provider isolation or production proof is
+implied by these source-integration checks.
+
+
 ## Hub execution API candidate — 2026-10-29
 
 This source-only feature branch adds layer PATCH, durable image-job and instance
@@ -2171,6 +2200,25 @@ resource bounds, and non-GPU scope.
 Keep the SHA, selected lanes/shards, platform, pass/skip counts and elapsed time
 with each result. Do not report a selected subset as a full regression.
 
+
+## Integrated native-selection guards — 2026-10-30 source
+
+The current integration retains `host_vm_control.py` and `retained_instances.py`
+as the host-removal/retention implementation; it does not restore a parallel
+`vm_removal.py`. It carries forward safe owned Lima configuration/protected-state
+binding, descriptor-pinned deletion checks across rename, and libvirt native
+backend/lifecycle-marker classification with inactive TPM retention preflight.
+Existing default root/firmware/topology retention, separately confirmed
+owned-instance purge, independent named data disks and console capabilities
+remain the current contracts described in [CLI usage](cli/usage.md).
+
+Parent qualification must cover the focused host-inventory/host-VM-control,
+retained-instance, inventory and UI regressions, including changed config/state,
+renamed selected native directories, backend/marker disagreement and unsupported TPM
+retention before any stop/undefine effect. No checks or native lifecycle effects
+were run in this documentation-integration slice. The dated receipt below
+remains evidence only for its original source; its pass counts and observed
+host state do not qualify these integrated guards or a deployed service.
 
 ## External host VM removal — 2026-10-16
 

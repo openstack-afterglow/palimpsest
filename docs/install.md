@@ -983,6 +983,8 @@ The required settings are:
 | `PALIMPSEST_HUB_PACKAGE_FORBIDDEN_PROJECT_IDS` | JSON array of exact protected project IDs, for example `'["<project-id>"]'`. A comma-separated list does not parse. Empty policy disables ordinary member/key authority with 503; independently verified human system management supersedes these mixed protected-owner exclusions. |
 | `PALIMPSEST_HUB_PACKAGE_FORBIDDEN_USER_IDS` | JSON array of exact protected administrator/service principal IDs, for example `'["<user-id>"]'`. Empty policy disables ordinary member/key authority with 503. Human system management independently excludes actual validator/trustee IDs and service/delegated authentication. |
 
+Human administration and admin-issued bounded key use freshly read the native user's home-domain ID and selected project's domain ID, verify each exact domain resource and require explicit boolean enabled=true. Disabled native requester/project/home/target domains deny with 403; missing/malformed/unavailable metadata is 503. The reader additionally needs complete native domain get/list, configured-domain filtered user lookup, user-group membership and raw user/group exact-system assignments, alongside existing subject/role/graph reads. Configure `OS_USER_DOMAIN_NAME`/`OS_USERNAME` to one existing native trustee domain/user; missing, ambiguous or partial lookup fails closed. Original token or saved key-provenance domain names never skip configured-service ID exclusion after a domain rename. These are read-only prerequisites, not permission to change IAM or fall back to service-password authentication.
+
 Optional settings and defaults:
 
 | Environment setting | Default / constraint |
@@ -1024,20 +1026,20 @@ Optional settings and defaults:
 
 The `OS_USERNAME`/`OS_PASSWORD` service identity remains separate from the read-only validator. The validator authenticates itself with `system_scope="all"` and validates the **presented subject token** through Keystone's token-read API; it never exchanges that token for a new default-project token and never falls back to service/admin credentials. `X-Project-Id`, if supplied, is only an exact assertion against the original scope, not a re-scope request. Downstream caller-scoped OpenStack requests reuse the validated original token and catalog. A missing reader identity/policy response fails closed (503), invalid/expired tokens fail 401, and scope assertions fail 403.
 
-Operator-owned Keystone policy must let this reader call token validation (`tokens.validate`), `users.get`, `projects.get` and `role_assignments.list`, including fresh direct system grants as well as effective project assignments. On every native package-key use, enabled user/project, current membership and current service authority are checked, not cached token membership. Native owners need current `member` or `reader` in the original project and remain forbidden by `admin`, `manager` or `service` assignments, protected IDs or validator identity. Direct system-grant lookup also attenuates existing native keys immediately when the owner is promoted. Read-only members cannot delegate writes; empty protected sets fail closed, and admin authority is not a native upload workaround. Deferred Glance exports retain this native owner policy.
+Operator-owned Keystone policy must let this reader call token validation (`tokens.validate`), `users.get`, `projects.get`, native domain/group reads and complete role-assignment collections. Every native package-key use freshly checks enabled owner/project, current authority and declared key ceilings. Ordinary member keys retain protected-owner and elevated `admin`/`manager`/`service` exclusions; independently issued human-admin keys retain explicit issuer provenance and fresh system-authority checks. A later owner promotion never upgrades an ordinary key. Missing/incomplete metadata fails closed; package keys cannot gain system management, key administration or OpenStack execution authority.
 
-The separate system-administrator gate uses `role_assignments.list(user=SUBJECT, system="all", include_names=True)` without effective expansion. Qualify that exact direct query with the dedicated reader and confirm immediate revocation; a project-oriented effective listing can omit a valid direct system-all admin assignment. Project-token admin/service grades are not substitutes for this system check. This does not change the fresh effective membership query used for ordinary package owners, and does not grant package keys builder/GC authority.
+The separate human system-administrator gate resolves complete raw exact-`system:all` user and current-group grants through the trusted unique-global role-ID implication graph; project-oriented effective expansion may omit these grants and is not evidence of their absence. Qualify raw user/group reads and immediate revocation with the dedicated reader. Tenant administrative/service grades never substitute for native system authority. Original `X-Project-Id` asserts caller scope; separate `X-Target-Project-Id` selects a verified logical management target without exchanging/re-scoping the original token. See [current credential contracts](project-package-registry.md#3-identity-and-authorization).
 
-For **legacy image/layer upload**, the 2026-10-14 owner-approved source policy
-treats a system administrator as an ordinary current-project user: both
-current original-project membership and current `palimpsest-publish_editor`
-are required. Publish authority derives only from ordinary direct/group/
-inherited assignment roots, excluding builtin `admin`/`manager` roots and
-Keystone implied copies tagged `links.prior_role`. Admin privilege alone never
-grants publication. Service identities, protected users/projects and validator
-identity remain denied. `/v1/me` projects this upload check for admins;
-delete/build remain system-admin. This does not relax native keys/owner policy
-or claim that live 0.3.3 has the candidate policy.
+**Historical legacy-publication policy (2026-10-14, before 0.3.10):** that
+candidate treated a system administrator as an ordinary project publisher,
+requiring current original-project membership and publication authority from
+nonadministrative assignment roots. Preserve its dated qualification records;
+do not apply that older rule as the current human-system management contract.
+Current 0.3.10 additionally admits independently revalidated human system
+administrators for policy-authorized target-bound publication without fabricated
+target membership or service leaves. Original requester audit, native domain
+enablement, delegated/service-identity vetoes and bounded key ceilings remain;
+deferred Glance Trust-export admission retains its separate stricter boundary.
 
 Keystone user/project IDs are exact bounded ASCII identifiers (up to 64 characters), including federated 64-hex user IDs. Do not parse them as UUIDs, case-fold or strip them. UUID formatting applies only to Hub-generated key/upload IDs. Protected sets and namespace binding values must preserve exact identity bytes. For a conventional project UUID, the conditional operator configuration is:
 
