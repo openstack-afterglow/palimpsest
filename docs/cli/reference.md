@@ -3,7 +3,7 @@
 
 This file is generated from `palimpsest_local.cli.build_parser`. It inventories every command, positional, option, choice, and parser default. For behavior, examples, and runtime restrictions, read [the usage guide](usage.md). Every command except raw `docker` pass-through accepts automatic `-h`/`--help`.
 
-Coverage: **125 command paths**, **333 positional/option definitions** (excluding automatic `-h/--help`).
+Coverage: **142 command paths**, **359 positional/option definitions** (excluding automatic `-h/--help`).
 
 ## `palimpsest`
 
@@ -330,10 +330,10 @@ usage: palimpsest cloud registry-worker [-h] --cache-root CACHE_ROOT --jobs-root
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest benchmark [-h] {local,openstack,workflow,report,init,submit,worker,status} ...
+usage: palimpsest benchmark [-h] {local,openstack,workflow,report,station,scenario,init,submit,worker,status} ...
 ```
 
-Subcommands: `local`, `openstack`, `workflow`, `report`, `init`, `submit`, `worker`, `status`.
+Subcommands: `local`, `openstack`, `workflow`, `report`, `station`, `scenario`, `init`, `submit`, `worker`, `status`.
 
 ### `palimpsest benchmark local`
 
@@ -394,6 +394,248 @@ usage: palimpsest benchmark report [-h] --output OUTPUT results [results ...]
 | --- | --- | --- | --- |
 | `results` | Path (one or more) | required | recorded environment/workflow result JSON files |
 | `--output` | Path | required | new directory for report.md, overview.html and issues.md |
+
+### `palimpsest benchmark station`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest benchmark station [-h] {plan,create,sample,run,status,report,repair-access,disk,cleanup} ...
+```
+
+Subcommands: `plan`, `create`, `sample`, `run`, `status`, `report`, `repair-access`, `disk`, `cleanup`.
+
+### `palimpsest benchmark station plan`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest benchmark station plan [-h] --config CONFIG
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `--config` | Path | required | Explicit operator-authored cloud/worker JSON configuration; no inferred cloud resources. |
+
+### `palimpsest benchmark station create`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest benchmark station create [-h] --config CONFIG --output OUTPUT [--auth-stdin]
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `--config` | Path | required | Explicit operator-authored cloud/worker JSON configuration; no inferred cloud resources. |
+| `--output` | Path | required | Write or copy output at this path. |
+| `--auth-stdin` | flag | `False` | consume original-caller auth through private stdin, never argv/environment/files |
+
+### `palimpsest benchmark station sample`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest benchmark station sample [-h] --output OUTPUT [--auth-stdin]
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `--output` | Path | required | Write or copy output at this path. |
+| `--auth-stdin` | flag | `False` | consume original-caller auth through private stdin, never argv/environment/files |
+
+### `palimpsest benchmark station run`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest benchmark station run [-h] --output OUTPUT [--auth-stdin] [--duration-seconds DURATION_SECONDS]
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `--output` | Path | required | Write or copy output at this path. |
+| `--auth-stdin` | flag | `False` | consume original-caller auth through private stdin, never argv/environment/files |
+| `--duration-seconds` | int | `7200` | finite active-experiment window; station is retained afterward |
+
+### `palimpsest benchmark station status`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest benchmark station status [-h] --output OUTPUT
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `--output` | Path | required | Write or copy output at this path. |
+
+### `palimpsest benchmark station report`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest benchmark station report [-h] --output OUTPUT
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `--output` | Path | required | Write or copy output at this path. |
+
+### `palimpsest benchmark station repair-access`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest benchmark station repair-access [-h] --output OUTPUT [--auth-stdin]
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `--output` | Path | required | Write or copy output at this path. |
+| `--auth-stdin` | flag | `False` | consume original-caller auth through private stdin, never argv/environment/files |
+
+### `palimpsest benchmark station disk`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest benchmark station disk [-h] --output OUTPUT [--checkpoint-output CHECKPOINT_OUTPUT] [--auth-stdin]
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `--output` | Path | required | Write or copy output at this path. |
+| `--checkpoint-output` | Path | `None` | new explicitly selected disk checkpoint root; original attempts are never overwritten or replayed |
+| `--auth-stdin` | flag | `False` | consume original-caller auth through private stdin, never argv/environment/files |
+
+### `palimpsest benchmark station cleanup`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest benchmark station cleanup [-h] --output OUTPUT [--auth-stdin]
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `--output` | Path | required | Write or copy output at this path. |
+| `--auth-stdin` | flag | `False` | consume original-caller auth through private stdin, never argv/environment/files |
+
+### `palimpsest benchmark scenario`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest benchmark scenario [-h] {list,plan,run,status,report,cleanup} ...
+```
+
+Subcommands: `list`, `plan`, `run`, `status`, `report`, `cleanup`.
+
+### `palimpsest benchmark scenario list`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest benchmark scenario list [-h]
+```
+
+### `palimpsest benchmark scenario plan`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest benchmark scenario plan [-h] --config CONFIG
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `--config` | Path | required | Explicit operator-authored cloud/worker JSON configuration; no inferred cloud resources. |
+
+### `palimpsest benchmark scenario run`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest benchmark scenario run [-h] --config CONFIG --output OUTPUT [--auth-stdin]
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `--config` | Path | required | Explicit operator-authored cloud/worker JSON configuration; no inferred cloud resources. |
+| `--output` | Path | required | Write or copy output at this path. |
+| `--auth-stdin` | flag | `False` | read private original-caller v3token/v3password JSON from stdin, never argv/environment/files |
+
+### `palimpsest benchmark scenario status`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest benchmark scenario status [-h] --output OUTPUT
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `--output` | Path | required | Write or copy output at this path. |
+
+### `palimpsest benchmark scenario report`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest benchmark scenario report [-h] --output OUTPUT
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `--output` | Path | required | Write or copy output at this path. |
+
+### `palimpsest benchmark scenario cleanup`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest benchmark scenario cleanup [-h] --output OUTPUT [--auth-stdin]
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `--output` | Path | required | Write or copy output at this path. |
+| `--auth-stdin` | flag | `False` | Read bounded original-caller v3token/v3password JSON from private stdin; never command arguments, environment or evidence files. |
 
 ### `palimpsest benchmark init`
 

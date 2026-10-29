@@ -37,6 +37,9 @@ def native_lima(tmp_path, monkeypatch):
     home = tmp_path / "lima"
     home.mkdir(mode=0o700)
     monkeypatch.setenv("LIMA_HOME", str(home))
+    monkeypatch.setattr(
+        host_vm_control.platforms, "detect_host", lambda: host_vm_control.platforms.HostPlatform("Darwin", "aarch64")
+    )
     directory = home / "native"
     directory.mkdir(mode=0o700)
     (directory / "basedisk").write_bytes(b"immutable base")
@@ -76,6 +79,8 @@ def native_lima(tmp_path, monkeypatch):
         "status": "running",
         "runtime_kind": "external",
         "run_id": None,
+        "managed": False,
+        "source": "host-backend",
         "removal_identity": identity,
     }
     return SimpleNamespace(
@@ -251,7 +256,7 @@ def test_external_libvirt_purge_refuses_unknown_ownership_before_stop(native_lim
     env = native_lima
     domain_uuid = str(uuid.uuid4())
     calls = []
-    definition = f"<domain><name>native</name><uuid>{domain_uuid}</uuid><devices><disk type='file' device='disk'><source file='{env.data}'/></disk></devices></domain>"
+    definition = f"<domain type='kvm'><name>native</name><uuid>{domain_uuid}</uuid><devices><disk type='file' device='disk'><source file='{env.data}'/></disk></devices></domain>"
     domain = SimpleNamespace(
         UUIDString=lambda: domain_uuid,
         name=lambda: "native",
@@ -269,6 +274,7 @@ def test_external_libvirt_purge_refuses_unknown_ownership_before_stop(native_lim
             VIR_DOMAIN_UNDEFINE_KEEP_NVRAM=1,
             VIR_DOMAIN_UNDEFINE_MANAGED_SAVE=2,
             VIR_DOMAIN_UNDEFINE_SNAPSHOTS_METADATA=4,
+            VIR_DOMAIN_XML_INACTIVE=2,
         ),
     )
     monkeypatch.setattr(host_vm_control.platforms, "detect_host", lambda: SimpleNamespace(system="Linux"))
@@ -829,3 +835,65 @@ def test_run_locked_archive_delete_refuses_foreign_archive_identity(managed_lima
             retained_instances.delete_retained_instance_for_run(env.roots, identifier, mutation=mutation)
     assert rpaths.state.read_bytes() == before
     assert (directory / "diffdisk").read_bytes() == b"root sentinel"
+
+
+@pytest.mark.parametrize(
+    "damage", ["config-bytes", "config-object", "protected", "null-marker", "config-symlink", "config-hardlink"]
+)
+def test_native_lima_selection_binds_configuration_before_mutation(native_lima, damage):
+    env = native_lima
+    config = env.directory / "lima.yaml"
+    if damage == "config-bytes":
+        config.write_text("vmType: vz\ncpus: 8\n")
+    elif damage == "config-object":
+        env.instance["config"]["cpus"] = 8
+    elif damage == "protected":
+        env.instance["protected"] = True
+    elif damage == "null-marker":
+        env.instance["config"]["env"] = {"PALIMPSEST_RUN_ID": None}
+    elif damage == "config-symlink":
+        config.rename(env.home / "other.yaml")
+        config.symlink_to(env.home / "other.yaml")
+    else:
+        os.link(config, env.home / "other.yaml")
+    with pytest.raises(StateError, match="identity changed"):
+        host_vm_control.remove_vm(env.row, expected_identity=env.identity, roots=env.roots, volumes=True)
+    assert not env.native["calls"]
+    assert env.data.read_bytes() == b"named volume sentinel"
+
+
+def test_native_lima_renamed_survivor_never_reports_removal(native_lima, monkeypatch):
+    env = native_lima
+    renamed = env.home / "renamed"
+
+    def command(argv, **kwargs):
+        assert argv[1] == "delete"
+        env.directory.rename(renamed)
+        env.native["present"] = False
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(lima, "_run_command", command)
+    with pytest.raises(StateError, match="absence could not be verified"):
+        host_vm_control.remove_vm(env.row, expected_identity=env.identity, roots=env.roots, volumes=True)
+    assert (renamed / "diffdisk").read_bytes() == b"root sentinel"
+    assert env.data.read_bytes() == b"named volume sentinel"
+
+
+def test_native_lima_incompatible_host_never_reaches_command(native_lima, monkeypatch):
+    env = native_lima
+    monkeypatch.setattr(
+        host_vm_control.platforms, "detect_host", lambda: SimpleNamespace(system="Linux", machine="x86_64")
+    )
+    with pytest.raises(StateError, match="not available"):
+        host_vm_control.remove_vm(env.row, expected_identity=env.identity, roots=env.roots, volumes=True)
+    assert not env.native["calls"]
+
+
+@pytest.mark.parametrize("damage", ["managed", "source", "name", "id", "run_id"])
+def test_native_removal_rejects_malformed_observed_selection(native_lima, damage):
+    env = native_lima
+    invalid = {"managed": True, "source": "run-ledger", "name": "../native", "id": "native", "run_id": "malformed"}
+    row = {**env.row, damage: invalid[damage]}
+    with pytest.raises(StateError):
+        host_vm_control.remove_vm(row, expected_identity=env.identity, roots=env.roots, volumes=True)
+    assert not env.native["calls"]

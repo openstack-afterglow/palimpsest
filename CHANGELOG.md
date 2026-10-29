@@ -4,6 +4,34 @@ All notable changes to Palimpsest Local are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- Add project-bound registry imports, bounded Dockerfile/context builds and public image-job APIs with durable request identities, fixed HTTPS worker leases and verified atomic layer publication.
+- Add original-human/project-bound instance create/list/detail/stop/delete APIs with provider-intent reconciliation, exact boot-volume checks, immutable ordered layer/runtime snapshots and bounded sealed guest results.
+- Add conditional layer metadata PATCH, retained physical-blob references, matching Hub client methods and dedicated image-worker container/Kolla policies. Current guests fetch payloads over HTTPS into read-only SquashFS lowers with private disk-backed upper/work; Manila-managed CephFS runtime access remains a separate target, not implemented by this change.
+- Add fixed PyTorch CPU/CUDA, NVIDIA CUDA, TensorFlow CPU/CUDA and rancher/k3s scenario programs with durable original-caller budgets, structured status/logs/reports and retained Hub instance/request identities, including uncertain provider creates. These source additions do not qualify new GPU or privileged-cluster execution.
+- Add a separately budgeted private iperf3 peer/bastion helper with console-pinned SSH, exact-owned SG/FIP and forward-only cleanup. Bounded private-stdin authentication keeps original-caller credentials out of argv, environment and evidence files.
+- Preserve the Korean visual guide and four interactive diagram artifacts byte-for-byte from the 2026-10-29 working-tree snapshot. README illustrations explain the external-control/Hub-metadata/Manila-managed-CephFS target, explicitly separate from current HTTPS bootstrap and historical Cinder prototypes; illustrations are not deployment or runtime evidence.
+
+### Fixed
+
+- Reject cyclic build-context symlinks on Python 3.13 as well as older supported interpreters while retaining valid dangling internal links.
+- Enforce a fully preallocated per-image workspace and packed-output budget with independent journal headroom; keep registry/tool temporary files in owned scratch and require exact cgroup/loop cleanup before publication.
+- Require separate current download and write authority before instance payload capabilities; permit only verified failed-create cleanup and retain capacity while a bound boot volume survives. Distinct definite no-create errors can be explicitly cleaned without treating an uncertain provider response as absence.
+- Bound guest result delivery by actual serialized JSON bytes, including escaped control output, while preserving identical-result retries and no workload replay.
+- Serialize Kolla's writable-disk GiB limit as a string; bound workload argv/results before allocation, keep CPU threading identical across comparison methods and require completed cluster probe computation before readiness. Preserve uncertain resource dispositions and cumulative auxiliary-resource budgets rather than replay effects.
+- Fence retained-station hourly/disk/create/repair/cleanup operations through one canonical station-wide lock, independent of checkpoint output paths. Retain failed attempts and per-output receipts; busy resident sampling returns a future wake-up without retry bursts.
+- Bind external Lima removal to safe owned native configuration and protected-state identity; prove descriptor-pinned directory deletion even across rename. Revalidate libvirt native backend/lifecycle metadata and inactive TPM retention before effects, through existing `host_vm_control.py`; default root/topology retention, independent named disks and console authority are unchanged.
+- Reuse the hardened private-stdin HTTPS/ambient-configuration boundary in the live Hub acceptance script. Persist exact consumer deletion identities before API effects and observe uncertain/deleting outcomes without issuing DELETE again; release budget only after original server/boot absence.
+- Recheck allocation expiry/deadline before image-job requests and the retained station's separate data-volume request. Explicitly settle only synchronously certified pre-request station admission failures; missing or late effect receipts remain uncertain.
+- Recover a completed disk checkpoint's latest pointer over an older result without repeating its probe, synthesizing a new timestamp or regressing a newer valid success.
+
+### Changed
+
+- Follow the owner's 2026-10-29 same-location measurement policy: reuse one retained 4-vCPU/8-GiB OpenStack station with a dedicated 500-GiB disk, pairing provider download/upload samples every 30–60 minutes during active experiments (default 60). Preserve individual provider values and equal-weight means; missing directions remain N/A. Workloads reference timestamped context instead of creating calibration VMs or running Internet probes per experiment. Historical matrices, failures and spent grants remain historical.
+- Keep ordinary notebook development/checks and specifically approved operator administration permitted; only long benchmarks require a resident host. Current API/SDK-reference and standalone-calibration modes remain explicit, with no silent CPU fallback or automatic GPU driver installation. Publication, actual Kolla deployment and quarantined-worker disposition remain separate recorded actions.
+
+
 ## [0.3.10] - 2026-10-28
 
 ### Added

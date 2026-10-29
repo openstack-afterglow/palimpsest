@@ -4,7 +4,12 @@ from collections.abc import AsyncGenerator
 
 from fastapi import HTTPException
 from sqlalchemy import inspect, text
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 _engine: AsyncEngine | None = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
@@ -68,6 +73,8 @@ async def get_session() -> AsyncGenerator[AsyncSession, None]:
 async def create_schema() -> None:
     if _engine is None:
         raise RuntimeError("database is not initialized")
+    # Register the independent image-job and instance ledgers before cold bootstrap.
+    from palimpsest_hub import image_models, instance_models  # noqa: F401
     from palimpsest_hub.models import Base
 
     async with _engine.begin() as connection:

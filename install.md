@@ -1,20 +1,20 @@
 # Install Palimpsest
 
 Palimpsest requires Python 3.11 or newer. The current release is
-[`palimpsest-client 0.3.5`](https://pypi.org/project/palimpsest-client/0.3.5/),
-released on 2026-10-14. Install released bytes in isolation:
+[`palimpsest-client 0.3.10`](https://pypi.org/project/palimpsest-client/0.3.10/),
+released on 2026-10-28. Install released bytes in isolation:
 
 ```sh
-uv tool install --python 3.11 "palimpsest-client==0.3.5"
+uv tool install --python 3.11 "palimpsest-client==0.3.10"
 palimpsest --version
 
 # Or use pip, without changing system Python:
 python3.11 -m venv .venv
-.venv/bin/python -m pip install "palimpsest-client==0.3.5"
+.venv/bin/python -m pip install "palimpsest-client==0.3.10"
 .venv/bin/palimpsest --version
 ```
 
-Released 0.3.5 includes the integrated local web, runtime, cache and
+Released 0.3.10 retains the integrated local web, runtime, cache and
 user-default/help/completion work. To use a trusted checkout's exact bytes,
 run `uv tool install --force --python 3.11 .`, or `python -m pip install .`
 inside a virtual environment. Remote branch/PyPI installation does not include
@@ -23,11 +23,16 @@ If uv's bin directory is not on `PATH`, explicitly run `uv tool update-shell`
 and open a new terminal. Hub is a separate distribution/deployment; a client
 upgrade does not publish or roll out Hub images.
 
-Release `v0.3.5` follows protected-dev PR #24 and merge
-`04d51ad6e1bf00c4b6e5bf82050383d0bb0a10cf`. PyPI/GHCR publication and
-production Hub on `dms-controller1` plus the dedicated build-worker VM rollout
-are recorded in [release receipts](docs/testing.md#full-source-035-integration--local-verification).
-Native KVM proof was NOT performed: repository-policy skip, exactly as for 0.3.4.
+Publication, deployment-server package selection and actual running services are
+separate gates; use the [latest release/operator handoff](docs/development-handoff.md)
+for their exact receipts. This integration's new APIs and station/scenario work
+are not included merely by installing the published 0.3.10 wheel.
+
+Historical release `v0.3.5` followed protected-dev PR #24 and merge
+`04d51ad6e1bf00c4b6e5bf82050383d0bb0a10cf`. Its publication and then-production
+rollout remain in [dated receipts](docs/testing.md#full-source-035-integration--local-verification),
+not evidence of the current deployment. Native KVM proof was NOT performed:
+repository-policy skip, exactly as for 0.3.4.
 
 ## 1. Install the Local CLI
 
@@ -117,7 +122,7 @@ Repository tags also drive GHCR image tags for
 `ghcr.io/openstack-afterglow/palimpsest-hub-worker` and
 `ghcr.io/openstack-afterglow/palimpsest-hub-build-worker`; image tags follow the
 repository tag, not the independently versioned Hub wheel. The released Kolla
-role defaults to Hub image tag `0.3.5`; verify exact reviewed API/export/build-worker
+role defaults to Hub image tag `0.3.10`; verify exact reviewed API/export/build-worker
 digests and platform manifests before any future deployment.
 Root publication requires trusted tag artifact checks and protected PyPI
 publisher gates. Native policy permits only enabled/success or explicitly

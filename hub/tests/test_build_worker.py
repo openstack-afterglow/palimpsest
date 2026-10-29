@@ -76,9 +76,16 @@ class Transport:
         self.responses = list(responses)
         self.calls = []
         self.events = events
+        self.image_claims = []
 
     @contextmanager
     def request(self, method, path, **kwargs):
+        # This suite exercises recipe jobs against a matching API with an empty
+        # image queue. Keep its recipe protocol trace distinct from image polls.
+        if path == "/v1/image-worker/claim":
+            self.image_claims.append((method, path))
+            yield Response(204)
+            return
         body = kwargs.get("body")
         if hasattr(body, "read"):
             body = body.read()
@@ -430,7 +437,7 @@ def test_uncertain_claim_never_reclaims_even_after_restart(harness, response):
         restarted.process_one()
     assert len(transport.calls) == 1
     assert restarted_transport.calls == []
-    assert harness.journal.load() == {"phase": "claim_pending"}
+    assert harness.journal.load() == {"phase": "claim_pending", "protocol": "recipe"}
 
 
 @pytest.mark.parametrize("response", [OSError("lost output"), Response(500), Response(200, b"broken json")])
@@ -1152,7 +1159,7 @@ def test_unidentified_claim_stays_uncertain_without_any_failure_request(harness,
     with pytest.raises(worker.WorkerHalted, match="claim outcome uncertain"):
         instance.process_one()
     assert [call[0] for call in transport.calls] == ["POST"]
-    assert harness.journal.load() == {"phase": "claim_pending"}
+    assert harness.journal.load() == {"phase": "claim_pending", "protocol": "recipe"}
     assert not harness.manifests
 
 
@@ -1197,7 +1204,7 @@ def test_oversize_actual_utf8_recipe_fails_durable_identity_without_poisoning_wo
     monkeypatch.setattr(instance, "_fail", fail)
     assert instance.process_one()
     assert not instance.process_one()
-    assert identities == [{"phase": "claimed", "id": BUILD_ID, "lease": LEASE}]
+    assert identities == [{"phase": "claimed", "protocol": "recipe", "id": BUILD_ID, "lease": LEASE}]
     assert [call[0] for call in transport.calls] == ["POST", "POST", "GET", "POST"]
     assert json.loads(transport.calls[1][3]) == {"error_code": "build_failed"}
     assert not harness.manifests and harness.journal.load() is None

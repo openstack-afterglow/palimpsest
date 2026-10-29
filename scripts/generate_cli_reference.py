@@ -126,6 +126,7 @@ DESCRIPTIONS = {
     "port": "Local web listen port; 0 selects an available loopback port.",
     "no_browser": "Print the dashboard URL without opening a browser.",
     "allow_control": "Enable local CAS tag edits, VM and storage controls; default: read-only.",
+    "auth_stdin": "Read bounded original-caller v3token/v3password JSON from private stdin; never command arguments, environment or evidence files.",
     "destination": "New local store path.",
     "keep_source": "Keep source bytes after moving the store.",
     "shell": "Shell completion target.",

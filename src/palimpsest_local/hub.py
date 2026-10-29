@@ -210,6 +210,7 @@ class HubClient:
         payload: dict[str, Any] | None = None,
         *,
         query: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
     ) -> Any:
         body = json.dumps(payload).encode("utf-8") if payload is not None else None
         try:
@@ -218,6 +219,7 @@ class HubClient:
                 path,
                 query=query,
                 body=body,
+                headers=headers,
                 content_type="application/json" if body is not None else None,
             ) as resp:
                 raw = resp.read()
@@ -229,6 +231,65 @@ class HubClient:
             return json.loads(raw)
         except json.JSONDecodeError as exc:
             raise HubError(f"malformed JSON response from hub for {method} {path}") from exc
+
+    def update_layer(self, digest: str, changes: dict[str, Any], *, config_digest: str) -> dict[str, Any]:
+        """Conditionally update descriptor metadata, never overwrite digest-addressed bytes."""
+        normalized = normalize_digest(digest)
+        expected = normalize_digest(config_digest)
+        if normalized is None or expected is None:
+            raise HubError("layer and config identities must be SHA-256 digests")
+        return self._json_request("PATCH", f"/layers/{normalized}", changes, headers={"If-Match": f'"{expected}"'})
+
+    def upload_build_context(self, source: Path) -> dict[str, Any]:
+        """Upload a bounded tar context; the server checks its digest before job admission."""
+        with Path(source).open("rb") as stream:
+            payload = stream.read(16 * 1024 * 1024 + 1)
+        if not payload or len(payload) > 16 * 1024 * 1024:
+            raise HubError("build context must contain 1..16777216 bytes")
+        import hashlib
+
+        digest = "sha256:" + hashlib.sha256(payload).hexdigest()
+        try:
+            with self._open(
+                "POST",
+                "/build-contexts",
+                body=payload,
+                content_type="application/x-tar",
+                headers={"X-Content-SHA256": digest},
+            ) as response:
+                return json.loads(response.read())
+        except urllib.error.HTTPError as exc:
+            raise self._wrap_http_error(exc, "POST", "/build-contexts") from exc
+
+    def import_registry_image(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Submit one request_id-bound server import; never execute or retry it locally."""
+        return self._json_request("POST", "/registry-imports", request)
+
+    def build_dockerfile(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Submit Dockerfile text and an optional previously uploaded context digest."""
+        return self._json_request("POST", "/dockerfile-builds", request)
+
+    def list_image_jobs(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        return self._json_request("GET", "/image-jobs", query={"limit": limit})
+
+    def get_image_job(self, job_id: str) -> dict[str, Any]:
+        return self._json_request("GET", "/image-jobs/" + urllib.parse.quote(job_id, safe=""))
+
+    def create_instance(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Create through the Hub API, including source_instance_id stack reuse."""
+        return self._json_request("POST", "/instances", request)
+
+    def list_instances(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        return self._json_request("GET", "/instances", query={"limit": limit})
+
+    def get_instance(self, instance_id: str) -> dict[str, Any]:
+        return self._json_request("GET", "/instances/" + urllib.parse.quote(instance_id, safe=""))
+
+    def stop_instance(self, instance_id: str) -> dict[str, Any]:
+        return self._json_request("POST", "/instances/" + urllib.parse.quote(instance_id, safe="") + "/stop")
+
+    def delete_instance(self, instance_id: str) -> dict[str, Any]:
+        return self._json_request("DELETE", "/instances/" + urllib.parse.quote(instance_id, safe=""))
 
     # -- search / read ----------------------------------------------------------
 
