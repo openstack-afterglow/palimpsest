@@ -141,17 +141,45 @@ def harness(tmp_path, monkeypatch):
     journal.close()
 
 
+def publication_status(state="building", *, staged=(), bound=True):
+    from palimpsest_hub.services.digest import compute_config_digest
+
+    return {
+        "id": JOB,
+        "status": state,
+        "result": result() if state == "complete" else None,
+        "publication": {
+            "version": 1,
+            "deadline": "2030-01-01T00:00:00+00:00",
+            "result_digest": compute_config_digest(result()) if bound else None,
+            "staged_outputs": list(staged),
+        },
+    }
+
+
+def publication_responses():
+    return [
+        Response(200, publication_status(bound=False)),
+        Response(200, publication_status()),
+        Response(200),
+        Response(200),
+        Response(200, publication_status(staged=result()["layers"])),
+        complete(),
+        complete(),
+    ]
+
+
 def complete():
-    return Response(200, {"id": JOB, "status": "complete", "result": result()})
+    return Response(200, publication_status("complete", staged=result()["layers"]))
 
 
 def test_image_executes_once_cleanup_precedes_all_uploads_and_finalizes_ordered_layers(harness):
-    instance, transport = harness.make([Response(202, claim()), Response(200), Response(200), complete(), complete()])
+    instance, transport = harness.make([Response(202, claim()), *publication_responses()])
     assert instance.process_one()
     assert harness.executions == [JOB]
-    assert [method for method, _ in transport.calls] == ["POST", "PUT", "PUT", "POST", "GET"]
-    assert transport.calls[1][1].endswith("/outputs/" + sha(b"hsqsone"))
-    assert transport.calls[2][1].endswith("/outputs/" + sha(b"hsqstwo"))
+    assert [method for method, _ in transport.calls] == ["POST", "GET", "POST", "PUT", "PUT", "GET", "POST", "GET"]
+    assert transport.calls[3][1].endswith("/outputs/" + sha(b"hsqsone"))
+    assert transport.calls[4][1].endswith("/outputs/" + sha(b"hsqstwo"))
     assert harness.events[1][0] == "cleanup"
     assert harness.journal.load() is None
 
@@ -181,7 +209,12 @@ def test_uncertain_image_claim_never_falls_back_or_replays(harness, response):
 
 def test_lost_staged_output_response_retains_image_protocol_and_never_restages(harness):
     instance, transport = harness.make(
-        [Response(202, claim()), OSError("lost output"), Response(200, {"id": JOB, "status": "building"})]
+        [
+            Response(202, claim()),
+            Response(200, publication_status(bound=False)),
+            Response(200, publication_status()),
+            OSError("lost output"),
+        ]
     )
     with pytest.raises(worker.WorkerHalted):
         instance.process_one()
@@ -200,14 +233,13 @@ def test_completed_provenance_conflict_holds_without_disposing(harness):
     instance, _ = harness.make(
         [
             Response(202, claim()),
-            Response(200),
-            Response(200),
-            complete(),
+            *publication_responses()[:-1],
             Response(200, {"id": JOB, "status": "complete", "result": wrong}),
         ]
     )
-    with pytest.raises(worker.WorkerHalted, match="conflicts"):
+    with pytest.raises(worker.WorkerHalted, match="retained") as failed:
         instance.process_one()
+    assert "conflicts" in str(failed.value.__cause__)
     assert harness.journal.load()["phase"] == "output_pending"
 
 
@@ -544,3 +576,171 @@ def test_cleanup_failure_does_not_read_or_replace_private_evidence(harness, monk
     with pytest.raises(worker.WorkerHalted, match="cleanup"):
         instance.process_one()
     assert len(transport.calls) == 1
+
+
+@pytest.mark.parametrize("accepted", [False, True])
+def test_lost_put_recovers_authoritative_exact_stages_without_rebuilding(harness, accepted):
+    instance, _ = harness.make(
+        [
+            Response(202, claim()),
+            Response(200, publication_status(bound=False)),
+            Response(200, publication_status()),
+            TimeoutError("private socket detail"),
+        ]
+    )
+    with pytest.raises(worker.WorkerHalted):
+        instance.process_one()
+    record = harness.journal.load()
+    assert record["publication"]["outputs"][sha(b"hsqsone")] == "attempted"
+    retained = json.loads((harness.journal.root / image.FAILURE_FILE).read_bytes())
+    assert retained["publication_failure"] == {
+        "operation": "stage",
+        "http_status": None,
+        "category": "TimeoutError",
+        "errno": None,
+    }
+    assert "private socket" not in json.dumps(retained)
+    staged = result()["layers"][:1] if accepted else []
+    responses = [Response(200, publication_status(staged=staged))]
+    responses += [Response(200) for _ in range(1 if accepted else 2)]
+    responses += [
+        Response(200, publication_status(staged=result()["layers"])),
+        complete(),
+        complete(),
+        Response(204),
+        Response(204),
+    ]
+    restarted, transport = harness.make(responses)
+    assert not restarted.process_one()
+    uploads = [path for method, path in transport.calls if method == "PUT"]
+    assert uploads == [
+        "/v1/image-worker/jobs/" + JOB + "/outputs/" + item["digest"]
+        for item in result()["layers"][1 if accepted else 0 :]
+    ]
+    assert harness.executions == [JOB]
+    assert harness.journal.load() is None
+
+
+def test_lost_complete_replays_only_after_authoritative_bound_ready_receipt(harness):
+    instance, _ = harness.make(
+        [
+            Response(202, claim()),
+            *publication_responses()[:-2],
+            TimeoutError("private completion detail"),
+        ]
+    )
+    with pytest.raises(worker.WorkerHalted):
+        instance.process_one()
+    assert harness.journal.load()["publication"]["completion"] == "attempted"
+    restarted, transport = harness.make(
+        [
+            Response(200, publication_status(staged=result()["layers"])),
+            Response(200, publication_status(staged=result()["layers"])),
+            complete(),
+            complete(),
+            Response(204),
+            Response(204),
+        ]
+    )
+    assert not restarted.process_one()
+    assert all(method != "PUT" for method, _ in transport.calls)
+    assert [path for method, path in transport.calls if method == "POST" and path.endswith("/complete")] == [
+        "/v1/image-worker/jobs/" + JOB + "/complete"
+    ]
+    assert harness.executions == [JOB]
+
+
+def test_legacy_output_pending_binds_exact_intent_before_continuing(harness):
+    instance, _ = harness.make(
+        [
+            Response(202, claim()),
+            Response(200, publication_status(bound=False)),
+            Response(200, publication_status()),
+            TimeoutError("lost first output"),
+        ]
+    )
+    with pytest.raises(worker.WorkerHalted):
+        instance.process_one()
+    legacy = harness.journal.load()
+    del legacy["publication"]
+    harness.journal.save(legacy)
+    staged = result()["layers"][:1]
+    restarted, transport = harness.make(
+        [
+            Response(200, publication_status(staged=staged, bound=False)),
+            Response(200, publication_status(staged=staged)),
+            Response(200),
+            Response(200, publication_status(staged=result()["layers"])),
+            complete(),
+            complete(),
+            Response(204),
+            Response(204),
+        ]
+    )
+    assert not restarted.process_one()
+    assert transport.calls[:3] == [
+        ("GET", "/v1/image-worker/jobs/" + JOB),
+        ("POST", "/v1/image-worker/jobs/" + JOB + "/publication-intent"),
+        ("PUT", "/v1/image-worker/jobs/" + JOB + "/outputs/" + sha(b"hsqstwo")),
+    ]
+    assert harness.executions == [JOB]
+
+
+def test_changed_authoritative_result_fingerprint_never_mutates_or_disposes(harness):
+    instance, _ = harness.make(
+        [
+            Response(202, claim()),
+            Response(200, publication_status(bound=False)),
+            Response(200, publication_status()),
+            TimeoutError("lost output"),
+        ]
+    )
+    with pytest.raises(worker.WorkerHalted):
+        instance.process_one()
+    conflicting = publication_status()
+    conflicting["publication"]["result_digest"] = sha(b"different")
+    restarted, transport = harness.make([Response(200, conflicting)])
+    with pytest.raises(worker.WorkerHalted):
+        restarted.process_one()
+    assert transport.calls == [("GET", "/v1/image-worker/jobs/" + JOB)]
+    assert harness.journal.job_dir(harness.journal.load()).exists()
+
+
+def test_restart_receipt_wait_uses_saved_lease_after_more_than_ten_seconds(harness, monkeypatch):
+    instance, _ = harness.make(
+        [
+            Response(202, claim()),
+            Response(200, publication_status(bound=False)),
+            Response(200, publication_status()),
+            TimeoutError("original lost PUT response"),
+        ]
+    )
+    with pytest.raises(worker.WorkerHalted):
+        instance.process_one()
+    saved = harness.journal.load()
+    old_failure = saved["publication_failure"].copy()
+    clock = [100.0]
+    monkeypatch.setattr(image.time, "monotonic", lambda: clock[0])
+    response = publication_status("complete", staged=result()["layers"])
+    restarted, transport = harness.make([Response(200, response)])
+    original_request = transport.request
+
+    @contextmanager
+    def slow_status(method, path, **kwargs):
+        assert method == "GET"
+        assert kwargs["wait_for_response"] is True
+        assert kwargs["deadline"] is not None
+        assert kwargs["deadline"] > clock[0] + 30
+        # Model the already-running server's CAS commit taking twenty seconds
+        # after restart. No real sleep, resource mutation or lease reset.
+        clock[0] += 20
+        assert clock[0] < kwargs["deadline"]
+        with original_request(method, path, **kwargs) as received:
+            yield received
+
+    monkeypatch.setattr(transport, "request", slow_status)
+    restarted.reconcile()
+    assert harness.journal.load() is None
+    retained = json.loads((harness.journal.root / image.FAILURE_FILE).read_bytes())
+    assert retained["publication_failure"] == old_failure
+    assert harness.executions == [JOB]

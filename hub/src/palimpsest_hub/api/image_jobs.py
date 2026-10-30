@@ -239,7 +239,10 @@ async def recover_claim(response: Response, identity: tuple[str, int] = Depends(
 
 
 @router.get("/image-worker/jobs/{job_id}", operation_id="image_worker_job_status")
-async def status(job_id: UUID, lease: str = Depends(require_build_lease)):
+async def status(job_id: UUID, response: Response, lease: str = Depends(require_build_lease)):
+    # Progress is serialized with publication; never reuse an intermediary's
+    # stale absence receipt to decide whether a mutation is needed.
+    response.headers["Cache-Control"] = "no-store"
     return service.serialize_job(await service.worker_status(str(job_id), lease), worker=True)
 
 
@@ -259,6 +262,18 @@ async def download_input(job_id: UUID, digest: str, lease: str = Depends(require
 async def stage_output(job_id: UUID, digest: str, request: Request, lease: str = Depends(require_build_lease)):
     expected, size = content_descriptor(request, get_settings().palimpsest_hub_max_blob_bytes, digest)
     return service.serialize_job(await service.stage_output(str(job_id), lease, request, expected, size))
+
+
+@router.post(
+    "/image-worker/jobs/{job_id}/publication-intent",
+    operation_id="bind_image_job_publication",
+    openapi_extra=request_body(CompleteRequest),
+)
+async def publication_intent(job_id: UUID, request: Request, lease: str = Depends(require_build_lease)):
+    req = await bounded_json(request, CompleteRequest, 512 * 1024)
+    return service.serialize_job(
+        await service.publication_intent(str(job_id), lease, req.model_dump(mode="json")), worker=True
+    )
 
 
 @router.post(

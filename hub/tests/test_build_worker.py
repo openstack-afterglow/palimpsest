@@ -11,6 +11,7 @@ import ssl
 import subprocess
 import sys
 import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -1352,3 +1353,55 @@ def test_run_logs_cause_category_without_exception_contents(monkeypatch, caplog)
     assert exit_info.value.code == 1
     assert "cause=OSError" in caplog.text
     assert "private-transport-payload" not in caplog.text and "private-worker-message" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "method,suffix,wait,extended",
+    [
+        ("PUT", "/outputs/sha256:" + "a" * 64, False, True),
+        ("POST", "/complete", False, True),
+        ("GET", "", True, True),
+        ("GET", "", False, False),
+        ("POST", "/fail", False, False),
+    ],
+)
+def test_image_bulk_response_wait_uses_remaining_lease_not_ten_second_idle_timeout(
+    monkeypatch, method, suffix, wait, extended
+):
+    events = []
+    response = Response(200, b"{}")
+
+    class Connection:
+        def __init__(self, host, port, *, timeout, context):
+            assert timeout == 10
+            self.sock = SimpleNamespace(
+                shutdown=lambda _: None, settimeout=lambda value: events.append(("timeout", value))
+            )
+
+        def connect(self):
+            events.append(("connect", None))
+
+        def request(self, *args, **kwargs):
+            events.append(("sent", None))
+
+        def getresponse(self):
+            events.append(("response", None))
+            return response
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(worker.http.client, "HTTPSConnection", Connection)
+    transport = worker.HttpsTransport("https://hub.example", "k" * 32)
+    with transport.request(
+        method,
+        "/v1/image-worker/jobs/" + BUILD_ID + suffix,
+        deadline=time.monotonic() + 60,
+        wait_for_response=wait,
+    ):
+        pass
+    if extended:
+        assert [event for event, _ in events] == ["connect", "sent", "timeout", "response"]
+        assert 50 < events[2][1] <= 60
+    else:
+        assert [event for event, _ in events] == ["connect", "sent", "response"]

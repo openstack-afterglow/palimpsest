@@ -793,9 +793,14 @@ disposition and automatic settlement depend on the recorded phase:
   a parent-death fence and `builder.pid` / `helper-UUID.pid` records bind
   PID/start ticks/boot ID. Stale records matching the current helper PID are
   previous lifetimes, not authority to kill that helper.
-- `output_pending` / `fail_pending`: a lost mutation response is settled by
-  **status only**, `GET /v1/build-worker/builds/{id}` for the exact lease
-  (including terminal status), not automatic output/failure replay.
+- Recipe `output_pending` and all `fail_pending` records settle through exact-
+  lease status, not blind mutation replay. Image `output_pending` additionally
+  uses a private authoritative publication receipt: bind the complete descriptor,
+  rehash retained packed spans, skip exact committed digest/size stages and send
+  only absent exact idempotent stages. Completion requires that same bound result
+  and unchanged lease deadline. This never re-executes a build or extends an
+  expired attempt. Deploy all API replicas before the compatible worker; pending
+  descriptors stay hidden from public image-job results until completion.
 - `terminal`: cleanup still must be established before deleting the job or
   claiming another. `preflight <worker_pid> <scratch_root>` and
   `cleanup <job_dir> <worker_pid>` are executor modes, not a license for broad

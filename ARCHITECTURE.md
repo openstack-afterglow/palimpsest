@@ -1,5 +1,27 @@
 # Palimpsest Architecture
 
+## Exact-descriptor image publication recovery — 2026-10-31
+
+After real overlay-backed registry acquisition, compilation, materialization and
+cleanup, a2.067GB/11-layer result reached `output_pending`. Six layers committed,
+including a1.269GB PUT whose server response took29.208seconds; the worker halted
+before that successful commit. A ten-second client response timeout is supported
+by the timing/source evidence, not a captured original exception. The retained
+pack is publication state, not an uncertain executor or permission to rebuild.
+
+A private publication-intent endpoint binds the canonical complete descriptor in
+the existing job `result_json`; no table/lease extension is added. Private status,
+staging and completion share the per-job output lock and expose exact staged
+digest/size receipts plus the unchanged deadline/result fingerprint. Public result
+remains hidden until completion. After exact cleanup and local span rehashing,
+the worker skips committed stages and sends only missing exact idempotent stages;
+completion is fenced by the bound full descriptor. Journal intent precedes every
+effect. No build execution is replayed, and terminal/expired attempts are not
+renewed. Bulk response waits use the remaining original deadline after sending,
+not the ten-second ordinary socket timeout. Connect/send/ordinary GET bounds stay
+unchanged. Deploy all API replicas before the compatible new worker; schema stays
+unchanged, and retained journals/packs require authoritative terminal settlement.
+
 ## Quota-bound BuildKit overlay snapshots — 2026-10-31
 
 Retained production evidence separated acquisition from local extraction: one
@@ -1992,9 +2014,9 @@ provider provisioning. Fresh multi-instance evidence is recorded separately.
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "1ba05d6589fc754765e591738b8df556606522f7da13d40ced35a71add9e14cd",
-  "reviewed_at": "2026-10-30T17:06:01Z",
-  "summary": "Reviewed quota-bound ext4 overlayfs admission, actual copy-up/whiteout and fail-closed unmount semantics, explicit BuildKit overlayfs without native fallback, and bounded mount returncode/stderr retention through existing failure artifact. Focused69 passed3 skipped and independent review clean; retained production layer download8.5s/extraction2832.8s distinguishes local extraction from transfer but does not measure copy volume. Native overlay and API CUDA/cuDNN proof remain pending; subsequent owner-requested five-success workload comparisons are gated on functional acceptance."
+  "source_sha256": "f90232f814cef0de85dc0d14cef6b62f5772932429e2e644a3e64279d1dad1cf",
+  "reviewed_at": "2026-10-30T18:32:50Z",
+  "summary": "Reviewed exact image publication intent in existing result_json, authoritative staged digest/size/deadline receipt under common per-job lock, local rehash/no build replay and fixed lease expiry, pending runtime hidden publicly, bulk wait within original deadline. Full Hub1287 passed7 skipped, focused220 passed, independent review clean, actual trusted-TLS delayed11s PUT passed. Native overlay/public Alpine437 build succeeded; CUDA11layer materialization succeeded but publication pending preserved and worker halted. Coordinated API-before-worker no-DDL rollout and GPU acceptance remain pending."
 }
 ```
 <!-- architecture-review:end -->

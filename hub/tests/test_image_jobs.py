@@ -594,3 +594,98 @@ async def test_image_claim_recovery_requires_worker_key_and_identity(images):
     for method in (images.client.get, images.client.post):
         assert (await method("/v1/image-worker/claim", headers=HUMAN)).status_code == 401
         assert (await method("/v1/image-worker/claim", headers=WORKER)).status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_publication_intent_binds_existing_stages_without_exposing_pending_runtime(images):
+    h = images
+    await enqueue(h)
+    job, headers = await claim(h)
+    a, b = b"hsqs-publication-a", b"hsqs-publication-b"
+    assert (await stage(h, job, headers, a)).status_code == 200
+    initial = await h.client.get(path(job), headers=headers)
+    assert initial.headers["cache-control"] == "no-store"
+    receipt = initial.json()["publication"]
+    assert receipt["result_digest"] is None
+    assert receipt["staged_outputs"] == [{"digest": digest(a), "size_bytes": len(a)}]
+    expiry = receipt["deadline"]
+    planned = descriptor(a, b)
+    bound = await h.client.post(path(job) + "/publication-intent", headers=headers, json=planned)
+    assert bound.status_code == 200, bound.text
+    assert bound.json()["result"] is None
+    assert bound.json()["publication"]["result_digest"] == compute_config_digest(planned)
+    assert bound.json()["publication"]["deadline"] == expiry
+    assert (
+        await h.client.post(path(job) + "/publication-intent", headers=headers, json=planned)
+    ).json() == bound.json()
+    changed = descriptor(b, a)
+    assert (await h.client.post(path(job) + "/publication-intent", headers=headers, json=changed)).status_code == 409
+    assert (await h.client.post(path(job) + "/complete", headers=headers, json=changed)).status_code == 409
+    assert (await stage(h, job, headers, b"hsqs-unbound-extra")).status_code == 409
+    public = await h.client.get("/v1/image-jobs/" + job["id"], headers=HUMAN)
+    assert public.json()["result"] is None
+    assert "publication" not in public.json() and "not-in-public-get" not in public.text
+    assert (await stage(h, job, headers, b)).status_code == 200
+    ready = (await h.client.get(path(job), headers=headers)).json()["publication"]
+    assert ready["deadline"] == expiry
+    assert ready["staged_outputs"] == planned["layers"]
+    completed = await h.client.post(path(job) + "/complete", headers=headers, json=planned)
+    assert completed.status_code == 200, completed.text
+    assert completed.json()["publication"]["result_digest"] == compute_config_digest(planned)
+    assert completed.json()["result"] == planned
+
+
+@pytest.mark.asyncio
+async def test_publication_receipt_waits_for_inflight_output_commit(images):
+    h = images
+    await enqueue(h)
+    job, headers = await claim(h)
+    payload = b"hsqs-receipt-fence"
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def slow_body():
+        yield payload[:4]
+        entered.set()
+        await release.wait()
+        yield payload[4:]
+
+    upload = asyncio.create_task(
+        h.client.put(
+            path(job) + "/outputs/" + digest(payload),
+            content=slow_body(),
+            headers={**headers, "Content-Length": str(len(payload))},
+        )
+    )
+    await asyncio.wait_for(entered.wait(), 5)
+    status = asyncio.create_task(h.client.get(path(job), headers=headers))
+    try:
+        await asyncio.sleep(0.05)
+        assert not status.done(), "absence receipt escaped the in-flight upload lock"
+    finally:
+        release.set()
+    assert (await asyncio.wait_for(upload, 5)).status_code == 200
+    receipt = (await asyncio.wait_for(status, 5)).json()["publication"]
+    assert receipt["staged_outputs"] == [{"digest": digest(payload), "size_bytes": len(payload)}]
+
+
+@pytest.mark.asyncio
+async def test_expired_publication_intent_never_extends_lease_or_publishes(images):
+    h = images
+    await enqueue(h)
+    job, headers = await claim(h)
+    payload = b"hsqs-expiring-publication"
+    planned = descriptor(payload)
+    assert (await h.client.post(path(job) + "/publication-intent", headers=headers, json=planned)).status_code == 200
+    async with h.factory() as session:
+        row = await session.get(PalimpsestHubImageJob, job["id"])
+        expired = datetime.now(UTC) - timedelta(seconds=1)
+        row.lease_expires_at = expired
+        await session.commit()
+    assert (await h.client.post(path(job) + "/publication-intent", headers=headers, json=planned)).status_code == 409
+    receipt = (await h.client.get(path(job), headers=headers)).json()
+    assert receipt["status"] == "error" and receipt["result"] is None
+    async with h.factory() as session:
+        row = await session.get(PalimpsestHubImageJob, job["id"])
+        assert row.lease_expires_at.replace(tzinfo=UTC) == expired
+        assert row.output_digests == []
+        assert (await session.scalars(select(PalimpsestHubLayer))).all() == []

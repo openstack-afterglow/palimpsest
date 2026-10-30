@@ -55,7 +55,7 @@ def iso(value):
 
 
 def serialize_job(row, *, worker=False):
-    result = row.result_json
+    result = row.result_json if row.status == "complete" else None
     if result and not worker:
         runtime = result["runtime"]
         result = {
@@ -68,7 +68,7 @@ def serialize_job(row, *, worker=False):
                 "env_names": [item.partition("=")[0] for item in runtime["env"]],
             },
         }
-    return {
+    value = {
         "id": row.id,
         "name": row.name,
         "kind": row.kind,
@@ -82,6 +82,16 @@ def serialize_job(row, *, worker=False):
         "started_at": iso(row.started_at),
         "completed_at": iso(row.completed_at),
     }
+    if worker:
+        value["publication"] = {
+            "version": 1,
+            "deadline": iso(row.lease_expires_at),
+            "result_digest": compute_config_digest(row.result_json) if row.result_json else None,
+            "staged_outputs": [
+                {"digest": item["digest"], "size_bytes": item["size_bytes"]} for item in row.staged_outputs
+            ],
+        }
+    return value
 
 
 def normalize_registry_reference(value: str, hosts=None) -> str:
@@ -476,9 +486,35 @@ async def claim(channel: str, sequence: int, *, recover: bool = False):
 
 
 async def worker_status(job_id, lease):
-    async with locked_jobs() as session:
+    store = _store_or_503()
+    async with (
+        _locked_file(store, lambda: store.acquire_package_lock("image-output:" + job_id, blocking=False)),
+        locked_jobs() as session,
+    ):
         job = await owned(session, job_id, lease)
         await session.commit()
+        return job
+
+
+async def publication_intent(job_id, lease, descriptor):
+    """Bind a result without publishing; exact retries do not extend the lease."""
+    store = _store_or_503()
+    if sum(item["size_bytes"] for item in descriptor["layers"]) > get_settings().palimpsest_hub_max_blob_bytes:
+        raise HTTPException(status_code=413, detail="image output stack exceeds byte limit")
+    async with (
+        _locked_file(store, lambda: store.acquire_package_lock("image-output:" + job_id, blocking=False)),
+        locked_jobs() as session,
+    ):
+        job = await owned(session, job_id, lease)
+        if job.result_json is not None and job.result_json != descriptor:
+            raise HTTPException(status_code=409, detail="image publication descriptor conflicts")
+        if job.status != "complete":
+            await owned(session, job_id, lease, live=True)
+            expected = {item["digest"]: item["size_bytes"] for item in descriptor["layers"]}
+            if any(expected.get(item["digest"]) != item["size_bytes"] for item in job.staged_outputs):
+                raise HTTPException(status_code=409, detail="publication intent conflicts with staged output")
+            job.result_json = descriptor
+            await session.commit()
         return job
 
 
@@ -532,6 +568,11 @@ async def stage_output(job_id, lease, request: Request, digest, size):
             else:
                 job = await owned(session, job_id, lease, live=True)
                 entries = job.staged_outputs
+                if (
+                    job.result_json is not None
+                    and {"digest": digest, "size_bytes": size} not in job.result_json["layers"]
+                ):
+                    raise HTTPException(status_code=409, detail="image output differs from publication intent")
                 old = next((item for item in entries if item["digest"] == digest), None)
                 if old and old["size_bytes"] != size:
                     raise HTTPException(status_code=409, detail="staged output descriptor conflicts")
@@ -590,13 +631,19 @@ async def complete(job_id, lease, descriptor):
     digests = [item["digest"] for item in layers]
     if sum(item["size_bytes"] for item in layers) > get_settings().palimpsest_hub_max_blob_bytes:
         raise HTTPException(status_code=413, detail="image output stack exceeds byte limit")
-    async with _locked_blobs(store, digests), locked_jobs() as session:
+    async with (
+        _locked_file(store, lambda: store.acquire_package_lock("image-output:" + job_id, blocking=False)),
+        _locked_blobs(store, digests),
+        locked_jobs() as session,
+    ):
         job = await owned(session, job_id, lease)
         if job.status == "complete":
             if job.result_json != descriptor:
                 raise HTTPException(status_code=409, detail="completed image descriptor conflicts")
             return job
         job = await owned(session, job_id, lease, live=True)
+        if job.result_json is not None and job.result_json != descriptor:
+            raise HTTPException(status_code=409, detail="image publication descriptor conflicts")
         stages = {item["digest"]: item for item in job.staged_outputs}
         if set(stages) != set(digests) or any(
             stages[item["digest"]]["size_bytes"] != item["size_bytes"] for item in layers

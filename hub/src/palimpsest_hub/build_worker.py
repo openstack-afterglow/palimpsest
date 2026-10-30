@@ -162,7 +162,17 @@ class HttpsTransport:
         self.context = ssl.create_default_context()
 
     @contextmanager
-    def request(self, method: str, path: str, *, lease: str | None = None, body=None, headers=None, deadline=None):
+    def request(
+        self,
+        method: str,
+        path: str,
+        *,
+        lease: str | None = None,
+        body=None,
+        headers=None,
+        deadline=None,
+        wait_for_response=False,
+    ):
         if not path.startswith(("/v1/build-worker/", "/v1/image-worker/")) or any(c in path for c in "\r\n?#"):
             raise WorkerHalted("invalid worker route")
         connection = http.client.HTTPSConnection(self.host, self.port, timeout=10, context=self.context)
@@ -197,6 +207,15 @@ class HttpsTransport:
                 expire()
                 raise BuildTimeout("HTTP request deadline exceeded")
             connection.request(method, path, body=body, headers=fields)
+            if wait_for_response or (
+                deadline is not None
+                and path.startswith("/v1/image-worker/")
+                and (method == "PUT" or (method == "POST" and path.endswith("/complete")))
+            ):
+                # The server still hashes/publishes a multi-GiB body AFTER the
+                # last byte is sent. Keep connect/send idle bounds, but wait
+                # for that receipt only until this unchanged absolute lease.
+                connection.sock.settimeout(max(0.001, end - time.monotonic()))
             response = connection.getresponse()
             try:
                 # Never consume or follow a Location, including same-origin redirects.
@@ -742,6 +761,11 @@ class BuildWorker:
         _uuid(record["id"])
         _uuid(record["lease"])
         self._cleanup(record)
+        if record["phase"] == "output_pending" and record.get("protocol") == "image":
+            from .image_executor import upload
+
+            upload(self, record, record["output"], None)
+            return
         if record["phase"] in {"output_pending", "fail_pending", "terminal"}:
             self._status(record)
             self._dispose(record)
