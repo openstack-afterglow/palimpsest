@@ -50,6 +50,11 @@ palimpsest_instance_max_boot_gib: 256
 palimpsest_instance_max_writable_gib: 64
 # Independently qualified unannotated Glance images, keyed by UUID and SHA hash.
 palimpsest_instance_base_images: {}
+# Explicit runtime opt-in, bound to qualified base content and an exact GPU flavor.
+# Empty until the operator qualifies driver/Container Toolkit and PCI assignment.
+palimpsest_instance_gpu_profiles: {}
+# Separately admitted whole-VM cluster privilege; normal CPU/GPU paths stay unchanged.
+palimpsest_instance_cluster_profiles: {}
 palimpsest_instance_ca_certificates: []
 # Optional exact hostname -> IP pins for the worker container only, e.g. when
 # the service network's DNS lacks the public Hub name. TLS still verifies the
@@ -207,6 +212,8 @@ palimpsest_hub_api_service:
     PALIMPSEST_HUB_INSTANCE_MAX_BOOT_GIB: "{{ palimpsest_instance_max_boot_gib | string }}"
     PALIMPSEST_HUB_INSTANCE_MAX_WRITABLE_GIB: "{{ palimpsest_instance_max_writable_gib | string }}"
     PALIMPSEST_HUB_INSTANCE_BASE_IMAGES: "{{ palimpsest_instance_base_images | to_json }}"
+    PALIMPSEST_HUB_INSTANCE_GPU_PROFILES: "{{ palimpsest_instance_gpu_profiles | to_json }}"
+    PALIMPSEST_HUB_INSTANCE_CLUSTER_PROFILES: "{{ palimpsest_instance_cluster_profiles | to_json }}"
     PALIMPSEST_HUB_INSTANCE_CA_CERTIFICATES: "{{ palimpsest_instance_ca_certificates | to_json }}"
     OS_AUTH_URL: "{{ palimpsest_keystone_auth_url }}"
     OS_USERNAME: "{{ palimpsest_keystone_user }}"

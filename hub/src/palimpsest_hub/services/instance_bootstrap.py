@@ -11,7 +11,14 @@ from __future__ import annotations
 import base64
 import json
 
-GUEST_RUNNER = r"""import hashlib, json, os, pathlib, subprocess, time, urllib.request
+from palimpsest_hub.services.instance_cluster_runtime import CLUSTER_RUNTIME
+from palimpsest_hub.services.instance_gpu_runtime import GPU_RUNTIME
+
+
+def render_runner(gpu: bool = False, cluster: bool = False) -> str:
+    """Keep CPU cloud-init bytes unchanged; vendor code consumes GPU budget only."""
+    return (
+        r"""import hashlib, json, os, pathlib, subprocess, time, urllib.request
 ROOT = pathlib.Path('/var/lib/palimpsest-instance')
 spec = json.loads((ROOT / 'spec.json').read_text())
 deadline = spec['expires_at']
@@ -20,6 +27,9 @@ process = None
 mounts = []
 loop_device = None
 backing_file = ROOT / 'writable.ext4'
+"""
+        + ("gpu_mounts = {}\ngpu_uuids = None\n" if gpu else "")
+        + r"""
 
 def bounded(path):
     with open(path, 'rb') as stream:
@@ -27,8 +37,13 @@ def bounded(path):
 
 def report(state, code=None):
     data = {'instance_id': spec['instance_id'], 'status': state,
-            'exit_code': process.poll() if process else None,
-            'stdout': bounded(ROOT / 'stdout') if (ROOT / 'stdout').exists() else '',
+"""
+        + (
+            "            'exit_code': 0 if state == 'ready' and spec['cluster']['role'] == 'server' else None,\n"
+            if cluster
+            else "            'exit_code': process.poll() if process else None,\n"
+        )
+        + r"""            'stdout': bounded(ROOT / 'stdout') if (ROOT / 'stdout').exists() else '',
             'stderr': bounded(ROOT / 'stderr') if (ROOT / 'stderr').exists() else '',
             'error_code': code}
     def serialize():
@@ -122,7 +137,10 @@ def pump(timeout=0.2):
             output.write(kept)
         outputs[key.fd] = (output, remaining - len(kept))
 
-try:
+"""
+        + (GPU_RUNTIME if gpu else "")
+        + (CLUSTER_RUNTIME if cluster else "")
+        + r"""try:
     if time.time() >= deadline:
         raise RuntimeError('bootstrap_expired')
     import platform
@@ -131,7 +149,24 @@ try:
     import shutil
     if any(shutil.which(tool) is None for tool in ('mount', 'umount', 'truncate', 'mkfs.ext4', 'losetup')):
         raise RuntimeError('guest_filesystem_tools_unavailable')
-    writable_bytes = spec['writable_bytes']
+"""
+        + (
+            r"""
+    if spec.get('gpu') is not None:
+        if spec['mode'] != 'oci-chroot':
+            raise RuntimeError('gpu_runtime_mode_mismatch')
+        import signal
+        def terminate(signum, frame):
+            raise SystemExit(signum)
+        signal.signal(signal.SIGTERM, terminate)
+        signal.signal(signal.SIGINT, terminate)
+        gpu_become_subreaper()
+        gpu_uuids = gpu_prerequisites(spec['gpu'])
+"""
+            if gpu
+            else ""
+        )
+        + r"""    writable_bytes = spec['writable_bytes']
     if type(writable_bytes) is not int or not 1024**3 <= writable_bytes <= 4096 * 1024**3:
         raise RuntimeError('invalid_writable_capacity')
     available = os.statvfs(ROOT)
@@ -208,11 +243,27 @@ try:
         if (merged / name).is_symlink():
             raise RuntimeError('unsafe_runtime_mountpoint')
         (merged / name).mkdir(exist_ok=True)
-    mount(['--bind', '/dev'], merged / 'dev')
-    mount(['-t', 'proc', '-o', 'nosuid,nodev,noexec', 'proc'], merged / 'proc')
+"""
+        + (
+            r"""    if gpu_uuids is not None:
+        # Vendor device injection must not create files on the base /dev bind.
+        mount(['-t', 'tmpfs', '-o', 'nosuid,noexec,mode=0755', 'tmpfs'], merged / 'dev')
+        for name in ('null', 'zero', 'random', 'urandom', 'tty'):
+            target = merged / 'dev' / name
+            target.touch()
+            mount(['--bind', '/dev/' + name], target)
+        (merged / 'dev' / 'shm').mkdir()
+        mount(['-t', 'tmpfs', '-o', 'nosuid,nodev,noexec,mode=1777', 'tmpfs'], merged / 'dev' / 'shm')
+"""
+            if gpu
+            else "    mount(['--bind', '/dev'], merged / 'dev')\n"
+        )
+        + r"""    mount(['-t', 'proc', '-o', 'nosuid,nodev,noexec', 'proc'], merged / 'proc')
     mount(['--bind', '/sys'], merged / 'sys')
     run(['mount', '-o', 'remount,bind,ro,nosuid,nodev,noexec', str(merged / 'sys')])
-    # Docker injects these guest-local network essentials too. Reject image
+"""
+        + ("    mount(['--bind', '/sys/fs/cgroup'], merged / 'sys/fs/cgroup')\n" if cluster else "")
+        + r"""    # Docker injects these guest-local network essentials too. Reject image
     # symlinks rather than resolving their absolute targets against the base.
     etc = merged / 'etc'
     if etc.is_symlink():
@@ -229,11 +280,34 @@ try:
         fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
         with os.fdopen(fd, 'wb') as output:
             output.write(data)
-    environment = {'PATH':'/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', 'HOME':'/'}
+"""
+        + (
+            r"""
+    if gpu_uuids is not None:
+        gpu_configure(spec['gpu'], gpu_uuids, merged, gpu_mounts)
+"""
+            if gpu
+            else ""
+        )
+        + r"""    environment = {'PATH':'/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', 'HOME':'/'}
     for entry in spec['runtime'].get('env', []):
         key, value = entry.split('=', 1)
         environment[key] = value
-    import selectors
+"""
+        + (
+            r"""
+    if gpu_uuids is not None:
+        environment['NVIDIA_VISIBLE_DEVICES'] = ','.join(gpu_uuids)
+        environment['NVIDIA_DRIVER_CAPABILITIES'] = 'compute,utility'
+        gpu_verify_injected(spec['gpu'], gpu_uuids, enter_runtime, environment)
+"""
+            if gpu
+            else ""
+        )
+        + (
+            "    cluster_execute()\n"
+            if cluster
+            else r"""    import selectors
     process = subprocess.Popen(spec['command'], stdin=subprocess.DEVNULL,
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=environment,
                                preexec_fn=enter_runtime, start_new_session=True)
@@ -279,8 +353,10 @@ try:
             output.close()
         for pipe in (process.stdout, process.stderr):
             pipe.close()
-except BaseException:
-    if process is not None and process.poll() is None:
+"""
+        )
+        + ("except BaseException as failure:\n" if gpu or cluster else "except BaseException:\n")
+        + r"""    if process is not None and process.poll() is None:
         import signal
         os.killpg(process.pid, signal.SIGTERM)
         try:
@@ -289,19 +365,75 @@ except BaseException:
             os.killpg(process.pid, signal.SIGKILL)
             process.wait()
     try:
-        report('error', 'guest_execution_failed')
-    except Exception:
+"""
+        + (
+            r"""
+        gpu_error = str(failure) if gpu_uuids is not None or spec.get('gpu') is not None else ''
+        report('error', gpu_error if gpu_error in GPU_ERROR_CODES else 'guest_execution_failed')
+"""
+            if gpu
+            else (
+                "        code = str(failure)\n        report('error', code if code in ('cluster_prerequisite_failed', 'cluster_bootstrap_failed', 'cluster_proof_failed') else 'cluster_bootstrap_failed')\n"
+                if cluster
+                else "        report('error', 'guest_execution_failed')\n"
+            )
+        )
+        + r"""    except Exception:
         pass  # No credentials or unbounded exception text in guest console logs.
 finally:
-    remaining_mounts = set(mounts)
-    for target in reversed(mounts):
+"""
+        + (
+            "    try:\n        cluster_cleanup()\n    except Exception:\n        while True:\n            time.sleep(60)  # Hold the namespace and mounts; unsafe cleanup must not peel them.\n"
+            if cluster
+            else ""
+        )
+        + (
+            r"""
+    if gpu_uuids is not None and process is not None:
+        # Finished command leaders may leave children holding injected mounts.
+        import signal
         try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    gpu_cleanup_failed = False
+    if spec.get('gpu') is not None:
+        import signal
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        try:
+            gpu_reap_children()
+            if gpu_mounts:
+                gpu_cleanup(gpu_mounts)
+        except Exception:
+            gpu_cleanup_failed = True
+"""
+            if gpu
+            else ""
+        )
+        + r"""    remaining_mounts = set(mounts)
+    for target in reversed(mounts):
+"""
+        + (
+            r"""
+        if gpu_cleanup_failed:
+            break  # Do not peel unowned replacements through generic cleanup.
+"""
+            if gpu
+            else ""
+        )
+        + r"""        try:
             run(['umount', str(target)])
             remaining_mounts.discard(target)
         except Exception:
             pass
-    if loop_device is not None and writable not in remaining_mounts:
-        try:
+"""
+        + (
+            "    if loop_device is not None and writable not in remaining_mounts and not gpu_cleanup_failed:\n"
+            if gpu
+            else "    if loop_device is not None and writable not in remaining_mounts:\n"
+        )
+        + r"""        try:
             backing = subprocess.run(['losetup', '--noheadings', '--output', 'BACK-FILE', loop_device],
                 check=True, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 text=True, timeout=30).stdout.strip()
@@ -312,6 +444,10 @@ finally:
     # The fixed expiry is server-enforced even if a guest cannot remove input.
     (ROOT / 'spec.json').unlink(missing_ok=True)
 """
+    )
+
+
+GUEST_RUNNER = render_runner()
 
 
 def render_bootstrap(spec: dict) -> str:
@@ -329,6 +465,8 @@ Restart=no
 [Install]
 WantedBy=multi-user.target
 """
+    if spec.get("cluster") is not None:
+        unit = unit.replace("PrivateMounts=yes\n", "PrivateMounts=yes\nDelegate=yes\n")
 
     def file(path: str, content: str, permissions: str = "0600") -> dict:
         return {
@@ -341,7 +479,12 @@ WantedBy=multi-user.target
     payload = {
         "write_files": [
             file("/var/lib/palimpsest-instance/spec.json", json.dumps(spec, separators=(",", ":"))),
-            file("/var/lib/palimpsest-instance/runner.py", GUEST_RUNNER),
+            file(
+                "/var/lib/palimpsest-instance/runner.py",
+                render_runner(cluster=True)
+                if spec.get("cluster") is not None
+                else (render_runner(True) if spec.get("gpu") is not None else GUEST_RUNNER),
+            ),
             file("/etc/systemd/system/palimpsest-instance.service", unit, "0644"),
         ],
         "runcmd": [["systemctl", "daemon-reload"], ["systemctl", "enable", "--now", "palimpsest-instance.service"]],

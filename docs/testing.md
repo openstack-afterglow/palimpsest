@@ -1,5 +1,34 @@
 # Fast feedback without dropping coverage
 
+## GPU and fixed API-cluster candidate — 2026-10-30
+
+Changed-node validation uses the separate root and Hub configurations, never a
+combined root collection that loses Hub's async-fixture mode. Latest complete Hub
+run1226passed/7skipped; root focused402passed. Five canonical Docker targets built
+and executed for API/exportarm64+amd64 and build-workeramd64. Actual installed
+runtime hashes match source; arm64 was native andamd64 emulated. No container
+health/OpenAPI/import check is a two-node or GPU numerical result.
+
+Unprivileged networkless/read-only Linux smoke exercised real streaming overflow,
+trickle deadlines, escaped sessions, direct-child reaping and preservation of live
+adopted k3s children during command-local cleanup. The fixed CUDA source compiled
+real sm61/sm89 cubins with nvcc12.6.85. Neither proof ran GPU arithmetic or a live
+Kubernetes workload. A representative four-layer cluster cloud-init consumed60052
+of65535Nova bytes; admission still rejects larger bootstrap payloads before create.
+
+The first full-root run retained8702pass/305skip/two failures: missinguv on the
+explicit PATH, and simulated shared ancestor ctime affected by unrelated `/tmp`
+churn. Only the test fixture freezes non-target simulated ctime; production guard
+and real-target mutation detection remain unchanged. The corrected focused42cases
+passed. The corrected complete root gate then passed8704tests/305skipped in497.73s;
+skipped native proofs remain unqualified and both initial failures remain recorded.
+
+Actual Ada8CPU/16GiB guest boot/SMI succeeded, vendor injection tools were missing,
+and the separately approved builder rebuild failed at the provider. Cold/warm GPU
+and k3s acceptance require actual externally controlled deployed-API consumers and
+their sealed numerical/provenance/lifecycle proofs. Historical n1/N5 matrices,
+portable results and the still-blocked worker disk do not supply those samples.
+
 ## Full-current integration — 2026-10-30
 
 Canonical full-root entrypoint is `uv run python scripts/test_lanes.py run full`

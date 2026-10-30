@@ -110,6 +110,7 @@ def cuda_result():
         cuda_driver_version=12060,
         cuda_runtime_version=12060,
         compiled_cuda_version=12060,
+        compiled_compute_capability=[8, 6],
         device_elapsed_seconds=0.2,
         pci_bus_id="0000:01:00.0",
         nvidia_smi_csv="0, GPU-12345678-1234-1234-1234-123456789abc, NVIDIA Test GPU, 560.35.03, 16384, 00000000:01:00.0\n",
@@ -464,4 +465,365 @@ def test_api_result_channel_rejects_unbounded_iteration_vectors_before_allocatio
     value = config(scenario, method)
     value["workload"]["iterations"] = 65
     with pytest.raises(ArtifactValidationError, match="iterations"):
+        workloads.validate_profile(value)
+
+
+@pytest.mark.parametrize("scenario", ["cuda", "torch-cuda", "tensorflow-cuda"])
+def test_api_pair_requires_explicit_operator_gpu_profile(scenario):
+    value = config(scenario, "api-cold-warm")
+    with pytest.raises(ArtifactValidationError, match="gpu_profile"):
+        workloads.validate_profile(value)
+    value["gpu_profile"] = "qualified-gpu"
+    if scenario == "tensorflow-cuda":
+        value["images"][scenario] = workloads.TENSORFLOW_GPU_BASE
+        value["hub"] = {"image_run_network": "default"}
+        with pytest.raises(ArtifactValidationError, match="image_run_network=none"):
+            workloads.validate_profile(value)
+        value["hub"] = {"image_run_network": "none"}
+    workloads.validate_profile(value)
+    command = workloads.workload_argv(value)
+    assert all(len(arg.encode()) <= 4096 for arg in command)
+    assert len(command) <= 256
+
+
+def test_tensorflow_fixed_recipe_uses_exact_historical_wheels_on_pinned_torch_base():
+    import hashlib
+    from pathlib import Path
+
+    value = config("tensorflow-cuda", "api-cold-warm")
+    value.update(gpu_profile="qualified-gpu", hub={"image_run_network": "none"})
+    value["images"]["tensorflow-cuda"] = workloads.TENSORFLOW_GPU_BASE
+    request, provenance = workloads.api_image_recipe(value)
+    lock = Path(workloads.__file__).with_name("tensorflow_delta.lock").read_text()
+    assert len(lock.splitlines()) == 18
+    assert all("--hash=sha256:" in line for line in lock.splitlines())
+    assert provenance["hash_pinned_wheels"] == 18 and provenance["supplemental_wheels"] == 17
+    assert provenance["lock_sha256"] == hashlib.sha256(lock.encode()).hexdigest()
+    assert provenance["tensorflow_version"] == "2.21.0"
+    assert provenance["untouched_tensorflow_image"] is False
+    assert provenance["guest_installation"] is False
+    assert provenance["required_operator_image_run_network"] == "none"
+    assert request["dockerfile"].startswith("FROM " + workloads.TENSORFLOW_GPU_BASE + "\n")
+    assert "--mount=type=bind,source=wheels,target=/opt/palimpsest-wheels" in request["dockerfile"]
+    assert "--mount=type=bind,source=tensorflow.lock,target=/tmp/palimpsest-tensorflow.lock" in request["dockerfile"]
+    assert "--no-index --find-links=/opt/palimpsest-wheels" in request["dockerfile"]
+    assert "--no-deps --require-hashes" in request["dockerfile"]
+    assert "pip" not in " ".join(workloads.workload_argv(value))
+    value["images"]["tensorflow-cuda"] = "docker.io/tensorflow/tensorflow:2.21.0@sha256:" + DIGEST
+    with pytest.raises(ArtifactValidationError, match="original pinned Torch"):
+        workloads.api_image_recipe(value)
+
+
+@pytest.mark.parametrize("capability", [[5, 2], [6, 1], [8, 6], [8, 9], [10, 0]])
+def test_cuda_result_requires_compilation_for_the_selected_gpu(capability):
+    value = config("cuda")
+    result = cuda_result()
+    result.update(compute_capability=capability, compiled_compute_capability=capability)
+    assert workloads.validate_result(value, marker(result))["compute_capability"] == capability
+    result["compiled_compute_capability"] = [9, 0] if capability != [9, 0] else [8, 6]
+    with pytest.raises(ArtifactValidationError, match="compiled_compute_capability"):
+        workloads.validate_result(value, marker(result))
+
+
+def api_cluster_config():
+    value = config("k3s", "api-cluster")
+    value.update(cluster_profile="qualified-k3s", k3s_version="v1.37.1+k3s1")
+    from palimpsest_local.benchmark_cluster_context import K3S_IMAGE, PAUSE_IMAGE
+
+    value["images"]["k3s"] = K3S_IMAGE
+
+    value["images"]["k3s-probe"] = PAUSE_IMAGE
+    return value
+
+
+def test_api_cluster_is_explicit_fixed_offline_recipe_not_sdk_or_arbitrary_command():
+    value = api_cluster_config()
+    workloads.validate_profile(value)
+    recipe, provenance = workloads.api_image_recipe(value)
+    assert provenance["guest_installation"] is False
+    assert provenance["airgap_bytes"] == 195939840
+    assert provenance["required_operator_image_run_network"] == "none"
+    assert "cp /bin/busybox /opt/palimpsest/probe-busybox" in recipe["dockerfile"]
+    assert "COPY k3s-airgap-images-amd64.tar /var/lib/rancher/k3s/agent/images/" in recipe["dockerfile"]
+    assert "/opt/palimpsest/pause-image" in recipe["dockerfile"]
+    assert "/opt/palimpsest/k3s-version" in recipe["dockerfile"]
+    assert all(word not in recipe["dockerfile"] for word in ("curl", "wget", "pip", "apt-get"))
+    with pytest.raises(ArtifactValidationError, match="dedicated cluster"):
+        workloads.workload_argv(value)
+    with pytest.raises(ArtifactValidationError, match="Docker reference"):
+        workloads.container_command(value, name="not-a-sdk-fallback")
+
+
+@pytest.mark.parametrize("change", ["profile", "gpu", "agents", "replicas", "version", "network"])
+def test_api_cluster_rejects_unqualified_or_inexact_profile(change):
+    value = api_cluster_config()
+    if change == "profile":
+        value.pop("cluster_profile")
+    elif change == "gpu":
+        value["gpu_profile"] = "qualified-gpu"
+    elif change == "agents":
+        value["cluster"]["agents"] = 2
+    elif change == "replicas":
+        value["cluster"]["probe_replicas"] = 1
+    elif change == "version":
+        value["k3s_version"] = "v1.37.0+k3s1"
+    else:
+        value["hub"] = {"image_run_network": "default"}
+    with pytest.raises(ArtifactValidationError):
+        workloads.validate_profile(value)
+
+
+def cluster_api_proof():
+    import uuid
+
+    value = api_cluster_config()
+    members, observations = [], []
+    for index in range(2):
+        identity = str(uuid.UUID(int=index + 1))
+        members.append(
+            {
+                "id": identity,
+                "server_id": "server-" + str(index),
+                "boot_volume_id": "boot-" + str(index),
+                "cluster": {
+                    "profile": value["cluster_profile"],
+                    "role": "server" if index == 0 else "agent",
+                    "server_instance_id": None if index == 0 else members[0]["id"],
+                    "server_address": None if index == 0 else "10.0.0.2",
+                    "node_name": "pal-" + uuid.UUID(identity).hex,
+                },
+            }
+        )
+        observations.append({"private_ip": "10.0.0." + str(index + 2)})
+    proof = {
+        "schema": "palimpsest.cluster-result.v1",
+        "success": True,
+        "k3s_version": value["k3s_version"],
+        "checks": {"nodes": True, "numerical": True},
+        "nodes": [
+            {
+                "name": member["cluster"]["node_name"],
+                "internal_ip": observations[index]["private_ip"],
+                "kubelet_version": value["k3s_version"],
+                "container_runtime": "containerd://2.2.2",
+            }
+            for index, member in enumerate(members)
+        ],
+        "pods": [
+            {
+                "node": member["cluster"]["node_name"],
+                "name": "probe-" + str(index),
+                "image": value["images"]["k3s-probe"],
+                "ready": True,
+                "restarts": 0,
+                "numerical_sum": 4950,
+            }
+            for index, member in enumerate(members)
+        ],
+    }
+    return value, proof, members, observations
+
+
+def test_api_cluster_controller_checks_real_two_node_wire_proof():
+    value, proof, members, observations = cluster_api_proof()
+    assert (
+        workloads.validate_cluster_result(value, json.dumps({"palimpsest_cluster": proof}), members, observations)
+        == proof
+    )
+
+
+@pytest.mark.parametrize(
+    "problem",
+    [
+        "marker",
+        "sum",
+        "bool_sum",
+        "restarts",
+        "image",
+        "extra_pod",
+        "same_node",
+        "extra_node",
+        "version",
+        "ip",
+        "runtime",
+        "checks",
+        "node_name",
+        "server",
+        "boot",
+        "oversized",
+        "noise",
+    ],
+)
+def test_api_cluster_controller_rejects_unqualified_proof(problem):
+    value, proof, members, observations = cluster_api_proof()
+    if problem == "marker":
+        proof = {"success": True}
+    elif problem in {"sum", "bool_sum", "restarts", "image"}:
+        key, replacement = {
+            "sum": ("numerical_sum", 4949),
+            "bool_sum": ("numerical_sum", True),
+            "restarts": ("restarts", 1),
+            "image": ("image", "unqualified"),
+        }[problem]
+        proof["pods"][0][key] = replacement
+    elif problem == "extra_pod":
+        proof["pods"].append(dict(proof["pods"][0]))
+    elif problem == "same_node":
+        proof["pods"][1]["node"] = proof["pods"][0]["node"]
+    elif problem == "extra_node":
+        proof["nodes"].append(dict(proof["nodes"][0]))
+    elif problem in {"version", "ip", "runtime"}:
+        key, replacement = {
+            "version": ("kubelet_version", "wrong"),
+            "ip": ("internal_ip", "10.0.0.99"),
+            "runtime": ("container_runtime", "docker://old"),
+        }[problem]
+        proof["nodes"][0][key] = replacement
+    elif problem == "checks":
+        proof["checks"]["numerical"] = 1
+    elif problem == "node_name":
+        members[1]["cluster"]["node_name"] = "not-the-admitted-node"
+    elif problem == "server":
+        members[1]["cluster"]["server_instance_id"] = members[1]["id"]
+    elif problem == "boot":
+        members[1]["boot_volume_id"] = members[0]["boot_volume_id"]
+    stdout = json.dumps({"palimpsest_cluster": proof})
+    if problem == "oversized":
+        stdout += " " * 8193
+    elif problem == "noise":
+        stdout = "not a single sealed JSON document\n" + stdout
+    with pytest.raises(ArtifactValidationError, match="exact two admitted"):
+        workloads.validate_cluster_result(value, stdout, members, observations)
+
+
+@pytest.mark.parametrize(
+    "url,redirected",
+    [
+        ("https://user:credential@github.com/k3s-io/k3s/releases/download/anything", False),
+        ("https://github.com/k3s-io/k3s/releases/download/latest/airgap.tar", False),
+        ("http://github.com/k3s-io/k3s/releases/download/anything", False),
+        ("https://example.com/github-production-release-asset/1", True),
+        ("https://release-assets.githubusercontent.com/not-the-release-asset/1", True),
+        ("https://user:credential@release-assets.githubusercontent.com/github-production-release-asset/1", True),
+    ],
+)
+def test_cluster_airgap_allowlist_does_not_widen_tensorflow_hosts(url, redirected):
+    from palimpsest_local import benchmark_cluster_context as context
+    from palimpsest_local import benchmark_tensorflow_context as tensorflow
+
+    with pytest.raises(ArtifactValidationError, match="allowlisted HTTPS"):
+        context._url(url, redirected=redirected)
+    with pytest.raises(ArtifactValidationError, match="allowlisted"):
+        tensorflow._url(context.AIRGAP_URL)
+
+
+def test_cluster_airgap_context_is_fresh_bounded_deterministic_and_external(tmp_path, monkeypatch):
+    import hashlib
+    import tarfile
+
+    from palimpsest_local import benchmark_cluster_context as context
+
+    payload = b"hash-authoritative-offline-airgap-fixture"
+    monkeypatch.setattr(context, "AIRGAP_BYTES", len(payload))
+    calls, checks = [], []
+
+    def transfer(url, target, **kwargs):
+        calls.append((url, kwargs))
+        target.write_bytes(payload)
+        return len(payload), None
+
+    monkeypatch.setattr(context, "_transfer", transfer)
+    root = tmp_path / "fresh"
+    root.mkdir(mode=0o700)
+    archive, receipt = context.acquire_context(
+        root,
+        deadline=100,
+        check=lambda deadline: checks.append(deadline),
+        event=lambda *_: None,
+        max_context_bytes=1024**2,
+    )
+    assert calls[0][0] == context.AIRGAP_URL and len(calls) == 1
+    assert receipt["context_digest"] == "sha256:" + hashlib.sha256(archive.read_bytes()).hexdigest()
+    assert receipt["guest_acquisition"] is False and receipt["worker_run_network"] == "none"
+    assert receipt["download_bytes"] == len(payload) and len(checks) >= 5
+    with tarfile.open(archive) as stream:
+        assert stream.getnames() == ["k3s-airgap-images-amd64.tar"]
+        member = stream.getmembers()[0]
+        assert (member.uid, member.gid, member.mtime, member.mode) == (0, 0, 0, 0o644)
+        assert stream.extractfile(member).read() == payload
+    with pytest.raises(ArtifactValidationError, match="empty fresh"):
+        context.acquire_context(root, deadline=100, check=lambda _: None, event=lambda *_: None)
+
+
+@pytest.mark.parametrize("problem", ["hash", "size", "redirect_loop", "deadline"])
+def test_cluster_owned_curl_rejects_bad_bytes_and_reaps_on_expiry(tmp_path, monkeypatch, problem):
+    import hashlib
+    import subprocess
+    import sys
+    import time
+
+    from palimpsest_local import benchmark_cluster_context as context
+
+    payload = b"fixed-asset-bytes"
+    monkeypatch.setattr(context, "AIRGAP_BYTES", len(payload))
+    monkeypatch.setattr(context, "AIRGAP_SHA256", hashlib.sha256(payload).hexdigest())
+    monkeypatch.setattr(context.shutil, "which", lambda _: "/fixture/curl")
+    real_popen, commands, processes = subprocess.Popen, [], []
+
+    def popen(command, **kwargs):
+        commands.append(command)
+        emitted = payload[:-1] if problem == "size" else b"x" * len(payload) if problem == "hash" else payload
+        status = (
+            "302\\nhttps://release-assets.githubusercontent.com/github-production-release-asset/1?signature=fixed"
+            if problem == "redirect_loop"
+            else "200\\n"
+        )
+        script = (
+            "import sys,time; sys.stdout.buffer.write("
+            + repr(emitted)
+            + "); sys.stdout.flush(); sys.stderr.write("
+            + repr(status.replace("\\n", "\n"))
+            + "); sys.stderr.flush()"
+        )
+        if problem == "deadline":
+            script += "; time.sleep(30)"
+        process = real_popen([sys.executable, "-c", script], **kwargs)
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(context.subprocess, "Popen", popen)
+    check_count = [0]
+
+    def check(_):
+        check_count[0] += 1
+        if problem == "deadline" and check_count[0] >= 3:
+            raise ArtifactValidationError("approval expired")
+
+    with pytest.raises(ArtifactValidationError):
+        context._transfer(
+            context.AIRGAP_URL
+            if problem != "redirect_loop"
+            else "https://release-assets.githubusercontent.com/github-production-release-asset/1?signature=fixed",
+            tmp_path / "asset",
+            deadline=time.monotonic() + 10,
+            check=check,
+            redirected=problem == "redirect_loop",
+        )
+    assert len(processes) == 1 and processes[0].poll() is not None
+    command = commands[0]
+    assert "--retry" not in command and "--location" not in command
+    assert command[command.index("--max-redirs") + 1] == "0"
+    assert command[command.index("--noproxy") + 1] == "*"
+
+
+def test_api_cluster_accepts_hub_qualified_profile_name_alphabet():
+    value = api_cluster_config()
+    value["cluster_profile"] = "K3s-cpu.4c"
+    workloads.validate_profile(value)
+
+
+def test_api_cluster_rejects_same_tag_with_unqualified_base_digest():
+    value = api_cluster_config()
+    value["images"]["k3s"] = "docker.io/rancher/k3s:v1.37.1-k3s1@sha256:" + "b" * 64
+    with pytest.raises(ArtifactValidationError, match="exact qualified.*digest"):
         workloads.validate_profile(value)

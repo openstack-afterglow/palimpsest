@@ -17,6 +17,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import tempfile
 import urllib.error
 import urllib.parse
@@ -167,7 +168,7 @@ class HubClient:
         path: str,
         *,
         query: dict[str, Any] | None = None,
-        body: bytes | None = None,
+        body: Any = None,
         content_type: str | None = None,
         headers: dict[str, str] | None = None,
     ):
@@ -240,26 +241,102 @@ class HubClient:
             raise HubError("layer and config identities must be SHA-256 digests")
         return self._json_request("PATCH", f"/layers/{normalized}", changes, headers={"If-Match": f'"{expected}"'})
 
-    def upload_build_context(self, source: Path) -> dict[str, Any]:
-        """Upload a bounded tar context; the server checks its digest before job admission."""
-        with Path(source).open("rb") as stream:
-            payload = stream.read(16 * 1024 * 1024 + 1)
-        if not payload or len(payload) > 16 * 1024 * 1024:
-            raise HubError("build context must contain 1..16777216 bytes")
+    def upload_build_context(
+        self, source: Path, *, max_bytes: int = 16 * 1024 * 1024, before_send=None
+    ) -> dict[str, Any]:
+        """Stream one descriptor-bound tar; larger operator grants are explicit."""
         import hashlib
 
-        digest = "sha256:" + hashlib.sha256(payload).hexdigest()
-        try:
-            with self._open(
-                "POST",
-                "/build-contexts",
-                body=payload,
-                content_type="application/x-tar",
-                headers={"X-Content-SHA256": digest},
-            ) as response:
-                return json.loads(response.read())
-        except urllib.error.HTTPError as exc:
-            raise self._wrap_http_error(exc, "POST", "/build-contexts") from exc
+        if type(max_bytes) is not int or not 1 <= max_bytes <= 1024**3:
+            raise HubError("build context maximum must be 1..1073741824 bytes")
+        fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as stream:
+            original = os.fstat(stream.fileno())
+            if (
+                not stat.S_ISREG(original.st_mode)
+                or original.st_uid != os.geteuid()
+                or original.st_nlink != 1
+                or original.st_mode & 0o022
+            ):
+                raise HubError("build context must be a single-link owned regular file without external writers")
+            if not 1 <= original.st_size <= max_bytes:
+                raise HubError(f"build context must contain 1..{max_bytes} bytes")
+
+            def unchanged():
+                current = os.fstat(stream.fileno())
+                if any(
+                    getattr(current, field) != getattr(original, field)
+                    for field in (
+                        "st_dev",
+                        "st_ino",
+                        "st_size",
+                        "st_mtime_ns",
+                        "st_ctime_ns",
+                        "st_nlink",
+                        "st_uid",
+                        "st_mode",
+                    )
+                ):
+                    raise HubError("build context changed during its original upload; never replay")
+
+            digest = hashlib.sha256()
+            remaining = original.st_size
+            while remaining:
+                unchanged()
+                chunk = stream.read(min(remaining, 1024**2))
+                if not chunk:
+                    raise HubError("build context truncated before upload")
+                digest.update(chunk)
+                remaining -= len(chunk)
+            unchanged()
+            expected = digest.hexdigest()
+            stream.seek(0)
+
+            class Payload:
+                def __init__(self):
+                    self.remaining = original.st_size
+                    self.digest = hashlib.sha256()
+
+                def read(self, size=1024**2):
+                    unchanged()
+                    if self.remaining == 0:
+                        if self.digest.hexdigest() != expected:
+                            raise HubError("build context bytes changed during upload; never replay")
+                        return b""
+                    chunk = stream.read(min(self.remaining, 1024**2, size if size > 0 else 1024**2))
+                    if not chunk:
+                        raise HubError("build context truncated during upload; never replay")
+                    self.remaining -= len(chunk)
+                    self.digest.update(chunk)
+                    return chunk
+
+            payload = Payload()
+            try:
+                if before_send is not None:
+                    before_send()
+                with self._open(
+                    "POST",
+                    "/build-contexts",
+                    body=payload,
+                    content_type="application/x-tar",
+                    headers={"X-Content-SHA256": "sha256:" + expected, "Content-Length": str(original.st_size)},
+                ) as response:
+                    unchanged()
+                    if payload.remaining or payload.digest.hexdigest() != expected:
+                        raise HubError("build context transport did not consume the exact original bytes; never replay")
+                    raw = response.read(1024**2 + 1)
+                    if len(raw) > 1024**2:
+                        raise HubError("build context response exceeds bounded JSON size")
+                    receipt = json.loads(raw)
+                    if (
+                        not isinstance(receipt, dict)
+                        or receipt.get("digest") != "sha256:" + expected
+                        or receipt.get("size_bytes") != original.st_size
+                    ):
+                        raise HubError("build context receipt differs from original upload; never replay")
+                    return receipt
+            except urllib.error.HTTPError as exc:
+                raise self._wrap_http_error(exc, "POST", "/build-contexts") from exc
 
     def import_registry_image(self, request: dict[str, Any]) -> dict[str, Any]:
         """Submit one request_id-bound server import; never execute or retry it locally."""

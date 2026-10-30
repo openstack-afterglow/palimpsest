@@ -1,8 +1,8 @@
 """Tracked, bounded OCI computations and an exact-guest rancher/k3s deployment.
 
-These functions never provision or delete cloud resources. GPU and privileged
-cluster profiles deliberately use the SDK reference lane: the API OCI chroot
-cannot inject host NVIDIA drivers or provide a writable privileged cgroup mount.
+GPU API profiles require an explicit operator-qualified GPU profile. The SDK
+container method remains a distinct reference lane; API clusters require their
+own operator-qualified whole-VM profile. Neither method is remote attestation.
 A workload result is evidence from a successful process, not remote attestation;
 the runner must also retain the process return code and exact image identity.
 """
@@ -21,14 +21,22 @@ from collections.abc import Callable
 
 from .errors import ArtifactValidationError
 
-_API_METHODS = ("api-import", "api-build", "api-reuse")
+_API_METHODS = ("api-import", "api-build", "api-reuse", "api-cold-warm")
+TENSORFLOW_GPU_BASE = (
+    "docker.io/pytorch/pytorch:2.8.0-cuda12.6-cudnn9-runtime@"
+    "sha256:dab81780fd94483b67b4b5679cc0024939b08e48540d39476d284cb29002ed69"
+)
 PROFILES = {
     name: {
         "description": description,
         "gpu": gpu,
         "cluster": name == "k3s",
         "image_keys": ("k3s", "k3s-probe") if name == "k3s" else (name,),
-        "methods": ("openstack-container",) if gpu or name == "k3s" else (*_API_METHODS, "openstack-container"),
+        "methods": ("openstack-container", "api-cluster")
+        if name == "k3s"
+        else ("api-cold-warm", "openstack-container")
+        if gpu
+        else (*_API_METHODS, "openstack-container"),
         "default_method": "openstack-container",
         "timeout_seconds": 600 if name == "k3s" else 300,
         "iterations": 10,
@@ -96,8 +104,18 @@ def validate_profile(config: dict) -> None:
     method = config.get("method", profile["default_method"])
     if method not in profile["methods"]:
         raise ArtifactValidationError(
-            f"unsupported {scenario} method: use openstack-container; API OCI has no NVIDIA driver injection or privileged cluster support"
+            f"unsupported {scenario} method: use openstack-container or an explicitly supported API profile"
         )
+    if profile["gpu"] and method.startswith("api-"):
+        gpu_profile = config.get("gpu_profile")
+        if not isinstance(gpu_profile, str) or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,62}", gpu_profile):
+            raise ArtifactValidationError("GPU API scenarios require an explicit operator-qualified gpu_profile")
+        if scenario == "tensorflow-cuda" and config.get("hub", {}).get("image_run_network", "none") != "none":
+            raise ArtifactValidationError("fixed TensorFlow build requires worker image_run_network=none")
+        if scenario == "tensorflow-cuda" and config.get("images", {}).get(scenario) != TENSORFLOW_GPU_BASE:
+            raise ArtifactValidationError(
+                "derived TensorFlow API recipe requires the original pinned Torch2.8 CUDA12.6/cuDNN9 base"
+            )
     images = config.get("images", {})
     if not isinstance(images, dict):
         raise ArtifactValidationError("scenario images must be a mapping")
@@ -111,10 +129,30 @@ def validate_profile(config: dict) -> None:
             raise ArtifactValidationError("CUDA kernel compilation requires an explicitly tagged devel image with nvcc")
     if scenario == "k3s":
         _cluster_options(config)
+        if method == "api-cluster":
+            options = _cluster_options(config)
+            if options["agents"] != 1 or options["probe_replicas"] != 2:
+                raise ArtifactValidationError("API cluster requires exactly one server, one agent and two probes")
+            if not isinstance(config.get("cluster_profile"), str) or not re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", config["cluster_profile"]
+            ):
+                raise ArtifactValidationError("API cluster requires an explicit operator-qualified cluster_profile")
+            if config.get("gpu_profile") is not None:
+                raise ArtifactValidationError("API cluster and GPU profiles are mutually exclusive")
+            if config.get("hub", {}).get("image_run_network", "none") != "none":
+                raise ArtifactValidationError("offline k3s build requires worker image_run_network=none")
+            from .benchmark_cluster_context import K3S_IMAGE, K3S_VERSION, PAUSE_IMAGE
+
+            if config.get("k3s_version") != K3S_VERSION:
+                raise ArtifactValidationError("API cluster requires the fixed airgap k3s version")
+            if images["k3s"] != K3S_IMAGE:
+                raise ArtifactValidationError("API cluster requires the exact qualified rancher/k3s base digest")
+            if images["k3s-probe"] != PAUSE_IMAGE:
+                raise ArtifactValidationError("API cluster requires the fixed offline pause image digest")
     else:
         options = _options(config)
         if method.startswith("api-"):
-            command = _python_argv(scenario, options)
+            command = _cuda_argv(options) if scenario == "cuda" else _python_argv(scenario, options)
             if len(command) > 256 or any(len(item.encode()) > 4096 for item in command):
                 raise ArtifactValidationError("workload argv exceeds the public instance result contract")
 
@@ -280,6 +318,8 @@ int main(int argc, char** argv) {
         check(cudaGetDeviceCount(&devices)); if (devices < 1) throw std::runtime_error("no CUDA devices");
         check(cudaSetDevice(0)); check(cudaDriverGetVersion(&driver)); check(cudaRuntimeGetVersion(&runtime));
         cudaDeviceProp p; check(cudaGetDeviceProperties(&p, 0));
+        if (p.major != COMPILED_ARCH_MAJOR || p.minor != COMPILED_ARCH_MINOR)
+            throw std::runtime_error("compiled architecture differs from selected GPU");
         char pci[64]; check(cudaDeviceGetPCIBusId(pci, sizeof(pci), 0));
         const int count = MATRIX_SIZE * MATRIX_SIZE;
         float* output = nullptr; check(cudaMalloc(&output, count * sizeof(float)));
@@ -309,6 +349,7 @@ int main(int argc, char** argv) {
           << "\"device_count\":" << devices << ",\"device_name\":" << quote(p.name)
           << ",\"pci_bus_id\":" << quote(pci) << ",\"total_memory_bytes\":" << p.totalGlobalMem
           << ",\"compute_capability\":[" << p.major << ',' << p.minor << "],\"cuda_available\":true,"
+          << "\"compiled_compute_capability\":[" << COMPILED_ARCH_MAJOR << ',' << COMPILED_ARCH_MINOR << "],"
           << "\"cuda_driver_version\":" << driver << ",\"cuda_runtime_version\":" << runtime
           << ",\"compiled_cuda_version\":" << CUDART_VERSION << ",\"cuda_allocated_bytes\":" << count * sizeof(float)
           << ",\"synchronization_count\":" << ITERATIONS << ",\"kernel_launches\":" << ITERATIONS
@@ -339,6 +380,189 @@ def _python_argv(scenario, options):
     ]
 
 
+def _cuda_argv(options):
+    # Separate bounded argv chunks preserve the public per-argument limit without
+    # requiring Python in the CUDA devel image or acquiring source inside a guest.
+    script = (
+        "umask 077\nwork=$(mktemp -d)\ntrap 'rm -rf -- \"$work\"' EXIT HUP INT TERM\n"
+        'timeout --signal=TERM --kill-after=5s 15s nvidia-smi --query-gpu=index,uuid,name,driver_version,memory.total,pci.bus_id --format=csv,noheader,nounits > "$work/nvidia.csv"\n'
+        "timeout --signal=TERM --kill-after=5s 10s nvcc --version\n"
+        'printf \'%s\' "$@" > "$work/workload.cu"\n'
+        "capability=$(timeout --signal=TERM --kill-after=5s 15s nvidia-smi --id=0 --query-gpu=compute_cap --format=csv,noheader,nounits)\n"
+        'case "$capability" in [0-9].[0-9]|[1-9][0-9].[0-9]) ;; *) printf "invalid GPU compute capability\\n" >&2; exit 2;; esac\n'
+        'target="sm_${capability%.*}${capability#*.}"\n'
+        + f'timeout --signal=TERM --kill-after=5s {options["timeout_seconds"]}s nvcc -O2 -arch="$target" -DCOMPILED_ARCH_MAJOR="${{capability%.*}}" -DCOMPILED_ARCH_MINOR="${{capability#*.}}" -DMATRIX_SIZE={options["matrix_size"]} -DITERATIONS={options["iterations"]} "$work/workload.cu" -o "$work/kernel"\n'
+        + f'timeout --signal=TERM --kill-after=5s {options["timeout_seconds"]}s "$work/kernel" "$work/nvidia.csv"\n'
+    )
+    return [
+        "timeout",
+        "--signal=TERM",
+        "--kill-after=5s",
+        f"{options['timeout_seconds']}s",
+        "/bin/sh",
+        "-ec",
+        script,
+        "palimpsest-cuda",
+        *[_CUDA_SOURCE[offset : offset + 3000] for offset in range(0, len(_CUDA_SOURCE), 3000)],
+    ]
+
+
+def api_image_recipe(config):
+    """Fixed externally built image request and honest acquisition provenance."""
+    import hashlib
+    from pathlib import Path
+
+    validate_profile(config)
+    base = config["images"][config["scenario"]]
+    provenance = {"base_reference": base, "guest_installation": False}
+    if config["method"] == "api-cluster":
+        from .benchmark_cluster_context import AIRGAP_BYTES, AIRGAP_SHA256, K3S_VERSION
+
+        dockerfile = (
+            "FROM " + base + "\n"
+            "RUN mkdir -p /opt/palimpsest /var/lib/rancher/k3s/agent/images"
+            " && cp /bin/busybox /opt/palimpsest/probe-busybox\n"
+            "COPY k3s-airgap-images-amd64.tar /var/lib/rancher/k3s/agent/images/k3s-airgap-images-amd64.tar\n"
+            "RUN printf '%s\\n' '" + config["images"]["k3s-probe"] + "' > /opt/palimpsest/pause-image"
+            " && printf '%s\\n' '" + K3S_VERSION + "' > /opt/palimpsest/k3s-version\n"
+        )
+        provenance.update(
+            kind="offline-k3s-airgap",
+            k3s_version=K3S_VERSION,
+            airgap_sha256=AIRGAP_SHA256,
+            airgap_bytes=AIRGAP_BYTES,
+            pause_reference=config["images"]["k3s-probe"],
+            required_operator_image_run_network="none",
+            external_dependency_context=True,
+        )
+        return {"dockerfile": dockerfile}, provenance
+    if config["scenario"] == "tensorflow-cuda":
+        lock = Path(__file__).with_name("tensorflow_delta.lock").read_text()
+        dockerfile = (
+            "FROM "
+            + TENSORFLOW_GPU_BASE
+            + "\n"
+            + "RUN --mount=type=bind,source=wheels,target=/opt/palimpsest-wheels"
+            + " --mount=type=bind,source=tensorflow.lock,target=/tmp/palimpsest-tensorflow.lock"
+            + " /opt/conda/bin/python -m pip install --no-index --find-links=/opt/palimpsest-wheels"
+            + " --no-cache-dir --no-deps --require-hashes -r /tmp/palimpsest-tensorflow.lock\n"
+            + "CMD "
+            + json.dumps(workload_argv(config))
+            + "\n"
+        )
+        provenance.update(
+            kind="derived-torch-base-tensorflow-delta",
+            tensorflow_version="2.21.0",
+            lock_sha256=hashlib.sha256(lock.encode()).hexdigest(),
+            hash_pinned_wheels=18,
+            supplemental_wheels=17,
+            required_operator_image_run_network="none",
+            external_dependency_context=True,
+            untouched_tensorflow_image=False,
+            historical_lock="api-nvidia-kms6qrv4/plain-ubuntu-hotplug-20261021/srv-cinder-runtime/tensorflow-delta.lock",
+        )
+        return {"dockerfile": dockerfile}, provenance
+    if config["method"] == "api-build":
+        return {"dockerfile": "FROM " + base + "\nCMD " + json.dumps(workload_argv(config)) + "\n"}, provenance
+    return {"reference": base}, provenance
+
+
+def validate_cluster_result(config, stdout, members, observations):
+    """Bind a sealed server proof to both admitted API/VM identities."""
+    import uuid
+
+    def reject():
+        raise ArtifactValidationError("API cluster proof differs from the exact two admitted nodes and probes")
+
+    if not isinstance(stdout, str) or len(stdout.encode()) > 8192:
+        reject()
+    try:
+        document = json.loads(stdout)
+    except (ValueError, TypeError):
+        reject()
+    if not isinstance(document, dict) or set(document) != {"palimpsest_cluster"}:
+        reject()
+    proof = document["palimpsest_cluster"]
+    if not isinstance(proof, dict) or (
+        proof.get("schema") != "palimpsest.cluster-result.v1"
+        or proof.get("success") is not True
+        or proof.get("k3s_version") != config["k3s_version"]
+        or not isinstance(proof.get("checks"), dict)
+        or proof["checks"].get("nodes") is not True
+        or proof["checks"].get("numerical") is not True
+        or any(value is not True for value in proof["checks"].values())
+        or len(members) != 2
+        or len(observations) != 2
+    ):
+        reject()
+    names, addresses, identities = [], [], set()
+    for index, (member, observed) in enumerate(zip(members, observations, strict=True)):
+        try:
+            node_name = "pal-" + uuid.UUID(member["id"]).hex
+            address = ipaddress.IPv4Address(observed["private_ip"])
+        except (KeyError, ValueError, TypeError):
+            reject()
+        cluster = member.get("cluster") or {}
+        if (
+            cluster.get("profile") != config["cluster_profile"]
+            or cluster.get("role") != ("server" if index == 0 else "agent")
+            or cluster.get("node_name") != node_name
+            or cluster.get("server_instance_id") != (None if index == 0 else members[0]["id"])
+            or (index == 1 and cluster.get("server_address") != addresses[0])
+            or not address.is_private
+            or address.is_loopback
+            or address.is_link_local
+            or address.is_multicast
+            or address.is_unspecified
+        ):
+            reject()
+        for key in ("id", "server_id", "boot_volume_id"):
+            value = member.get(key)
+            if not isinstance(value, str) or not value or value in identities:
+                reject()
+            identities.add(value)
+        names.append(node_name)
+        addresses.append(str(address))
+    nodes, pods = proof.get("nodes"), proof.get("pods")
+    if (
+        len(set(names)) != 2
+        or len(set(addresses)) != 2
+        or not isinstance(nodes, list)
+        or len(nodes) != 2
+        or not isinstance(pods, list)
+        or len(pods) != 2
+        or any(not isinstance(item, dict) for item in nodes + pods)
+        or {node.get("name") for node in nodes} != set(names)
+        or {pod.get("node") for pod in pods} != set(names)
+    ):
+        reject()
+    for node in nodes:
+        if (
+            node.get("internal_ip") != addresses[names.index(node["name"])]
+            or node.get("kubelet_version") != config["k3s_version"]
+            or not isinstance(node.get("container_runtime"), str)
+            or not node["container_runtime"].startswith("containerd://")
+        ):
+            reject()
+    pod_names = set()
+    for pod in pods:
+        name = pod.get("name")
+        if (
+            not isinstance(name, str)
+            or not re.fullmatch(r"[a-z0-9][a-z0-9.-]{0,252}", name)
+            or name in pod_names
+            or pod.get("image") != config["images"]["k3s-probe"]
+            or pod.get("ready") is not True
+            or type(pod.get("restarts")) is not int
+            or pod["restarts"] != 0
+            or type(pod.get("numerical_sum")) is not int
+            or pod["numerical_sum"] != 4950
+        ):
+            reject()
+        pod_names.add(name)
+    return proof
+
+
 def workload_argv(config: dict) -> list[str]:
     """The actual process argv used identically by API OCI and Docker CPU lanes.
 
@@ -352,24 +576,7 @@ def workload_argv(config: dict) -> list[str]:
         raise ArtifactValidationError("k3s uses its dedicated cluster deployment path")
     options = _options(config)
     if scenario == "cuda":
-        script = (
-            "umask 077\nwork=$(mktemp -d)\ntrap 'rm -rf -- \"$work\"' EXIT HUP INT TERM\n"
-            'timeout --signal=TERM --kill-after=5s 15s nvidia-smi --query-gpu=index,uuid,name,driver_version,memory.total,pci.bus_id --format=csv,noheader,nounits > "$work/nvidia.csv"\n'
-            "timeout --signal=TERM --kill-after=5s 10s nvcc --version\ncat > \"$work/workload.cu\" <<'PALIMPSEST_CUDA_SOURCE'\n"
-            + _CUDA_SOURCE
-            + "\nPALIMPSEST_CUDA_SOURCE\n"
-            + f'timeout --signal=TERM --kill-after=5s {options["timeout_seconds"]}s nvcc -O2 -DMATRIX_SIZE={options["matrix_size"]} -DITERATIONS={options["iterations"]} "$work/workload.cu" -o "$work/kernel"\n'
-            + f'timeout --signal=TERM --kill-after=5s {options["timeout_seconds"]}s "$work/kernel" "$work/nvidia.csv"\n'
-        )
-        return [
-            "timeout",
-            "--signal=TERM",
-            "--kill-after=5s",
-            f"{options['timeout_seconds']}s",
-            "/bin/sh",
-            "-ec",
-            script,
-        ]
+        return _cuda_argv(options)
     return _python_argv(scenario, options)
 
 
@@ -543,6 +750,7 @@ def validate_result(config: dict, stdout: str) -> dict:
             _integer(capability[0], "compute capability major", 1, 99)
             _integer(capability[1], "compute capability minor", 0, 99)
             if scenario == "cuda":
+                _exact(result, "compiled_compute_capability", capability)
                 raw = result.get("nvidia_smi_csv")
                 if not isinstance(raw, str) or len(raw) > 65536:
                     raise ArtifactValidationError("CUDA NVIDIA inventory is missing")

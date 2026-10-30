@@ -16,11 +16,18 @@ from fastapi import HTTPException
 from sqlalchemy import func, select
 
 from palimpsest_hub.auth import package_target_project_id
+from palimpsest_hub.config import InstanceGpuProfile, Settings
 from palimpsest_hub.instance_models import PalimpsestHubInstance
 from palimpsest_hub.models import exact_identity
 from palimpsest_hub.services.blob_references import retain_blob
 from palimpsest_hub.services.hub_store import MEDIA_TYPE_LAYER_SQUASHFS
 from palimpsest_hub.services.instance_bootstrap import render_bootstrap
+from palimpsest_hub.services.instance_cluster_runtime import (
+    cluster_snapshot,
+    qualified_cluster,
+    require_cluster_source,
+    server_address,
+)
 from palimpsest_hub.services.worker_leases import run_blocking, sql_mutex
 
 MARKER = "palimpsest_instance_id"
@@ -91,6 +98,13 @@ def projection(row):
         "image_job_id": row.spec_json.get("image_job_id"),
         "boot_volume_id": row.boot_volume_id,
         "mode": row.spec_json["mode"],
+        "gpu_profile": row.spec_json.get("gpu_profile"),
+        "gpu": row.spec_json.get("gpu"),
+        "cluster": (
+            {key: item for key, item in row.spec_json["cluster"].items() if key != "qualification"}
+            if row.spec_json.get("cluster")
+            else None
+        ),
         "provenance": row.spec_json.get("provenance"),
         "writable_gib": row.spec_json["writable_gib"],
         "writable_storage": "guest-private boot-disk ext4 loop filesystem",
@@ -110,7 +124,34 @@ async def owned(session, instance_id, project):
     return row
 
 
-def provider_inputs(conn, spec, project, max_boot, base_images=None):
+def qualified_gpu(spec, project, settings):
+    identity = spec.get("gpu_profile")
+    if identity is None:
+        return None
+    configured = settings.palimpsest_hub_instance_gpu_profiles.get(identity)
+    if configured is None:
+        raise HTTPException(422, "GPU profile is not operator-qualified")
+    try:
+        profile = InstanceGpuProfile.model_validate(
+            configured.model_dump() if isinstance(configured, InstanceGpuProfile) else configured
+        )
+    except ValueError:
+        raise HTTPException(422, "GPU profile qualification is invalid") from None
+    if project not in profile.project_ids:
+        raise HTTPException(403, "GPU profile is not qualified for the original caller project")
+    if spec["mode"] != "oci-chroot" or spec["image_id"] != profile.image_id or spec["flavor_id"] != profile.flavor_id:
+        raise HTTPException(422, "GPU profile requires its exact OCI guest image and flavor")
+    qualification = settings.palimpsest_hub_instance_base_images.get(profile.image_id)
+    if qualification is None:
+        raise HTTPException(422, "GPU guest image requires exact operator-qualified content")
+    try:
+        Settings.qualified_base_images({profile.image_id: qualification})
+    except (ValueError, TypeError, KeyError):
+        raise HTTPException(422, "GPU guest content qualification is invalid") from None
+    return {**profile.model_dump(exclude={"project_ids"}), "project_id": project, "base_image": dict(qualification)}
+
+
+def provider_inputs(conn, spec, project, max_boot, base_images=None, gpu=None):
     """No allocation until every explicitly selected provider object is checked."""
     image = conn.image.get_image(spec["image_id"])
     if image is None or str(value(image, "status", "")).lower() != "active":
@@ -124,6 +165,8 @@ def provider_inputs(conn, spec, project, max_boot, base_images=None):
         content = value(image, "hash_value") or value(image, "os_hash_value")
         if (algorithm, content) != (qualification["os_hash_algo"], qualification["os_hash_value"]):
             raise HTTPException(422, "Qualified base image content changed")
+    if gpu is not None and (qualification is None or qualification != gpu["base_image"]):
+        raise HTTPException(422, "GPU guest content qualification changed")
     arch = value(image, "architecture") or props.get("architecture")
     if arch is None and qualification:
         arch = qualification["architecture"]
@@ -156,6 +199,15 @@ def provider_inputs(conn, spec, project, max_boot, base_images=None):
         access = conn.compute.get_flavor_access(spec["flavor_id"]) if public is False else []
         if not any(value(item, "tenant_id") == project for item in access):
             raise HTTPException(403, "Flavor must be public or explicitly grant the original caller project")
+    fetched = conn.compute.fetch_flavor_extra_specs(flavor)
+    extra = value(fetched, "extra_specs", {}) or {}
+    if gpu is not None:
+        if extra.get("pci_passthrough:alias") != gpu["pci_alias"]:
+            raise HTTPException(422, "GPU flavor must declare the exact qualified PCI aliases")
+    elif extra.get("pci_passthrough:alias") or any(
+        re.fullmatch(r"resources[A-Za-z0-9_-]*:.+", key) and "GPU" in key.upper() for key in extra
+    ):
+        raise HTTPException(422, "PCI/GPU flavors require an explicit operator-qualified GPU profile")
     network = conn.network.get_network(spec["network_id"])
     if network is None or value(network, "project_id") != project:
         raise HTTPException(403, "Network must belong to the exact caller project")
@@ -283,7 +335,9 @@ async def snapshot(session, req, actor, store):
     else:
         runtime = {"entrypoint": [], "cmd": [], "env": [], "working_dir": "/", "user": "0"}
         provenance = {"base_image_digest": base_digest}
-    command = req["command"] or [*runtime["entrypoint"], *runtime["cmd"]]
+    command = (
+        ["/bin/k3s"] if req.get("cluster_profile") else req["command"] or [*runtime["entrypoint"], *runtime["cmd"]]
+    )
     if not command:
         raise HTTPException(422, "An executable command or image default command is required")
     if len(command) > 128 or sum(len(arg.encode()) for arg in command) > 16384 or not command[0]:
@@ -307,7 +361,15 @@ async def create(factory, store, settings, actor, conn, req):
     await _legacy_download(actor)
     if req["writable_gib"] > settings.palimpsest_hub_instance_max_writable_gib:
         raise HTTPException(422, "Writable filesystem capacity exceeds configured limit")
-    digest = "sha256:" + hashlib.sha256(json.dumps(req, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    # Adding an opt-in selector must not invalidate pre-upgrade CPU idempotency.
+    digest_req = {
+        key: item
+        for key, item in req.items()
+        if key not in ("gpu_profile", "cluster_profile", "cluster_server_id") or item is not None
+    }
+    digest = (
+        "sha256:" + hashlib.sha256(json.dumps(digest_req, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    )
     token = secrets.token_urlsafe(32)
     # Discover only immutable candidate identities without a writer mutex. Every
     # publication/admission takes lexical CAS locks BEFORE a SQL write fence.
@@ -363,6 +425,8 @@ async def create(factory, store, settings, actor, conn, req):
         if active >= settings.palimpsest_hub_max_instances_per_project:
             raise HTTPException(429, "Project instance limit reached")
         spec = await snapshot(session, effective_req, actor, store)
+        spec["gpu"] = qualified_gpu(spec, project, settings)
+        spec["cluster"] = await cluster_snapshot(session, spec, actor, conn, settings)
         if not set(spec["layer_digests"]) <= set(lock_digests) or (
             spec["base_image_digest"] and spec["base_image_digest"] not in lock_digests
         ):
@@ -377,6 +441,7 @@ async def create(factory, store, settings, actor, conn, req):
                 project,
                 settings.palimpsest_hub_instance_max_boot_gib,
                 settings.palimpsest_hub_instance_base_images,
+                spec["gpu"],
             )
         except HTTPException:
             raise
@@ -400,6 +465,8 @@ async def create(factory, store, settings, actor, conn, req):
             created_at=now,
             updated_at=now,
         )
+        if spec["cluster"] is not None:
+            spec["cluster"]["node_name"] = "pal-" + uuid.UUID(row.id).hex
         session.add(row)
         for bound_digest in dict.fromkeys(
             [*spec["layer_digests"], *([spec["base_image_digest"]] if spec["base_image_digest"] else [])]
@@ -419,6 +486,12 @@ async def create(factory, store, settings, actor, conn, req):
             "layers": spec["layers"],
             "mode": spec["mode"],
             "runtime": spec["runtime"],
+            **({"gpu": spec["gpu"]} if spec["gpu"] is not None else {}),
+            **(
+                {"cluster": {key: item for key, item in spec["cluster"].items() if key != "qualification"}}
+                if spec.get("cluster") is not None
+                else {}
+            ),
             "writable_bytes": spec["writable_gib"] * 1024**3,
             "command": spec["command"],
             "readiness_argv": spec["readiness_argv"],
@@ -433,15 +506,51 @@ async def create(factory, store, settings, actor, conn, req):
             row.status, row.error_code, row.capability_hash = "error", "create_bootstrap_input_limit", None
             await session.commit()
             return projection(row)
+
+        # Provider inspection may block; fresh original-human authority MUST be
+        # checked after those reads, not before a potentially long network gap.
+        def inspect():
+            gpu = qualified_gpu(spec, project, settings)
+            if gpu != spec["gpu"]:
+                raise HTTPException(422, "GPU qualification changed before allocation")
+            cluster = qualified_cluster(spec, project, settings)
+            if cluster != (spec.get("cluster") or {}).get("qualification"):
+                raise HTTPException(422, "Cluster qualification changed before allocation")
+            provider_inputs(
+                conn,
+                spec,
+                project,
+                settings.palimpsest_hub_instance_max_boot_gib,
+                settings.palimpsest_hub_instance_base_images,
+                gpu,
+            )
+
+        try:
+            await run_blocking(inspect)
+            if spec.get("cluster") and spec["cluster"]["role"] == "agent":
+                source = await owned(session, spec["cluster"]["server_instance_id"], project)
+                require_cluster_source(source, spec, actor, settings, spec["cluster"]["qualification"])
+                address = await run_blocking(server_address, conn, source, spec["network_id"])
+                if address != spec["cluster"]["server_address"]:
+                    raise HTTPException(409, "Cluster source network identity changed")
+                # Current read, not the transaction's earlier MariaDB snapshot; retain through allocation.
+                await session.refresh(source, with_for_update=True)
+                require_cluster_source(source, spec, actor, settings, spec["cluster"]["qualification"])
+        except Exception as exc:
+            row.status, row.error_code, row.capability_hash = "error", "create_inputs_changed", None
+            await session.commit()
+            if isinstance(exc, HTTPException):
+                raise
+            raise HTTPException(502, "Provider input validation unavailable") from None
         try:
             await payload_authority(actor, conn, session, spec)
         except HTTPException:
             row.status, row.error_code, row.capability_hash = "error", "create_authority_revoked", None
             await session.commit()
             raise
-        try:
-            server = await run_blocking(
-                conn.compute.create_server,
+
+        def allocate():
+            return conn.compute.create_server(
                 name=spec["name"],
                 flavor_id=spec["flavor_id"],
                 networks=[{"uuid": spec["network_id"]}],
@@ -459,6 +568,9 @@ async def create(factory, store, settings, actor, conn, req):
                 metadata={MARKER: row.id, "palimpsest_request_digest": row.request_digest},
                 user_data=user_data,
             )
+
+        try:
+            server = await run_blocking(allocate)
             server_id = str(value(server, "id", ""))
             uuid.UUID(server_id)
             row.server_id = server_id
@@ -569,7 +681,13 @@ def create_not_attempted(row):
         and row.server_id is None
         and row.boot_volume_id is None
         and row.capability_hash is None
-        and row.error_code in {"create_authority_revoked", "create_bootstrap_expired", "create_bootstrap_input_limit"}
+        and row.error_code
+        in {
+            "create_authority_revoked",
+            "create_bootstrap_expired",
+            "create_bootstrap_input_limit",
+            "create_inputs_changed",
+        }
     )
 
 

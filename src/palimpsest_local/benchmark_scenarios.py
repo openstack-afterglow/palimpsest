@@ -23,7 +23,7 @@ from .state import atomic_write_json
 
 SCHEMA = "palimpsest.benchmark-scenario.v1"
 RESULT_SCHEMA = "palimpsest.benchmark-scenario-result.v1"
-METHODS = ("openstack-container", "api-import", "api-build", "api-reuse")
+METHODS = ("openstack-container", "api-import", "api-build", "api-reuse", "api-cold-warm", "api-cluster")
 _NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,62}\Z")
 _SECRET = re.compile(r"password|secret|credential|authorization|(^|_)token($|_)", re.IGNORECASE)
 
@@ -205,6 +205,25 @@ def validate_scenario(config):
             or parsed.path not in {"", "/"}
         ):
             raise ArtifactValidationError("scenario Hub must be an explicit verified HTTPS origin")
+        if config["scenario"] == "tensorflow-cuda" or config["method"] == "api-cluster":
+            default_context = 1024**3 if config["method"] == "api-cluster" else 16 * 1024**2
+            context_limit = _integer(
+                config["hub"].get("max_context_bytes", default_context), 1, 1024**3, "context upload maximum"
+            )
+            approved_context = _integer(
+                approval.get("max_context_bytes", 16 * 1024**2), 1, 1024**3, "approved context upload maximum"
+            )
+            if context_limit > approved_context:
+                raise ArtifactValidationError(
+                    "cluster context upload exceeds explicit approval"
+                    if config["method"] == "api-cluster"
+                    else "TensorFlow context upload exceeds explicit approval"
+                )
+            if config["method"] == "api-cluster":
+                from .benchmark_cluster_context import AIRGAP_BYTES
+
+                if context_limit < AIRGAP_BYTES + 10240:
+                    raise ArtifactValidationError("fixed k3s airgap exceeds approved context upload budget")
 
     # Configuration is persisted; accept credential references, never literal secrets.
     def secrets(value):
@@ -230,7 +249,7 @@ def plan_scenario(config, *, validate=True):
     elif config["method"] == "openstack-container":
         creates, live = repetitions, 1
     else:
-        creates, live = repetitions * (2 if config["method"] == "api-reuse" else 1), 1
+        creates, live = repetitions * (2 if config["method"] in {"api-reuse", "api-cold-warm"} else 1), 1
     return {
         "schema": "palimpsest.benchmark-scenario-plan.v1",
         "job_id": config["job_id"],
@@ -277,6 +296,8 @@ class ResourceBudget:
         self.policy.update(
             allow_gpu=approval.get("allow_gpu", False), allow_cluster=approval.get("allow_cluster", False)
         )
+        if "max_context_bytes" in approval:
+            self.policy["max_context_bytes"] = approval["max_context_bytes"]
         self.policy.update(
             max_security_groups=approval.get("max_security_groups", 0),
             max_floating_ips=approval.get("max_floating_ips", 0),
@@ -319,7 +340,11 @@ class ResourceBudget:
             for limits, selected in ((self.policy, rows), (self.config["resources"], own)):
                 if (
                     len(selected) >= limits["max_creates"]
-                    or sum(not r["released"] for r in selected) >= limits["max_live"]
+                    or sum(
+                        not r["released"] and (r.get("live_reserved", False) or not r.get("pending", False))
+                        for r in selected
+                    )
+                    >= limits["max_live"]
                     or sum(r["boot_gib"] for r in selected) + boot_gib > limits["max_boot_gib"]
                 ):
                     raise ArtifactValidationError("approval cumulative/live/boot budget exhausted")
@@ -333,6 +358,69 @@ class ResourceBudget:
                 "reserved_unix_seconds": time.time(),
             }
             return identity
+
+    def reserve_pair(self, roles, boot_gib, *, simultaneous=False):
+        """Consume cumulative slots and hold the pair's required live capacity atomically."""
+        _integer(boot_gib, 1, 32768, "reserved boot GiB")
+        with self._locked() as value:
+            self.check_allocation()
+            rows = list(value["reservations"].values())
+            own = [row for row in rows if row["job_id"] == self.config["job_id"]]
+            if len(roles) != 2 or len(set(roles)) != 2 or any(not _NAME.fullmatch(role) for role in roles):
+                raise ArtifactValidationError("cold/warm requires two distinct bounded roles")
+            if any(row["role"] in roles for row in own):
+                raise ArtifactValidationError("creation role consumed; inspect instead of replaying")
+            for limits, selected in ((self.policy, rows), (self.config["resources"], own)):
+                if (
+                    len(selected) + 2 > limits["max_creates"]
+                    or sum(row["boot_gib"] for row in selected) + 2 * boot_gib > limits["max_boot_gib"]
+                ):
+                    raise ArtifactValidationError("approval pair cumulative/boot budget exhausted")
+                if (
+                    sum(
+                        not row["released"] and (row.get("live_reserved", False) or not row.get("pending", False))
+                        for row in selected
+                    )
+                    + (2 if simultaneous else 1)
+                    > limits["max_live"]
+                ):
+                    raise ArtifactValidationError("approval pair live budget exhausted")
+            result = {}
+            for index, role in enumerate(roles):
+                identity = str(uuid.uuid4())
+                value["reservations"][identity] = {
+                    "job_id": self.config["job_id"],
+                    "role": role,
+                    "boot_gib": boot_gib,
+                    "released": False,
+                    "pending": True,
+                    "live_reserved": simultaneous or index == 0,
+                    "server_id": None,
+                    "reserved_unix_seconds": time.time(),
+                }
+                result[role] = identity
+            return result
+
+    def activate(self, identity, deadline):
+        with self._locked() as value:
+            self.check_allocation(deadline)
+            row = value["reservations"][identity]
+            if row["job_id"] != self.config["job_id"] or not row.get("pending") or row["released"]:
+                raise ArtifactValidationError("pair reservation is not an unused original slot")
+            rows = list(value["reservations"].values())
+            own = [item for item in rows if item["job_id"] == self.config["job_id"]]
+            if not row.get("live_reserved", False):
+                for limits, selected in ((self.policy, rows), (self.config["resources"], own)):
+                    if (
+                        sum(
+                            not item["released"]
+                            and (item.get("live_reserved", False) or not item.get("pending", False))
+                            for item in selected
+                        )
+                        >= limits["max_live"]
+                    ):
+                        raise ArtifactValidationError("approval live budget exhausted")
+            row["pending"] = False
 
     def bind(self, identity, server_id):
         with self._locked() as value:
@@ -578,6 +666,332 @@ def _delete_consumer(
     return row
 
 
+def _boundary(start, finish, *, strict=True):
+    import math
+
+    elapsed = finish[0] - start[0]
+    if (
+        not all(math.isfinite(value) for value in (*start, *finish, elapsed))
+        or elapsed < 0
+        or (strict and elapsed == 0)
+        or abs((finish[1] - start[1]) - elapsed) > 15
+    ):
+        raise ArtifactValidationError("clock disagreement invalidates the measured boundary")
+    return {
+        "started_monotonic_seconds": start[0],
+        "finished_monotonic_seconds": finish[0],
+        "started_unix_seconds": start[1],
+        "finished_unix_seconds": finish[1],
+        "elapsed_seconds": elapsed,
+    }
+
+
+def _run_api_cluster(config, output, prefix, measurement, state, cloud, budget, live, deadline, event, retained):
+    """One cold image job, then fresh simultaneous server/agent pairs through API only."""
+    import ipaddress
+    import tempfile
+
+    from .benchmark_cluster_context import acquire_context
+    from .benchmark_scenario_workloads import api_image_recipe, validate_cluster_result
+
+    pair_deadline = deadline
+
+    def fence():
+        budget.check_allocation(pair_deadline)
+        if _source_identity()["files"] != state["runner_source"]["files"]:
+            raise ArtifactValidationError("runner source changed before cluster effect; no call")
+
+    def journal(path, value):
+        atomic_write_json(output / path, value)
+        fence()
+
+    def observe(row):
+        fence()
+        observed = cloud.verify_external(
+            {"server_id": row["server_id"], "volume_ids": [row["boot_volume_id"]]},
+            expected_marker={"palimpsest_instance_id": row["id"]},
+        )
+        fence()
+        private = []
+        for value in observed.get("addresses", []):
+            try:
+                address = ipaddress.IPv4Address(value)
+            except (ValueError, TypeError):
+                continue
+            if (
+                address.is_private
+                and not address.is_loopback
+                and not address.is_link_local
+                and not address.is_multicast
+                and not address.is_unspecified
+            ):
+                private.append(str(address))
+        if observed.get("status") != "ACTIVE" or len(set(private)) != 1:
+            raise ArtifactValidationError("cluster provider must expose one ACTIVE owned private IPv4")
+        return dict(observed, private_ip=private[0])
+
+    roles = [prefix + "-consumer1", prefix + "-consumer2"]
+    fence()
+    reservations = budget.reserve_pair(roles, config["placement"]["boot_gib"], simultaneous=True)
+    for role in roles:
+        journal(role + "-reservation.json", {"id": reservations[role], "role": role, "call_tracking": True})
+    cold = not retained
+    start = (time.monotonic(), time.time())
+    measurement.update(boundary="cold" if cold else "prepared-reuse", consumers=[])
+    if cold:
+        request = {
+            "request_id": str(uuid.uuid5(uuid.NAMESPACE_URL, config["job_id"] + ":cluster-image")),
+            "name": "benchmark-" + config["job_id"].replace("_", "-"),
+            "platform": "linux/amd64",
+        }
+        recipe, provenance = api_image_recipe(config)
+        request.update(recipe)
+        measurement["image_recipe"] = provenance
+        maximum = config["hub"].get("max_context_bytes", 1024**3)
+        journal(
+            prefix + "-context-intent.json",
+            {
+                "request_id": request["request_id"],
+                "max_bytes": maximum,
+                "effect": "uncertain-no-replay",
+                "external_acquisition": True,
+            },
+        )
+        approval_remaining = (
+            datetime.fromisoformat(config["approval"]["expires_at"].replace("Z", "+00:00")).timestamp() - time.time()
+        )
+        with tempfile.TemporaryDirectory(prefix=".cluster-context-", dir=output) as temporary:
+            context, dependencies = acquire_context(
+                temporary,
+                deadline=min(deadline, time.monotonic() + approval_remaining),
+                check=budget.check_allocation,
+                event=event,
+                max_context_bytes=maximum,
+            )
+            measurement["dependency_acquisition"] = _boundary(start, (time.monotonic(), time.time()))
+            measurement["dependencies"] = dependencies
+            journal(
+                prefix + "-context-upload-intent.json",
+                {
+                    "request_id": request["request_id"],
+                    "context_digest": dependencies["context_digest"],
+                    "context_bytes": dependencies["context_bytes"],
+                    "effect": "uncertain-no-replay",
+                },
+            )
+            event("context-upload-started", dependencies)
+            upload_start = (time.monotonic(), time.time())
+            fence()
+            receipt = _hub(config, cloud.connection).upload_build_context(
+                context,
+                max_bytes=maximum,
+                before_send=fence,
+            )
+            if (
+                receipt.get("digest") != dependencies["context_digest"]
+                or receipt.get("size_bytes") != dependencies["context_bytes"]
+            ):
+                raise ArtifactValidationError("uploaded cluster context identity differs; no replay")
+            journal(prefix + "-context-accepted.json", receipt)
+            measurement["context_upload"] = _boundary(upload_start, (time.monotonic(), time.time()))
+            request["context_digest"] = receipt["digest"]
+        journal(prefix + "-image-intent.json", request)
+        event("image-submission-started", {"request_id": request["request_id"]})
+        submission = {"request_id": request["request_id"], "effect": "uncertain-no-replay"}
+        measurement["image_submission"] = submission
+        atomic_write_json(output / (prefix + "-image-submission.json"), submission)
+        client = _hub(config, cloud.connection)
+        try:
+            fence()
+        except ArtifactValidationError:
+            submission["effect"] = "no-call"
+            atomic_write_json(output / (prefix + "-image-submission.json"), submission)
+            raise
+        image_start = (time.monotonic(), time.time())
+        admitted = client.build_dockerfile(request)
+        atomic_write_json(output / (prefix + "-image-accepted.json"), admitted)
+        job = _wait(
+            lambda: _hub(config, cloud.connection).get_image_job(admitted["id"]),
+            {"complete"},
+            deadline,
+            event,
+            "image-status",
+        )
+        if not job.get("output_digests") or any(
+            not isinstance(value, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", value)
+            for value in job["output_digests"]
+        ):
+            raise ArtifactValidationError("cluster image job lacks exact ordered completed layers")
+        atomic_write_json(output / (prefix + "-image-result.json"), job)
+        measurement["acquisition_build"] = _boundary(image_start, (time.monotonic(), time.time()))
+        submission.update(effect="complete", image_job_id=job["id"])
+        retained.update(job=job, image_recipe=provenance, dependencies=dependencies, identities=[])
+    else:
+        fence()
+        job = _hub(config, cloud.connection).get_image_job(retained["job"]["id"])
+        if (
+            job.get("status") != "complete"
+            or job.get("id") != retained["job"]["id"]
+            or job.get("output_digests") != retained["job"]["output_digests"]
+        ):
+            raise ArtifactValidationError("prepared cluster reuse changed the exact ordered completed job")
+        journal(prefix + "-image-reuse.json", job)
+        measurement.update(image_recipe=retained["image_recipe"], dependencies=retained["dependencies"])
+    job = retained["job"]
+    measurement["image_job_id"] = job["id"]
+    pair_start = (time.monotonic(), time.time())
+    pair_deadline = min(deadline, pair_start[0] + config.get("cluster", {}).get("timeout_seconds", 600))
+    members, originals, specs, observations, records = [], [], [], [], []
+    for index, role in enumerate(roles):
+        reservation = reservations[role]
+        fence()
+        budget.activate(reservation, pair_deadline)
+        spec = {
+            key: value
+            for key, value in config["placement"].items()
+            if key
+            in {
+                "image_id",
+                "flavor_id",
+                "network_id",
+                "security_group_ids",
+                "boot_gib",
+                "writable_gib",
+            }
+        }
+        spec.update(
+            request_id=str(uuid.uuid5(uuid.NAMESPACE_URL, config["job_id"] + ":" + role)),
+            name="pal-bench-" + role + "-" + config["job_id"],
+            command=[],
+            cluster_profile=config["cluster_profile"],
+        )
+        if index:
+            spec.update(source_instance_id=members[0]["id"], cluster_server_id=members[0]["id"])
+        else:
+            spec["image_job_id"] = job["id"]
+        journal(role + "-intent.json", spec)
+        event("consumer-create-started", {"role": role, "request_id": spec["request_id"]})
+        record = dict(
+            origin="api", role=role, request_id=spec["request_id"], reservation_id=reservation, effect="no-call"
+        )
+        state["resources"].append(record)
+        client = _hub(config, cloud.connection)
+        record["effect"] = "uncertain-no-replay"
+        atomic_write_json(output / (role + "-submission.json"), record)
+        try:
+            fence()
+        except ArtifactValidationError:
+            record["effect"] = "no-call"
+            atomic_write_json(output / (role + "-submission.json"), record)
+            raise
+        live.append(record)
+        consumer_start = (time.monotonic(), time.time())
+        admitted = client.create_instance(spec)
+        atomic_write_json(output / (role + "-accepted.json"), admitted)
+        record.update(instance_id=admitted["id"], server_id=admitted.get("server_id"), effect="accepted")
+        originals.append(admitted)
+        specs.append(spec)
+        records.append(record)
+
+        def member_visible(admitted=admitted, index=index):
+            fence()
+            row = _hub(config, cloud.connection).get_instance(admitted["id"])
+            fence()
+            if row.get("status") in {"error", "failed", "missing", "uncertain", "deleting", "deleted"}:
+                return row
+            if row.get("provider_status") == "ACTIVE" and row.get("server_id") and row.get("boot_volume_id"):
+                return dict(row, status="provider-active") if index == 0 else row
+            # A callback can precede Nova ACTIVE; readiness alone cannot admit provider reads.
+            return dict(row, status="awaiting-provider-active") if row.get("status") == "ready" else row
+
+        row = _wait(
+            member_visible,
+            {"provider-active"} if index == 0 else {"ready"},
+            pair_deadline,
+            event,
+            "cluster-server-status" if index == 0 else "cluster-agent-status",
+        )
+        if row.get("request_id") != spec["request_id"] or row.get("layer_digests") != job["output_digests"]:
+            raise ArtifactValidationError("cluster admission changed request or exact ordered image layers")
+        if any(
+            row.get(key) in retained["identities"] or not row.get(key) for key in ("id", "server_id", "boot_volume_id")
+        ):
+            raise ArtifactValidationError("cluster pair requires fresh durable instance/server/boot identities")
+        retained["identities"].extend(row[key] for key in ("id", "server_id", "boot_volume_id"))
+        budget.bind(reservation, row["server_id"])
+        record.update(server_id=row["server_id"], boot_volume_id=row["boot_volume_id"], status=row["status"])
+        members.append(row)
+        observations.append(observe(row))
+        measurement["consumers"].append(
+            {
+                "instance_id": row["id"],
+                "server_id": row["server_id"],
+                "boot_volume_id": row["boot_volume_id"],
+                "role": "server" if index == 0 else "agent",
+                "status": "awaiting-cluster-proof",
+                "image_job_id": job["id"],
+                "layer_digests": row["layer_digests"],
+                "admission_timing": _boundary(consumer_start, (time.monotonic(), time.time())),
+            }
+        )
+        atomic_write_json(output / (role + "-result.json"), row)
+
+    def server_proof():
+        fence()
+        row = _hub(config, cloud.connection).get_instance(members[0]["id"])
+        fence()
+        return row
+
+    final_server = _wait(server_proof, {"ready"}, pair_deadline, event, "cluster-proof-status")
+    if any(
+        final_server.get(key) != members[0].get(key)
+        for key in ("id", "request_id", "server_id", "boot_volume_id", "layer_digests", "cluster")
+    ):
+        raise ArtifactValidationError("cluster final proof changed original server identity or ordered layers")
+    members[0] = final_server
+    for index, row in enumerate(members):
+        current = observe(row)
+        if current["private_ip"] != observations[index]["private_ip"]:
+            raise ArtifactValidationError("cluster provider private address changed during proof")
+        observations[index] = current
+    runtime = members[0].get("result") or {}
+    if runtime.get("exit_code") != 0:
+        raise ArtifactValidationError("cluster Ready without successful sealed server proof is not a measurement")
+    proof = validate_cluster_result(config, runtime.get("stdout", ""), members, observations)
+    fence()
+    finish = (time.monotonic(), time.time())
+    measurement.update(
+        workload=proof,
+        timing=_boundary(start, finish),
+        cluster_timing=_boundary(pair_start, finish),
+        acquisition_build_included=cold,
+        layer_digests=job["output_digests"],
+    )
+    measurement["workload_seconds"] = measurement["timing"]["elapsed_seconds"]
+    for index, role in enumerate(roles):
+        atomic_write_json(output / (role + "-result.json"), members[index])
+        measurement["consumers"][index].update(status="success", sdk=_public(observations[index]))
+    for index in (1, 0):
+        _delete_consumer(
+            config,
+            output,
+            roles[index],
+            specs[index],
+            originals[index],
+            members[index],
+            _hub(config, cloud.connection),
+            cloud,
+            budget,
+            reservations[roles[index]],
+            deadline,
+            event,
+            "cluster-delete-status",
+        )
+        records[index]["status"] = "deleted"
+        live.remove(records[index])
+    measurement["status"] = "success"
+
+
 def _source_identity():
     import platform
     import sys
@@ -597,6 +1011,9 @@ def _source_identity():
         "benchmark_openstack.py",
         "nova_build.py",
         "hub.py",
+        "tensorflow_delta.lock",
+        "benchmark_tensorflow_context.py",
+        "benchmark_cluster_context.py",
     )
     files = {name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in names}
     return {
@@ -633,6 +1050,7 @@ def run_scenario(config, output, *, cloud_factory=None, connection=None):
 def _run_scenario(config, output, *, cloud_factory=None, connection=None):
     from .benchmark_scenario_cloud import ScenarioCloud
     from .benchmark_scenario_workloads import (
+        api_image_recipe,
         container_command,
         deploy_cluster,
         gpu_preflight,
@@ -646,6 +1064,9 @@ def _run_scenario(config, output, *, cloud_factory=None, connection=None):
         "job_id": config["job_id"],
         "scenario": config["scenario"],
         "method": config["method"],
+        "execution_lane": "sdk-docker-reference"
+        if config["method"] == "openstack-container"
+        else "official-api-oci-chroot",
         "status": "running",
         "phase": "preflight",
         "config_sha256": _digest(config),
@@ -677,6 +1098,7 @@ def _run_scenario(config, output, *, cloud_factory=None, connection=None):
 
     live = []
     hub_live = []
+    cluster_image = {}
     try:
         event("preflight", {"config_sha256": state["config_sha256"]})
         budget = ResourceBudget(config, output)
@@ -769,7 +1191,21 @@ def _run_scenario(config, output, *, cloud_factory=None, connection=None):
                 state["resources"].append(_public(resource))
                 if _source_identity()["files"] != state["runner_source"]["files"]:
                     raise ArtifactValidationError("runner source changed during allocation; workload not started")
-            if config["scenario"] == "k3s":
+            if config["method"] == "api-cluster":
+                _run_api_cluster(
+                    config,
+                    output,
+                    prefix,
+                    measurement,
+                    state,
+                    cloud,
+                    budget,
+                    hub_live,
+                    deadline,
+                    event,
+                    cluster_image,
+                )
+            elif config["scenario"] == "k3s":
                 nodes = [resource]
                 for index in range(config.get("cluster", {}).get("agents", 1)):
                     node = cloud.create(prefix + "-agent" + str(index + 1))
@@ -813,22 +1249,80 @@ def _run_scenario(config, output, *, cloud_factory=None, connection=None):
             else:
                 client = _hub(config, cloud.connection)
                 identity = str(uuid.uuid5(uuid.NAMESPACE_URL, config["job_id"] + ":" + prefix + ":image"))
-                reference = config["images"][config["scenario"]]
+                paired = config["method"] == "api-cold-warm"
+                pair_roles = [prefix + "-consumer" + str(index + 1) for index in range(2)]
+                pair_reservations = budget.reserve_pair(pair_roles, config["placement"]["boot_gib"]) if paired else {}
+                for role, reservation in pair_reservations.items():
+                    atomic_write_json(
+                        output / (role + "-reservation.json"), {"id": reservation, "role": role, "call_tracking": True}
+                    )
                 request = {
                     "request_id": identity,
                     "name": "benchmark-" + config["job_id"].replace("_", "-"),
                     "platform": "linux/amd64",
                 }
-                if config["method"] == "api-build":
-                    request["dockerfile"] = "FROM " + reference + "\nCMD " + json.dumps(workload_argv(config)) + "\n"
-                    operation = client.build_dockerfile
-                else:
-                    request["reference"] = reference
-                    operation = client.import_registry_image
+                recipe, provenance = api_image_recipe(config)
+                request.update(recipe)
+                measurement["image_recipe"] = provenance
+                operation = client.build_dockerfile if "dockerfile" in recipe else client.import_registry_image
+                budget.check_allocation(deadline)
+                acquisition_start = (time.monotonic(), time.time())
+                if config["scenario"] == "tensorflow-cuda":
+                    import tempfile
+
+                    from .benchmark_tensorflow_context import acquire_context
+
+                    dependency_start = acquisition_start
+                    with tempfile.TemporaryDirectory(prefix=".tensorflow-context-", dir=output) as temporary:
+                        approval_remaining = (
+                            datetime.fromisoformat(config["approval"]["expires_at"].replace("Z", "+00:00")).timestamp()
+                            - time.time()
+                        )
+                        dependency_deadline = min(deadline, time.monotonic() + approval_remaining)
+                        context, dependencies = acquire_context(
+                            temporary,
+                            deadline=dependency_deadline,
+                            check=budget.check_allocation,
+                            event=event,
+                            max_context_bytes=config["hub"].get("max_context_bytes", 16 * 1024**2),
+                        )
+                        measurement["dependency_acquisition"] = _boundary(
+                            dependency_start, (time.monotonic(), time.time())
+                        )
+                        measurement["dependencies"] = dependencies
+                        event("context-upload-started", dependencies)
+                        budget.check_allocation(deadline)
+                        context_upload_start = (time.monotonic(), time.time())
+                        context_receipt = client.upload_build_context(
+                            context,
+                            max_bytes=config["hub"].get("max_context_bytes", 16 * 1024**2),
+                            before_send=lambda: budget.check_allocation(deadline),
+                        )
+                        if (
+                            context_receipt.get("digest") != dependencies["context_digest"]
+                            or context_receipt.get("size_bytes") != dependencies["context_bytes"]
+                        ):
+                            raise ArtifactValidationError(
+                                "uploaded TensorFlow context receipt identity differs; no replay"
+                            )
+                        request["context_digest"] = context_receipt["digest"]
+                        atomic_write_json(output / (prefix + "-context-accepted.json"), context_receipt)
+                    measurement["context_upload"] = _boundary(context_upload_start, (time.monotonic(), time.time()))
                 budget.check_allocation(deadline)
                 atomic_write_json(output / (prefix + "-image-intent.json"), request)
                 event("image-submission-started", {"request_id": identity})
+                if _source_identity()["files"] != state["runner_source"]["files"]:
+                    raise ArtifactValidationError("runner source changed before image submission; no call")
                 budget.check_allocation(deadline)
+                measurement["image_submission"] = {"request_id": identity, "effect": "uncertain-no-replay"}
+                atomic_write_json(output / (prefix + "-image-submission.json"), measurement["image_submission"])
+                try:
+                    budget.check_allocation(deadline)
+                except ArtifactValidationError:
+                    measurement["image_submission"]["effect"] = "no-call"
+                    atomic_write_json(output / (prefix + "-image-submission.json"), measurement["image_submission"])
+                    raise
+                image_start = (time.monotonic(), time.time())
                 admitted = operation(request)
                 atomic_write_json(output / (prefix + "-image-accepted.json"), admitted)
                 job = _wait(
@@ -839,12 +1333,22 @@ def _run_scenario(config, output, *, cloud_factory=None, connection=None):
                     "image-status",
                 )
                 atomic_write_json(output / (prefix + "-image-result.json"), job)
+                acquisition_finish = (time.monotonic(), time.time())
+                measurement["acquisition_build"] = _boundary(image_start, acquisition_finish, strict=paired)
+                measurement["image_submission"].update(effect="complete", image_job_id=job["id"])
                 previous = None
                 measurement["consumers"] = []
-                for index in range(2 if config["method"] == "api-reuse" else 1):
+                for index in range(2 if config["method"] in {"api-reuse", "api-cold-warm"} else 1):
                     role = prefix + "-consumer" + str(index + 1)
-                    reservation = budget.reserve(role, config["placement"]["boot_gib"])
-                    atomic_write_json(output / (role + "-reservation.json"), {"id": reservation, "role": role})
+                    if paired:
+                        reservation = pair_reservations[role]
+                        budget.activate(reservation, deadline)
+                    else:
+                        reservation = budget.reserve(role, config["placement"]["boot_gib"])
+                        atomic_write_json(
+                            output / (role + "-reservation.json"),
+                            {"id": reservation, "role": role, "call_tracking": True},
+                        )
                     spec = {
                         k: v
                         for k, v in config["placement"].items()
@@ -856,24 +1360,42 @@ def _run_scenario(config, output, *, cloud_factory=None, connection=None):
                         name="pal-bench-" + role + "-" + config["job_id"],
                         command=workload_argv(config),
                     )
+                    if config.get("gpu_profile") is not None:
+                        spec["gpu_profile"] = config["gpu_profile"]
                     spec.update(source_instance_id=previous["id"]) if previous else spec.update(image_job_id=job["id"])
                     atomic_write_json(output / (role + "-intent.json"), spec)
                     event("consumer-create-started", {"role": role, "request_id": spec["request_id"]})
-                    at = time.monotonic()
-                    admitted = _hub(config, cloud.connection).create_instance(spec)
+                    resource_record = {
+                        "origin": "api",
+                        "role": role,
+                        "request_id": spec["request_id"],
+                        "reservation_id": reservation,
+                        "effect": "no-call",
+                    }
+                    state["resources"].append(resource_record)
+                    budget.check_allocation(deadline)
+                    call_client = _hub(config, cloud.connection)
+                    if _source_identity()["files"] != state["runner_source"]["files"]:
+                        raise ArtifactValidationError("runner source changed before consumer creation; no call")
+                    budget.check_allocation(deadline)
+                    resource_record["effect"] = "uncertain-no-replay"
+                    atomic_write_json(output / (role + "-submission.json"), resource_record)
+                    try:
+                        budget.check_allocation(deadline)
+                    except ArtifactValidationError:
+                        resource_record["effect"] = "no-call"
+                        atomic_write_json(output / (role + "-submission.json"), resource_record)
+                        raise
+                    hub_live.append(resource_record)
+                    consumer_start = (time.monotonic(), time.time())
+                    admitted = call_client.create_instance(spec)
                     atomic_write_json(output / (role + "-accepted.json"), admitted)
-                    state["resources"].append(
-                        {
-                            "origin": "api",
-                            "role": role,
-                            "instance_id": admitted["id"],
-                            "request_id": spec["request_id"],
-                            "status": admitted.get("status"),
-                            "server_id": admitted.get("server_id"),
-                            "reservation_id": reservation,
-                        }
+                    resource_record.update(
+                        instance_id=admitted["id"],
+                        status=admitted.get("status"),
+                        server_id=admitted.get("server_id"),
+                        effect="accepted",
                     )
-                    hub_live.append(state["resources"][-1])
                     if admitted.get("server_id"):
                         budget.bind(reservation, admitted["server_id"])
                     row = _wait(
@@ -895,17 +1417,62 @@ def _run_scenario(config, output, *, cloud_factory=None, connection=None):
                             "guest readiness without successful benchmark command is not a measurement"
                         )
                     proof = validate_result(config, runtime.get("stdout", ""))
+                    if config["scenario"] == "tensorflow-cuda" and proof.get("framework_version") != "2.21.0":
+                        raise ArtifactValidationError("derived TensorFlow proof must execute pinned TensorFlow2.21.0")
+                    if config.get("gpu_profile") is not None:
+                        qualified = row.get("gpu") or {}
+                        inventory = proof.get("nvidia_smi") or []
+                        if (
+                            row.get("gpu_profile") != config["gpu_profile"]
+                            or qualified.get("image_id") != config["placement"]["image_id"]
+                            or qualified.get("flavor_id") != config["placement"]["flavor_id"]
+                            or qualified.get("project_id") != config["project_id"]
+                            or qualified.get("device_count") != proof.get("device_count")
+                            or len(inventory) != qualified.get("device_count")
+                            or not qualified.get("driver_version")
+                            or any(item.get("driver_version") != qualified["driver_version"] for item in inventory)
+                            or (previous and previous.get("gpu") != qualified)
+                        ):
+                            raise ArtifactValidationError(
+                                "GPU proof differs from the concrete operator-qualified API profile"
+                            )
+                    proof_finish = (time.monotonic(), time.time())
+                    consumer_boundary = _boundary(consumer_start, proof_finish, strict=paired)
+                    measured_boundary = _boundary(
+                        acquisition_start if paired and index == 0 else consumer_start, proof_finish, strict=paired
+                    )
                     if previous and row["layer_digests"] != previous["layer_digests"]:
                         raise ArtifactValidationError("reuse changed the retained ordered layer digests")
+                    if paired:
+                        if not row.get("layer_digests") or (
+                            index == 0 and job.get("output_digests") != row["layer_digests"]
+                        ):
+                            raise ArtifactValidationError("consumer ordered layers differ from the completed image job")
+                        if previous and any(
+                            row.get(key) == previous.get(key) or not row.get(key)
+                            for key in ("id", "server_id", "boot_volume_id")
+                        ):
+                            raise ArtifactValidationError(
+                                "cold/warm consumers require distinct instances and writable boot state"
+                            )
                     atomic_write_json(output / (role + "-result.json"), row)
                     measurement["consumers"].append(
                         {
                             "instance_id": row["id"],
                             "server_id": row["server_id"],
-                            "elapsed_seconds": time.monotonic() - at,
+                            "boundary": "cold" if paired and index == 0 else "warm" if paired else "consumer",
+                            "elapsed_seconds": measured_boundary["elapsed_seconds"],
+                            "timing": measured_boundary,
+                            "consumer_timing": consumer_boundary,
+                            "inner_compute_seconds": proof["elapsed_seconds"],
+                            "acquisition_build_included": paired and index == 0,
+                            "image_job_id": job["id"],
+                            "gpu_profile": config.get("gpu_profile"),
+                            "gpu": row.get("gpu"),
                             "workload": proof,
                             "sdk": _public(observed),
                             "layer_digests": row["layer_digests"],
+                            "status": "success",
                         }
                     )
                     _delete_consumer(
@@ -934,6 +1501,8 @@ def _run_scenario(config, output, *, cloud_factory=None, connection=None):
             if _source_identity()["files"] != state["runner_source"]["files"]:
                 for item in state["measurements"]:
                     item["status"] = "source-invalid"
+                    for consumer in item.get("consumers", []):
+                        consumer["status"] = "source-invalid"
                 raise ArtifactValidationError("runner source changed during execution; measurements are not qualified")
             event("repetition-completed", {"repetition": repetition + 1})
         state.update(status="success", phase="completed")
@@ -953,6 +1522,12 @@ def _run_scenario(config, output, *, cloud_factory=None, connection=None):
                     }
                 )
         state.update(status="failed", phase="held-no-replay")
+        for measurement in state["measurements"]:
+            if measurement["status"] == "running":
+                measurement["status"] = "failed"
+                if config["method"] in {"api-cold-warm", "api-cluster"}:
+                    for consumer in measurement.get("consumers", []):
+                        consumer["status"] = "pair-invalid"
         state["issues"].append(
             {
                 "category": type(error).__name__,
@@ -974,6 +1549,8 @@ def _run_scenario(config, output, *, cloud_factory=None, connection=None):
             state.update(status="failed", phase="timing-invalid")
             for measurement in state["measurements"]:
                 measurement["status"] = "timing-invalid"
+                for consumer in measurement.get("consumers", []):
+                    consumer["status"] = "timing-invalid"
             state["issues"].append(
                 {
                     "category": "clock-disagreement",
@@ -1018,9 +1595,48 @@ def _cleanup_scenario(output, *, connection=None):
     for resource in reversed(cloud.resources()):
         cloud.delete(resource)
         deleted.append({"origin": "sdk", "server_id": resource.get("server_id")})
-    for path in sorted(output.glob("r*-consumer*-intent.json")):
+    for path in sorted(output.glob("r*-consumer*-reservation.json")):
+        reservation = json.loads(path.read_text())
+        role = path.name.removesuffix("-reservation.json")
+        if not reservation.get("call_tracking") or (output / (role + "-intent.json")).exists():
+            continue
+        if any((output / (role + suffix)).exists() for suffix in ("-submission.json", "-accepted.json")):
+            raise ArtifactValidationError("create evidence without original intent; retain reservation")
+        with budget._locked() as ledger:
+            original = ledger["reservations"].get(reservation.get("id"), {})
+            if (
+                reservation.get("role") != role
+                or original.get("role") != role
+                or original.get("job_id") != config["job_id"]
+                or original.get("server_id") is not None
+            ):
+                raise ArtifactValidationError("original API no-call reservation identity changed; retain reservation")
+        budget.release(reservation["id"])
+        event("consumer-no-call", {"role": role, "reservation_id": reservation["id"]})
+    intents = sorted(output.glob("r*-consumer*-intent.json"))
+    if config["method"] == "api-cluster":
+        # In every pair consumer2 is the agent; never remove its join server first.
+        intents.sort(key=lambda path: (path.name.split("-", 1)[0], "consumer1-" in path.name))
+    for path in intents:
         spec = json.loads(path.read_text())
         role = path.name.removesuffix("-intent.json")
+        reservation_row = json.loads((output / (role + "-reservation.json")).read_text())
+        if reservation_row.get("role") != role:
+            raise ArtifactValidationError("original API delete reservation role changed; no budget release")
+        submission_path = output / (role + "-submission.json")
+        submission = json.loads(submission_path.read_text()) if submission_path.exists() else None
+        no_call = submission is not None and submission.get("effect") == "no-call"
+        if no_call and (
+            submission.get("request_id") != spec["request_id"]
+            or submission.get("role") != role
+            or submission.get("reservation_id") != reservation_row["id"]
+            or (output / (role + "-accepted.json")).exists()
+        ):
+            raise ArtifactValidationError("original API no-call disposition changed; retain reservation")
+        if no_call or (reservation_row.get("call_tracking") and submission is None):
+            budget.release(reservation_row["id"])
+            event("consumer-no-call", {"role": role, "request_id": spec["request_id"]})
+            continue
         accepted = output / (role + "-accepted.json")
         client = _hub(config, cloud.connection)
         if accepted.exists():
@@ -1033,9 +1649,6 @@ def _cleanup_scenario(output, *, connection=None):
                     "uncertain API create cannot be uniquely observed; retain reservation, never replay"
                 )
             row = admitted = matches[0]
-        reservation_row = json.loads((output / (role + "-reservation.json")).read_text())
-        if reservation_row.get("role") != role:
-            raise ArtifactValidationError("original API delete reservation role changed; no budget release")
         row = _delete_consumer(
             config,
             output,
@@ -1123,17 +1736,71 @@ def render_scenario_report(result, output):
         environments.append(measurement["environment"])
         if measurement.get("status") != "success":
             continue
-        if "consumers" in measurement:
+        if result["method"] in {"api-cold-warm", "api-cluster"}:
+            for key, label in (
+                ("dependency_acquisition", "external fixed-dependency acquisition/context preparation"),
+                ("context_upload", "context upload"),
+                ("acquisition_build", "image job admission/acquisition/build"),
+            ):
+                if key in measurement:
+                    rows.append(
+                        [
+                            str(measurement["repetition"]),
+                            label,
+                            str(round(measurement[key]["elapsed_seconds"], 6)),
+                            "controller monotonic",
+                            "N/A",
+                            "N/A",
+                            "N/A",
+                            "N/A",
+                        ]
+                    )
+        if result["method"] == "api-cluster":
+            rows.append(
+                [
+                    str(measurement["repetition"]),
+                    measurement["boundary"] + " two-node cluster proof",
+                    str(round(measurement["timing"]["elapsed_seconds"], 6)),
+                    "two exact API consumers",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                ]
+            )
+            rows.append(
+                [
+                    str(measurement["repetition"]),
+                    "pair create-to-verified-cluster-proof",
+                    str(round(measurement["cluster_timing"]["elapsed_seconds"], 6)),
+                    "controller monotonic",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                ]
+            )
+        elif "consumers" in measurement:
             for index, consumer in enumerate(measurement["consumers"], 1):
                 rows.append(
                     [
                         str(measurement["repetition"]),
-                        "consumer " + str(index),
+                        consumer.get("boundary", "consumer " + str(index)),
                         str(round(consumer["elapsed_seconds"], 6)),
                         _safe_text(consumer["server_id"]),
                         *metrics(consumer.get("workload", {})),
                     ]
                 )
+                if result["method"] == "api-cold-warm" and consumer.get("boundary") == "cold":
+                    rows.append(
+                        [
+                            str(measurement["repetition"]),
+                            "cold consumer create-to-verified-proof",
+                            str(round(consumer["consumer_timing"]["elapsed_seconds"], 6)),
+                            _safe_text(consumer["server_id"]),
+                            *metrics(consumer.get("workload", {})),
+                        ]
+                    )
         else:
             seconds = measurement.get("workload_seconds", measurement.get("workload", {}).get("elapsed_seconds"))
             rows.append(
@@ -1171,6 +1838,24 @@ def render_scenario_report(result, output):
     markdown += "\n".join(
         "| " + " | ".join(escape(_safe_text(c)).replace("|", "&#124;") for c in row) + " |" for row in rows
     )
+    boundary_note = (
+        "Cold is continuous external preparation/image submission through verified GPU proof; it is not the first registry HTTP timestamp. "
+        "Warm is a fresh existing-Hub-layer consumer including guest HTTPS layer transfer, not guest-local-cache warm, Manila or zero-copy. "
+        "OS/CDN/shared cache state is unknown and not flushed. Phase intervals are separate observations, never summed into the cold clock. "
+        "A successful whole-process GPU proof is not remote attestation."
+        if result["method"] == "api-cold-warm"
+        else "SDK Docker reference and official API OCI chroot are distinct execution lanes."
+    )
+    if result["method"] == "api-cluster":
+        boundary_note = (
+            "Cold is continuous external fixed-airgap context acquisition, upload and one image job through "
+            "the exact two-node API cluster numerical proof. Prepared reuse starts a fresh simultaneous pair "
+            "from that same completed job and exact ordered layers, without acquisition or another build. "
+            "Both boundaries include guest layer transfer and k3s startup, not guest-local-cache warm, Manila "
+            "or zero-copy. Only nodes and per-node numerical pods are qualified; DNS, HTTP and PVC persistence "
+            "are not claimed. These whole-VM cluster profiles are not hostile-container isolation or remote attestation."
+        )
+    markdown += "\n\n" + boundary_note
     html = (
         "<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>"
         + escape(title)
@@ -1182,7 +1867,9 @@ def render_scenario_report(result, output):
         + "".join("<th>" + escape(h) + "</th>" for h in headers)
         + "</tr></thead><tbody>"
         + "".join("<tr>" + "".join("<td>" + escape(_safe_text(c)) + "</td>" for c in row) + "</tr>" for row in rows)
-        + "</tbody></table><p>Successful rows only. Setup/acquisition, request-to-ready and inner computation timings are distinct boundaries; missing data is N/A.</p><p><a href=environment.html>Disk and network measurements</a> · <a href=issues.md>Issues and retained resources</a> · <a href=result.json>Machine-readable result</a></p></main></html>"
+        + "</tbody></table><p>Successful rows only. Setup/acquisition, consumer and inner computation timings are distinct boundaries; missing data is N/A.</p><p>"
+        + escape(boundary_note)
+        + "</p><p><a href=environment.html>Disk and network measurements</a> · <a href=issues.md>Issues and retained resources</a> · <a href=result.json>Machine-readable result</a></p></main></html>"
     )
     context_paths = [
         Path(row["environment_context_report"])

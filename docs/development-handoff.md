@@ -24,6 +24,176 @@ files_modified:
 [ARCHITECTURE.md](../ARCHITECTURE.md), 실행 경계는 [testing.md](testing.md),
 세부 결과는 아래 링크된 문서와 source다.
 
+## Available-GPU and API k3s precision-study resumption — 2026-10-30
+
+- Owner expanded GPU selection beyond3060 to available1080Ti/TITAN X/other GPUs,
+  permits8/16GiB flavors and requires functional/measurement explanation rather
+  than a speed-improvement claim. The screenshot is capacity context, not
+  original-project flavor access or a successful placement. Fresh original-human
+  inventory exposes only3060LHR8c32g and2000Ada8c16g;1080Ti/TITAN X flavors are not
+  currently returned even with private flavors included. No IAM/flavor grant was
+  changed or another user's GPU/VM adopted.
+- New explicit selections **제한 캠페인 실행 / 검증 후 자동 갱신** bind the existing
+  feature branch:9newGPU creates(3prerequisites+6measured),4CPUk3screates, max2live/
+  GPU1, VM≤8CPU/32GiB, GPU boot≤80GiB/CPU≤40GiB, cumulativeboot≤880GiB, one fresh
+  80GiB scratch on the exact existing worker,12-hour expiry. Failed/deleted slots
+  stay consumed. Reviewed exact source may be committed/pushed/PR-tested and SHA
+  images canonically rolled to the existing seven Palimpsest services; no protected
+  merge, formal release, broker/IAM/host GPU change or foreign resource mutation.
+- Actual one-shot Mini prerequisite `gpu-resume-ada16-qual-01`, Nova
+  `23074a82-c46a-4905-9303-af52c13ad9be`, boot
+  `9bc058c4-306f-4f26-933f-b4ce1aa1c1e7`, reachedACTIVE on8CPU/16GiB. Serial evidence
+  records NVIDIA RTX2000Ada/16GiB VRAM/capability8.9, driver535.309.01,
+  kernel6.8.0-57, successful SMI and driver API initialization. Vendor CLI was
+  absent, so neither API injection nor framework GPU timing is qualified.
+- User asked to check CUDA container images before making a base. Actual pinned
+  CUDA12.6.3 devel ran networkless locally: nvcc12.6.85 is present, Container Toolkit
+  CLI/packages absent. NVIDIA's documented stack places libnvidia-container/CLI on
+  the container host (here the workload guest base), distinct from image CUDA/
+  cuDNN. CUDA13 images are not an interchangeable fix for driver535 or all Pascal
+  GPUs. Preserve exact runtime/driver/architecture qualification instead of silently
+  changing framework versions.
+- Separate owner approval allows exact new builder preparation and one private
+  image, plus one dedicated self-only k3s SG. The builder inherited an unrelated
+  baked RSA login key, not the legitimate resident key. Without cycling keys or
+  resetting credentials, owner selected one same-image Nova2.93 rebuild of this
+  exact VM with bounded private bootstrap. It conservatively consumes a second
+  prerequisite/80GiB budget. Accepted HTTP202 request
+  `req-1510c06f-3712-4f4f-b941-b5567cc5b399`; transient console404 whileREBUILD is
+  retained as observer failure, not server absence or authority to repeat rebuild.
+  The separate finite Mini observer only reads the accepted operation. Cinder
+  resident GET observed the boot volume `downloading`, attachmentsempty; notebook
+  Cinder connection timed out, so network-origin failure is not recast as GPU error.
+- Dedicated SG `94f05500-797f-4f00-abc6-9736e476db20` belongs to original SYSTEM.
+  Only self-group6443/TCP,10250/TCP,8472/UDP plus boundedHTTPS/DNS/NTP egress were
+  added; auto-created broad egress was removed only on this new SG. Existing peer
+  SG/FIP/resources were unchanged. Exact worker metadata confirms UUID
+  `49b87ab3-340c-4e2d-ab89-4d4f40bd8bb3`, ownerproject
+  `9cdd693a8af8414f8eaa7f026a7b95f9`; original benchmark credentials must not be used
+  to fabricate cross-project disk attachment. No scratch volume was created yet.
+- Current k3s SDK/Docker reference is not API proof. A separate fixed
+  `api-cluster` implementation now uses one worker-built offline k3s job and two
+  simultaneously live original-human consumers, private expiring join capability,
+  exact nodes and4950 numerical pod checks, then agent-first API cleanup. Default
+  CPU/GPU privilege stays unchanged. No DNS/HTTP/PVC/reboot equivalence is claimed.
+  Before-fix actual BusyBox `/probe` dispatch failed `applet not found`; fixed pod
+  executes basename `/busybox`. Independent reviews found source-expiry/profile,
+  descendantPID, output-capture, atomic-capacity, callback/Nova-ACTIVE and per-pair
+  deadline defects; fixes and final verification must close before deployment.
+- Local checkpoint before those review fixes:140Hub instance tests and382root
+  focused tests passed. A guessed nonexistent test filename caused one collection
+  error; corrected invocation used actual existing test modules. New test-defined
+  behavior is not a final test pass or native cluster proof. Actual CUDA12.6 nvcc
+  produced sm61/sm89 cubins with the real numerical source; no GPU execution was
+  performed by that networkless compiler smoke.
+- Final scoped review closed all seven cluster admission/capture/cleanup/capacity/
+  timing findings, including missing-timeout defaults. Locking current reads retain
+  source eligibility across MariaDB repeatable-read snapshots through allocation.
+  Full Hub1226passed/7skipped in341.11s, focused root402passed. Five canonical API/
+  export arm64+amd64 and build-workeramd64 images built and executed networkless,
+  read-only; actual four runtime file hashes match reviewed working source. This
+  verifies nativearm64/emulatedamd64 image payloads, not native GPU/cluster work.
+  Real unprivileged Linux smoke passed child capture, overflow, trickle, escaped
+  sessions and adopted-runtime-child preservation until final cleanup. Representative
+  four-layer cluster bootstrap measured60052Nova bytes below65535; larger inputs
+  still fail closed. Actual client/Hub wheels+sdists built, fixed context/lock assets
+  present and Python3.11.15 installed-wheel imports passed.
+- First full root gate:8702passed/305skipped with two failures. The subprocess
+  package check lacked `~/.local/bin` onPATH and could not finduv. The unrelated
+  ancestor fixture inherited mutable shared `/tmp` ctime; only simulated ancestors
+  now freeze ctime while the target and actual mutation regressions remain live.
+  No production ancestor guard was relaxed. Focused42cases passed, then the
+  corrected complete root gate passed8704tests/305skipped in497.73s.
+- The accepted same-image rebuild later reachedERROR without a public fault;
+  subsequently exact VM GET/list returned404 without an assistant DELETE. Cause
+  and deletion actor are unknown; do not call that successful builder cleanup.
+  Its exact80GiB boot was verifiedavailable/unattached/originalimage-bound, then
+  explicitly ordinarily deleted; resident GET confirmed absence. Original create
+  and rebuild budgets stay spent. Owner separately selected the final fresh
+  Ada16GiB base-builder slot with the same fixed Toolkit bootstrap on first boot;
+  `gpu-resume-ada16-base-final` is the last prerequisite, not another open retry grant.
+- Worker scratch remains **credential-blocked**: four production Kollaadmin
+  password attempts returned401 across rendered/canonical and project/system
+  scopes. Both stored sources fail; missing-role is not established as cause.
+  All further admin login variants, credential resets and IAM changes are stopped.
+  Read-only rendered Keystone security_compliance keys were unset oncontroller1;
+  that is not proof that identity lockout/rate limits cannot apply. Zero scratch
+  Cinder creates/attachments/formats occurred. User will prepare a separate exact
+  project application credential onwireguardserver at
+  `/home/pieroot/.config/palimpsest/worker-storage-clouds.yaml`, profile
+  `palimpsest-worker-storage`,v3applicationcredential,RegionOne/public/verifiedTLS,
+  file0600/parent0700, ownerpieroot. Its project must be9cdd693a8af8414f8eaa7f026a7b95f9
+  and permit bounded Cinder create/read/delete plus Nova attachment/read/detach on
+  worker49b87ab3 only. No secrets inchat, original benchmark credential replacement
+  or globaladmin is needed. Inactive helper now accepts only this file and never
+  falls back to blockedadmin credentials; do not execute it before user preparation.
+- Private evidence root: `~/.local/share/palimpsest-proofs/gpu-cold-warm-20261030/`
+  `resume-available-gpu-k3s-01/`; original grants/failures are unchanged. User's
+  question-format correction is now explicit: provide facts/unknowns, why a
+  decision is needed, option-specific effects/risks/recovery and exclusions before
+  blocking for a choice; do not compress that context into terse labels.
+
+## GPU API cold/warm attempt and current block — 2026-10-30
+
+- Owner selected official API GPU enhancement, one cold/warm pair each CUDA,
+  Torch and TensorFlow; separate worktree `palimpsest-gpu-cold-warm-20261030`,
+  branch `feature/gpu-cold-warm-api-20261030`, base05cba09. Existing production
+  source1afca684 and all original dirty worktrees remain unchanged.
+- New strict operator GPU profiles, both provider/original-human authority fences,
+  vendor1.18+ guest injection and bounded callback errors are implemented locally.
+  Independent GPU admission/namespace reviews closed their findings. One approved
+  Docker Desktop private native proof passed real mount tracking/overmount
+  preservation/exact loop detach and ordinary stopped-container removal; no NVIDIA
+  device or vendor injection was qualified by that proof.
+- Fixed `api-cold-warm` performs one external image import/build and two fresh
+  API consumers, with identical retained ordered layers and separate writable boot
+  state. Cold continuously includes dependency/context/image acquisition/build;
+  warm includes existing-Hub-layer consumer boot/HTTPS transfer, not local-cache,
+  Manila or zero-copy. TensorFlow uses the exact historical18-total-wheel lock on
+  the pinned Torch CUDA/cuDNN9 base; original TensorFlow image failure is preserved.
+  Absolute curl process deadlines, post-hash/post-fsync expiry fences and no-call
+  cleanup are independently reviewed; final local gate results are recorded below
+  only after actual completion, not inherited from earlier source snapshots.
+- Final local verification, not GPU qualification:327root focused tests and111Hub
+  instance tests passed under their separate canonical configurations;67Kolla
+  contract tests passed with the existing Ansible venv on PATH. Fourteen changed
+  Python files passed Ruff lint/format and the lane manifest is valid. Source
+  review guard `b5b7133fdd0c28a877d0d72dbb2e7395faf35a8824b84d76a3a9c9ad1a0e8f84`,579files.
+  Preserved failed attempts:54Kolla failures from missing Ansible PATH; combined
+  root+Hub collection used the wrong async fixture config; one new test selected
+  a UUID-sorted pending warm reservation instead of its consumer1 role. The latter
+  was corrected to role-bound selection, not a product exception suppression.
+  The final327/111 runs include the deadline/upload/cleanup corrections. No new
+  service-image build, native NVIDIA injection, production workload or publication
+  pass is inferred from these local results.
+- Approved resource cap: seven cumulative GPU VM creates (one prerequisite plus
+  six measured consumers), one live,8CPU/32GiB/80GiB boot each; one fresh80GiB
+  scratch disk on the existing worker. No automatic replacements, host GPU reset/
+  reassignment, unrelated resources, protected merge or formal release. Conditional
+  branch/image publication and canonical Kolla rollout require successful GPU
+  qualification, independent review and required verification; that condition has
+  **not** been met. The scratch disk was not created, and nothing was committed,
+  pushed, image-published or redeployed for this candidate.
+- Actual Mini prerequisite helper SHA256
+  `73ffcfed291734c10236a6dcab817a7012629498c69c3d698441494439d5c949`
+  created `gpu-base-20261030-once`, Nova
+  `e09c0309-959f-4afb-a6c3-4d5608f5fe79`, in original pieroot/SYSTEM project.
+  Nova returnedERROR/code500 `No valid host was found` before a guest booted.
+  Existing DMSLab-paper uses3060 and jisu_model uses2000Ada, but these observations
+  do **not** prove the exact scheduler rejection cause; detailed hypervisor
+  inspection returnedForbidden. Do not call2000Ada free/available.
+- Exact receipt/project/name/job/spec markers, ERROR state and zero attachments
+  were checked before ordinary deletion; final Nova404 and no residual named
+  volume were observed. One cumulative create/80GiB slot remains spent, six
+  measurement slots remain, and no automatic new prerequisite/replacement is
+  authorized. No Docker Hub workload acquisition or GPU numerical benchmark ran;
+  all six requested timings remain N/A. Do not infer GPU compatibility failure
+  from this scheduling failure or publish despite its unmet qualification gate.
+- Private evidence: `~/.local/share/palimpsest-proofs/gpu-cold-warm-20261030/`
+  contains resource authority, original-human Hub GET200, read-only baseline,
+  native proof outcome/cleanup and `qualification-failure-and-cleanup.json`.
+  The Mini retains the original single-create receipt; no credentials were stored.
+
 <a id="owner-contract-and-next-step-2026-10-29"></a>
 ## Full current integration and Kolla rollout — 2026-10-30
 

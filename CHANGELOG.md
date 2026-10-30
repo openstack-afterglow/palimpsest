@@ -6,6 +6,9 @@ All notable changes to Palimpsest Local are documented here.
 
 ### Added
 
+- Add disabled-by-default API GPU profiles bound to original projects, exact qualified guest content, flavor/PCI aliases, driver and GPU count; use preinstalled NVIDIA vendor injection with preserved image identity and owned namespace cleanup. Actual GPU base qualification remains blocked, not passed.
+- Add one-job/two-consumer API cold/warm measurements with continuous cold timing, existing ordered-layer warm reuse, fresh writable state and explicit HTTPS-transfer/cache limits. Keep a fixed offline hash-pinned derived TensorFlow recipe and bounded streaming context upload; no GPU timing, publication or deployment is claimed.
+- Add separately admitted two-node API k3s profiles, an external fixed offline-airgap build context, private expiring join capabilities and exact node/numerical-pod proofs. Cold/prepared pairs hold two live reservations and reuse one immutable image job; default CPU/GPU privilege is unchanged.
 - Add project-bound registry imports, bounded Dockerfile/context builds and public image-job APIs with durable request identities, fixed HTTPS worker leases and verified atomic layer publication.
 - Add original-human/project-bound instance create/list/detail/stop/delete APIs with provider-intent reconciliation, exact boot-volume checks, immutable ordered layer/runtime snapshots and bounded sealed guest results.
 - Add conditional layer metadata PATCH, retained physical-blob references, matching Hub client methods and dedicated image-worker container/Kolla policies. Current guests fetch payloads over HTTPS into read-only SquashFS lowers with private disk-backed upper/work; Manila-managed CephFS runtime access remains a separate target, not implemented by this change.
@@ -15,6 +18,8 @@ All notable changes to Palimpsest Local are documented here.
 
 ### Fixed
 
+- Recheck expiry immediately after durable submission writes and after context hashing, before external effects. Bound slow/trickling dependency downloads by an owned-process absolute deadline, and release only definite no-call live occupancy without refunding cumulative reservations.
+- Bind CUDA compilation to the validated device compute capability and reject compiled/executed architecture mismatches; do not rely on default-target PTX JIT for older drivers. Enforce cluster source expiry/pinned qualification, identity-safe child cleanup, streaming output limits, atomic simultaneous capacity and per-pair deadlines.
 - Reject cyclic build-context symlinks on Python 3.13 as well as older supported interpreters while retaining valid dangling internal links.
 - Enforce a fully preallocated per-image workspace and packed-output budget with independent journal headroom; keep registry/tool temporary files in owned scratch and require exact cgroup/loop cleanup before publication.
 - Require separate current download and write authority before instance payload capabilities; permit only verified failed-create cleanup and retain capacity while a bound boot volume survives. Distinct definite no-create errors can be explicitly cleaned without treating an uncertain provider response as absence.

@@ -24,6 +24,13 @@ from palimpsest_hub.instance_models import PalimpsestHubInstance
 from palimpsest_hub.models import exact_identity
 from palimpsest_hub.services import instances as service
 from palimpsest_hub.services.digest import normalize_digest
+from palimpsest_hub.services.instance_cluster_runtime import (
+    ClusterErrorCode,
+    cluster_capability,
+    cluster_join_token,
+    validate_cluster_result,
+)
+from palimpsest_hub.services.instance_gpu_runtime import GpuErrorCode
 from palimpsest_hub.services.worker_leases import run_blocking, sql_mutex
 
 router = APIRouter()
@@ -35,6 +42,9 @@ class InstanceRequest(BaseModel):
     name: str = Field(pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$")
     image_id: UUID
     flavor_id: str = Field(min_length=1, max_length=64, pattern=r"^[a-zA-Z0-9_.-]+$")
+    gpu_profile: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+    cluster_profile: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+    cluster_server_id: UUID | None = None
     network_id: UUID
     security_group_ids: list[UUID] = Field(default_factory=list, max_length=16)
     layer_digests: list[str] = Field(default_factory=list, max_length=128)
@@ -83,6 +93,10 @@ class InstanceRequest(BaseModel):
             raise ValueError("source_instance_id already selects immutable image provenance")
         if self.writable_gib >= self.boot_gib:
             raise ValueError("writable_gib must be smaller than boot_gib")
+        if self.cluster_server_id and not self.cluster_profile:
+            raise ValueError("cluster_server_id requires cluster_profile")
+        if self.cluster_profile and (self.gpu_profile or self.command or self.readiness_argv):
+            raise ValueError("cluster_profile excludes GPU and caller-selected execution")
         return self
 
 
@@ -185,6 +199,18 @@ async def bootstrap_layer(instance_id: UUID, digest: str, request: Request):
     )
 
 
+@router.get("/instance-bootstrap/{instance_id}/cluster", operation_id="get_instance_bootstrap_cluster")
+async def bootstrap_cluster(instance_id: UUID, request: Request, response: Response):
+    async with _factory_or_503()() as session:
+        row = await session.get(PalimpsestHubInstance, str(instance_id))
+        if row is None:
+            raise HTTPException(404, "Bootstrap capability not found or expired")
+        service.capability(row, bearer(request))
+        result = await cluster_capability(session, row, get_settings())
+    response.headers["Cache-Control"] = "no-store"
+    return result
+
+
 class InstanceResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
     instance_id: UUID
@@ -192,7 +218,7 @@ class InstanceResult(BaseModel):
     exit_code: int | None = Field(None, ge=-255, le=255)
     stdout: str = Field(default="", max_length=8192)
     stderr: str = Field(default="", max_length=8192)
-    error_code: Literal["guest_execution_failed", "command_failed"] | None = None
+    error_code: Literal["guest_execution_failed", "command_failed"] | GpuErrorCode | ClusterErrorCode | None = None
 
     @model_validator(mode="after")
     def outcome(self):
@@ -239,7 +265,19 @@ async def bootstrap_result(instance_id: UUID, request: Request):
         payload = result.model_dump(mode="json")
         for channel in ("stdout", "stderr"):
             payload[channel] = payload[channel].replace(bearer(request), "[redacted bootstrap capability]")
-        if payload["status"] == "ready" and payload["exit_code"] is None and not row.spec_json["readiness_argv"]:
+        if row.spec_json.get("cluster"):
+            settings = get_settings()
+            token = cluster_join_token(row, settings)
+            for channel in ("stdout", "stderr"):
+                payload[channel] = payload[channel].replace(token, "[redacted cluster token]")
+            if payload["status"] == "ready":
+                validate_cluster_result(payload, await cluster_capability(session, row, settings))
+        if (
+            payload["status"] == "ready"
+            and payload["exit_code"] is None
+            and not row.spec_json["readiness_argv"]
+            and not row.spec_json.get("cluster")
+        ):
             raise HTTPException(422, "A running command requires an explicit readiness probe")
         if row.result_json is not None and row.result_json != payload:
             raise HTTPException(409, "Instance guest result is already sealed")

@@ -1,5 +1,71 @@
 # Palimpsest Architecture
 
+## Bounded available-GPU and fixed API cluster candidate — 2026-10-30
+
+The resumed study prioritizes intended framework behavior and explainable phase
+measurements, not faster results. Available original-project flavors and GPU/RAM
+tuples are checked independently of the dashboard screenshot; real Ada8c16GiB
+boot/driver evidence is not vendor injection or GPU framework qualification.
+CUDA compilation explicitly targets the validated actual compute capability and
+rejects a compiled/executed mismatch instead of relying on default-target PTX JIT.
+
+`api-cluster` is a separate, default-disabled `cluster_profile` privilege contract,
+not a CPU/GPU chroot relaxation. Exact original projects, content-qualified guest
+image and permitted CPU flavors admit fixed k3s only. `cluster_server_id` binds the
+same original user's unexpired live server and its one immutable agent to identical
+ordered layers/runtime. Server eligibility is fenced at admission and allocation.
+A capability-scoped domain-separated HMAC token is derived, never plaintext SQL/
+projection/argv/environment; source expiry and profile changes fail closed.
+
+The existing worker builds pinned k3s plus exact offline airgap archive/static
+probe bytes. Guests only mount/run; no Palimpsest CLI or registry/layer acquisition.
+Explicit whole-VM root/cgroupfs/native-snapshotter operation reports exact two-node
+readiness and per-node4950 numerical proofs through the existing bounded sealed
+callback. Private join data, child ownership, bounded capture and normal mount
+cleanup remain mandatory; no hostile-code isolation or DNS/HTTP/PVC/reboot proof
+is implied. Both live slots are atomically held; each pair has its own deployment
+deadline. Later pairs reuse one completed job without acquisition/build and use
+fresh writable guests, then agent-first normal API cleanup. Old provider RPC/
+attachment failures are not framework workload failures.
+
+The dedicated API module is `services/instance_cluster_runtime.py`; external
+hash/byte/deadline-bounded acquisition lives in `benchmark_cluster_context.py`.
+Kolla `palimpsest_instance_cluster_profiles` defaults to empty; new fields are
+immutable spec JSON in the existing table, with no added SQL schema or secret rows.
+Actual deployment and live cluster/GPU evidence must be recorded separately.
+
+## API GPU cold/warm candidate — 2026-10-30
+
+The owner selected official API GPU execution before benchmarking, one cold/warm
+pair each for CUDA, PyTorch and TensorFlow. This worktree starts from05cba09;
+the previously deployed1afca684 remains the production baseline until a separately
+approved canonical rollout. Current implementation is still verified HTTPS layer
+delivery, not the target Manila/CephFS mount or zero-copy path.
+
+GPU requests select `gpu_profile`; an empty operator
+`palimpsest_hub_instance_gpu_profiles` denies GPU admission. Each strict profile
+binds exact original projects, hash-qualified Glance image, flavor/PCI aliases,
+driver version and GPU count. Both provider fences precede fresh original-human
+read/write checks and the durable intent/Nova effect. Ungrouped, numeric-group and
+named-group GPU flavor resources cannot bypass the opt-in. CPU idempotency and
+its existing Nova cloud-init byte budget are retained.
+
+The qualified guest base must already provide working NVIDIA driver plus vendor
+CLI/library1.18+. Server-generated bootstrap verifies assigned UUIDs and driver,
+then the vendor CLI injects compute/utility support into a private chroot namespace.
+It does not install/reset drivers, reassign host GPUs, run Docker, install Palimpsest
+in the workload VM, or build layers there. The image UID/GID is preserved. Vendor
+mount IDs, subreaped children and normal unmount/loop cleanup are fenced; unowned
+overmounts are never peeled off. GPU failures share the API's bounded result vocabulary.
+
+Independent admission and namespace reviews closed grouped-resource admission,
+post-provider authority, callback-vocabulary and pinned-mount cleanup defects.
+The affected instance node passed111tests. One separately approved isolated Linux
+proof exercised actual mount/unowned-overmount preservation and exact loop detach,
+then ordinarily removed its exact stopped container. This is not actual NVIDIA
+injection or GPU numerical evidence. Live base qualification and six measurements
+are distinct subsequent proofs; no CPU fallback or historical timing is substituted.
+
 ## Full current integration and Kolla rollout — 2026-10-30
 
 The owner's new request expands the earlier Hub-only publication to all remaining
@@ -1161,6 +1227,15 @@ uv run python scripts/test_lanes.py run gate2
 
 ## Maintenance
 
+2026-10-30 GPU candidate: explicit project/content/flavor/driver profiles replace
+implicit GPU flavor acceptance; source-reviewed vendor injection stays guest-local
+and does not install drivers or build layers. The paired API benchmark keeps cold
+dependency/acquisition/build and existing-layer warm boundaries distinct, with
+post-fsync/post-hash authority and absolute acquisition deadlines. Independent
+reviews and real Linux cleanup are not GPU qualification: the sole prerequisite
+VM failed Nova scheduling before boot and was ordinarily removed. Conditional
+publication/rollout remains blocked; no new timing or Manila claim is made.
+
 2026-10-30 full-current integration: the following2026-10-29 paragraph describes
 only its earlier scoped branch. This integration includes benchmark scenario/
 station source, fixed programs, the live Hub acceptance harness and visual guide.
@@ -1807,9 +1882,9 @@ provider provisioning. Fresh multi-instance evidence is recorded separately.
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "6fb894d4f3ebd53f2f7e15fe34223ce3a8d3799c64fdddfb1f7f1ed7835adbd1",
-  "reviewed_at": "2026-10-29T16:04:35Z",
-  "summary": "Reviewed all current shared/release deltas on0.3.10+5c9a30b. Integrated scenario/station/fixed API harness and native config/absence guards without old worker/security rollback. Independent review closes6auth/no-replay/expiry/no-call/disk-publication defects;18scenario+5station failing-before boundaries and actual plaintext-before/HTTPS-rejected-after proof retained. Four-table cold Kolla/paired recovery and worker disposition remain operational gates."
+  "source_sha256": "c12fb7a3ba1f24ea29a53d62797e8ac461b4315676313fa7be5a9b3b312fedf4",
+  "reviewed_at": "2026-10-30T06:34:41Z",
+  "summary": "Reviewed fixed API GPU/cluster implementation and original-actor/current-locking gates; independent source reviews closed expiry/profile, capture/PID, atomic live-budget, readiness and timeout/default findings. Actual fullHub1226/7, focusedroot402, fivecanonicalarm64/amd64 image execution+source hashes and realLinux child ownership/capture passed; representativeNova60052/65535bytes, sm61/sm89 cubins andminimumPython3.11wheelpassed. Fullrootinitial8702/305 hadmissinguvPATH andunrelatedsimulatedancestorctimefixture race; corrected42casespassed andonlytestfixture non-targetctimeisolated, productionguardunchanged. ActualAda16bootSMIpassed butmissingvendor; acceptedrebuildfailed/unattributedVM404, exactnewbootordinarydeleted. Finalfreshprerequisiteslotseparatelyapproved; noactualGPU/k3smeasurements/deploymentclaimed. Operatoradmin401stopnewworkerdisk; dedicatedprojectapplicationcredentialrequired, noadditionaladminauthentication/IAMbypass."
 }
 ```
 <!-- architecture-review:end -->

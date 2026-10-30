@@ -16,6 +16,7 @@ from uuid import uuid4
 import httpx
 import pytest
 from fastapi import FastAPI, HTTPException, Request
+from pydantic import SecretStr
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -72,6 +73,9 @@ class Provider:
 
     def get_flavor(self, flavor_id):
         return {"id": flavor_id, "ram": 1024, "is_public": True}
+
+    def fetch_flavor_extra_specs(self, flavor):
+        return {**flavor, "extra_specs": {}}
 
     def get_network(self, network_id):
         return {"id": network_id, "project_id": self.network_owner}
@@ -165,6 +169,9 @@ async def instance_hub(tmp_path, monkeypatch):
         palimpsest_hub_instance_max_writable_gib=64,
         palimpsest_hub_max_blob_bytes=1024 * 1024,
         palimpsest_hub_instance_base_images={},
+        palimpsest_hub_instance_gpu_profiles={},
+        palimpsest_hub_instance_cluster_profiles={},
+        palimpsest_hub_build_worker_key=SecretStr("test-worker-secret-" + "x" * 32),
         palimpsest_hub_instance_ca_certificates=(),
     )
     async with factory() as session:
@@ -909,3 +916,1263 @@ async def test_definite_preallocation_failure_retains_reason_and_can_release_quo
     monkeypatch.setattr(service, "render_bootstrap", original_render)
     assert (await h.client.post("/v1/instances", json=request_body())).status_code == 202
     assert len(h.provider.creates) == 1
+
+
+async def gpu_request(h, monkeypatch):
+    """Only SQL/provider fixtures, never a live hardware qualification."""
+    from palimpsest_hub.image_models import PalimpsestHubImageJob
+
+    job_id = str(uuid4())
+    async with h.factory() as session:
+        layer = await session.scalar(select(PalimpsestHubLayer).where(PalimpsestHubLayer.blob_digest == DIGEST))
+        layer.config_json = {"base_image_digest": None}
+        session.add(
+            PalimpsestHubImageJob(
+                id=job_id,
+                project_id=PROJECT,
+                created_by=USER,
+                request_id=str(uuid4()),
+                kind="registry",
+                name="gpu-source",
+                request_digest=BASE,
+                request_json={},
+                status="complete",
+                output_digests=[DIGEST],
+                result_json={
+                    "source": {"root_digest": BASE, "manifest_digest": BASE, "config_digest": BASE},
+                    "runtime": {
+                        "entrypoint": [],
+                        "cmd": ["/app/proof"],
+                        "env": [],
+                        "working_dir": "/",
+                        "user": "1000:1000",
+                    },
+                },
+            )
+        )
+        await session.commit()
+    body = request_body(layer_digests=[], image_job_id=job_id, gpu_profile="rtx-qualified", command=[])
+    h.settings.palimpsest_hub_instance_gpu_profiles["rtx-qualified"] = {
+        "image_id": body["image_id"],
+        "flavor_id": body["flavor_id"],
+        "pci_alias": "RTX-3060-LHR:1,GA106-audio:1",
+        "driver_version": "580.95.05",
+        "device_count": 1,
+        "project_ids": [PROJECT],
+    }
+    h.settings.palimpsest_hub_instance_base_images[body["image_id"]] = {
+        "architecture": "x86_64",
+        "os_type": "linux",
+        "os_hash_algo": "sha512",
+        "os_hash_value": "a" * 128,
+    }
+    image = h.provider.get_image
+    monkeypatch.setattr(
+        h.provider,
+        "get_image",
+        lambda identity: {
+            **image(identity),
+            "os_hash_algo": "sha512",
+            "os_hash_value": "a" * 128,
+        },
+    )
+    monkeypatch.setattr(
+        h.provider,
+        "fetch_flavor_extra_specs",
+        lambda flavor: {
+            **flavor,
+            "extra_specs": {"pci_passthrough:alias": "RTX-3060-LHR:1,GA106-audio:1"},
+        },
+    )
+    return body
+
+
+@pytest.mark.asyncio
+async def test_gpu_snapshots_trusted_profile_and_preserves_image_identity_on_reuse(instance_hub, monkeypatch):
+    h = instance_hub
+    body = await gpu_request(h, monkeypatch)
+    response = await h.client.post("/v1/instances", json=body)
+    assert response.status_code == 202, response.text
+    item = response.json()
+    assert item["gpu_profile"] == "rtx-qualified" and item["gpu"]["device_count"] == 1
+    assert "project_ids" not in item["gpu"] and item["gpu"]["project_id"] == PROJECT
+    guest = guest_spec(h.provider)
+    assert guest["gpu"] == item["gpu"] and guest["runtime"]["user"] == "1000:1000"
+    assert guest["command"] == ["/app/proof"]
+    repeated = await h.client.post("/v1/instances", json=body)
+    assert repeated.json()["id"] == item["id"] and len(h.provider.creates) == 1
+    warm = await h.client.post(
+        "/v1/instances",
+        json=request_body(
+            image_id=body["image_id"],
+            layer_digests=[],
+            source_instance_id=item["id"],
+            gpu_profile="rtx-qualified",
+        ),
+    )
+    assert warm.status_code == 202, warm.text
+    assert warm.json()["layer_digests"] == item["layer_digests"] and len(h.provider.creates) == 2
+    assert guest_spec(h.provider)["gpu"] == guest["gpu"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "disabled",
+        "image",
+        "flavor",
+        "unqualified",
+        "hash",
+        "driver",
+        "project",
+        "alias",
+        "private-flavor",
+        "mode",
+    ],
+)
+async def test_gpu_mismatch_never_admits_or_allocates(instance_hub, monkeypatch, failure):
+    h = instance_hub
+    body = await gpu_request(h, monkeypatch)
+    profile = h.settings.palimpsest_hub_instance_gpu_profiles["rtx-qualified"]
+    if failure == "disabled":
+        h.settings.palimpsest_hub_instance_gpu_profiles.clear()
+    elif failure in {"image", "flavor"}:
+        body[failure + "_id"] = str(uuid4())
+    elif failure == "unqualified":
+        h.settings.palimpsest_hub_instance_base_images.clear()
+    elif failure == "hash":
+        h.settings.palimpsest_hub_instance_base_images[body["image_id"]]["os_hash_value"] = "b" * 128
+    elif failure == "driver":
+        profile.pop("driver_version")
+    elif failure == "project":
+        profile["project_ids"] = [OTHER]
+    elif failure == "alias":
+        monkeypatch.setattr(h.provider, "fetch_flavor_extra_specs", lambda flavor: {**flavor, "extra_specs": {}})
+    elif failure == "private-flavor":
+        monkeypatch.setattr(
+            h.provider, "get_flavor", lambda identity: {"id": identity, "ram": 1024, "is_public": False}
+        )
+        monkeypatch.setattr(h.provider, "get_flavor_access", lambda identity: [{"tenant_id": OTHER}], raising=False)
+    elif failure == "mode":
+        async with h.factory() as session:
+            layer = await session.scalar(select(PalimpsestHubLayer).where(PalimpsestHubLayer.blob_digest == DIGEST))
+            layer.config_json = {"base_image_digest": BASE}
+            await session.commit()
+    response = await h.client.post("/v1/instances", json=body)
+    assert response.status_code == (403 if failure in {"project", "private-flavor"} else 422), response.text
+    assert not h.provider.creates
+    async with h.factory() as session:
+        assert not (await session.scalars(select(PalimpsestHubInstance))).all()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["profile", "disabled", "project", "qualification", "hash", "alias", "access"])
+async def test_gpu_second_fence_changes_fail_without_effect_or_replay(instance_hub, monkeypatch, failure):
+    h = instance_hub
+    body = await gpu_request(h, monkeypatch)
+    original = service.qualified_gpu
+    calls = 0
+
+    def mutate(spec, project, settings):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            profile = h.settings.palimpsest_hub_instance_gpu_profiles["rtx-qualified"]
+            if failure == "profile":
+                profile["driver_version"] = "581.12.00"
+            elif failure == "disabled":
+                h.settings.palimpsest_hub_instance_gpu_profiles.clear()
+            elif failure == "project":
+                profile["project_ids"] = [OTHER]
+            elif failure == "qualification":
+                h.settings.palimpsest_hub_instance_base_images.clear()
+            elif failure == "hash":
+                image = h.provider.get_image
+                monkeypatch.setattr(
+                    h.provider, "get_image", lambda identity: {**image(identity), "os_hash_value": "b" * 128}
+                )
+            elif failure == "alias":
+                monkeypatch.setattr(
+                    h.provider, "fetch_flavor_extra_specs", lambda flavor: {**flavor, "extra_specs": {}}
+                )
+            elif failure == "access":
+                monkeypatch.setattr(
+                    h.provider, "get_flavor", lambda identity: {"id": identity, "ram": 1024, "is_public": False}
+                )
+                monkeypatch.setattr(h.provider, "get_flavor_access", lambda identity: [], raising=False)
+        return original(spec, project, settings)
+
+    monkeypatch.setattr(service, "qualified_gpu", mutate)
+    response = await h.client.post("/v1/instances", json=body)
+    assert response.status_code == (403 if failure in {"project", "access"} else 422), response.text
+    assert not h.provider.creates
+    async with h.factory() as session:
+        row = (await session.scalars(select(PalimpsestHubInstance))).one()
+        assert row.error_code == "create_inputs_changed" and row.capability_hash is None
+        assert service.create_not_attempted(row)
+    repeated = await h.client.post("/v1/instances", json=body)
+    assert repeated.status_code == 202 and repeated.json()["error_code"] == "create_inputs_changed"
+    assert not h.provider.creates
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"pci_passthrough:alias": "gpu:1"},
+        {"resources:VGPU": "1"},
+        {"resources1:VGPU": "1"},
+        {"resources42:CUSTOM_GPU": "1"},
+        {"resourcesgpu:VGPU": "1"},
+        {"resourcesgroup-a:CUSTOM_GPU": "1"},
+        {"resourcesgroup_b:CUSTOM_GPU": "1"},
+    ],
+)
+async def test_gpu_flavor_without_explicit_profile_never_allocates(instance_hub, monkeypatch, extra):
+    h = instance_hub
+    monkeypatch.setattr(h.provider, "fetch_flavor_extra_specs", lambda flavor: {**flavor, "extra_specs": extra})
+    response = await h.client.post("/v1/instances", json=request_body())
+    assert response.status_code == 422 and not h.provider.creates
+
+
+@pytest.mark.asyncio
+async def test_cpu_default_needs_no_gpu_profile_or_guest_tools(instance_hub):
+    h = instance_hub
+    response = await h.client.post("/v1/instances", json=request_body())
+    assert response.status_code == 202, response.text
+    assert response.json()["gpu"] is None and response.json()["gpu_profile"] is None
+    assert "gpu" not in guest_spec(h.provider)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"device_count": 0},
+        {"device_count": 17},
+        {"device_count": True},
+        {"device_count": "1"},
+        {"driver_version": ""},
+        {"driver_version": "580.95;id"},
+        {"pci_alias": "gpu:0"},
+        {"pci_alias": "gpu:1,gpu:1"},
+        {"pci_alias": "gpu:1, audio:1"},
+        {"project_ids": []},
+        {"project_ids": [PROJECT, PROJECT]},
+        {"project_ids": ["not-a-project"]},
+        {"host_library_path": "/usr/lib"},
+        {"image_id": "not-an-image"},
+    ],
+)
+def test_gpu_profile_rejects_unsafe_or_incomplete_operator_data(change):
+    from pydantic import ValidationError
+
+    from palimpsest_hub.config import InstanceGpuProfile
+
+    profile = {
+        "image_id": str(uuid4()),
+        "flavor_id": "gpu",
+        "pci_alias": "gpu:1,audio:1",
+        "driver_version": "580.95.05",
+        "device_count": 1,
+        "project_ids": [PROJECT],
+    }
+    with pytest.raises(ValidationError):
+        InstanceGpuProfile.model_validate({**profile, **change})
+
+
+def gpu_helper_namespace():
+    import os
+    import pathlib
+    import subprocess
+    import time
+
+    from palimpsest_hub.services.instance_gpu_runtime import GPU_RUNTIME
+
+    namespace = {"os": os, "pathlib": pathlib, "subprocess": subprocess, "time": time}
+    exec(compile(GPU_RUNTIME, "embedded-gpu-runtime.py", "exec"), namespace)
+    return namespace
+
+
+@pytest.mark.parametrize(
+    "version,observation,error",
+    [
+        ("1.17.8", "GPU-11111111-2222-3333-4444-555555555555, 580.95.05\n", "gpu_vendor_version_unqualified"),
+        ("1.18.0", "", "gpu_device_count_mismatch"),
+        ("1.18.0", "GPU-11111111-2222-3333-4444-555555555555, 579.00\n", "gpu_driver_or_uuid_mismatch"),
+        ("1.18.0", "not-a-uuid, 580.95.05\n", "gpu_driver_or_uuid_mismatch"),
+        ("1.18.0", "GPU-11111111-2222-3333-4444-555555555555, 580.95.05\n", None),
+    ],
+)
+def test_gpu_prerequisite_boundary_fails_closed_without_driver_install(version, observation, error):
+    import stat
+
+    namespace = gpu_helper_namespace()
+    trusted = SimpleNamespace(
+        resolve=lambda **kwargs: trusted, stat=lambda: SimpleNamespace(st_mode=stat.S_IFREG | 0o755, st_uid=0)
+    )
+    namespace["pathlib"] = SimpleNamespace(Path=lambda tool: trusted)
+    namespace["os"] = SimpleNamespace(access=lambda path, permission: True, X_OK=1)
+    commands = []
+
+    def capture(argv):
+        commands.append(argv)
+        return (
+            "cli-version: " + version + "\nlib-version: " + version + "\n" if argv[-1] == "--version" else observation
+        )
+
+    namespace["gpu_capture"] = capture
+    profile = {"driver_version": "580.95.05", "device_count": 1}
+    if error:
+        with pytest.raises(RuntimeError, match=error):
+            namespace["gpu_prerequisites"](profile)
+    else:
+        assert namespace["gpu_prerequisites"](profile) == ["GPU-11111111-2222-3333-4444-555555555555"]
+    assert all(argv[0] in {"/usr/bin/nvidia-smi", "/usr/bin/nvidia-container-cli"} for argv in commands)
+
+
+@pytest.mark.parametrize("partial_failure", [False, True])
+def test_gpu_vendor_mounts_tracked_even_on_partial_failure_and_cleaned_in_reverse(tmp_path, partial_failure):
+    namespace = gpu_helper_namespace()
+    merged = tmp_path / "merged"
+    for name in ("dev", "proc", "sys", "etc"):
+        (merged / name).mkdir(parents=True)
+    namespace["gpu_mount_table"] = lambda: dict(current)
+    current = {1: merged.parent}
+    commands = []
+    owned = {}
+
+    def capture(argv):
+        commands.append(argv)
+        current.update({10: merged / "usr/lib/libcuda.so", 11: merged / "dev/nvidia0"})
+        if partial_failure:
+            raise RuntimeError("gpu_vendor_command_failed")
+        return ""
+
+    namespace["gpu_capture"] = capture
+    if partial_failure:
+        with pytest.raises(RuntimeError, match="gpu_vendor_command_failed"):
+            namespace["gpu_configure"]({}, ["GPU-fixture"], merged, owned)
+    else:
+        namespace["gpu_configure"]({}, ["GPU-fixture"], merged, owned)
+    assert set(owned) == {10, 11}
+    assert commands == [
+        [
+            "/usr/bin/nvidia-container-cli",
+            "configure",
+            "--no-cgroups",
+            "--compute",
+            "--utility",
+            "--no-persistenced",
+            "--no-fabricmanager",
+            "--ldconfig=@/sbin/ldconfig",
+            "--device=GPU-fixture",
+            str(merged),
+        ]
+    ]
+    removed = []
+
+    namespace["gpu_resolved_mount"] = lambda path: next(
+        identity for identity, target in current.items() if target == path
+    )
+
+    def unmount(path, identity):
+        assert current[identity] == path
+        removed.append(["umount", str(path)])
+        current.pop(identity)
+
+    namespace["gpu_unmount_owned"] = unmount
+    namespace["gpu_cleanup"](owned)
+    assert removed == [["umount", str(merged / "usr/lib/libcuda.so")], ["umount", str(merged / "dev/nvidia0")]]
+    assert current == {1: merged.parent}
+
+
+def test_gpu_runtime_managed_symlink_never_reaches_vendor_or_base(tmp_path):
+    namespace = gpu_helper_namespace()
+    merged = tmp_path / "merged"
+    merged.mkdir()
+    (merged / "dev").symlink_to("/dev")
+    namespace["gpu_capture"] = lambda argv: pytest.fail("vendor must not receive redirected managed root")
+    with pytest.raises(RuntimeError, match="gpu_unsafe_mountpoint"):
+        namespace["gpu_configure"]({}, ["GPU-fixture"], merged, {})
+
+
+def test_gpu_injected_probe_uses_runtime_identity_and_exact_device_driver():
+    namespace = gpu_helper_namespace()
+    calls = []
+    enter = object()
+    environment = {"PATH": "/usr/bin", "NVIDIA_VISIBLE_DEVICES": "GPU-fixture"}
+
+    def capture(argv, preexec, env):
+        calls.append((argv, preexec, env))
+        return "GPU-fixture, 580.95.05\n"
+
+    namespace["gpu_capture"] = capture
+    namespace["gpu_verify_injected"]({"driver_version": "580.95.05"}, ["GPU-fixture"], enter, environment)
+    assert calls[0][1] is enter and calls[0][2] is environment
+    with pytest.raises(RuntimeError, match="gpu_injected_runtime_mismatch"):
+        namespace["gpu_verify_injected"]({"driver_version": "581.00"}, ["GPU-fixture"], enter, environment)
+
+
+def test_settings_gpu_defaults_disabled_and_requires_content_pinned_base():
+    from pydantic import ValidationError
+
+    from palimpsest_hub.config import Settings
+
+    values = {
+        "database_url": "sqlite+aiosqlite:///fixture.db",
+        "redis_url": "redis://localhost:6379",
+        "palimpsest_hub_local_path": "/tmp/fixture-cas",
+        "os_auth_url": "https://keystone.example/v3",
+        "os_username": "service",
+        "os_password": "fixture",
+        "os_project_name": "service",
+    }
+    assert Settings(**values).palimpsest_hub_instance_gpu_profiles == {}
+    profile = {
+        "image_id": str(uuid4()),
+        "flavor_id": "gpu",
+        "pci_alias": "gpu:1,audio:1",
+        "driver_version": "580.95.05",
+        "device_count": 1,
+        "project_ids": [PROJECT],
+    }
+    with pytest.raises(ValidationError, match="content-pinned"):
+        Settings(**values, palimpsest_hub_instance_gpu_profiles={"qualified": profile})
+
+
+@pytest.mark.asyncio
+async def test_cpu_request_digest_is_compatible_with_pre_gpu_api(instance_hub):
+    h = instance_hub
+    body = request_body()
+    expected = instances.InstanceRequest.model_validate(body).model_dump(mode="json")
+    expected.pop("gpu_profile")
+    expected.pop("cluster_profile")
+    expected.pop("cluster_server_id")
+    response = await h.client.post("/v1/instances", json=body)
+    assert response.status_code == 202, response.text
+    async with h.factory() as session:
+        row = await session.get(PalimpsestHubInstance, response.json()["id"])
+        assert (
+            row.request_digest
+            == "sha256:"
+            + hashlib.sha256(json.dumps(expected, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        )
+
+
+@pytest.mark.asyncio
+async def test_cpu_flavor_becoming_gpu_at_second_fence_cannot_allocate(instance_hub, monkeypatch):
+    h = instance_hub
+    original = h.provider.get_image
+    calls = 0
+
+    def mutate(identity):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            monkeypatch.setattr(
+                h.provider,
+                "fetch_flavor_extra_specs",
+                lambda flavor: {
+                    **flavor,
+                    "extra_specs": {"pci_passthrough:alias": "gpu:1"},
+                },
+            )
+        return original(identity)
+
+    monkeypatch.setattr(h.provider, "get_image", mutate)
+    response = await h.client.post("/v1/instances", json=request_body())
+    assert response.status_code == 422 and not h.provider.creates
+
+
+def test_gpu_escaped_vendor_mount_is_owned_for_cleanup_and_fails_closed(tmp_path):
+    namespace = gpu_helper_namespace()
+    merged = tmp_path / "merged"
+    escaped = tmp_path / "outside"
+    namespace["gpu_mount_table"] = lambda: {1: tmp_path, 10: escaped}
+    owned = {}
+    with pytest.raises(RuntimeError, match="gpu_vendor_mount_escaped"):
+        namespace["gpu_track_mounts"]({1: tmp_path}, merged, owned)
+    assert owned == {10: escaped}
+
+
+def test_gpu_vendor_capture_bounds_actual_subprocess_output():
+    import sys
+
+    namespace = gpu_helper_namespace()
+    assert namespace["gpu_capture"]([sys.executable, "-c", "print('bounded')"]) == "bounded\n"
+    with pytest.raises(RuntimeError, match="gpu_vendor_output_limit"):
+        namespace["gpu_capture"]([sys.executable, "-c", "import sys; sys.stdout.write('x' * 20000)"])
+
+
+@pytest.mark.parametrize("unowned_top,retain_after_success", [(False, False), (True, False), (False, True)])
+def test_gpu_cleanup_same_path_resolves_stack_not_numeric_ids(tmp_path, unowned_top, retain_after_success):
+    namespace = gpu_helper_namespace()
+    path = tmp_path / "injected-library"
+    # ID 900 is the BOTTOM: numeric ordering must not determine unmount order.
+    current = {900: path, 12: path}
+    stack = [900, 12]
+    if unowned_top:
+        current[3] = path
+        stack.append(3)
+    removed = []
+    namespace["gpu_mount_table"] = lambda: dict(current)
+
+    def resolve(target):
+        assert target == path
+        return stack[-1]
+
+    def unmount(target, identity):
+        assert target == path
+        assert identity in {900, 12}, "unowned replacement must never be unmounted"
+        removed.append(identity)
+        if not retain_after_success:
+            assert stack.pop() == identity
+            current.pop(identity)
+
+    namespace["gpu_resolved_mount"] = resolve
+    namespace["gpu_unmount_owned"] = unmount
+    if unowned_top or retain_after_success:
+        with pytest.raises(RuntimeError, match="gpu_mount_cleanup_failed"):
+            namespace["gpu_cleanup"]({900: path, 12: path})
+        assert current[900] == path and current[12] == path
+        if unowned_top:
+            assert removed == [] and current[3] == path
+    else:
+        namespace["gpu_cleanup"]({900: path, 12: path})
+        assert removed == [12, 900] and not current
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("revoked", ["packages:read", "packages:write"])
+async def test_second_provider_reads_revoke_authority_before_nova(instance_hub, monkeypatch, revoked):
+    h = instance_hub
+    original_image = h.provider.get_image
+    state = {"calls": 0, "revoked": False}
+
+    def inspect(identity):
+        state["calls"] += 1
+        if state["calls"] == 2:
+            state["revoked"] = True
+        return original_image(identity)
+
+    async def authority(actor, conn):
+        if state["revoked"]:
+            if revoked == "packages:write":
+                raise HTTPException(403, "Fresh write authority revoked during provider reads")
+            return {**actor, "package_actions": actor["package_actions"] - {revoked}}
+        return actor
+
+    monkeypatch.setattr(h.provider, "get_image", inspect)
+    monkeypatch.setattr(service, "fresh_writer", authority)
+    response = await h.client.post("/v1/instances", json=request_body())
+    assert response.status_code == 403 and not h.provider.creates
+    async with h.factory() as session:
+        row = (await session.scalars(select(PalimpsestHubInstance))).one()
+        assert row.error_code == "create_authority_revoked" and row.capability_hash is None
+
+
+@pytest.mark.asyncio
+async def test_every_bounded_gpu_failure_is_accepted_and_visible_in_actual_callback(instance_hub):
+    from palimpsest_hub.services.instance_gpu_runtime import GPU_ERROR_CODES
+
+    h = instance_hub
+    h.settings.palimpsest_hub_max_instances_per_project = 100
+    for code in GPU_ERROR_CODES:
+        item = (await h.client.post("/v1/instances", json=request_body())).json()
+        guest = guest_spec(h.provider)
+        response = await h.client.put(
+            "/v1/instance-bootstrap/" + item["id"] + "/result",
+            headers={"Authorization": "Bearer " + guest["capability"]},
+            json={"instance_id": item["id"], "status": "error", "error_code": code},
+        )
+        assert response.status_code == 204, (code, response.text)
+        observed = (await h.client.get("/v1/instances/" + item["id"])).json()
+        assert observed["status"] == "error" and observed["result"]["error_code"] == code
+        await h.client.delete("/v1/instances/" + item["id"])
+        await h.client.get("/v1/instances/" + item["id"])
+
+
+@pytest.mark.asyncio
+async def test_large_valid_cpu_payload_allocates_without_gpu_bootstrap_budget_cost(instance_hub, monkeypatch):
+    h = instance_hub
+    body = await gpu_request(h, monkeypatch)
+    command = ["/app/proof", *(["x" * 4000] * 4)]
+    body["command"] = command
+    extra_specs = h.provider.fetch_flavor_extra_specs
+    monkeypatch.setattr(h.provider, "fetch_flavor_extra_specs", lambda flavor: {**flavor, "extra_specs": {}})
+    cpu = await h.client.post("/v1/instances", json={**body, "gpu_profile": None})
+    assert cpu.status_code == 202 and cpu.json()["status"] == "booting", cpu.text
+    assert len(h.provider.creates) == 1
+    guest = guest_spec(h.provider)
+    assert guest["command"] == command and guest["runtime"]["user"] == "1000:1000"
+    assert len(h.provider.creates[0]["user_data"]) <= 65535
+
+    # The same near-limit argv plus the vendor payload cannot be silently
+    # truncated or allocated with a CPU fallback when GPU was explicitly asked.
+    monkeypatch.setattr(h.provider, "fetch_flavor_extra_specs", extra_specs)
+    gpu = await h.client.post("/v1/instances", json={**body, "request_id": str(uuid4())})
+    assert gpu.status_code == 202, gpu.text
+    assert gpu.json()["status"] == "error" and gpu.json()["error_code"] == "create_bootstrap_input_limit"
+    assert len(h.provider.creates) == 1
+    async with h.factory() as session:
+        row = await session.get(PalimpsestHubInstance, gpu.json()["id"])
+        assert row.capability_hash is None and service.create_not_attempted(row)
+
+
+async def cluster_request(h, monkeypatch):
+    """Real SQL/API admission with fake provider, not a guest k3s qualification."""
+    body = await gpu_request(h, monkeypatch)
+    body.update(gpu_profile=None, cluster_profile="k3s-qualified")
+    h.settings.palimpsest_hub_instance_cluster_profiles["k3s-qualified"] = {
+        "image_id": body["image_id"],
+        "flavor_ids": [body["flavor_id"]],
+        "project_ids": [PROJECT],
+    }
+    monkeypatch.setattr(h.provider, "fetch_flavor_extra_specs", lambda flavor: {**flavor, "extra_specs": {}})
+    monkeypatch.setattr(
+        h.provider,
+        "server_interfaces",
+        lambda server: [
+            {"net_id": body["network_id"], "port_id": "cluster-port", "fixed_ips": [{"ip_address": "10.88.0.2"}]}
+        ],
+        raising=False,
+    )
+    monkeypatch.setattr(
+        h.provider,
+        "get_port",
+        lambda port: {
+            "id": port,
+            "project_id": PROJECT,
+            "network_id": body["network_id"],
+            "device_id": next(iter(h.provider.servers_by_id)),
+            "fixed_ips": [{"ip_address": "10.88.0.2"}],
+        },
+        raising=False,
+    )
+    return body
+
+
+def cluster_agent_body(body, server):
+    return {
+        **body,
+        "request_id": str(uuid4()),
+        "image_job_id": None,
+        "source_instance_id": server["id"],
+        "cluster_server_id": server["id"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_cluster_two_member_admission_private_capability_and_one_agent(instance_hub, monkeypatch):
+    h = instance_hub
+    body = await cluster_request(h, monkeypatch)
+    response = await h.client.post("/v1/instances", json=body)
+    assert response.status_code == 202, response.text
+    server = response.json()
+    assert server["status"] == "booting", server
+    server_guest = guest_spec(h.provider)
+    assert server["mode"] == "oci-chroot" and server["cluster"]["role"] == "server"
+    assert server["cluster"]["node_name"] == "pal-" + server["id"].replace("-", "")
+    assert "qualification" not in server["cluster"]
+    auth = {"Authorization": "Bearer " + server_guest["capability"]}
+    path = "/v1/instance-bootstrap/" + server["id"] + "/cluster"
+    initial = await h.client.get(path, headers=auth)
+    assert initial.status_code == 200 and initial.headers["cache-control"] == "no-store"
+    assert len(initial.json()["members"]) == 1
+    agent_response = await h.client.post("/v1/instances", json=cluster_agent_body(body, server))
+    assert agent_response.status_code == 202, agent_response.text
+    agent = agent_response.json()
+    assert agent["status"] == "booting" and agent["cluster"]["server_address"] == "10.88.0.2"
+    agent_guest = guest_spec(h.provider)
+    agent_auth = {"Authorization": "Bearer " + agent_guest["capability"]}
+    agent_cap = await h.client.get("/v1/instance-bootstrap/" + agent["id"] + "/cluster", headers=agent_auth)
+    server_cap = (await h.client.get(path, headers=auth)).json()
+    assert len(server_cap["members"]) == 2 and agent_cap.json()["token"] == server_cap["token"]
+    assert initial.json()["token"] == server_cap["token"]
+    assert h.settings.palimpsest_hub_build_worker_key.get_secret_value() not in agent_cap.text
+    async with h.factory() as session:
+        rows = (await session.scalars(select(PalimpsestHubInstance))).all()
+        assert len(rows) == 2
+        assert all(server_cap["token"] not in json.dumps(row.spec_json) for row in rows)
+    assert server_cap["token"] not in (await h.client.get("/v1/instances")).text
+    denied = await h.client.get(path, headers=agent_auth)
+    assert denied.status_code == 404
+    duplicate = await h.client.post("/v1/instances", json=cluster_agent_body(body, server))
+    assert duplicate.status_code == 409 and len(h.provider.creates) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["disabled", "project", "image", "flavor", "gpu", "command", "probe", "key"])
+async def test_cluster_admission_rejects_unqualified_or_caller_execution(instance_hub, monkeypatch, failure):
+    h = instance_hub
+    body = await cluster_request(h, monkeypatch)
+    profile = h.settings.palimpsest_hub_instance_cluster_profiles["k3s-qualified"]
+    if failure == "disabled":
+        h.settings.palimpsest_hub_instance_cluster_profiles.clear()
+    elif failure == "project":
+        profile["project_ids"] = [OTHER]
+    elif failure in {"image", "flavor"}:
+        body[failure + "_id"] = str(uuid4())
+    elif failure == "gpu":
+        body["gpu_profile"] = "rtx-qualified"
+    elif failure == "command":
+        body["command"] = ["/bin/sh"]
+    elif failure == "probe":
+        body["readiness_argv"] = ["/bin/true"]
+    elif failure == "key":
+        h.settings.palimpsest_hub_build_worker_key = SecretStr("")
+    response = await h.client.post("/v1/instances", json=body)
+    assert response.status_code in (403, 422, 503), response.text
+    assert not h.provider.creates
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["foreign-user", "foreign-port", "provider-not-active", "public-ip"])
+async def test_cluster_agent_requires_original_subject_and_exact_private_interface(instance_hub, monkeypatch, failure):
+    h = instance_hub
+    body = await cluster_request(h, monkeypatch)
+    server = (await h.client.post("/v1/instances", json=body)).json()
+    if failure == "foreign-user":
+        async with h.factory() as session:
+            source = await session.get(PalimpsestHubInstance, server["id"])
+            source.created_by = OTHER
+            await session.commit()
+    elif failure == "foreign-port":
+        port = h.provider.get_port("cluster-port")
+        monkeypatch.setattr(h.provider, "get_port", lambda identity: {**port, "project_id": OTHER})
+    elif failure == "provider-not-active":
+        h.provider.servers_by_id[server["server_id"]]["status"] = "BUILD"
+    else:
+        port = h.provider.get_port("cluster-port")
+        monkeypatch.setattr(h.provider, "get_port", lambda identity: {**port, "fixed_ips": [{"ip_address": "8.8.8.8"}]})
+    response = await h.client.post("/v1/instances", json=cluster_agent_body(body, server))
+    assert response.status_code == 409, response.text
+    assert len(h.provider.creates) == 1
+
+
+def cluster_fixture_proof(server, agent):
+    pause = "docker.io/rancher/mirrored-pause:3.10.2@sha256:412c4a7219cb8a299a37337f3d87810c5340095322e15594a1637785adad0f17"
+    return {
+        "palimpsest_cluster": {
+            "schema": "palimpsest.cluster-result.v1",
+            "success": True,
+            "k3s_version": "v1.37.1+k3s1",
+            "checks": {"nodes": True, "numerical": True},
+            "nodes": [
+                {
+                    "name": item["cluster"]["node_name"],
+                    "internal_ip": "10.88.0." + str(index + 2),
+                    "kubelet_version": "v1.37.1+k3s1",
+                    "container_runtime": "containerd://2.3.2",
+                }
+                for index, item in enumerate((server, agent))
+            ],
+            "pods": [
+                {
+                    "node": item["cluster"]["node_name"],
+                    "name": "pal-proof-" + str(index),
+                    "image": pause,
+                    "ready": True,
+                    "restarts": 0,
+                    "numerical_sum": 4950,
+                }
+                for index, item in enumerate((server, agent))
+            ],
+        }
+    }
+
+
+@pytest.mark.asyncio
+async def test_cluster_callback_validates_full_proof_then_seals_and_revokes(instance_hub, monkeypatch):
+    h = instance_hub
+    body = await cluster_request(h, monkeypatch)
+    server = (await h.client.post("/v1/instances", json=body)).json()
+    auth = {"Authorization": "Bearer " + guest_spec(h.provider)["capability"]}
+    path = "/v1/instance-bootstrap/" + server["id"]
+    agent = (await h.client.post("/v1/instances", json=cluster_agent_body(body, server))).json()
+    agent_auth = {"Authorization": "Bearer " + guest_spec(h.provider)["capability"]}
+    agent_result = await h.client.put(
+        "/v1/instance-bootstrap/" + agent["id"] + "/result",
+        headers=agent_auth,
+        json={"instance_id": agent["id"], "status": "ready"},
+    )
+    assert agent_result.status_code == 204, agent_result.text
+    proof = cluster_fixture_proof(server, agent)
+    result = {"instance_id": server["id"], "status": "ready", "exit_code": 0, "stdout": json.dumps(proof)}
+    marker = await h.client.put(
+        path + "/result", headers=auth, json={**result, "stdout": '{"palimpsest_cluster":true}'}
+    )
+    assert marker.status_code == 422
+    proof["palimpsest_cluster"]["pods"][0]["numerical_sum"] = 0
+    bad = await h.client.put(path + "/result", headers=auth, json={**result, "stdout": json.dumps(proof)})
+    assert bad.status_code == 422
+    successful = await h.client.put(path + "/result", headers=auth, json=result)
+    assert successful.status_code == 204, successful.text
+    repeated = await h.client.put(path + "/result", headers=auth, json=result)
+    assert repeated.status_code == 204
+    changed = await h.client.put(
+        path + "/result",
+        headers=auth,
+        json={"instance_id": server["id"], "status": "error", "error_code": "cluster_proof_failed"},
+    )
+    assert changed.status_code == 409
+    h.settings.palimpsest_hub_instance_cluster_profiles.clear()
+    assert (await h.client.get(path + "/cluster", headers=auth)).status_code != 200
+
+
+@pytest.mark.asyncio
+async def test_cluster_second_fence_profile_revocation_is_durable_not_replayed(instance_hub, monkeypatch):
+    h = instance_hub
+    body = await cluster_request(h, monkeypatch)
+    image = h.provider.get_image
+    calls = 0
+
+    def inspect(identity):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            h.settings.palimpsest_hub_instance_cluster_profiles.clear()
+        return image(identity)
+
+    monkeypatch.setattr(h.provider, "get_image", inspect)
+    response = await h.client.post("/v1/instances", json=body)
+    assert response.status_code == 422 and not h.provider.creates
+    repeated = await h.client.post("/v1/instances", json=body)
+    assert repeated.status_code == 202 and repeated.json()["error_code"] == "create_inputs_changed"
+    assert not h.provider.creates
+
+
+@pytest.mark.parametrize("change", [{"flavor_ids": []}, {"project_ids": ["invalid"]}, {"extra": "forbidden"}])
+def test_cluster_configuration_rejects_invalid_privilege_authority(change):
+    from pydantic import ValidationError
+
+    from palimpsest_hub.config import InstanceClusterProfile
+
+    with pytest.raises(ValidationError):
+        InstanceClusterProfile.model_validate(
+            {"image_id": str(uuid4()), "flavor_ids": ["small"], "project_ids": [PROJECT], **change}
+        )
+
+
+@pytest.mark.asyncio
+async def test_cluster_concurrent_agents_share_project_admission_lock(instance_hub, monkeypatch):
+    import asyncio
+
+    h = instance_hub
+    body = await cluster_request(h, monkeypatch)
+    server = (await h.client.post("/v1/instances", json=body)).json()
+    responses = await asyncio.gather(
+        *[h.client.post("/v1/instances", json=cluster_agent_body(body, server)) for _ in range(2)]
+    )
+    assert sorted(response.status_code for response in responses) == [202, 409]
+    assert len(h.provider.creates) == 2
+
+
+@pytest.mark.asyncio
+async def test_cluster_private_route_rejects_cpu_and_expired_capability(instance_hub, monkeypatch):
+    h = instance_hub
+    cpu = (await h.client.post("/v1/instances", json=request_body())).json()
+    auth = {"Authorization": "Bearer " + guest_spec(h.provider)["capability"]}
+    assert (await h.client.get("/v1/instance-bootstrap/" + cpu["id"] + "/cluster", headers=auth)).status_code == 404
+    body = await cluster_request(h, monkeypatch)
+    server = (await h.client.post("/v1/instances", json=body)).json()
+    auth = {"Authorization": "Bearer " + guest_spec(h.provider)["capability"]}
+    async with h.factory() as session:
+        row = await session.get(PalimpsestHubInstance, server["id"])
+        row.capability_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+        await session.commit()
+    assert (await h.client.get("/v1/instance-bootstrap/" + server["id"] + "/cluster", headers=auth)).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_cluster_bounded_failure_codes_use_existing_callback(instance_hub, monkeypatch):
+    from palimpsest_hub.services.instance_cluster_runtime import CLUSTER_ERROR_CODES
+
+    h = instance_hub
+    body = await cluster_request(h, monkeypatch)
+    for code in sorted(CLUSTER_ERROR_CODES):
+        response = await h.client.post("/v1/instances", json={**body, "request_id": str(uuid4())})
+        server = response.json()
+        auth = {"Authorization": "Bearer " + guest_spec(h.provider)["capability"]}
+        callback = await h.client.put(
+            "/v1/instance-bootstrap/" + server["id"] + "/result",
+            headers=auth,
+            json={"instance_id": server["id"], "status": "error", "error_code": code},
+        )
+        assert callback.status_code == 204, callback.text
+        assert (await h.client.get("/v1/instances/" + server["id"])).json()["error_code"] == code
+
+
+def test_cluster_private_asset_symlink_rejected_before_chroot(tmp_path):
+    import os
+    import pathlib
+    import subprocess
+    import time
+
+    from palimpsest_hub.services.instance_cluster_runtime import CLUSTER_RUNTIME
+
+    namespace = {"os": os, "pathlib": pathlib, "subprocess": subprocess, "time": time, "merged": tmp_path}
+    exec(compile(CLUSTER_RUNTIME, "embedded-cluster-runtime.py", "exec"), namespace)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (tmp_path / "opt").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(RuntimeError, match="cluster_prerequisite_failed"):
+        namespace["cluster_private"]("/opt/palimpsest/probe-busybox")
+    assert not (outside / "palimpsest").exists()
+
+
+@pytest.mark.parametrize("mutation", ["boolean-marker", "numeric-check", "extra-node", "restarted", "wrong-image"])
+def test_cluster_proof_validator_rejects_forged_or_incomplete_result(mutation):
+    from palimpsest_hub.services.instance_cluster_runtime import validate_cluster_result
+
+    server = {"cluster": {"node_name": "pal-" + "a" * 32}}
+    agent = {"cluster": {"node_name": "pal-" + "b" * 32}}
+    proof = cluster_fixture_proof(server, agent)
+    capability = {
+        "role": "server",
+        "server_address": "10.88.0.2",
+        "members": [
+            {"node_name": server["cluster"]["node_name"], "role": "server"},
+            {"node_name": agent["cluster"]["node_name"], "role": "agent"},
+        ],
+    }
+    if mutation == "boolean-marker":
+        proof = {"palimpsest_cluster": True}
+    elif mutation == "numeric-check":
+        proof["palimpsest_cluster"]["checks"]["numerical"] = 1
+    elif mutation == "extra-node":
+        proof["palimpsest_cluster"]["nodes"].append(dict(proof["palimpsest_cluster"]["nodes"][0]))
+    elif mutation == "restarted":
+        proof["palimpsest_cluster"]["pods"][0]["restarts"] = 1
+    else:
+        proof["palimpsest_cluster"]["pods"][0]["image"] = "arbitrary:latest"
+    with pytest.raises(HTTPException) as failure:
+        validate_cluster_result(
+            {"status": "ready", "exit_code": 0, "stdout": json.dumps(proof), "stderr": ""}, capability
+        )
+    assert failure.value.status_code == 422
+
+
+def test_cluster_generated_pods_execute_multicall_numerical_probe(tmp_path):
+    """Execute generated argv through a basename-dispatch executable, not a path-string assertion."""
+    import os
+    import pathlib
+    import subprocess
+    import time
+
+    from palimpsest_hub.services.instance_cluster_runtime import CLUSTER_RUNTIME
+
+    namespace = {"os": os, "pathlib": pathlib, "subprocess": subprocess, "time": time}
+    exec(compile(CLUSTER_RUNTIME, "embedded-cluster-runtime.py", "exec"), namespace)
+    manifest = namespace["cluster_probe_manifest"]({"node-a", "node-b"}, "fixture-pinned-pause")
+    for index, pod in enumerate(manifest["items"]):
+        container = pod["spec"]["containers"][0]
+        mount = container["volumeMounts"][0]
+        executable = tmp_path / str(index) / mount["mountPath"].lstrip("/")
+        executable.parent.mkdir(parents=True)
+        # Model BusyBox's actual basename dispatcher, then exercise the real fixed shell program.
+        executable.write_text('#!/bin/sh\n[ "${0##*/}" = busybox ] || exit 127\nexec "$@"\n')
+        executable.chmod(0o755)
+        argv = container["command"]
+        result = subprocess.run(
+            [str(tmp_path / str(index) / argv[0].lstrip("/")), *argv[1:]], capture_output=True, text=True, timeout=5
+        )
+        assert result.returncode == 0 and result.stdout.strip() == "4950", result.stderr
+
+
+@pytest.mark.asyncio
+async def test_cluster_agent_failure_seals_after_server_capability_expires(instance_hub, monkeypatch):
+    h = instance_hub
+    body = await cluster_request(h, monkeypatch)
+    server = (await h.client.post("/v1/instances", json=body)).json()
+    agent = (await h.client.post("/v1/instances", json=cluster_agent_body(body, server))).json()
+    auth = {"Authorization": "Bearer " + guest_spec(h.provider)["capability"]}
+    path = "/v1/instance-bootstrap/" + agent["id"]
+    token = (await h.client.get(path + "/cluster", headers=auth)).json()["token"]
+    async with h.factory() as session:
+        row = await session.get(PalimpsestHubInstance, server["id"])
+        row.capability_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+        await session.commit()
+    assert (await h.client.get(path + "/cluster", headers=auth)).status_code == 404
+    result = {"instance_id": agent["id"], "status": "error", "error_code": "cluster_bootstrap_failed", "stderr": token}
+    first = await h.client.put(path + "/result", headers=auth, json=result)
+    assert first.status_code == 204, first.text
+    assert (await h.client.put(path + "/result", headers=auth, json=result)).status_code == 204
+    stored = (await h.client.get("/v1/instances/" + agent["id"])).json()["result"]
+    assert token not in json.dumps(stored) and stored["stderr"] == "[redacted cluster token]"
+
+
+def test_cluster_private_existing_wrong_owner_is_not_truncated_or_repermissioned(tmp_path):
+    import os
+    import pathlib
+    import subprocess
+    import time
+
+    from palimpsest_hub.services.instance_cluster_runtime import CLUSTER_RUNTIME
+
+    target = tmp_path / "token"
+    target.write_text("original-untrusted-content")
+    target.chmod(0o644)
+    real_os = os
+
+    class WrongOwnerOS:
+        def __getattr__(self, name):
+            return getattr(real_os, name)
+
+        def fstat(self, fd):
+            observed = real_os.fstat(fd)
+            return SimpleNamespace(st_mode=observed.st_mode, st_uid=1000, st_nlink=observed.st_nlink)
+
+        def fchmod(self, *args):
+            pytest.fail("wrong-owner leaf must be rejected before permissions change")
+
+        def ftruncate(self, *args):
+            pytest.fail("wrong-owner leaf must be rejected before truncation")
+
+    namespace = {"os": WrongOwnerOS(), "pathlib": pathlib, "subprocess": subprocess, "time": time, "merged": tmp_path}
+    exec(compile(CLUSTER_RUNTIME, "embedded-cluster-runtime.py", "exec"), namespace)
+    with pytest.raises(RuntimeError, match="cluster_prerequisite_failed"):
+        namespace["cluster_private"]("/token", "private-join-token")
+    assert target.read_text() == "original-untrusted-content"
+    assert target.stat().st_mode & 0o777 == 0o644
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["expired", "removed", "profile-allowlist"])
+async def test_cluster_agent_rejects_unobserved_source_authority_change(instance_hub, monkeypatch, change):
+    h = instance_hub
+    body = await cluster_request(h, monkeypatch)
+    server = (await h.client.post("/v1/instances", json=body)).json()
+    if change == "profile-allowlist":
+        h.settings.palimpsest_hub_instance_cluster_profiles["k3s-qualified"]["project_ids"].append(OTHER)
+    else:
+        async with h.factory() as session:
+            source = await session.get(PalimpsestHubInstance, server["id"])
+            if change == "expired":
+                source.capability_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+            else:
+                source.capability_hash = None
+            await session.commit()
+    # No GET reconciles the expired source before admission.
+    response = await h.client.post("/v1/instances", json=cluster_agent_body(body, server))
+    assert response.status_code == 409, response.text
+    assert len(h.provider.creates) == 1
+    async with h.factory() as session:
+        rows = (await session.scalars(select(PalimpsestHubInstance))).all()
+        assert [row.id for row in rows] == [server["id"]]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["expired", "removed", "profile-allowlist"])
+async def test_cluster_agent_source_fence_after_provider_read_definitely_prevents_nova(
+    instance_hub, monkeypatch, change
+):
+    h = instance_hub
+    body = await cluster_request(h, monkeypatch)
+    server = (await h.client.post("/v1/instances", json=body)).json()
+    original = service.run_blocking
+    address_reads = 0
+
+    async def inspect(function, *args, **kwargs):
+        nonlocal address_reads
+        result = await original(function, *args, **kwargs)
+        if function is service.server_address:
+            address_reads += 1
+            if address_reads == 2:
+                if change == "profile-allowlist":
+                    h.settings.palimpsest_hub_instance_cluster_profiles["k3s-qualified"]["project_ids"].append(OTHER)
+                else:
+                    from sqlalchemy.ext.asyncio import async_object_session
+
+                    source = args[1]
+                    if change == "expired":
+                        source.capability_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+                    else:
+                        source.capability_hash = None
+                    await async_object_session(source).flush()
+        return result
+
+    # Both modules use the same boundary helper; count admission then allocation reads.
+    from palimpsest_hub.services import worker_leases
+
+    monkeypatch.setattr(service, "run_blocking", inspect)
+    monkeypatch.setattr(worker_leases, "run_blocking", inspect)
+    response = await h.client.post("/v1/instances", json=cluster_agent_body(body, server))
+    assert response.status_code == 409 and address_reads == 2, response.text
+    assert len(h.provider.creates) == 1
+    async with h.factory() as session:
+        rows = (await session.scalars(select(PalimpsestHubInstance))).all()
+        agent = next(row for row in rows if row.id != server["id"])
+        assert agent.error_code == "create_inputs_changed" and agent.capability_hash is None
+        assert service.create_not_attempted(agent)
+
+
+def cluster_process_regression(body, tmp_path):
+    """Isolate Linux subreaper ownership from the pytest process itself."""
+    import pathlib
+    import subprocess
+    import sys
+
+    from palimpsest_hub.services.instance_cluster_runtime import CLUSTER_RUNTIME
+
+    if sys.platform != "linux" or not pathlib.Path("/proc/self/task").exists():
+        pytest.skip("Linux /proc and child-subreaper behavior required")
+    script = (
+        "import os, pathlib, subprocess, time, sys\n"
+        + CLUSTER_RUNTIME
+        + "\nassert ctypes.CDLL(None).prctl(36, 1, 0, 0, 0) == 0\n"
+        + "ROOT = pathlib.Path(sys.argv[1])\n"
+        + body
+    )
+    result = subprocess.run([sys.executable, "-c", script, str(tmp_path)], capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0, result.stderr
+
+
+def test_cluster_cleanup_drains_real_independent_sessions(tmp_path):
+    cluster_process_regression(
+        r'''
+ready = ROOT / 'ready'
+program = """import os, pathlib, subprocess, sys, time
+subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], start_new_session=True)
+pathlib.Path(sys.argv[1]).write_text('ready')
+time.sleep(60)
+"""
+child = subprocess.Popen([sys.executable, '-c', program, str(ready)], start_new_session=True)
+until = time.monotonic() + 3
+while not ready.exists() and time.monotonic() < until:
+    time.sleep(.01)
+assert ready.exists()
+cluster_cleanup()
+assert not cluster_children()
+assert child.poll() is not None
+''',
+        tmp_path,
+    )
+
+
+@pytest.mark.parametrize("mode", ["overflow", "trickle", "escaped-session"])
+def test_cluster_exec_real_children_obey_output_and_deadline_bounds(tmp_path, mode):
+    cluster_process_regression(
+        "mode = "
+        + repr(mode)
+        + "\n"
+        + r"""
+real_popen = subprocess.Popen
+secret = 'fixture-secret-output'
+programs = {
+    'overflow': "import os, time; os.write(1, b'fixture-secret-output' * 10000); time.sleep(60)",
+    'trickle': "import os, time\nwhile True:\n os.write(1, b'x'); time.sleep(.02)",
+    'escaped-session': "import os, pathlib, subprocess, sys, time\n"
+        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], start_new_session=True)\n"
+        "os.write(1, b'fixture-secret-output' * 10000)\ntime.sleep(60)",
+}
+def command(argv, **kwargs):
+    kwargs.pop('preexec_fn')  # Exercise capture/ownership, not a privileged chroot.
+    return real_popen([sys.executable, '-c', programs[mode]], **kwargs)
+subprocess.Popen = command
+deadline = time.time() + (0.4 if mode == 'trickle' else 3)
+started = time.monotonic()
+try:
+    cluster_exec(['fixed-fixture-command'])
+except RuntimeError as error:
+    assert str(error) == 'cluster_proof_failed' and secret not in str(error)
+else:
+    raise AssertionError('unbounded fixture must fail closed')
+assert time.monotonic() - started < 6
+assert not cluster_children()
+""",
+        tmp_path,
+    )
+
+
+def test_cluster_cleanup_refuses_unmount_when_children_cannot_quiesce(tmp_path):
+    import os
+    import pathlib
+    import subprocess
+    import time
+
+    from palimpsest_hub.services.instance_cluster_runtime import CLUSTER_RUNTIME
+
+    namespace = {"os": os, "pathlib": pathlib, "subprocess": subprocess, "time": time, "ROOT": tmp_path}
+    exec(compile(CLUSTER_RUNTIME, "embedded-cluster-runtime.py", "exec"), namespace)
+    (tmp_path / "merged").mkdir()
+
+    def stuck():
+        raise RuntimeError("cluster_proof_failed")
+
+    namespace["cluster_reap_children"] = stuck
+    namespace["signal"] = SimpleNamespace(SIGTERM=15, SIGINT=2, SIG_IGN=1, signal=lambda *args: None)
+    namespace["subprocess"] = SimpleNamespace(run=lambda *args, **kwargs: pytest.fail("live children forbid unmount"))
+    with pytest.raises(RuntimeError, match="cluster_proof_failed"):
+        namespace["cluster_cleanup"]()
+
+
+def test_cluster_child_drain_only_signals_unreaped_direct_children(tmp_path):
+    import pathlib
+    import time
+
+    from palimpsest_hub.services.instance_cluster_runtime import CLUSTER_RUNTIME
+
+    current = [101]
+    killed = []
+
+    def kill(pid, number):
+        assert pid in current, "stale or non-child numeric identities must never be signalled"
+        killed.append(pid)
+
+    def wait(pid, options):
+        current.remove(pid)
+        if pid == 101:
+            current.append(202)  # Adopt the escaped-session orphan only after its parent exits.
+        return pid, 0
+
+    class NoProcScan:
+        @staticmethod
+        def Path(path):
+            assert path != "/proc", "grandchild PID scans cannot authorize a root signal"
+            return pathlib.Path(path)
+
+    namespace = {
+        "os": SimpleNamespace(kill=kill, waitpid=wait, WNOHANG=1, getpid=lambda: 100),
+        "pathlib": NoProcScan,
+        "time": time,
+    }
+    exec(compile(CLUSTER_RUNTIME, "embedded-cluster-runtime.py", "exec"), namespace)
+    namespace["cluster_children"] = lambda: list(current)
+    namespace["cluster_reap_children"]()
+    assert killed == [101, 202] and not current
+
+
+def test_cluster_exec_bounded_stdin_preserves_k3s_leader_and_adopted_daemon_until_cleanup(tmp_path):
+    cluster_process_regression(
+        r"""
+real_popen = subprocess.Popen
+ready = ROOT / 'daemon-pid'
+helper = "import pathlib, subprocess, sys\nchild=subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], start_new_session=True)\npathlib.Path(sys.argv[1]).write_text(str(child.pid))"
+leader = "import subprocess, sys, time\nsubprocess.run([sys.executable, '-c', sys.argv[1], sys.argv[2]], check=True)\ntime.sleep(60)"
+cluster_process = real_popen([sys.executable, '-c', leader, helper, str(ready)], start_new_session=True)
+until = time.monotonic() + 3
+daemon = None
+while time.monotonic() < until:
+    if ready.exists():
+        daemon = int(ready.read_text())
+        if daemon in cluster_children():
+            break
+    time.sleep(.01)
+assert daemon is not None and daemon in cluster_children()
+def command(argv, **kwargs):
+    kwargs.pop('preexec_fn')
+    return real_popen([sys.executable, '-c', 'import sys; sys.stdout.buffer.write(sys.stdin.buffer.read())'], **kwargs)
+subprocess.Popen = command
+deadline = time.time() + 3
+assert cluster_exec(['fixed-fixture-command'], b'bounded-input') == 'bounded-input'
+assert cluster_process.poll() is None
+os.kill(daemon, 0)
+assert daemon in cluster_children()  # A successful kubectl must not kill live runtime orphans.
+subprocess.Popen = real_popen
+cluster_cleanup()
+assert not cluster_children()
+""",
+        tmp_path,
+    )

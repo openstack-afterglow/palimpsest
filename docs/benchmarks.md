@@ -211,15 +211,102 @@ provider ownership. Unknown outcomes never become mutation retries.
 | `api-import` | Reuse station context; public Hub registry import and instance creation; SDK only observes provider identity | 1 |
 | `api-build` | Reuse station context; public Dockerfile build and instance creation | 1 |
 | `api-reuse` | Reuse station context; two sequential public consumers with identical ordered digests and separate writable disks | 2, sequential |
+| `api-cold-warm` (unpublished candidate) | One external image job, then fresh sequential cold/warm consumers; warm selects the retained exact stack and never submits another image job | 2, sequential |
+| `api-cluster` (unpublished candidate) | External fixed airgap-context build once; two simultaneously live API consumers form one exact k3s server/agent pair; later repetitions reuse the same completed job | 2, simultaneous |
 
-API image/consumer timing and SDK reference timing remain different measurement
-boundaries. API CPU processes use `oci-chroot`, not native OCI boot. Current API
-runtime does not inject host NVIDIA driver libraries and exposes read-only `/sys`;
-GPU and privileged k3s API profiles therefore fail **before allocation**. Run their
-explicit SDK-container reference lane, not a hidden fallback or a claim of API
-parity. GPU bases must already provide a working host driver and Docker NVIDIA
-runtime. Host `nvidia-smi` and runtime capability are checked before image
-execution; scripts never install/reset a driver, assign a GPU, or silently use CPU.
+API image/consumer timing and SDK reference timing remain different boundaries.
+Deployed1afca684 has no GPU injection or privileged cluster profile. This
+unpublished candidate adds explicit `api-cold-warm` GPU profiles and the separately
+admitted fixed `api-cluster` path. Other unsupported methods fail before allocation,
+without a Docker/SDK fallback disguised as API qualification.
+
+An operator `palimpsest_instance_gpu_profiles` entry must pin the permitted project
+IDs, exact qualified Glance image and content hash, flavor/PCI aliases, driver
+version and actual GPU count. The base already supplies working NVIDIA drivers
+and vendor CLI/library1.18+; no workload guest installs/resets drivers or builds
+layers. API bootstrap uses fixed vendor compute/utility injection in its private
+namespace and preserves the image UID/GID. Default profiles are empty/disabled.
+SDK reference guests separately require their existing Docker NVIDIA runtime.
+
+For `api-cold-warm`, one repetition consumes two cumulative VM/boot reservations
+but at most one live consumer. Cold uses one continuous controller monotonic
+interval from external dependency/context/image preparation through verified GPU
+output. Warm begins immediately before the second consumer request, reuses the
+same ordered Hub digests and profile, and requires distinct instance/Nova/boot
+identities. Acquisition/build, consumer-only and synchronized inner-compute clocks
+are reported separately, never summed. Warm still includes current guest HTTPS
+layer transfer; it is not guest-local-cache warm, Manila or zero-copy. Shared
+OS/CDN cache state is unknown and is never flushed. A failed pair yields no
+successful comparison rows.
+
+The fixed TensorFlow recipe is a derived runtime, not untouched original-image
+success: pinned Torch2.8 CUDA12.6/cuDNN9 base plus TensorFlow2.21 and17 supplemental
+hash-pinned wheels. The external resident client downloads the18 fixed wheels
+under absolute time/byte/hash fences and uploads a bounded offline context. The
+server builds with read-only BuildKit bind mounts and pip `--no-index --no-deps
+--require-hashes`; wheel archives are not intentionally copied into runtime layers.
+Worker RUN networking remains `none`. Cold includes this dependency preparation;
+warm performs none of it. The streamed client default remains16MiB; larger
+contexts require explicit `hub.max_context_bytes` and matching approval/server
+limits, capped1GiB. The pre-send guard runs after hashing, immediately before POST.
+
+The first3060/32GiB prerequisite failed Nova scheduling before boot; its ordinary
+cleanup and spent budget remain historical. Under a new bounded approval, an
+Ada8vCPU/16GiB prerequisite booted with working driver535.309.01 and GPU capability
+8.9, but lacked `nvidia-container-cli`. The exact CUDA12.6 devel image supplied
+nvcc12.6.85, not that guest-side injection runtime. A separately approved one-shot
+same-image rebuild prepares only this new base-builder, without upgrading its
+driver/kernel or installing packages in measured workload guests. Actual API GPU
+injection and all numerical timings remain unqualified until those paths run.
+
+For older/newer GPUs, CUDA compilation selects a validated actual device0 compute
+capability and explicitly emits its `sm_xy` code; the program and result validator
+require the compiled capability to match the executed GPU. This avoids relying on
+default-target PTX JIT against an older driver. Actual nvcc compilation produced
+both Pascal `sm_61` and Ada `sm_89` cubins locally, not GPU execution proof.
+
+### Fixed API k3s qualification
+
+`cluster_profile` is disabled by default and separate from GPU privilege. It binds
+original projects, exact content-qualified Linux guest base and permitted CPU
+flavors. `cluster_server_id` connects only the same original user's live,
+unexpired, identically qualified server to its one immutable agent, with the exact
+ordered worker-built layer/runtime provenance. Both admission and effect fences
+revalidate source eligibility; no caller-controlled command/readiness argv is
+accepted for this fixed mode.
+
+The image contains pinned k3s1.37.1, its exact hash/size-checked offline airgap
+archive, static BusyBox and the exact sandbox-image digest. The guest mounts and
+executes it; it does not acquire/build layers, download registry images or install
+Palimpsest. Whole-VM root privilege, writable cgroups, native containerd snapshotter
+and original-network server/agent communication are explicit exceptions, never a
+relaxation of ordinary CPU/GPU chroot policy. A private expiry-bound capability
+provides a domain-separated HMAC join token; no plaintext token is persisted in
+SQL, public projection, argv, environment or logs. New dedicated SG ingress is
+self-group only; no external ingress or FIP is required.
+
+One cold repetition includes external airgap acquisition/context upload/image
+build and a fresh two-node pair. A prepared repetition reuses the exact completed
+job and ordered layers, creates two new writable guests, and performs no image
+job/acquisition. Shared-ledger reservation atomically holds both live slots;
+`cluster.timeout_seconds` separately bounds each pair's deployment/proof interval.
+Hub callback readiness and Nova ACTIVE are independently observed before provider
+identity checks. Cleanup deletes agent before server through API; ambiguous
+effects are observed, not replayed, and cumulative consumption is never refunded.
+
+The fixed proof checks the exact two Ready node identities/IPs/versions, one
+digest-pinned numerical pod per node, successful4950 output and zero unexpected
+restarts. It does **not** claim the older campaign's DNS/HTTP/PVC/service-restart
+or VM-reboot gates. Old conductor RPC MessagingTimeout and Cinder attachment502
+failed before k3s execution and remain provider evidence, not framework failures.
+
+This study asks whether the intended build→layer→consumer→workload→cleanup path
+works and whether measured boundaries are explainable—not whether a faster number
+can be produced. Keep acquisition bytes/time, guest transfer, boot, cluster/GPU
+proof and inner computation distinct; report exact numerical invariants, GPU/CPU/
+RAM/source identities, clock agreement, failures and unavailable stages. One pair
+does not establish dispersion or p90, and different GPU/memory combinations must
+not be pooled as controlled hardware comparisons.
 
 ### Saved configuration and immutable inputs
 
@@ -238,6 +325,8 @@ not values to invent at execution time:
 | `resources` | Per-run `max_creates`, `max_live`, cumulative `max_boot_gib`, sufficient for the entire planned scenario |
 | `approval` | Exact `id`, `project_id`, `user_id`, `allowed_scenarios`, `allowed_flavor_ids`, per-VM `max_vcpus`/`max_ram_mib`, cumulative limits, timezone-aware `expires_at`, absolute private shared `ledger_root`; GPU/cluster additionally need `allow_gpu=true`/`allow_cluster=true` |
 | `hub` | API lanes: verified HTTPS `url`, optional additional `ca_file`; original token comes from the SDK session, not configuration |
+| `gpu_profile` | `api-cold-warm` GPU-only explicit operator profile ID; no caller-controlled library paths or device bypass |
+| `cluster_profile`, `k3s_version` | `api-cluster`: exact operator privilege profile and fixed `v1.37.1+k3s1`; pinned k3s and sandbox references, one server/one agent, two proof replicas |
 | `workload` | Bounded `iterations`, `matrix_size`, `timeout_seconds`; fixed actual numerical program, not caller shell |
 | `cluster` | `servers=1`, `agents`, bounded deployment/probe timeout and probe replicas; network/SG must already permit required node traffic |
 | `repetitions`, `deadline_seconds`, `timeouts` | Explicit finite repetition count, global bound and optional bounded ACTIVE/readiness/delete/guest windows |

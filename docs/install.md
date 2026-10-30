@@ -21,6 +21,47 @@ Historical DMS Lab deployment receipts preserve private listen port `18021`, int
 
 Package references require a separate trusted `palimpsest_package_public_origin`; it was empty in the inspected runtime. For the Afterglow key-gateway deployment, use the approved `https://cloud.dmslab.re.kr` origin rather than inferring it from Hub Host or the internal transport. Verify nonempty exact protected IDs, current requester service leaves and original-token `/v1/projects/current` through Afterglow. Do not use admin/service credentials for package acceptance, grant ordinary users automatically, or claim health 200 proves authenticated reads/writes.
 
+### Unreleased GPU and fixed k3s runtime profiles
+
+These candidate contracts are not enabled by installing the client wheel alone.
+`palimpsest_instance_gpu_profiles` and `palimpsest_instance_cluster_profiles`
+default to empty. Profiles require exact original project IDs and a separately
+content-pinned guest image in `palimpsest_instance_base_images`; preserve existing
+operator values rather than copying a historical image/flavor into production.
+
+GPU entries pin image/flavor/PCI aliases, actual driver version and device count.
+The guest base must already contain working NVIDIA driver and vendor CLI/library
+1.18+. CUDA `base`/`runtime`/`devel` container tags describe application CUDA/cuDNN
+components, not proof that this guest injection runtime or a compatible kernel
+driver is installed. The tested CUDA12.6 devel image supplied nvcc12.6.85 and no
+`nvidia-container-cli`. Do not install drivers/toolkits during measured workload
+bootstrap; use a separately approved base-creation worker and immutable result.
+
+Cluster entries pin image, permitted CPU flavor IDs and original projects. Only
+the fixed two-node `cluster_profile` grants the whole-VM root/writable-cgroup
+exception; normal CPU/GPU policy remains unchanged. Runtime inputs require the
+fixed offline k3s image recipe and hash-pinned airgap archive. `cluster_server_id`
+selects the same original user's unexpired server and exact retained stack, not an
+arbitrary join URL/token or remote shell. See [precise execution/proof boundaries](benchmarks.md#fixed-api-k3s-qualification).
+
+For the fixed k3s context, set explicit matching API/worker
+`palimpsest_max_context_bytes` and `palimpsest_max_context_expanded_bytes` to at
+least256MiB; keep worker RUN network `none`. Larger TensorFlow contexts require
+their own explicit bounds and physically reserved scratch. Increasing a logical
+limit does not create disk capacity. Never prune shared caches or resize/reformat
+existing disks to hide insufficient capacity.
+
+Operator storage administration uses a separate project-scoped application
+credential, not workload auth or repeated global-admin password attempts. In the
+current bounded worker preparation, the required private file onwireguardserver
+is `/home/pieroot/.config/palimpsest/worker-storage-clouds.yaml`, ownerpieroot,
+parent0700/file0600, cloud `palimpsest-worker-storage`, `v3applicationcredential`,
+verified public Keystone `/v3` andRegionOne. The token's actual project must match
+the exact approved worker project before Cinder or attachment effects. Do not put
+secrets in chat, persist caller tokens, change IAM, reset administrator passwords,
+or fall back to a different identity after authentication fails.
+
+
 ### Hub liveness and readiness (0.3.6)
 
 `GET /health` and `GET /v1/health` remain dependency-free liveness endpoints

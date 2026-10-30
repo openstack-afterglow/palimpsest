@@ -50,6 +50,7 @@ PORTABLE_FILES = {
         named_volumes retained_instances oci_volume_policy nova_build nova_metrics
         environment_benchmark benchmark_workflow benchmark_openstack benchmark_reporting
         benchmark_scenarios benchmark_scenario_cloud benchmark_scenario_peer benchmark_scenario_workloads
+        benchmark_tensorflow_context
         benchmark_station_cli benchmark_station_cloud benchmark_station_disk benchmark_station_measurements
         platforms process_session project project_adapter project_runtime project_volumes oci_host
         oci_run_request oci_run_adapter oci_public_cli oci_resource_status oci_docker_hub_cli_live_contract

@@ -12,7 +12,7 @@ from typing import Literal
 from urllib.parse import urlsplit
 from uuid import UUID
 
-from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from redis.asyncio.connection import SSLConnection, parse_url
 
@@ -75,6 +75,64 @@ class DatabaseSettings(BaseSettings):
     database_unhealthy_seconds: int = Field(default=30, ge=1, le=3600)
 
 
+class InstanceGpuProfile(BaseModel):
+    """Operator-qualified guest/PCI tuple, never caller-selected host paths."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    image_id: str
+    flavor_id: str = Field(min_length=1, max_length=64, pattern=r"^[a-zA-Z0-9_.-]+$")
+    pci_alias: str = Field(min_length=3, max_length=575)
+    driver_version: str = Field(pattern=r"^[0-9]{3}\.[0-9]{1,3}(?:\.[0-9]{1,3})?$")
+    device_count: int = Field(ge=1, le=16)
+    project_ids: list[str] = Field(min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def exact_gpu_tuple(self) -> InstanceGpuProfile:
+        if str(UUID(self.image_id)) != self.image_id:
+            raise ValueError("GPU guest image must be a canonical UUID")
+        aliases = self.pci_alias.split(",")
+        if (
+            len(aliases) > 8
+            or any(re.fullmatch(r"[a-zA-Z0-9_.-]{1,64}:(?:[1-9]|1[0-6])", item) is None for item in aliases)
+            or len({item.split(":", 1)[0] for item in aliases}) != len(aliases)
+        ):
+            raise ValueError("GPU PCI aliases must be distinct exact alias:count pairs")
+        if len(set(self.project_ids)) != len(self.project_ids) or any(
+            UUID(identity).hex != identity for identity in self.project_ids
+        ):
+            raise ValueError("GPU project_ids must be distinct canonical OpenStack UUID hex identifiers")
+        return self
+
+
+class InstanceClusterProfile(BaseModel):
+    """Explicit whole-VM root privilege qualification for the fixed k3s runtime."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+    image_id: str
+    flavor_ids: tuple[str, ...] = Field(min_length=1, max_length=64)
+    project_ids: tuple[str, ...] = Field(min_length=1, max_length=64)
+
+    @field_validator("flavor_ids", "project_ids", mode="before")
+    @classmethod
+    def json_sequences(cls, value):
+        return tuple(value) if isinstance(value, list) else value
+
+    @model_validator(mode="after")
+    def exact_cluster_tuple(self) -> InstanceClusterProfile:
+        if str(UUID(self.image_id)) != self.image_id:
+            raise ValueError("Cluster guest image must be a canonical UUID")
+        if len(set(self.flavor_ids)) != len(self.flavor_ids) or any(
+            re.fullmatch(r"[a-zA-Z0-9_.-]{1,64}", item) is None for item in self.flavor_ids
+        ):
+            raise ValueError("Cluster flavors must be distinct bounded identifiers")
+        if len(set(self.project_ids)) != len(self.project_ids) or any(
+            UUID(item).hex != item for item in self.project_ids
+        ):
+            raise ValueError("Cluster projects must be distinct canonical OpenStack UUID hex identifiers")
+        return self
+
+
 class Settings(DatabaseSettings):
     model_config = SettingsConfigDict(case_sensitive=False, extra="ignore", hide_input_in_errors=True)
 
@@ -104,6 +162,8 @@ class Settings(DatabaseSettings):
     palimpsest_hub_instance_max_writable_gib: int = Field(default=64, ge=1, le=1024)
     # Operators may qualify an unannotated Glance image only by exact content hash.
     palimpsest_hub_instance_base_images: dict[str, dict[str, str]] = Field(default_factory=dict)
+    palimpsest_hub_instance_gpu_profiles: dict[str, InstanceGpuProfile] = Field(default_factory=dict)
+    palimpsest_hub_instance_cluster_profiles: dict[str, InstanceClusterProfile] = Field(default_factory=dict)
     palimpsest_hub_instance_ca_certificates: tuple[str, ...] = ()
     palimpsest_hub_package_forbidden_project_ids: tuple[str, ...] = ()
     palimpsest_hub_package_forbidden_user_ids: tuple[str, ...] = ()
@@ -159,6 +219,38 @@ class Settings(DatabaseSettings):
             ):
                 raise ValueError("qualified base image content and target are invalid")
         return value
+
+    @field_validator("palimpsest_hub_instance_gpu_profiles")
+    @classmethod
+    def qualified_gpu_profiles(cls, value: dict[str, InstanceGpuProfile]) -> dict[str, InstanceGpuProfile]:
+        if len(value) > 64 or any(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", key) is None for key in value):
+            raise ValueError("GPU qualification requires at most 64 bounded profile identifiers")
+        return value
+
+    @field_validator("palimpsest_hub_instance_cluster_profiles")
+    @classmethod
+    def qualified_cluster_profiles(cls, value: dict[str, InstanceClusterProfile]) -> dict[str, InstanceClusterProfile]:
+        if len(value) > 64 or any(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", key) is None for key in value):
+            raise ValueError("Cluster qualification requires at most 64 bounded profile identifiers")
+        return value
+
+    @model_validator(mode="after")
+    def cluster_images_are_content_pinned(self) -> Settings:
+        if any(
+            profile.image_id not in self.palimpsest_hub_instance_base_images
+            for profile in self.palimpsest_hub_instance_cluster_profiles.values()
+        ):
+            raise ValueError("Every cluster profile requires an exact content-pinned instance base image")
+        return self
+
+    @model_validator(mode="after")
+    def gpu_images_are_content_pinned(self) -> Settings:
+        if any(
+            profile.image_id not in self.palimpsest_hub_instance_base_images
+            for profile in self.palimpsest_hub_instance_gpu_profiles.values()
+        ):
+            raise ValueError("Every GPU profile requires an exact content-pinned instance base image")
+        return self
 
     @field_validator("palimpsest_hub_instance_ca_certificates")
     @classmethod
