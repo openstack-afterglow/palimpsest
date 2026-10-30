@@ -364,8 +364,9 @@ def cluster_command(args, data=None):
     until = time.monotonic() + min(20, max(0, deadline-time.time()))
     if time.monotonic() >= until:
         raise RuntimeError('cluster_proof_failed')
+    command = ['/bin/kubectl', *args[1:]] if args and args[0] == 'kubectl' else ['/bin/k3s', *args]
     try:
-        child = subprocess.Popen(['/bin/k3s', *args], stdin=subprocess.PIPE if data else subprocess.DEVNULL,
+        child = subprocess.Popen(command, stdin=subprocess.PIPE if data else subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, start_new_session=True,
             env={'PATH':'/bin:/usr/bin:/sbin:/usr/sbin','HOME':'/root'}, preexec_fn=cluster_enter)
     except Exception:

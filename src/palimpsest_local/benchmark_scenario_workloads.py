@@ -308,6 +308,9 @@ static std::string quote(const std::string& s) {
 __global__ void add(float* out, int count) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < count) out[i] = float(i % 97 + 3 * (i % 31));
+#ifdef __CUDA_ARCH__
+    if (i == 0) out[count] = float(__CUDA_ARCH__);
+#endif
 }
 int main(int argc, char** argv) {
     try {
@@ -318,13 +321,11 @@ int main(int argc, char** argv) {
         check(cudaGetDeviceCount(&devices)); if (devices < 1) throw std::runtime_error("no CUDA devices");
         check(cudaSetDevice(0)); check(cudaDriverGetVersion(&driver)); check(cudaRuntimeGetVersion(&runtime));
         cudaDeviceProp p; check(cudaGetDeviceProperties(&p, 0));
-        if (p.major != COMPILED_ARCH_MAJOR || p.minor != COMPILED_ARCH_MINOR)
-            throw std::runtime_error("compiled architecture differs from selected GPU");
         char pci[64]; check(cudaDeviceGetPCIBusId(pci, sizeof(pci), 0));
         const int count = MATRIX_SIZE * MATRIX_SIZE;
-        float* output = nullptr; check(cudaMalloc(&output, count * sizeof(float)));
+        float* output = nullptr; check(cudaMalloc(&output, (count + 1) * sizeof(float)));
         cudaEvent_t begin, end; check(cudaEventCreate(&begin)); check(cudaEventCreate(&end));
-        std::vector<float> host(count); std::vector<double> samples; double device_ms = 0;
+        std::vector<float> host(count + 1); std::vector<double> samples; double device_ms = 0;
         for (int iteration = 0; iteration < ITERATIONS; ++iteration) {
             auto started = std::chrono::steady_clock::now();
             check(cudaEventRecord(begin)); add<<<(count + 255) / 256, 256>>>(output, count);
@@ -333,7 +334,10 @@ int main(int argc, char** argv) {
             device_ms += milliseconds;
             samples.push_back(std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count());
         }
-        check(cudaMemcpy(host.data(), output, count * sizeof(float), cudaMemcpyDeviceToHost));
+        check(cudaMemcpy(host.data(), output, (count + 1) * sizeof(float), cudaMemcpyDeviceToHost));
+        const int device_arch = int(host[count]);
+        if (host[count] != float(device_arch) || device_arch != p.major * 100 + p.minor * 10)
+            throw std::runtime_error("executed device architecture differs from selected GPU");
         double checksum = 0, expected = 0; int errors = 0;
         for (int i = 0; i < count; ++i) {
             float value = float(i % 97 + 3 * (i % 31)); expected += value; checksum += host[i];
@@ -349,9 +353,10 @@ int main(int argc, char** argv) {
           << "\"device_count\":" << devices << ",\"device_name\":" << quote(p.name)
           << ",\"pci_bus_id\":" << quote(pci) << ",\"total_memory_bytes\":" << p.totalGlobalMem
           << ",\"compute_capability\":[" << p.major << ',' << p.minor << "],\"cuda_available\":true,"
-          << "\"compiled_compute_capability\":[" << COMPILED_ARCH_MAJOR << ',' << COMPILED_ARCH_MINOR << "],"
+          << "\"compiled_compute_capability\":[" << device_arch / 100 << ',' << (device_arch % 100) / 10 << "],"
+          << "\"device_compiled_arch\":" << device_arch << ','
           << "\"cuda_driver_version\":" << driver << ",\"cuda_runtime_version\":" << runtime
-          << ",\"compiled_cuda_version\":" << CUDART_VERSION << ",\"cuda_allocated_bytes\":" << count * sizeof(float)
+          << ",\"compiled_cuda_version\":" << CUDART_VERSION << ",\"cuda_allocated_bytes\":" << (count + 1) * sizeof(float)
           << ",\"synchronization_count\":" << ITERATIONS << ",\"kernel_launches\":" << ITERATIONS
           << ",\"checked_elements\":" << count << ",\"completed_elements\":" << static_cast<long long>(count) * ITERATIONS
           << ",\"checksum\":" << checksum << ",\"expected_checksum\":" << expected << ",\"max_abs_error\":0,"
@@ -391,7 +396,7 @@ def _cuda_argv(options):
         "capability=$(timeout --signal=TERM --kill-after=5s 15s nvidia-smi --id=0 --query-gpu=compute_cap --format=csv,noheader,nounits)\n"
         'case "$capability" in [0-9].[0-9]|[1-9][0-9].[0-9]) ;; *) printf "invalid GPU compute capability\\n" >&2; exit 2;; esac\n'
         'target="sm_${capability%.*}${capability#*.}"\n'
-        + f'timeout --signal=TERM --kill-after=5s {options["timeout_seconds"]}s nvcc -O2 -arch="$target" -DCOMPILED_ARCH_MAJOR="${{capability%.*}}" -DCOMPILED_ARCH_MINOR="${{capability#*.}}" -DMATRIX_SIZE={options["matrix_size"]} -DITERATIONS={options["iterations"]} "$work/workload.cu" -o "$work/kernel"\n'
+        + f'timeout --signal=TERM --kill-after=5s {options["timeout_seconds"]}s nvcc -O2 -arch="$target" -DMATRIX_SIZE={options["matrix_size"]} -DITERATIONS={options["iterations"]} "$work/workload.cu" -o "$work/kernel"\n'
         + f'timeout --signal=TERM --kill-after=5s {options["timeout_seconds"]}s "$work/kernel" "$work/nvidia.csv"\n'
     )
     return [
@@ -751,6 +756,7 @@ def validate_result(config: dict, stdout: str) -> dict:
             _integer(capability[1], "compute capability minor", 0, 99)
             if scenario == "cuda":
                 _exact(result, "compiled_compute_capability", capability)
+                _exact(result, "device_compiled_arch", capability[0] * 100 + capability[1] * 10)
                 raw = result.get("nvidia_smi_csv")
                 if not isinstance(raw, str) or len(raw) > 65536:
                     raise ArtifactValidationError("CUDA NVIDIA inventory is missing")

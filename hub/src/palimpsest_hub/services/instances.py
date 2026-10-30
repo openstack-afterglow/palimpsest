@@ -195,10 +195,15 @@ def provider_inputs(conn, spec, project, max_boot, base_images=None, gpu=None):
     if value(flavor, "is_disabled") is True:
         raise HTTPException(422, "Flavor is disabled")
     public = value(flavor, "is_public")
-    if public is not True:
-        access = conn.compute.get_flavor_access(spec["flavor_id"]) if public is False else []
-        if not any(value(item, "tenant_id") == project for item in access):
-            raise HTTPException(403, "Flavor must be public or explicitly grant the original caller project")
+    # Nova's public filter includes project grants; SDK omission means ALL.
+    # os-flavor-access enumerates other tenants and requires admin policy.
+    if public is not True and (
+        public is not False
+        or not any(
+            value(item, "id") == spec["flavor_id"] for item in conn.compute.flavors(details=False, is_public=True)
+        )
+    ):
+        raise HTTPException(403, "Flavor must be public or visible in the original caller's available flavors")
     fetched = conn.compute.fetch_flavor_extra_specs(flavor)
     extra = value(fetched, "extra_specs", {}) or {}
     if gpu is not None:

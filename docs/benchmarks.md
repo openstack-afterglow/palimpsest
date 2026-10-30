@@ -226,6 +226,13 @@ version and actual GPU count. The base already supplies working NVIDIA drivers
 and vendor CLI/library1.18+; no workload guest installs/resets drivers or builds
 layers. API bootstrap uses fixed vendor compute/utility injection in its private
 namespace and preserves the image UID/GID. Default profiles are empty/disabled.
+Private flavor eligibility uses the same original caller's explicit
+`is_public=True` listing (Nova public-or-project grants), not administrative
+whole-tenant ACL enumeration. SDK3.3 omission sends `is_public=None`/all flavors
+and is not a project-access fence. Actual CPU/GPU reads with the explicit filter
+passed without creating a VM. Absent/revoked flavors still fail before allocation;
+no IAM change or admin fallback is used.
+
 SDK reference guests separately require their existing Docker NVIDIA runtime.
 
 For `api-cold-warm`, one repetition consumes two cumulative VM/boot reservations
@@ -252,18 +259,23 @@ limits, capped1GiB. The pre-send guard runs after hashing, immediately before PO
 
 The first3060/32GiB prerequisite failed Nova scheduling before boot; its ordinary
 cleanup and spent budget remain historical. Under a new bounded approval, an
-Ada8vCPU/16GiB prerequisite booted with working driver535.309.01 and GPU capability
-8.9, but lacked `nvidia-container-cli`. The exact CUDA12.6 devel image supplied
-nvcc12.6.85, not that guest-side injection runtime. A separately approved one-shot
-same-image rebuild prepares only this new base-builder, without upgrading its
-driver/kernel or installing packages in measured workload guests. Actual API GPU
-injection and all numerical timings remain unqualified until those paths run.
+Ada8vCPU/16GiB prerequisite booted with driver535.309.01/capability8.9 but lacked
+`nvidia-container-cli`. A separately approved same-image rebuild failed before
+qualification; its VM later disappeared without an assistant DELETE, cause/actor
+unknown, and its exact retained boot was ordinarily removed. The last approved
+fresh base-builder installed signed/hash-verified Toolkit1.20.1 without changing
+driver/kernel. Private image17085575 was captured, and that exact builder/boot
+were ordinarily removed with absence proof; three prerequisite slots/240GiB stay
+spent. CUDA12.6 devel supplies nvcc, not guest-host injection tooling. Actual API
+GPU injection and numerical timings remain unqualified until those paths run.
 
 For older/newer GPUs, CUDA compilation selects a validated actual device0 compute
 capability and explicitly emits its `sm_xy` code; the program and result validator
-require the compiled capability to match the executed GPU. This avoids relying on
-default-target PTX JIT against an older driver. Actual nvcc compilation produced
-both Pascal `sm_61` and Ada `sm_89` cubins locally, not GPU execution proof.
+require the capability written by the executed kernel's `__CUDA_ARCH__` to match
+the selected GPU; a host compiler define is not device evidence. One trailing
+float in the existing output buffer carries that observation, outside the checked
+numerical elements/operation count. This avoids default-target PTX JIT against an
+older driver. Real sm61/sm89 compilation is distinct from GPU execution proof.
 
 ### Fixed API k3s qualification
 
@@ -307,6 +319,11 @@ proof and inner computation distinct; report exact numerical invariants, GPU/CPU
 RAM/source identities, clock agreement, failures and unavailable stages. One pair
 does not establish dispersion or p90, and different GPU/memory combinations must
 not be pooled as controlled hardware comparisons.
+Reported `operations` are source-defined mathematical work, not hardware
+instruction counters. TensorFlow's inner interval includes device-to-host
+completion and convolution; its rate is not directly interchangeable with
+PyTorch matmul or CUDA vector-add throughput.
+
 
 ### Saved configuration and immutable inputs
 

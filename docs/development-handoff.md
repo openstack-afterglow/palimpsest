@@ -26,6 +26,43 @@ files_modified:
 
 ## Available-GPU and API k3s precision-study resumption — 2026-10-30
 
+- Reviewed candidate `ffcbb26c0ce9a1fb7fbf89297f2daa53abf9a4b3` was committed/pushed
+  to the approved feature branch and [PR37](https://github.com/openstack-afterglow/palimpsest/pull/37).
+  Hosted Test41015857634 and PR-image41015857469 passed; SHA publisher41016837151
+  was dispatched only afterward. Neither publication nor local tests deploy the
+  service. Before rollout, a later precision review identified host macro echo in
+  CUDA architecture evidence. The follow-up writes `__CUDA_ARCH__` from device
+  code into the existing buffer tail and validates it, removing host architecture
+  defines. Real nvcc first failed undefined intrinsic in its host pass; a standard
+  device-pass guard corrected it, and real sm61/sm89 compilation passed. New source/
+  wheel checks and exact publisher identity must supersede the earlier snapshot
+  before consumers run; no historical result/source stamp is relabelled.
+- Actual pinned k3s bundle preflight additionally failed `/bin/k3s kubectl` with
+  `unknown command`; the image's `/bin/kubectl` multicall basename succeeds. The
+  runtime now strips that fixed selector and executes the dedicated entrypoint,
+  while `--version` stays onk3s. Actual current-helper capture/subreaper smoke
+  against pinned binaries returned exact1.37.1versions and reaped all commands.
+  The full Hub suite after this correction passed1226/7 in337.04s; root after the
+  CUDA correction passed8704/305 in488.15s. Offline preflight verified the exact
+  195939840-byte airgap archive and its native pause manifest412c/indexf548. A
+  standalone read-only containerd fixture could import eight tags but could not
+  initialize its CRI service; this is not pod readiness or a production-source bug.
+  No cloud VM was spent on these preflights and no numerical timing is fabricated.
+- Final five canonical images built and executed read-only/networkless for API/
+  exportarm64+amd64 and build-workeramd64; runtime hashes matched the then-reviewed
+  source. A subsequent actual Hub SDK3.3 metadata smoke found Ada admission called
+  admin-only whole-tenant flavor ACL enumeration and received403, although exact
+  flavor/extra specs/list reads succeeded. Peer review caught that SDK3.3 omitted
+  `is_public` means all flavors, not Nova's default project filter. Final code uses
+  explicit `is_public=True` (public OR caller-project grants) at both fences; real
+  CPU/GPU reads passed with zero creates/no IAM fallback. New final images/checks
+  must bind these later bytes before publication/deployment. A consumer-visible
+  admin-ungranted-private regression and private-visible→revoked fence are retained.
+- Actual synthetic temporary SQL-probe cleanup exposed plain Python PID1 ignoring
+  ordinary TERM. The failed probe naturally exited, then was ordinarily removed.
+  Private preservation and shared capture/restore helpers now require Docker init;
+  actual nonce-owned networkless/no-DB smokes passed TERM→exit143/PID0→ordinaryrm.
+  This is local teardown evidence, not production backup/restore qualification.
 - Owner expanded GPU selection beyond3060 to available1080Ti/TITAN X/other GPUs,
   permits8/16GiB flavors and requires functional/measurement explanation rather
   than a speed-improvement claim. The screenshot is capacity context, not

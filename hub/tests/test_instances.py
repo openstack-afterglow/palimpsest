@@ -1016,6 +1016,43 @@ async def test_gpu_snapshots_trusted_profile_and_preserves_image_identity_on_reu
 
 
 @pytest.mark.asyncio
+async def test_project_visible_private_gpu_flavor_does_not_require_tenant_acl_admin(instance_hub, monkeypatch):
+    from openstack.exceptions import ForbiddenException
+
+    h = instance_hub
+    body = await gpu_request(h, monkeypatch)
+    monkeypatch.setattr(h.provider, "get_flavor", lambda identity: {"id": identity, "ram": 1024, "is_public": False})
+    monkeypatch.setattr(h.provider, "flavors", lambda **kwargs: iter([{"id": body["flavor_id"]}]), raising=False)
+
+    def tenant_acl(identity):
+        raise ForbiddenException("Tenant ACL enumeration is administrative")
+
+    monkeypatch.setattr(h.provider, "get_flavor_access", tenant_acl, raising=False)
+    response = await h.client.post("/v1/instances", json=body)
+    assert response.status_code == 202, response.text
+    assert len(h.provider.creates) == 1
+    assert response.json()["gpu"]["project_id"] == PROJECT
+
+
+@pytest.mark.asyncio
+async def test_admin_inventory_does_not_grant_unassigned_private_gpu_flavor(instance_hub, monkeypatch):
+    h = instance_hub
+    body = await gpu_request(h, monkeypatch)
+    monkeypatch.setattr(h.provider, "get_flavor", lambda identity: {"id": identity, "ram": 1024, "is_public": False})
+
+    def available_flavors(*, is_public=None, **kwargs):
+        # Nova's unrestricted admin inventory includes private IDs with no grant.
+        return [] if is_public is True else [{"id": body["flavor_id"]}]
+
+    monkeypatch.setattr(h.provider, "flavors", available_flavors, raising=False)
+    response = await h.client.post("/v1/instances", json=body)
+    assert response.status_code == 403, response.text
+    assert not h.provider.creates
+    async with h.factory() as session:
+        assert not (await session.scalars(select(PalimpsestHubInstance))).all()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "failure",
     [
@@ -1053,7 +1090,7 @@ async def test_gpu_mismatch_never_admits_or_allocates(instance_hub, monkeypatch,
         monkeypatch.setattr(
             h.provider, "get_flavor", lambda identity: {"id": identity, "ram": 1024, "is_public": False}
         )
-        monkeypatch.setattr(h.provider, "get_flavor_access", lambda identity: [{"tenant_id": OTHER}], raising=False)
+        monkeypatch.setattr(h.provider, "flavors", lambda **kwargs: [{"id": str(uuid4())}], raising=False)
     elif failure == "mode":
         async with h.factory() as session:
             layer = await session.scalar(select(PalimpsestHubLayer).where(PalimpsestHubLayer.blob_digest == DIGEST))
@@ -1071,6 +1108,11 @@ async def test_gpu_mismatch_never_admits_or_allocates(instance_hub, monkeypatch,
 async def test_gpu_second_fence_changes_fail_without_effect_or_replay(instance_hub, monkeypatch, failure):
     h = instance_hub
     body = await gpu_request(h, monkeypatch)
+    if failure == "access":
+        monkeypatch.setattr(
+            h.provider, "get_flavor", lambda identity: {"id": identity, "ram": 1024, "is_public": False}
+        )
+        monkeypatch.setattr(h.provider, "flavors", lambda **kwargs: [{"id": body["flavor_id"]}], raising=False)
     original = service.qualified_gpu
     calls = 0
 
@@ -1100,7 +1142,7 @@ async def test_gpu_second_fence_changes_fail_without_effect_or_replay(instance_h
                 monkeypatch.setattr(
                     h.provider, "get_flavor", lambda identity: {"id": identity, "ram": 1024, "is_public": False}
                 )
-                monkeypatch.setattr(h.provider, "get_flavor_access", lambda identity: [], raising=False)
+                monkeypatch.setattr(h.provider, "flavors", lambda **kwargs: [], raising=False)
         return original(spec, project, settings)
 
     monkeypatch.setattr(service, "qualified_gpu", mutate)

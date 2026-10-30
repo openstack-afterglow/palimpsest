@@ -111,6 +111,7 @@ def cuda_result():
         cuda_runtime_version=12060,
         compiled_cuda_version=12060,
         compiled_compute_capability=[8, 6],
+        device_compiled_arch=860,
         device_elapsed_seconds=0.2,
         pci_bus_id="0000:01:00.0",
         nvidia_smi_csv="0, GPU-12345678-1234-1234-1234-123456789abc, NVIDIA Test GPU, 560.35.03, 16384, 00000000:01:00.0\n",
@@ -518,10 +519,18 @@ def test_tensorflow_fixed_recipe_uses_exact_historical_wheels_on_pinned_torch_ba
 def test_cuda_result_requires_compilation_for_the_selected_gpu(capability):
     value = config("cuda")
     result = cuda_result()
-    result.update(compute_capability=capability, compiled_compute_capability=capability)
+    result.update(
+        compute_capability=capability,
+        compiled_compute_capability=capability,
+        device_compiled_arch=capability[0] * 100 + capability[1] * 10,
+    )
     assert workloads.validate_result(value, marker(result))["compute_capability"] == capability
     result["compiled_compute_capability"] = [9, 0] if capability != [9, 0] else [8, 6]
     with pytest.raises(ArtifactValidationError, match="compiled_compute_capability"):
+        workloads.validate_result(value, marker(result))
+    result["compiled_compute_capability"] = capability
+    result["device_compiled_arch"] = 520 if capability != [5, 2] else 610
+    with pytest.raises(ArtifactValidationError, match="device_compiled_arch"):
         workloads.validate_result(value, marker(result))
 
 

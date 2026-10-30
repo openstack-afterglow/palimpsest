@@ -1227,6 +1227,36 @@ uv run python scripts/test_lanes.py run gate2
 
 ## Maintenance
 
+2026-10-30 post-publication precision review: requested compiler macros were not
+evidence of the architecture actually compiled into a launched kernel. CUDA now
+writes device `__CUDA_ARCH__` into one trailing element of its existing output
+buffer; host result and consumer validation require that observed value to match
+the selected GPU. Host architecture defines are removed, explicit validated
+`-arch=sm_xy` remains, and numeric operation/element counts exclude this telemetry.
+The initial real nvcc smoke exposed host-pass macro visibility; a device-pass
+preprocessor guard fixes that compile failure. Corrected real sm61/sm89 cubins
+build without host defines, not GPU execution proof. No service deployment or
+new GPU resource is implied by this narrowly scoped correction.
+
+Actual pinned k3s image execution also rejected `/bin/k3s kubectl`; its multicall
+bundle requires the `/bin/kubectl` basename with the selector removed. The fixed
+runtime now routes only that known prefix to its dedicated path, retaining
+`/bin/k3s --version`, bounded capture and process cleanup. A networkless actual
+binary/runtime smoke returned both exact1.37.1versions and reaped all commands.
+Verified airgap bytes contain the native sandbox manifest, but local read-only
+containerd fixture failures do not establish CRI or pod readiness; actual two-node
+acceptance remains required.
+
+Actual original-caller Hub SDK3.3 reads found a pre-allocation GPU admission bug:
+the private Ada flavor and its extra specs were readable, but whole-tenant
+`os-flavor-access` enumeration returned403. Admission now requires that exact
+private ID in the original connection's explicitly `is_public=True` list (Nova
+public-or-project grants), without admin credentials. SDK3.3 omission requests
+all flavors, so implicit defaults are not eligibility proof. Unknown visibility,
+IDs and provider-read failures remain closed at both admission/effect fences;
+GPU project/content/PCI qualification is unchanged. Corrected real CPU/GPU reads
+passed with zero creates; this is not scheduling or NVIDIA execution proof.
+
 2026-10-30 GPU candidate: explicit project/content/flavor/driver profiles replace
 implicit GPU flavor acceptance; source-reviewed vendor injection stays guest-local
 and does not install drivers or build layers. The paired API benchmark keeps cold
@@ -1882,9 +1912,9 @@ provider provisioning. Fresh multi-instance evidence is recorded separately.
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "c12fb7a3ba1f24ea29a53d62797e8ac461b4315676313fa7be5a9b3b312fedf4",
-  "reviewed_at": "2026-10-30T06:34:41Z",
-  "summary": "Reviewed fixed API GPU/cluster implementation and original-actor/current-locking gates; independent source reviews closed expiry/profile, capture/PID, atomic live-budget, readiness and timeout/default findings. Actual fullHub1226/7, focusedroot402, fivecanonicalarm64/amd64 image execution+source hashes and realLinux child ownership/capture passed; representativeNova60052/65535bytes, sm61/sm89 cubins andminimumPython3.11wheelpassed. Fullrootinitial8702/305 hadmissinguvPATH andunrelatedsimulatedancestorctimefixture race; corrected42casespassed andonlytestfixture non-targetctimeisolated, productionguardunchanged. ActualAda16bootSMIpassed butmissingvendor; acceptedrebuildfailed/unattributedVM404, exactnewbootordinarydeleted. Finalfreshprerequisiteslotseparatelyapproved; noactualGPU/k3smeasurements/deploymentclaimed. Operatoradmin401stopnewworkerdisk; dedicatedprojectapplicationcredentialrequired, noadditionaladminauthentication/IAMbypass."
+  "source_sha256": "99c52ed4825fc722b38c8d65826b19b95522729edcce4101faf7fdbd347ff814",
+  "reviewed_at": "2026-10-30T08:28:00Z",
+  "summary": "Reviewed final GPU/k3s corrections: kernel-written CUDA architecture evidence, actual pinned kubectl multicall routing, original-scoped private flavor eligibility with explicit is_public=True against SDK3.3 all-flavors default. Independent review clean; real zero-create CPU/GPU metadata smoke passed, private-visible/admin-ungranted/revoked boundary cases pass. Root workload bytes retain8704/305 full proof, latest exact Hub/image/package gates recorded separately. Private ordinary-TERM init and bounded live idle-journal helpers reviewed/smoked separately, no production or live GPU/cluster qualification claimed."
 }
 ```
 <!-- architecture-review:end -->
