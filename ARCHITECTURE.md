@@ -1,5 +1,26 @@
 # Palimpsest Architecture
 
+## Image executor socket and retained failure evidence — 2026-10-30
+
+Production-length private state paths exposed BuildKit's104-byte Unix-socket
+limit: the generated job socket was120bytes. An actual native BuildKit smoke
+reproduced the refusal and reached worker RPC readiness using the29-byte
+`/run/palimpsest-buildkit.sock` instead. The socket belongs to the already
+namespace-private per-executor `/run` tmpfs; persistent context/cache/payload
+storage remains on the quota-bound ext4 scratch. No shared host socket, shorter
+unqualified state root, network-policy relaxation or extra volume is required.
+
+Image failures retain bounded trailing executor/BuildKit diagnostics in private
+host-side job files, outside the disposable mounted scratch. Only after exact
+executor cleanup may the worker atomically replace one owner-only
+`last-image-failure.json` beside its journal, before disposing the job directory.
+The final serialized artifact is capped at266240bytes; raw tool output stays
+private, and public failure codes/logging do not expose recipes, URLs, paths or
+credentials. This artifact is not claim/recovery authority. Idle validation
+permits only its exact safe filename; unfinished diagnostic staging is discarded,
+not adopted. The root cause of historical failures without retained diagnostics
+must not be inferred from a later successful build or a scratch-size estimate.
+
 ## Durable HTTP-worker claim settlement — 2026-10-30
 
 The production worker exposed a correctness/availability boundary: a claim can
@@ -1953,9 +1974,9 @@ provider provisioning. Fresh multi-instance evidence is recorded separately.
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "008d0a643939180c669e111e6656310ae8b08d222d941a3ece322462c377b109",
-  "reviewed_at": "2026-10-30T13:10:06Z",
-  "summary": "Reviewed durable HTTP-worker claim channel/sequence journal and bounded SQL receipt under the selection mutex; recovery fences delayed POSTs and settles exact assigned leases without reexecution, legacy uncertainty preserved, additive bootstrap/migration required. Full Hub1266 passed7 skipped, focused251 passed2 skipped, real loopback lost-response/fencing smoke and independent claim review clean. Canonical candidate packages smoke passed; repaired production rollout and GPU cuDNN proof remain pending."
+  "source_sha256": "a57dbc65f8881541185b869be5d1179d26e37a421148c97f2ecc165d16f621d6",
+  "reviewed_at": "2026-10-30T14:48:30Z",
+  "summary": "Reviewed worker image short socket under private per-executor /run and bounded final diagnostic tails after exact cleanup, strict private artifact journal allowance and unchanged public error schema. Actual installed native BuildKit refused production120-byte socket and reached RPC readiness with29-byte path in private namespaces; focused231 passed3 skipped and independent review clean. Earlier ed540 seven-service additive-schema rollout is live; two CUDA image attempts failed before GPU creation. Worker-only repair deployment and real CUDA/cuDNN acceptance remain pending."
 }
 ```
 <!-- architecture-review:end -->

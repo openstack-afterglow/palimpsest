@@ -538,3 +538,183 @@ def test_cleanup_fences_cgroup_before_exact_loop_cleanup_even_after_group_remova
     builder.cleanup_image(job)
     assert events[-1] == "loops"
     assert not (job / "image-resources.json").exists()
+
+
+def test_private_tool_drain_keeps_final_failure_tail_outside_scratch(tmp_path):
+    import shutil
+
+    job = tmp_path / "job"
+    job.mkdir(mode=0o700)
+    scratch = job / "scratch"
+    scratch.mkdir(mode=0o700)
+    marker = b"final-buildkit-failure-evidence"
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            "import os; os.write(2,b'prefix'+b'x'*300000+" + repr(marker) + "); raise SystemExit(1)",
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    log = job / "buildctl.log"
+    drain = builder._private_log(child, log)
+    try:
+        assert child.wait(timeout=10) == 1
+        drain.join(timeout=5)
+        assert not drain.is_alive()
+        shutil.rmtree(scratch)
+        tail = log.read_bytes()
+        assert len(tail) == builder.LOG_TAIL_BYTES
+        assert tail.endswith(marker) and b"prefix" not in tail
+        assert log.stat().st_mode & 0o777 == 0o600
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=5)
+
+
+def test_private_tool_drain_refuses_symlinks_before_starting_thread(tmp_path):
+    from types import SimpleNamespace
+
+    protected = tmp_path / "protected"
+    protected.write_bytes(b"not a log")
+    log = tmp_path / "buildkitd.log"
+    log.symlink_to(protected)
+    with pytest.raises(OSError):
+        builder._private_log(SimpleNamespace(stderr=io.BytesIO(b"overwrite")), log)
+    assert protected.read_bytes() == b"not a log"
+
+
+@pytest.mark.parametrize(
+    "error,category,number,exit_code",
+    [
+        (OSError(28, "SECRET recipe /private/path"), "OSError", 28, 1),
+        (RuntimeError("SECRET recipe /private/path"), "RuntimeError", None, 1),
+        (TimeoutError("SECRET recipe /private/path"), "TimeoutError", None, 124),
+    ],
+)
+def test_executor_main_reports_safe_real_exception_category_and_errno(
+    tmp_path, monkeypatch, capsys, error, category, number, exit_code
+):
+    def fail(manifest, directory):
+        raise error
+
+    monkeypatch.setattr(sys, "argv", ["hub_image_builder", str(tmp_path / "input.json"), "123"])
+    monkeypatch.setattr(builder, "_mark_builder", lambda *args: None)
+    monkeypatch.setattr(builder, "_load_manifest", lambda *args: {})
+    monkeypatch.setattr(builder, "run_image", fail)
+    with pytest.raises(SystemExit) as stopped:
+        builder.main()
+    assert stopped.value.code == exit_code
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert json.loads(captured.err) == {"stage": "execution", "category": category, "errno": number}
+    assert "SECRET" not in captured.err and "/private/path" not in captured.err
+
+
+def test_safe_failure_stage_identifies_actual_allocation_without_paths(tmp_path, monkeypatch):
+    def no_space(*args):
+        raise OSError(28, "SECRET allocation /private/path")
+
+    monkeypatch.setattr(builder.os, "posix_fallocate", no_space, raising=False)
+    try:
+        builder._allocate(tmp_path / "reserve", 4096)
+    except OSError as exc:
+        diagnostic = json.loads(builder._failure_summary(exc, "execution"))
+    else:
+        pytest.fail("allocation unexpectedly succeeded")
+    assert diagnostic == {"stage": "scratch_allocation", "category": "OSError", "errno": 28}
+
+
+def test_buildkit_binds_short_private_socket_with_production_length_job_root(tmp_path, monkeypatch):
+    # Exercise the real AF_UNIX bind and client connection, without root,
+    # BuildKit binaries, cgroups, networking, or any cloud resources.
+    job = tmp_path / ("worker-" + "x" * 100) / ("job-" + "1" * 36)
+    scratch = job / "scratch"
+    scratch.mkdir(mode=0o700, parents=True)
+    assert len(os.fsencode(scratch / "buildkit.sock")) > 104
+    actual_popen = subprocess.Popen
+    original_path = builder.Path
+    addresses = []
+
+    with tempfile.TemporaryDirectory(prefix="pbs-", dir="/tmp") as runtime:
+        short_socket = Path(runtime) / "buildkit.sock"
+
+        def private_path(value):
+            if value == "/run/palimpsest-buildkit.sock":
+                # Production /run is private tmpfs; model only that mount here.
+                return short_socket
+            return original_path(value)
+
+        def launch(argv, **kwargs):
+            address = argv[argv.index("--addr") + 1]
+            path = address.removeprefix("unix://")
+            addresses.append(path)
+            if argv[0] == "buildkitd":
+                assert "preexec_fn" in kwargs
+                del kwargs["preexec_fn"]
+                code = (
+                    "import socket,sys,time; s=socket.socket(socket.AF_UNIX); "
+                    "s.bind(sys.argv[1]); s.listen(); time.sleep(60)"
+                )
+                return actual_popen([sys.executable, "-I", "-c", code, path], **kwargs)
+            assert argv[0] == "buildctl"
+            output = argv[argv.index("--output") + 1].split("dest=", 1)[1].split(",", 1)[0]
+            code = (
+                "import socket,sys,pathlib; s=socket.socket(socket.AF_UNIX); "
+                "s.connect(sys.argv[1]); pathlib.Path(sys.argv[2]).write_bytes(b'oci-output')"
+            )
+            return actual_popen([sys.executable, "-I", "-c", code, path, output], **kwargs)
+
+        monkeypatch.setattr(builder, "Path", private_path)
+        monkeypatch.setattr(builder.subprocess, "Popen", launch)
+        manifest = {
+            "context": None,
+            "request": {"dockerfile": "FROM scratch\n"},
+            "registry_hosts": ["docker.io"],
+            "_execution_cgroup": "/sys/fs/cgroup/palimpsest-test",
+            "run_network": "none",
+            "max_output_bytes": 4096,
+        }
+        output = builder._buildkit(manifest, scratch, time.monotonic() + 10, job)
+        assert output.read_bytes() == b"oci-output"
+        assert addresses == [str(short_socket), str(short_socket)]
+        assert len(os.fsencode(short_socket)) <= 104
+        assert not (scratch / "buildkit.sock").exists()
+        assert (job / "buildkitd.log").stat().st_mode & 0o777 == 0o600
+        assert (job / "buildctl.log").stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_safe_failure_summary_preserves_wrapped_cache_errno_without_payload(explicit):
+    from palimpsest_local.layer_cache import LayerCacheError
+
+    def raise_implicitly():
+        raise LayerCacheError("private wrapped payload")
+
+    try:
+        try:
+            raise OSError(28, "private credential recipe /private/path")
+        except OSError as cause:
+            if explicit:
+                raise LayerCacheError("private wrapped payload") from cause
+            raise_implicitly()
+    except LayerCacheError as exc:
+        summary = builder._failure_summary(exc, "execution")
+    assert json.loads(summary) == {"stage": "execution", "category": "OSError", "errno": 28}
+    assert "private" not in summary and "credential" not in summary
+
+
+def test_safe_failure_summary_bounds_cyclic_cause_chain():
+    first = RuntimeError("private first")
+    second = OSError(28, "private second")
+    first.__cause__ = second
+    second.__cause__ = first
+    assert json.loads(builder._failure_summary(first, "execution")) == {
+        "stage": "execution",
+        "category": "OSError",
+        "errno": 28,
+    }

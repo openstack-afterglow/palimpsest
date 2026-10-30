@@ -18,6 +18,7 @@ All notable changes to Palimpsest Local are documented here.
 
 ### Fixed
 
+- Keep the image executor's BuildKit socket in its private `/run` tmpfs, independent of persistent job-path length. Retain only the latest image-worker failure in an atomic owner-only, bounded local artifact after exact executor cleanup, preserving trailing executor/BuildKit stderr outside mounted scratch and job deletion with fixed stage/category/errno diagnostics; public errors, database schema and journal recovery authority are unchanged.
 - Settle lost worker claim responses through a durable channel/sequence cursor under the job-selection SQL mutex. Fence delayed original requests, retain exact-lease no-reexecution semantics, preserve legacy unidentified journals, and require explicit additive-schema bootstrap before coordinated API/worker cutover.
 - Recheck expiry immediately after durable submission writes and after context hashing, before external effects. Bound slow/trickling dependency downloads by an owned-process absolute deadline, and release only definite no-call live occupancy without refunding cumulative reservations.
 - Bind CUDA compilation to the validated device capability and reject execution mismatches using the kernel-written `__CUDA_ARCH__`, not echoed host compiler defines. Enforce cluster source expiry/pinned qualification, identity-safe child cleanup, streaming output limits, atomic simultaneous capacity and per-pair deadlines.

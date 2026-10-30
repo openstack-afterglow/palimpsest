@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -108,6 +109,7 @@ def build(instance, claim: dict, record: dict, deadline: float) -> dict:
         manifest["timeout_seconds"],
         instance.stop,
         module="palimpsest_local.hub_image_builder",
+        log=directory / "executor.log",
     )
     fd = worker._open_private(directory / "result.json")
     with os.fdopen(fd, "rb") as stream:
@@ -115,6 +117,48 @@ def build(instance, claim: dict, record: dict, deadline: float) -> dict:
     if len(raw) > worker.JSON_LIMIT:
         raise worker.BuildFailed("image result exceeds limit")
     return validate_result(json.loads(raw), claim["max_output_bytes"])
+
+
+FAILURE_FILE = "last-image-failure.json"
+FAILURE_LIMIT = 4 * worker.LOG_LIMIT + 4096
+
+
+def retain_failure(instance, record: dict, exc: Exception | None = None) -> None:
+    """Called only AFTER exact executor cleanup; never read mounted scratch.
+
+    Fixed host-side filenames only. One atomic owner-only artifact replaces the
+    previous failure, independently of the operation journal and job disposal.
+    Raw tool tails are private evidence, never API fields or logger arguments.
+    """
+    directory = instance.journal.job_dir(record)
+    tails = {}
+    for name in ("executor.log", "buildctl.log", "buildkitd.log"):
+        try:
+            fd = worker._open_private(directory / name)
+        except FileNotFoundError:
+            continue
+        with os.fdopen(fd, "rb") as stream:
+            stream.seek(max(0, os.fstat(stream.fileno()).st_size - worker.LOG_LIMIT))
+            tails[name] = base64.b64encode(stream.read(worker.LOG_LIMIT)).decode("ascii")
+    value = {
+        "job_id": worker._uuid(record["id"]),
+        "recorded_at": datetime.now(UTC).isoformat(),
+        "cause": worker._safe_error_class(exc) if exc is not None else "Interrupted",
+        "errno": exc.errno if isinstance(exc, OSError) and type(exc.errno) is int else None,
+        "tails_base64": tails,
+    }
+    raw = json.dumps(value, ensure_ascii=True).encode("ascii")
+    if len(raw) > FAILURE_LIMIT:
+        raise worker.WorkerHalted("image failure evidence exceeds limit")
+    target = instance.journal.root / FAILURE_FILE
+    temporary = instance.journal.root / (FAILURE_FILE + ".new")
+    fd = worker._open_private(temporary, os.O_CREAT | os.O_WRONLY | os.O_EXCL)
+    with os.fdopen(fd, "wb") as stream:
+        stream.write(raw)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, target)
+    instance.journal._sync()
 
 
 def validate_result(result: dict, maximum: int) -> dict:

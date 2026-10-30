@@ -46,6 +46,7 @@ from .registry_intake import resolve_anonymous_reference
 DEFAULT_HOSTS = ("docker.io", "registry-1.docker.io", "ghcr.io", "quay.io")
 MAX_LAYERS = 128
 JOURNAL_RESERVE_BYTES = 8 * 1024**2
+LOG_TAIL_BYTES = 65536
 
 
 def _allocate(path: Path, size: int) -> None:
@@ -345,21 +346,26 @@ def cleanup_image(directory: Path) -> None:
 
 
 def _private_log(process, path: Path) -> threading.Thread:
+    # Open on the host-side job directory, never inside disposable mounted
+    # scratch. Persist each bounded tail so a killed executor still leaves it.
+    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+
     def drain():
-        remaining = 65536
-        with path.open("xb") as output, process.stderr:
-            path.chmod(0o600)
-            for chunk in iter(lambda: process.stderr.read(8192), b""):
-                if remaining:
-                    output.write(chunk[:remaining])
-                    remaining -= min(remaining, len(chunk))
+        tail = bytearray()
+        with os.fdopen(fd, "wb", buffering=0) as output, process.stderr:
+            for chunk in iter(lambda: process.stderr.read1(8192), b""):
+                tail.extend(chunk)
+                del tail[:-LOG_TAIL_BYTES]
+                output.seek(0)
+                output.write(tail)
+                output.truncate()
 
     thread = threading.Thread(target=drain, daemon=True)
     thread.start()
     return thread
 
 
-def _buildkit(manifest: dict, directory: Path, deadline: float) -> Path:
+def _buildkit(manifest: dict, directory: Path, deadline: float, log_directory: Path) -> Path:
     context = directory / "context"
     descriptor = manifest.get("context")
     if descriptor is not None:
@@ -389,7 +395,9 @@ def _buildkit(manifest: dict, directory: Path, deadline: float) -> Path:
         + "\nmax-parallelism = 2\n[cdi]\ndisabled = true\n"
         + '[frontend."gateway.v0"]\nenabled = false\n'
     )
-    socket = directory / "buildkit.sock"
+    # /run is a per-executor private tmpfs. Persistent job roots can exceed
+    # AF_UNIX's 104-byte socket limit before BuildKit even starts.
+    socket = Path("/run/palimpsest-buildkit.sock")
     root = directory / "buildkit"
     root.mkdir(mode=0o700)
     parent = os.getpid()
@@ -422,7 +430,7 @@ def _buildkit(manifest: dict, directory: Path, deadline: float) -> Path:
         preexec_fn=child_setup,
         umask=0o077,
     )
-    daemon_log = _private_log(daemon, directory / "buildkitd.log")
+    daemon_log = _private_log(daemon, log_directory / "buildkitd.log")
     try:
         while not socket.exists():
             if daemon.poll() is not None:
@@ -471,7 +479,7 @@ def _buildkit(manifest: dict, directory: Path, deadline: float) -> Path:
             close_fds=True,
             umask=0o077,
         )
-        client_log = _private_log(client, directory / "buildctl.log")
+        client_log = _private_log(client, log_directory / "buildctl.log")
         try:
             client.wait(timeout=max(0.001, deadline - time.monotonic()))
             if client.returncode != 0:
@@ -609,7 +617,7 @@ def run_image(manifest: dict, directory: Path) -> dict:
                 reference = normalize_reference(manifest["request"]["reference"], manifest["registry_hosts"])
                 imported = cache.pull(reference, timeout_seconds=max(0.001, deadline - time.monotonic()))
             elif manifest["kind"] == "dockerfile":
-                archive = _buildkit(manifest, scratch, deadline)
+                archive = _buildkit(manifest, scratch, deadline, directory)
                 imported = cache.import_source(archive)
             else:
                 raise ValueError("invalid image job kind")
@@ -642,16 +650,70 @@ def preflight_image_host(directory: Path, cgroup_root: Path) -> None:
     cleanup_image(directory)
 
 
+def _failure_summary(exc: Exception, stage: str) -> str:
+    # Never stringify exceptions, argv, paths, recipes or custom class names.
+    # This credential-free child receives no worker key; private stderr conveys
+    # only a fixed stage/category and numeric OS/tool status to its parent.
+    category = "Exception"
+    stages = {
+        "_cgroup": "cgroup",
+        "_private_mounts": "mount_namespace",
+        "_scratch": "scratch",
+        "_allocate": "scratch_allocation",
+        "_temporary_root": "temporary_storage",
+        "_buildkit": "buildkit",
+        "extract_context": "context_extraction",
+        "normalize_reference": "registry_reference",
+        "materialized_result": "output_packing",
+    }
+    number = None
+    seen = set()
+    cause = exc
+    for _ in range(16):
+        if cause is None or id(cause) in seen:
+            break
+        seen.add(id(cause))
+        for kind in (TimeoutError, subprocess.TimeoutExpired, OSError, ValueError, RuntimeError):
+            if isinstance(cause, kind):
+                category = kind.__name__
+                break
+        if isinstance(cause, OSError) and type(cause.errno) is int:
+            number = cause.errno
+        trace = cause.__traceback__
+        for _ in range(128):
+            if trace is None:
+                break
+            # Only our own code objects can assign a diagnostic stage.
+            frame = trace.tb_frame
+            name = frame.f_code.co_name
+            function = globals().get(name)
+            function = getattr(function, "__wrapped__", function)
+            if name in stages and getattr(function, "__code__", None) is frame.f_code:
+                stage = stages[name]
+            trace = trace.tb_next
+        cause = cause.__cause__ or cause.__context__
+    return json.dumps(
+        {
+            "stage": stage,
+            "category": category,
+            "errno": number,
+        }
+    )
+
+
 def main() -> None:
+    stage = "arguments"
     try:
         if len(sys.argv) == 5 and sys.argv[1] == "preflight":
             directory = Path(sys.argv[3]).resolve(strict=True)
+            stage = "preflight"
             marker = _mark_helper(directory, int(sys.argv[2]))
             preflight_image_host(directory, Path(sys.argv[4]))
             marker.unlink()
             return
         if len(sys.argv) == 4 and sys.argv[1] == "cleanup":
             directory = Path(sys.argv[2]).resolve(strict=True)
+            stage = "cleanup"
             _fence_helper(int(sys.argv[3]))
             _release_journal_reserve(directory)
             marker = _mark_helper(directory, int(sys.argv[3]))
@@ -661,12 +723,17 @@ def main() -> None:
         if len(sys.argv) != 3:
             raise ValueError("expected private manifest and parent")
         path = Path(sys.argv[1])
+        stage = "manifest"
         _mark_builder(path.parent, int(sys.argv[2]))
-        run_image(_load_manifest(path), path.parent)
-    except (TimeoutError, subprocess.TimeoutExpired):
+        manifest = _load_manifest(path)
+        stage = "execution"
+        run_image(manifest, path.parent)
+    except (TimeoutError, subprocess.TimeoutExpired) as exc:
+        print(_failure_summary(exc, stage), file=sys.stderr)
         raise SystemExit(124) from None
-    except Exception:
-        raise SystemExit("image executor failed") from None
+    except Exception as exc:
+        print(_failure_summary(exc, stage), file=sys.stderr)
+        raise SystemExit(1) from None
     print('{"result_file":"result.json"}')
 
 

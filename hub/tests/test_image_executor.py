@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import io
 import json
+import os
+import shutil
+import subprocess
+import sys
 import threading
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -392,3 +397,150 @@ def test_image_restart_recovers_exact_lease_without_execution(harness):
         ("GET", f"/v1/image-worker/jobs/{JOB}"),
     ]
     assert not harness.executions and harness.journal.load() is None
+
+
+def test_real_failed_executor_tail_survives_cleanup_disposal_and_next_idle_claim(tmp_path, monkeypatch, caplog):
+    journal = worker.Journal(tmp_path / "worker")
+    events = []
+    payloads = []
+    actual_popen = subprocess.Popen
+    actual_executor = worker.run_executor
+    attempt = 0
+
+    class PrivateTransport(Transport):
+        @contextmanager
+        def request(self, method, path, **kwargs):
+            if path.endswith("/fail"):
+                payloads.append(json.loads(kwargs["body"]))
+                assert not journal.job_dir({"id": JOB}).joinpath("scratch").exists()
+            with super().request(method, path, **kwargs) as response:
+                yield response
+
+    def launch(argv, **kwargs):
+        nonlocal attempt
+        attempt += 1
+        assert kwargs["env"] == worker.EXECUTOR_ENV
+        assert "PALIMPSEST_HUB_BUILD_WORKER_KEY" not in kwargs["env"]
+        # A real failing process emits far more than one retained window. Final
+        # stderr (not a mocked error string) must survive the entire worker path.
+        code = (
+            "import os, pathlib, sys; "
+            "d=pathlib.Path(sys.argv[1]).parent; (d/'scratch').mkdir(); "
+            "[(d/n).write_bytes(b'prefix'+b'x'*200000+b'private-tool-tail') "
+            "for n in ('buildctl.log','buildkitd.log')]; "
+            "[(d/n).chmod(0o600) for n in ('buildctl.log','buildkitd.log')]; "
+            "os.write(2,b'discarded-prefix'+b'x'*200000+b'private-recipe-path-tail-'+sys.argv[2].encode()); "
+            "raise SystemExit(1)"
+        )
+        return actual_popen([sys.executable, "-I", "-c", code, argv[-2], str(attempt)], **kwargs)
+
+    def executor(arguments, timeout, stop=None, log=None, *, module=None):
+        if arguments[0] == "cleanup":
+            directory = journal.job_dir({"id": JOB})
+            assert (directory / "executor.log").stat().st_size == worker.LOG_LIMIT
+            shutil.rmtree(directory / "scratch")
+            events.append(("cleanup", str(directory)))
+            return b""
+        return actual_executor(arguments, timeout, stop, log, module=module)
+
+    monkeypatch.setenv("PALIMPSEST_HUB_BUILD_WORKER_KEY", "never-copy-worker-key")
+    monkeypatch.setattr(worker.subprocess, "Popen", launch)
+    monkeypatch.setattr(worker, "run_executor", executor)
+    transport = PrivateTransport(
+        [
+            response
+            for _ in range(2)
+            for response in (Response(202, claim()), Response(200), Response(200, {"id": JOB, "status": "error"}))
+        ],
+        journal,
+        events,
+    )
+    instance = worker.BuildWorker(settings(), transport, journal, threading.Event())
+    try:
+        for ordinal in (1, 2):
+            assert instance.process_one()
+            artifact = journal.root / image.FAILURE_FILE
+            raw = artifact.read_bytes()
+            assert len(raw) <= image.FAILURE_LIMIT
+            assert artifact.stat().st_mode & 0o777 == 0o600
+            retained = json.loads(raw)
+            tails = {key: base64.b64decode(value) for key, value in retained["tails_base64"].items()}
+            assert set(tails) == {"executor.log", "buildctl.log", "buildkitd.log"}
+            assert all(len(value) == worker.LOG_LIMIT for value in tails.values())
+            assert tails["executor.log"].endswith(f"private-recipe-path-tail-{ordinal}".encode())
+            assert tails["buildctl.log"].endswith(b"private-tool-tail")
+            assert all(b"prefix" not in value for value in tails.values())
+            assert b"never-copy-worker-key" not in raw
+            assert not journal.job_dir({"id": JOB}).exists()
+            assert journal.load() is None
+            assert {path.name for path in journal.root.iterdir()} == {"worker.lock", "worker.json", image.FAILURE_FILE}
+        assert journal.cursor["sequence"] == 2
+        assert payloads == [{"error_code": "build_failed"}] * 2
+        assert "private-recipe" not in caplog.text and "private-tool" not in caplog.text
+    finally:
+        journal.close()
+
+
+@pytest.mark.parametrize("damage", ["symlink", "hardlink", "permissions", "oversize"])
+def test_idle_journal_rejects_unsafe_diagnostic_artifact(tmp_path, damage):
+    journal = worker.Journal(tmp_path / "worker")
+    artifact = journal.root / image.FAILURE_FILE
+    protected = tmp_path / "protected"
+    protected.write_bytes(b"private unrelated content")
+    protected.chmod(0o600)
+    if damage == "symlink":
+        artifact.symlink_to(protected)
+    elif damage == "hardlink":
+        os.link(protected, artifact)
+    else:
+        artifact.write_bytes(b"x" * (image.FAILURE_LIMIT + 1) if damage == "oversize" else b"private")
+        artifact.chmod(0o600 if damage == "oversize" else 0o644)
+    try:
+        with pytest.raises((worker.WorkerHalted, OSError)):
+            journal.load()
+        assert protected.read_bytes() == b"private unrelated content"
+    finally:
+        journal.close()
+
+
+def test_uncommitted_diagnostics_never_replace_previous_evidence_or_journal(tmp_path):
+    journal = worker.Journal(tmp_path / "worker")
+    journal.begin_claim("image")
+    journal.clear()
+    original = journal.path.read_bytes()
+    target = journal.root / image.FAILURE_FILE
+    target.write_bytes(b"committed failure")
+    target.chmod(0o600)
+    temporary = journal.root / (image.FAILURE_FILE + ".new")
+    temporary.write_bytes(b"partial replacement")
+    temporary.chmod(0o600)
+    try:
+        assert journal.load() is None
+        assert target.read_bytes() == b"committed failure"
+        assert not temporary.exists()
+        assert journal.path.read_bytes() == original
+    finally:
+        journal.close()
+
+
+def test_cleanup_failure_does_not_read_or_replace_private_evidence(harness, monkeypatch):
+    def failed(instance, admitted, record, deadline):
+        directory = instance.journal.job_dir(record)
+        directory.mkdir(mode=0o700)
+        record["phase"] = "executing"
+        instance.journal.save(record)
+        raise worker.BuildFailed("private failure")
+
+    def unsafe_cleanup(*args, **kwargs):
+        raise worker.BuildFailed("owned namespace still populated")
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("evidence read before cleanup quiescence")
+
+    monkeypatch.setattr(image, "build", failed)
+    monkeypatch.setattr(worker, "run_executor", unsafe_cleanup)
+    monkeypatch.setattr(image, "retain_failure", forbidden)
+    instance, transport = harness.make([Response(202, claim())])
+    with pytest.raises(worker.WorkerHalted, match="cleanup"):
+        instance.process_one()
+    assert len(transport.calls) == 1

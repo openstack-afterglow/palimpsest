@@ -341,10 +341,11 @@ class Journal:
         os.close(self.lock_fd)
 
     def load(self) -> dict | None:
+        self._diagnostics()
         try:
             fd = _open_private(self.path)
         except FileNotFoundError:
-            if any(p.name != "worker.lock" for p in self.root.iterdir()):
+            if any(p.name not in {"worker.lock", "last-image-failure.json"} for p in self.root.iterdir()):
                 raise WorkerHalted("unjournaled worker scratch retained")
             return None
         with os.fdopen(fd, "rb") as stream:
@@ -377,10 +378,34 @@ class Journal:
         self._discard_uncommitted()
         self.cursor = {key: value[key] for key in ("channel", "sequence")} if "channel" in value else None
         if value["phase"] == "idle":
-            if any(p.name not in {"worker.lock", "worker.json"} for p in self.root.iterdir()):
+            if any(
+                p.name not in {"worker.lock", "worker.json", "last-image-failure.json"} for p in self.root.iterdir()
+            ):
                 raise WorkerHalted("unjournaled worker scratch retained")
             return None
         return value
+
+    def _diagnostics(self):
+        # These two fixed files confer no job/recovery authority. A crash before
+        # replace leaves only bounded uncommitted evidence, safe to discard.
+        from .image_executor import FAILURE_FILE, FAILURE_LIMIT
+
+        for name in (FAILURE_FILE, FAILURE_FILE + ".new"):
+            path = self.root / name
+            try:
+                fd = _open_private(path)
+            except FileNotFoundError:
+                continue
+            try:
+                info = os.fstat(fd)
+                current = path.lstat()
+                if info.st_size > FAILURE_LIMIT or (info.st_dev, info.st_ino) != (current.st_dev, current.st_ino):
+                    raise WorkerHalted("unsafe image failure evidence retained")
+                if name.endswith(".new"):
+                    path.unlink()
+                    self._sync()
+            finally:
+                os.close(fd)
 
     def _discard_uncommitted(self):
         """Under flock, only the validated durable journal authorizes recovery.
@@ -495,6 +520,7 @@ def run_executor(
     )
     output = bytearray()
     errors = 0
+    error_tail = bytearray()
     end = time.monotonic() + timeout
     try:
         with selectors.DefaultSelector() as selector:
@@ -516,13 +542,22 @@ def run_executor(
                                 raise BuildFailed("executor output exceeded limit")
                             output.extend(chunk)
                         else:
-                            errors += len(chunk)
-                            if errors > LOG_LIMIT:
-                                raise BuildFailed("executor log exceeded limit")
-                            if log_fd is not None:
-                                os.write(log_fd, chunk)
+                            if module == "palimpsest_local.hub_image_builder":
+                                error_tail.extend(chunk)
+                                del error_tail[:-LOG_LIMIT]
+                            else:
+                                errors += len(chunk)
+                                if errors > LOG_LIMIT:
+                                    raise BuildFailed("executor log exceeded limit")
+                                if log_fd is not None:
+                                    os.write(log_fd, chunk)
             finally:
                 if log_fd is not None:
+                    if module == "palimpsest_local.hub_image_builder":
+                        with os.fdopen(os.dup(log_fd), "wb") as stream:
+                            stream.write(error_tail)
+                            stream.flush()
+                            os.fsync(stream.fileno())
                     os.close(log_fd)
         if child.returncode == 124:
             raise BuildTimeout("executor deadline exceeded")
@@ -711,6 +746,10 @@ class BuildWorker:
             self._status(record)
             self._dispose(record)
         else:
+            if record.get("protocol") == "image":
+                from .image_executor import retain_failure
+
+                retain_failure(self, record)
             self._fail(record, "build_failed")
 
     def _download(self, record, descriptor, target: Path, deadline: float):
@@ -877,6 +916,8 @@ class BuildWorker:
             # The exact lease is durable: invalid descriptors fail this attempt,
             # rather than poisoning the worker as an unidentified claim.
             self._cleanup(record)
+            if record.get("protocol") == "image":
+                image_executor.retain_failure(self, record, exc)
             self._fail(record, "build_failed")
             return True
         deadline = time.monotonic() + claim["timeout_seconds"]
@@ -886,11 +927,15 @@ class BuildWorker:
                 if record.get("protocol") == "image"
                 else self._build(claim, record, deadline)
             )
-        except WorkerHalted:
+        except WorkerHalted as exc:
             self._cleanup(record)
+            if record.get("protocol") == "image":
+                image_executor.retain_failure(self, record, exc)
             raise
         except Exception as exc:
             self._cleanup(record)
+            if record.get("protocol") == "image":
+                image_executor.retain_failure(self, record, exc)
             self._fail(record, "build_timeout" if isinstance(exc, BuildTimeout) else "build_failed")
         else:
             self._cleanup(record)
@@ -905,6 +950,8 @@ class BuildWorker:
                 # Upload intent means only status settlement remains safe.
                 if record["phase"] == "output_pending":
                     raise WorkerHalted("output disposition uncertain; journal retained")
+                if record.get("protocol") == "image":
+                    image_executor.retain_failure(self, record, exc)
                 self._fail(record, "build_timeout" if isinstance(exc, BuildTimeout) else "build_failed")
         return True
 

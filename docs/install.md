@@ -825,6 +825,19 @@ including when launched through the direct `uvicorn palimpsest_hub.main:app`
 command. Do not enable third-party HTTP/SQL trace logging or an independent
 server access logger that emits raw targets in production.
 
+For image-build failures the worker retains one private owner-only
+`last-image-failure.json` beside `worker.json`, after exact executor cleanup and
+before deleting the disposable job tree. It contains the last64KiB from each
+executor/BuildKit stream as base64 plus fixed category/errno metadata; final JSON
+is limited to266240bytes. Treat these raw tool tails as potentially sensitive:
+inspect only through approved operator access, never copy them into public API
+errors, ordinary logs or reports. A later failure atomically replaces this one
+artifact. It is not journal/claim authority; do not delete an uncertain journal
+or adopt diagnostic staging to resume work. Executor stderr survives normal
+failed-child finalization, not an arbitrary worker SIGKILL before the tail is
+persisted. BuildKit uses a short socket in the existing per-executor private
+`/run` tmpfs so persistent job path length cannot exceed its Unix-socket limit.
+
 On a reused asyncmy connection whose uvloop TCP transport was already closed,
 Hub marks the failed pool pre-ping as a disconnect and obtains a fresh connection
 before the request's SQL operation. It does not retry transactions that lose
