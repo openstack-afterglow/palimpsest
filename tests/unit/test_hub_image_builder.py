@@ -388,12 +388,141 @@ def test_temporary_root_covers_python_and_safe_external_tools_and_restores_state
     assert (os.environ.get("TMPDIR"), tempfile.tempdir, builder.SAFE_ENV.get("TMPDIR")) == before
 
 
+@pytest.fixture
+def overlay_host(monkeypatch):
+    monkeypatch.setattr(builder.sys, "platform", "linux")
+    monkeypatch.setattr(builder.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(builder.shutil, "which", lambda tool: "/usr/bin/" + tool)
+    monkeypatch.setattr(builder.os, "access", lambda *args: True)
+
+
+@pytest.mark.parametrize(
+    "missing", ["linux", "root", "buildkitd", "buildctl", "mount", "umount", "findmnt", "runtime", "ext4"]
+)
+def test_buildkit_overlay_preconditions_fail_before_context_or_daemon(tmp_path, monkeypatch, overlay_host, missing):
+    if missing == "linux":
+        monkeypatch.setattr(builder.sys, "platform", "darwin")
+    elif missing == "root":
+        monkeypatch.setattr(builder.os, "geteuid", lambda: 1000)
+    elif missing == "runtime":
+        monkeypatch.setattr(builder.os, "access", lambda *args: False)
+    elif missing != "ext4":
+        monkeypatch.setattr(builder.shutil, "which", lambda tool: None if tool == missing else "/usr/bin/" + tool)
+    monkeypatch.setattr(builder, "_command", lambda *args, **kwargs: b"overlay\n")
+    monkeypatch.setattr(builder.subprocess, "Popen", lambda *args, **kwargs: pytest.fail("daemon must not start"))
+    with pytest.raises(RuntimeError, match="overlayfs") as failure:
+        builder._buildkit({}, tmp_path, time.monotonic() + 10, tmp_path)
+    assert json.loads(builder._failure_summary(failure.value, "execution"))["stage"] == "overlay_snapshotter"
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("mount_completed", [False, True])
+def test_overlay_mount_denial_retains_errno_and_never_falls_back(tmp_path, monkeypatch, overlay_host, mount_completed):
+    calls = []
+
+    def command(argv, *args, **kwargs):
+        calls.append(argv[0])
+        if argv[0] == "findmnt":
+            return b"ext4\n"
+        if argv[0] == "umount":
+            return b""
+        raise OSError(1, "private mount denial")
+
+    monkeypatch.setattr(builder, "_command", command)
+    monkeypatch.setattr(builder, "_overlay_command", command)
+    monkeypatch.setattr(builder.subprocess, "Popen", lambda *args, **kwargs: pytest.fail("daemon must not start"))
+    monkeypatch.setattr(builder.os.path, "ismount", lambda path: mount_completed)
+    with pytest.raises(RuntimeError, match="native fallback prohibited") as failure:
+        builder._buildkit({}, tmp_path, time.monotonic() + 10, tmp_path)
+    assert calls == ["findmnt", "mount"] + (["umount"] if mount_completed else [])
+    assert json.loads(builder._failure_summary(failure.value, "execution")) == {
+        "stage": "overlay_snapshotter",
+        "category": "OSError",
+        "errno": 1,
+    }
+    assert not (tmp_path / "overlayfs-probe").exists()
+
+
+@pytest.mark.parametrize("unmount_fails", [False, True])
+def test_overlay_probe_verifies_mounted_content_and_does_not_remove_uncertain_mount(
+    tmp_path, monkeypatch, overlay_host, unmount_fails
+):
+    calls = []
+
+    def command(argv, *args, **kwargs):
+        calls.append(argv[0])
+        if argv[0] == "umount" and unmount_fails:
+            raise OSError(16, "busy")
+        return b"ext4\n"
+
+    monkeypatch.setattr(builder, "_command", command)
+    monkeypatch.setattr(builder, "_overlay_command", command)
+    # A tool returning zero without a working overlay is insufficient.
+    with pytest.raises(RuntimeError, match="cleanup uncertain" if unmount_fails else "precondition failed"):
+        builder._require_overlayfs(tmp_path, time.monotonic() + 10, tmp_path)
+    assert calls == ["findmnt", "mount", "umount"]
+    assert (tmp_path / "overlayfs-probe").exists() == unmount_fails
+
+
+def test_overlay_actual_command_failure_retains_private_bounded_tail_and_exit_status(
+    tmp_path, monkeypatch, overlay_host
+):
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    logs = tmp_path / "journal"
+    logs.mkdir()
+    actual_popen = subprocess.Popen
+    marker = b"mount: overlay permission denied private-path"
+
+    def launch(argv, **kwargs):
+        assert argv[0] in ("mount", "umount"), "BuildKit must not start after the failed probe"
+        del kwargs["preexec_fn"]  # Real process/logging; no Linux privilege fence in this portable test.
+        # Run a real failing process through the production drain/wait/status
+        # path, rather than injecting an OSError that mount never raises.
+        return actual_popen(
+            [
+                sys.executable,
+                "-I",
+                "-c",
+                "import os; os.write(2,b'x'*200000+" + repr(marker) + "); raise SystemExit(32)",
+            ],
+            **kwargs,
+        )
+
+    monkeypatch.setattr(builder, "_command", lambda *args, **kwargs: b"ext4\n")
+    monkeypatch.setattr(builder.subprocess, "Popen", launch)
+    with pytest.raises(RuntimeError, match="native fallback prohibited") as failure:
+        builder._buildkit({}, scratch, time.monotonic() + 10, logs)
+    assert not list(scratch.iterdir())
+    log = logs / "overlayfs-mount.log"
+    assert log.read_bytes().endswith(marker)
+    assert log.stat().st_size == builder.LOG_TAIL_BYTES
+    assert log.stat().st_mode & 0o777 == 0o600
+    assert json.loads((logs / "overlayfs-mount.json").read_text()) == {"returncode": 32, "timed_out": False}
+    retained = (logs / "buildkitd.log").read_bytes()
+    header, retained_tail = retained.split(b"\n", 1)
+    assert json.loads(header) == {"stage": "overlay_snapshotter", "tool": "mount", "returncode": 32, "timed_out": False}
+    assert retained_tail.endswith(marker)
+    assert len(retained) == builder.LOG_TAIL_BYTES
+    assert (logs / "buildkitd.log").stat().st_mode & 0o777 == 0o600
+    # A second failed cleanup command cannot mask the original mount failure,
+    # including its exit status, in the parent's existing retained-log slot.
+    with pytest.raises(RuntimeError, match="probe command failed"):
+        builder._overlay_command(["umount", "unused"], time.monotonic() + 10, logs)
+    assert (logs / "buildkitd.log").read_bytes() == retained
+    cause = failure.value.__cause__.__cause__
+    assert isinstance(cause, subprocess.CalledProcessError) and cause.returncode == 32
+    summary = builder._failure_summary(failure.value, "execution")
+    assert json.loads(summary)["stage"] == "overlay_snapshotter"
+    assert "permission denied" not in summary and "private-path" not in summary
+
+
 @pytest.mark.skipif(
     os.environ.get("PALIMPSEST_IMAGE_SCRATCH_LINUX_SMOKE") != "1",
     reason="explicit single-container privileged Linux scratch proof only",
 )
-def test_native_scratch_bounds_temp_kill_journal_and_exact_loop_cleanup(tmp_path):
-    """No registry/network/tools beyond ext4+loop; writes at most 264MiB."""
+def test_ext4_overlay_scratch_bounds_temp_kill_journal_and_exact_loop_cleanup(tmp_path):
+    """Real overlay copy-up on bounded ext4; no registry or BuildKit daemon."""
     import shutil
 
     from palimpsest_local import hub_builder
@@ -402,7 +531,7 @@ def test_native_scratch_bounds_temp_kill_journal_and_exact_loop_cleanup(tmp_path
     job = tmp_path / "scratch-proof"
     job.mkdir(mode=0o700)
     script = r"""
-import errno, json, os, sys, tempfile, time
+import errno, json, os, shutil, sys, tempfile, time
 from pathlib import Path
 from palimpsest_local import hub_image_builder as b
 job = Path(sys.argv[1])
@@ -411,6 +540,39 @@ b._private_mounts()
 with b._scratch(job, 256 * 1024**2, 64 * 1024**2, time.monotonic() + 90) as (root, maximum, executor):
     assert (job / 'scratch.ext4').stat().st_blocks * 512 >= 192 * 1024**2
     assert (job / 'outputs.pack').stat().st_blocks * 512 >= maximum
+    b._require_overlayfs(root, time.monotonic() + 30, job)
+    assert not (root / 'overlayfs-probe').exists()
+    assert not (job / 'buildkitd.log').exists(), 'successful probe must leave daemon log slot unused'
+    fixture = root / 'overlay-fixture'
+    fixture.mkdir(mode=0o700)
+    base = fixture / 'base'
+    base.mkdir(mode=0o700)
+    inherited_bytes = 32 * 1024**2
+    with (base / 'inherited').open('wb') as stream:
+        for _ in range(32):
+            stream.write(b'x' * 1024**2)
+    (base / 'counter').write_text('0')
+    lowers = [base]
+    overlay_upper_bytes = []
+    for ordinal in range(2):
+        upper, work, merged = (fixture / (name + str(ordinal)) for name in ('upper', 'work', 'merged'))
+        upper.mkdir(mode=0o700)
+        work.mkdir(mode=0o700)
+        executor.mount('overlay', merged, 'overlay', 'lowerdir=' + ':'.join(map(str, lowers))
+            + ',upperdir=' + str(upper) + ',workdir=' + str(work))
+        assert (merged / 'counter').read_text() == str(ordinal)
+        assert (merged / 'inherited').stat().st_size == inherited_bytes
+        with (merged / 'inherited').open('rb') as stream:
+            assert stream.read(16) == b'x' * 16
+        (merged / 'counter').write_text(str(ordinal + 1))
+        executor.unmount(merged)
+        assert not (upper / 'inherited').exists(), 'unchanged parent must not be copied'
+        allocated = sum(path.stat().st_blocks * 512 for path in upper.rglob('*'))
+        assert allocated < 1024**2, allocated
+        overlay_upper_bytes.append(allocated)
+        lowers.insert(0, upper)
+    assert (base / 'counter').read_text() == '0'
+    shutil.rmtree(fixture)
     with b._temporary_root(root):
         temporary = Path(tempfile.mkdtemp(prefix='registry-killed-'))
         (temporary / 'partial-download').write_bytes(b'owned bytes')
@@ -429,7 +591,8 @@ with b._scratch(job, 256 * 1024**2, 64 * 1024**2, time.monotonic() + 90) as (roo
         os.write(fd, b'hsqsreserved-output')
         os.fsync(fd)
         os.close(fd)
-        b._save(job / 'ready.json', {'loop': executor.loops[0]['device'], 'temporary': str(temporary)})
+        b._save(job / 'ready.json', {'loop': executor.loops[0]['device'], 'temporary': str(temporary),
+            'overlay_upper_bytes': overlay_upper_bytes, 'inherited_bytes': inherited_bytes})
         while True:
             time.sleep(1)
 """
@@ -441,6 +604,9 @@ with b._scratch(job, 256 * 1024**2, 64 * 1024**2, time.monotonic() + 90) as (roo
             assert time.monotonic() < deadline, "scratch proof timed out"
             time.sleep(0.05)
         ready = json.loads((job / "ready.json").read_text())
+        assert ready["inherited_bytes"] == 32 * 1024**2
+        assert len(ready["overlay_upper_bytes"]) == 2
+        assert all(size < 1024**2 for size in ready["overlay_upper_bytes"])
         assert json.loads((job / "worker.json").read_text())["phase"] == "cleanup_pending"
         with (job / "outputs.pack").open("rb") as stream:
             assert stream.read(19) == b"hsqsreserved-output"
@@ -670,6 +836,7 @@ def test_buildkit_binds_short_private_socket_with_production_length_job_root(tmp
             return actual_popen([sys.executable, "-I", "-c", code, path, output], **kwargs)
 
         monkeypatch.setattr(builder, "Path", private_path)
+        monkeypatch.setattr(builder, "_require_overlayfs", lambda *args: None)
         monkeypatch.setattr(builder.subprocess, "Popen", launch)
         manifest = {
             "context": None,

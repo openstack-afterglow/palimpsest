@@ -365,7 +365,139 @@ def _private_log(process, path: Path) -> threading.Thread:
     return thread
 
 
+def _overlay_command(argv: list[str], deadline: float, log_directory: Path) -> None:
+    """Retain actual mount-tool failures outside the disposable scratch."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("overlayfs probe deadline expired")
+    tool = argv[0]
+    parent = os.getpid()
+    process = subprocess.Popen(
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        env=SAFE_ENV,
+        close_fds=True,
+        preexec_fn=lambda: _child_limits(parent, LOG_TAIL_BYTES),
+        umask=0o077,
+    )
+    drain = None
+    timed_out = False
+    try:
+        drain = _private_log(process, log_directory / f"overlayfs-{tool}.log")
+        try:
+            process.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            raise
+        if process.returncode != 0:
+            raise RuntimeError("overlayfs probe command failed") from subprocess.CalledProcessError(
+                process.returncode, tool
+            )
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+        if drain is not None:
+            drain.join(timeout=5)
+        _save(log_directory / f"overlayfs-{tool}.json", {"returncode": process.returncode, "timed_out": timed_out})
+        if drain is not None and drain.is_alive():
+            raise RuntimeError("overlayfs probe log cleanup uncertain")
+        if process.returncode != 0 or timed_out:
+            # The parent retains buildkitd.log before disposing this directory,
+            # not the probe sidecars. No daemon has started on this path. Keep
+            # the first failure if a subsequent cleanup command also fails.
+            status = (
+                json.dumps(
+                    {
+                        "stage": "overlay_snapshotter",
+                        "tool": tool,
+                        "returncode": process.returncode,
+                        "timed_out": timed_out,
+                    }
+                ).encode("ascii")
+                + b"\n"
+            )
+            tail = (log_directory / f"overlayfs-{tool}.log").read_bytes() if drain is not None else b""
+            try:
+                fd = os.open(
+                    log_directory / "buildkitd.log", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600
+                )
+            except FileExistsError:
+                pass
+            else:
+                with os.fdopen(fd, "wb") as retained:
+                    retained.write(status + tail[-(LOG_TAIL_BYTES - len(status)) :])
+                    retained.flush()
+                    os.fsync(retained.fileno())
+
+
+def _require_overlayfs(directory: Path, deadline: float, log_directory: Path) -> None:
+    """Fail closed unless this job's ext4 supports real overlay copy-up/whiteouts."""
+    if sys.platform != "linux" or os.geteuid() != 0:
+        raise RuntimeError("BuildKit overlayfs requires privileged root Linux execution")
+    for tool in ("buildkitd", "buildctl", "mount", "umount", "findmnt"):
+        if shutil.which(tool) is None:
+            raise RuntimeError("BuildKit overlayfs execution tool unavailable")
+    if not os.access("/usr/bin/buildkit-runc", os.X_OK):
+        raise RuntimeError("BuildKit overlayfs runtime unavailable")
+    filesystem = _command(["findmnt", "-n", "-o", "FSTYPE", "-T", str(directory)], deadline, capture=True).strip()
+    if filesystem != b"ext4":
+        raise RuntimeError("BuildKit overlayfs requires the quota-bound ext4 scratch")
+    probe = directory / "overlayfs-probe"
+    probe.mkdir(mode=0o700)
+    lower, upper, work, merged = (probe / name for name in ("lower", "upper", "work", "merged"))
+    for path in (lower, upper, work, merged):
+        path.mkdir(mode=0o700)
+    (lower / "copy-up").write_bytes(b"lower")
+    (lower / "deleted").write_bytes(b"lower")
+    mounted = False
+    try:
+        # An actual mount checks kernel/module, CAP_SYS_ADMIN, LSM and backing
+        # filesystem support together; /proc/filesystems alone proves none of it.
+        _overlay_command(
+            [
+                "mount",
+                "-t",
+                "overlay",
+                "-o",
+                f"lowerdir={lower},upperdir={upper},workdir={work}",
+                "overlay",
+                str(merged),
+            ],
+            deadline,
+            log_directory,
+        )
+        mounted = True
+        if (merged / "copy-up").read_bytes() != b"lower":
+            raise RuntimeError("overlayfs lower layer unavailable")
+        (merged / "copy-up").write_bytes(b"upper")
+        (merged / "deleted").unlink()
+        if (
+            (upper / "copy-up").read_bytes() != b"upper"
+            or (lower / "copy-up").read_bytes() != b"lower"
+            or (merged / "deleted").exists()
+            or (lower / "deleted").read_bytes() != b"lower"
+        ):
+            raise RuntimeError("overlayfs copy-up or whiteout unavailable")
+    except (OSError, RuntimeError) as exc:
+        raise RuntimeError("BuildKit overlayfs snapshotter precondition failed; native fallback prohibited") from exc
+    finally:
+        # Never recurse into a mounted overlay on failure. Interrupted mounts
+        # belong to the private namespace; the existing cleanup fence owns it.
+        if mounted or os.path.ismount(merged):
+            try:
+                _overlay_command(["umount", str(merged)], time.monotonic() + 15, log_directory)
+            except (OSError, RuntimeError) as exc:
+                raise RuntimeError("BuildKit overlayfs probe cleanup uncertain") from exc
+        shutil.rmtree(probe)
+
+
 def _buildkit(manifest: dict, directory: Path, deadline: float, log_directory: Path) -> Path:
+    # Native snapshots recursively copy the accumulated root at each layer.
+    # Require overlayfs, never auto/native fallback or a larger job deadline.
+    _require_overlayfs(directory, deadline, log_directory)
     context = directory / "context"
     descriptor = manifest.get("context")
     if descriptor is not None:
@@ -418,7 +550,7 @@ def _buildkit(manifest: dict, directory: Path, deadline: float, log_directory: P
             "unix://" + str(socket),
             "--oci-worker=true",
             "--containerd-worker=false",
-            "--oci-worker-snapshotter=native",
+            "--oci-worker-snapshotter=overlayfs",
             "--oci-worker-binary=/usr/bin/buildkit-runc",
             "--oci-worker-net=bridge",
         ],
@@ -662,6 +794,7 @@ def _failure_summary(exc: Exception, stage: str) -> str:
         "_allocate": "scratch_allocation",
         "_temporary_root": "temporary_storage",
         "_buildkit": "buildkit",
+        "_require_overlayfs": "overlay_snapshotter",
         "extract_context": "context_extraction",
         "normalize_reference": "registry_reference",
         "materialized_result": "output_packing",

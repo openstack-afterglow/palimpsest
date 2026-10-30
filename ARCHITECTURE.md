@@ -1,5 +1,23 @@
 # Palimpsest Architecture
 
+## Quota-bound BuildKit overlay snapshots — 2026-10-31
+
+Retained production evidence separated acquisition from local extraction: one
+compiler layer downloaded in8.5seconds but its native-snapshot extraction took
+2832.8seconds; the image attempt reached its3600-second deadline without a GPU
+consumer. These timings are not a network-speed measurement, and the exact
+production parent-copy volume was not measured. Native snapshot copy amplification
+is addressed by requiring BuildKit's overlayfs snapshotter on the existing
+quota-bound ext4 scratch, not by raising the deadline or silently falling back.
+
+Before context extraction or daemon startup, a real private overlay mount must
+demonstrate lower reads, copy-up, whiteouts and unchanged lower contents. Failure
+retains a bounded private command return code/stderr tail in the existing last-
+failure path. Uncertain unmount prevents recursive probe cleanup. Physical quota,
+source/network policy, short private socket and exact executor cleanup stay intact.
+Unit tests and a kernel mount probe are distinct from a real registry-backed
+BuildKit build and the eventual API GPU/cuDNN acceptance; record each separately.
+
 ## Image executor socket and retained failure evidence — 2026-10-30
 
 Production-length private state paths exposed BuildKit's104-byte Unix-socket
@@ -1974,9 +1992,9 @@ provider provisioning. Fresh multi-instance evidence is recorded separately.
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "a57dbc65f8881541185b869be5d1179d26e37a421148c97f2ecc165d16f621d6",
-  "reviewed_at": "2026-10-30T14:48:30Z",
-  "summary": "Reviewed worker image short socket under private per-executor /run and bounded final diagnostic tails after exact cleanup, strict private artifact journal allowance and unchanged public error schema. Actual installed native BuildKit refused production120-byte socket and reached RPC readiness with29-byte path in private namespaces; focused231 passed3 skipped and independent review clean. Earlier ed540 seven-service additive-schema rollout is live; two CUDA image attempts failed before GPU creation. Worker-only repair deployment and real CUDA/cuDNN acceptance remain pending."
+  "source_sha256": "1ba05d6589fc754765e591738b8df556606522f7da13d40ced35a71add9e14cd",
+  "reviewed_at": "2026-10-30T17:06:01Z",
+  "summary": "Reviewed quota-bound ext4 overlayfs admission, actual copy-up/whiteout and fail-closed unmount semantics, explicit BuildKit overlayfs without native fallback, and bounded mount returncode/stderr retention through existing failure artifact. Focused69 passed3 skipped and independent review clean; retained production layer download8.5s/extraction2832.8s distinguishes local extraction from transfer but does not measure copy volume. Native overlay and API CUDA/cuDNN proof remain pending; subsequent owner-requested five-success workload comparisons are gated on functional acceptance."
 }
 ```
 <!-- architecture-review:end -->
