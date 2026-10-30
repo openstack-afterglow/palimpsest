@@ -2014,9 +2014,9 @@ provider provisioning. Fresh multi-instance evidence is recorded separately.
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "f90232f814cef0de85dc0d14cef6b62f5772932429e2e644a3e64279d1dad1cf",
-  "reviewed_at": "2026-10-30T18:32:50Z",
-  "summary": "Reviewed exact image publication intent in existing result_json, authoritative staged digest/size/deadline receipt under common per-job lock, local rehash/no build replay and fixed lease expiry, pending runtime hidden publicly, bulk wait within original deadline. Full Hub1287 passed7 skipped, focused220 passed, independent review clean, actual trusted-TLS delayed11s PUT passed. Native overlay/public Alpine437 build succeeded; CUDA11layer materialization succeeded but publication pending preserved and worker halted. Coordinated API-before-worker no-DDL rollout and GPU acceptance remain pending."
+  "source_sha256": "a1365e974d0e7a519fbaa4bf7a91b726d4f6c943bcb390ceef418484c7b002cb",
+  "reviewed_at": "2026-10-30T18:46:18Z",
+  "summary": "Reviewed publication receipt recovery unchanged from c60afe1 (full Hub1287 passed7 skipped, actual11s verifiedTLS smoke and independent review clean). Hosted macOS size-failure descendant test wrote oversize input before recording child PID; reordered fixture to establish descendant identity before triggering the intentional size error. Both real-child timeout/size cases passed locally. No runtime behavior or deadline relaxation. Coordinated publication rollout and actual GPU acceptance still pending."
 }
 ```
 <!-- architecture-review:end -->
