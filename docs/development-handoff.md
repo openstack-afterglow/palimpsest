@@ -26,6 +26,51 @@ files_modified:
 
 ## Available-GPU and API k3s precision-study resumption — 2026-10-30
 
+- **PAUSED by user, 2026-10-30 ~09:30UTC.** Resume from the private state file
+  `~/.local/share/palimpsest-proofs/gpu-cold-warm-20261030/resume-available-gpu-k3s-01/RESUME-STATE.md`
+  (not in git). Production is still `1afca684`; nothing from this candidate is
+  deployed. Owner selected `정상 정지·보존 후 새 scratch로 배포` for the existing
+  worker, but its private helpers were edited and **never executed or smoke-tested**;
+  no worker stop, scratch creation, package install or Kolla action has happened.
+  No GPU/k3s consumer VM was created, so there are no new cold/warm timings.
+
+- Final runtime follow-up **`57ab180c5429ced6fa477a883d1b9ba6645d72bf`** is pushed
+  to PR37; source guard **`99c52ed4825fc722b38c8d65826b19b95522729edcce4101faf7fdbd347ff814`**,
+  581files. Exact root8704passed/305skipped in472.87s; Hub1228passed/7skipped
+  in325.77s; five canonical images built/executed with matching runtime hashes,
+  final root/Hub distributions built and Python3.11.15 wheel imports passed.
+  Hosted Test41027257296 and PR-image41027257364 passed; only afterward SHA
+  publisher41028278198 succeeded. All three immutable published images were
+  pulled/executed with full57ab180revision and matching runtime source bytes.
+  Native KVM remains policy-skipped; no new GPU/cluster consumer was created.
+- **New actual rollout blocker,09:00UTC:** before any package install, service
+  stop, config replacement or Kolla reconfigure, the read-only worker preflight
+  failed its live identity fence. Separate exact-state/journal/log diagnosis found
+  existing container `cf7642d70ebc86f733d6cee966f0e5d200b52cf9be4416e012fd977763136bfc`
+  restarting773times, PID0/exit1, retaining a47-byte image `claim_pending` journal
+  SHA256 `3616650fae78c3a998e24e25040e3fa942dd80ba8f0480485b43e25b1e7bea78`
+  in `palimpsest_build_worker_scratch_1afca684_20261030_95b7f432`; noid/lease.
+  Logs report retained-state halt. This is persistent uncertainty, not a harmless
+  idle-poll transient. Cause of the first uncertain claim is unknown. Do not clear,
+  replay, bypass the guard or silently restart it on the same scratch.
+- The six controller services still run1afca684 with restart0. Current read-only
+  service-DB census has19tables,0actionable build/export/upload/delegation/instance/
+  image-job rows, no activeattempts and stale claim mutexes; limited SQL visibility
+  and empty job rows do not certify that an uncertain claim never had an effect.
+  Historical quarantine journal87837860… remains exact and unattached. Zero
+  production package/config/service/SQL/CAS mutations occurred in this follow-up;
+  only owned helper/receipt distribution and bounded read-only probes ran.
+- New resident exact-wheel environment is installed and payload-verified onMini:
+  client wheel `a9783f73c706d924dab4a397d5570d0bac699501cb4b2ba496af1b49ccf7e54f`,
+  actual Python3.12.13/openstacksdk4.22.0 (Hub image remains lockedSDK3.3.0).
+  Existing private release tools/uv was located after normalPATH absence, without
+  tool bootstrap. Shared ledger was created once with3spent/released80GiB rows,
+  240GiB cumulative/0live; no refund. Only original station-config mode0644→0600
+  was tightened; its hash/grant and station identity/schedule bytes are unchanged.
+  Actual resident install/ledger/station prerequisite checks passed without auth,
+  Internet sampling or workload calls. Live qualification is still blocked by
+  current-worker disposition and user-prepared worker-project scratch credential.
+
 - Reviewed candidate `ffcbb26c0ce9a1fb7fbf89297f2daa53abf9a4b3` was committed/pushed
   to the approved feature branch and [PR37](https://github.com/openstack-afterglow/palimpsest/pull/37).
   Hosted Test41015857634 and PR-image41015857469 passed; SHA publisher41016837151
@@ -5576,4 +5621,16 @@ Exact selectors and caveats: [testing](testing.md#host-vm-removal-across-state-r
 - **Integration gaps, not an instruction to add a second orchestrator:** inspected HubClient/CLI does not submit/poll Hub build jobs automatically; direct `cloud_cli` SDK/SSH paths remain different workflows. New experimental Nova/OCI modules are not automatically server APIs or deployed images. Afterglow catalog admission snapshots managed published artifacts and explicitly selects `transport="nfs"` at creation/execution; separate Cinder block code is not evidence this route consumes block layers. A Hub output digest/catalog asset does not itself establish a published managed environment or live artifact-to-consumer bridge. Required result is a connected API-owned build/artifact/consume/workload/lifecycle contract, with sanitized job diagnostics rather than assistant node access.
 - **Executed source audits on the Mini, not live API proofs:** `M/api-first-architecture-review-01/route-inventory.json` SHA256 `cce6a8e6cb0ec1fa3bcb473a258cbebf6f03d2f1bf1f3461cf0458c1cc0beeac` verified15 source files and mounted Hub decorators:54 route declarations in each selected generation, worker routes0(old)/5(release), runtime routes0 in those Hub routers. `consumer-route-inventory.json` SHA256 `6ec228acbebe390090fc77a68c305832cefec31abc698b9ca9f2c5c278354b70` verified five Afterglow files, actual mounted prefixes and NFS literals. These are bounded offline AST inventories, not FastAPI runtime, test-suite, dependency readiness or current API availability. No production auth/API call, infrastructure-node connection, service change, deployment, new resource or failed-job replay occurred.
 - **Corrected continuation:** use the reviewed service-release baseline; map unpublished feature deltas into existing API admission/durable job and resource ownership/worker/result contracts; deploy reviewed API and worker images through actual Kolla entrypoints; then use the Mini as an external original-user/project API client to prove build ID → exact output digest → supported consumer binding → workload readiness/output → API lifecycle/cleanup. A new research reference VM or direct-node route is not the next prerequisite. Existing n5 accounting/receipts remain immutable and separate. Final review receipt `M/api-first-architecture-review-01/architecture-reassessment.json` SHA256 `0640dbf51e306909201d46174315ae4b3c8dcfa4998e1cb09f70342a7eb4aa9c`. README, architecture overview, contributor workflow and benchmark scope now carry this boundary. This is a source/evidence reassessment, not new feature implementation, release, architecture stamp or deployment authorization.
+
+## Durable worker claim recovery and API cuDNN acceptance repair — 2026-10-30
+
+- Owner explicitly requested iterative repair of the actual Palimpsest services until the official API acquires a CUDA image and an OpenStack GPU consumer proves `nvidia-smi` plus actual cuDNN computation. This supersedes waiting for a journal-only option selection; unrelated cloud resources, IAM, broker and GPU-host mutations remain out of scope. Astra was unavailable; development and an independent source review were performed without claiming Astra approval.
+- Production correction: six controller services were actually updated to `57ab180` via canonical Kolla and verified; the new build worker `840b6043…` subsequently halted with a preserved recipe `claim_pending` journal. The earlier assertion that no claim reached the API was incorrect: a bounded log sample missed 44 HTTP204 image/recipe claims. The final API recipe response took12.9265s; its inferred start precedes the worker halt by approximately10s, matching the socket timeout. Exact request attribution and the underlying latency cause remain inference, not captured exception evidence.
+- The initial nonterminal/unexpired-lease census proved only no currently active attempt. A stronger whole-row comparison against the cold baseline found18of19tables identical, including all six build rows and empty image-job/context tables; only two claim-mutex rows differed. The non-mutex project lease matched exactly. This is observed data stability, not a global SQL fence or a license to erase an uncertain journal.
+- Actual new retirement: encrypted/decrypt-verified current configuration, container inspection, bounded logs and all three legacy journals; disabled restart and ordinarily stopped exactly `840b6043…` using Docker29.1.3 `stop --timeout=-1` (no SIGKILL deadline). Result PID0/not-running/exit1; no clean-exit claim. All journals remained byte-identical. Created only an empty root-owned0700 `claim-cursor-20261030-02` subdirectory in the same Docker volume; no new Cinder/Docker volume or journal deletion. Evidence: private `repair-current-worker-retired-and-fresh-root.json` under the existing GPU campaign proof root.
+- Source fix: durable worker channel/sequence in the existing journal with an idle checkpoint; additive `palimpsest_worker_claims` cursor per channel/protocol under the original selection SQL mutex. Authenticated GET recovery is explicitly a mutating settlement: it fences unseen delayed POSTs or returns exact assigned identity. No blind claim POST retry; recovered jobs retain exact-lease fail/status and no-reexecution semantics. Legacy unidentified pending journals remain fail-closed. The10-second socket timeout is unchanged; an earlier30-second handoff claim was superseded.
+- Parent verification: affected seven Hub modules251passed/2skipped; complete Hub suite1266passed/7skipped in309.30s on Python3.13.12; full Hub Ruff and67-file formatting check passed. Standalone real loopback HTTP smoke exercised unseen-request fencing, deliberately lost POST response settlement, stale409 and bounded single cursor with zero cloud requests. Independent `ReviewClaimSafety` read the complete changed source and found no concrete blocker; real database commit-loss and production qualification were not exercised by that review. Client canonical build/install/tool smoke passed on Python3.11.15; Hub wheel/sdist build passed. Local artifacts retain version0.3.10 but are private candidate bytes, not official PyPI0.3.10.
+- CUDA acceptance preparation: pinned CUDA12.2.2/cuDNN8 runtime and GCC11 compiler, server-side multistage Dockerfile plus native C probe. Planned proof calls actual `cudnnConvolutionForward`, synchronizes CUDA, copies nine distinct outputs back and checks checksum5724/max error0 and the CUDA/NVIDIA PCI identity. Source review and C syntax check are not GPU proof. Independent runner review fixed an exact-owned NovaERROR/no-boot cleanup gap. Actual resident CLI smoke exposed a missing `resident_driver` import; exact fixed-path loading corrected it and `--help` returned0. No CUDA image job or GPU consumer has run at this checkpoint.
+- Read-only deployment inspection found API output bounds100GiB on all three controllers versus worker4GiB, which rejects image claims before execution. Planned repair preserves the global API contract, matches worker logical maximum100GiB and bounds each image operation by24GiB physical scratch (6GiB packed output/18GiB ext4) on the existing root with approximately31.7GB free. Actual image fit/compression deadlines remain unproven; this is not a whole-worker/recipe quota. The previously requested80GiB Cinder credential is absent but is not a prerequisite for this selected bounded path.
+- Next: publish reviewed branch-only repair artifacts, explicit additive-schema bootstrap after a new paired SQL/CAS backup and isolated official-bootstrap proof, canonical controller then worker rollout, actual identity/settings/data preservation and advancing idle cursors. Then run one official-API CUDA/cuDNN GPU acceptance on the resident Mini, preserving cumulative campaign spend and exact API cleanup. No protected merge, formal release, production DDL/new repaired deployment or GPU/cuDNN success is claimed by this checkpoint.
 

@@ -94,6 +94,8 @@ class Transport:
         self.events.append((method, path))
         assert self.responses, f"unexpected request: {method} {path}"
         response = self.responses.pop(0)
+        if callable(response):
+            response = response()
         if isinstance(response, Exception):
             raise response
         try:
@@ -429,15 +431,18 @@ def test_happy_path_pins_download_upload_and_cleans_before_next_claim(harness):
 
 @pytest.mark.parametrize("response", [OSError("lost claim"), Response(500), Response(202, b"broken json")])
 def test_uncertain_claim_never_reclaims_even_after_restart(harness, response):
-    instance, transport = harness.make([response])
+    instance, transport = harness.make([response, Response(503)])
     with pytest.raises(worker.WorkerHalted):
         instance.process_one()
-    restarted, restarted_transport = harness.make([])
+    pending = harness.journal.load()
+    restarted, restarted_transport = harness.make([Response(503)])
     with pytest.raises(worker.WorkerHalted, match="claim outcome uncertain"):
         restarted.process_one()
-    assert len(transport.calls) == 1
-    assert restarted_transport.calls == []
-    assert harness.journal.load() == {"phase": "claim_pending", "protocol": "recipe"}
+    assert [call[0] for call in transport.calls] == ["POST", "GET"]
+    assert [call[0] for call in restarted_transport.calls] == ["GET"]
+    assert pending["phase"] == "claim_pending" and pending["protocol"] == "recipe"
+    assert worker._uuid(pending["channel"]) and pending["sequence"] == 2
+    assert harness.journal.load() == pending
 
 
 @pytest.mark.parametrize("response", [OSError("lost output"), Response(500), Response(200, b"broken json")])
@@ -1155,11 +1160,13 @@ def test_unsupported_memory_fence_is_fail_closed_without_loading_libc(monkeypatc
 def test_unidentified_claim_stays_uncertain_without_any_failure_request(harness, field, value):
     descriptor = claim()
     descriptor[field] = value
-    instance, transport = harness.make([Response(202, descriptor)])
+    instance, transport = harness.make([Response(202, descriptor), Response(503)])
     with pytest.raises(worker.WorkerHalted, match="claim outcome uncertain"):
         instance.process_one()
-    assert [call[0] for call in transport.calls] == ["POST"]
-    assert harness.journal.load() == {"phase": "claim_pending", "protocol": "recipe"}
+    assert [call[0] for call in transport.calls] == ["POST", "GET"]
+    pending = harness.journal.load()
+    assert pending["phase"] == "claim_pending" and pending["protocol"] == "recipe"
+    assert worker._uuid(pending["channel"]) and pending["sequence"] == 2
     assert not harness.manifests
 
 
@@ -1204,7 +1211,144 @@ def test_oversize_actual_utf8_recipe_fails_durable_identity_without_poisoning_wo
     monkeypatch.setattr(instance, "_fail", fail)
     assert instance.process_one()
     assert not instance.process_one()
-    assert identities == [{"phase": "claimed", "protocol": "recipe", "id": BUILD_ID, "lease": LEASE}]
+    assert len(identities) == 1
+    assert {key: identities[0][key] for key in ("phase", "protocol", "id", "lease")} == {
+        "phase": "claimed",
+        "protocol": "recipe",
+        "id": BUILD_ID,
+        "lease": LEASE,
+    }
+    assert worker._uuid(identities[0]["channel"]) and identities[0]["sequence"] == 2
     assert [call[0] for call in transport.calls] == ["POST", "POST", "GET", "POST"]
     assert json.loads(transport.calls[1][3]) == {"error_code": "build_failed"}
     assert not harness.manifests and harness.journal.load() is None
+
+
+def claim_settlement(journal, identity=None):
+    pending = journal.load()
+    return {**{key: pending[key] for key in ("channel", "sequence", "protocol")}, "claim": identity}
+
+
+def test_lost_idle_response_settles_by_get_then_uses_next_sequence(harness):
+    instance, transport = harness.make(
+        [
+            OSError("lost idle response"),
+            lambda: Response(200, claim_settlement(harness.journal)),
+            Response(204),
+        ]
+    )
+    assert instance.process_one()
+    assert harness.journal.load() is None
+    first = dict(harness.journal.cursor)
+    assert not instance.process_one()
+    assert [call[0] for call in transport.calls] == ["POST", "GET", "POST"]
+    assert transport.calls[0][4] == transport.calls[1][4]
+    assert harness.journal.cursor == {"channel": first["channel"], "sequence": first["sequence"] + 2}
+    assert not harness.manifests
+
+
+def test_lost_claimed_response_recovers_exact_lease_but_never_executes(harness):
+    identity = {"id": BUILD_ID, "lease": LEASE}
+    instance, transport = harness.make(
+        [
+            OSError("lost accepted response"),
+            lambda: Response(200, claim_settlement(harness.journal, identity)),
+            Response(200, terminal()),
+            Response(200, terminal()),
+        ]
+    )
+    assert instance.process_one()
+    assert [call[0] for call in transport.calls] == ["POST", "GET", "POST", "GET"]
+    assert transport.calls[2][:3] == ("POST", f"/v1/build-worker/builds/{BUILD_ID}/fail", LEASE)
+    assert harness.journal.load() is None and not harness.manifests
+
+
+@pytest.mark.parametrize("identity", [None, {"id": BUILD_ID, "lease": LEASE}])
+def test_restart_recovers_claim_outcome_before_any_new_claim(harness, identity):
+    pending = harness.journal.begin_claim("recipe")
+    responses = [Response(200, {**{k: pending[k] for k in ("channel", "sequence", "protocol")}, "claim": identity})]
+    if identity:
+        responses += [Response(200, terminal()), Response(200, terminal())]
+    instance, transport = harness.make(responses)
+    instance.reconcile()
+    assert transport.calls[0][0] == "GET"
+    assert not any(call[0] == "POST" and call[1].endswith("/claim") for call in transport.calls)
+    assert not harness.manifests and harness.journal.load() is None
+
+
+@pytest.mark.parametrize("change", ["channel", "sequence", "protocol", "missing", "invalid_lease"])
+def test_recovery_requires_exact_typed_outcome_and_binding(harness, change):
+    pending = harness.journal.begin_claim("recipe")
+    result = claim_settlement(harness.journal)
+    if change == "missing":
+        result.pop("claim")
+    elif change == "invalid_lease":
+        result["claim"] = {"id": BUILD_ID, "lease": "invalid"}
+    else:
+        result[change] = "mismatch"
+    instance, transport = harness.make([Response(200, result)])
+    with pytest.raises(worker.WorkerHalted, match="claim outcome uncertain"):
+        instance.reconcile()
+    assert harness.journal.load() == pending
+    assert [call[0] for call in transport.calls] == ["GET"] and not harness.manifests
+
+
+def test_idle_cursor_survives_real_journal_reopen_and_protocol_switch(tmp_path):
+    root = tmp_path / "scratch"
+    journal = worker.Journal(root)
+    first = journal.begin_claim("image")
+    journal.clear()
+    journal.close()
+    reopened = worker.Journal(root)
+    try:
+        assert reopened.load() is None
+        second = reopened.begin_claim("recipe")
+        assert second["channel"] == first["channel"] and second["sequence"] == first["sequence"] + 1
+        reopened.clear()
+        third = reopened.begin_claim("image")
+        assert third["channel"] == first["channel"] and third["sequence"] == first["sequence"] + 2
+    finally:
+        reopened.close()
+
+
+@pytest.mark.parametrize("sequence", [True, 0, -1, 2**63, "1"])
+def test_invalid_durable_claim_sequence_is_fail_closed(harness, sequence):
+    harness.journal.save({"phase": "claim_pending", "protocol": "recipe", "channel": BUILD_ID, "sequence": sequence})
+    instance, transport = harness.make([])
+    with pytest.raises(worker.WorkerHalted, match="invalid worker journal"):
+        instance.reconcile()
+    assert not transport.calls
+
+
+def test_claim_diagnostic_never_logs_exception_payload(harness, caplog):
+    instance, _ = harness.make([OSError("credential-like-value-must-not-log"), Response(503)])
+    with pytest.raises(worker.WorkerHalted):
+        instance.process_one()
+    assert "credential-like-value-must-not-log" not in caplog.text
+    assert "protocol=recipe" in caplog.text and "sequence=2" in caplog.text and "cause=OSError" in caplog.text
+
+
+def test_failed_recovery_logs_exact_identity_and_safe_underlying_category(harness, caplog):
+    pending = harness.journal.begin_claim("recipe")
+    instance, transport = harness.make([OSError("private-recovery-payload")])
+    with pytest.raises(worker.WorkerHalted):
+        instance.reconcile()
+    assert "private-recovery-payload" not in caplog.text
+    assert "settlement unavailable protocol=recipe" in caplog.text
+    assert f"channel={pending['channel']} sequence={pending['sequence']} cause=OSError" in caplog.text
+    assert [call[0] for call in transport.calls] == ["GET"] and harness.journal.load() == pending
+
+
+def test_run_logs_cause_category_without_exception_contents(monkeypatch, caplog):
+    async def interrupted():
+        try:
+            raise OSError("private-transport-payload")
+        except OSError as exc:
+            raise worker.WorkerHalted("private-worker-message") from exc
+
+    monkeypatch.setattr(worker, "main", interrupted)
+    with pytest.raises(SystemExit) as exit_info:
+        worker.run()
+    assert exit_info.value.code == 1
+    assert "cause=OSError" in caplog.text
+    assert "private-transport-payload" not in caplog.text and "private-worker-message" not in caplog.text

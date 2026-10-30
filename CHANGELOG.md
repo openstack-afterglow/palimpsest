@@ -18,6 +18,7 @@ All notable changes to Palimpsest Local are documented here.
 
 ### Fixed
 
+- Settle lost worker claim responses through a durable channel/sequence cursor under the job-selection SQL mutex. Fence delayed original requests, retain exact-lease no-reexecution semantics, preserve legacy unidentified journals, and require explicit additive-schema bootstrap before coordinated API/worker cutover.
 - Recheck expiry immediately after durable submission writes and after context hashing, before external effects. Bound slow/trickling dependency downloads by an owned-process absolute deadline, and release only definite no-call live occupancy without refunding cumulative reservations.
 - Bind CUDA compilation to the validated device capability and reject execution mismatches using the kernel-written `__CUDA_ARCH__`, not echoed host compiler defines. Enforce cluster source expiry/pinned qualification, identity-safe child cleanup, streaming output limits, atomic simultaneous capacity and per-pair deadlines.
 - Validate private flavor eligibility through the original caller's default available-flavor listing instead of requiring administrative whole-tenant ACL enumeration. Keep exact GPU profile/PCI/content checks and a fresh visibility fence before allocation.

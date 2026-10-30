@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from sqlalchemy import select
 
-from palimpsest_hub.api.builds import require_build_lease, require_build_worker
+from palimpsest_hub.api.builds import require_build_lease, require_build_worker, require_claim_identity
 from palimpsest_hub.api.hub import _factory_or_503, _legacy_inventory, _legacy_writer
 from palimpsest_hub.auth import package_target_project_id
 from palimpsest_hub.config import get_settings
@@ -226,9 +226,16 @@ async def get_job(job_id: UUID, token_info: dict = Depends(_legacy_inventory)):
 @router.post(
     "/image-worker/claim", status_code=202, dependencies=[Depends(require_build_worker)], operation_id="claim_image_job"
 )
-async def claim():
-    result = await service.claim()
+async def claim(identity: tuple[str, int] = Depends(require_claim_identity)):
+    result = await service.claim(*identity)
     return result if result is not None else Response(status_code=204)
+
+
+@router.get("/image-worker/claim", operation_id="recover_image_job_claim")
+async def recover_claim(response: Response, identity: tuple[str, int] = Depends(require_claim_identity)):
+    """Settle this sequence, fencing an unseen POST; this is NOT a read-only probe."""
+    response.headers["Cache-Control"] = "no-store"
+    return await service.claim(*identity, recover=True)
 
 
 @router.get("/image-worker/jobs/{job_id}", operation_id="image_worker_job_status")

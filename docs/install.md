@@ -771,12 +771,23 @@ stopping the Hub API to avoid an uncertain claim.
 
 Keep scratch private and persistent across restarts. Its `worker.lock` flock
 and `worker.json` journal are recovery authority; do not remove either merely
-to unblock polling. Operator disposition depends on the recorded phase:
+to unblock polling. The current source retains an `idle` checkpoint containing
+the worker's private channel and monotonic claim sequence; an idle journal is
+not an uncertain job and must not be deleted to reset that sequence. Operator
+disposition and automatic settlement depend on the recorded phase:
 
-- `claim_pending`: a lost claim response means the API may have assigned a
-  lease the worker never learned. The worker halts permanently for operator
-  disposition; inspect server state/deadline and retained journal without
-  replaying the claim or deleting uncertainty. Expiry is terminal, not requeue.
+- Identified `claim_pending`: the API durably binds the channel, protocol and
+  sequence to an empty outcome or an exact job/lease under the claim SQL mutex.
+  Authenticated claim recovery settles that identity; it never blindly retries
+  the original claim POST. Recovery also fences an unseen request so a delayed
+  original POST cannot assign a new job afterward. This recovery endpoint can
+  write the claim cursor and is **not a read-only diagnostic**. A recovered job
+  retains the no-reexecution rule and is settled through its exact lease.
+- Legacy `claim_pending` without durable request identity remains fail-closed:
+  preserve its journal and establish an explicitly authorized disposition.
+  Counts of current nonterminal rows or unexpired leases alone cannot prove
+  that no claim occurred; compare attempt/lease/status fields against the
+  pre-worker baseline. Never clear a journal merely to resume polling.
 - `claimed` / `executing`: restart never re-executes a recorded job. Preserve
   the tree while the cleanup helper verifies exact process groups and loops;
   a parent-death fence and `builder.pid` / `helper-UUID.pid` records bind
@@ -792,9 +803,12 @@ to unblock polling. Operator disposition depends on the recorded phase:
   journal and inspect exact owned processes/mounts/loops; never detach unknown
   loops, kill PID-only matches or erase the tree to manufacture recovery.
 
-These recovery contracts are source-reviewed; the 0.3.5 production receipt
-records `claim_pending` disposition and resumed idle polling, not native build
-or recipe execution/restart/cleanup qualification.
+The identified-claim protocol requires the additive `palimpsest_worker_claims`
+table and coordinated API/worker deployment. Bootstrap it only through an
+explicit reviewed deployment after paired SQL/CAS backup and isolated restore;
+preserve existing tables and legacy journals. Historical 0.3.5 recovery used
+operator disposition, not this protocol, and is not current live qualification.
+Record current-source tests, deployment and native workload proof separately.
 
 ### Hub API and worker logs
 

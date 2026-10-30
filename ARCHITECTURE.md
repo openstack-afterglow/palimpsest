@@ -1,5 +1,35 @@
 # Palimpsest Architecture
 
+## Durable HTTP-worker claim settlement — 2026-10-30
+
+The production worker exposed a correctness/availability boundary: a claim can
+commit after the client loses its response. A larger socket timeout alone cannot
+establish whether a job was assigned. The repaired protocol binds each claim to
+a private durable worker channel and monotonically increasing sequence. The API
+stores one latest receipt per channel/protocol in the additive
+`palimpsest_worker_claims` table under the same SQL mutex as job selection.
+Authoritative recovery settles an unseen request as empty before a delayed POST
+can claim anything; an already committed assignment returns its exact identity.
+Recovery is a state-changing fence, not a read-only diagnostic. Claims are not
+blindly retransmitted, and recovered assignments retain the existing no-reexecution
+rule. Legacy unidentified pending journals remain fail-closed and preserved.
+
+The worker retains channel/sequence in a durable idle checkpoint rather than
+unlinking all identity after each poll. A repair deployment must bootstrap the
+additive table explicitly before starting the new worker, preserve every existing
+table and CAS object, and leave old journals intact in their original locations.
+Source/test verification, canonical deployment, and real workload acceptance are
+separate evidence; none is implied by this design record.
+
+The owner's current acceptance target is official API acquisition of a pinned
+CUDA/cuDNN image and execution in an OpenStack GPU instance: `nvidia-smi`, matching
+CUDA device identity, and synchronized `cudnnConvolutionForward` output checked
+against an independent numerical oracle. Library presence or CPU execution is
+not cuDNN GPU proof. The existing worker's physical scratch quota and its logical
+claim-output limit are distinct; the latter must admit the API's declared bound
+without lowering the API's global upload contract. Guest-side image acquisition,
+build orchestration, and manual provisioning are not substitutes for this path.
+
 ## Bounded available-GPU and fixed API cluster candidate — 2026-10-30
 
 The resumed study prioritizes intended framework behavior and explainable phase
@@ -1227,6 +1257,17 @@ uv run python scripts/test_lanes.py run gate2
 
 ## Maintenance
 
+2026-10-30 service-repair review: inspected durable worker journal transitions,
+both authenticated claim routers, SQL-mutex ownership/commit boundaries,
+bounded channel/protocol receipts and additive offline migration. Keep the
+existing 10-second socket timeout; recovery, not a longer timeout or blind POST
+retry, resolves lost claim responses. A recovered assignment is never executed
+after uncertainty. Legacy journals remain preserved and require disposition.
+Real loopback HTTP smoke established unseen-request fencing, response-loss
+settlement and stale-sequence rejection with one bounded cursor. Source tests,
+production additive-schema cutover and CUDA/cuDNN acceptance remain distinct
+checks, with actual results recorded in the handoff rather than implied here.
+
 2026-10-30 post-publication precision review: requested compiler macros were not
 evidence of the architecture actually compiled into a launched kernel. CUDA now
 writes device `__CUDA_ARCH__` into one trailing element of its existing output
@@ -1253,7 +1294,7 @@ the private Ada flavor and its extra specs were readable, but whole-tenant
 private ID in the original connection's explicitly `is_public=True` list (Nova
 public-or-project grants), without admin credentials. SDK3.3 omission requests
 all flavors, so implicit defaults are not eligibility proof. Unknown visibility,
-IDs and provider-read failures remain closed at both admission/effect fences;
+missing/revoked IDs and provider-read failures remain closed at both admission/effect fences;
 GPU project/content/PCI qualification is unchanged. Corrected real CPU/GPU reads
 passed with zero creates; this is not scheduling or NVIDIA execution proof.
 
@@ -1912,9 +1953,9 @@ provider provisioning. Fresh multi-instance evidence is recorded separately.
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "99c52ed4825fc722b38c8d65826b19b95522729edcce4101faf7fdbd347ff814",
-  "reviewed_at": "2026-10-30T08:28:00Z",
-  "summary": "Reviewed final GPU/k3s corrections: kernel-written CUDA architecture evidence, actual pinned kubectl multicall routing, original-scoped private flavor eligibility with explicit is_public=True against SDK3.3 all-flavors default. Independent review clean; real zero-create CPU/GPU metadata smoke passed, private-visible/admin-ungranted/revoked boundary cases pass. Root workload bytes retain8704/305 full proof, latest exact Hub/image/package gates recorded separately. Private ordinary-TERM init and bounded live idle-journal helpers reviewed/smoked separately, no production or live GPU/cluster qualification claimed."
+  "source_sha256": "008d0a643939180c669e111e6656310ae8b08d222d941a3ece322462c377b109",
+  "reviewed_at": "2026-10-30T13:10:06Z",
+  "summary": "Reviewed durable HTTP-worker claim channel/sequence journal and bounded SQL receipt under the selection mutex; recovery fences delayed POSTs and settles exact assigned leases without reexecution, legacy uncertainty preserved, additive bootstrap/migration required. Full Hub1266 passed7 skipped, focused251 passed2 skipped, real loopback lost-response/fencing smoke and independent claim review clean. Canonical candidate packages smoke passed; repaired production rollout and GPU cuDNN proof remain pending."
 }
 ```
 <!-- architecture-review:end -->

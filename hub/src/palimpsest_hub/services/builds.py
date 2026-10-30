@@ -33,6 +33,7 @@ from palimpsest_hub.api.hub import (
 )
 from palimpsest_hub.config import get_settings
 from palimpsest_hub.models import PalimpsestHubBuild, PalimpsestHubLayer
+from palimpsest_hub.services import claim_recovery
 from palimpsest_hub.services.digest import compute_config_digest
 from palimpsest_hub.services.hub_store import MEDIA_TYPE_LAYER_SQUASHFS, HubStoreError
 from palimpsest_hub.services.worker_leases import sql_mutex
@@ -139,9 +140,13 @@ async def _inputs(session, store, job: PalimpsestHubBuild) -> list[PalimpsestHub
     return rows
 
 
-async def claim_build() -> dict | None:
+async def claim_build(channel: str, sequence: int, *, recover: bool = False) -> dict | None:
     store = _store_or_503()
     async with _global_lock(store) as session:
+        cursor, settled = await claim_recovery.prepare(session, "recipe", channel, sequence)
+        if recover or settled:
+            await session.commit()
+            return claim_recovery.settlement(cursor) if recover else cursor.result_json
         active = (
             await session.scalars(
                 select(PalimpsestHubBuild).where(PalimpsestHubBuild.status == "building").with_for_update()
@@ -199,6 +204,7 @@ async def claim_build() -> dict | None:
                 ],
                 "max_output_bytes": get_settings().palimpsest_hub_max_blob_bytes,
             }
+            cursor.result_json = result
             await session.commit()
             return result
         await session.commit()

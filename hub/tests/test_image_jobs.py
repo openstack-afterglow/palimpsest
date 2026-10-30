@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
 import tarfile
@@ -110,8 +111,16 @@ async def enqueue(h, *, request_id=None, headers=None, **values):
     )
 
 
+def claim_headers(channel=None, sequence=1):
+    return {
+        **WORKER,
+        "X-Palimpsest-Worker-Channel": channel or str(uuid4()),
+        "X-Palimpsest-Claim-Sequence": str(sequence),
+    }
+
+
 async def claim(h):
-    response = await h.client.post("/v1/image-worker/claim", headers=WORKER)
+    response = await h.client.post("/v1/image-worker/claim", headers=claim_headers())
     assert response.status_code == 202, response.text
     value = response.json()
     return value, {**WORKER, "X-Palimpsest-Build-Lease": value["lease"]}
@@ -167,7 +176,7 @@ async def test_authority_request_binding_visibility_and_sanitization(images):
     job, headers = await claim(h)
     assert job["request"]["reference"] == "docker.io/library/alpine:3"
     assert job["context"] is None and job["timeout_seconds"] <= 60
-    assert (await h.client.post("/v1/image-worker/claim", headers=WORKER)).status_code == 204
+    assert (await h.client.post("/v1/image-worker/claim", headers=claim_headers())).status_code == 204
     assert (await h.client.get(path(job), headers={**WORKER, "X-Palimpsest-Build-Lease": "wrong"})).status_code == 409
 
 
@@ -307,7 +316,7 @@ async def test_expired_attempt_never_replays_and_terminal_fail_is_immutable(imag
     assert (await stage(h, job, headers, b"hsqs-expired")).status_code == 409
     status = await h.client.get(path(job), headers=headers)
     assert status.json()["status"] == "error" and status.json()["error_code"] == "worker_interrupted"
-    assert (await h.client.post("/v1/image-worker/claim", headers=WORKER)).status_code == 204
+    assert (await h.client.post("/v1/image-worker/claim", headers=claim_headers())).status_code == 204
     assert (await h.client.post(path(job) + "/fail", json={"error_code": "build_failed"}, headers=headers)).json()[
         "error_code"
     ] == "worker_interrupted"
@@ -505,4 +514,83 @@ async def test_deadline_during_completion_rolls_back_partial_registrations(image
         assert (await session.scalars(select(PalimpsestHubLayer))).all() == []
     status = await h.client.get(path(job), headers=headers)
     assert status.json()["status"] == "error" and status.json()["output_digests"] == []
-    assert (await h.client.post("/v1/image-worker/claim", headers=WORKER)).status_code == 204
+    assert (await h.client.post("/v1/image-worker/claim", headers=claim_headers())).status_code == 204
+
+
+@pytest.mark.asyncio
+async def test_image_lost_claim_responses_and_delayed_post_are_authoritatively_settled(images):
+    h = images
+    channel = str(uuid4())
+    idle = claim_headers(channel)
+    assert (await h.client.post("/v1/image-worker/claim", headers=idle)).status_code == 204
+    queued = await enqueue(h)
+    recovery = await h.client.get("/v1/image-worker/claim", headers=idle)
+    assert recovery.status_code == 200 and recovery.headers["Cache-Control"] == "no-store"
+    assert recovery.json() == {"channel": channel, "protocol": "image", "sequence": 1, "claim": None}
+    assert (await h.client.post("/v1/image-worker/claim", headers=idle)).status_code == 204
+    fenced = claim_headers(channel, 2)
+    assert (await h.client.get("/v1/image-worker/claim", headers=fenced)).json()["claim"] is None
+    assert (await h.client.post("/v1/image-worker/claim", headers=fenced)).status_code == 204
+    next_headers = claim_headers(channel, 3)
+    accepted = await h.client.post("/v1/image-worker/claim", headers=next_headers)
+    job = accepted.json()
+    assert accepted.status_code == 202 and job["id"] == queued.json()["id"]
+    recovery = await h.client.get("/v1/image-worker/claim", headers=next_headers)
+    assert recovery.json()["claim"] == {"id": job["id"], "lease": job["lease"]}
+    assert (await h.client.post("/v1/image-worker/claim", headers=next_headers)).json() == job
+    h.settings.palimpsest_hub_build_timeout_seconds = 3600
+    async with h.factory() as session, session.begin():
+        row = await session.get(PalimpsestHubImageJob, job["id"])
+        row.lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+    recovered = await h.client.get("/v1/image-worker/claim", headers=next_headers)
+    assert recovered.json()["claim"]["lease"] == job["lease"]
+    status = await h.client.get(path(job), headers={**WORKER, "X-Palimpsest-Build-Lease": job["lease"]})
+    assert status.json()["error_code"] == "worker_interrupted"
+    for sequence in range(4, 9):
+        assert (
+            await h.client.post("/v1/image-worker/claim", headers=claim_headers(channel, sequence))
+        ).status_code == 204
+    from palimpsest_hub.models import PalimpsestWorkerClaim
+
+    async with h.factory() as session:
+        cursors = (await session.scalars(select(PalimpsestWorkerClaim))).all()
+        assert len(cursors) == 1 and cursors[0].sequence == 8 and cursors[0].result_json is None
+    assert (await h.client.post("/v1/image-worker/claim", headers=next_headers)).status_code == 409
+    assert (await h.client.post("/v1/image-worker/claim", headers=claim_headers())).status_code == 204
+
+
+@pytest.mark.asyncio
+async def test_recovery_waits_for_inflight_image_claim_transaction(images, monkeypatch):
+    h = images
+    await enqueue(h)
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = service.context_for
+
+    async def delayed(session, job):
+        entered.set()
+        await release.wait()
+        return await original(session, job)
+
+    monkeypatch.setattr(service, "context_for", delayed)
+    headers = claim_headers()
+    posting = asyncio.create_task(h.client.post("/v1/image-worker/claim", headers=headers))
+    recovering = None
+    try:
+        await asyncio.wait_for(entered.wait(), 3)
+        recovering = asyncio.create_task(h.client.get("/v1/image-worker/claim", headers=headers))
+        await asyncio.sleep(0.05)
+        assert not recovering.done()
+        release.set()
+        accepted, recovered = await asyncio.gather(posting, recovering)
+        assert accepted.status_code == 202 and recovered.status_code == 200
+        assert recovered.json()["claim"] == {key: accepted.json()[key] for key in ("id", "lease")}
+    finally:
+        release.set()
+        await asyncio.gather(posting, *([recovering] if recovering else []), return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_image_claim_recovery_requires_worker_key_and_identity(images):
+    for method in (images.client.get, images.client.post):
+        assert (await method("/v1/image-worker/claim", headers=HUMAN)).status_code == 401
+        assert (await method("/v1/image-worker/claim", headers=WORKER)).status_code == 422

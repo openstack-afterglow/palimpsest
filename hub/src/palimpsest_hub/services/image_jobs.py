@@ -39,6 +39,7 @@ from palimpsest_hub.auth import (
 from palimpsest_hub.config import get_settings
 from palimpsest_hub.image_models import PalimpsestHubBuildContext, PalimpsestHubImageJob
 from palimpsest_hub.models import PalimpsestHubLayer, exact_identity
+from palimpsest_hub.services import claim_recovery
 from palimpsest_hub.services.blob_references import retain_blob
 from palimpsest_hub.services.digest import compute_config_digest
 from palimpsest_hub.services.hub_store import MEDIA_TYPE_LAYER_SQUASHFS, HubStoreError
@@ -411,9 +412,13 @@ async def context_for(session, job):
     return {"digest": context.digest, "size_bytes": context.size_bytes}
 
 
-async def claim():
+async def claim(channel: str, sequence: int, *, recover: bool = False):
     settings = get_settings()
     async with locked_jobs() as session:
+        cursor, settled = await claim_recovery.prepare(session, "image", channel, sequence)
+        if recover or settled:
+            await session.commit()
+            return claim_recovery.settlement(cursor) if recover else cursor.result_json
         active = (
             await session.scalars(
                 select(PalimpsestHubImageJob).where(PalimpsestHubImageJob.status == "building").with_for_update()
@@ -463,6 +468,7 @@ async def claim():
                 "timeout_seconds": max(1, math.ceil((deadline(job) - now()).total_seconds())),
                 "max_output_bytes": settings.palimpsest_hub_max_blob_bytes,
             }
+            cursor.result_json = result
             await session.commit()
             return result
         await session.commit()

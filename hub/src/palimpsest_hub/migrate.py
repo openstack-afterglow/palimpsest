@@ -19,6 +19,7 @@ _TABLES = (
     "palimpsest_image_exports",
     "palimpsest_image_export_delegations",
     "palimpsest_hub_builds",
+    "palimpsest_worker_claims",
     "palimpsest_hub_build_contexts",
     "palimpsest_hub_image_jobs",
     "palimpsest_hub_instances",
@@ -75,6 +76,7 @@ async def migrate(source_url: str, destination_url: str, *, dry_run: bool = Fals
                     if table_name not in {
                         "palimpsest_hub_layer_access",
                         "palimpsest_hub_builds",
+                        "palimpsest_worker_claims",
                         "palimpsest_image_export_delegations",
                         "palimpsest_hub_build_contexts",
                         "palimpsest_hub_image_jobs",

@@ -117,12 +117,12 @@ def _ownership_process(url, root, lock_path, mode, channel, gate):
             if gate is not None:
                 await asyncio.to_thread(gate.wait)
             if mode == "claim":
-                claim = await builds.claim_build()
+                claim = await builds.claim_build(str(uuid4()), 1)
                 channel.send({"claim": claim["id"] if claim else None, "lease": claim["lease"] if claim else None})
             elif mode == "build":
                 from starlette.requests import Request
 
-                claim = await builds.claim_build()
+                claim = await builds.claim_build(str(uuid4()), 1)
                 assert claim is not None
                 tree = Path(root) / "private-worker" / claim["id"]
                 tree.mkdir(parents=True)

@@ -184,6 +184,21 @@ class PalimpsestHubBuild(Base):
     __table_args__ = (Index("idx_palimpsest_builds_project_created", "project_id", "created_at"),)
 
 
+class PalimpsestWorkerClaim(Base):
+    """Bounded response receipt per private worker channel and claim protocol.
+
+    The sequence is never reset within a channel. An empty receipt also fences
+    a delayed POST after recovery; rows must not be pruned while a channel lives.
+    """
+
+    __tablename__ = "palimpsest_worker_claims"
+
+    channel: Mapped[str] = mapped_column(CHAR(36), primary_key=True)
+    protocol: Mapped[str] = mapped_column(VARCHAR(8), primary_key=True)
+    sequence: Mapped[int] = mapped_column(BIGINT, nullable=False)
+    result_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+
 class PalimpsestWorkerLease(Base):
     """Shared maintenance roles and reserved API mutexes; tokens are not credentials."""
 

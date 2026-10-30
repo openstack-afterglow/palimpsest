@@ -1,10 +1,10 @@
 """HTTPS-only, single-execution Hub worker.
 
-The private local journal is a write-ahead fence, not a retry queue. A lost
-claim response permanently stops claiming until an operator establishes its
-safe disposition. Lost output/failure responses are settled only by status
-reads. Restart never executes a recorded job again. Executor cleanup must
-succeed before uploading, deleting a job tree, or claiming another job.
+The private local journal is a write-ahead fence, not a retry queue. Identified
+claim loss is settled by an authenticated SQL-fenced GET, never another POST.
+Legacy unidentified claim loss requires operator disposition. Lost output/failure
+responses are settled only by status reads. Restart never executes a recorded job
+again. Executor cleanup must succeed before disposal or another claim.
 
 Configuration comes from BuildWorkerSettings; only the key *path* is configured.
 The executor CLI owns Linux/tool/mount preflight and exact resource cleanup.
@@ -63,6 +63,22 @@ class BuildFailed(RuntimeError):
 
 class BuildTimeout(BuildFailed):
     pass
+
+
+def _safe_error_class(exc: Exception) -> str:
+    # Fixed labels only: even a custom exception class name is untrusted data.
+    for kind in (
+        BuildTimeout,
+        TimeoutError,
+        ssl.SSLError,
+        http.client.HTTPException,
+        OSError,
+        WorkerHalted,
+        ValueError,
+    ):
+        if isinstance(exc, kind):
+            return kind.__name__
+    return "Exception"
 
 
 def _seal_worker_memory() -> None:
@@ -313,6 +329,7 @@ class Journal:
             raise WorkerHalted("worker scratch must be an owner-only directory")
         self.root = root
         self.path = root / "worker.json"
+        self.cursor = None
         self.lock_fd = _open_private(root / "worker.lock", os.O_CREAT | os.O_RDWR)
         try:
             fcntl.flock(self.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -337,6 +354,7 @@ class Journal:
         try:
             value = json.loads(raw)
             if not isinstance(value, dict) or value.get("phase") not in {
+                "idle",
                 "claim_pending",
                 "claimed",
                 "executing",
@@ -347,12 +365,21 @@ class Journal:
                 raise ValueError("invalid journal phase")
             if value.get("protocol", "recipe") not in {"recipe", "image"}:
                 raise ValueError("invalid journal protocol")
-            if value["phase"] != "claim_pending":
+            if "channel" in value or "sequence" in value or value["phase"] == "idle":
+                _uuid(value["channel"])
+                if type(value["sequence"]) is not int or not 1 <= value["sequence"] <= 2**63 - 1:
+                    raise ValueError("invalid claim sequence")
+            if value["phase"] not in {"claim_pending", "idle"}:
                 _uuid(value["id"])
                 _uuid(value["lease"])
         except (ValueError, TypeError, KeyError) as exc:
             raise WorkerHalted("invalid worker journal") from exc
         self._discard_uncommitted()
+        self.cursor = {key: value[key] for key in ("channel", "sequence")} if "channel" in value else None
+        if value["phase"] == "idle":
+            if any(p.name not in {"worker.lock", "worker.json"} for p in self.root.iterdir()):
+                raise WorkerHalted("unjournaled worker scratch retained")
+            return None
         return value
 
     def _discard_uncommitted(self):
@@ -395,10 +422,29 @@ class Journal:
             os.fsync(stream.fileno())
         os.replace(temporary, self.path)
         self._sync()
+        self.cursor = {key: value[key] for key in ("channel", "sequence")} if "channel" in value else None
 
     def clear(self):
+        if self.cursor is not None:
+            self.save({"phase": "idle", **self.cursor})
+            return
         self.path.unlink()
         self._sync()
+
+    def begin_claim(self, protocol: str) -> dict:
+        if self.load() is not None:
+            raise WorkerHalted("unsettled worker journal")
+        cursor = self.cursor or {"channel": str(uuid.uuid4()), "sequence": 0}
+        if cursor["sequence"] >= 2**63 - 1:
+            raise WorkerHalted("worker claim sequence exhausted")
+        record = {
+            "phase": "claim_pending",
+            "protocol": protocol,
+            "channel": cursor["channel"],
+            "sequence": cursor["sequence"] + 1,
+        }
+        self.save(record)
+        return record
 
     def job_dir(self, record: dict) -> Path:
         return self.root / ("job-" + _uuid(record["id"]))
@@ -600,12 +646,62 @@ class BuildWorker:
             self._status(record)
         self._dispose(record)
 
+    @staticmethod
+    def _claim_route(protocol):
+        return "/v1/image-worker/claim" if protocol == "image" else "/v1/build-worker/claim"
+
+    @staticmethod
+    def _claim_headers(record):
+        return {
+            "X-Palimpsest-Worker-Channel": _uuid(record["channel"]),
+            "X-Palimpsest-Claim-Sequence": str(record["sequence"]),
+        }
+
+    def _recover_claim(self, record):
+        if "channel" not in record:
+            raise WorkerHalted("claim outcome uncertain; operator disposition required")
+        try:
+            with self.transport.request(
+                "GET", self._claim_route(record.get("protocol", "recipe")), headers=self._claim_headers(record)
+            ) as response:
+                if response.status != 200:
+                    raise WorkerHalted("claim settlement unavailable")
+                result = _json_response(response)
+            if type(result.get("sequence")) is not int or any(
+                result.get(key) != record.get(key) for key in ("channel", "sequence", "protocol")
+            ):
+                raise WorkerHalted("claim settlement identity mismatch")
+            if "claim" not in result:
+                raise WorkerHalted("claim settlement missing outcome")
+            if result["claim"] is None:
+                self.journal.clear()
+                return None
+            identity = {
+                **record,
+                "phase": "claimed",
+                "id": _uuid(result["claim"]["id"]),
+                "lease": _uuid(result["claim"]["lease"]),
+            }
+            self.journal.save(identity)
+            return identity
+        except Exception as exc:
+            logger.warning(
+                "Worker claim settlement unavailable protocol=%s channel=%s sequence=%s cause=%s",
+                record["protocol"],
+                record["channel"],
+                record["sequence"],
+                _safe_error_class(exc),
+            )
+            raise WorkerHalted("claim outcome uncertain; journal retained") from exc
+
     def reconcile(self):
         record = self.journal.load()
         if record is None:
             return
         if record.get("phase") == "claim_pending":
-            raise WorkerHalted("claim outcome uncertain; operator disposition required")
+            record = self._recover_claim(record)
+            if record is None:
+                return
         if record.get("phase") not in {"claimed", "executing", "output_pending", "fail_pending", "terminal"}:
             raise WorkerHalted("invalid worker journal phase")
         _uuid(record["id"])
@@ -733,11 +829,12 @@ class BuildWorker:
         from palimpsest_hub import image_executor
 
         record = None
+        pending = None
         try:
             for candidate in ("image", "recipe"):
-                self.journal.save({"phase": "claim_pending", "protocol": candidate})
-                route = "/v1/image-worker/claim" if candidate == "image" else "/v1/build-worker/claim"
-                with self.transport.request("POST", route) as response:
+                pending = self.journal.begin_claim(candidate)
+                route = self._claim_route(candidate)
+                with self.transport.request("POST", route, headers=self._claim_headers(pending)) as response:
                     if response.status == 204:
                         self.journal.clear()
                         continue
@@ -745,6 +842,7 @@ class BuildWorker:
                         raise WorkerHalted("claim outcome uncertain")
                     value = _json_response(response)
                     identity = {
+                        **pending,
                         "phase": "claimed",
                         "protocol": candidate,
                         "id": _uuid(value["id"]),
@@ -765,7 +863,17 @@ class BuildWorker:
                 return False
         except Exception as exc:
             if record is None:
-                raise WorkerHalted("claim outcome uncertain; journal retained") from exc
+                if pending is None:
+                    raise WorkerHalted("claim outcome uncertain; journal retained") from exc
+                logger.warning(
+                    "Worker claim response uncertain protocol=%s channel=%s sequence=%s cause=%s",
+                    pending["protocol"],
+                    pending["channel"],
+                    pending["sequence"],
+                    _safe_error_class(exc),
+                )
+                self.reconcile()
+                return True
             # The exact lease is durable: invalid descriptors fail this attempt,
             # rather than poisoning the worker as an unidentified claim.
             self._cleanup(record)
@@ -860,9 +968,12 @@ async def main() -> None:
 def run() -> None:
     try:
         asyncio.run(main())
-    except Exception:
+    except Exception as exc:
         # Never send exception chains, recipes, paths, or credentials to logs.
-        logger.error("Build worker halted; retained state requires safe disposition")
+        logger.error(
+            "Build worker halted; retained state requires safe disposition cause=%s",
+            _safe_error_class(exc.__cause__ or exc),
+        )
         raise SystemExit(1) from None
 
 

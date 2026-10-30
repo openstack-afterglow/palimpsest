@@ -84,7 +84,9 @@ class Transport:
         self.events.append((method, path))
         if path.endswith("/claim"):
             protocol = "image" if "/image-worker/" in path else "recipe"
-            assert self.journal.load() == {"phase": "claim_pending", "protocol": protocol}
+            pending = self.journal.load()
+            assert pending["phase"] == "claim_pending" and pending["protocol"] == protocol
+            assert kwargs["headers"] == worker.BuildWorker._claim_headers(pending)
         body = kwargs.get("body")
         if hasattr(body, "read"):
             data = bytearray()
@@ -92,6 +94,8 @@ class Transport:
                 data.extend(part)
             assert bytes(data) in (b"hsqsone", b"hsqstwo")
         response = self.responses.pop(0)
+        if callable(response):
+            response = response()
         if isinstance(response, Exception):
             raise response
         yield response
@@ -156,14 +160,18 @@ def test_empty_image_queue_falls_back_to_recipe_only_after_durable_204(harness):
 
 @pytest.mark.parametrize("response", [OSError("lost claim"), Response(500), Response(202, {"id": JOB})])
 def test_uncertain_image_claim_never_falls_back_or_replays(harness, response):
-    instance, transport = harness.make([response])
+    instance, transport = harness.make([response, Response(503)])
     with pytest.raises(worker.WorkerHalted):
         instance.process_one()
-    assert harness.journal.load() == {"phase": "claim_pending", "protocol": "image"}
-    restarted, other = harness.make([])
+    pending = harness.journal.load()
+    assert pending["phase"] == "claim_pending" and pending["protocol"] == "image"
+    assert worker._uuid(pending["channel"]) and pending["sequence"] == 1
+    restarted, other = harness.make([Response(503)])
     with pytest.raises(worker.WorkerHalted, match="claim outcome uncertain"):
         restarted.process_one()
-    assert len(transport.calls) == 1 and not other.calls and not harness.executions
+    assert [method for method, _ in transport.calls] == ["POST", "GET"]
+    assert [method for method, _ in other.calls] == ["GET"]
+    assert not harness.executions and harness.journal.load() == pending
 
 
 def test_lost_staged_output_response_retains_image_protocol_and_never_restages(harness):
@@ -337,3 +345,50 @@ def test_packed_range_rejects_span_beyond_pinned_reserve(tmp_path):
     path.write_bytes(b"hsqsone")
     with path.open("rb") as stream, pytest.raises(worker.BuildFailed, match="span"):
         image._PackedRange(stream, 3, 7, 7)
+
+
+@pytest.mark.parametrize("accepted", [False, True])
+def test_image_response_loss_settles_exact_outcome_without_recipe_fallback(harness, accepted):
+    def recovery():
+        pending = harness.journal.load()
+        return Response(
+            200,
+            {
+                **{key: pending[key] for key in ("channel", "sequence", "protocol")},
+                "claim": {"id": JOB, "lease": LEASE} if accepted else None,
+            },
+        )
+
+    responses = [OSError("lost image claim response"), recovery]
+    if accepted:
+        responses += [Response(200, {"id": JOB, "status": "error"}), Response(200, {"id": JOB, "status": "error"})]
+    instance, transport = harness.make(responses)
+    assert instance.process_one()
+    assert transport.calls[:2] == [("POST", "/v1/image-worker/claim"), ("GET", "/v1/image-worker/claim")]
+    assert all("/build-worker/" not in route for _, route in transport.calls)
+    assert not harness.executions and harness.journal.load() is None
+    assert harness.journal.cursor["sequence"] == 1
+
+
+def test_image_restart_recovers_exact_lease_without_execution(harness):
+    pending = harness.journal.begin_claim("image")
+    instance, transport = harness.make(
+        [
+            Response(
+                200,
+                {
+                    **{key: pending[key] for key in ("channel", "sequence", "protocol")},
+                    "claim": {"id": JOB, "lease": LEASE},
+                },
+            ),
+            Response(200, {"id": JOB, "status": "error"}),
+            Response(200, {"id": JOB, "status": "error"}),
+        ]
+    )
+    instance.reconcile()
+    assert transport.calls == [
+        ("GET", "/v1/image-worker/claim"),
+        ("POST", f"/v1/image-worker/jobs/{JOB}/fail"),
+        ("GET", f"/v1/image-worker/jobs/{JOB}"),
+    ]
+    assert not harness.executions and harness.journal.load() is None
