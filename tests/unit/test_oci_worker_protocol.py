@@ -28,11 +28,14 @@ from palimpsest_local.oci_image import OCIImageRef
 from palimpsest_local.oci_materializer import OCIHardWorkerError
 from palimpsest_local.oci_packer import (
     DEFAULT_SQUASHFS_PACK_POLICY,
+    SERVICE_IMAGE_SQUASHFS_PACK_POLICY,
     SQUASHFS_PACK_POLICY_ID,
     SQUASHFS_STRUCTURAL_VERIFIER_ID,
     LeasedSquashFS,
     PackedSquashFSReceipt,
     SquashFSPackError,
+    SquashFSPackPolicy,
+    SquashFSPackProfile,
     SquashFSToolchainIdentity,
     VerifiedSquashFSToolchain,
 )
@@ -54,6 +57,7 @@ from palimpsest_local.oci_store import (
 )
 from palimpsest_local.oci_worker_protocol import (
     MAX_OCI_WORKER_MESSAGE_BYTES,
+    OCI_WORKER_REQUEST_SCHEMA,
     OCI_WORKER_RESPONSE_SCHEMA,
     OCIWorkerProtocolError,
     OCIWorkerRequest,
@@ -204,14 +208,16 @@ def _materialization_fixture(tmp_path: Path) -> SimpleNamespace:
     )
 
 
-def _fixture_worker_request(fixture: SimpleNamespace) -> OCIWorkerRequest:
+def _fixture_worker_request(
+    fixture: SimpleNamespace, pack_profile: SquashFSPackProfile = SquashFSPackProfile.CANONICAL
+) -> OCIWorkerRequest:
     occurrence = DerivedLayerOccurrence.from_image(fixture.image, 0)
     key = DerivedSquashFSKey.for_occurrence(
         occurrence,
         intake_policy_id=LAYER_INTAKE_POLICY_ID,
         intake_policy_fingerprint=DEFAULT_LAYER_CONVERSION_LIMITS.fingerprint,
         pack_policy_id=SQUASHFS_PACK_POLICY_ID,
-        pack_policy_fingerprint=DEFAULT_SQUASHFS_PACK_POLICY.fingerprint,
+        pack_policy_fingerprint=pack_profile.policy.fingerprint,
         toolchain=fixture.toolchain,
     )
     return OCIWorkerRequest(
@@ -228,6 +234,7 @@ def _fixture_worker_request(fixture: SimpleNamespace) -> OCIWorkerRequest:
         packer_path=fixture.packer,
         packer_sha256=fixture.toolchain.identity.executable_digest.removeprefix("sha256:"),
         cpu_limit_seconds=30,
+        pack_profile=pack_profile,
     )
 
 
@@ -242,7 +249,7 @@ def _minimal_squashfs() -> bytes:
         0,
         131072,
         0,
-        1,
+        6,  # SquashFS zstd compressor ID, required by the actual pack verifier.
         17,
         0,
         1,
@@ -302,6 +309,45 @@ def test_request_rejects_unknown_fields_and_digest_or_path_tampering() -> None:
     bad_path["roots"]["state"] = "/var/lib/../tmp"
 
     for value in (unknown, bad_digest, bad_path):
+        with pytest.raises(OCIWorkerProtocolError):
+            OCIWorkerRequest.from_dict(value)
+
+
+def test_fixed_pack_profiles_preserve_default_and_separate_recipe_authority():
+    canonical = _request()
+    assert canonical.pack_profile is SquashFSPackProfile.CANONICAL
+    assert canonical.key.pack_policy_fingerprint == SquashFSPackPolicy().fingerprint
+    assert DEFAULT_SQUASHFS_PACK_POLICY.packer_timeout_seconds == 120.0
+    assert SERVICE_IMAGE_SQUASHFS_PACK_POLICY == replace(SquashFSPackPolicy(), packer_timeout_seconds=900.0)
+    service_key = replace(canonical.key, pack_policy_fingerprint=SERVICE_IMAGE_SQUASHFS_PACK_POLICY.fingerprint)
+    service = replace(
+        canonical, pack_profile=SquashFSPackProfile.SERVICE_IMAGE, key=service_key, key_digest=service_key.digest
+    )
+    assert service_key.digest != canonical.key.digest
+    assert replace(service, cpu_limit_seconds=1).key == replace(service, cpu_limit_seconds=3600).key
+    assert service.to_dict()["pack_profile"] == "service-image"
+    assert OCIWorkerRequest.from_json_bytes(service.to_json_bytes()) == service
+    assert service.schema == OCI_WORKER_REQUEST_SCHEMA == "palimpsest.oci-materialize-worker-request.v3"
+
+
+@pytest.mark.parametrize("profile", [None, True, [], {}, "unknown", "unbounded", 900, float("inf")])
+def test_request_rejects_unknown_or_unbounded_pack_profiles(profile):
+    value = _request().to_dict()
+    value["pack_profile"] = profile
+    with pytest.raises(OCIWorkerProtocolError):
+        OCIWorkerRequest.from_dict(value)
+
+
+def test_request_rejects_profile_key_mismatch_old_schema_and_freeform_timeout():
+    mismatch = _request().to_dict()
+    mismatch["pack_profile"] = "service-image"
+    old = _request().to_dict()
+    old["schema"] = "palimpsest.oci-materialize-worker-request.v2"
+    missing = _request().to_dict()
+    del missing["pack_profile"]
+    arbitrary = _request().to_dict()
+    arbitrary["packer_timeout_seconds"] = 3600
+    for value in (mismatch, old, missing, arbitrary):
         with pytest.raises(OCIWorkerProtocolError):
             OCIWorkerRequest.from_dict(value)
 
@@ -1762,3 +1808,153 @@ def test_operation_marker_rejects_untrusted_attributes_and_keeps_first_observati
     worker._observe_operation(failure, "staging")
     worker._observe_operation(failure, "store")
     assert worker._operation_stage(failure) == "staging"
+
+
+@pytest.mark.parametrize("timeout", [150.0, 300.0])
+def test_service_profile_parent_wait_and_cpu_remain_capped_by_attempt(tmp_path, monkeypatch, timeout):
+    fixture = _materialization_fixture(tmp_path)
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(materializer, "sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setattr(materializer, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    original_mkdtemp = materializer.tempfile.mkdtemp
+
+    def setup(*args, **kwargs):
+        clock.now += 30.25
+        return original_mkdtemp(*args, **kwargs)
+
+    captured = []
+
+    def exchange(request, **kwargs):
+        captured.append((request, kwargs["timeout_seconds"]))
+        clock.now = timeout + 1
+        response = OCIWorkerResponse(request.nonce, request.digest, "succeeded", _result(request), None)
+        return response.to_json_bytes(), 0, SimpleNamespace(poll=lambda: 0)
+
+    monkeypatch.setattr(materializer.tempfile, "mkdtemp", setup)
+    monkeypatch.setattr(materializer, "_spawn_and_exchange", exchange)
+    with pytest.raises(OCIHardWorkerError, match="late materializer success"):
+        materializer.materialize_layer_hard(
+            fixture.image,
+            0,
+            source_cas_root=fixture.source_cas_root,
+            roots=fixture.roots,
+            store=fixture.store,
+            packer_path=fixture.packer,
+            toolchain=fixture.toolchain,
+            timeout_seconds=timeout,
+            pack_profile=SquashFSPackProfile.SERVICE_IMAGE,
+        )
+    request, wait = captured[0]
+    assert wait == timeout - 30.25 < 900
+    assert request.cpu_limit_seconds == int(wait) + 1
+    assert request.pack_profile is SquashFSPackProfile.SERVICE_IMAGE
+    assert request.key == _fixture_worker_request(fixture, SquashFSPackProfile.SERVICE_IMAGE).key
+    assert request.key.pack_policy_fingerprint == SERVICE_IMAGE_SQUASHFS_PACK_POLICY.fingerprint
+
+
+@pytest.mark.parametrize("profile", list(SquashFSPackProfile))
+def test_child_real_pack_boundary_selects_fixed_policy_with_slow_clock_fixture(tmp_path, monkeypatch, profile):
+    from palimpsest_local import oci_packer
+
+    fixture = _materialization_fixture(tmp_path)
+    request = _fixture_worker_request(fixture, profile)
+    scratch = tmp_path / "worker-scratch"
+    scratch.mkdir(mode=0o700)
+    monkeypatch.chdir(scratch)
+    monkeypatch.setattr(oci_packer, "sys", SimpleNamespace(platform="linux"))
+    selected = []
+
+    def discover(*args, **kwargs):
+        selected.append(kwargs["policy"])
+        return fixture.toolchain
+
+    monkeypatch.setattr(worker, "discover_squashfs_toolchain", discover)
+    monkeypatch.setattr(oci_packer, "_discover_dependency_paths", lambda _path: ())
+    monkeypatch.setattr(oci_packer, "_packer_version", lambda *args: fixture.toolchain.identity.version)
+    image = _minimal_squashfs()
+    waits = []
+    clock = SimpleNamespace(now=0.0)
+    processes = []
+
+    class SlowPacker:
+        def wait(self, timeout):
+            waits.append(timeout)
+            clock.now += min(180.0, timeout)
+            if timeout < 180:
+                raise oci_packer.subprocess.TimeoutExpired("<verified-mksquashfs>", timeout)
+            return 0
+
+    def spawn(argv, **kwargs):
+        # Keep the actual pinned descriptor, fixed argv, normalized tar and
+        # output publication path; virtualize only the slow process clock.
+        assert argv[0] == "<verified-mksquashfs>"
+        assert argv[1:3] == ["-", "layer.squashfs"]
+        assert argv[3 : 3 + len(oci_packer.SQUASHFS_PACKER_FIXED_ARGUMENTS)] == list(
+            oci_packer.SQUASHFS_PACKER_FIXED_ARGUMENTS
+        )
+        assert request.source.requested_reference not in repr(argv)
+        assert kwargs["executable"].endswith(str(kwargs["pass_fds"][0]))
+        assert kwargs["stdin"].read(512)
+        fd = os.open("layer.squashfs", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=kwargs["pass_fds"][1])
+        try:
+            os.write(fd, image)
+        finally:
+            os.close(fd)
+        process = SlowPacker()
+        processes.append(process)
+        return process
+
+    terminated = []
+    monkeypatch.setattr(oci_packer.subprocess, "Popen", spawn)
+    monkeypatch.setattr(oci_packer, "_terminate_process", lambda process, *args, **kwargs: terminated.append(process))
+    if profile is SquashFSPackProfile.CANONICAL:
+        with pytest.raises(SquashFSPackError, match="oci-packer-timeout"):
+            worker._materialize(request)
+        assert waits == [120.0] and clock.now == 120.0
+        assert terminated == processes
+    else:
+        result = worker._materialize(request)
+        assert result.receipt.key_digest == request.key.digest
+        assert result.receipt.image_digest == f"sha256:{hashlib.sha256(image).hexdigest()}"
+        assert waits == [900.0] and clock.now == 180.0
+        assert not terminated
+    assert selected == [profile.policy]
+    assert not list(scratch.iterdir())
+
+
+def test_worker_spawn_and_pipe_startup_do_not_reset_remaining_deadline(tmp_path, monkeypatch):
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(materializer, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    waits = []
+    process = SimpleNamespace(
+        pid=12345,
+        stdin=io.BytesIO(),
+        stdout=io.BytesIO(),
+        returncode=0,
+        wait=lambda timeout: waits.append(timeout),
+    )
+
+    def spawn(*args, **kwargs):
+        clock.now += 3
+        return process
+
+    class PipeThread:
+        ident = 1
+
+        def __init__(self, **kwargs):
+            pass
+
+        def start(self):
+            clock.now += 1
+
+        def join(self, **kwargs):
+            pass
+
+    monkeypatch.setattr(materializer.subprocess, "Popen", spawn)
+    monkeypatch.setattr(materializer.threading, "Thread", PipeThread)
+    monkeypatch.setattr(materializer, "_group_exists", lambda pid: False)
+    output, code, actual = materializer._spawn_and_exchange(
+        _request(), scratch=tmp_path, timeout_seconds=10, grace_seconds=0.1
+    )
+    assert (output, code, actual) == (b"", 0, process)
+    assert waits == [5]

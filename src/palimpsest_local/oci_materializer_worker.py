@@ -15,7 +15,6 @@ from .errors import ArtifactValidationError, UnsupportedPlatformError
 from .oci_converter import DEFAULT_LAYER_CONVERSION_LIMITS, LAYER_INTAKE_POLICY_ID, LayerIntakeError, stage_layer
 from .oci_image import OCIImageRef, resolve_image
 from .oci_packer import (
-    DEFAULT_SQUASHFS_PACK_POLICY,
     SQUASHFS_PACK_POLICY_ID,
     SquashFSPackError,
     SquashFSPackExecution,
@@ -141,6 +140,7 @@ def _reconstruct_image(request: OCIWorkerRequest, cas: SourceCAS) -> Snapshotted
 
 
 def _materialize(request: OCIWorkerRequest):
+    policy = request.pack_profile.policy
     roots = StatePaths(request.config_root, request.state_root)
     store = _resource_boundary("store", OCIStore, roots)
     if store.identity != request.expected_store_id:
@@ -160,14 +160,14 @@ def _materialize(request: OCIWorkerRequest):
             discover_squashfs_toolchain,
             request.packer_path,
             expected_packer_sha256=request.packer_sha256,
-            policy=DEFAULT_SQUASHFS_PACK_POLICY,
+            policy=policy,
         )
         computed_key = DerivedSquashFSKey.for_occurrence(
             request.occurrence,
             intake_policy_id=LAYER_INTAKE_POLICY_ID,
             intake_policy_fingerprint=DEFAULT_LAYER_CONVERSION_LIMITS.fingerprint,
             pack_policy_id=SQUASHFS_PACK_POLICY_ID,
-            pack_policy_fingerprint=DEFAULT_SQUASHFS_PACK_POLICY.fingerprint,
+            pack_policy_fingerprint=policy.fingerprint,
             toolchain=toolchain,
         )
         if computed_key != request.key:
@@ -191,7 +191,7 @@ def _materialize(request: OCIWorkerRequest):
                     staged,
                     packer_path=request.packer_path,
                     expected_packer_sha256=request.packer_sha256,
-                    policy=DEFAULT_SQUASHFS_PACK_POLICY,
+                    policy=policy,
                     toolchain=toolchain,
                     execution=execution,
                 ),

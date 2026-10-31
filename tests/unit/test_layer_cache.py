@@ -19,6 +19,7 @@ from palimpsest_local import cli, layer_cache, registry_intake
 from palimpsest_local.artifact_store import ArtifactStore
 from palimpsest_local.errors import ArtifactValidationError
 from palimpsest_local.layer_cache import LayerCache, LayerCacheError
+from palimpsest_local.oci_packer import SquashFSPackProfile
 from palimpsest_local.oci_provenance import (
     OCI_IMAGE_CONFIG_MEDIA_TYPE,
     OCI_IMAGE_INDEX_MEDIA_TYPE,
@@ -517,7 +518,10 @@ def test_cli_import_retain_release_and_inspect_use_only_cache_state(tmp_path, mo
     sys.platform != "linux" or shutil.which("mksquashfs") is None,
     reason="real canonical hard materializer requires Linux and mksquashfs >=4.6",
 )
-def test_real_materialization_reuses_recipe_after_reopen_and_changed_host_authority(tmp_path, monkeypatch):
+@pytest.mark.parametrize("pack_profile", list(SquashFSPackProfile))
+def test_real_materialization_reuses_recipe_after_reopen_and_changed_host_authority(
+    tmp_path, monkeypatch, pack_profile
+):
     source, root, compressed = _layout(tmp_path / "layout", repeat=True)
     cache = _cache(tmp_path / "cache")
     cache.import_source(source)
@@ -525,9 +529,10 @@ def test_real_materialization_reuses_recipe_after_reopen_and_changed_host_author
     alias = tmp_path / "relative-packer"
     alias.symlink_to(packer)
     monkeypatch.chdir(tmp_path)
-    first = cache.materialize(root, packer_path=Path("relative-packer"))
+    first = cache.materialize(root, packer_path=Path("relative-packer"), pack_profile=pack_profile)
     assert [result["cache_result"] for result in first["receipt"]["results"]] == ["cold_miss", "warm_hit"]
     assert len(first["derived"]) == 1
+    assert next(iter(first["derived"].values()))["key"]["pack_policy_fingerprint"] == pack_profile.policy.fingerprint
     assert first["blob_paths"][0] == first["blob_paths"][1]
     output = Path(first["blob_paths"][0])
     assert _sha(output.read_bytes()) == next(iter(first["derived"].values()))["image_digest"]
@@ -537,21 +542,23 @@ def test_real_materialization_reuses_recipe_after_reopen_and_changed_host_author
     cache.release("first-vm")
     cache.release("second-vm")
     before = _bytes(cache)
-    second = LayerCache(cache.root).materialize(root, packer_path=packer)
+    second = LayerCache(cache.root).materialize(
+        root, packer_path=packer, pack_profile=pack_profile, timeout_seconds=240
+    )
     assert all(result["cache_result"] == "warm_hit" for result in second["receipt"]["results"])
     moved = tmp_path / "other-host"
     shutil.copytree(cache.root, moved)
     copied = LayerCache(moved)
     assert copied._source.identity != cache._source.identity
     assert copied._store.identity != cache._store.identity
-    third = copied.materialize(root, packer_path=packer)
+    third = copied.materialize(root, packer_path=packer, pack_profile=pack_profile, timeout_seconds=180)
     assert all(result["cache_result"] == "warm_hit" for result in third["receipt"]["results"])
     assert third["receipt"]["source_snapshot_binding_digest"] != first["receipt"]["source_snapshot_binding_digest"]
     assert _bytes(copied) == before
     damaged = Path(third["blob_paths"][0])
     damaged.unlink()
     with pytest.raises(ArtifactValidationError):
-        copied.materialize(root, packer_path=packer)
+        copied.materialize(root, packer_path=packer, pack_profile=pack_profile)
     assert not damaged.exists()
 
 
@@ -618,3 +625,68 @@ def test_different_compressed_recipe_cannot_replace_retained_output(tmp_path, fa
         assert blob.stat().st_ino == inode
         if fault == "corrupt":
             assert blob.read_bytes() == damaged
+
+
+@pytest.mark.parametrize("pack_profile", [None, SquashFSPackProfile.SERVICE_IMAGE])
+def test_materialize_forwards_fixed_profile_and_remaining_deadline(tmp_path, monkeypatch, pack_profile):
+    from types import SimpleNamespace
+
+    source, root, _ = _layout(tmp_path / "layout")
+    cache = _cache(tmp_path / "cache")
+    cache.import_source(source)
+    packer = tmp_path / "packer"
+    packer.write_bytes(b"pinned-packer")
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(layer_cache, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    selected = pack_profile or SquashFSPackProfile.CANONICAL
+    toolchain = object()
+
+    def discover(path, **kwargs):
+        assert path == packer.resolve()
+        assert kwargs["expected_packer_sha256"] == hashlib.sha256(b"pinned-packer").hexdigest()
+        assert kwargs["policy"] is selected.policy
+        clock.now += 12.5
+        return toolchain
+
+    class ObservedMaterialization(Exception):
+        pass
+
+    def materialize(snapshot, **kwargs):
+        assert kwargs["pack_profile"] is selected
+        assert kwargs["timeout_seconds"] == 287.5
+        assert kwargs["toolchain"] is toolchain
+        raise ObservedMaterialization
+
+    monkeypatch.setattr(layer_cache, "discover_squashfs_toolchain", discover)
+    monkeypatch.setattr(layer_cache, "materialize_image_hard", materialize)
+    arguments = {} if pack_profile is None else {"pack_profile": pack_profile}
+    with pytest.raises(ObservedMaterialization):
+        cache.materialize(root, packer_path=packer, timeout_seconds=300, **arguments)
+
+
+def test_materialize_pre_worker_expiry_preserves_coded_failure_summary(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from palimpsest_local import hub_image_builder
+    from palimpsest_local.oci_materializer import OCIHardWorkerError
+
+    source, root, _ = _layout(tmp_path / "layout")
+    cache = _cache(tmp_path / "cache")
+    cache.import_source(source)
+    packer = tmp_path / "packer"
+    packer.write_bytes(b"pinned-packer")
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(layer_cache, "time", SimpleNamespace(monotonic=lambda: clock.now))
+
+    def discover(*args, **kwargs):
+        clock.now = 301
+        return object()
+
+    monkeypatch.setattr(layer_cache, "discover_squashfs_toolchain", discover)
+    monkeypatch.setattr(layer_cache, "materialize_image_hard", lambda *a, **k: pytest.fail("worker started"))
+    with pytest.raises(OCIHardWorkerError) as failure:
+        cache.materialize(root, packer_path=packer, pack_profile=SquashFSPackProfile.SERVICE_IMAGE)
+    summary = json.loads(hub_image_builder._failure_summary(failure.value, "execution"))
+    assert summary["code"] == "oci-worker-timeout"
+    assert summary["stage"] == "materialization"
+    assert summary["category"] == "OCIHardWorkerError"

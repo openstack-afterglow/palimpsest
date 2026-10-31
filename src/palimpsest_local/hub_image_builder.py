@@ -42,6 +42,7 @@ from .hub_builder import (
 from .layer_cache import LayerCache
 from .oci_image import strict_json_object
 from .oci_materializer import OCIHardWorkerError
+from .oci_packer import SquashFSPackProfile
 from .oci_worker_protocol import (
     OCI_WORKER_CATEGORY_CODES,
     OCI_WORKER_EXCEPTION_CODES,
@@ -775,8 +776,13 @@ def run_image(manifest: dict, directory: Path) -> dict:
                 imported = cache.import_source(archive)
             else:
                 raise ValueError("invalid image job kind")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("image execution deadline expired before materialization")
             materialized = cache.materialize(
-                imported["root_digest"], timeout_seconds=max(0.001, deadline - time.monotonic())
+                imported["root_digest"],
+                timeout_seconds=remaining,
+                pack_profile=SquashFSPackProfile.SERVICE_IMAGE,
             )
             result = materialized_result(materialized, directory, maximum)
     _save(directory / "result.json", result)

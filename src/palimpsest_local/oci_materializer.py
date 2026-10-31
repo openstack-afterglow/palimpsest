@@ -24,8 +24,8 @@ from .digest import normalize_digest
 from .errors import ArtifactValidationError, UnsupportedPlatformError
 from .oci_converter import DEFAULT_LAYER_CONVERSION_LIMITS, LAYER_INTAKE_POLICY_ID
 from .oci_packer import (
-    DEFAULT_SQUASHFS_PACK_POLICY,
     SQUASHFS_PACK_POLICY_ID,
+    SquashFSPackProfile,
     VerifiedSquashFSToolchain,
     process_resource_detail,
     process_resource_failure,
@@ -376,6 +376,7 @@ def _spawn_and_exchange(
     command: tuple[str, ...] | None = None,
     register_worker: Callable[[subprocess.Popen[bytes]], None] | None = None,
 ) -> tuple[bytes, int, subprocess.Popen[bytes]]:
+    deadline = time.monotonic() + timeout_seconds
     request_bytes = request.to_json_bytes()
     output = bytearray()
     output_overflow = threading.Event()
@@ -443,7 +444,10 @@ def _spawn_and_exchange(
             with defer_web_cancellation():
                 start_attempts += 1
                 thread.start()
-        process.wait(timeout=timeout_seconds)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(selected_command, timeout_seconds)
+        process.wait(timeout=remaining)
         if _group_exists(process.pid):
             raise OCIHardWorkerError("oci-worker-protocol", "materializer worker left a live descendant")
         writer.join(timeout=grace_seconds)
@@ -517,6 +521,7 @@ def materialize_layer_hard(
     toolchain: VerifiedSquashFSToolchain,
     timeout_seconds: float = 300.0,
     terminate_grace_seconds: float = 1.0,
+    pack_profile: SquashFSPackProfile = SquashFSPackProfile.CANONICAL,
 ) -> MaterializationResult:
     """Materialize one occurrence in an exec worker or return no success."""
     if os.name != "posix" or not sys.platform.startswith("linux"):
@@ -527,36 +532,24 @@ def materialize_layer_hard(
         raise OCIHardWorkerError("oci-worker-input", "materializer store authority is invalid")
     if not isinstance(toolchain, VerifiedSquashFSToolchain):
         raise OCIHardWorkerError("oci-worker-input", "materializer toolchain is invalid")
+    if not isinstance(pack_profile, SquashFSPackProfile):
+        raise OCIHardWorkerError("oci-worker-input", "materializer pack profile is invalid")
+    policy = pack_profile.policy
     for value in (timeout_seconds, terminate_grace_seconds):
         if not isinstance(value, (int, float)) or isinstance(value, bool) or not 0 < float(value) < float("inf"):
             raise OCIHardWorkerError("oci-worker-input", "materializer deadline is invalid")
+    started = time.monotonic()
     occurrence = DerivedLayerOccurrence.from_image(image, ordinal)
     key = DerivedSquashFSKey.for_occurrence(
         occurrence,
         intake_policy_id=LAYER_INTAKE_POLICY_ID,
         intake_policy_fingerprint=DEFAULT_LAYER_CONVERSION_LIMITS.fingerprint,
         pack_policy_id=SQUASHFS_PACK_POLICY_ID,
-        pack_policy_fingerprint=DEFAULT_SQUASHFS_PACK_POLICY.fingerprint,
+        pack_policy_fingerprint=policy.fingerprint,
         toolchain=toolchain,
-    )
-    request = OCIWorkerRequest(
-        nonce=str(uuid.uuid4()),
-        config_root=roots.config,
-        state_root=roots.state,
-        expected_store_id=store.identity,
-        source_cas_root=source_cas_root,
-        expected_source_cas_id=image.cas_id,
-        source=image.image.source,
-        occurrence=occurrence,
-        key=key,
-        key_digest=key.digest,
-        packer_path=packer_path,
-        packer_sha256=toolchain.identity.executable_digest.removeprefix("sha256:"),
-        cpu_limit_seconds=min(3600, max(1, math.ceil(float(timeout_seconds)))),
     )
 
     scratch_parent = roots.runtime_packs
-    started = time.monotonic()
     scratch: Path | None = None
     scratch_fd: int | None = None
     process: subprocess.Popen[bytes] | None = None
@@ -581,6 +574,22 @@ def materialize_layer_hard(
         remaining = float(timeout_seconds) - (time.monotonic() - started)
         if remaining <= 0:
             raise OCIHardWorkerError("oci-worker-timeout", "materializer deadline expired before worker start")
+        request = OCIWorkerRequest(
+            nonce=str(uuid.uuid4()),
+            config_root=roots.config,
+            state_root=roots.state,
+            expected_store_id=store.identity,
+            source_cas_root=source_cas_root,
+            expected_source_cas_id=image.cas_id,
+            source=image.image.source,
+            occurrence=occurrence,
+            key=key,
+            key_digest=key.digest,
+            packer_path=packer_path,
+            packer_sha256=toolchain.identity.executable_digest.removeprefix("sha256:"),
+            cpu_limit_seconds=min(3600, max(1, math.ceil(remaining))),
+            pack_profile=pack_profile,
+        )
         output, return_code, process = _spawn_and_exchange(
             request,
             scratch=scratch,
@@ -680,6 +689,7 @@ def materialize_image_hard(
     toolchain: VerifiedSquashFSToolchain,
     timeout_seconds: float = 300.0,
     terminate_grace_seconds: float = 1.0,
+    pack_profile: SquashFSPackProfile = SquashFSPackProfile.CANONICAL,
 ) -> OCIImageMaterializationReceipt:
     """Materialize every layer occurrence in order under one wall-clock deadline.
 
@@ -688,6 +698,8 @@ def materialize_image_hard(
     """
     if not isinstance(image, SnapshottedOCIImage):
         raise OCIHardWorkerError("oci-worker-input", "materializer image is invalid")
+    if not isinstance(pack_profile, SquashFSPackProfile):
+        raise OCIHardWorkerError("oci-worker-input", "materializer pack profile is invalid")
     for value in (timeout_seconds, terminate_grace_seconds):
         if not isinstance(value, (int, float)) or isinstance(value, bool) or not 0 < float(value) < float("inf"):
             raise OCIHardWorkerError("oci-worker-input", "materializer deadline is invalid")
@@ -707,6 +719,7 @@ def materialize_image_hard(
             toolchain=toolchain,
             timeout_seconds=remaining,
             terminate_grace_seconds=terminate_grace_seconds,
+            pack_profile=pack_profile,
         )
         if time.monotonic() - started > float(timeout_seconds):
             raise OCIHardWorkerError("oci-worker-timeout", "late image materialization success was discarded")

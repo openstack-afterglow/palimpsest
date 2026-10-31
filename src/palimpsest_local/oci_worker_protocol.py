@@ -15,7 +15,7 @@ from typing import Any
 from .artifact_store import ArtifactStoreError
 from .errors import ArtifactValidationError
 from .oci_converter import LayerIntakeError
-from .oci_packer import SquashFSPackError
+from .oci_packer import SQUASHFS_PACK_POLICY_ID, SquashFSPackError, SquashFSPackProfile
 from .oci_provenance import ProvenanceSource
 from .oci_store import (
     DerivedLayerOccurrence,
@@ -24,7 +24,7 @@ from .oci_store import (
     OCIStoreError,
 )
 
-OCI_WORKER_REQUEST_SCHEMA = "palimpsest.oci-materialize-worker-request.v1"
+OCI_WORKER_REQUEST_SCHEMA = "palimpsest.oci-materialize-worker-request.v3"
 OCI_WORKER_RESPONSE_SCHEMA = "palimpsest.oci-materialize-worker-response.v4"
 MAX_OCI_WORKER_MESSAGE_BYTES = 256 * 1024
 MAX_OCI_WORKER_JSON_DEPTH = 12
@@ -243,6 +243,7 @@ class OCIWorkerRequest:
     packer_path: Path
     packer_sha256: str
     cpu_limit_seconds: int
+    pack_profile: SquashFSPackProfile = SquashFSPackProfile.CANONICAL
     schema: str = OCI_WORKER_REQUEST_SCHEMA
 
     def __post_init__(self) -> None:
@@ -281,6 +282,13 @@ class OCIWorkerRequest:
         )
         if f"sha256:{self.packer_sha256}" != self.key.packer_executable_digest:
             raise OCIWorkerProtocolError("request packer digest does not match the key")
+        if not isinstance(self.pack_profile, SquashFSPackProfile):
+            raise OCIWorkerProtocolError("request.pack_profile is unsupported")
+        if (
+            self.key.pack_policy_id != SQUASHFS_PACK_POLICY_ID
+            or self.key.pack_policy_fingerprint != self.pack_profile.policy.fingerprint
+        ):
+            raise OCIWorkerProtocolError("request pack policy does not match the key")
         if type(self.cpu_limit_seconds) is not int or not 1 <= self.cpu_limit_seconds <= 3600:
             raise OCIWorkerProtocolError("request.cpu_limit_seconds is invalid")
         if self.schema != OCI_WORKER_REQUEST_SCHEMA:
@@ -294,6 +302,7 @@ class OCIWorkerRequest:
             "key": {"digest": self.key_digest, "value": self.key.to_dict()},
             "nonce": self.nonce,
             "occurrence": self.occurrence.to_dict(),
+            "pack_profile": self.pack_profile.value,
             "packer_path": os.fspath(self.packer_path),
             "packer_sha256": self.packer_sha256,
             "roots": {"config": os.fspath(self.config_root), "state": os.fspath(self.state_root)},
@@ -318,6 +327,7 @@ class OCIWorkerRequest:
             "key",
             "nonce",
             "occurrence",
+            "pack_profile",
             "packer_path",
             "packer_sha256",
             "roots",
@@ -330,6 +340,9 @@ class OCIWorkerRequest:
         source_cas = _exact_fields(value["source_cas"], {"cas_id", "root"}, "request.source_cas")
         key_value = _exact_fields(value["key"], {"digest", "value"}, "request.key")
         try:
+            if type(value["pack_profile"]) is not str:
+                raise OCIWorkerProtocolError("request.pack_profile is unsupported")
+            pack_profile = SquashFSPackProfile(value["pack_profile"])
             source = ProvenanceSource.from_dict(value["source"])
             occurrence = DerivedLayerOccurrence.from_dict(value["occurrence"])
             key = DerivedSquashFSKey.from_dict(key_value["value"])
@@ -349,6 +362,7 @@ class OCIWorkerRequest:
             packer_path=_absolute_path(value["packer_path"], "request.packer_path"),
             packer_sha256=value["packer_sha256"],
             cpu_limit_seconds=value["cpu_limit_seconds"],
+            pack_profile=pack_profile,
             schema=value["schema"],
         )
 

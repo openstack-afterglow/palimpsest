@@ -1,5 +1,23 @@
 # Palimpsest Architecture
 
+## Fixed service-image packing profile — 2026-10-31
+
+The next real CUDA attempt retained an observed `squashfs_packing` failure with
+code `oci-packer-timeout`; this establishes the120-second packer-policy rejection,
+not a disk-full or network cause. Service image execution explicitly selects the
+fixed `service-image` profile with900seconds per packer invocation. Canonical
+local/default callers retain their original120-second policy and recipe keys.
+The service policy has one stable fingerprint, independent of each attempt's
+remaining time; parent and exec child recompute matching derived keys/toolchain
+authority. Strict request wirev3 requires the known profile; no arbitrary policy
+JSON or v2 compatibility shim is accepted. Response wire staysv4.
+
+The enclosing original image-job/materialization deadline still stops the child
+earlier when necessary; no3600-second lease extension, timeout success, retry of a
+failed image, or changed artifact bytes is introduced. A tiny real-child fixture
+can prove selected-policy/key binding, but only a large API image attempt can
+qualify the newly admitted packing duration and actual GPU/cuDNN behavior.
+
 ## Materialization diagnostic wire — 2026-10-31
 
 OCI layer conversion/packing occurs in a hard-bounded child process. Error
@@ -2027,9 +2045,9 @@ provider provisioning. Fresh multi-instance evidence is recorded separately.
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "a940c8e15e923a6054184bb978476049a27e0cf405eeb9b7e330964598105996",
-  "reviewed_at": "2026-10-31T02:20:25Z",
-  "summary": "Reviewed materializer response v4 producer/decoder/parent/builder cutover with fixed code/category/resource and IO errno allowlists, bounded cause/context, and observed operation phase rather than exception-domain inference. Diagnostic privacy/no-success-metadata and artifact authority retained. Final affected591 passed4 skipped; isolated real emission test passed after removing unsafe global platform spoof (test-only Darwin SIGSYS cause). Runtime policy/limits/successful artifact semantics unchanged. Native new-child candidate probe, worker-only rollout and actual GPU acceptance remain pending; old failed a2 cause remains unknown."
+  "source_sha256": "c12dd31fbb4e2eeab13d88724bbda4005b90e2e7654cb9e728be1f39a78dd063",
+  "reviewed_at": "2026-10-31T03:42:19Z",
+  "summary": "Reviewed fixed named service-image900s pack profile after actual retainedoci-packer-timeout; canonical120 defaults/keys unchanged, parent/child stable policyfingerprint/keyauthority and strictrequestv3/responsev4, no arbitrarytimeout orleaseextension; originalabsolute3600job/remainingCPUdeadline stillfences. Focused652 passed6 skipped and independentreview clean; lint passed/ownedformat done. Native selectedprofile/defaultkey fixture and newlargeAPI GPUacceptance remain pending; all old failures/accounting preserved."
 }
 ```
 <!-- architecture-review:end -->

@@ -998,3 +998,71 @@ def test_safe_failure_summary_walks_both_links_and_bounds_depth():
         "category": "Exception",
         "errno": None,
     }
+
+
+@pytest.mark.parametrize("acquisition_seconds", [250.0, 3601.0])
+def test_run_image_selects_service_profile_without_extending_absolute_deadline(
+    tmp_path, monkeypatch, acquisition_seconds
+):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+
+    from palimpsest_local.oci_packer import SquashFSPackProfile
+
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(builder, "sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setattr(builder, "platform", SimpleNamespace(machine=lambda: "x86_64"))
+    monkeypatch.setattr(builder.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(builder.resource, "setrlimit", lambda *args: None)
+    monkeypatch.setattr(builder, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    monkeypatch.setattr(builder, "_private_mounts", lambda: None)
+    group = tmp_path / "cgroup"
+    group.mkdir()
+    monkeypatch.setattr(builder, "_cgroup", lambda *args: (group, None))
+    executor = SimpleNamespace(mounts=[], command=lambda *args: None)
+    monkeypatch.setattr(builder, "_scratch", lambda *args: nullcontext((tmp_path, 1024, executor)))
+    monkeypatch.setattr(builder, "_temporary_root", lambda *args: nullcontext())
+    original_mkdir = Path.mkdir
+
+    def mkdir(path, *args, **kwargs):
+        if path == Path("/var/lib/cni"):
+            return None
+        return original_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", mkdir)
+    observed = []
+
+    class Cache:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def pull(self, reference, **kwargs):
+            assert kwargs["timeout_seconds"] == 3600
+            clock.now += acquisition_seconds
+            return {"root_digest": "sha256:" + "a" * 64}
+
+        def materialize(self, digest, **kwargs):
+            observed.append(kwargs)
+            return {"receipt": "materialized"}
+
+    monkeypatch.setattr(builder, "LayerCache", Cache)
+    monkeypatch.setattr(builder, "materialized_result", lambda *args: {"complete": True})
+    manifest = {
+        "platform": "linux/amd64",
+        "run_network": "none",
+        "cgroup_root": str(group),
+        "scratch_bytes": 1024,
+        "timeout_seconds": 3600,
+        "max_output_bytes": 1024,
+        "kind": "registry",
+        "request": {"reference": "docker.io/library/alpine:latest"},
+        "registry_hosts": ["docker.io"],
+    }
+    if acquisition_seconds > 3600:
+        with pytest.raises(TimeoutError, match="deadline expired"):
+            builder.run_image(manifest, tmp_path)
+        assert not observed
+    else:
+        assert builder.run_image(manifest, tmp_path) == {"complete": True}
+        assert observed == [{"timeout_seconds": 3350.0, "pack_profile": SquashFSPackProfile.SERVICE_IMAGE}]
+    assert manifest["timeout_seconds"] == 3600
