@@ -589,6 +589,134 @@ def _wait(get, terminal, deadline, event, kind):
     raise ArtifactValidationError("scenario observation deadline; inspect persisted IDs, never replay")
 
 
+def _advance_once(config, output, role, spec, admitted, row, client, operation, *, before_effect=None):
+    """Persist exact intent before one POST; an ambiguous reply is GET-only forever."""
+    identity = {
+        "job_id": config["job_id"],
+        "config_sha256": _digest(config),
+        "role": role,
+        "instance_id": admitted.get("id"),
+        "operation": operation,
+        "request_id": spec.get("request_id"),
+        "boot_volume_id": row.get("boot_volume_id"),
+    }
+    if any(not isinstance(value, str) or not value for value in identity.values()):
+        raise ArtifactValidationError("explicit API advance requires original bound identities")
+    if row.get("id") != identity["instance_id"] or row.get("request_id") != identity["request_id"]:
+        raise ArtifactValidationError("explicit API advance original identity changed")
+    if admitted.get("boot_volume_id") not in (None, identity["boot_volume_id"]):
+        raise ArtifactValidationError("explicit API advance boot identity changed")
+    path = Path(output) / (role + "-" + operation + "-advance.json")
+    if path.exists():
+        if json.loads(path.read_text()) != identity:
+            raise ArtifactValidationError("original API advance intent changed; no replay")
+        result_path = path.with_name(path.stem + "-result.json")
+        if result_path.exists() and json.loads(result_path.read_text()).get("outcome") in {"rejected", "no-call"}:
+            raise ArtifactValidationError(
+                "original API advance did not proceed; explicit disposition required, no replay"
+            )
+        return row
+    advance = client.advance_instance
+    if not callable(advance):
+        raise ArtifactValidationError("explicit API advance transport is required")
+    if before_effect is not None:
+        before_effect()
+    atomic_write_json(path, identity)
+    if before_effect is not None:
+        try:
+            before_effect()
+        except Exception:
+            atomic_write_json(path.with_name(path.stem + "-result.json"), {"outcome": "no-call"})
+            raise
+    try:
+        response = advance(
+            identity["instance_id"],
+            operation=operation,
+            request_id=identity["request_id"],
+            boot_volume_id=identity["boot_volume_id"],
+        )
+    except Exception as exc:
+        status = getattr(exc, "http_status", None)
+        rejected = isinstance(status, int) and 400 <= status < 500
+        atomic_write_json(
+            path.with_name(path.stem + "-result.json"),
+            {
+                "outcome": "rejected" if rejected else "unknown",
+                "http_status": status,
+            },
+        )
+        if rejected:
+            raise ArtifactValidationError(
+                "explicit API advance rejected (HTTP " + str(status) + "); no replay"
+            ) from None
+        # An unknown response is not evidence of either success or no effect.
+        return row
+    atomic_write_json(
+        path.with_name(path.stem + "-result.json"), {"outcome": "accepted", "response": _public(response)}
+    )
+    return row
+
+
+def _consumer_observer(config, output, role, spec, admitted, cloud, budget, reservation, deadline, *, fence=None):
+    """Normal execution polling, unlike cleanup, may explicitly admit Nova once."""
+
+    def check():
+        budget.check_allocation(deadline)
+        if fence is not None:
+            fence()
+        with budget._locked() as ledger:
+            original = ledger["reservations"].get(reservation, {})
+            if (
+                original.get("job_id") != config["job_id"]
+                or original.get("role") != role
+                or original.get("released")
+                or original.get("pending", False)
+                or original.get("server_id") is not None
+            ):
+                raise ArtifactValidationError("original API advance reservation changed")
+        # Ledger persistence and optional source checks may themselves be slow.
+        if fence is not None:
+            fence()
+        budget.check_allocation(deadline)
+
+    def observe():
+        client = _hub(config, cloud.connection)
+        row = client.get_instance(admitted["id"])
+        if row.get("id") != admitted["id"] or row.get("request_id") != spec["request_id"]:
+            raise ArtifactValidationError("original API consumer identity changed")
+        if admitted.get("boot_volume_id") not in (None, row.get("boot_volume_id")):
+            raise ArtifactValidationError("original API consumer boot identity changed")
+        if row.get("provider_phase") == "volume_ready":
+            if row.get("server_id") is not None or row.get("server_create_attempted") is not False:
+                raise ArtifactValidationError("prepared root lacks a certified unattempted Nova effect")
+            _advance_once(config, output, role, spec, admitted, row, client, "create-server", before_effect=check)
+            # GET remains the sole observation path; never treat POST acceptance
+            # or a missing response as guest/provider readiness.
+            row = client.get_instance(admitted["id"])
+            if (
+                row.get("id") != admitted["id"]
+                or row.get("request_id") != spec["request_id"]
+                or row.get("boot_volume_id")
+                != json.loads((Path(output) / (role + "-create-server-advance.json")).read_text())["boot_volume_id"]
+            ):
+                raise ArtifactValidationError("advanced API consumer identity changed")
+        if row.get("server_id"):
+            with budget._locked() as ledger:
+                original = ledger["reservations"].get(reservation, {})
+                if (
+                    original.get("job_id") != config["job_id"]
+                    or original.get("role") != role
+                    or original.get("released")
+                    or original.get("pending", False)
+                    or original.get("server_id") not in (None, row["server_id"])
+                ):
+                    raise ArtifactValidationError("observed API server original reservation changed")
+            budget.bind(reservation, row["server_id"])
+        return row
+
+    return observe
+
+
 def _delete_consumer(
     config, output, role, spec, admitted, row, client, cloud, budget, reservation, deadline, event, kind
 ):
@@ -607,8 +735,23 @@ def _delete_consumer(
     existing = path.exists()
     if existing and json.loads(path.read_text()) != identity:
         raise ArtifactValidationError("original API delete identity changed; retain reservation, never replay")
-    if any(not isinstance(value, str) or not value for value in identity.values()):
+
+    def never_attempted(observed):
+        phase = observed.get("provider_phase")
+        return (
+            observed.get("server_id") is None
+            and observed.get("server_create_attempted") is False
+            and (
+                phase in {"volume_preparing", "volume_ready", "delete_volume_pending", "delete_volume_ready", "deleted"}
+                or (phase == "uncertain" and observed.get("status") in {"error", "deleting"})
+            )
+        )
+
+    volume_only = never_attempted(row)
+    if any(not isinstance(value, str) or not value for key, value in identity.items() if key != "server_id"):
         raise ArtifactValidationError("original API delete identity uncertain; no budget release")
+    if not volume_only and (not isinstance(identity["server_id"], str) or not identity["server_id"]):
+        raise ArtifactValidationError("original API delete identity uncertain: Nova history unknown; no budget release")
 
     def validate(observed):
         if any(
@@ -621,6 +764,8 @@ def _delete_consumer(
             )
         ):
             raise ArtifactValidationError("original API delete identity changed; retain reservation, never replay")
+        if volume_only and not never_attempted(observed):
+            raise ArtifactValidationError("original volume-only Nova certificate changed")
         return observed
 
     validate(row)
@@ -645,23 +790,53 @@ def _delete_consumer(
     budget.bind(reservation, identity["server_id"])
     if not existing:
         if row["status"] not in {"deleting", "deleted"}:
-            cloud.verify_external(
-                identity["server_id"], expected_marker={"palimpsest_instance_id": identity["instance_id"]}
-            )
+            if volume_only:
+                prepared = cloud.verify_prepared_volume(identity["instance_id"], identity["boot_volume_id"])
+                atomic_write_json(Path(output) / (role + "-delete-root-observation.json"), prepared)
+            else:
+                cloud.verify_external(
+                    identity["server_id"], expected_marker={"palimpsest_instance_id": identity["instance_id"]}
+                )
         atomic_write_json(path, identity)
         if row["status"] not in {"deleting", "deleted"}:
             event("consumer-delete-started", {"id": identity["instance_id"], "role": role})
             client.delete_instance(identity["instance_id"])
+
+    def cleanup_fence():
+        if time.monotonic() >= deadline:
+            raise ArtifactValidationError("cleanup observation deadline before delete effect; retain reservation")
+
+    def observe_deletion():
+        observed = validate(_hub(config, cloud.connection).get_instance(identity["instance_id"]))
+        if observed.get("provider_phase") == "delete_volume_ready":
+            _advance_once(
+                config,
+                output,
+                role,
+                spec,
+                admitted,
+                observed,
+                _hub(config, cloud.connection),
+                "delete-volume",
+                before_effect=cleanup_fence,
+            )
+            observed = validate(_hub(config, cloud.connection).get_instance(identity["instance_id"]))
+        return observed
+
     if row["status"] != "deleted":
         row = _wait(
-            lambda: validate(_hub(config, cloud.connection).get_instance(identity["instance_id"])),
+            observe_deletion,
             {"deleted"},
             deadline,
             event,
             kind,
         )
     atomic_write_json(Path(output) / (role + "-deleted.json"), row)
-    cloud.verify_absent(identity["server_id"], identity["boot_volume_id"])
+    if volume_only:
+        absence = cloud.verify_absent(None, identity["boot_volume_id"], server_not_created=True)
+    else:
+        absence = cloud.verify_absent(identity["server_id"], identity["boot_volume_id"])
+    atomic_write_json(Path(output) / (role + "-absence.json"), absence)
     budget.release(reservation)
     return row
 
@@ -892,10 +1067,13 @@ def _run_api_cluster(config, output, prefix, measurement, state, cloud, budget, 
         originals.append(admitted)
         specs.append(spec)
         records.append(record)
+        poll_member = _consumer_observer(
+            config, output, role, spec, admitted, cloud, budget, reservation, pair_deadline, fence=fence
+        )
 
-        def member_visible(admitted=admitted, index=index):
+        def member_visible(admitted=admitted, index=index, poll_member=poll_member):
             fence()
-            row = _hub(config, cloud.connection).get_instance(admitted["id"])
+            row = poll_member()
             fence()
             if row.get("status") in {"error", "failed", "missing", "uncertain", "deleting", "deleted"}:
                 return row
@@ -990,6 +1168,11 @@ def _run_api_cluster(config, output, prefix, measurement, state, cloud, budget, 
         records[index]["status"] = "deleted"
         live.remove(records[index])
     measurement["status"] = "success"
+
+
+def _check_runner_source(state):
+    if _source_identity()["files"] != state["runner_source"]["files"]:
+        raise ArtifactValidationError("runner source changed before consumer advance; no call")
 
 
 def _source_identity():
@@ -1396,10 +1579,19 @@ def _run_scenario(config, output, *, cloud_factory=None, connection=None):
                         server_id=admitted.get("server_id"),
                         effect="accepted",
                     )
-                    if admitted.get("server_id"):
-                        budget.bind(reservation, admitted["server_id"])
                     row = _wait(
-                        lambda identity=admitted["id"]: _hub(config, cloud.connection).get_instance(identity),
+                        _consumer_observer(
+                            config,
+                            output,
+                            role,
+                            spec,
+                            admitted,
+                            cloud,
+                            budget,
+                            reservation,
+                            deadline,
+                            fence=lambda: _check_runner_source(state),
+                        ),
                         {"ready"},
                         deadline,
                         event,

@@ -24,6 +24,8 @@ sys.path.insert(0, str(ROOT / "src"))
 from palimpsest_local.benchmark_scenario_cloud import ScenarioCloud  # noqa: E402
 from palimpsest_local.benchmark_scenarios import (  # noqa: E402
     ResourceBudget,
+    _consumer_observer,
+    _delete_consumer,
     _digest,
     _hub,
     _wait,
@@ -203,13 +205,12 @@ def run(config, output, *, connection=None):
             spec.update(source_instance_id=previous["id"]) if previous else spec.update(image_job_id=built["id"])
             atomic_write_json(output / (role + "-intent.json"), {"request": spec, "reservation_id": reservation})
             event("consumer-create", {"role": role, "request_id": spec["request_id"]})
+            budget.check_allocation(deadline)
             row = _hub(config, observer.connection).create_instance(spec)
             atomic_write_json(output / (role + "-accepted.json"), row)
             state["consumer_creations"] += 1
-            if row.get("server_id"):
-                budget.bind(reservation, row["server_id"])
             ready = _wait(
-                lambda identity=row["id"]: _hub(config, observer.connection).get_instance(identity),
+                _consumer_observer(config, output, role, spec, row, observer, budget, reservation, deadline),
                 {"ready"},
                 deadline,
                 event,
@@ -244,26 +245,23 @@ def run(config, output, *, connection=None):
                     "consumer-stop-status",
                 )
             event("consumer-delete", {"id": ready["id"], "server_id": ready["server_id"]})
-            atomic_write_json(
-                output / (role + "-delete-intent.json"),
-                {
-                    "instance_id": ready["id"],
-                    "server_id": ready["server_id"],
-                    "boot_volume_id": ready["boot_volume_id"],
-                },
-            )
-            _hub(config, observer.connection).delete_instance(ready["id"])
-            deleted = _wait(
-                lambda identity=ready["id"]: _hub(config, observer.connection).get_instance(identity),
-                {"deleted"},
+            deleted = _delete_consumer(
+                config,
+                output,
+                role,
+                spec,
+                row,
+                ready,
+                _hub(config, observer.connection),
+                observer,
+                budget,
+                reservation,
                 deadline,
                 event,
                 "consumer-delete-status",
             )
-            absence = observer.verify_absent(ready["server_id"], ready["boot_volume_id"])
+            absence = json.loads((output / (role + "-absence.json")).read_text())
             atomic_write_json(output / (role + "-deleted.json"), {"api": deleted, "sdk": absence})
-            budget.bind(reservation, ready["server_id"])
-            budget.release(reservation)
             state["steps"].append(
                 {
                     "operation": role,

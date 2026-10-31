@@ -51,6 +51,63 @@ def test_generic_hub_cache_upload_is_rejected_before_transport(tmp_path: Path, m
     assert source.read_bytes() == b"cache bytes"
 
 
+@pytest.mark.parametrize("failure", ["server-error", "disconnect", "rejected"])
+def test_instance_advance_posts_exact_original_binding_and_get_remains_pure(failure):
+    import http.client
+    import socket
+
+    calls = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            calls.append(("POST", self.path, body, self.headers["X-Project-Id"]))
+            if failure == "disconnect":
+                self.connection.shutdown(socket.SHUT_RDWR)
+                self.connection.close()
+                return
+            self.send_response(403 if failure == "rejected" else 500)
+            self.end_headers()
+
+        def do_GET(self):
+            calls.append(("GET", self.path, None, self.headers["X-Project-Id"]))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"id":"instance/id","provider_phase":"volume_ready"}')
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        client = HubClient(
+            "http://127.0.0.1:" + str(server.server_address[1]), "original-token", project_id="original-project"
+        )
+        with pytest.raises((HubError, http.client.RemoteDisconnected)) as caught:
+            client.advance_instance(
+                "instance/id", operation="create-server", request_id="original-request", boot_volume_id="exact-boot"
+            )
+        if failure != "disconnect":
+            assert caught.value.http_status == (403 if failure == "rejected" else 500)
+        assert client.get_instance("instance/id")["provider_phase"] == "volume_ready"
+        assert calls == [
+            (
+                "POST",
+                "/v1/instances/instance%2Fid/advance",
+                {"operation": "create-server", "request_id": "original-request", "boot_volume_id": "exact-boot"},
+                "original-project",
+            ),
+            ("GET", "/v1/instances/instance%2Fid", None, "original-project"),
+        ]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
 class MockHubHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass  # Suppress logging during tests

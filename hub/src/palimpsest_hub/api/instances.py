@@ -132,8 +132,32 @@ async def list_instances(limit: int = Query(50, ge=1, le=100), actor: dict = Dep
 
 
 @router.get("/instances/{instance_id}", operation_id="get_hub_instance")
-async def get_instance(instance_id: UUID, actor: dict = Depends(_legacy_inventory), conn=Depends(get_os_conn)):
-    return await service.observe(_factory_or_503(), actor, conn, str(instance_id))
+async def get_instance(
+    instance_id: UUID, response: Response, actor: dict = Depends(_legacy_inventory), conn=Depends(get_os_conn)
+):
+    # Reconcile SQL observations only: GET never dispatches a provider mutation.
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        return await service.observe(_factory_or_503(), actor, conn, str(instance_id), get_settings())
+    except HTTPException as exc:
+        exc.headers = {**(exc.headers or {}), "Cache-Control": "no-store"}
+        raise
+
+
+class InstanceAdvanceRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    operation: Literal["create-server", "delete-volume"]
+    request_id: UUID
+    boot_volume_id: UUID
+
+
+@router.post("/instances/{instance_id}/advance", status_code=202, operation_id="advance_hub_instance")
+async def advance_instance(
+    instance_id: UUID, req: InstanceAdvanceRequest, actor: dict = Depends(_legacy_writer), conn=Depends(get_os_conn)
+):
+    return await service.advance(
+        _factory_or_503(), actor, conn, str(instance_id), req.model_dump(mode="json"), get_settings()
+    )
 
 
 @router.post("/instances/{instance_id}/stop", status_code=202, operation_id="stop_hub_instance")

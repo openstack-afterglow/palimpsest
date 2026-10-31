@@ -44,6 +44,30 @@ fixed offline k3s image recipe and hash-pinned airgap archive. `cluster_server_i
 selects the same original user's unexpired server and exact retained stack, not an
 arbitrary join URL/token or remote shell. See [precise execution/proof boundaries](benchmarks.md#fixed-api-k3s-qualification).
 
+The prepared-root instance API requires a coordinated reviewed API/client source
+cutover; installing a client wheel alone does not deploy it. Initial instance
+creation allocates only one exact-project image-backed Cinder root and returns
+while it is preparing. Pure GET observes `provider_phase=volume_ready` without
+starting a VM. Explicit `POST /v1/instances/{id}/advance` with
+`{"operation":"create-server","request_id":"<original UUID>","boot_volume_id":"<bound UUID>"}`
+is the only first-Nova path. Nova attaches that existing volume, not an image
+source. Preserve the original bootstrap expiration and all current Nova/Cinder/
+GPU-host settings; this repair does not increase provider wait limits.
+
+Deploy source-compatible callers together: record each explicit advancement
+intent before sending once, then use GET-only settlement after an unknown reply.
+Do not assume an older client which only creates and polls GET will start Nova.
+Prepared-volume-only DELETE records cleanup intent without deleting Cinder;
+when GET exposes `delete_volume_ready`, advance with `operation="delete-volume"`
+and the same original request/boot identity. Unknown provider deletion remains
+GET-only until actual404. `server_create_attempted=false` is a versioned no-call
+certificate; null legacy/unknown state is never evidence that no server exists.
+Existing server-backed DELETE may still remove Nova. This change adds private
+versioned state to the existing instance spec JSON and uses `boot_volume_id`;
+no new database column or raw-token persistence is required. Preserve existing
+server-backed rows and uncertain journals rather than replaying old creates.
+See the [instance state and ownership contract](../ARCHITECTURE.md#instance-effects-guest-boundary-and-result-semantics).
+
 For the fixed k3s context, set explicit matching API/worker
 `palimpsest_max_context_bytes` and `palimpsest_max_context_expanded_bytes` to at
 least256MiB; keep worker RUN network `none`. Larger TensorFlow contexts require

@@ -653,6 +653,13 @@ def _api_scenario_model(tmp_path, monkeypatch, method="api-import"):
             self.lose_response = False
             self.fail_verification = False
             self.absence_checks = []
+            self.advances = []
+            self.lose_advance = False
+            self.advance_effect = True
+            self.pending_volume_delete = False
+            self.volume_deletes = 0
+            self.lose_volume_delete = False
+            self.volume_delete_effect = True
 
         def import_registry_image(self, request):
             self.images.append(request)
@@ -667,8 +674,10 @@ def _api_scenario_model(tmp_path, monkeypatch, method="api-import"):
             self.row = {
                 "id": "consumer",
                 "request_id": request["request_id"],
-                "status": "ready",
-                "server_id": "original-server",
+                "status": "allocating",
+                "server_id": None,
+                "provider_phase": "volume_ready",
+                "server_create_attempted": False,
                 "boot_volume_id": "original-boot",
                 "layer_digests": ["sha256:" + "a" * 64],
                 "result": {"exit_code": 0, "stdout": json.dumps({"palimpsest_workload": proof})},
@@ -676,8 +685,38 @@ def _api_scenario_model(tmp_path, monkeypatch, method="api-import"):
             self.removed = False
             return dict(self.row)
 
+        def advance_instance(self, identity, *, operation, request_id, boot_volume_id):
+            assert identity == self.row["id"]
+            assert request_id == self.row["request_id"] and boot_volume_id == self.row["boot_volume_id"]
+            if operation == "delete-volume":
+                assert self.row["provider_phase"] == "delete_volume_ready"
+                assert (output / "r1-consumer1-delete-volume-advance.json").exists()
+                self.volume_deletes += 1
+                if self.volume_delete_effect:
+                    self.removed = True
+                    self.row.update(status="deleted", provider_phase="deleted")
+                if self.lose_volume_delete:
+                    raise RuntimeError("volume delete response lost")
+                return dict(self.row)
+            assert operation == "create-server"
+            assert self.row["server_create_attempted"] is False
+            assert (output / ("r1-consumer" + str(len(self.advances) + 1) + "-create-server-advance.json")).exists()
+            self.advances.append((identity, operation, request_id, boot_volume_id))
+            if self.advance_effect:
+                self.row.update(
+                    status="ready",
+                    server_id="original-server",
+                    provider_phase="server_attempted",
+                    server_create_attempted=True,
+                )
+            if self.lose_advance:
+                raise RuntimeError("advance response lost")
+            return dict(self.row)
+
         def get_instance(self, identity):
             assert identity == "consumer"
+            if self.row.get("provider_phase") == "delete_volume_pending":
+                self.row["provider_phase"] = "delete_volume_ready"
             return dict(self.row)
 
         def delete_instance(self, identity):
@@ -685,6 +724,9 @@ def _api_scenario_model(tmp_path, monkeypatch, method="api-import"):
             self.provider_deletes += 1
             self.delete_journals.append((output / "r1-consumer1-delete.json").exists())
             self.row["status"] = "deleting"
+            if self.pending_volume_delete:
+                self.row["provider_phase"] = "delete_volume_pending"
+                return dict(self.row)
             if self.lose_response:
                 raise RuntimeError("accepted provider deletion response lost")
             self.row["status"] = "deleted"
@@ -706,9 +748,13 @@ def _api_scenario_model(tmp_path, monkeypatch, method="api-import"):
                 raise ArtifactValidationError("verification interrupted")
             return {"server_id": server_id}
 
-        def verify_absent(self, server_id, boot_volume_id):
+        def verify_prepared_volume(self, instance_id, boot_volume_id):
+            assert instance_id == "consumer" and boot_volume_id == "original-boot"
+            assert model.row["server_id"] is None and model.row["server_create_attempted"] is False
+
+        def verify_absent(self, server_id, boot_volume_id, *, server_not_created=False):
             model.absence_checks.append((server_id, boot_volume_id))
-            assert (server_id, boot_volume_id) == ("original-server", "original-boot")
+            assert (server_id, boot_volume_id) == (None if server_not_created else "original-server", "original-boot")
             if not model.removed:
                 raise ArtifactValidationError("original provider resources still present")
 
@@ -908,11 +954,27 @@ def _cold_warm_model(tmp_path, monkeypatch):
         clock[0] += 10 if index == 1 else 5
         create(request)
         suffix = "1" if model.reused_resources else str(index)
-        model.row.update(id="consumer-" + suffix, server_id="server-" + suffix, boot_volume_id="boot-" + suffix)
+        model.row.update(id="consumer-" + suffix, boot_volume_id="boot-" + suffix)
         if index == 1 and model.fail_first:
             model.row["result"]["exit_code"] = 1
         if index == 2 and model.changed_layers:
             model.row["layer_digests"] = ["sha256:" + "b" * 64]
+        return dict(model.row)
+
+    def advance(identity, *, operation, request_id, boot_volume_id):
+        assert identity == model.row["id"] and operation == "create-server"
+        assert request_id == model.row["request_id"] and boot_volume_id == model.row["boot_volume_id"]
+        role = "r1-consumer" + str(len(model.creates))
+        intent = json.loads((output / (role + "-create-server-advance.json")).read_text())
+        assert intent["request_id"] == request_id and intent["boot_volume_id"] == boot_volume_id
+        assert model.row["server_id"] is None and model.row["server_create_attempted"] is False
+        model.advances.append((identity, operation, request_id, boot_volume_id))
+        model.row.update(
+            status="ready",
+            server_id="server-" + identity.rsplit("-", 1)[1],
+            provider_phase="server_attempted",
+            server_create_attempted=True,
+        )
         return dict(model.row)
 
     def delete(identity):
@@ -928,10 +990,11 @@ def _cold_warm_model(tmp_path, monkeypatch):
         "output_digests": ["sha256:" + "a" * 64],
     }
     model.create_instance = consumer
+    model.advance_instance = advance
     model.get_instance = lambda identity: dict(model.row)
     model.delete_instance = delete
     monkeypatch.setattr(cloud, "verify_external", lambda self, identity, **kwargs: {"server_id": identity})
-    monkeypatch.setattr(cloud, "verify_absent", lambda self, *args: None)
+    monkeypatch.setattr(cloud, "verify_absent", lambda self, *args, **kwargs: None)
     return value, output, model, cloud, clock
 
 
@@ -944,6 +1007,8 @@ def test_cold_warm_has_one_image_job_two_fresh_consumers_and_continuous_clocks(t
     assert model.creates[1]["source_instance_id"] == "consumer-1"
     assert "image_job_id" not in model.creates[1]
     assert model.creates[0]["request_id"] != model.creates[1]["request_id"]
+    assert len(model.advances) == 2
+    assert [item[2] for item in model.advances] == [item["request_id"] for item in model.creates]
     measurement = result["measurements"][0]
     cold, warm = measurement["consumers"]
     assert [cold["boundary"], warm["boundary"]] == ["cold", "warm"]
@@ -1286,10 +1351,12 @@ def _api_cluster_model(tmp_path, monkeypatch):
         row = {
             "id": identity,
             "request_id": spec["request_id"],
-            "server_id": "server-" + str(index),
+            "server_id": None,
             "boot_volume_id": "boot-" + str(index),
-            "status": "ready" if role == "agent" else "bootstrapping",
-            "provider_status": "ACTIVE",
+            "status": "allocating",
+            "provider_status": None,
+            "provider_phase": "volume_ready",
+            "server_create_attempted": False,
             "private_ip": "10.0.0." + str(index + 1),
             "layer_digests": ["sha256:" + "a" * 64],
             "result": {"exit_code": None, "stdout": ""},
@@ -1305,11 +1372,30 @@ def _api_cluster_model(tmp_path, monkeypatch):
             row["layer_digests"] = ["sha256:" + "b" * 64]
         model.rows[identity] = row
         model.maximum_live = max(model.maximum_live, sum(item["status"] != "deleted" for item in model.rows.values()))
-        if role == "agent":
-            server.update(status="ready", result={"exit_code": 0, "stdout": json.dumps(proof(server, row))})
+        # The initial admission is Cinder-only, even when its root is ready.
         clock[0] += 10
         if model.lost_create:
             raise RuntimeError("accepted create response lost")
+        return copy.deepcopy(row)
+
+    def advance(identity, *, operation, request_id, boot_volume_id):
+        row = model.rows[identity]
+        assert operation == "create-server" and row["server_create_attempted"] is False
+        assert row["request_id"] == request_id and row["boot_volume_id"] == boot_volume_id
+        index = int(uuid.UUID(identity))
+        role = "r" + str((index + 1) // 2) + "-consumer" + str(2 if index % 2 == 0 else 1)
+        assert (output / (role + "-create-server-advance.json")).exists()
+        model.advances.append((identity, operation, request_id, boot_volume_id))
+        row.update(
+            server_id="server-" + str(index),
+            provider_status="ACTIVE",
+            provider_phase="server_attempted",
+            server_create_attempted=True,
+            status="ready" if row["cluster"]["role"] == "agent" else "bootstrapping",
+        )
+        if row["cluster"]["role"] == "agent":
+            server = model.rows[row["cluster"]["server_instance_id"]]
+            server.update(status="ready", result={"exit_code": 0, "stdout": json.dumps(proof(server, row))})
         return copy.deepcopy(row)
 
     def delete(identity):
@@ -1324,7 +1410,7 @@ def _api_cluster_model(tmp_path, monkeypatch):
         if model.lost_delete:
             row["status"] = "deleting"
             raise RuntimeError("accepted delete response lost")
-        row["status"] = "deleted"
+        row.update(status="deleted", provider_phase="deleted")
         clock[0] += 1
 
     def observe(self, identity, **kwargs):
@@ -1335,15 +1421,22 @@ def _api_cluster_model(tmp_path, monkeypatch):
             assert resource["volume_ids"] == [row["boot_volume_id"]]
         return {"server_id": identity, "status": "ACTIVE", "addresses": [row["private_ip"]]}
 
+    def prepared(self, instance_id, boot_volume_id):
+        row = model.rows[instance_id]
+        assert row["boot_volume_id"] == boot_volume_id and row["server_id"] is None
+        assert row["server_create_attempted"] is False
+
     def forbidden_create(self, *args, **kwargs):
         model.sdk_creates.append((args, kwargs))
         raise AssertionError("api-cluster must never create through SDK")
 
     model.create_instance, model.delete_instance = create, delete
+    model.advance_instance = advance
     model.get_instance = lambda identity: copy.deepcopy(model.rows[identity])
     model.upload_build_context = upload
     monkeypatch.setattr(context, "acquire_context", acquire)
     monkeypatch.setattr(cloud, "verify_external", observe)
+    monkeypatch.setattr(cloud, "verify_prepared_volume", prepared)
     monkeypatch.setattr(cloud, "create", forbidden_create, raising=False)
     return value, output, model, cloud, clock
 
@@ -1355,6 +1448,7 @@ def test_api_cluster_one_cold_job_two_simultaneous_pairs_exact_prepared_reuse(tm
     assert model.sdk_creates == []
     assert len(model.images) == len(model.uploads) == len(model.acquisitions) == 1
     assert len(model.creates) == 4 and model.maximum_live == 2
+    assert len(model.advances) == 4
     assert [row["boundary"] for row in result["measurements"]] == ["cold", "prepared-reuse"]
     assert result["measurements"][0]["timing"]["elapsed_seconds"] == 85
     assert result["measurements"][1]["timing"]["elapsed_seconds"] == 20
@@ -1377,19 +1471,19 @@ def test_api_cluster_agent_callback_ready_waits_read_only_for_provider_active(tm
 
     value, output, model, cloud, clock = _api_cluster_model(tmp_path, monkeypatch)
     value["repetitions"] = 1
-    create, get, observe = model.create_instance, model.get_instance, cloud.verify_external
+    advance, get, observe = model.advance_instance, model.get_instance, cloud.verify_external
     agent_reads, provider_reads = [], []
 
-    def early_callback(spec):
-        row = create(spec)
-        if spec.get("cluster_server_id"):
+    def early_callback(identity, **binding):
+        row = advance(identity, **binding)
+        if row["cluster"]["role"] == "agent":
             model.rows[row["id"]]["provider_status"] = "BUILD"
             row["provider_status"] = "BUILD"
         return row
 
     def observe_callback(identity):
         row = model.rows[identity]
-        if row["cluster"]["role"] == "agent" and row["status"] != "deleted":
+        if row["cluster"]["role"] == "agent" and row["server_id"] and row["status"] != "deleted":
             if agent_reads:
                 row["provider_status"] = "ACTIVE"
             agent_reads.append((row["status"], row["provider_status"]))
@@ -1401,7 +1495,7 @@ def test_api_cluster_agent_callback_ready_waits_read_only_for_provider_active(tm
         provider_reads.append((row["cluster"]["role"], row["provider_status"]))
         return dict(observe(self, resource, **kwargs), status=row["provider_status"])
 
-    model.create_instance, model.get_instance = early_callback, observe_callback
+    model.advance_instance, model.get_instance = early_callback, observe_callback
     monkeypatch.setattr(cloud, "verify_external", provider)
     monkeypatch.setattr(scenarios.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
     result = run_scenario(value, output, cloud_factory=cloud)
@@ -1710,7 +1804,7 @@ def test_api_cluster_waits_for_provider_active_before_observing_unbound_ports(tm
 
     def building(identity):
         row = model.rows[identity]
-        if not waiting[0]:
+        if row["server_id"] and not waiting[0]:
             waiting[0] = True
             row["provider_status"] = "BUILD"
         return get(identity)
@@ -1733,3 +1827,300 @@ def test_api_cluster_waits_for_provider_active_before_observing_unbound_ports(tm
     assert run_scenario(value, output, cloud_factory=cloud)["status"] == "success"
     assert sleeps == [2]
     assert model.sdk_creates == []
+
+
+@pytest.mark.parametrize("effect", [True, False])
+def test_normal_consumer_unknown_advance_response_is_get_only_and_never_rereserved(tmp_path, monkeypatch, effect):
+    from palimpsest_local import benchmark_scenarios as scenarios
+
+    value, output, model, cloud = _api_scenario_model(tmp_path, monkeypatch)
+    model.lose_advance = True
+    model.advance_effect = effect
+    result = run_scenario(value, output, cloud_factory=cloud)
+    assert result["status"] == ("success" if effect else "failed")
+    assert len(model.advances) == 1
+    reservations = _scenario_reservations(value)
+    assert len(reservations) == 1 and reservations[0]["released"] is effect
+    if not effect:
+        admitted = json.loads((output / "r1-consumer1-accepted.json").read_text())
+        spec = json.loads((output / "r1-consumer1-intent.json").read_text())
+        observe = scenarios._consumer_observer(
+            value,
+            output,
+            "r1-consumer1",
+            spec,
+            admitted,
+            cloud(),
+            ResourceBudget(value, output),
+            result["resources"][0]["reservation_id"],
+            1e20,
+        )
+        assert observe()["server_id"] is None
+        assert len(model.advances) == 1
+
+
+@pytest.mark.parametrize("stage", ["before-intent", "after-intent"])
+@pytest.mark.parametrize("expired", ["approval", "deadline"])
+def test_prepared_consumer_expiry_fences_nova_without_another_reservation(tmp_path, monkeypatch, stage, expired):
+    from datetime import datetime
+
+    from palimpsest_local import benchmark_scenarios as scenarios
+
+    value, output, model, cloud = _api_scenario_model(tmp_path, monkeypatch)
+    value["approval"]["expires_at"] = datetime.fromtimestamp(1100, UTC).isoformat()
+    value["deadline_seconds"] = 60
+    clock = [1000.0]
+    monkeypatch.setattr(scenarios.time, "time", lambda: clock[0])
+    monkeypatch.setattr(scenarios.time, "monotonic", lambda: clock[0] - 1000)
+    original_get = model.get_instance
+    original_write = scenarios.atomic_write_json
+
+    def expire():
+        clock[0] = 1101 if expired == "approval" else 1061
+
+    def observe(identity):
+        row = original_get(identity)
+        if stage == "before-intent":
+            expire()
+        return row
+
+    def write(path, row):
+        original_write(path, row)
+        if stage == "after-intent" and path.name.endswith("-create-server-advance.json"):
+            expire()
+
+    model.get_instance = observe
+    monkeypatch.setattr(scenarios, "atomic_write_json", write)
+    result = run_scenario(value, output, cloud_factory=cloud)
+    assert result["status"] == "failed" and model.advances == []
+    assert (output / "r1-consumer1-create-server-advance.json").exists() is (stage == "after-intent")
+    assert len(_scenario_reservations(value)) == 1 and not _scenario_reservations(value)[0]["released"]
+
+
+@pytest.mark.parametrize("lost_reply", [True, False])
+def test_generic_cleanup_volume_only_never_creates_and_advances_exact_delete_once(tmp_path, monkeypatch, lost_reply):
+    from palimpsest_local import benchmark_scenarios as scenarios
+
+    value, output, model, cloud = _api_scenario_model(tmp_path, monkeypatch)
+    # Slow Cinder has not certified volume_ready during the normal run.
+    create = model.create_instance
+
+    def preparing(spec):
+        create(spec)
+        model.row["provider_phase"] = "volume_preparing"
+        return dict(model.row)
+
+    model.create_instance = preparing
+    result = run_scenario(value, output, cloud_factory=cloud)
+    assert result["status"] == "failed" and model.advances == []
+    model.pending_volume_delete = True
+    model.lose_volume_delete = lost_reply
+    model.row["provider_phase"] = "volume_ready"
+    # Cleanup remains authorized after creation authority expires.
+    monkeypatch.setattr(scenarios.time, "time", lambda: 1e12)
+    assert scenarios.cleanup_scenario(output)["cloud_creates"] == 0
+    assert model.provider_deletes == model.volume_deletes == 1 and model.advances == []
+    assert model.absence_checks == [(None, "original-boot")]
+    assert _scenario_reservations(value)[0]["released"]
+    scenarios.cleanup_scenario(output)
+    assert model.provider_deletes == model.volume_deletes == 1
+
+
+@pytest.mark.parametrize("certificate", [None, True])
+def test_generic_cleanup_legacy_or_attempted_null_server_is_hold(tmp_path, monkeypatch, certificate):
+    from palimpsest_local import benchmark_scenarios as scenarios
+
+    value, output, model, cloud = _api_scenario_model(tmp_path, monkeypatch)
+    model.advance_effect = False
+    run_scenario(value, output, cloud_factory=cloud)
+    model.row["server_create_attempted"] = certificate
+    with pytest.raises(ArtifactValidationError, match="uncertain"):
+        scenarios.cleanup_scenario(output)
+    assert model.provider_deletes == model.volume_deletes == 0
+    assert not _scenario_reservations(value)[0]["released"]
+
+
+def test_cli_scenario_run_uses_prepared_root_effect_then_status_is_readonly(tmp_path, monkeypatch, capsys):
+    from types import SimpleNamespace
+
+    from palimpsest_local import benchmark_cli
+
+    value, output, model, _ = _api_scenario_model(tmp_path, monkeypatch)
+    path = tmp_path / "scenario.json"
+    path.write_text(json.dumps(value))
+    monkeypatch.setattr(benchmark_cli.signal, "signal", lambda *args: None)
+    args = SimpleNamespace(benchmark_mode="scenario", scenario_action="run", config=path, output=output)
+    assert benchmark_cli.dispatch(args) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "success"
+    assert len(model.advances) == model.provider_deletes == 1
+    args.scenario_action = "status"
+    model.get_instance = lambda *args: pytest.fail("recorded CLI status must not access provider/API lifecycle")
+    assert benchmark_cli.dispatch(args) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "success"
+    assert len(model.advances) == model.provider_deletes == 1
+
+
+def test_cleanup_unknown_volume_delete_without_effect_holds_without_retry(tmp_path, monkeypatch):
+    from palimpsest_local import benchmark_scenarios as scenarios
+
+    value, output, model, cloud = _api_scenario_model(tmp_path, monkeypatch)
+    model.advance_effect = False
+    run_scenario(value, output, cloud_factory=cloud)
+    model.pending_volume_delete = True
+    model.volume_delete_effect = False
+    model.lose_volume_delete = True
+    for _ in range(2):
+        with pytest.raises(ArtifactValidationError, match="observation interrupted"):
+            scenarios.cleanup_scenario(output)
+        assert model.provider_deletes == model.volume_deletes == 1
+        assert len(model.advances) == 1
+        assert not _scenario_reservations(value)[0]["released"]
+    model.row.update(status="deleted", provider_phase="deleted")
+    model.removed = True
+    assert scenarios.cleanup_scenario(output)["status"] == "success"
+    assert model.provider_deletes == model.volume_deletes == 1
+    assert _scenario_reservations(value)[0]["released"]
+
+
+@pytest.mark.parametrize("status", [403, 409, 422, 500])
+def test_advance_response_receipts_distinguish_rejection_from_unknown(tmp_path, monkeypatch, status):
+    from palimpsest_local import benchmark_scenarios as scenarios
+    from palimpsest_local.errors import HubError
+
+    value, output, model, cloud = _api_scenario_model(tmp_path, monkeypatch)
+    attempts = []
+
+    def reject(identity, **binding):
+        attempts.append((identity, binding))
+        error = HubError("provider response")
+        error.http_status = status
+        raise error
+
+    model.advance_instance = reject
+    result = run_scenario(value, output, cloud_factory=cloud)
+    assert result["status"] == "failed"
+    receipt = json.loads((output / "r1-consumer1-create-server-advance-result.json").read_text())
+    assert receipt == {"outcome": "rejected" if status < 500 else "unknown", "http_status": status}
+    assert len(attempts) == 1 and not _scenario_reservations(value)[0]["released"]
+    if status < 500:
+        assert "advance rejected" in result["issues"][-1]["message"]
+    else:
+        assert "observation interrupted" in result["issues"][-1]["message"]
+    admitted = json.loads((output / "r1-consumer1-accepted.json").read_text())
+    spec = json.loads((output / "r1-consumer1-intent.json").read_text())
+    observe = scenarios._consumer_observer(
+        value,
+        output,
+        "r1-consumer1",
+        spec,
+        admitted,
+        cloud(),
+        ResourceBudget(value, output),
+        result["resources"][0]["reservation_id"],
+        1e20,
+    )
+    if status < 500:
+        with pytest.raises(ArtifactValidationError, match="explicit disposition"):
+            observe()
+    else:
+        observe()
+    assert len(attempts) == 1
+
+
+def test_first_visible_server_is_bound_before_workload_verification(tmp_path, monkeypatch):
+    value, output, model, cloud = _api_scenario_model(tmp_path, monkeypatch)
+    model.fail_verification = True
+    result = run_scenario(value, output, cloud_factory=cloud)
+    assert result["status"] == "failed" and model.provider_deletes == 0
+    reservation = _scenario_reservations(value)[0]
+    assert reservation["server_id"] == "original-server" and not reservation["released"]
+    receipt = json.loads((output / "r1-consumer1-create-server-advance-result.json").read_text())
+    assert receipt["outcome"] == "accepted" and receipt["response"]["server_id"] == "original-server"
+
+
+@pytest.mark.parametrize("attempted", [False, None, True])
+@pytest.mark.parametrize("root_state", ["present", "absent", "none", "error"])
+def test_terminal_prepared_root_cleanup_requires_positive_no_nova_certificate(
+    tmp_path, monkeypatch, attempted, root_state
+):
+    from types import SimpleNamespace
+
+    from palimpsest_local import benchmark_scenarios as scenarios
+    from palimpsest_local.benchmark_scenario_cloud import ScenarioCloud
+
+    value, output, model, cloud = _api_scenario_model(tmp_path, monkeypatch)
+    create = model.create_instance
+    provider_reads = []
+
+    def failed_root(spec):
+        create(spec)
+        model.row.update(
+            status="error",
+            provider_phase="uncertain",
+            server_create_attempted=attempted,
+            error_code="provider_instance_error",
+        )
+        return dict(model.row)
+
+    def get_volume(identity):
+        assert identity == "original-boot"
+        provider_reads.append(identity)
+        if root_state == "none":
+            return None
+        if root_state == "error":
+            error = RuntimeError("Cinder GET unavailable")
+            error.status_code = 503
+            raise error
+        if model.removed or root_state == "absent":
+            error = RuntimeError("actual exact Cinder GET404")
+            error.status_code = 404
+            raise error
+        return {
+            "id": identity,
+            "project_id": value["project_id"],
+            "attachments": [],
+            "metadata": {"palimpsest_instance_id": "consumer"},
+        }
+
+    # Exercise the real exact-volume observation/404 implementation rather than
+    # a cleanup stub that simply echoes successful deletion.
+    observer = object.__new__(ScenarioCloud)
+    observer.config = value
+    observer.project_id = value["project_id"]
+    observer.connection = SimpleNamespace(block_storage=SimpleNamespace(get_volume=get_volume))
+    observer._scope = lambda: None
+    monkeypatch.setattr(cloud, "verify_prepared_volume", lambda self, *args: observer.verify_prepared_volume(*args))
+    monkeypatch.setattr(cloud, "verify_absent", lambda self, *args, **kwargs: observer.verify_absent(*args, **kwargs))
+    model.create_instance = failed_root
+    model.pending_volume_delete = True
+    if root_state == "absent":
+
+        def settle_missing(identity):
+            assert identity == model.row["id"]
+            model.provider_deletes += 1  # Official API DELETE intent, no provider deletion.
+            model.row.update(status="deleted", provider_phase="deleted")
+
+        model.delete_instance = settle_missing
+    assert run_scenario(value, output, cloud_factory=cloud)["status"] == "failed"
+    assert model.advances == []
+    if attempted is not False:
+        with pytest.raises(ArtifactValidationError, match="identity uncertain"):
+            scenarios.cleanup_scenario(output)
+        assert model.provider_deletes == model.volume_deletes == 0 and provider_reads == []
+        assert not _scenario_reservations(value)[0]["released"]
+        return
+    if root_state in {"none", "error"}:
+        with pytest.raises(ArtifactValidationError if root_state == "none" else RuntimeError):
+            scenarios.cleanup_scenario(output)
+        assert model.provider_deletes == model.volume_deletes == 0
+        assert not _scenario_reservations(value)[0]["released"]
+        return
+    assert scenarios.cleanup_scenario(output)["status"] == "success"
+    assert model.provider_deletes == 1 and model.volume_deletes == (0 if root_state == "absent" else 1)
+    assert model.advances == []
+    assert provider_reads == ["original-boot", "original-boot"]
+    observation = json.loads((output / "r1-consumer1-delete-root-observation.json").read_text())
+    assert observation.get("volume_already_absent", False) is (root_state == "absent")
+    absence = json.loads((output / "r1-consumer1-absence.json").read_text())
+    assert absence["server_absent"] == "not_created" and absence["boot_volume_absent"] is True
+    assert _scenario_reservations(value)[0]["released"]

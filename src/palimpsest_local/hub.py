@@ -202,7 +202,9 @@ class HubClient:
             detail = exc.read(4096).decode("utf-8", errors="replace")
         except OSError:
             detail = ""
-        return HubError(self._redact(f"{method} {path} failed (HTTP {exc.code}): {detail[:300]}"))
+        error = HubError(self._redact(f"{method} {path} failed (HTTP {exc.code}): {detail[:300]}"))
+        error.http_status = exc.code
+        return error
 
     def _json_request(
         self,
@@ -361,6 +363,16 @@ class HubClient:
 
     def get_instance(self, instance_id: str) -> dict[str, Any]:
         return self._json_request("GET", "/instances/" + urllib.parse.quote(instance_id, safe=""))
+
+    def advance_instance(
+        self, instance_id: str, *, operation: str, request_id: str, boot_volume_id: str
+    ) -> dict[str, Any]:
+        """Submit one explicit bound provider effect; never transparently retry it."""
+        return self._json_request(
+            "POST",
+            "/instances/" + urllib.parse.quote(instance_id, safe="") + "/advance",
+            {"operation": operation, "request_id": request_id, "boot_volume_id": boot_volume_id},
+        )
 
     def stop_instance(self, instance_id: str) -> dict[str, Any]:
         return self._json_request("POST", "/instances/" + urllib.parse.quote(instance_id, safe="") + "/stop")

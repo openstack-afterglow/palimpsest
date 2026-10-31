@@ -46,6 +46,13 @@ class Provider:
         self.volumes_by_id = {}
         self.creates = []
         self.deletes = []
+        self.volume_creates = []
+        self.volume_deletes = []
+        self.volume_reads = []
+        self.volume_lists = []
+        self.server_lists = []
+        self.volume_status = "available"
+        self.timeout_after_volume_create = False
         self.stops = []
         self.network_owner = PROJECT
         self.group_owner = PROJECT
@@ -72,7 +79,7 @@ class Provider:
         }
 
     def get_flavor(self, flavor_id):
-        return {"id": flavor_id, "ram": 1024, "is_public": True}
+        return {"id": flavor_id, "ram": 1024, "disk": 0, "vcpus": 1, "is_public": True}
 
     def fetch_flavor_extra_specs(self, flavor):
         return {**flavor, "extra_specs": {}}
@@ -83,9 +90,47 @@ class Provider:
     def get_security_group(self, group_id):
         return {"id": group_id, "project_id": self.group_owner}
 
+    def create_volume(self, **kwargs):
+        self.volume_creates.append(kwargs)
+        volume_id = str(uuid4())
+        row = {
+            "id": volume_id,
+            "project_id": PROJECT,
+            "name": kwargs["name"],
+            "size": kwargs["size"],
+            "status": self.volume_status,
+            "metadata": dict(kwargs["metadata"]),
+            "bootable": True,
+            "volume_image_metadata": {"image_id": kwargs["image_id"]},
+            "attachments": [],
+        }
+        self.volumes_by_id[volume_id] = row
+        if self.timeout_after_volume_create:
+            raise TimeoutError("private Cinder diagnostics must not escape")
+        return row
+
+    def volumes(self, **kwargs):
+        self.volume_lists.append(kwargs)
+        return iter(self.volumes_by_id.values())
+
+    def delete_volume(self, volume_id):
+        self.volume_deletes.append(volume_id)
+        self.volumes_by_id.pop(volume_id, None)
+
     def create_server(self, **kwargs):
         self.creates.append(kwargs)
-        server_id, volume_id = str(uuid4()), str(uuid4())
+        server_id = str(uuid4())
+        mapping = kwargs["block_device_mapping_v2"][0]
+        volume_id = mapping["uuid"]
+        assert mapping == {
+            "uuid": volume_id,
+            "source_type": "volume",
+            "destination_type": "volume",
+            "boot_index": "0",
+            "delete_on_termination": True,
+        }
+        volume = self.volumes_by_id[volume_id]
+        assert volume["status"] == "available" and volume["attachments"] == []
         row = {
             "id": server_id,
             "project_id": PROJECT,
@@ -95,13 +140,7 @@ class Provider:
             "volume_id": volume_id,
         }
         self.servers_by_id[server_id] = row
-        self.volumes_by_id[volume_id] = {
-            "id": volume_id,
-            "project_id": PROJECT,
-            "bootable": True,
-            "volume_image_metadata": {"image_id": kwargs["block_device_mapping_v2"][0]["uuid"]},
-            "attachments": [{"server_id": server_id}],
-        }
+        volume.update(status="in-use", attachments=[{"server_id": server_id}])
         if self.timeout_after_create:
             raise TimeoutError("secret provider diagnostics must not escape")
         return row
@@ -110,6 +149,7 @@ class Provider:
         return self.servers_by_id.get(server_id)
 
     def servers(self, **kwargs):
+        self.server_lists.append(kwargs)
         return iter(self.servers_by_id.values())
 
     def volume_attachments(self, server_id, **kwargs):
@@ -120,7 +160,12 @@ class Provider:
         ]
 
     def get_volume(self, volume_id):
-        return self.volumes_by_id.get(volume_id)
+        self.volume_reads.append(volume_id)
+        from openstack.exceptions import NotFoundException
+
+        if volume_id not in self.volumes_by_id:
+            raise NotFoundException("exact volume not found", http_status=404)
+        return self.volumes_by_id[volume_id]
 
     def delete_server(self, server_id, **kwargs):
         self.deletes.append(server_id)
@@ -152,6 +197,18 @@ def request_body(**overrides):
 @pytest.fixture
 async def instance_hub(tmp_path, monkeypatch):
     # Import the image table before create_all, as the production bootstrap does.
+    clock = SimpleNamespace(now=datetime(2030, 1, 2, 3, 4, 5, tzinfo=UTC))
+
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock.now if tz is not None else clock.now.replace(tzinfo=None)
+
+    monkeypatch.setattr(service, "datetime", FixedDatetime)
+    from palimpsest_hub.services import instance_cluster_runtime
+
+    monkeypatch.setattr(instance_cluster_runtime, "datetime", FixedDatetime)
+    monkeypatch.setattr(instances, "datetime", FixedDatetime)
     from palimpsest_hub import image_models  # noqa: F401
 
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'instances.sqlite'}")
@@ -212,7 +269,7 @@ async def instance_hub(tmp_path, monkeypatch):
             raise HTTPException(403, "native human package policy denied")
         return {
             "project_id": request.headers.get("X-Project", PROJECT),
-            "user_id": USER,
+            "user_id": request.headers.get("X-User", USER),
             "token": "fixture-original-human-token",
             "package_actions": set(
                 request.headers.get("X-Actions", "packages:write,packages:inventory,packages:read").split(",")
@@ -236,8 +293,26 @@ async def instance_hub(tmp_path, monkeypatch):
     monkeypatch.setattr(instances, "get_settings", lambda: settings)
     monkeypatch.setattr(service, "fresh_writer", fresh)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="https://hub.example.test") as client:
-        yield SimpleNamespace(client=client, provider=provider, factory=factory, store=store, settings=settings)
+        yield SimpleNamespace(
+            client=client, provider=provider, factory=factory, store=store, settings=settings, clock=clock
+        )
     await engine.dispose()
+
+
+async def advance_instance(h, item, *, operation="create-server", headers=None):
+    return await h.client.post(
+        "/v1/instances/" + item["id"] + "/advance",
+        json={"operation": operation, "request_id": item["request_id"], "boot_volume_id": item["boot_volume_id"]},
+        headers=headers,
+    )
+
+
+async def create_and_advance(h, **kwargs):
+    """Exercise both explicit API writes for existing guest/runtime proof fixtures."""
+    accepted = await h.client.post("/v1/instances", **kwargs)
+    if accepted.status_code == 202 and accepted.json().get("provider_phase") == "volume_ready":
+        return await advance_instance(h, accepted.json(), headers=kwargs.get("headers"))
+    return accepted
 
 
 def guest_spec(provider):
@@ -251,13 +326,13 @@ def guest_spec(provider):
 async def test_create_idempotency_durable_snapshot_and_provider_active_not_ready(instance_hub):
     h = instance_hub
     body = request_body()
-    created = await h.client.post("/v1/instances", json=body)
+    created = await create_and_advance(h, json=body)
     assert created.status_code == 202, created.text
     item = created.json()
     assert item["status"] == "booting" and item["result"] is None
-    repeated = await h.client.post("/v1/instances", json=body)
+    repeated = await create_and_advance(h, json=body)
     assert repeated.json()["id"] == item["id"] and len(h.provider.creates) == 1
-    changed = await h.client.post("/v1/instances", json={**body, "command": ["/bin/false"]})
+    changed = await create_and_advance(h, json={**body, "command": ["/bin/false"]})
     assert changed.status_code == 409 and len(h.provider.creates) == 1
     observed = await h.client.get("/v1/instances/" + item["id"])
     assert observed.status_code == 200, observed.text
@@ -274,7 +349,9 @@ async def test_create_idempotency_durable_snapshot_and_provider_active_not_ready
     assert guest["capability"] not in created.text
     assert "token" not in json.dumps(guest)
     bdm = h.provider.creates[0]["block_device_mapping_v2"][0]
-    assert bdm["delete_on_termination"] is True and bdm["source_type"] == "image"
+    assert bdm["delete_on_termination"] is True and bdm["source_type"] == "volume"
+    assert bdm["uuid"] == item["boot_volume_id"]
+    assert h.provider.volume_creates[0]["image_id"] == body["image_id"]
 
 
 @pytest.mark.asyncio
@@ -282,10 +359,10 @@ async def test_lost_create_response_reconciles_exact_marker_without_reallocation
     h = instance_hub
     h.provider.timeout_after_create = True
     body = request_body()
-    created = await h.client.post("/v1/instances", json=body)
+    created = await create_and_advance(h, json=body)
     assert created.json()["status"] == "uncertain"
     assert "secret provider" not in created.text
-    assert (await h.client.post("/v1/instances", json=body)).json()["id"] == created.json()["id"]
+    assert (await create_and_advance(h, json=body)).json()["id"] == created.json()["id"]
     detail = await h.client.get("/v1/instances/" + created.json()["id"])
     assert detail.json()["status"] == "booting" and detail.json()["server_id"]
     assert len(h.provider.creates) == 1
@@ -294,7 +371,7 @@ async def test_lost_create_response_reconciles_exact_marker_without_reallocation
 @pytest.mark.asyncio
 async def test_guest_capability_exact_binding_result_sealing_and_delete_revocation(instance_hub):
     h = instance_hub
-    item = (await h.client.post("/v1/instances", json=request_body())).json()
+    item = (await create_and_advance(h, json=request_body())).json()
     guest = guest_spec(h.provider)
     auth = {"Authorization": "Bearer " + guest["capability"]}
     path = "/v1/instance-bootstrap/" + item["id"]
@@ -322,12 +399,10 @@ async def test_guest_capability_exact_binding_result_sealing_and_delete_revocati
 @pytest.mark.asyncio
 async def test_reuse_deleted_instance_exact_snapshot_and_no_rebuild(instance_hub):
     h = instance_hub
-    original = (await h.client.post("/v1/instances", json=request_body())).json()
+    original = (await create_and_advance(h, json=request_body())).json()
     await h.client.delete("/v1/instances/" + original["id"])
     await h.client.get("/v1/instances/" + original["id"])
-    reused = await h.client.post(
-        "/v1/instances", json=request_body(layer_digests=[], source_instance_id=original["id"])
-    )
+    reused = await create_and_advance(h, json=request_body(layer_digests=[], source_instance_id=original["id"]))
     assert reused.status_code == 202, reused.text
     assert reused.json()["source_instance_id"] == original["id"] and reused.json()["layer_digests"] == [DIGEST]
     assert len(h.provider.creates) == 2 and h.store.blob_path(DIGEST).read_bytes() == PAYLOAD
@@ -354,7 +429,7 @@ async def test_admission_failure_has_no_provider_effect(instance_hub, violation)
         body["boot_gib"] = 257
     if violation == "policy":
         headers["X-Deny"] = "yes"
-    response = await h.client.post("/v1/instances", json=body, headers=headers)
+    response = await create_and_advance(h, json=body, headers=headers)
     assert response.status_code in (403, 422), response.text
     assert not h.provider.creates
 
@@ -362,7 +437,7 @@ async def test_admission_failure_has_no_provider_effect(instance_hub, violation)
 @pytest.mark.asyncio
 async def test_stop_and_cleanup_refuse_foreign_marker_and_unknown_dot_volume(instance_hub):
     h = instance_hub
-    item = (await h.client.post("/v1/instances", json=request_body())).json()
+    item = (await create_and_advance(h, json=request_body())).json()
     path = "/v1/instances/" + item["id"]
     assert (await h.client.post(path + "/stop")).status_code == 202
     assert (await h.client.get(path)).json()["status"] == "stopped"
@@ -382,11 +457,11 @@ async def test_stop_and_cleanup_refuse_foreign_marker_and_unknown_dot_volume(ins
 @pytest.mark.asyncio
 async def test_expired_capability_cannot_report_and_foreign_project_cannot_reuse(instance_hub):
     h = instance_hub
-    item = (await h.client.post("/v1/instances", json=request_body())).json()
+    item = (await create_and_advance(h, json=request_body())).json()
     guest = guest_spec(h.provider)
     async with h.factory() as session:
         row = await session.get(PalimpsestHubInstance, item["id"])
-        row.capability_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+        row.capability_expires_at = h.clock.now - timedelta(seconds=1)
         await session.commit()
     response = await h.client.get(
         "/v1/instance-bootstrap/" + item["id"] + "/layers/" + DIGEST,
@@ -395,8 +470,8 @@ async def test_expired_capability_cannot_report_and_foreign_project_cannot_reuse
     assert response.status_code == 404
     assert (await h.client.get("/v1/instances/" + item["id"])).json()["error_code"] == "bootstrap_expired"
     h.provider._afterglow_project_id = OTHER
-    foreign = await h.client.post(
-        "/v1/instances",
+    foreign = await create_and_advance(
+        h,
         headers={"X-Project": OTHER},
         json=request_body(layer_digests=[], source_instance_id=item["id"]),
     )
@@ -440,8 +515,8 @@ async def test_explicit_image_job_derives_ordered_repeated_stack_and_default_run
             )
         )
         await session.commit()
-    created = await h.client.post(
-        "/v1/instances",
+    created = await create_and_advance(
+        h,
         json=request_body(layer_digests=[], image_job_id=job_id, command=[], readiness_argv=["/app/check-ready"]),
     )
     assert created.status_code == 202, created.text
@@ -453,8 +528,8 @@ async def test_explicit_image_job_derives_ordered_repeated_stack_and_default_run
     original = created.json()
     await h.client.delete("/v1/instances/" + original["id"])
     await h.client.get("/v1/instances/" + original["id"])
-    reused = await h.client.post(
-        "/v1/instances", json=request_body(layer_digests=[], source_instance_id=original["id"], command=[])
+    reused = await create_and_advance(
+        h, json=request_body(layer_digests=[], source_instance_id=original["id"], command=[])
     )
     assert reused.status_code == 202, reused.text
     assert guest_spec(h.provider)["runtime"] == runtime
@@ -471,13 +546,13 @@ async def test_unobserved_create_never_reallocates_or_falsely_settles_delete(ins
 
     h.provider.create_server = lost_without_observation
     body = request_body()
-    created = (await h.client.post("/v1/instances", json=body)).json()
+    created = (await create_and_advance(h, json=body)).json()
     assert created["status"] == "uncertain"
     path = "/v1/instances/" + created["id"]
     assert (await h.client.get(path)).json()["status"] == "uncertain"
     assert (await h.client.delete(path)).json()["status"] == "deleting"
     assert (await h.client.get(path)).json()["status"] == "deleting"
-    assert (await h.client.post("/v1/instances", json=body)).json()["id"] == created["id"]
+    assert (await create_and_advance(h, json=body)).json()["id"] == created["id"]
     assert len(h.provider.creates) == 1
 
 
@@ -494,7 +569,7 @@ async def test_fresh_policy_revocation_before_effect_prevents_allocation(instanc
         return actor
 
     monkeypatch.setattr(service, "fresh_writer", revoke_before_effect)
-    response = await h.client.post("/v1/instances", json=request_body())
+    response = await create_and_advance(h, json=request_body())
     assert response.status_code == 403 and not h.provider.creates
 
 
@@ -512,7 +587,7 @@ def test_instance_openapi_documents_bounded_result_body():
 @pytest.mark.asyncio
 async def test_bootstrap_result_redacts_bearer_equivalent_and_seals_observation_timestamp(instance_hub):
     h = instance_hub
-    item = (await h.client.post("/v1/instances", json=request_body())).json()
+    item = (await create_and_advance(h, json=request_body())).json()
     guest = guest_spec(h.provider)
     response = await h.client.put(
         "/v1/instance-bootstrap/" + item["id"] + "/result",
@@ -529,7 +604,7 @@ async def test_bootstrap_result_redacts_bearer_equivalent_and_seals_observation_
 @pytest.mark.parametrize("writable,boot", [(0, 16), (16, 16), (65, 128), (1025, 2048)])
 async def test_invalid_disk_writable_capacity_rejected_before_provider_effect(instance_hub, writable, boot):
     h = instance_hub
-    response = await h.client.post("/v1/instances", json=request_body(writable_gib=writable, boot_gib=boot))
+    response = await create_and_advance(h, json=request_body(writable_gib=writable, boot_gib=boot))
     assert response.status_code == 422, response.text
     assert not h.provider.creates
 
@@ -559,7 +634,7 @@ async def test_original_token_revoked_during_provider_inspection_never_admits_or
     monkeypatch.setattr(auth, "validate_token", validate)
     monkeypatch.setattr(auth, "get_package_member_info", member)
     monkeypatch.setattr(service, "fresh_writer", REAL_FRESH_WRITER)
-    response = await h.client.post("/v1/instances", json=request_body())
+    response = await create_and_advance(h, json=request_body())
     assert response.status_code == 401
     assert not h.provider.creates
     async with h.factory() as session:
@@ -570,7 +645,7 @@ async def test_original_token_revoked_during_provider_inspection_never_admits_or
 async def test_async_delete_survives_stop_and_provider_error_until_absence(instance_hub, monkeypatch):
     h = instance_hub
     h.settings.palimpsest_hub_max_instances_per_project = 1
-    created = (await h.client.post("/v1/instances", json=request_body())).json()
+    created = (await create_and_advance(h, json=request_body())).json()
     path = "/v1/instances/" + created["id"]
 
     def asynchronous_delete(server_id, **kwargs):
@@ -586,7 +661,7 @@ async def test_async_delete_survives_stop_and_provider_error_until_absence(insta
     h.provider.servers_by_id.pop(created["server_id"])
     h.provider.volumes_by_id.clear()
     assert (await h.client.get(path)).json()["status"] == "deleted"
-    assert (await h.client.post("/v1/instances", json=request_body())).status_code == 202
+    assert (await create_and_advance(h, json=request_body())).status_code == 202
     assert h.store.blob_path(DIGEST).read_bytes() == PAYLOAD
 
 
@@ -615,7 +690,7 @@ async def test_unannotated_boot_image_requires_unchanged_operator_qualified_cont
             "os_hash_algo": "sha512",
             "os_hash_value": "a" * 128,
         }
-    response = await h.client.post("/v1/instances", json=body)
+    response = await create_and_advance(h, json=body)
     if case == "qualified":
         assert response.status_code == 202 and response.json()["status"] == "booting"
         assert response.json()["result"] is None
@@ -628,7 +703,7 @@ async def test_unannotated_boot_image_requires_unchanged_operator_qualified_cont
 @pytest.mark.parametrize("actions", ["packages:write", "packages:write,packages:inventory", "packages:read"])
 async def test_instance_payload_admission_requires_separate_read_and_write_grants(instance_hub, actions):
     h = instance_hub
-    response = await h.client.post("/v1/instances", json=request_body(), headers={"X-Actions": actions})
+    response = await create_and_advance(h, json=request_body(), headers={"X-Actions": actions})
     assert response.status_code == 403
     assert not h.provider.creates
     async with h.factory() as session:
@@ -658,7 +733,7 @@ async def test_download_revocation_at_each_fresh_fence_prevents_capability_effec
     monkeypatch.setattr(auth, "get_package_member_info", member)
     monkeypatch.setattr(service, "fresh_writer", REAL_FRESH_WRITER)
     body = request_body()
-    response = await h.client.post("/v1/instances", json=body)
+    response = await create_and_advance(h, json=body)
     assert response.status_code == 403 and not h.provider.creates
     async with h.factory() as session:
         rows = (await session.scalars(select(PalimpsestHubInstance))).all()
@@ -667,7 +742,7 @@ async def test_download_revocation_at_each_fresh_fence_prevents_capability_effec
             assert rows[0].status == "error" and rows[0].error_code == "create_authority_revoked"
             assert rows[0].capability_hash is None
     if fence == 2:
-        repeated = await h.client.post("/v1/instances", json=body)
+        repeated = await create_and_advance(h, json=body)
         assert repeated.status_code == 202 and not h.provider.creates
 
 
@@ -675,24 +750,22 @@ async def test_download_revocation_at_each_fresh_fence_prevents_capability_effec
 @pytest.mark.parametrize(
     "case", ["failed-create", "active", "previously-active", "bound", "ready", "foreign", "unknown"]
 )
-async def test_only_verified_empty_failed_create_can_delete_without_boot_volume(instance_hub, monkeypatch, case):
+async def test_historical_server_without_attachment_never_proves_empty_boot_census(instance_hub, monkeypatch, case):
     h = instance_hub
-    item = (await h.client.post("/v1/instances", json=request_body())).json()
+    item = (await create_and_advance(h, json=request_body())).json()
     path = "/v1/instances/" + item["id"]
     server = h.provider.servers_by_id[item["server_id"]]
     server["status"] = "ACTIVE" if case == "active" else "ERROR"
     if case == "foreign":
         server["project_id"] = OTHER
-    if case in ("bound", "ready", "previously-active"):
-        async with h.factory() as session:
-            row = await session.get(PalimpsestHubInstance, item["id"])
-            if case == "bound":
-                row.boot_volume_id = server["volume_id"]
-            elif case == "ready":
-                row.status, row.result_json = "ready", {"status": "ready"}
-            else:
-                row.provider_status = "ACTIVE"
-            await session.commit()
+    async with h.factory() as session:
+        row = await session.get(PalimpsestHubInstance, item["id"])
+        row.spec_json = {key: val for key, val in row.spec_json.items() if key != "_boot_prepare"}
+        row.boot_volume_id = server["volume_id"] if case == "bound" else None
+        row.provider_status = "ACTIVE" if case == "previously-active" else None
+        if case == "ready":
+            row.status, row.result_json = "ready", {"status": "ready"}
+        await session.commit()
 
     def attachments(*args, **kwargs):
         if case == "unknown":
@@ -700,16 +773,17 @@ async def test_only_verified_empty_failed_create_can_delete_without_boot_volume(
         return []
 
     monkeypatch.setattr(h.provider, "volume_attachments", attachments)
+    legacy = next(entry for entry in (await h.client.get("/v1/instances")).json() if entry["id"] == item["id"])
+    assert legacy["provider_phase"] == "legacy" and legacy["server_create_attempted"] is None
     response = await h.client.delete(path)
+    assert response.status_code == (502 if case == "unknown" else 409), response.text
+    assert h.provider.deletes == [] and h.provider.volume_deletes == []
+    assert set(h.provider.servers_by_id) == {item["server_id"]}
+    assert set(h.provider.volumes_by_id) == {server["volume_id"]}
     if case == "failed-create":
-        assert response.status_code == 202 and response.json()["status"] == "deleting"
-        assert h.provider.deletes == [item["server_id"]]
-        assert (await h.client.get(path)).json()["status"] == "deleted"
-        assert (await h.client.delete(path)).json()["status"] == "deleted"
-        assert len(h.provider.deletes) == 1 and len(h.provider.creates) == 1
-    else:
-        assert response.status_code == (502 if case == "unknown" else 409)
-        assert not h.provider.deletes
+        async with h.factory() as session:
+            row = await session.get(PalimpsestHubInstance, item["id"])
+            assert row.boot_volume_id is None and row.error_code == "provider_boot_volume_unknown"
 
 
 @pytest.mark.asyncio
@@ -719,7 +793,7 @@ async def test_deleted_server_retains_capacity_until_bound_volume_disappears(
 ):
     h = instance_hub
     h.settings.palimpsest_hub_max_instances_per_project = 1
-    item = (await h.client.post("/v1/instances", json=request_body())).json()
+    item = (await create_and_advance(h, json=request_body())).json()
     path = "/v1/instances/" + item["id"]
     assert (await h.client.get(path)).json()["boot_volume_id"]
     volume_id = h.provider.servers_by_id[item["server_id"]]["volume_id"]
@@ -736,13 +810,13 @@ async def test_deleted_server_retains_capacity_until_bound_volume_disappears(
         pending = (await h.client.get(path)).json()
         assert pending["status"] == "deleting" and pending["error_code"] == "provider_boot_volume_pending"
         assert (await h.client.delete(path)).json()["status"] == "deleting"
-        assert (await h.client.post("/v1/instances", json=request_body())).status_code == 429
+        assert (await create_and_advance(h, json=request_body())).status_code == 429
     assert volume_id in h.provider.volumes_by_id
     h.provider.volumes_by_id.pop(volume_id)
     assert (await h.client.get(path)).json()["status"] == "deleted"
     assert (await h.client.delete(path)).json()["status"] == "deleted"
     assert len(h.provider.deletes) == (0 if missing_before_delete else 1)
-    assert (await h.client.post("/v1/instances", json=request_body())).status_code == 202
+    assert (await create_and_advance(h, json=request_body())).status_code == 202
 
 
 @pytest.mark.asyncio
@@ -750,7 +824,7 @@ async def test_deleted_server_retains_capacity_until_bound_volume_disappears(
 async def test_volume_observation_failure_never_fabricates_absence_or_frees_capacity(instance_hub, monkeypatch, via):
     h = instance_hub
     h.settings.palimpsest_hub_max_instances_per_project = 1
-    item = (await h.client.post("/v1/instances", json=request_body())).json()
+    item = (await create_and_advance(h, json=request_body())).json()
     path = "/v1/instances/" + item["id"]
     await h.client.get(path)
     server = h.provider.servers_by_id.pop(item["server_id"])
@@ -770,14 +844,14 @@ async def test_volume_observation_failure_never_fabricates_absence_or_frees_capa
     async with h.factory() as session:
         row = await session.get(PalimpsestHubInstance, item["id"])
         assert row.status != "deleted" and row.boot_volume_id == server["volume_id"]
-    assert (await h.client.post("/v1/instances", json=request_body())).status_code == 429
+    assert (await create_and_advance(h, json=request_body())).status_code == 429
     assert not h.provider.deletes
 
 
 @pytest.mark.asyncio
-async def test_empty_failed_create_deletion_rechecks_before_provider_effect(instance_hub, monkeypatch):
+async def test_empty_attachment_observation_blocks_delete_before_any_provider_effect(instance_hub, monkeypatch):
     h = instance_hub
-    item = (await h.client.post("/v1/instances", json=request_body())).json()
+    item = (await create_and_advance(h, json=request_body())).json()
     server = h.provider.servers_by_id[item["server_id"]]
     server["status"] = "ERROR"
     observations = 0
@@ -791,17 +865,17 @@ async def test_empty_failed_create_deletion_rechecks_before_provider_effect(inst
 
     monkeypatch.setattr(h.provider, "volume_attachments", changing_attachments)
     response = await h.client.delete("/v1/instances/" + item["id"])
-    assert response.status_code == 409 and observations == 2
+    assert response.status_code == 409 and observations == 1
     assert not h.provider.deletes
     async with h.factory() as session:
         row = await session.get(PalimpsestHubInstance, item["id"])
-        assert row.status == "deleting" and row.capability_hash is None
+        assert row.server_id == item["server_id"] and row.boot_volume_id == server["volume_id"]
 
 
 @pytest.mark.asyncio
 async def test_failed_create_with_foreign_boot_attachment_is_never_deleted(instance_hub):
     h = instance_hub
-    item = (await h.client.post("/v1/instances", json=request_body())).json()
+    item = (await create_and_advance(h, json=request_body())).json()
     server = h.provider.servers_by_id[item["server_id"]]
     server["status"] = "ERROR"
     h.provider.volumes_by_id[server["volume_id"]]["project_id"] = OTHER
@@ -813,11 +887,17 @@ async def test_failed_create_with_foreign_boot_attachment_is_never_deleted(insta
 async def test_late_valid_boot_attachment_requires_durable_binding_before_delete(instance_hub, monkeypatch):
     h = instance_hub
     h.settings.palimpsest_hub_max_instances_per_project = 1
-    item = (await h.client.post("/v1/instances", json=request_body())).json()
+    item = (await create_and_advance(h, json=request_body())).json()
     path = "/v1/instances/" + item["id"]
     server = h.provider.servers_by_id[item["server_id"]]
     server["status"] = "ERROR"
     volume_id = server["volume_id"]
+    async with h.factory() as session:
+        row = await session.get(PalimpsestHubInstance, item["id"])
+        row.spec_json = {key: val for key, val in row.spec_json.items() if key != "_boot_prepare"}
+        row.boot_volume_id = None
+        row.provider_status = None
+        await session.commit()
     original_attachments = h.provider.volume_attachments
     observations = 0
 
@@ -833,18 +913,18 @@ async def test_late_valid_boot_attachment_requires_durable_binding_before_delete
     monkeypatch.setattr(h.provider, "volume_attachments", late_attachment)
     monkeypatch.setattr(h.provider, "delete_server", delayed_volume_delete)
     response = await h.client.delete(path)
-    assert response.status_code == 409 and observations == 2
+    assert response.status_code == 409 and observations == 1
     assert not h.provider.deletes
     async with h.factory() as session:
         row = await session.get(PalimpsestHubInstance, item["id"])
-        assert row.status == "deleting" and row.boot_volume_id is None
+        assert row.server_id == item["server_id"] and row.boot_volume_id is None
     # An explicit retry admits and commits the newly observed original binding.
     response = await h.client.delete(path)
     assert response.status_code == 202 and response.json()["boot_volume_id"] == volume_id
     assert h.provider.deletes == [item["server_id"]]
     assert (await h.client.get(path)).json()["status"] == "deleting"
     assert volume_id in h.provider.volumes_by_id
-    assert (await h.client.post("/v1/instances", json=request_body())).status_code == 429
+    assert (await create_and_advance(h, json=request_body())).status_code == 429
     h.provider.volumes_by_id.pop(volume_id)
     assert (await h.client.get(path)).json()["status"] == "deleted"
 
@@ -855,7 +935,6 @@ async def test_late_valid_boot_attachment_requires_durable_binding_before_delete
     [
         ("authority", "create_authority_revoked"),
         ("expired", "create_bootstrap_expired"),
-        ("input-limit", "create_bootstrap_input_limit"),
     ],
 )
 async def test_definite_preallocation_failure_retains_reason_and_can_release_quota(
@@ -877,11 +956,8 @@ async def test_definite_preallocation_failure_retains_reason_and_can_release_quo
     monkeypatch.setattr(service, "fresh_writer", authority)
     if failure == "expired":
         h.settings.palimpsest_hub_instance_bootstrap_ttl_seconds = -1
-    original_render = service.render_bootstrap
-    if failure == "input-limit":
-        monkeypatch.setattr(service, "render_bootstrap", lambda spec: "x" * 50000)
     body = request_body()
-    failed = await h.client.post("/v1/instances", json=body)
+    failed = await create_and_advance(h, json=body)
     assert failed.status_code == (403 if failure == "authority" else 202)
     assert not h.provider.creates
     async with h.factory() as session:
@@ -900,9 +976,9 @@ async def test_definite_preallocation_failure_retains_reason_and_can_release_quo
         observed = await h.client.get(path)
         assert observed.status_code == 200
         assert observed.json()["status"] == "error" and observed.json()["error_code"] == reason
-    assert (await h.client.post("/v1/instances", json=request_body())).status_code == 429
+    assert (await create_and_advance(h, json=request_body())).status_code == 429
     assert (await h.client.delete(path, headers={"X-Actions": "packages:read"})).status_code == 403
-    assert (await h.client.post("/v1/instances", json=request_body())).status_code == 429
+    assert (await create_and_advance(h, json=request_body())).status_code == 429
     # Restored write authority can discard only the proven unallocated intent;
     # read authority is deliberately not required for lifecycle cleanup.
     deleted = await h.client.delete(path, headers={"X-Actions": "packages:write"})
@@ -910,11 +986,10 @@ async def test_definite_preallocation_failure_retains_reason_and_can_release_quo
     assert deleted.json()["error_code"] == reason
     assert (await h.client.get(path)).json()["error_code"] == reason
     assert (await h.client.delete(path)).json()["status"] == "deleted"
-    assert (await h.client.post("/v1/instances", json=body)).json()["status"] == "deleted"
+    assert (await create_and_advance(h, json=body)).json()["status"] == "deleted"
     assert not h.provider.creates and not h.provider.deletes
     h.settings.palimpsest_hub_instance_bootstrap_ttl_seconds = 3600
-    monkeypatch.setattr(service, "render_bootstrap", original_render)
-    assert (await h.client.post("/v1/instances", json=request_body())).status_code == 202
+    assert (await create_and_advance(h, json=request_body())).status_code == 202
     assert len(h.provider.creates) == 1
 
 
@@ -991,7 +1066,7 @@ async def gpu_request(h, monkeypatch):
 async def test_gpu_snapshots_trusted_profile_and_preserves_image_identity_on_reuse(instance_hub, monkeypatch):
     h = instance_hub
     body = await gpu_request(h, monkeypatch)
-    response = await h.client.post("/v1/instances", json=body)
+    response = await create_and_advance(h, json=body)
     assert response.status_code == 202, response.text
     item = response.json()
     assert item["gpu_profile"] == "rtx-qualified" and item["gpu"]["device_count"] == 1
@@ -999,10 +1074,10 @@ async def test_gpu_snapshots_trusted_profile_and_preserves_image_identity_on_reu
     guest = guest_spec(h.provider)
     assert guest["gpu"] == item["gpu"] and guest["runtime"]["user"] == "1000:1000"
     assert guest["command"] == ["/app/proof"]
-    repeated = await h.client.post("/v1/instances", json=body)
+    repeated = await create_and_advance(h, json=body)
     assert repeated.json()["id"] == item["id"] and len(h.provider.creates) == 1
-    warm = await h.client.post(
-        "/v1/instances",
+    warm = await create_and_advance(
+        h,
         json=request_body(
             image_id=body["image_id"],
             layer_digests=[],
@@ -1028,7 +1103,7 @@ async def test_project_visible_private_gpu_flavor_does_not_require_tenant_acl_ad
         raise ForbiddenException("Tenant ACL enumeration is administrative")
 
     monkeypatch.setattr(h.provider, "get_flavor_access", tenant_acl, raising=False)
-    response = await h.client.post("/v1/instances", json=body)
+    response = await create_and_advance(h, json=body)
     assert response.status_code == 202, response.text
     assert len(h.provider.creates) == 1
     assert response.json()["gpu"]["project_id"] == PROJECT
@@ -1045,7 +1120,7 @@ async def test_admin_inventory_does_not_grant_unassigned_private_gpu_flavor(inst
         return [] if is_public is True else [{"id": body["flavor_id"]}]
 
     monkeypatch.setattr(h.provider, "flavors", available_flavors, raising=False)
-    response = await h.client.post("/v1/instances", json=body)
+    response = await create_and_advance(h, json=body)
     assert response.status_code == 403, response.text
     assert not h.provider.creates
     async with h.factory() as session:
@@ -1096,7 +1171,7 @@ async def test_gpu_mismatch_never_admits_or_allocates(instance_hub, monkeypatch,
             layer = await session.scalar(select(PalimpsestHubLayer).where(PalimpsestHubLayer.blob_digest == DIGEST))
             layer.config_json = {"base_image_digest": BASE}
             await session.commit()
-    response = await h.client.post("/v1/instances", json=body)
+    response = await create_and_advance(h, json=body)
     assert response.status_code == (403 if failure in {"project", "private-flavor"} else 422), response.text
     assert not h.provider.creates
     async with h.factory() as session:
@@ -1146,14 +1221,15 @@ async def test_gpu_second_fence_changes_fail_without_effect_or_replay(instance_h
         return original(spec, project, settings)
 
     monkeypatch.setattr(service, "qualified_gpu", mutate)
-    response = await h.client.post("/v1/instances", json=body)
+    response = await create_and_advance(h, json=body)
     assert response.status_code == (403 if failure in {"project", "access"} else 422), response.text
     assert not h.provider.creates
     async with h.factory() as session:
         row = (await session.scalars(select(PalimpsestHubInstance))).one()
         assert row.error_code == "create_inputs_changed" and row.capability_hash is None
-        assert service.create_not_attempted(row)
-    repeated = await h.client.post("/v1/instances", json=body)
+        assert row.boot_volume_id is None and row.server_id is None
+        assert h.provider.volume_creates == []
+    repeated = await create_and_advance(h, json=body)
     assert repeated.status_code == 202 and repeated.json()["error_code"] == "create_inputs_changed"
     assert not h.provider.creates
 
@@ -1174,14 +1250,14 @@ async def test_gpu_second_fence_changes_fail_without_effect_or_replay(instance_h
 async def test_gpu_flavor_without_explicit_profile_never_allocates(instance_hub, monkeypatch, extra):
     h = instance_hub
     monkeypatch.setattr(h.provider, "fetch_flavor_extra_specs", lambda flavor: {**flavor, "extra_specs": extra})
-    response = await h.client.post("/v1/instances", json=request_body())
+    response = await create_and_advance(h, json=request_body())
     assert response.status_code == 422 and not h.provider.creates
 
 
 @pytest.mark.asyncio
 async def test_cpu_default_needs_no_gpu_profile_or_guest_tools(instance_hub):
     h = instance_hub
-    response = await h.client.post("/v1/instances", json=request_body())
+    response = await create_and_advance(h, json=request_body())
     assert response.status_code == 202, response.text
     assert response.json()["gpu"] is None and response.json()["gpu_profile"] is None
     assert "gpu" not in guest_spec(h.provider)
@@ -1391,7 +1467,7 @@ async def test_cpu_request_digest_is_compatible_with_pre_gpu_api(instance_hub):
     expected.pop("gpu_profile")
     expected.pop("cluster_profile")
     expected.pop("cluster_server_id")
-    response = await h.client.post("/v1/instances", json=body)
+    response = await create_and_advance(h, json=body)
     assert response.status_code == 202, response.text
     async with h.factory() as session:
         row = await session.get(PalimpsestHubInstance, response.json()["id"])
@@ -1423,7 +1499,7 @@ async def test_cpu_flavor_becoming_gpu_at_second_fence_cannot_allocate(instance_
         return original(identity)
 
     monkeypatch.setattr(h.provider, "get_image", mutate)
-    response = await h.client.post("/v1/instances", json=request_body())
+    response = await create_and_advance(h, json=request_body())
     assert response.status_code == 422 and not h.provider.creates
 
 
@@ -1507,7 +1583,7 @@ async def test_second_provider_reads_revoke_authority_before_nova(instance_hub, 
 
     monkeypatch.setattr(h.provider, "get_image", inspect)
     monkeypatch.setattr(service, "fresh_writer", authority)
-    response = await h.client.post("/v1/instances", json=request_body())
+    response = await create_and_advance(h, json=request_body())
     assert response.status_code == 403 and not h.provider.creates
     async with h.factory() as session:
         row = (await session.scalars(select(PalimpsestHubInstance))).one()
@@ -1521,7 +1597,7 @@ async def test_every_bounded_gpu_failure_is_accepted_and_visible_in_actual_callb
     h = instance_hub
     h.settings.palimpsest_hub_max_instances_per_project = 100
     for code in GPU_ERROR_CODES:
-        item = (await h.client.post("/v1/instances", json=request_body())).json()
+        item = (await create_and_advance(h, json=request_body())).json()
         guest = guest_spec(h.provider)
         response = await h.client.put(
             "/v1/instance-bootstrap/" + item["id"] + "/result",
@@ -1543,7 +1619,7 @@ async def test_large_valid_cpu_payload_allocates_without_gpu_bootstrap_budget_co
     body["command"] = command
     extra_specs = h.provider.fetch_flavor_extra_specs
     monkeypatch.setattr(h.provider, "fetch_flavor_extra_specs", lambda flavor: {**flavor, "extra_specs": {}})
-    cpu = await h.client.post("/v1/instances", json={**body, "gpu_profile": None})
+    cpu = await create_and_advance(h, json={**body, "gpu_profile": None})
     assert cpu.status_code == 202 and cpu.json()["status"] == "booting", cpu.text
     assert len(h.provider.creates) == 1
     guest = guest_spec(h.provider)
@@ -1553,13 +1629,24 @@ async def test_large_valid_cpu_payload_allocates_without_gpu_bootstrap_budget_co
     # The same near-limit argv plus the vendor payload cannot be silently
     # truncated or allocated with a CPU fallback when GPU was explicitly asked.
     monkeypatch.setattr(h.provider, "fetch_flavor_extra_specs", extra_specs)
-    gpu = await h.client.post("/v1/instances", json={**body, "request_id": str(uuid4())})
+    gpu = await create_and_advance(h, json={**body, "request_id": str(uuid4())})
     assert gpu.status_code == 202, gpu.text
     assert gpu.json()["status"] == "error" and gpu.json()["error_code"] == "create_bootstrap_input_limit"
-    assert len(h.provider.creates) == 1
+    gpu_volume_id = gpu.json()["boot_volume_id"]
+    cpu_volume_id = cpu.json()["boot_volume_id"]
+    assert gpu_volume_id != cpu_volume_id and gpu.json()["server_id"] is None
+    assert set(h.provider.volumes_by_id) == {cpu_volume_id, gpu_volume_id}
+    assert set(h.provider.servers_by_id) == {cpu.json()["server_id"]}
+    assert len(h.provider.creates) == 1 and len(h.provider.volume_creates) == 2
+    assert h.provider.volume_deletes == h.provider.deletes == []
+    assert h.provider.creates[0]["block_device_mapping_v2"][0]["uuid"] == cpu_volume_id
+    reserved = h.provider.volumes_by_id[gpu_volume_id]
+    assert reserved["metadata"][service.MARKER] == gpu.json()["id"]
+    assert reserved["volume_image_metadata"]["image_id"] == body["image_id"]
+    assert reserved["attachments"] == [] and reserved["status"] == "available"
     async with h.factory() as session:
         row = await session.get(PalimpsestHubInstance, gpu.json()["id"])
-        assert row.capability_hash is None and service.create_not_attempted(row)
+        assert row.boot_volume_id == gpu_volume_id and row.server_id is None and row.capability_hash is None
 
 
 async def cluster_request(h, monkeypatch):
@@ -1609,7 +1696,7 @@ def cluster_agent_body(body, server):
 async def test_cluster_two_member_admission_private_capability_and_one_agent(instance_hub, monkeypatch):
     h = instance_hub
     body = await cluster_request(h, monkeypatch)
-    response = await h.client.post("/v1/instances", json=body)
+    response = await create_and_advance(h, json=body)
     assert response.status_code == 202, response.text
     server = response.json()
     assert server["status"] == "booting", server
@@ -1622,7 +1709,7 @@ async def test_cluster_two_member_admission_private_capability_and_one_agent(ins
     initial = await h.client.get(path, headers=auth)
     assert initial.status_code == 200 and initial.headers["cache-control"] == "no-store"
     assert len(initial.json()["members"]) == 1
-    agent_response = await h.client.post("/v1/instances", json=cluster_agent_body(body, server))
+    agent_response = await create_and_advance(h, json=cluster_agent_body(body, server))
     assert agent_response.status_code == 202, agent_response.text
     agent = agent_response.json()
     assert agent["status"] == "booting" and agent["cluster"]["server_address"] == "10.88.0.2"
@@ -1640,7 +1727,7 @@ async def test_cluster_two_member_admission_private_capability_and_one_agent(ins
     assert server_cap["token"] not in (await h.client.get("/v1/instances")).text
     denied = await h.client.get(path, headers=agent_auth)
     assert denied.status_code == 404
-    duplicate = await h.client.post("/v1/instances", json=cluster_agent_body(body, server))
+    duplicate = await create_and_advance(h, json=cluster_agent_body(body, server))
     assert duplicate.status_code == 409 and len(h.provider.creates) == 2
 
 
@@ -1664,7 +1751,7 @@ async def test_cluster_admission_rejects_unqualified_or_caller_execution(instanc
         body["readiness_argv"] = ["/bin/true"]
     elif failure == "key":
         h.settings.palimpsest_hub_build_worker_key = SecretStr("")
-    response = await h.client.post("/v1/instances", json=body)
+    response = await create_and_advance(h, json=body)
     assert response.status_code in (403, 422, 503), response.text
     assert not h.provider.creates
 
@@ -1674,7 +1761,7 @@ async def test_cluster_admission_rejects_unqualified_or_caller_execution(instanc
 async def test_cluster_agent_requires_original_subject_and_exact_private_interface(instance_hub, monkeypatch, failure):
     h = instance_hub
     body = await cluster_request(h, monkeypatch)
-    server = (await h.client.post("/v1/instances", json=body)).json()
+    server = (await create_and_advance(h, json=body)).json()
     if failure == "foreign-user":
         async with h.factory() as session:
             source = await session.get(PalimpsestHubInstance, server["id"])
@@ -1688,7 +1775,7 @@ async def test_cluster_agent_requires_original_subject_and_exact_private_interfa
     else:
         port = h.provider.get_port("cluster-port")
         monkeypatch.setattr(h.provider, "get_port", lambda identity: {**port, "fixed_ips": [{"ip_address": "8.8.8.8"}]})
-    response = await h.client.post("/v1/instances", json=cluster_agent_body(body, server))
+    response = await create_and_advance(h, json=cluster_agent_body(body, server))
     assert response.status_code == 409, response.text
     assert len(h.provider.creates) == 1
 
@@ -1729,10 +1816,10 @@ def cluster_fixture_proof(server, agent):
 async def test_cluster_callback_validates_full_proof_then_seals_and_revokes(instance_hub, monkeypatch):
     h = instance_hub
     body = await cluster_request(h, monkeypatch)
-    server = (await h.client.post("/v1/instances", json=body)).json()
+    server = (await create_and_advance(h, json=body)).json()
     auth = {"Authorization": "Bearer " + guest_spec(h.provider)["capability"]}
     path = "/v1/instance-bootstrap/" + server["id"]
-    agent = (await h.client.post("/v1/instances", json=cluster_agent_body(body, server))).json()
+    agent = (await create_and_advance(h, json=cluster_agent_body(body, server))).json()
     agent_auth = {"Authorization": "Bearer " + guest_spec(h.provider)["capability"]}
     agent_result = await h.client.put(
         "/v1/instance-bootstrap/" + agent["id"] + "/result",
@@ -1778,9 +1865,9 @@ async def test_cluster_second_fence_profile_revocation_is_durable_not_replayed(i
         return image(identity)
 
     monkeypatch.setattr(h.provider, "get_image", inspect)
-    response = await h.client.post("/v1/instances", json=body)
+    response = await create_and_advance(h, json=body)
     assert response.status_code == 422 and not h.provider.creates
-    repeated = await h.client.post("/v1/instances", json=body)
+    repeated = await create_and_advance(h, json=body)
     assert repeated.status_code == 202 and repeated.json()["error_code"] == "create_inputs_changed"
     assert not h.provider.creates
 
@@ -1803,10 +1890,8 @@ async def test_cluster_concurrent_agents_share_project_admission_lock(instance_h
 
     h = instance_hub
     body = await cluster_request(h, monkeypatch)
-    server = (await h.client.post("/v1/instances", json=body)).json()
-    responses = await asyncio.gather(
-        *[h.client.post("/v1/instances", json=cluster_agent_body(body, server)) for _ in range(2)]
-    )
+    server = (await create_and_advance(h, json=body)).json()
+    responses = await asyncio.gather(*[create_and_advance(h, json=cluster_agent_body(body, server)) for _ in range(2)])
     assert sorted(response.status_code for response in responses) == [202, 409]
     assert len(h.provider.creates) == 2
 
@@ -1814,15 +1899,15 @@ async def test_cluster_concurrent_agents_share_project_admission_lock(instance_h
 @pytest.mark.asyncio
 async def test_cluster_private_route_rejects_cpu_and_expired_capability(instance_hub, monkeypatch):
     h = instance_hub
-    cpu = (await h.client.post("/v1/instances", json=request_body())).json()
+    cpu = (await create_and_advance(h, json=request_body())).json()
     auth = {"Authorization": "Bearer " + guest_spec(h.provider)["capability"]}
     assert (await h.client.get("/v1/instance-bootstrap/" + cpu["id"] + "/cluster", headers=auth)).status_code == 404
     body = await cluster_request(h, monkeypatch)
-    server = (await h.client.post("/v1/instances", json=body)).json()
+    server = (await create_and_advance(h, json=body)).json()
     auth = {"Authorization": "Bearer " + guest_spec(h.provider)["capability"]}
     async with h.factory() as session:
         row = await session.get(PalimpsestHubInstance, server["id"])
-        row.capability_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+        row.capability_expires_at = h.clock.now - timedelta(seconds=1)
         await session.commit()
     assert (await h.client.get("/v1/instance-bootstrap/" + server["id"] + "/cluster", headers=auth)).status_code == 404
 
@@ -1834,7 +1919,7 @@ async def test_cluster_bounded_failure_codes_use_existing_callback(instance_hub,
     h = instance_hub
     body = await cluster_request(h, monkeypatch)
     for code in sorted(CLUSTER_ERROR_CODES):
-        response = await h.client.post("/v1/instances", json={**body, "request_id": str(uuid4())})
+        response = await create_and_advance(h, json={**body, "request_id": str(uuid4())})
         server = response.json()
         auth = {"Authorization": "Bearer " + guest_spec(h.provider)["capability"]}
         callback = await h.client.put(
@@ -1927,14 +2012,14 @@ def test_cluster_generated_pods_execute_multicall_numerical_probe(tmp_path):
 async def test_cluster_agent_failure_seals_after_server_capability_expires(instance_hub, monkeypatch):
     h = instance_hub
     body = await cluster_request(h, monkeypatch)
-    server = (await h.client.post("/v1/instances", json=body)).json()
-    agent = (await h.client.post("/v1/instances", json=cluster_agent_body(body, server))).json()
+    server = (await create_and_advance(h, json=body)).json()
+    agent = (await create_and_advance(h, json=cluster_agent_body(body, server))).json()
     auth = {"Authorization": "Bearer " + guest_spec(h.provider)["capability"]}
     path = "/v1/instance-bootstrap/" + agent["id"]
     token = (await h.client.get(path + "/cluster", headers=auth)).json()["token"]
     async with h.factory() as session:
         row = await session.get(PalimpsestHubInstance, server["id"])
-        row.capability_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+        row.capability_expires_at = h.clock.now - timedelta(seconds=1)
         await session.commit()
     assert (await h.client.get(path + "/cluster", headers=auth)).status_code == 404
     result = {"instance_id": agent["id"], "status": "error", "error_code": "cluster_bootstrap_failed", "stderr": token}
@@ -1985,19 +2070,19 @@ def test_cluster_private_existing_wrong_owner_is_not_truncated_or_repermissioned
 async def test_cluster_agent_rejects_unobserved_source_authority_change(instance_hub, monkeypatch, change):
     h = instance_hub
     body = await cluster_request(h, monkeypatch)
-    server = (await h.client.post("/v1/instances", json=body)).json()
+    server = (await create_and_advance(h, json=body)).json()
     if change == "profile-allowlist":
         h.settings.palimpsest_hub_instance_cluster_profiles["k3s-qualified"]["project_ids"].append(OTHER)
     else:
         async with h.factory() as session:
             source = await session.get(PalimpsestHubInstance, server["id"])
             if change == "expired":
-                source.capability_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+                source.capability_expires_at = h.clock.now - timedelta(seconds=1)
             else:
                 source.capability_hash = None
             await session.commit()
     # No GET reconciles the expired source before admission.
-    response = await h.client.post("/v1/instances", json=cluster_agent_body(body, server))
+    response = await create_and_advance(h, json=cluster_agent_body(body, server))
     assert response.status_code == 409, response.text
     assert len(h.provider.creates) == 1
     async with h.factory() as session:
@@ -2012,7 +2097,7 @@ async def test_cluster_agent_source_fence_after_provider_read_definitely_prevent
 ):
     h = instance_hub
     body = await cluster_request(h, monkeypatch)
-    server = (await h.client.post("/v1/instances", json=body)).json()
+    server = (await create_and_advance(h, json=body)).json()
     original = service.run_blocking
     address_reads = 0
 
@@ -2029,7 +2114,7 @@ async def test_cluster_agent_source_fence_after_provider_read_definitely_prevent
 
                     source = args[1]
                     if change == "expired":
-                        source.capability_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+                        source.capability_expires_at = h.clock.now - timedelta(seconds=1)
                     else:
                         source.capability_hash = None
                     await async_object_session(source).flush()
@@ -2040,14 +2125,16 @@ async def test_cluster_agent_source_fence_after_provider_read_definitely_prevent
 
     monkeypatch.setattr(service, "run_blocking", inspect)
     monkeypatch.setattr(worker_leases, "run_blocking", inspect)
-    response = await h.client.post("/v1/instances", json=cluster_agent_body(body, server))
+    response = await create_and_advance(h, json=cluster_agent_body(body, server))
     assert response.status_code == 409 and address_reads == 2, response.text
     assert len(h.provider.creates) == 1
     async with h.factory() as session:
         rows = (await session.scalars(select(PalimpsestHubInstance))).all()
         agent = next(row for row in rows if row.id != server["id"])
         assert agent.error_code == "create_inputs_changed" and agent.capability_hash is None
-        assert service.create_not_attempted(agent)
+        assert agent.boot_volume_id is None and agent.server_id is None
+        assert len(h.provider.volume_creates) == 1
+        assert set(h.provider.volumes_by_id) == {server["boot_volume_id"]}
 
 
 def cluster_process_regression(body, tmp_path):
@@ -2218,3 +2305,915 @@ assert not cluster_children()
 """,
         tmp_path,
     )
+
+
+@pytest.mark.asyncio
+async def test_cinder_preparation_waits_for_exact_available_volume_before_one_nova(instance_hub):
+    h = instance_hub
+    h.provider.volume_status = "creating"
+    body = request_body()
+    accepted = await h.client.post("/v1/instances", json=body)
+    assert accepted.status_code == 202, accepted.text
+    item = accepted.json()
+    path = "/v1/instances/" + item["id"]
+    volume_id = item["boot_volume_id"]
+    assert item["status"] == "booting" and item["error_code"] == "create_boot_volume_pending"
+    assert item["server_id"] is None and h.provider.creates == []
+    assert set(h.provider.volumes_by_id) == {volume_id}
+    assert len(h.provider.volume_creates) == 1
+    volume = h.provider.volumes_by_id[volume_id]
+    assert volume["size"] == body["boot_gib"]
+    assert volume["volume_image_metadata"]["image_id"] == body["image_id"]
+    async with h.factory() as session:
+        row = await session.get(PalimpsestHubInstance, item["id"])
+        expiry = row.capability_expires_at
+        assert row.boot_volume_id == volume_id and row.capability_hash is None
+        assert row.created_by == USER and row.project_id == PROJECT
+        assert "fixture-original-human-token" not in json.dumps(row.spec_json)
+        assert volume["metadata"] == {
+            service.MARKER: row.id,
+            "palimpsest_request_digest": row.request_digest,
+            "palimpsest_volume_role": "boot",
+            "palimpsest_image_id": body["image_id"],
+        }
+    for status in ("creating", "downloading", "downloading"):
+        volume["status"] = status
+        observed = await h.client.get(path)
+        assert observed.status_code == 200, observed.text
+        assert observed.json()["boot_volume_id"] == volume_id
+        assert observed.json()["server_id"] is None and observed.json()["error_code"] == "create_boot_volume_pending"
+        assert h.provider.creates == [] and len(h.provider.volume_creates) == 1
+        assert (await h.client.post("/v1/instances", json=body)).json()["id"] == item["id"]
+        pending_inventory = (await h.client.get("/v1/instances")).json()
+        assert [(entry["id"], entry["boot_volume_id"], entry["server_id"]) for entry in pending_inventory] == [
+            (item["id"], volume_id, None)
+        ]
+    h.clock.now += timedelta(minutes=7)
+    volume["status"] = "available"
+    for _ in range(2):
+        ready = await h.client.get(path)
+        assert ready.status_code == 200 and ready.json()["provider_phase"] == "volume_ready", ready.text
+        assert ready.json()["server_create_attempted"] is False and ready.json()["server_id"] is None
+        assert h.provider.creates == [] and h.provider.volume_deletes == []
+    started = await advance_instance(h, item)
+    assert started.status_code == 202, started.text
+    server_id = started.json()["server_id"]
+    assert started.json()["status"] == "booting" and server_id in h.provider.servers_by_id
+    assert set(h.provider.servers_by_id) == {server_id}
+    assert len(h.provider.creates) == 1 and len(h.provider.volume_creates) == 1
+    assert h.provider.creates[0]["block_device_mapping_v2"] == [
+        {
+            "uuid": volume_id,
+            "source_type": "volume",
+            "destination_type": "volume",
+            "boot_index": "0",
+            "delete_on_termination": True,
+        }
+    ]
+    guest = guest_spec(h.provider)
+    async with h.factory() as session:
+        row = await session.get(PalimpsestHubInstance, item["id"])
+        assert row.capability_expires_at == expiry
+        assert guest["expires_at"] == int(expiry.replace(tzinfo=UTC).timestamp())
+        assert row.capability_hash == hashlib.sha256(guest["capability"].encode()).hexdigest()
+        persisted = {column.name: str(getattr(row, column.name)) for column in row.__table__.columns}
+        assert guest["capability"] not in json.dumps(persisted)
+    for _ in range(3):
+        assert (await h.client.get(path)).json()["server_id"] == server_id
+    inventory = (await h.client.get("/v1/instances")).json()
+    assert any(entry["id"] == item["id"] and entry["boot_volume_id"] == volume_id for entry in inventory)
+    assert len(h.provider.creates) == len(h.provider.volume_creates) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "observation", ["exact", "absent", "multiple", "foreign", "changed-marker", "attached", "wrong-image", "wrong-size"]
+)
+async def test_lost_cinder_post_recovers_only_one_exact_owned_intent(instance_hub, observation):
+    h = instance_hub
+    h.provider.timeout_after_volume_create = True
+    h.provider.volume_status = "creating"
+    body = request_body()
+    accepted = await h.client.post("/v1/instances", json=body)
+    assert accepted.status_code == 202, accepted.text
+    item = accepted.json()
+    assert item["server_id"] is None and h.provider.creates == []
+    assert item["status"] == "uncertain" and item["boot_volume_id"] is None
+    volume_id = next(iter(h.provider.volumes_by_id))
+    volume = h.provider.volumes_by_id[volume_id]
+    if observation == "absent":
+        h.provider.volumes_by_id.clear()
+    elif observation == "multiple":
+        other_id = str(uuid4())
+        h.provider.volumes_by_id[other_id] = {**volume, "id": other_id, "metadata": dict(volume["metadata"])}
+    elif observation == "foreign":
+        volume["project_id"] = OTHER
+    elif observation == "changed-marker":
+        volume["metadata"]["palimpsest_request_digest"] = "sha256:" + "0" * 64
+    elif observation == "attached":
+        volume["attachments"] = [{"server_id": str(uuid4())}]
+        volume["status"] = "available"
+    elif observation == "wrong-image":
+        volume["volume_image_metadata"]["image_id"] = str(uuid4())
+    elif observation == "wrong-size":
+        volume["size"] += 1
+    path = "/v1/instances/" + item["id"]
+    for _ in range(2):
+        observed = await h.client.get(path)
+        if observation == "exact":
+            assert observed.status_code == 200, observed.text
+            assert observed.json()["boot_volume_id"] == volume_id
+            assert observed.json()["error_code"] == "create_boot_volume_pending"
+        elif observation == "absent":
+            assert observed.status_code == 200, observed.text
+            assert observed.json()["status"] == "uncertain" and observed.json()["boot_volume_id"] is None
+        else:
+            assert observed.status_code == (200 if observation in ("foreign", "changed-marker") else 409), observed.text
+            if observed.status_code == 200:
+                assert observed.json()["server_id"] is None and observed.json()["status"] in ("error", "uncertain")
+        assert h.provider.creates == [] and len(h.provider.volume_creates) == 1
+    assert h.provider.volume_lists and all(call.get("details") is True for call in h.provider.volume_lists)
+    async with h.factory() as session:
+        row = await session.get(PalimpsestHubInstance, item["id"])
+        assert row.boot_volume_id == (volume_id if observation == "exact" else None)
+        assert row.server_id is None and row.capability_hash is None
+    assert (await h.client.post("/v1/instances", json=body)).json()["id"] == item["id"]
+    assert len(h.provider.volume_creates) == 1 and h.provider.creates == []
+    if observation == "absent":
+        assert (await h.client.delete(path)).json()["status"] == "deleting"
+        for _ in range(2):
+            assert (await h.client.get(path)).json()["status"] == "deleting"
+        assert h.provider.volume_deletes == [] and h.provider.deletes == []
+        assert len(h.provider.volume_creates) == 1 and h.provider.creates == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["foreign", "marker", "attached", "wrong-image", "wrong-size", "wrong-volume"])
+async def test_bound_prepared_volume_identity_changes_never_reach_nova(instance_hub, monkeypatch, change):
+    h = instance_hub
+    h.provider.volume_status = "downloading"
+    item = (await h.client.post("/v1/instances", json=request_body())).json()
+    volume_id = item["boot_volume_id"]
+    volume = h.provider.volumes_by_id[volume_id]
+    volume["status"] = "available"
+    if change == "foreign":
+        volume["project_id"] = OTHER
+    elif change == "marker":
+        volume["metadata"][service.MARKER] = str(uuid4())
+    elif change == "attached":
+        volume["attachments"] = [{"server_id": str(uuid4())}]
+    elif change == "wrong-image":
+        volume["volume_image_metadata"]["image_id"] = str(uuid4())
+    elif change == "wrong-volume":
+        wrong_volume_id = str(uuid4())
+        monkeypatch.setattr(h.provider, "get_volume", lambda identity: {**volume, "id": wrong_volume_id})
+    else:
+        volume["size"] += 1
+    response = await h.client.get("/v1/instances/" + item["id"])
+    assert response.status_code == (200 if change == "attached" else 409), response.text
+    if change == "attached":
+        assert response.json()["status"] == "error" and response.json()["server_id"] is None
+    assert h.provider.creates == [] and h.provider.volume_deletes == []
+    assert len(h.provider.volume_creates) == 1 and set(h.provider.volumes_by_id) == {volume_id}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("access", ["reader", "other-human", "foreign-project"])
+async def test_prepared_volume_observation_cannot_allocate_under_different_authority(instance_hub, access):
+    h = instance_hub
+    h.provider.volume_status = "creating"
+    item = (await h.client.post("/v1/instances", json=request_body())).json()
+    volume_id = item["boot_volume_id"]
+    h.provider.volumes_by_id[volume_id]["status"] = "available"
+    headers = {"X-Actions": "packages:inventory,packages:read"}
+    if access == "other-human":
+        h.provider._afterglow_user_id = OTHER
+        headers = {"X-User": OTHER}
+    elif access == "foreign-project":
+        h.provider._afterglow_project_id = OTHER
+        headers = {"X-Project": OTHER}
+    response = await h.client.get("/v1/instances/" + item["id"], headers=headers)
+    assert response.status_code == (404 if access == "foreign-project" else 200), response.text
+    assert h.provider.creates == [] and len(h.provider.volume_creates) == 1
+    async with h.factory() as session:
+        row = await session.get(PalimpsestHubInstance, item["id"])
+        assert row.server_id is None and row.capability_hash is None and row.boot_volume_id == volume_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["outage", "unauthorized", "forbidden", "revoked", "expired"])
+@pytest.mark.parametrize("read_fence", [1, 2])
+async def test_slow_prepared_volume_read_rechecks_original_authority_before_nova(
+    instance_hub, monkeypatch, failure, read_fence
+):
+    h = instance_hub
+    h.provider.volume_status = "downloading"
+    item = (await h.client.post("/v1/instances", json=request_body())).json()
+    volume_id = item["boot_volume_id"]
+    h.provider.volumes_by_id[volume_id]["status"] = "available"
+    ready = await h.client.get("/v1/instances/" + item["id"])
+    assert ready.status_code == 200 and ready.json()["provider_phase"] == "volume_ready", ready.text
+    assert h.provider.creates == []
+    original_read = h.provider.get_volume
+    fresh = service.fresh_writer
+    state = {"reads": 0}
+
+    def slow_read(identity):
+        row = original_read(identity)
+        state["reads"] += 1
+        if failure == "expired" and state["reads"] == read_fence:
+            h.clock.now += timedelta(hours=2)
+        return row
+
+    async def authority(actor, conn):
+        if state["reads"] >= read_fence and failure != "expired":
+            raise HTTPException(
+                {"outage": 503, "unauthorized": 401, "forbidden": 403, "revoked": 403}[failure],
+                "private identity failure",
+            )
+        return await fresh(actor, conn)
+
+    monkeypatch.setattr(h.provider, "get_volume", slow_read)
+    monkeypatch.setattr(service, "fresh_writer", authority)
+    response = await advance_instance(h, item)
+    assert (
+        response.status_code
+        == {"outage": 503, "unauthorized": 401, "forbidden": 403, "revoked": 403, "expired": 202}[failure]
+    ), response.text
+    if failure == "expired":
+        assert response.json()["error_code"] == "create_bootstrap_expired"
+    assert state["reads"] >= read_fence and h.provider.creates == [] and len(h.provider.volume_creates) == 1
+    async with h.factory() as session:
+        row = await session.get(PalimpsestHubInstance, item["id"])
+        assert row.server_id is None and row.capability_hash is None and row.boot_volume_id == volume_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lost_response", [False, True])
+@pytest.mark.parametrize("pending_status", ["creating", "downloading"])
+async def test_pre_nova_cinder_cleanup_deletes_once_then_requires_exact_absence(
+    instance_hub, monkeypatch, lost_response, pending_status
+):
+    from openstack.exceptions import NotFoundException
+
+    h = instance_hub
+    h.settings.palimpsest_hub_max_instances_per_project = 1
+    h.provider.volume_status = pending_status
+    item = (await h.client.post("/v1/instances", json=request_body())).json()
+    path = "/v1/instances/" + item["id"]
+    volume_id = item["boot_volume_id"]
+    assert (await h.client.delete(path)).json()["status"] == "deleting"
+    assert h.provider.volume_deletes == [] and h.provider.deletes == [] and h.provider.creates == []
+    assert (await h.client.get(path)).json()["status"] == "deleting"
+    h.provider.volumes_by_id[volume_id]["status"] = "available"
+    ready = await h.client.get(path)
+    assert ready.status_code == 200 and ready.json()["provider_phase"] == "delete_volume_ready", ready.text
+    assert h.provider.volume_deletes == [] and h.provider.creates == []
+
+    def delete_exact(identity):
+        assert identity == volume_id
+        h.provider.volume_deletes.append(identity)
+        h.provider.volumes_by_id[identity]["status"] = "deleting"
+        if lost_response:
+            raise TimeoutError("lost exact Cinder DELETE response")
+
+    monkeypatch.setattr(h.provider, "delete_volume", delete_exact)
+    deleted = await advance_instance(h, item, operation="delete-volume")
+    assert deleted.status_code == 202 and deleted.json()["status"] == "deleting", deleted.text
+    for _ in range(2):
+        assert (await h.client.get(path)).json()["status"] == "deleting"
+        assert (await h.client.delete(path)).json()["status"] == "deleting"
+        assert h.provider.volume_deletes == [volume_id]
+        assert (await h.client.post("/v1/instances", json=request_body())).status_code == 429
+    h.provider.volumes_by_id.pop(volume_id)
+    original_get_volume = h.provider.get_volume
+
+    def absent_exact(identity):
+        assert identity == volume_id
+        h.provider.volume_reads.append(identity)
+        raise NotFoundException("exact Cinder volume is absent", http_status=404)
+
+    monkeypatch.setattr(h.provider, "get_volume", absent_exact)
+    assert (await h.client.get(path)).json()["status"] == "deleted"
+    assert (await h.client.delete(path)).json()["status"] == "deleted"
+    assert h.provider.volume_deletes == [volume_id] and h.provider.deletes == [] and h.provider.creates == []
+    assert set(h.provider.volumes_by_id) == set()
+    monkeypatch.setattr(h.provider, "get_volume", original_get_volume)
+    assert (await h.client.post("/v1/instances", json=request_body())).status_code == 202
+
+
+@pytest.mark.asyncio
+async def test_lost_nova_response_after_prepared_volume_recovers_exact_server_once(instance_hub):
+    h = instance_hub
+    h.provider.volume_status = "creating"
+    h.provider.timeout_after_create = True
+    item = (await h.client.post("/v1/instances", json=request_body())).json()
+    path = "/v1/instances/" + item["id"]
+    volume_id = item["boot_volume_id"]
+    h.provider.volumes_by_id[volume_id]["status"] = "available"
+    ready = await h.client.get(path)
+    assert ready.status_code == 200 and ready.json()["provider_phase"] == "volume_ready", ready.text
+    assert h.provider.creates == []
+    uncertain = await advance_instance(h, item)
+    assert uncertain.status_code == 202 and uncertain.json()["status"] == "uncertain", uncertain.text
+    server_id = next(iter(h.provider.servers_by_id))
+    for _ in range(3):
+        recovered = await h.client.get(path)
+        assert recovered.status_code == 200, recovered.text
+        assert recovered.json()["server_id"] == server_id and recovered.json()["boot_volume_id"] == volume_id
+    listed = (await h.client.get("/v1/instances")).json()
+    assert any(entry["id"] == item["id"] and entry["server_id"] == server_id for entry in listed)
+    assert h.provider.server_lists
+    assert len(h.provider.creates) == len(h.provider.volume_creates) == 1
+    assert set(h.provider.servers_by_id) == {server_id} and set(h.provider.volumes_by_id) == {volume_id}
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_budget_failure_releases_only_exact_prepared_cinder_reservation(instance_hub, monkeypatch):
+    h = instance_hub
+    h.settings.palimpsest_hub_max_instances_per_project = 1
+    original_render = service.render_bootstrap
+    monkeypatch.setattr(service, "render_bootstrap", lambda spec: "x" * 50000)
+    failed = await create_and_advance(h, json=request_body())
+    assert failed.status_code == 202, failed.text
+    item = failed.json()
+    volume_id = item["boot_volume_id"]
+    assert item["status"] == "error" and item["error_code"] == "create_bootstrap_input_limit"
+    assert item["server_id"] is None and h.provider.creates == []
+    assert len(h.provider.volume_creates) == 1 and set(h.provider.volumes_by_id) == {volume_id}
+    async with h.factory() as session:
+        row = await session.get(PalimpsestHubInstance, item["id"])
+        assert row.capability_hash is None and row.boot_volume_id == volume_id
+    path = "/v1/instances/" + item["id"]
+    assert (await h.client.get(path)).json()["error_code"] == "create_bootstrap_input_limit"
+    assert (await create_and_advance(h, json=request_body())).status_code == 429
+    deleting = await h.client.delete(path)
+    assert deleting.status_code == 202 and deleting.json()["status"] == "deleting", deleting.text
+    assert h.provider.volume_deletes == [] and h.provider.deletes == []
+    ready = await h.client.get(path)
+    assert ready.status_code == 200 and ready.json()["provider_phase"] == "delete_volume_ready", ready.text
+    assert h.provider.volume_deletes == []
+    disposed = await advance_instance(h, item, operation="delete-volume")
+    assert disposed.status_code == 202 and h.provider.volume_deletes == [volume_id], disposed.text
+    assert (await h.client.get(path)).json()["status"] == "deleted"
+    assert (await h.client.delete(path)).json()["status"] == "deleted"
+    monkeypatch.setattr(service, "render_bootstrap", original_render)
+    replacement = await create_and_advance(h, json=request_body())
+    assert replacement.status_code == 202 and replacement.json()["server_id"], replacement.text
+    assert len(h.provider.volume_creates) == 2 and len(h.provider.creates) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recovery", ["absent", "multiple", "foreign", "changed-marker"])
+async def test_lost_nova_post_never_reallocates_from_unproven_server_inventory(instance_hub, recovery):
+    h = instance_hub
+    h.provider.timeout_after_create = True
+    body = request_body()
+    accepted = await create_and_advance(h, json=body)
+    assert accepted.status_code == 202 and accepted.json()["status"] == "uncertain", accepted.text
+    item = accepted.json()
+    volume_id = item["boot_volume_id"]
+    server_id = next(iter(h.provider.servers_by_id))
+    server = h.provider.servers_by_id[server_id]
+    if recovery == "absent":
+        h.provider.servers_by_id.clear()
+    elif recovery == "multiple":
+        duplicate_id = str(uuid4())
+        h.provider.servers_by_id[duplicate_id] = {**server, "id": duplicate_id, "metadata": dict(server["metadata"])}
+    elif recovery == "foreign":
+        server["project_id"] = OTHER
+    else:
+        server["metadata"]["palimpsest_request_digest"] = "sha256:" + "0" * 64
+    path = "/v1/instances/" + item["id"]
+    for _ in range(3):
+        observed = await h.client.get(path)
+        assert observed.status_code == (409 if recovery == "multiple" else 200), observed.text
+        if observed.status_code == 200:
+            assert observed.json()["status"] == "uncertain" and observed.json()["server_id"] is None
+            assert observed.json()["boot_volume_id"] == volume_id
+        assert len(h.provider.creates) == len(h.provider.volume_creates) == 1
+    assert (await create_and_advance(h, json=body)).json()["id"] == item["id"]
+    assert set(h.provider.volumes_by_id) == {volume_id}
+    assert h.provider.deletes == h.provider.volume_deletes == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["timeout", "unauthorized", "forbidden", "none"])
+async def test_cinder_observation_outage_preserves_reservation_without_nova(instance_hub, monkeypatch, failure):
+    h = instance_hub
+    h.provider.volume_status = "creating"
+    item = (await h.client.post("/v1/instances", json=request_body())).json()
+    volume_id = item["boot_volume_id"]
+
+    def unavailable(identity):
+        assert identity == volume_id
+        if failure == "none":
+            return None
+        if failure != "timeout":
+            from openstack.exceptions import HttpException
+
+            raise HttpException("private storage endpoint", http_status=401 if failure == "unauthorized" else 403)
+        raise TimeoutError("private storage endpoint")
+
+    monkeypatch.setattr(h.provider, "get_volume", unavailable)
+    for _ in range(2):
+        observed = await h.client.get("/v1/instances/" + item["id"])
+        assert observed.status_code == 502 and "private storage endpoint" not in observed.text
+        assert h.provider.creates == [] and len(h.provider.volume_creates) == 1
+    assert set(h.provider.volumes_by_id) == {volume_id}
+    async with h.factory() as session:
+        row = await session.get(PalimpsestHubInstance, item["id"])
+        assert row.boot_volume_id == volume_id and row.server_id is None and row.capability_hash is None
+
+
+@pytest.mark.asyncio
+async def test_cinder_error_retains_owned_root_until_explicit_delete_and_exact_404(instance_hub):
+    h = instance_hub
+    h.settings.palimpsest_hub_max_instances_per_project = 1
+    h.provider.volume_status = "creating"
+    body = request_body()
+    item = (await h.client.post("/v1/instances", json=body)).json()
+    volume_id = item["boot_volume_id"]
+    path = "/v1/instances/" + item["id"]
+    h.provider.volumes_by_id[volume_id]["status"] = "error"
+    for _ in range(2):
+        observed = await h.client.get(path)
+        assert observed.status_code == 200, observed.text
+        assert observed.json()["status"] == "error" and observed.json()["error_code"] == "provider_boot_volume_error"
+        assert observed.json()["server_id"] is None and observed.json()["boot_volume_id"] == volume_id
+        assert h.provider.creates == [] and h.provider.volume_deletes == []
+    assert (await h.client.post("/v1/instances", json=body)).json()["id"] == item["id"]
+    assert (await h.client.post("/v1/instances", json=request_body())).status_code == 429
+    deleted = await h.client.delete(path)
+    assert deleted.status_code == 202 and deleted.json()["status"] == "deleting", deleted.text
+    assert h.provider.volume_deletes == [] and h.provider.deletes == []
+    ready = await h.client.get(path)
+    assert ready.status_code == 200 and ready.json()["provider_phase"] == "delete_volume_ready", ready.text
+    assert h.provider.volume_deletes == []
+    disposed = await advance_instance(h, item, operation="delete-volume")
+    assert disposed.status_code == 202 and h.provider.volume_deletes == [volume_id], disposed.text
+    assert (await h.client.get(path)).json()["status"] == "deleted"
+    assert (await h.client.delete(path)).json()["status"] == "deleted"
+    assert h.provider.volume_deletes == [volume_id]
+    assert len(h.provider.volume_creates) == 1 and h.provider.creates == []
+    assert set(h.provider.volumes_by_id) == set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["project", "marker", "attached"])
+async def test_serverless_cinder_cleanup_never_deletes_foreign_or_attached_volume(instance_hub, change):
+    h = instance_hub
+    h.provider.volume_status = "creating"
+    item = (await h.client.post("/v1/instances", json=request_body())).json()
+    volume_id = item["boot_volume_id"]
+    volume = h.provider.volumes_by_id[volume_id]
+    volume["status"] = "available"
+    if change == "project":
+        volume["project_id"] = OTHER
+    elif change == "marker":
+        volume["metadata"]["palimpsest_volume_role"] = "unrelated-data"
+    else:
+        volume["attachments"] = [{"server_id": str(uuid4())}]
+    response = await h.client.delete("/v1/instances/" + item["id"])
+    assert response.status_code == (202 if change == "attached" else 409), response.text
+    if change == "attached":
+        assert response.json()["status"] == "deleting" and response.json()["boot_volume_id"] == volume_id
+    assert h.provider.volume_deletes == h.provider.deletes == h.provider.creates == []
+    assert len(h.provider.volume_creates) == 1 and set(h.provider.volumes_by_id) == {volume_id}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["nova_not_attempted", "nova_create_uncertain"])
+@pytest.mark.parametrize("contender", ["advance", "delete"])
+async def test_prepared_boot_commit_races_never_duplicate_or_delete_a_late_create(
+    instance_hub, monkeypatch, boundary, contender
+):
+    import asyncio
+
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    h = instance_hub
+    h.provider.volume_status = "creating"
+    item = (await h.client.post("/v1/instances", json=request_body())).json()
+    volume_id = item["boot_volume_id"]
+    path = "/v1/instances/" + item["id"]
+    h.provider.volumes_by_id[volume_id]["status"] = "available"
+    ready = await h.client.get(path)
+    assert ready.status_code == 200 and ready.json()["provider_phase"] == "volume_ready", ready.text
+    assert h.provider.creates == []
+    committed = asyncio.Event()
+    resume = asyncio.Event()
+    state = {"owner": None, "paused": False}
+    real_commit = AsyncSession.commit
+
+    async def interleaved_commit(session):
+        pause = (
+            not state["paused"]
+            and asyncio.current_task() is state["owner"]
+            and any(
+                isinstance(row, PalimpsestHubInstance)
+                and row.id == item["id"]
+                and row.spec_json.get("_boot_prepare", {}).get("phase") == boundary
+                for row in session.identity_map.values()
+            )
+        )
+        await real_commit(session)
+        if pause:
+            state["paused"] = True
+            committed.set()
+            await resume.wait()
+
+    async def original_advance():
+        state["owner"] = asyncio.current_task()
+        return await advance_instance(h, item)
+
+    monkeypatch.setattr(AsyncSession, "commit", interleaved_commit)
+    async with asyncio.timeout(10):
+        original = asyncio.create_task(original_advance())
+        try:
+            await committed.wait()
+            assert h.provider.creates == [] and h.provider.volume_deletes == []
+            for _ in range(2):
+                read_only = await h.client.get(path)
+                assert read_only.status_code == 200, read_only.text
+                assert read_only.json()["server_id"] is None and h.provider.creates == []
+                assert h.provider.volume_deletes == []
+            raced = await (advance_instance(h, item) if contender == "advance" else h.client.delete(path))
+            assert raced.status_code == (
+                409 if contender == "advance" and boundary == "nova_create_uncertain" else 202
+            ), raced.text
+            if contender == "delete":
+                assert h.provider.creates == []
+                if boundary == "nova_create_uncertain":
+                    assert raced.json()["status"] == "deleting"
+                    assert h.provider.volume_deletes == [] and set(h.provider.volumes_by_id) == {volume_id}
+                else:
+                    assert raced.json()["status"] == "deleting" and h.provider.volume_deletes == []
+            elif boundary == "nova_not_attempted":
+                assert len(h.provider.creates) == 1
+                assert raced.json()["server_id"] in h.provider.servers_by_id
+            else:
+                assert h.provider.servers_by_id == {} and h.provider.creates == []
+        finally:
+            resume.set()
+            first = await original
+        assert first.status_code == 202, first.text
+        final = await h.client.get(path)
+        assert final.status_code == 200, final.text
+    assert state["paused"] and len(h.provider.volume_creates) == 1
+    assert h.provider.deletes == []
+    if contender == "advance":
+        server_id = final.json()["server_id"]
+        assert final.json()["status"] == "booting" and server_id in h.provider.servers_by_id
+        assert len(h.provider.creates) == 1 and h.provider.volume_deletes == []
+        assert set(h.provider.servers_by_id) == {server_id} and set(h.provider.volumes_by_id) == {volume_id}
+        assert h.provider.creates[0]["block_device_mapping_v2"][0]["uuid"] == volume_id
+    else:
+        assert final.json()["server_id"] is None and h.provider.creates == []
+        assert final.json()["status"] == "deleting" and final.json()["provider_phase"] == "delete_volume_ready"
+        assert final.json()["server_create_attempted"] is False
+        assert h.provider.volume_deletes == [] and set(h.provider.volumes_by_id) == {volume_id}
+        disposed = await advance_instance(h, item, operation="delete-volume")
+        assert disposed.status_code == 202 and h.provider.volume_deletes == [volume_id], disposed.text
+        assert (await h.client.get(path)).json()["status"] == "deleted"
+        assert h.provider.volumes_by_id == {} and h.provider.creates == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "boundary", ["volume_create_uncertain", "volume_waiting", "nova_create_uncertain", "nova_observed"]
+)
+async def test_unknown_allocation_commit_outcome_never_replays_provider_post(instance_hub, monkeypatch, boundary):
+    """Inject a lost COMMIT reply after real durability, not a delayed server commit."""
+    from sqlalchemy.exc import OperationalError
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    h = instance_hub
+    body = request_body()
+    real_commit = AsyncSession.commit
+    failure = OperationalError("COMMIT", {}, TimeoutError("unknown COMMIT outcome"), connection_invalidated=True)
+    state = {"injected": False, "instance_id": None}
+
+    async def unknown_commit(session):
+        matching = next(
+            (
+                row
+                for row in session.identity_map.values()
+                if isinstance(row, PalimpsestHubInstance)
+                and row.request_id == body["request_id"]
+                and row.spec_json.get("_boot_prepare", {}).get("phase") == boundary
+            ),
+            None,
+        )
+        inject = matching is not None and not state["injected"]
+        if inject:
+            state["instance_id"] = matching.id
+        await real_commit(session)
+        if inject:
+            state["injected"] = True
+            raise failure
+
+    monkeypatch.setattr(AsyncSession, "commit", unknown_commit)
+    with pytest.raises(OperationalError) as raised:
+        await create_and_advance(h, json=body)
+    assert raised.value is failure
+    assert state["injected"] and state["instance_id"]
+    path = "/v1/instances/" + state["instance_id"]
+    expected_volumes = 0 if boundary == "volume_create_uncertain" else 1
+    expected_servers = 1 if boundary == "nova_observed" else 0
+    for _ in range(3):
+        observed = await h.client.get(path)
+        assert observed.status_code == 200, observed.text
+        assert observed.json()["id"] == state["instance_id"]
+        assert len(h.provider.volume_creates) == expected_volumes
+        assert len(h.provider.creates) == expected_servers
+        if expected_servers:
+            assert observed.json()["status"] == "booting"
+            assert set(h.provider.servers_by_id) == {observed.json()["server_id"]}
+            assert set(h.provider.volumes_by_id) == {observed.json()["boot_volume_id"]}
+        elif boundary == "volume_waiting":
+            assert observed.json()["status"] == "booting" and observed.json()["provider_phase"] == "volume_ready"
+            assert observed.json()["server_id"] is None and observed.json()["server_create_attempted"] is False
+        else:
+            assert observed.json()["status"] == "uncertain" and observed.json()["server_id"] is None
+    repeated = await h.client.post("/v1/instances", json=body)
+    assert repeated.status_code == 202 and repeated.json()["id"] == state["instance_id"]
+    assert len(h.provider.volume_creates) == expected_volumes and len(h.provider.creates) == expected_servers
+    assert h.provider.volume_deletes == h.provider.deletes == []
+    assert h.store.blob_path(DIGEST).read_bytes() == PAYLOAD
+    if boundary == "volume_waiting":
+        started = await advance_instance(h, observed.json())
+        assert started.status_code == 202 and started.json()["server_id"] in h.provider.servers_by_id, started.text
+        assert len(h.provider.volume_creates) == len(h.provider.creates) == 1
+        assert set(h.provider.volumes_by_id) == {started.json()["boot_volume_id"]}
+
+
+@pytest.mark.asyncio
+async def test_available_initial_create_and_all_gets_are_observation_only(instance_hub):
+    h = instance_hub
+    body = request_body()
+    accepted = await h.client.post("/v1/instances", json=body)
+    assert accepted.status_code == 202, accepted.text
+    item = accepted.json()
+    volume_id = item["boot_volume_id"]
+    assert item["provider_phase"] == "volume_ready" and item["server_create_attempted"] is False
+    assert item["server_id"] is None and h.provider.creates == []
+    for _ in range(3):
+        detail = await h.client.get("/v1/instances/" + item["id"])
+        assert detail.status_code == 200 and detail.json()["provider_phase"] == "volume_ready", detail.text
+        assert detail.json()["server_create_attempted"] is False and detail.json()["boot_volume_id"] == volume_id
+        listed = (await h.client.get("/v1/instances")).json()
+        assert [(entry["id"], entry["server_id"], entry["boot_volume_id"]) for entry in listed] == [
+            (item["id"], None, volume_id)
+        ]
+    assert len(h.provider.volume_creates) == 1 and h.provider.creates == h.provider.volume_deletes == []
+    assert set(h.provider.volumes_by_id) == {volume_id} and h.provider.servers_by_id == {}
+    async with h.factory() as session:
+        row = await session.get(PalimpsestHubInstance, item["id"])
+        assert row.capability_hash is None and row.server_id is None and row.boot_volume_id == volume_id
+    started = await advance_instance(h, item)
+    assert started.status_code == 202 and started.json()["server_create_attempted"] is True, started.text
+    server_id = started.json()["server_id"]
+    assert set(h.provider.servers_by_id) == {server_id} and len(h.provider.creates) == 1
+    repeated = await advance_instance(h, item)
+    assert repeated.status_code == 409, repeated.text
+    assert len(h.provider.creates) == len(h.provider.volume_creates) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mismatch", ["request", "volume", "operation", "extra", "missing", "reader", "other-human", "foreign-project"]
+)
+async def test_explicit_advance_requires_exact_accepted_intent_and_original_writer(instance_hub, mismatch):
+    h = instance_hub
+    item = (await h.client.post("/v1/instances", json=request_body())).json()
+    payload = {"operation": "create-server", "request_id": item["request_id"], "boot_volume_id": item["boot_volume_id"]}
+    headers = {}
+    if mismatch == "request":
+        payload["request_id"] = str(uuid4())
+    elif mismatch == "volume":
+        payload["boot_volume_id"] = str(uuid4())
+    elif mismatch == "operation":
+        payload["operation"] = "delete-volume"
+    elif mismatch == "extra":
+        payload["force"] = True
+    elif mismatch == "missing":
+        payload.pop("boot_volume_id")
+    elif mismatch == "reader":
+        headers["X-Actions"] = "packages:inventory,packages:read"
+    elif mismatch == "foreign-project":
+        headers["X-Project"] = OTHER
+        h.provider._afterglow_project_id = OTHER
+    else:
+        headers["X-User"] = OTHER
+        h.provider._afterglow_user_id = OTHER
+    response = await h.client.post("/v1/instances/" + item["id"] + "/advance", json=payload, headers=headers)
+    expected = (
+        422
+        if mismatch in ("extra", "missing")
+        else 403
+        if mismatch in ("reader", "other-human")
+        else 404
+        if mismatch == "foreign-project"
+        else 409
+    )
+    assert response.status_code == expected, response.text
+    assert len(h.provider.volume_creates) == 1 and h.provider.creates == h.provider.volume_deletes == []
+    assert set(h.provider.volumes_by_id) == {item["boot_volume_id"]}
+    async with h.factory() as session:
+        row = await session.get(PalimpsestHubInstance, item["id"])
+        assert row.server_id is None and row.capability_hash is None and row.boot_volume_id == item["boot_volume_id"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["volume_create_uncertain", "nova_create_uncertain"])
+@pytest.mark.parametrize("failure", ["revoked", "expired"])
+@pytest.mark.parametrize("lose_terminal_commit_reply", [False, True])
+async def test_authority_loss_after_intent_commit_proves_no_call_and_allows_exact_cleanup(
+    instance_hub, monkeypatch, boundary, failure, lose_terminal_commit_reply
+):
+    from sqlalchemy.exc import OperationalError
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    h = instance_hub
+    body = request_body()
+    real_commit = AsyncSession.commit
+    fresh = service.fresh_writer
+    state = {"crossed": False, "instance_id": None, "revoked": False, "lost_terminal": False}
+    unknown_terminal = OperationalError(
+        "COMMIT", {}, TimeoutError("unknown terminal no-call COMMIT outcome"), connection_invalidated=True
+    )
+
+    async def change_after_commit(session):
+        matching = next(
+            (
+                row
+                for row in session.identity_map.values()
+                if isinstance(row, PalimpsestHubInstance)
+                and row.request_id == body["request_id"]
+                and row.spec_json.get("_boot_prepare", {}).get("phase") == boundary
+            ),
+            None,
+        )
+        change = matching is not None and not state["crossed"]
+        if change:
+            state["instance_id"] = matching.id
+        lose_terminal = (
+            lose_terminal_commit_reply
+            and state["crossed"]
+            and not state["lost_terminal"]
+            and any(
+                isinstance(row, PalimpsestHubInstance)
+                and row.request_id == body["request_id"]
+                and row.status == "error"
+                and row.error_code
+                == ("create_authority_revoked" if failure == "revoked" else "create_bootstrap_expired")
+                for row in session.identity_map.values()
+            )
+        )
+        await real_commit(session)
+        if lose_terminal:
+            state["lost_terminal"] = True
+            raise unknown_terminal
+        if change:
+            state["crossed"] = True
+            if failure == "expired":
+                h.clock.now += timedelta(hours=2)
+            else:
+                state["revoked"] = True
+
+    async def authority(actor, conn):
+        if state["revoked"]:
+            raise HTTPException(403, "original write authority revoked")
+        return await fresh(actor, conn)
+
+    monkeypatch.setattr(AsyncSession, "commit", change_after_commit)
+    monkeypatch.setattr(service, "fresh_writer", authority)
+    if lose_terminal_commit_reply:
+        with pytest.raises(OperationalError) as raised:
+            await create_and_advance(h, json=body)
+        assert raised.value is unknown_terminal and state["lost_terminal"]
+    else:
+        response = await create_and_advance(h, json=body)
+        assert response.status_code == (403 if failure == "revoked" else 202), response.text
+    assert state["crossed"] and state["instance_id"]
+    expected_volumes = 0 if boundary == "volume_create_uncertain" else 1
+    assert len(h.provider.volume_creates) == expected_volumes and h.provider.creates == []
+    state["revoked"] = False
+    path = "/v1/instances/" + state["instance_id"]
+    observed = await h.client.get(path)
+    assert observed.status_code == 200 and observed.json()["status"] == "error", observed.text
+    assert observed.json()["server_create_attempted"] is False and observed.json()["server_id"] is None
+    assert observed.json()["error_code"] == (
+        "create_authority_revoked" if failure == "revoked" else "create_bootstrap_expired"
+    )
+    volume_id = observed.json()["boot_volume_id"]
+    assert set(h.provider.volumes_by_id) == ({volume_id} if expected_volumes else set())
+    async with h.factory() as session:
+        row = await session.get(PalimpsestHubInstance, state["instance_id"])
+        assert row.capability_hash is None and row.server_id is None
+    deleting = await h.client.delete(path)
+    assert deleting.status_code == 202, deleting.text
+    assert h.provider.volume_deletes == []
+    if expected_volumes:
+        assert deleting.json()["status"] == "deleting"
+        ready = await h.client.get(path)
+        assert ready.status_code == 200 and ready.json()["provider_phase"] == "delete_volume_ready", ready.text
+        assert h.provider.volume_deletes == []
+        disposed = await advance_instance(h, ready.json(), operation="delete-volume")
+        assert disposed.status_code == 202 and h.provider.volume_deletes == [volume_id], disposed.text
+    settled = await h.client.get(path)
+    assert settled.status_code == 200 and settled.json()["status"] == "deleted", settled.text
+    assert h.provider.volume_deletes == ([volume_id] if expected_volumes else [])
+    assert len(h.provider.volume_creates) == expected_volumes and h.provider.creates == h.provider.deletes == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["volume_create_uncertain", "nova_create_uncertain"])
+async def test_unproven_intent_commit_cannot_dispatch_or_replay_a_provider_effect(instance_hub, monkeypatch, boundary):
+    """An exception before real COMMIT leaves no permission to dispatch that POST."""
+    from sqlalchemy.exc import OperationalError
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    h = instance_hub
+    body = request_body()
+    real_commit = AsyncSession.commit
+    failure = OperationalError("COMMIT", {}, TimeoutError("unproven COMMIT outcome"), connection_invalidated=True)
+    state = {"injected": False, "instance_id": None}
+
+    async def unproven_commit(session):
+        row = next(
+            (
+                candidate
+                for candidate in session.identity_map.values()
+                if isinstance(candidate, PalimpsestHubInstance)
+                and candidate.request_id == body["request_id"]
+                and candidate.spec_json.get("_boot_prepare", {}).get("phase") == boundary
+            ),
+            None,
+        )
+        if row is not None and not state["injected"]:
+            state["instance_id"], state["injected"] = row.id, True
+            raise failure
+        await real_commit(session)
+
+    monkeypatch.setattr(AsyncSession, "commit", unproven_commit)
+    with pytest.raises(OperationalError) as raised:
+        await create_and_advance(h, json=body)
+    assert raised.value is failure and state["injected"]
+    expected_volumes = 0 if boundary == "volume_create_uncertain" else 1
+    for _ in range(3):
+        observed = await h.client.get("/v1/instances/" + state["instance_id"])
+        assert observed.status_code == 200 and observed.json()["server_id"] is None, observed.text
+        assert len(h.provider.volume_creates) == expected_volumes and h.provider.creates == []
+    assert (await h.client.post("/v1/instances", json=body)).json()["id"] == state["instance_id"]
+    assert len(h.provider.volume_creates) == expected_volumes and h.provider.creates == []
+    assert h.provider.volume_deletes == h.provider.deletes == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("attempt", ["missing", None, 0, "false", False, True])
+@pytest.mark.parametrize("phase", ["volume_waiting", "nova_create_uncertain"])
+@pytest.mark.parametrize("version", [1, True], ids=["version-one", "boolean-not-version"])
+async def test_unknown_or_attempted_history_never_authorizes_serverless_cinder_disposal(
+    instance_hub, attempt, phase, version
+):
+    h = instance_hub
+    item = (await h.client.post("/v1/instances", json=request_body())).json()
+    volume_id = item["boot_volume_id"]
+    path = "/v1/instances/" + item["id"]
+    async with h.factory() as session:
+        row = await session.get(PalimpsestHubInstance, item["id"])
+        state = {**row.spec_json["_boot_prepare"], "version": version, "phase": phase}
+        if attempt == "missing":
+            state.pop("server_create_attempted", None)
+        else:
+            state["server_create_attempted"] = attempt
+        row.spec_json = {**row.spec_json, "_boot_prepare": state}
+        await session.commit()
+    intent = await h.client.delete(path)
+    assert intent.status_code == 202 and intent.json()["status"] == "deleting", intent.text
+    assert h.provider.volume_deletes == h.provider.deletes == h.provider.creates == []
+    listed = next(entry for entry in (await h.client.get("/v1/instances")).json() if entry["id"] == item["id"])
+    recognized = type(version) is int and version == 1
+    expected_attempted = (
+        (True if phase == "nova_create_uncertain" else attempt) if recognized and type(attempt) is bool else None
+    )
+    assert listed["server_create_attempted"] is expected_attempted
+    if not recognized:
+        assert listed["provider_phase"] == "legacy"
+    disposed = await advance_instance(h, item, operation="delete-volume")
+    permitted = recognized and phase == "volume_waiting" and attempt is False
+    assert disposed.status_code == (202 if permitted else 409), disposed.text
+    assert h.provider.volume_deletes == ([volume_id] if permitted else [])
+    assert len(h.provider.volume_creates) == 1 and h.provider.creates == h.provider.deletes == []
+    if permitted:
+        settled = await h.client.get(path)
+        assert settled.status_code == 200 and settled.json()["status"] == "deleted", settled.text
+        assert h.provider.volumes_by_id == {}
+    else:
+        assert set(h.provider.volumes_by_id) == {volume_id}
+        assert h.provider.volumes_by_id[volume_id]["attachments"] == []
+        async with h.factory() as session:
+            row = await session.get(PalimpsestHubInstance, item["id"])
+            assert row.status == "deleting" and row.boot_volume_id == volume_id and row.server_id is None

@@ -442,11 +442,37 @@ Keystone token is persisted in a job or forwarded to the worker or guest.
 | Server registry import | `POST /v1/registry-imports` | `GET /v1/image-jobs/{id}` reaches `complete` with ordered output digests and source manifest/config identities |
 | Upload Dockerfile context | `POST /v1/build-contexts`, raw `application/x-tar`, `X-Content-SHA256`, exact `Content-Length` | Verified project-bound context digest |
 | Direct Dockerfile build | `POST /v1/dockerfile-builds` | Same image-job completion contract; no client build |
-| Create consumer | `POST /v1/instances` | `GET /v1/instances/{id}` includes guest result, timestamp, output and provider state |
+| Create consumer | `POST /v1/instances` | Creates only the exact image-backed Cinder root; pure `GET /v1/instances/{id}` observes `provider_phase=volume_ready` before a separately authorized Nova attempt |
 | Reuse previously connected layers | `POST /v1/instances` with `source_instance_id` | New consumer binds the previous immutable ordered stack and runtime provenance |
+| Advance prepared root | `POST /v1/instances/{id}/advance` with `operation="create-server"`, original `request_id`, exact `boot_volume_id` | One explicit Nova attempt after durable intent and fresh original approval/deadline checks; then pure GET observes provider/guest result |
 | Observe/stop/remove consumer | `GET /v1/instances`, `GET /v1/instances/{id}`, `POST /v1/instances/{id}/stop`, `DELETE /v1/instances/{id}` | Exact-owned provider observation and terminal lifecycle state |
+| Finish deferred root removal | The same explicit advance route with `operation="delete-volume"` after DELETE and pure GET reports `delete_volume_ready` | One exact-owned deletion attempt; actual Cinder GET404 plus either exact Nova absence or certified `server_create_attempted=false`/null server proves completion |
 
 ### Requests and retained identity
+Consumer GET/list/status never allocates or deletes provider resources. Manual API
+clients must retain the original create request and returned root identity, journal
+the advance operation before sending it once, and only observe with GET after an
+unknown response; retrying the mutation is not a recovery strategy. Scenario
+pollers use the same original cumulative reservation (no new slot or refund), and
+check both approval expiry and the original scenario deadline before the advance
+intent and immediately before its POST. Cleanup never advances creation. A null
+legacy/unknown server identity is a HOLD, not proof that Nova was never attempted.
+An `error`/`deleting` row whose provider phase is `uncertain` remains eligible
+for exact-root cleanup only with positive `server_create_attempted=false`, a
+known bound root and no historical server binding in the original receipts or
+reservation. Uncertain phase alone never proves Nova absence.
+An exact pre-cleanup Cinder GET404 is recorded as `volume_already_absent=true`
+and permits the official API DELETE to settle the bound row without another
+provider deletion. Budget release still requires Hub `deleted`, the positive
+no-Nova certificate and a final exact Cinder GET404; null/non404 failures HOLD.
+Per-operation `*-advance.json` retains the immutable original binding;
+`*-advance-result.json` distinguishes accepted responses, definitive HTTP4xx
+rejections, pre-effect no-call fences and unknown responses. Rejected/no-call
+operations require explicit disposition rather than automatic resubmission;
+unknown responses remain GET-only. The first exact visible Nova identity is
+bound to the original reservation before workload verification. Successful
+cleanup persists `*-absence.json` before releasing its live hold.
+
 
 Registry import accepts `request_id` (UUID), `name`, `reference`, and
 `platform="linux/amd64"`. Docker Hub shorthand such as `alpine:3` normalizes to
@@ -546,8 +572,11 @@ source deletion/GC is refused even after consumer deletion so reuse remains vali
 
 The stdlib `HubClient` exposes `update_layer`, `upload_build_context`,
 `import_registry_image`, `build_dockerfile`, `get_image_job`, `list_image_jobs`,
-`create_instance`, `get_instance`, `list_instances`, `stop_instance` and
-`delete_instance` without client-side SDK/SSH or automatic mutation retries.
+`create_instance`, `get_instance`, `advance_instance`, `list_instances`,
+`stop_instance` and `delete_instance` without client-side SDK/SSH or automatic
+mutation retries. `advance_instance(id, operation="create-server",
+request_id=original_request_id, boot_volume_id=exact_boot_id)` is the explicit
+prepared-root transition; use `operation="delete-volume"` only for pending cleanup.
 Publication, Kolla rollout, existing worker quarantine disposition and real cloud
 resource proofs remain separately scoped actions. The historical N5 private
 SDK/SSH harness is not automatically migrated or reauthorized by these APIs.

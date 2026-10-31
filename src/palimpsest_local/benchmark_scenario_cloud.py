@@ -376,18 +376,58 @@ class ScenarioCloud:
                 result.append(resource)
         return result
 
-    def verify_absent(self, server_id: str, boot_volume_id: str | None = None) -> dict:
-        """Read-only exact-identity 404 proof after an API-owned cleanup."""
+    def verify_prepared_volume(self, instance_id: str, boot_volume_id: str) -> dict:
+        """Observe an exact API-owned unattached root; never acquire SDK delete authority."""
         self._scope()
-        server_id = _id(server_id, "server")
+        instance_id = _id(instance_id, "API instance")
+        boot_volume_id = _id(boot_volume_id, "boot volume")
+        try:
+            volume = self.connection.block_storage.get_volume(boot_volume_id)
+        except Exception as exc:
+            if getattr(exc, "status_code", None) == 404 or getattr(exc, "http_status", None) == 404:
+                return {"boot_volume_id": boot_volume_id, "project_id": self.project_id, "volume_already_absent": True}
+            raise
+        if (
+            volume is None
+            or _field(volume, "id") != boot_volume_id
+            or _field(volume, "project_id") != self.project_id
+            or (_field(volume, "metadata", {}) or {}).get("palimpsest_instance_id") != instance_id
+            or _field(volume, "attachments", [])
+        ):
+            _fail("prepared API root ownership, marker or unattached identity changed")
+        return {"boot_volume_id": boot_volume_id, "project_id": self.project_id}
+
+    def verify_absent(
+        self, server_id: str | None, boot_volume_id: str | None = None, *, server_not_created: bool = False
+    ) -> dict:
+        """Exact GET404 proof; null Nova identity requires a caller-validated no-attempt certificate."""
+        self._scope()
         deadline = time.monotonic() + _seconds(self.config, "delete_seconds", 300)
-        self._absent(self.connection.compute.find_server, server_id, deadline)
+        if server_id is None:
+            if server_not_created is not True or boot_volume_id is None:
+                _fail("unknown Nova identity is not absence evidence")
+        else:
+            if server_not_created:
+                _fail("bound Nova identity conflicts with never-created certificate")
+            server_id = _id(server_id, "server")
+            self._absent(self.connection.compute.find_server, server_id, deadline)
         if boot_volume_id is not None:
             boot_volume_id = _id(boot_volume_id, "boot volume")
-            self._absent(self.connection.block_storage.find_volume, boot_volume_id, deadline)
+            while True:
+                try:
+                    volume = self.connection.block_storage.get_volume(boot_volume_id)
+                except Exception as exc:
+                    if getattr(exc, "status_code", None) == 404 or getattr(exc, "http_status", None) == 404:
+                        break
+                    raise
+                if volume is None or _field(volume, "id") != boot_volume_id:
+                    _fail("exact boot volume absence requires an actual provider 404")
+                if time.monotonic() >= deadline:
+                    _fail("ordinary deletion absence deadline expired; budget remains reserved")
+                time.sleep(min(2, max(0, deadline - time.monotonic())))
         return {
             "server_id": server_id,
-            "server_absent": True,
+            "server_absent": "not_created" if server_not_created else True,
             "boot_volume_id": boot_volume_id,
             "boot_volume_absent": True if boot_volume_id else None,
         }

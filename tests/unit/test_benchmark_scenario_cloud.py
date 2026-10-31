@@ -111,7 +111,7 @@ class Cloud:
             get_security_group=lambda _: {"project_id": "project-one"},
         )
         self.block_storage = SimpleNamespace(
-            get_volume=lambda _: copy.deepcopy(self.volume),
+            get_volume=self.get_volume,
             delete_volume=self.delete_volume,
             find_volume=self.find_volume,
         )
@@ -158,6 +158,14 @@ class Cloud:
 
     def find_server(self, identity, **kwargs):
         return None if self.server_absent else self.server
+
+    def get_volume(self, identity):
+        assert identity == self.volume["id"]
+        if self.volume_absent:
+            error = RuntimeError("provider volume absent")
+            error.status_code = 404
+            raise error
+        return copy.deepcopy(self.volume)
 
     def find_volume(self, identity, **kwargs):
         return None if self.volume_absent else self.volume
@@ -754,6 +762,35 @@ def test_readonly_absence_refuses_name_resolution_to_different_identity(adapter)
     with pytest.raises(ArtifactValidationError, match="different resource"):
         instance.verify_absent("server-one", "volume-one")
     assert not cloud.deleted and not budget.released
+
+
+def test_volume_only_absence_requires_explicit_certificate_and_actual_get404(adapter):
+    instance, cloud, budget, _ = adapter
+    with pytest.raises(ArtifactValidationError, match="unknown Nova"):
+        instance.verify_absent(None, "volume-one")
+    cloud.block_storage.get_volume = lambda identity: None
+    with pytest.raises(ArtifactValidationError, match="actual provider 404"):
+        instance.verify_absent(None, "volume-one", server_not_created=True)
+    cloud.block_storage.get_volume = cloud.get_volume
+    cloud.volume_absent = True
+    result = instance.verify_absent(None, "volume-one", server_not_created=True)
+    assert result["server_absent"] == "not_created" and result["boot_volume_absent"] is True
+    assert not cloud.deleted and not budget.released
+
+
+@pytest.mark.parametrize("change", ["project", "marker", "attachment"])
+def test_prepared_root_observation_preserves_exact_ownership_guards(adapter, change):
+    instance, cloud, _, _ = adapter
+    cloud.volume.update(metadata={"palimpsest_instance_id": "consumer-one"}, attachments=[])
+    assert instance.verify_prepared_volume("consumer-one", "volume-one")["boot_volume_id"] == "volume-one"
+    if change == "project":
+        cloud.volume["project_id"] = "other"
+    elif change == "marker":
+        cloud.volume["metadata"]["palimpsest_instance_id"] = "other"
+    else:
+        cloud.volume["attachments"] = [{"server_id": "other"}]
+    with pytest.raises(ArtifactValidationError, match="ownership"):
+        instance.verify_prepared_volume("consumer-one", "volume-one")
 
 
 def test_resized_flavor_is_not_original_allocation_evidence(adapter, monkeypatch):

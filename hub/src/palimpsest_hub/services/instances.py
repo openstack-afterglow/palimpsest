@@ -10,15 +10,16 @@ import json
 import re
 import secrets
 import uuid
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 
 from fastapi import HTTPException
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 
 from palimpsest_hub.auth import package_target_project_id
 from palimpsest_hub.config import InstanceGpuProfile, Settings
 from palimpsest_hub.instance_models import PalimpsestHubInstance
-from palimpsest_hub.models import exact_identity
+from palimpsest_hub.models import PalimpsestWorkerLease, exact_identity
 from palimpsest_hub.services.blob_references import retain_blob
 from palimpsest_hub.services.hub_store import MEDIA_TYPE_LAYER_SQUASHFS
 from palimpsest_hub.services.instance_bootstrap import render_bootstrap
@@ -93,6 +94,8 @@ def projection(row):
         "status": row.status,
         "server_id": row.server_id,
         "provider_status": row.provider_status,
+        "provider_phase": provider_phase(row),
+        "server_create_attempted": server_create_attempted(row),
         "layer_digests": row.spec_json["layer_digests"],
         "source_instance_id": row.source_instance_id,
         "image_job_id": row.spec_json.get("image_job_id"),
@@ -375,7 +378,6 @@ async def create(factory, store, settings, actor, conn, req):
     digest = (
         "sha256:" + hashlib.sha256(json.dumps(digest_req, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     )
-    token = secrets.token_urlsafe(32)
     # Discover only immutable candidate identities without a writer mutex. Every
     # publication/admission takes lexical CAS locks BEFORE a SQL write fence.
     async with factory() as session:
@@ -452,6 +454,12 @@ async def create(factory, store, settings, actor, conn, req):
             raise
         except Exception:
             raise HTTPException(502, "Provider input validation unavailable") from None
+        spec["_boot_prepare"] = {
+            "version": 1,
+            "phase": "volume_not_attempted",
+            "volume_create_attempted": False,
+            "server_create_attempted": False,
+        }
         await payload_authority(actor, conn, session, spec)
         now = datetime.now(UTC)
         row = PalimpsestHubInstance(
@@ -465,7 +473,7 @@ async def create(factory, store, settings, actor, conn, req):
             source_instance_id=req.get("source_instance_id"),
             status="uncertain",
             error_code="create_pending",
-            capability_hash=hashlib.sha256(token.encode()).hexdigest(),
+            capability_hash=None,
             capability_expires_at=now + timedelta(seconds=settings.palimpsest_hub_instance_bootstrap_ttl_seconds),
             created_at=now,
             updated_at=now,
@@ -481,129 +489,424 @@ async def create(factory, store, settings, actor, conn, req):
         instance_id = row.id
     async with sql_mutex(factory, "build-api:instance:" + instance_id) as session:
         row = await owned(session, instance_id, project)
-        if row.status != "uncertain" or row.error_code != "create_pending":
-            return projection(row)
-        guest = {
-            "instance_id": row.id,
-            "origin": settings.palimpsest_hub_package_public_origin.rstrip("/"),
-            "capability": token,
-            "expires_at": int(aware(row.capability_expires_at).timestamp()),
-            "layers": spec["layers"],
-            "mode": spec["mode"],
-            "runtime": spec["runtime"],
-            **({"gpu": spec["gpu"]} if spec["gpu"] is not None else {}),
-            **(
-                {"cluster": {key: item for key, item in spec["cluster"].items() if key != "qualification"}}
-                if spec.get("cluster") is not None
-                else {}
-            ),
-            "writable_bytes": spec["writable_gib"] * 1024**3,
-            "command": spec["command"],
-            "readiness_argv": spec["readiness_argv"],
-            "ca_certificates": list(settings.palimpsest_hub_instance_ca_certificates),
-        }
-        if aware(row.capability_expires_at) <= datetime.now(UTC):
-            row.status, row.error_code, row.capability_hash = "error", "create_bootstrap_expired", None
-            await session.commit()
-            return projection(row)
-        user_data = base64.b64encode(render_bootstrap(guest).encode()).decode()
-        if len(user_data) > 65535:
-            row.status, row.error_code, row.capability_hash = "error", "create_bootstrap_input_limit", None
-            await session.commit()
-            return projection(row)
-
-        # Provider inspection may block; fresh original-human authority MUST be
-        # checked after those reads, not before a potentially long network gap.
-        def inspect():
-            gpu = qualified_gpu(spec, project, settings)
-            if gpu != spec["gpu"]:
-                raise HTTPException(422, "GPU qualification changed before allocation")
-            cluster = qualified_cluster(spec, project, settings)
-            if cluster != (spec.get("cluster") or {}).get("qualification"):
-                raise HTTPException(422, "Cluster qualification changed before allocation")
-            provider_inputs(
-                conn,
-                spec,
-                project,
-                settings.palimpsest_hub_instance_max_boot_gib,
-                settings.palimpsest_hub_instance_base_images,
-                gpu,
-            )
-
-        try:
-            await run_blocking(inspect)
-            if spec.get("cluster") and spec["cluster"]["role"] == "agent":
-                source = await owned(session, spec["cluster"]["server_instance_id"], project)
-                require_cluster_source(source, spec, actor, settings, spec["cluster"]["qualification"])
-                address = await run_blocking(server_address, conn, source, spec["network_id"])
-                if address != spec["cluster"]["server_address"]:
-                    raise HTTPException(409, "Cluster source network identity changed")
-                # Current read, not the transaction's earlier MariaDB snapshot; retain through allocation.
-                await session.refresh(source, with_for_update=True)
-                require_cluster_source(source, spec, actor, settings, spec["cluster"]["qualification"])
-        except Exception as exc:
-            row.status, row.error_code, row.capability_hash = "error", "create_inputs_changed", None
-            await session.commit()
-            if isinstance(exc, HTTPException):
-                raise
-            raise HTTPException(502, "Provider input validation unavailable") from None
-        try:
-            await payload_authority(actor, conn, session, spec)
-        except HTTPException:
-            row.status, row.error_code, row.capability_hash = "error", "create_authority_revoked", None
-            await session.commit()
-            raise
-
-        def allocate():
-            return conn.compute.create_server(
-                name=spec["name"],
-                flavor_id=spec["flavor_id"],
-                networks=[{"uuid": spec["network_id"]}],
-                security_groups=[{"name": gid} for gid in spec["security_group_ids"]],
-                block_device_mapping_v2=[
-                    {
-                        "boot_index": "0",
-                        "uuid": spec["image_id"],
-                        "source_type": "image",
-                        "destination_type": "volume",
-                        "volume_size": spec["boot_gib"],
-                        "delete_on_termination": True,
-                    }
-                ],
-                metadata={MARKER: row.id, "palimpsest_request_digest": row.request_digest},
-                user_data=user_data,
-            )
-
-        try:
-            server = await run_blocking(allocate)
-            server_id = str(value(server, "id", ""))
-            uuid.UUID(server_id)
-            row.server_id = server_id
-            row.status = "booting"
-            row.error_code = None
-        except Exception:
-            row.status = "uncertain"
-            row.error_code = "provider_create_uncertain"
-        row.updated_at = datetime.now(UTC)
-        await session.commit()
+        await advance_prepared_boot(session, row, actor, conn, settings, allocate=True)
         return projection(row)
+
+
+def preparation(row):
+    state = row.spec_json.get("_boot_prepare")
+    phases = {
+        "volume_not_attempted",
+        "volume_create_uncertain",
+        "volume_waiting",
+        "nova_not_attempted",
+        "nova_create_uncertain",
+        "nova_observed",
+    }
+    return (
+        state
+        if isinstance(state, dict)
+        and type(state.get("version")) is int
+        and state["version"] == 1
+        and state.get("phase") in phases
+        else None
+    )
+
+
+def server_create_attempted(row):
+    state = preparation(row)
+    if state is None or type(state.get("server_create_attempted")) is not bool:
+        return None
+    if row.server_id is not None:
+        return True
+    if state["phase"] in ("nova_create_uncertain", "nova_observed"):
+        return True
+    return state["server_create_attempted"]
+
+
+def provider_phase(row):
+    state = preparation(row)
+    if state is None:
+        return "legacy"
+    if row.status == "deleted":
+        return "deleted"
+    if row.status == "deleting":
+        if state.get("delete_phase") == "uncertain":
+            return "uncertain"
+        return "delete_volume_ready" if state.get("delete_ready") else "delete_volume_pending"
+    if state.get("terminal"):
+        return "uncertain"
+    return {
+        "volume_not_attempted": "uncertain",
+        "volume_create_uncertain": "uncertain",
+        "volume_waiting": "volume_preparing",
+        "nova_not_attempted": "volume_ready",
+        "nova_create_uncertain": "server_attempted",
+        "nova_observed": "server_attempted",
+    }[state["phase"]]
+
+
+def preparation_update(row, **changes):
+    # JSON columns do not track nested mutations; always replace the whole value.
+    row.spec_json = {**row.spec_json, "_boot_prepare": {**preparation(row), **changes}}
+    row.updated_at = datetime.now(UTC)
+
+
+async def preparation_refence(session, row):
+    # A durable intent commit releases sql_mutex's transaction lock. Retake the
+    # SAME mutex and refresh before continuing, never trust the pre-commit row.
+    await session.execute(
+        update(PalimpsestWorkerLease)
+        .where(PalimpsestWorkerLease.name == "build-api:instance:" + row.id)
+        .values(token=uuid.uuid4().hex, expires_at=datetime.now(UTC))
+    )
+    await session.refresh(row)
+
+
+def can_continue_preparation(row, phase):
+    state = preparation(row)
+    return (
+        state is not None
+        and state["phase"] == phase
+        and not state.get("terminal")
+        and row.status not in ("deleting", "deleted")
+    )
+
+
+def volume_markers(row):
+    return {
+        MARKER: row.id,
+        "palimpsest_request_digest": row.request_digest,
+        "palimpsest_volume_role": "boot",
+        "palimpsest_image_id": row.spec_json["image_id"],
+    }
+
+
+def checked_prepared_volume(row, volume, *, image_required=False):
+    metadata = value(volume, "metadata", {}) or {}
+    image = (value(volume, "volume_image_metadata", {}) or {}).get("image_id")
+    if (
+        value(volume, "project_id", value(volume, "os-vol-tenant-attr:tenant_id")) != row.project_id
+        or any(metadata.get(key) != item for key, item in volume_markers(row).items())
+        or value(volume, "size") != row.spec_json["boot_gib"]
+        or (image is not None and image != row.spec_json["image_id"])
+        or (image_required and image != row.spec_json["image_id"])
+    ):
+        raise HTTPException(409, "Prepared boot volume ownership or image intent does not match")
+    uuid.UUID(str(value(volume, "id", "")))
+    return volume
+
+
+def get_prepared_volume(conn, row):
+    if row.boot_volume_id:
+        try:
+            volume = conn.block_storage.get_volume(row.boot_volume_id)
+        except Exception as exc:
+            if getattr(exc, "status_code", None) == 404:
+                return None
+            raise
+        if volume is None:
+            raise HTTPException(502, "Provider did not prove prepared volume presence or absence")
+        if str(value(volume, "id", "")) != row.boot_volume_id:
+            raise HTTPException(409, "Provider returned a different prepared boot volume identity")
+        return checked_prepared_volume(row, volume)
+    # Exhaust the project inventory before adopting anything. A truncated or
+    # ambiguous read is not absence and cannot authorize another POST.
+    matches = []
+    for index, volume in enumerate(conn.block_storage.volumes(details=True, project_id=row.project_id)):
+        if index >= 1000:
+            raise HTTPException(409, "Prepared volume recovery inventory exceeds observation bound")
+        metadata = value(volume, "metadata", {}) or {}
+        if value(volume, "project_id", value(volume, "os-vol-tenant-attr:tenant_id")) == row.project_id and all(
+            metadata.get(key) == item for key, item in volume_markers(row).items()
+        ):
+            if value(volume, "attachments", []):
+                raise HTTPException(409, "Cannot recover an already attached prepared boot volume")
+            matches.append(checked_prepared_volume(row, volume))
+    if len(matches) > 1:
+        raise HTTPException(409, "Prepared boot volume intent marker is ambiguous")
+    return matches[0] if matches else None
+
+
+def fail_preparation(row, code, *, no_call=None):
+    row.status, row.error_code, row.capability_hash = "error", code, None
+    preparation_update(row, terminal=True)
+    if no_call == "volume":
+        preparation_update(row, phase="volume_not_attempted", volume_create_attempted=False)
+    elif no_call == "server":
+        preparation_update(row, phase="nova_not_attempted", server_create_attempted=False)
+
+
+async def allocation_authority(session, row, actor, conn, settings, *, no_call=None):
+    """Revalidate after slow provider reads, without renewing the accepted expiry."""
+    spec = row.spec_json
+    try:
+        gpu = qualified_gpu(spec, row.project_id, settings)
+        if gpu != spec["gpu"] or qualified_cluster(spec, row.project_id, settings) != (spec.get("cluster") or {}).get(
+            "qualification"
+        ):
+            raise HTTPException(422, "Runtime qualification changed before allocation")
+        await run_blocking(
+            provider_inputs,
+            conn,
+            spec,
+            row.project_id,
+            settings.palimpsest_hub_instance_max_boot_gib,
+            settings.palimpsest_hub_instance_base_images,
+            gpu,
+        )
+        if spec.get("cluster") and spec["cluster"]["role"] == "agent":
+            source = await owned(session, spec["cluster"]["server_instance_id"], row.project_id)
+            require_cluster_source(source, spec, actor, settings, spec["cluster"]["qualification"])
+            address = await run_blocking(server_address, conn, source, spec["network_id"])
+            if address != spec["cluster"]["server_address"]:
+                raise HTTPException(409, "Cluster source network identity changed")
+            await session.refresh(source, with_for_update=True)
+            require_cluster_source(source, spec, actor, settings, spec["cluster"]["qualification"])
+    except Exception as exc:
+        fail_preparation(row, "create_inputs_changed", no_call=no_call)
+        await session.commit()
+        if isinstance(exc, HTTPException):
+            raise
+        raise HTTPException(502, "Provider input validation unavailable") from None
+    try:
+        await payload_authority(actor, conn, session, spec)
+    except HTTPException:
+        fail_preparation(row, "create_authority_revoked", no_call=no_call)
+        await session.commit()
+        raise
+    if aware(row.capability_expires_at) <= datetime.now(UTC):
+        fail_preparation(row, "create_bootstrap_expired", no_call=no_call)
+        await session.commit()
+        return False
+    return True
+
+
+async def advance_prepared_boot(session, row, actor, conn, settings, *, allocate=False, launch=False):
+    state = preparation(row)
+    if not state or row.status in ("deleting", "deleted"):
+        return
+    if state.get("terminal"):
+        # Expiry/revocation ends allocation authority, not ownership recovery.
+        # Keep the terminal cause while binding one exact previously-called root.
+        if state["phase"] != "volume_not_attempted":
+            try:
+                volume = await run_blocking(get_prepared_volume, conn, row)
+            except HTTPException:
+                raise
+            except Exception:
+                raise HTTPException(502, "Provider prepared volume observation unavailable") from None
+            if volume is not None:
+                row.boot_volume_id = str(value(volume, "id"))
+                row.updated_at = datetime.now(UTC)
+                await session.commit()
+        return
+    phase = state["phase"]
+    if phase in ("nova_create_uncertain", "nova_observed"):
+        return  # The Nova POST may already have happened. Observation only.
+    if aware(row.capability_expires_at) <= datetime.now(UTC):
+        fail_preparation(row, "create_bootstrap_expired")
+        await session.commit()
+        return
+    # An inventory reader can observe settlement, never spend accepted authority.
+    may_allocate = (
+        allocate
+        and settings is not None
+        and actor is not None
+        and actor.get("user_id") == row.created_by
+        and "packages:write" in actor.get("package_actions", ())
+    )
+    if phase == "volume_not_attempted":
+        if not may_allocate or not await allocation_authority(session, row, actor, conn, settings):
+            return
+        preparation_update(row, phase="volume_create_uncertain", volume_create_attempted=True)
+        row.status, row.error_code = "uncertain", "provider_volume_create_uncertain"
+        await session.commit()  # Crash after this commit MUST NOT replay Cinder POST.
+        await preparation_refence(session, row)
+        if not can_continue_preparation(row, "volume_create_uncertain"):
+            if preparation(row)["phase"] == "volume_create_uncertain":
+                preparation_update(row, phase="volume_not_attempted", volume_create_attempted=False, terminal=True)
+                if row.status == "deleting":
+                    row.status, row.error_code = "deleted", None
+                    preparation_update(row, delete_phase="absent", delete_ready=False)
+                await session.commit()
+            return
+        if not await allocation_authority(session, row, actor, conn, settings, no_call="volume"):
+            return
+        try:
+            volume = await run_blocking(
+                conn.block_storage.create_volume,
+                name=row.name + "-boot",
+                size=row.spec_json["boot_gib"],
+                image_id=row.spec_json["image_id"],
+                metadata=volume_markers(row),
+            )
+            checked_prepared_volume(row, volume)
+        except Exception:
+            # Provider uncertainty is already durable. Never retry POST or a
+            # possibly-failed SQL COMMIT in a provider exception handler.
+            return
+        row.boot_volume_id = str(value(volume, "id"))
+        preparation_update(row, phase="volume_waiting")
+        row.status, row.error_code = "booting", "create_boot_volume_pending"
+        await session.commit()
+        await preparation_refence(session, row)
+        if not can_continue_preparation(row, "volume_waiting"):
+            return
+    try:
+        volume = await run_blocking(get_prepared_volume, conn, row)
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(502, "Provider prepared volume observation unavailable") from None
+    if volume is None:
+        if row.boot_volume_id:
+            fail_preparation(row, "provider_boot_volume_missing")
+            await session.commit()
+        return
+    row.boot_volume_id = str(value(volume, "id"))
+    preparation_update(row, phase="volume_waiting")
+    row.status, row.error_code = "booting", "create_boot_volume_pending"
+    status = str(value(volume, "status", "UNKNOWN")).lower()
+    if status in ("creating", "downloading"):
+        if may_allocate:
+            try:
+                await payload_authority(actor, conn, session, row.spec_json)
+            except HTTPException:
+                fail_preparation(row, "create_authority_revoked")
+                await session.commit()
+                raise
+        if aware(row.capability_expires_at) <= datetime.now(UTC):
+            fail_preparation(row, "create_bootstrap_expired")
+        await session.commit()
+        return
+    if status != "available" or value(volume, "attachments", []):
+        fail_preparation(row, "provider_boot_volume_error")
+        await session.commit()
+        return
+    checked_prepared_volume(row, volume, image_required=True)
+    preparation_update(row, phase="nova_not_attempted")
+    await session.commit()
+    await preparation_refence(session, row)
+    if not can_continue_preparation(row, "nova_not_attempted"):
+        return
+    if not launch or not may_allocate or not await allocation_authority(session, row, actor, conn, settings):
+        return
+    # Final volume observation precedes the final original-human fence.
+    volume = await run_blocking(get_prepared_volume, conn, row)
+    if volume is None or str(value(volume, "status", "")).lower() != "available" or value(volume, "attachments", []):
+        fail_preparation(row, "provider_boot_volume_error")
+        await session.commit()
+        return
+    checked_prepared_volume(row, volume, image_required=True)
+    try:
+        await payload_authority(actor, conn, session, row.spec_json)
+    except HTTPException:
+        fail_preparation(row, "create_authority_revoked")
+        await session.commit()
+        raise
+    if aware(row.capability_expires_at) <= datetime.now(UTC):
+        fail_preparation(row, "create_bootstrap_expired")
+        await session.commit()
+        return
+    spec = row.spec_json
+    token = secrets.token_urlsafe(32)
+    guest = {
+        "instance_id": row.id,
+        "origin": settings.palimpsest_hub_package_public_origin.rstrip("/"),
+        "capability": token,
+        "expires_at": int(aware(row.capability_expires_at).timestamp()),
+        "layers": spec["layers"],
+        "mode": spec["mode"],
+        "runtime": spec["runtime"],
+        **({"gpu": spec["gpu"]} if spec["gpu"] is not None else {}),
+        **(
+            {"cluster": {key: item for key, item in spec["cluster"].items() if key != "qualification"}}
+            if spec.get("cluster") is not None
+            else {}
+        ),
+        "writable_bytes": spec["writable_gib"] * 1024**3,
+        "command": spec["command"],
+        "readiness_argv": spec["readiness_argv"],
+        "ca_certificates": list(settings.palimpsest_hub_instance_ca_certificates),
+    }
+    user_data = base64.b64encode(render_bootstrap(guest).encode()).decode()
+    if len(user_data) > 65535:
+        fail_preparation(row, "create_bootstrap_input_limit")
+        await session.commit()
+        return
+    row.capability_hash = hashlib.sha256(token.encode()).hexdigest()
+    preparation_update(row, phase="nova_create_uncertain", server_create_attempted=True)
+    row.status, row.error_code = "uncertain", "provider_create_uncertain"
+    await session.commit()  # Only this request holds raw token; never replay Nova POST.
+    await preparation_refence(session, row)
+    if (
+        not can_continue_preparation(row, "nova_create_uncertain")
+        or row.capability_hash != hashlib.sha256(token.encode()).hexdigest()
+    ):
+        if preparation(row)["phase"] == "nova_create_uncertain":
+            preparation_update(row, phase="nova_not_attempted", server_create_attempted=False, terminal=True)
+            row.capability_hash = None
+            await session.commit()
+        return
+    # Reacquire cluster-source authority/lock, settings, human and payload after
+    # the commit and potentially slow mutex wait; retain these locks through POST.
+    if not await allocation_authority(session, row, actor, conn, settings, no_call="server"):
+        return
+    try:
+        server = await run_blocking(
+            conn.compute.create_server,
+            name=spec["name"],
+            flavor_id=spec["flavor_id"],
+            networks=[{"uuid": spec["network_id"]}],
+            security_groups=[{"name": gid} for gid in spec["security_group_ids"]],
+            block_device_mapping_v2=[
+                {
+                    "boot_index": "0",
+                    "uuid": row.boot_volume_id,
+                    "source_type": "volume",
+                    "destination_type": "volume",
+                    "delete_on_termination": True,
+                }
+            ],
+            metadata={MARKER: row.id, "palimpsest_request_digest": row.request_digest},
+            user_data=user_data,
+        )
+        server_id = str(value(server, "id", ""))
+        uuid.UUID(server_id)
+        row.server_id = server_id
+        preparation_update(row, phase="nova_observed")
+        row.status, row.error_code = "booting", None
+    except Exception:
+        row.status, row.error_code = "uncertain", "provider_create_uncertain"
+    row.updated_at = datetime.now(UTC)
+    await session.commit()
 
 
 def exact_server(conn, row):
     """Inspect ownership AND exact intent marker before any lifecycle effect."""
+    state = preparation(row)
+    if state and state["phase"] not in ("nova_create_uncertain", "nova_observed"):
+        return None
     server = conn.compute.get_server(row.server_id) if row.server_id else None
     if server is None and row.server_id is None:
-        matches = [
-            server
-            for server in conn.compute.servers(details=True)
-            if value(server, "project_id") == row.project_id
-            and (value(server, "metadata", {}) or {}).get(MARKER) == row.id
-        ]
+        matches = []
+        for index, candidate in enumerate(conn.compute.servers(details=True)):
+            if index >= 1000:
+                raise HTTPException(409, "Provider instance recovery inventory exceeds observation bound")
+            if (
+                value(candidate, "project_id") == row.project_id
+                and (value(candidate, "metadata", {}) or {}).get(MARKER) == row.id
+                and (value(candidate, "metadata", {}) or {}).get("palimpsest_request_digest") == row.request_digest
+            ):
+                matches.append(candidate)
         if len(matches) > 1:
             raise HTTPException(409, "Provider intent marker is ambiguous")
         server = matches[0] if matches else None
     if server is not None and (
-        value(server, "project_id") != row.project_id
+        row.server_id is not None
+        and str(value(server, "id", "")) != row.server_id
+        or value(server, "project_id") != row.project_id
         or (value(server, "metadata", {}) or {}).get(MARKER) != row.id
         or (value(server, "metadata", {}) or {}).get("palimpsest_request_digest") != row.request_digest
     ):
@@ -614,19 +917,10 @@ def exact_server(conn, row):
 def inspect_boot_volume(conn, row, server, *, deleting=False):
     """Bind the one original image boot volume; never auto-delete a later attachment."""
     attachments = list(conn.compute.volume_attachments(value(server, "id"), microversion="2.79"))
-    if (
-        deleting
-        and not attachments
-        and str(value(server, "status", "")).upper() == "ERROR"
-        and row.boot_volume_id is None
-        and row.result_json is None
-        and row.provider_status in (None, "BUILD", "ERROR")
-        and row.status in ("uncertain", "booting", "error", "deleting")
-    ):
-        # Exact intent/ownership is checked by exact_server at both fences. Only
-        # a never-booted failed create with a successfully enumerated empty list
-        # may be removed without identifying a boot volume.
-        return None
+    if deleting and not attachments and preparation(row) and row.boot_volume_id:
+        volume = get_prepared_volume(conn, row)
+        if volume is not None and not value(volume, "attachments", []):
+            return row.boot_volume_id
     root_device = value(server, "root_device_name")
     boot = []
     for attachment in attachments:
@@ -643,6 +937,8 @@ def inspect_boot_volume(conn, row, server, *, deleting=False):
         )
         if is_boot:
             volume = conn.block_storage.get_volume(volume_id)
+            if preparation(row):
+                checked_prepared_volume(row, volume, image_required=True)
             owner = value(volume, "project_id", value(volume, "os-vol-tenant-attr:tenant_id"))
             attached = value(volume, "attachments", []) or []
             image_meta = value(volume, "volume_image_metadata", {}) or {}
@@ -679,8 +975,82 @@ async def settle_missing_server(row, conn):
     row.status, row.error_code, row.capability_hash = "deleted", None, None
 
 
+async def dispose_prepared_volume(session, row, actor, conn, *, allow_delete=False):
+    """Only positively owned, unattached settled roots admit one ordinary DELETE."""
+    state = preparation(row)
+    row.capability_hash = None
+    row.status = "deleting"
+    if state["phase"] == "volume_not_attempted":
+        preparation_update(row, terminal=True, delete_phase="absent", delete_ready=False)
+        row.status, row.error_code = "deleted", None
+        await session.commit()
+        return
+    try:
+        volume = await run_blocking(get_prepared_volume, conn, row)
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(502, "Provider prepared volume observation unavailable") from None
+    if volume is None:
+        if row.boot_volume_id:
+            preparation_update(row, terminal=True, delete_phase="absent", delete_ready=False)
+            row.status, row.error_code = "deleted", None
+        else:
+            row.error_code = "provider_volume_create_uncertain"
+        await session.commit()
+        return
+    row.boot_volume_id = str(value(volume, "id"))
+    status = str(value(volume, "status", "UNKNOWN")).lower()
+    preparation_update(
+        row,
+        delete_ready=status in ("available", "error") and not value(volume, "attachments", []),
+    )
+    if state.get("delete_phase") == "uncertain":
+        row.error_code = "provider_volume_delete_uncertain"
+        await session.commit()
+        return  # A lost DELETE is settled by GET only, never another DELETE.
+    if status not in ("available", "error") or value(volume, "attachments", []):
+        row.error_code = "provider_boot_volume_pending"
+        await session.commit()
+        return
+    if not allow_delete or actor is None or "packages:write" not in actor.get("package_actions", ()):
+        row.error_code = "provider_boot_volume_pending"
+        await session.commit()
+        return
+    await fresh_writer(actor, conn)  # Fresh writer after the slow ownership read.
+    preparation_update(row, delete_phase="uncertain")
+    row.error_code = "provider_volume_delete_uncertain"
+    await session.commit()
+    await preparation_refence(session, row)
+    if row.status != "deleting" or preparation(row).get("delete_phase") != "uncertain":
+        return
+    volume = await run_blocking(get_prepared_volume, conn, row)
+    if volume is None:
+        preparation_update(row, terminal=True, delete_phase="absent", delete_ready=False)
+        row.status, row.error_code = "deleted", None
+        await session.commit()
+        return
+    if str(value(volume, "status", "")).lower() not in ("available", "error") or value(volume, "attachments", []):
+        preparation_update(row, delete_phase="not_attempted", delete_ready=False)
+        await session.commit()
+        return
+    try:
+        await fresh_writer(actor, conn)
+    except HTTPException:
+        preparation_update(row, delete_phase="not_attempted")
+        await session.commit()
+        raise
+    # The prior durable intent remains uncertain on every failed response; no replay.
+    with suppress(Exception):
+        await run_blocking(conn.block_storage.delete_volume, row.boot_volume_id)
+    await session.commit()
+
+
 def create_not_attempted(row):
     """Only durable pre-allocation failures prove no provider create was issued."""
+    state = preparation(row)
+    if state:
+        return state["phase"] == "volume_not_attempted" and row.status == "error"
     return (
         row.status == "error"
         and row.server_id is None
@@ -696,9 +1066,16 @@ def create_not_attempted(row):
     )
 
 
-async def reconcile(session, row, conn):
+async def reconcile(session, row, conn, actor=None, settings=None):
     if row.status == "deleted":
         return
+    state = preparation(row)
+    if state and state["phase"] not in ("nova_create_uncertain", "nova_observed"):
+        if row.status == "deleting":
+            await dispose_prepared_volume(session, row, actor, conn)
+        else:
+            await advance_prepared_boot(session, row, actor, conn, settings)
+        return  # Observation-only continuation; never use a row after its commit.
     if create_not_attempted(row):
         return
     try:
@@ -714,7 +1091,11 @@ async def reconcile(session, row, conn):
             raise HTTPException(502, "Provider instance observation unavailable") from None
     if server is None:
         if row.status == "deleting" and row.server_id:
-            await settle_missing_server(row, conn)
+            if state:
+                await dispose_prepared_volume(session, row, actor, conn)
+                return
+            else:
+                await settle_missing_server(row, conn)
         elif row.server_id:
             row.status = "error"
             row.error_code = "provider_instance_missing"
@@ -722,6 +1103,8 @@ async def reconcile(session, row, conn):
         # An unobserved uncertain create is never declared absent or retried.
     else:
         row.server_id = str(value(server, "id"))
+        if state:
+            preparation_update(row, phase="nova_observed")
         status = str(value(server, "status", "UNKNOWN")).upper()
         row.provider_status = status[:32]
         if status not in ("BUILD", "DELETED", "ERROR"):
@@ -747,11 +1130,56 @@ async def reconcile(session, row, conn):
     await session.commit()
 
 
-async def observe(factory, actor, conn, instance_id):
+async def observe(factory, actor, conn, instance_id, settings=None):
     project = request_project(actor, conn)
     async with sql_mutex(factory, "build-api:instance:" + instance_id) as session:
         row = await owned(session, instance_id, project)
-        await reconcile(session, row, conn)
+        await reconcile(session, row, conn, actor, settings)
+        return projection(row)
+
+
+async def advance(factory, actor, conn, instance_id, request, settings):
+    project = request_project(actor, conn)
+    async with sql_mutex(factory, "build-api:instance:" + instance_id) as session:
+        row = await owned(session, instance_id, project)
+        if row.request_id != request["request_id"] or row.boot_volume_id != request["boot_volume_id"]:
+            raise HTTPException(409, "Advance does not match the original request and prepared boot volume")
+        state = preparation(row)
+        if state is None:
+            raise HTTPException(409, "Legacy instances cannot advance provider creation")
+        if actor.get("user_id") != row.created_by:
+            raise HTTPException(403, "Only the original instance subject can advance its accepted intent")
+        await fresh_writer(actor, conn)
+        if request["operation"] == "create-server":
+            if (
+                row.status != "booting"
+                or state.get("terminal")
+                or state["phase"] != "nova_not_attempted"
+                or server_create_attempted(row) is not False
+            ):
+                raise HTTPException(409, "Instance has no unattempted ready server creation intent")
+            await advance_prepared_boot(session, row, actor, conn, settings, allocate=True, launch=True)
+        else:
+            if row.status != "deleting":
+                raise HTTPException(409, "Volume disposal requires the original explicit deletion intent")
+            attempted = server_create_attempted(row)
+            if attempted is None:
+                raise HTTPException(409, "Unknown server attempt history cannot authorize volume disposal")
+            if attempted is True:
+                if row.server_id is None:
+                    raise HTTPException(409, "Unknown server creation cannot authorize volume disposal")
+                try:
+                    server = await run_blocking(exact_server, conn, row)
+                except Exception as exc:
+                    if getattr(exc, "status_code", None) == 404:
+                        server = None
+                    elif isinstance(exc, HTTPException):
+                        raise
+                    else:
+                        raise HTTPException(502, "Provider instance observation unavailable") from None
+                if server is not None:
+                    raise HTTPException(409, "Owned provider server must be absent before volume disposal")
+            await dispose_prepared_volume(session, row, actor, conn, allow_delete=True)
         return projection(row)
 
 
@@ -769,6 +1197,8 @@ async def action(factory, actor, conn, instance_id, operation):
                 raise HTTPException(409, "Instance create was never attempted")
             # Retain the definite no-call reason through DELETE and future GET;
             # do not turn it into an ambiguous provider-create outcome.
+            if preparation(row):
+                preparation_update(row, terminal=True, delete_phase="absent", delete_ready=False)
             row.status = "deleted"
             row.updated_at = datetime.now(UTC)
             await session.commit()
@@ -788,10 +1218,19 @@ async def action(factory, actor, conn, instance_id, operation):
                 try:
                     row.boot_volume_id = await run_blocking(inspect_boot_volume, conn, row, server, deleting=True)
                 except HTTPException:
+                    row.error_code = "provider_boot_volume_unknown"
+                    await session.commit()
                     raise
                 except Exception:
                     raise HTTPException(502, "Provider boot volume observation unavailable") from None
             # Unknown create outcome cannot be settled by an empty inventory race.
+            if (
+                server is None
+                and preparation(row)
+                and (row.server_id or preparation(row)["phase"] not in ("nova_create_uncertain", "nova_observed"))
+            ):
+                await dispose_prepared_volume(session, row, actor, conn)
+                return projection(row)
             if server is None and row.server_id is None:
                 row.status, row.error_code = "deleting", "provider_create_uncertain"
             elif server is None:

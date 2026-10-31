@@ -325,7 +325,7 @@ evidence that an existing production schema has been upgraded.
 
 `HubClient` in `src/palimpsest_local/hub.py` exposes layer PATCH, context upload,
 registry import, Dockerfile submission, image-job list/get, instance create/list/
-get/stop/delete. These are real HTTP calls, not local execution or SDK fallback;
+get/advance/stop/delete. These are real HTTP calls, not local execution or SDK fallback;
 the client adds no mutation-retry loop. Kolla remains the deployment owner:
 role defaults wire registry/context/resource policies, exact base qualification,
 guest CA certificates and optional worker-only hostname pins. The dedicated
@@ -434,30 +434,71 @@ still checks actual architecture and filesystem tools. Application-layer mode
 additionally requires exact base-digest provenance; OCI mode requires the exact
 completed job's ordered stack and runtime, not a user-written descriptor flag.
 
-`(project_id, request_id UUID)` uniquely binds immutable instance intent. SQL
-commits `uncertain/create_pending` and retained inputs **before** one Nova create;
-Nova metadata carries instance ID/request digest. Identical requests return that
-intent; descriptor conflict409. A timeout becomes `provider_create_uncertain`,
-not a second allocation. GET may reconcile durable state through original-caller
-provider reads, including exact ownership/intent markers; an empty list cannot
-settle an uncertain unobserved create. Nova ACTIVE is never guest readiness.
-Stop/delete revalidate exact server and original image boot-volume attachment/
-ownership, refuse unknown delete-on-termination attachments and record intent
-before effect; they do not imply a new create/restart/replay or shared-CAS erase.
+`(project_id, request_id UUID)` uniquely binds immutable instance intent. Initial
+`POST /v1/instances` persists retained inputs and a private versioned preparation
+intent, then requests **one image-backed Cinder root**, never a Nova server. The
+root binds original project, image, size, instance ID, request digest and boot
+role in exact metadata. `creating`/`downloading` are observed asynchronously:
+public status remains `booting`, with `provider_phase=volume_preparing`. No Nova/
+Cinder/GPU-host wait configuration is changed, and HTTP admission does not wait
+ten minutes for image download. Available roots expose `volume_ready`.
 
-An exact-owned, correctly marked ERROR failed create may be deleted after a
-successful empty attachment enumeration only when no boot disk, readiness
-result or previously active state has been bound. Both effect fences recheck;
-unknown attachments and ordinary active instances never use that exception.
-Missing Nova state does not prove full cleanup: a recorded boot volume must
-also be observed absent before terminal deletion releases instance capacity.
-Provider observation errors and surviving volumes leave cleanup unresolved;
-the API never implicitly deletes an unverified Cinder volume.
-Definite no-call failures retain distinct `create_authority_revoked`,
-`create_bootstrap_expired` or `create_bootstrap_input_limit` reasons. A freshly
-authorized DELETE can settle those without provider discovery or allocation;
-ordinary `bootstrap_expired` after an uncertain create is never treated as
-proof that no provider request occurred.
+`GET /v1/instances/{id}` performs provider reads and SQL reconciliation only;
+it never dispatches Cinder/Nova POST or DELETE, even for an original writer.
+Its responses carry `Cache-Control: no-store`. The explicit
+`POST /v1/instances/{id}/advance` requires exactly `operation` (`create-server`
+or `delete-volume`), original `request_id` and bound `boot_volume_id`. Creation
+advance requires the original subject/project, current write/download/selected-
+payload authority, unchanged qualification and unexpired original acceptance.
+After slow provider reads and every continuation COMMIT it retakes the same SQL
+write fence and refreshes state. Nova receives the exact available Cinder UUID
+with `source_type=volume`, `destination_type=volume` and
+`delete_on_termination=true`; no image-source Nova create path remains. Bootstrap
+capability generation happens only for this first explicit Nova attempt; only
+its hash is persisted, and the original expiration is never renewed. Nova ACTIVE
+is never guest readiness.
+
+The private `spec_json._boot_prepare` integer version1 state chart is
+`volume_not_attempted -> volume_create_uncertain -> volume_waiting ->
+nova_not_attempted -> nova_create_uncertain -> nova_observed`.
+`volume_create_attempted` and `server_create_attempted` are committed before each
+possibly-called provider POST. `terminal`, `delete_phase` (`not_attempted`,
+`uncertain`, `absent`) and `delete_ready` retain cleanup disposition; boot UUID
+and attempt history survive deletion. Definite pre-call authority/expiry/input
+failures atomically record terminal no-call evidence; a crash or unknown COMMIT
+after a possible effect never resets that evidence or licenses replay. No raw
+caller token or bootstrap capability is stored, and no SQL schema is added.
+
+Lost Cinder replies recover only after a complete bounded original-project
+inventory (at most1000 entries), exactly one marker/owner/size/image match and
+no attachment; truncated, ambiguous, foreign or empty reads never authorize a
+replacement allocation. Bound UUID reads must return that same UUID. Expired/
+revoked pre-Nova intents remain eligible for ownership observation/recovery,
+never a new server. Lost Nova replies likewise use bounded exact ownership/
+intent discovery without replay. Public `provider_phase` is one of
+`volume_preparing`, `volume_ready`, `server_attempted`, `delete_volume_pending`,
+`delete_volume_ready`, `deleted`, `uncertain`, `legacy`.
+`server_create_attempted=false` is emitted only for a recognized strict private
+version and literal false history; legacy/unknown/malformed history is null,
+not absence evidence. Identical create requests return the retained intent;
+descriptor conflicts return409. Legacy server-backed rows are observation/
+lifecycle-only and never enter new preparation.
+
+Stop/delete revalidate exact server and original boot-volume attachment/ownership
+and refuse unknown delete-on-termination attachments. Empty attachments on an
+unbound legacy ERROR server do **not** prove that no boot disk exists. Prepared-
+volume-only DELETE latches intent without a Cinder mutation, including available
+or ERROR roots; GET may later expose `delete_volume_ready`. Only explicit advance
+`delete-volume` can issue one ordinary Cinder DELETE, after original writer,
+exact project/markers/image binding and unattached settled status are verified.
+Creating/downloading volumes wait. When a server was attempted, its bound exact
+absence is required first; a zero-match unknown server create is not absence.
+An unknown DELETE is GET-only until actual Cinder404; it is never repeated.
+No arbitrary SDK error or `None` response proves volume absence. Existing
+server-backed DELETE can still issue ordinary Nova DELETE. Terminal deletion
+requires the exact boot volume404 as well as known server absence/no-call proof;
+surviving/unknown resources retain capacity. Lifecycle cleanup does not erase
+shared CAS or refund cumulative allocations.
 
 **CURRENT IMPLEMENTATION — guest acquisition and mounts (not the Manila target).**
 
@@ -2068,9 +2109,9 @@ provider provisioning. Fresh multi-instance evidence is recorded separately.
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "e872fcd9dee398be60b1725839538ec3f01aa72d625d1b71ba37353a0f0d9155",
-  "reviewed_at": "2026-10-31T09:38:36Z",
-  "summary": "Reviewed explicitasyncmy finiteper-read30s policy withactual0.2.13driver/localcandidateengine silent-socket boundedfailure andpeerclose; nooveralltransactiondeadline/no retry. PreserveCAS/resumablestagingafterfinalcommitstarts inall5legacy/native/imagecompensationpaths; originalsource6behaviornodesfail andcorrected276pass2skip. FullHub1301pass7skip342.76s, last2strongerpostpublish-precommitcases2pass separately; lint/format/offlinelockpass andindependentfinalsource/testclean. CanonicalfreshSQLitebootstrap20tables/integrityok, obsoletedirectengineharnessremoved, asyncmyfloorpinonly/noresolvedversionchanges. NoAPI3stackcauseorprodrecoveryclaim; active95d9imageuntouched/candidateonly."
+  "source_sha256": "e5e0a3d0dcf0680fe718d2a41709ef40b583d3ca0a0f4063a7b1806d08518b9b",
+  "reviewed_at": "2026-10-31T10:51:15Z",
+  "summary": "Reviewed officialAPI Cinder-only admission andexplicit boundcreate-server/delete-volume advance; GETneverproviderwrites, noNova/Cinder/GPUhosttimeoutmutation. Durablestrictversionedprivatephase/refenceaftercommit, originalsubject/expiry/payload+qualification, atomicknownnocall, unknownPOST/COMMITno-replay, exactmetadata/literal404/Cinder-onlycleanup history retained; everyrootclient/poller/cleanup/smoke migrated. Hub1396pass7skip317.80s, instances247pass5skip14.04s, root265pass7.09s, realPython3.12 TCPHTTPactualrouter/SQLite/CAS smoke passed withsyntheticidentity/provider, independentwholeproductreviewclean0.93. Privatefinal17syntheticpass0.207s/noGPUeffects. ActualpriorCUDAimage95d9complete11layers butGPUconsumerVolumeNotCreated186s vsCinder599sfailed; exactownedorphanordinarydelete+404proved/1spent80notrefunded. Native191/role30/CI/pairedrestore/canonicalcontrollercutover andactualGPUcuDNN stillpending; worker7cretained."
 }
 ```
 <!-- architecture-review:end -->
