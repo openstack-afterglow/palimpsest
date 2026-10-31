@@ -1,5 +1,18 @@
 # Palimpsest Architecture
 
+## Materialization diagnostic wire — 2026-10-31
+
+OCI layer conversion/packing occurs in a hard-bounded child process. Error
+category alone previously discarded the child's structured intake/packer cause,
+leaving a generic executor failure even after a real image export. Response wire
+v4 carries only allowlisted domain codes and validated resource/I/O errno metadata
+through the child, strict parent decoder and retained executor summary. Bounded
+cause/context traversal includes suppressed context but never messages, paths,
+locals or raw stderr. Resource errno/stage restrictions remain distinct from the
+small I/O errno allowlist. Parent and child migrate together within one worker
+package; successful artifacts, quotas, timeouts and API schemas do not change.
+Historical a2 failure cannot be retrospectively classified from its generic log.
+
 ## Exact-descriptor image publication recovery — 2026-10-31
 
 After real overlay-backed registry acquisition, compilation, materialization and
@@ -2014,9 +2027,9 @@ provider provisioning. Fresh multi-instance evidence is recorded separately.
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "a1365e974d0e7a519fbaa4bf7a91b726d4f6c943bcb390ceef418484c7b002cb",
-  "reviewed_at": "2026-10-30T18:46:18Z",
-  "summary": "Reviewed publication receipt recovery unchanged from c60afe1 (full Hub1287 passed7 skipped, actual11s verifiedTLS smoke and independent review clean). Hosted macOS size-failure descendant test wrote oversize input before recording child PID; reordered fixture to establish descendant identity before triggering the intentional size error. Both real-child timeout/size cases passed locally. No runtime behavior or deadline relaxation. Coordinated publication rollout and actual GPU acceptance still pending."
+  "source_sha256": "a940c8e15e923a6054184bb978476049a27e0cf405eeb9b7e330964598105996",
+  "reviewed_at": "2026-10-31T02:20:25Z",
+  "summary": "Reviewed materializer response v4 producer/decoder/parent/builder cutover with fixed code/category/resource and IO errno allowlists, bounded cause/context, and observed operation phase rather than exception-domain inference. Diagnostic privacy/no-success-metadata and artifact authority retained. Final affected591 passed4 skipped; isolated real emission test passed after removing unsafe global platform spoof (test-only Darwin SIGSYS cause). Runtime policy/limits/successful artifact semantics unchanged. Native new-child candidate probe, worker-only rollout and actual GPU acceptance remain pending; old failed a2 cause remains unknown."
 }
 ```
 <!-- architecture-review:end -->

@@ -29,6 +29,10 @@ from .oci_store import DerivedLayerOccurrence, DerivedSquashFSKey, OCIStore, OCI
 from .oci_worker_limits import OCI_WORKER_NPROC_LIMIT
 from .oci_worker_protocol import (
     MAX_OCI_WORKER_MESSAGE_BYTES,
+    OCI_WORKER_CATEGORY_CODES,
+    OCI_WORKER_EXCEPTION_CODES,
+    OCI_WORKER_IO_CODES,
+    OCI_WORKER_IO_ERRNOS,
     OCIWorkerProtocolError,
     OCIWorkerRequest,
     OCIWorkerResponse,
@@ -41,6 +45,30 @@ _MAX_WORKER_ADDRESS_SPACE = 40 * 1024**3
 _MAX_WORKER_FILE_SIZE = 40 * 1024**3
 _MAX_WORKER_FDS = 256
 _MAX_WORKER_PROCESSES = OCI_WORKER_NPROC_LIMIT
+_OPERATION_MARKER = object()
+
+
+def _observe_operation(exc: BaseException, stage: str | None) -> None:
+    marker = getattr(exc, "_oci_operation", None)
+    if not (type(marker) is tuple and len(marker) == 2 and marker[0] is _OPERATION_MARKER):
+        exc._oci_operation = (_OPERATION_MARKER, stage)
+
+
+def _operation_stage(exc: BaseException) -> str | None:
+    marker = getattr(exc, "_oci_operation", None)
+    if type(marker) is tuple and len(marker) == 2 and marker[0] is _OPERATION_MARKER:
+        return marker[1]
+    return None
+
+
+class _OperationStack(ExitStack):
+    def __exit__(self, *args):
+        try:
+            return super().__exit__(*args)
+        except BaseException as exc:
+            # A new teardown exception has no trustworthy producer phase.
+            _observe_operation(exc, None)
+            raise
 
 
 class _WorkerResourceError(Exception):
@@ -56,8 +84,11 @@ def _resource_boundary(failure_stage: str, operation: Callable[..., T], *args: A
     try:
         return operation(*args, **kwargs)
     except BaseException as exc:
+        _observe_operation(exc, failure_stage)
         if process_resource_failure(exc):
-            raise _WorkerResourceError(failure_stage, process_resource_errno(exc)) from None
+            failure = _WorkerResourceError(failure_stage, process_resource_errno(exc))
+            _observe_operation(failure, _operation_stage(exc))
+            raise failure from None
         raise
 
 
@@ -142,7 +173,7 @@ def _materialize(request: OCIWorkerRequest):
         if computed_key != request.key:
             raise OCIStoreError("oci-store-key", "worker recipe does not match the verified toolchain")
         execution = SquashFSPackExecution(scratch_root=Path.cwd(), inherit_process_group=True)
-        with ExitStack() as stack:
+        with _OperationStack() as stack:
             source = _resource_boundary(
                 "source",
                 stack.enter_context,
@@ -168,7 +199,11 @@ def _materialize(request: OCIWorkerRequest):
             # Exceptions from store publication are thrown back through this
             # yield. ExitStack cleanup deliberately runs outside every phase
             # boundary so it cannot be mislabeled as source, staging or pack.
-            yield staged.receipt, packed
+            try:
+                yield staged.receipt, packed
+            except BaseException as exc:
+                _observe_operation(exc, "store")
+                raise
 
     return _resource_boundary("store", store.materialize_observed, request.occurrence, request.key, producer)
 
@@ -207,6 +242,51 @@ def _failure_details(exc: BaseException, category: str) -> tuple[str | None, int
     return None, None
 
 
+def _failure_code(exc: BaseException, category: str) -> str | None:
+    allowed = OCI_WORKER_CATEGORY_CODES.get(category, ())
+    pending = [exc]
+    seen = set()
+    for _ in range(16):
+        if not pending:
+            break
+        cause = pending.pop()
+        if id(cause) in seen:
+            continue
+        seen.add(id(cause))
+        for kind, codes in OCI_WORKER_EXCEPTION_CODES.items():
+            if isinstance(cause, kind):
+                code = cause.code
+                if type(code) is str and code in codes and code in allowed:
+                    return code
+                break
+        if cause.__context__ is not None:
+            pending.append(cause.__context__)
+        if cause.__cause__ is not None and cause.__cause__ is not cause.__context__:
+            pending.append(cause.__cause__)
+    return None
+
+
+def _io_errno(exc: BaseException, code: str | None) -> int | None:
+    if code not in OCI_WORKER_IO_CODES:
+        return None
+    pending = [exc]
+    seen = set()
+    for _ in range(16):
+        if not pending:
+            break
+        cause = pending.pop()
+        if id(cause) in seen:
+            continue
+        seen.add(id(cause))
+        if isinstance(cause, OSError) and type(cause.errno) is int and cause.errno in OCI_WORKER_IO_ERRNOS:
+            return cause.errno
+        if cause.__context__ is not None:
+            pending.append(cause.__context__)
+        if cause.__cause__ is not None and cause.__cause__ is not cause.__context__:
+            pending.append(cause.__cause__)
+    return None
+
+
 def main() -> int:
     os.umask(0o077)
     payload = sys.stdin.buffer.read(MAX_OCI_WORKER_MESSAGE_BYTES + 1)
@@ -227,6 +307,7 @@ def main() -> int:
     except BaseException as exc:
         category = _category(exc)
         failure_stage, failure_errno = _failure_details(exc, category)
+        failure_code = _failure_code(exc, category)
         response = OCIWorkerResponse(
             nonce=request.nonce,
             request_digest=request.digest,
@@ -235,6 +316,9 @@ def main() -> int:
             error_category=category,
             failure_stage=failure_stage,
             failure_errno=failure_errno,
+            failure_code=failure_code,
+            io_errno=_io_errno(exc, failure_code),
+            operation_stage=_operation_stage(exc),
         )
     output = response.to_json_bytes()
     try:

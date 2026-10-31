@@ -243,3 +243,21 @@ No limits or unrelated services were changed; no unacknowledged app command
 was replayed. The guest binary and builder were unchanged, so the full guest
 boot matrix and image rebuild were not repeated. Historical Gate 2 evidence
 remains separately recorded, not counted as a new full Gate 2 run here.
+
+## Current materializer response v4 — 2026-10-31
+
+The current worker package migrates both response producer and parent consumer
+to strict v4. It carries allowlisted domain failure codes, a separately validated
+I/O errno allowlist, and the observed operation phase. The historical v3 resource
+`failure_stage`/EAGAIN/ENOMEM constraints remain distinct and are not widened.
+An intake-domain error raised during packing reports the observed packing
+operation; a packed-stream error while publishing reports derived-store
+operation. Unknown or newly raised cleanup failures do not borrow an earlier
+phase. Success responses cannot carry non-null failure attribution. Nonce/request
+binding, canonical wire validation, size limits and artifact authority remain.
+
+This diagnostic extension does not raise limits, retry jobs, change successful
+SquashFS bytes, or prove a historical failure cause. No exception message, path,
+traceback locals or raw child stderr crosses the wire. Actual native child
+execution and production GPU acceptance must be reported separately from source
+tests and the historical failed proofs above.

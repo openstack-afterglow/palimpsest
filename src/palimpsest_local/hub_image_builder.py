@@ -41,12 +41,34 @@ from .hub_builder import (
 )
 from .layer_cache import LayerCache
 from .oci_image import strict_json_object
+from .oci_materializer import OCIHardWorkerError
+from .oci_worker_protocol import (
+    OCI_WORKER_CATEGORY_CODES,
+    OCI_WORKER_EXCEPTION_CODES,
+    OCI_WORKER_FAILURE_ERRNOS,
+    OCI_WORKER_FAILURE_STAGES,
+    OCI_WORKER_IO_CODES,
+    OCI_WORKER_IO_ERRNOS,
+)
 from .registry_intake import resolve_anonymous_reference
 
 DEFAULT_HOSTS = ("docker.io", "registry-1.docker.io", "ghcr.io", "quay.io")
 MAX_LAYERS = 128
 JOURNAL_RESERVE_BYTES = 8 * 1024**2
 LOG_TAIL_BYTES = 65536
+
+# Never accept arbitrary exception codes, even from a known exception class.
+# These literals are diagnostic identifiers, not exception text or source data.
+_FAILURE_CODES = {
+    **OCI_WORKER_EXCEPTION_CODES,
+    OCIHardWorkerError: frozenset(
+        "oci-image-receipt oci-worker-input oci-worker-protocol oci-worker-resource "
+        "oci-worker-interrupted "
+        "oci-worker-scratch oci-worker-spawn oci-worker-timeout oci-worker-authority "
+        "oci-worker-intake oci-worker-internal oci-worker-invalid_request oci-worker-pack "
+        "oci-worker-source oci-worker-store oci-worker-toolchain oci-worker-unsupported".split()
+    ),
+}
 
 
 def _allocate(path: Path, size: int) -> None:
@@ -784,8 +806,7 @@ def preflight_image_host(directory: Path, cgroup_root: Path) -> None:
 
 def _failure_summary(exc: Exception, stage: str) -> str:
     # Never stringify exceptions, argv, paths, recipes or custom class names.
-    # This credential-free child receives no worker key; private stderr conveys
-    # only a fixed stage/category and numeric OS/tool status to its parent.
+    # Private stderr contains only fixed identifiers and numeric OS status.
     category = "Exception"
     stages = {
         "_cgroup": "cgroup",
@@ -797,15 +818,64 @@ def _failure_summary(exc: Exception, stage: str) -> str:
         "_require_overlayfs": "overlay_snapshotter",
         "extract_context": "context_extraction",
         "normalize_reference": "registry_reference",
-        "materialized_result": "output_packing",
+        "materialized_result": "output_copy",
     }
+    cache_stages = {
+        LayerCache.import_source.__code__: "source_import",
+        LayerCache.pull.__code__: "source_acquisition",
+        LayerCache.materialize.__code__: "materialization",
+    }
+    code = None
+    code_stage = None
     number = None
+    failure_stage = None
+    io_errno = None
     seen = set()
-    cause = exc
+    pending = [exc]
     for _ in range(16):
-        if cause is None or id(cause) in seen:
+        if not pending:
             break
+        cause = pending.pop()
+        if id(cause) in seen:
+            continue
         seen.add(id(cause))
+        for kind, allowed in _FAILURE_CODES.items():
+            if isinstance(cause, kind):
+                candidate = cause.code
+                if type(candidate) is str and candidate in allowed:
+                    code = candidate
+                    category = kind.__name__
+                    if kind is OCIHardWorkerError:
+                        code_stage = "materialization"
+                        operation = cause.operation_stage
+                        if type(operation) is str:
+                            code_stage = {
+                                "source": "source_access",
+                                "staging": "layer_intake",
+                                "packing": "squashfs_packing",
+                                "store": "derived_store",
+                                "limits": "resource_limits",
+                            }.get(operation, "materialization")
+                        nested = cause.failure_code
+                        allowed_nested = OCI_WORKER_CATEGORY_CODES.get(candidate.removeprefix("oci-worker-"), ())
+                        if type(nested) is str and nested in allowed_nested:
+                            code = nested
+                            if (
+                                nested in OCI_WORKER_IO_CODES
+                                and type(cause.io_errno) is int
+                                and cause.io_errno in OCI_WORKER_IO_ERRNOS
+                            ):
+                                io_errno = cause.io_errno
+                        resource_stage = cause.failure_stage
+                        if (
+                            candidate == "oci-worker-resource"
+                            and type(resource_stage) is str
+                            and resource_stage in OCI_WORKER_FAILURE_STAGES
+                        ):
+                            failure_stage = resource_stage
+                            if type(cause.failure_errno) is int and cause.failure_errno in OCI_WORKER_FAILURE_ERRNOS:
+                                number = cause.failure_errno
+                break
         for kind in (TimeoutError, subprocess.TimeoutExpired, OSError, ValueError, RuntimeError):
             if isinstance(cause, kind):
                 category = kind.__name__
@@ -823,15 +893,23 @@ def _failure_summary(exc: Exception, stage: str) -> str:
             function = getattr(function, "__wrapped__", function)
             if name in stages and getattr(function, "__code__", None) is frame.f_code:
                 stage = stages[name]
+            elif frame.f_code in cache_stages:
+                stage = cache_stages[frame.f_code]
             trace = trace.tb_next
-        cause = cause.__cause__ or cause.__context__
-    return json.dumps(
-        {
-            "stage": stage,
-            "category": category,
-            "errno": number,
-        }
-    )
+        # `raise ... from None` suppresses display, not the retained context.
+        # Inspect both links without exposing either exception's message.
+        if cause.__context__ is not None:
+            pending.append(cause.__context__)
+        if cause.__cause__ is not None and cause.__cause__ is not cause.__context__:
+            pending.append(cause.__cause__)
+    summary = {"stage": code_stage or stage, "category": category, "errno": number}
+    if code is not None:
+        summary["code"] = code
+    if failure_stage is not None:
+        summary["failure_stage"] = failure_stage
+    if io_errno is not None:
+        summary["io_errno"] = io_errno
+    return json.dumps(summary)
 
 
 def main() -> None:

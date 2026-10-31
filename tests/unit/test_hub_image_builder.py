@@ -17,6 +17,9 @@ from pathlib import Path
 import pytest
 
 from palimpsest_local import hub_image_builder as builder
+from palimpsest_local.oci_converter import LayerIntakeError
+from palimpsest_local.oci_packer import SquashFSPackError
+from palimpsest_local.oci_store import OCIStoreError
 from palimpsest_local.registry_intake import RegistryIntakeError
 
 
@@ -884,4 +887,114 @@ def test_safe_failure_summary_bounds_cyclic_cause_chain():
         "stage": "execution",
         "category": "OSError",
         "errno": 28,
+    }
+
+
+@pytest.mark.parametrize(
+    "kind,code,stage",
+    [
+        (OCIStoreError, "oci-store-producer", "execution"),
+        (SquashFSPackError, "oci-packer-timeout", "execution"),
+        (LayerIntakeError, "oci-layer-timeout", "execution"),
+        (builder.OCIHardWorkerError, "oci-worker-pack", "materialization"),
+        (builder.OCIHardWorkerError, "oci-worker-intake", "materialization"),
+        (builder.OCIHardWorkerError, "oci-worker-timeout", "materialization"),
+    ],
+)
+def test_executor_main_reports_wrapped_known_code_without_source_echo(tmp_path, monkeypatch, capsys, kind, code, stage):
+    from palimpsest_local.layer_cache import LayerCacheError
+
+    private = "SECRET recipe credential https://user:password@example.invalid /private/path"
+
+    def fail(manifest, directory):
+        try:
+            raise kind(code, private)
+        except kind as cause:
+            # Suppression hides display, but diagnostics can inspect context.
+            raise LayerCacheError(str(cause)) from None
+
+    monkeypatch.setattr(sys, "argv", ["hub_image_builder", str(tmp_path / "input.json"), "123"])
+    monkeypatch.setattr(builder, "_mark_builder", lambda *args: None)
+    monkeypatch.setattr(builder, "_load_manifest", lambda *args: {})
+    monkeypatch.setattr(builder, "run_image", fail)
+    with pytest.raises(SystemExit) as stopped:
+        builder.main()
+    assert stopped.value.code == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert json.loads(captured.err) == {
+        "stage": stage,
+        "category": kind.__name__,
+        "errno": None,
+        "code": code,
+    }
+    for secret in ("SECRET", "recipe", "credential", "password", "example.invalid", "/private/path"):
+        assert secret not in captured.err
+
+
+@pytest.mark.parametrize("known_class", [False, True])
+def test_safe_failure_summary_rejects_untrusted_code_and_class(known_class):
+    class PrivateCredentialClass(Exception):
+        code = "oci-packer-timeout"
+
+    error = (
+        SquashFSPackError("SECRET-code /private/path", "SECRET recipe")
+        if known_class
+        else PrivateCredentialClass("SECRET recipe")
+    )
+    assert json.loads(builder._failure_summary(error, "execution")) == {
+        "stage": "execution",
+        "category": "Exception",
+        "errno": None,
+    }
+
+
+@pytest.mark.parametrize("method,stage", [("import_source", "source_import"), ("materialize", "materialization")])
+def test_safe_failure_summary_identifies_trusted_cache_phase(tmp_path, monkeypatch, method, stage):
+    cache = object.__new__(builder.LayerCache)
+
+    def fail():
+        raise RuntimeError("SECRET recipe /private/path")
+
+    monkeypatch.setattr(cache, "_locked", fail)
+    argument = tmp_path if method == "import_source" else "sha256:" + "a" * 64
+    with pytest.raises(RuntimeError) as failure:
+        getattr(cache, method)(argument)
+    assert json.loads(builder._failure_summary(failure.value, "execution")) == {
+        "stage": stage,
+        "category": "RuntimeError",
+        "errno": None,
+    }
+
+
+def test_safe_failure_summary_identifies_output_copy_without_source_echo(tmp_path):
+    with pytest.raises(KeyError) as failure:
+        builder.materialized_result({}, tmp_path, 1024)
+    assert json.loads(builder._failure_summary(failure.value, "execution")) == {
+        "stage": "output_copy",
+        "category": "Exception",
+        "errno": None,
+    }
+
+
+def test_safe_failure_summary_walks_both_links_and_bounds_depth():
+    outer = Exception("SECRET outer")
+    outer.__cause__ = Exception("SECRET explicit cause")
+    outer.__context__ = SquashFSPackError("oci-packer-timeout", "SECRET context")
+    outer.__context__.__cause__ = outer
+    assert json.loads(builder._failure_summary(outer, "execution")) == {
+        "stage": "execution",
+        "category": "SquashFSPackError",
+        "errno": None,
+        "code": "oci-packer-timeout",
+    }
+    deep = SquashFSPackError("oci-packer-timeout", "SECRET deep")
+    for _ in range(16):
+        wrapper = Exception("SECRET wrapper")
+        wrapper.__context__ = deep
+        deep = wrapper
+    assert json.loads(builder._failure_summary(deep, "execution")) == {
+        "stage": "execution",
+        "category": "Exception",
+        "errno": None,
     }

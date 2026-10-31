@@ -37,9 +37,14 @@ from .oci_store import DerivedLayerOccurrence, DerivedSquashFSKey, Materializati
 from .oci_worker_limits import OCI_WORKER_NPROC_LIMIT
 from .oci_worker_protocol import (
     MAX_OCI_WORKER_MESSAGE_BYTES,
+    OCI_WORKER_FAILURE_ERRNOS,
+    OCI_WORKER_FAILURE_STAGES,
     OCIWorkerProtocolError,
     OCIWorkerRequest,
     OCIWorkerResponse,
+    validate_worker_failure_code,
+    validate_worker_io_errno,
+    validate_worker_operation_stage,
 )
 from .state import StatePaths
 from .web_job_client import defer_web_cancellation
@@ -66,8 +71,36 @@ _WORKER_RESOURCE_ERRNO_DETAILS = {
 class OCIHardWorkerError(ArtifactValidationError):
     """Stable path-free failure from the parent worker boundary."""
 
-    def __init__(self, code: str, detail: str):
+    def __init__(
+        self,
+        code: str,
+        detail: str,
+        *,
+        failure_code: str | None = None,
+        failure_stage: str | None = None,
+        failure_errno: int | None = None,
+        io_errno: int | None = None,
+        operation_stage: str | None = None,
+    ):
+        validate_worker_failure_code(code.removeprefix("oci-worker-"), failure_code)
+        validate_worker_io_errno(failure_code, io_errno)
+        validate_worker_operation_stage(operation_stage)
+        if failure_stage is not None and (
+            type(failure_stage) is not str
+            or failure_stage not in OCI_WORKER_FAILURE_STAGES
+            or code != "oci-worker-resource"
+        ):
+            raise OCIWorkerProtocolError("OCI worker failure stage is invalid")
+        if failure_errno is not None and (
+            type(failure_errno) is not int or failure_errno not in OCI_WORKER_FAILURE_ERRNOS or failure_stage is None
+        ):
+            raise OCIWorkerProtocolError("OCI worker failure errno is invalid")
         self.code = code
+        self.operation_stage = operation_stage
+        self.failure_code = failure_code
+        self.failure_stage = failure_stage
+        self.failure_errno = failure_errno
+        self.io_errno = io_errno
         super().__init__(f"{code}: {detail}")
 
 
@@ -566,6 +599,12 @@ def materialize_layer_hard(
             raise OCIHardWorkerError("oci-worker-protocol", "materializer worker response is invalid") from None
         _validate_worker_response_binding(response, request)
         if response.status == "failed":
+            try:
+                validate_worker_failure_code(response.error_category, response.failure_code)
+                validate_worker_io_errno(response.failure_code, response.io_errno)
+                validate_worker_operation_stage(response.operation_stage)
+            except OCIWorkerProtocolError:
+                raise OCIHardWorkerError("oci-worker-protocol", "materializer failure code is invalid") from None
             if response.error_category != "resource" and (
                 response.failure_stage is not None or response.failure_errno is not None
             ):
@@ -579,6 +618,11 @@ def materialize_layer_hard(
                     if response.error_category == "resource"
                     else "materializer worker failed inside its isolated boundary"
                 ),
+                failure_code=response.failure_code,
+                failure_stage=response.failure_stage,
+                failure_errno=response.failure_errno,
+                io_errno=response.io_errno,
+                operation_stage=response.operation_stage,
             )
         if response.result is None:
             raise OCIHardWorkerError("oci-worker-protocol", "materializer worker omitted its result")
