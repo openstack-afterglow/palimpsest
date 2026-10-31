@@ -71,6 +71,7 @@ class DatabaseSettings(BaseSettings):
     database_pool_size: int = Field(default=10, ge=1, le=100)
     database_max_overflow: int = Field(default=20, ge=0, le=100)
     database_connect_timeout: int = Field(default=10, ge=1, le=120)
+    database_read_timeout: int = Field(default=30, ge=1, le=120)
     database_pool_timeout: int = Field(default=30, ge=1, le=120)
     database_unhealthy_seconds: int = Field(default=30, ge=1, le=3600)
 

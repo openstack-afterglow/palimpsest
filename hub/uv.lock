@@ -903,7 +903,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "aiosqlite", marker = "extra == 'dev'", specifier = ">=0.22.0" },
-    { name = "asyncmy", specifier = ">=0.2.0" },
+    { name = "asyncmy", specifier = ">=0.2.13" },
     { name = "fastapi", specifier = "==0.133.0" },
     { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.28.1" },
     { name = "openstacksdk", specifier = "==3.3.0" },

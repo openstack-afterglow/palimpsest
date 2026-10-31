@@ -4,6 +4,7 @@ from collections.abc import AsyncGenerator
 
 from fastapi import HTTPException
 from sqlalchemy import inspect, text
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -38,6 +39,7 @@ def init_db(
     pool_size: int,
     max_overflow: int,
     connect_timeout: int,
+    read_timeout: int,
     pool_timeout: int,
     unhealthy_seconds: int,
 ) -> None:
@@ -45,13 +47,17 @@ def init_db(
     global _engine, _session_factory
     if _engine is not None:
         return
+    connect_args = {}
+    if make_url(database_url).get_driver_name() == "asyncmy":
+        # TCP connect timeout does not bound asyncmy's handshake or response reads.
+        connect_args = {"connect_timeout": connect_timeout, "read_timeout": read_timeout}
     _engine = create_async_engine(
         database_url,
         pool_pre_ping=True,
         pool_size=pool_size,
         max_overflow=max_overflow,
         pool_timeout=pool_timeout,
-        connect_args={"connect_timeout": connect_timeout},
+        connect_args=connect_args,
     )
     if _engine.sync_engine.dialect.driver == "asyncmy":
         _recover_closed_transport_ping(_engine)

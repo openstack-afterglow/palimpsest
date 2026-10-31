@@ -1447,8 +1447,8 @@ async def _locked_blobs(store: LocalPathBlobStore, digests: list[str]):
 async def _discard_unregistered_blob(store: LocalPathBlobStore, factory, digest: str) -> None:
     """Remove rolled-back CAS bytes only when SQL proves no layer references them.
 
-    The caller still owns this digest lock, so an ambiguous commit that actually
-    landed keeps its bytes instead of losing them to its own compensation.
+    The caller owns the digest lock and must not compensate an uncertain commit:
+    a fresh reference read cannot rule out a commit still in flight.
     """
     try:
         async with factory() as session:
@@ -1631,6 +1631,7 @@ async def _finalize_upload_locked(
         "base_image_digest": meta.base_image_digest,
     }
     created = False
+    commit_started = False
     existing: PalimpsestHubLayer | None = None
     lock_digests = [digest for digest in (finalized.blob_digest, meta.parent_digest, meta.base_image_digest) if digest]
     async with _locked_blobs(store, lock_digests):
@@ -1707,9 +1708,10 @@ async def _finalize_upload_locked(
                     await _legacy_writer(token_info)
                     if meta.is_published and "system:manage" not in token_info["package_actions"]:
                         raise HTTPException(status_code=403, detail="System publication policy denied")
+                commit_started = True
                 await session.commit()
         except BaseException:
-            if created:
+            if created and not commit_started:
                 await _discard_unregistered_blob(store, factory, finalized.blob_digest)
             raise
 
@@ -1929,6 +1931,7 @@ async def import_bundle(file: UploadFile, token_info: dict = Depends(_legacy_wri
 
         if publishable:
             created: list[str] = []
+            commit_started = False
             lock_digests = [
                 digest
                 for _, finalized, meta in publishable
@@ -2032,11 +2035,13 @@ async def import_bundle(file: UploadFile, token_info: dict = Depends(_legacy_wri
                         if token_info.get("is_package_system_admin"):
                             token_info = await revalidate_package_admin(token_info)
                             await _legacy_writer(token_info)
+                        commit_started = True
                         await session.commit()
                 except BaseException:
-                    imported.clear()
-                    for digest in reversed(created):
-                        await _discard_unregistered_blob(store, factory, digest)
+                    if not commit_started:
+                        imported.clear()
+                        for digest in reversed(created):
+                            await _discard_unregistered_blob(store, factory, digest)
                     raise
 
     return {"imported": imported, "imported_count": len(imported), "skipped": skipped}

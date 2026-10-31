@@ -1065,6 +1065,7 @@ Optional settings and defaults:
 | `DATABASE_POOL_SIZE` | `10`, valid 1–100 |
 | `DATABASE_MAX_OVERFLOW` | `20`, valid 0–100 |
 | `DATABASE_CONNECT_TIMEOUT` | `10` seconds, valid 1–120 |
+| `DATABASE_READ_TIMEOUT` | `30` seconds, valid 1–120; asyncmy handshake/response read limit, separate from TCP connection and pool checkout timeouts; applies to API, export worker and offline bootstrap |
 | `DATABASE_POOL_TIMEOUT` | `30` seconds, valid 1–120 |
 | `DATABASE_UNHEALTHY_SECONDS` | `30` seconds, valid 1–3600 |
 | `PALIMPSEST_HUB_MAX_BLOB_BYTES` | `107374182400` bytes (100 GiB), minimum 1 |
@@ -1081,6 +1082,14 @@ Optional settings and defaults:
 | `OS_REGION_NAME` | `RegionOne` |
 | `OS_INTERFACE` | `internal` |
 | `SSL_VERIFY` | `true` |
+
+`DATABASE_READ_TIMEOUT` limits each asyncmy wait for incoming protocol data,
+including handshake/pre-ping/query responses; it is not an overall SQL transaction
+deadline and does not bound a peer that continually supplies partial data. It
+does not introduce retries. A response timeout after a mutation or COMMIT leaves
+an uncertain outcome: preserve the original durable claim/publication receipt
+and use its existing authoritative settlement, never assume rollback or replay.
+The separate HTTPS-only build worker does not consume this database setting.
 
 ### Remote build worker settings
 

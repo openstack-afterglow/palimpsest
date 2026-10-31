@@ -22,7 +22,8 @@ import pytest
 from fastapi import HTTPException, Response, UploadFile
 from fastapi.testclient import TestClient
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from starlette.requests import Request
 
 from palimpsest_hub import cache as hub_cache
@@ -43,6 +44,7 @@ from palimpsest_hub.models import (
     PalimpsestHubUpload,
 )
 from palimpsest_hub.services import hub_store
+from palimpsest_hub.services.blob_references import blob_referenced
 from palimpsest_hub.services.digest import compute_config_digest
 from palimpsest_hub.services.hub_bundle import (
     ANNOTATION_CONFIG_DIGEST,
@@ -696,6 +698,42 @@ async def test_import_rejects_conflicting_shared_descriptor_without_publishing(
         async with factory() as session:
             assert (await session.execute(select(PalimpsestHubLayer))).scalars().all() == []
         assert not destination.exists(root.blob_digest)
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_bundle_import_unknown_commit_outcome_retains_unregistered_cas(
+    store: LocalPathBlobStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Inject an unknown COMMIT outcome, not a real server-side delayed commit."""
+    chain = _chain(store)
+    payload = _gzip_bundle(store, chain)
+    expected_bytes = {layer.blob_digest: store.blob_path(layer.blob_digest).read_bytes() for layer in chain}
+    destination = LocalPathBlobStore(tmp_path / "unknown-bundle-destination")
+    engine, factory = await _prepared_hub(tmp_path, "unknown-bundle-commit.sqlite", destination, monkeypatch)
+    failure = OperationalError("COMMIT", {}, TimeoutError("unknown COMMIT outcome"), connection_invalidated=True)
+    commit_failed = False
+
+    async def unknown_commit(session):
+        nonlocal commit_failed
+        # Schema/setup is committed already; all imported descriptors must be prepared.
+        rows = (await session.scalars(select(PalimpsestHubLayer))).all()
+        assert {row.blob_digest for row in rows} == set(expected_bytes)
+        commit_failed = True
+        raise failure
+
+    monkeypatch.setattr(AsyncSession, "commit", unknown_commit)
+    try:
+        response = await _import_bundle_over_http(payload)
+        assert response.status_code == 500 and commit_failed
+        async with factory() as session:
+            # A fresh empty reference read does not prove the original COMMIT rolled back.
+            for expected in expected_bytes:
+                assert not await blob_referenced(session, expected)
+        for expected, original in expected_bytes.items():
+            retained = destination.blob_path(expected).read_bytes()
+            assert retained == original and _sha256(retained) == expected
     finally:
         await engine.dispose()
 
@@ -1426,6 +1464,7 @@ async def test_upload_remains_retryable_after_blob_promotion_precedes_registrati
         with pytest.raises(RuntimeError, match="interrupted"):
             await finalize_upload(session_id, descriptor, request, identity)
         assert store.upload_path(session_id).read_bytes() == payload
+        assert not store.exists(digest)
         monkeypatch.setattr(hub_api, "compute_config_digest", compute)
         registered = await finalize_upload(session_id, descriptor, request, identity)
         assert registered["blob_digest"] == digest
@@ -1433,6 +1472,53 @@ async def test_upload_remains_retryable_after_blob_promotion_precedes_registrati
         assert not store.upload_path(session_id).exists()
         async with factory() as session:
             assert await session.get(PalimpsestHubUpload, session_id) is None
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_upload_unknown_commit_outcome_retains_cas_and_verified_staging(
+    store: LocalPathBlobStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Inject an unknown COMMIT outcome, not a real server-side delayed commit."""
+    engine, factory = await _prepared_hub(tmp_path, "unknown-upload-commit.sqlite", store, monkeypatch)
+    identity = {"project_id": "alpha", "user_id": "member"}
+    payload = b"verified layer with unknown registration outcome"
+    digest = _sha256(payload)
+    session_id = (await start_upload(HubUploadStartRequest(digest=digest), identity))["session_id"]
+    store.upload_path(session_id).write_bytes(payload)
+    async with factory() as session:
+        upload = await session.get(PalimpsestHubUpload, session_id)
+        upload.received_bytes = len(payload)
+        await session.commit()
+    request = Request(
+        {
+            "type": "http",
+            "method": "PUT",
+            "path": f"/v1/uploads/{session_id}",
+            "headers": [(b"upload-offset", str(len(payload)).encode())],
+        }
+    )
+    failure = OperationalError("COMMIT", {}, TimeoutError("unknown COMMIT outcome"), connection_invalidated=True)
+
+    async def unknown_commit(session):
+        # Installed after all setup commits; this is the prepared registration transaction.
+        assert await session.scalar(select(PalimpsestHubLayer).where(PalimpsestHubLayer.blob_digest == digest))
+        raise failure
+
+    monkeypatch.setattr(AsyncSession, "commit", unknown_commit)
+    try:
+        with pytest.raises(OperationalError) as raised:
+            await finalize_upload(session_id, HubLayerMeta(name="unknown-outcome"), request, identity)
+        assert raised.value is failure
+        async with factory() as session:
+            # Absence in a new read is deliberately NOT proof the original COMMIT rolled back.
+            assert not await blob_referenced(session, digest)
+            upload = await session.get(PalimpsestHubUpload, session_id)
+            assert upload is not None and upload.received_bytes == len(payload)
+        assert store.upload_path(session_id).read_bytes() == payload
+        retained = store.blob_path(digest).read_bytes()
+        assert retained == payload and _sha256(retained) == digest
     finally:
         await engine.dispose()
 

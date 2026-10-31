@@ -87,6 +87,7 @@ async def lifespan(_: FastAPI):
         pool_size=settings.database_pool_size,
         max_overflow=settings.database_max_overflow,
         connect_timeout=settings.database_connect_timeout,
+        read_timeout=settings.database_read_timeout,
         pool_timeout=settings.database_pool_timeout,
         unhealthy_seconds=settings.database_unhealthy_seconds,
     )

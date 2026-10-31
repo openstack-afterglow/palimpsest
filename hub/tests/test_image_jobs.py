@@ -15,7 +15,8 @@ import pytest
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import SecretStr
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from palimpsest_hub.api import builds, hub, image_jobs
 from palimpsest_hub.image_models import PalimpsestHubBuildContext, PalimpsestHubImageJob
@@ -26,6 +27,7 @@ from palimpsest_hub.models import (
     RuntimeBlobReference,
 )
 from palimpsest_hub.services import image_jobs as service
+from palimpsest_hub.services.blob_references import blob_referenced
 from palimpsest_hub.services.digest import compute_config_digest
 from palimpsest_hub.services.hub_store import LocalPathBlobStore
 
@@ -264,6 +266,62 @@ async def test_context_copy_descriptor_project_bounds_and_hash(images):
 
 
 @pytest.mark.asyncio
+async def test_build_context_unknown_commit_outcome_retains_unregistered_cas(images, monkeypatch):
+    """Inject an unknown COMMIT outcome without a real delayed server commit."""
+    h = images
+    payload = context_tar(payload=b"context with unknown metadata outcome")
+    expected = digest(payload)
+    failure = OperationalError("COMMIT", {}, TimeoutError("unknown COMMIT outcome"), connection_invalidated=True)
+
+    async def unknown_commit(session):
+        # Only the context and its retention-reference transaction may fail.
+        context = await session.get(PalimpsestHubBuildContext, ("alpha", expected))
+        assert context is not None and context.size_bytes == len(payload)
+        assert await session.scalar(select(RuntimeBlobReference).where(RuntimeBlobReference.digest == expected))
+        raise failure
+
+    monkeypatch.setattr(AsyncSession, "commit", unknown_commit)
+    with pytest.raises(OperationalError) as raised:
+        await h.client.post(
+            "/v1/build-contexts",
+            headers={**HUMAN, "Content-Type": "application/x-tar", "X-Content-SHA256": expected},
+            content=payload,
+        )
+    assert raised.value is failure
+    async with h.factory() as session:
+        # Neither missing context metadata nor missing references proves COMMIT rollback.
+        assert await session.get(PalimpsestHubBuildContext, ("alpha", expected)) is None
+        assert not await blob_referenced(session, expected)
+    retained = h.store.blob_path(expected).read_bytes()
+    assert retained == payload and digest(retained) == expected
+    assert not list(h.store.uploads_dir.iterdir())
+
+
+@pytest.mark.asyncio
+async def test_build_context_precommit_failure_discards_published_unreferenced_cas(images, monkeypatch):
+    h = images
+    payload = context_tar(payload=b"verified context before reference failure")
+    expected = digest(payload)
+
+    async def fail_reference(*_args):
+        assert h.store.blob_path(expected).read_bytes() == payload
+        raise RuntimeError("reference transaction failed before commit")
+
+    monkeypatch.setattr(service, "retain_blob", fail_reference)
+    with pytest.raises(RuntimeError, match="reference transaction failed before commit"):
+        await h.client.post(
+            "/v1/build-contexts",
+            headers={**HUMAN, "Content-Type": "application/x-tar", "X-Content-SHA256": expected},
+            content=payload,
+        )
+    assert not h.store.exists(expected)
+    assert not list(h.store.uploads_dir.iterdir())
+    async with h.factory() as session:
+        assert await session.get(PalimpsestHubBuildContext, ("alpha", expected)) is None
+        assert not await blob_referenced(session, expected)
+
+
+@pytest.mark.asyncio
 async def test_multioutput_atomicity_integrity_terminal_retry_and_retention(images):
     h = images
     await enqueue(h)
@@ -302,6 +360,61 @@ async def test_multioutput_atomicity_integrity_terminal_retry_and_retention(imag
         assert not first.is_published and first.config_json["base_image_digest"] is None
         assert second.config_json["instance_mode"] == "oci-layer"
     assert not list(h.store.uploads_dir.iterdir())
+
+
+@pytest.mark.asyncio
+async def test_staged_output_unknown_commit_outcome_retains_unregistered_cas(images, monkeypatch):
+    """Inject an unknown COMMIT outcome without a real delayed server commit."""
+    h = images
+    assert (await enqueue(h)).status_code == 202
+    job, headers = await claim(h)
+    payload = b"hsqs-verified-output-with-unknown-commit"
+    expected = digest(payload)
+    failure = OperationalError("COMMIT", {}, TimeoutError("unknown COMMIT outcome"), connection_invalidated=True)
+
+    async def unknown_commit(session):
+        # Claim/setup is committed already; only the output-reference commit may fail.
+        row = await session.get(PalimpsestHubImageJob, job["id"])
+        assert any(item["digest"] == expected for item in row.staged_outputs)
+        assert await session.scalar(select(RuntimeBlobReference).where(RuntimeBlobReference.digest == expected))
+        raise failure
+
+    monkeypatch.setattr(AsyncSession, "commit", unknown_commit)
+    with pytest.raises(OperationalError) as raised:
+        await stage(h, job, headers, payload)
+    assert raised.value is failure
+    async with h.factory() as session:
+        # A fresh empty reference read cannot rule out the in-flight COMMIT landing later.
+        assert not await blob_referenced(session, expected)
+        row = await session.get(PalimpsestHubImageJob, job["id"])
+        assert row.status == "building" and row.staged_outputs == []
+    retained = h.store.blob_path(expected).read_bytes()
+    assert retained == payload and digest(retained) == expected
+    # This route's anonymous receive spool is not a resumable upload.
+    assert not list(h.store.uploads_dir.iterdir())
+
+
+@pytest.mark.asyncio
+async def test_staged_output_precommit_failure_discards_published_unreferenced_cas(images, monkeypatch):
+    h = images
+    assert (await enqueue(h)).status_code == 202
+    job, headers = await claim(h)
+    payload = b"hsqs-published-before-reference-failure"
+    expected = digest(payload)
+
+    async def fail_reference(*_args):
+        assert h.store.blob_path(expected).read_bytes() == payload
+        raise RuntimeError("reference transaction failed before commit")
+
+    monkeypatch.setattr(service, "retain_blob", fail_reference)
+    with pytest.raises(RuntimeError, match="reference transaction failed before commit"):
+        await stage(h, job, headers, payload)
+    assert not h.store.exists(expected)
+    assert not list(h.store.uploads_dir.iterdir())
+    async with h.factory() as session:
+        assert not await blob_referenced(session, expected)
+        row = await session.get(PalimpsestHubImageJob, job["id"])
+        assert row.staged_outputs == []
 
 
 @pytest.mark.asyncio

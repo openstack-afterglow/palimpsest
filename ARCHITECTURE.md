@@ -1,5 +1,28 @@
 # Palimpsest Architecture
 
+## Finite database reads and uncertain commit preservation — 2026-10-31
+
+The Hub configures a separate asyncmy protocol read wait limit, default30seconds
+(1–120), for API, export worker and offline bootstrap. TCP connect and pool
+checkout timeouts do not bound a silent handshake, pre-ping or query response.
+A real asyncmy0.2.13/SQLAlchemy loopback peer established this gap and verified
+the bounded driver failure and peer closure. This is not proof of the exact
+await point or cause of the separately observed unhealthy controller3 process.
+The read limit is per incoming-data wait, not a whole-transaction wall deadline.
+The HTTPS-only image/build worker has no database credentials or read policy.
+
+A COMMIT reply timeout leaves server outcome uncertain. Legacy upload/bundle
+registration, image context/output retention and native package/cache publication
+therefore preserve newly published CAS bytes once their final metadata commit
+has started; a fresh nonlocking read showing no reference is not rollback proof.
+Native finalization also avoids its own exception-driven state reset after that
+point. Earlier known precommit failures keep normal compensation; successful
+publication retains the existing reference-aware cleanup. Errors still propagate,
+and no claim, output publication, COMMIT or provider effect is blindly replayed.
+Verified resumable staging stays available; anonymous receive temporaries need
+not survive after their content is already published in CAS. Ordinary concurrent
+retry races are not newly claimed solved by this exception-compensation guard.
+
 ## Fixed service-image packing profile — 2026-10-31
 
 The next real CUDA attempt retained an observed `squashfs_packing` failure with
@@ -1900,7 +1923,7 @@ Current-workspace dev integration: explicitly approved preservation commit `2d18
 
 2026-10-07 scoped native verification: reviewed root `NativePackageClient`, credential helpers, CLI preflights and their regression contracts alongside Hub role graph/action boundaries. CLI push uses inventory+publish without download; pull preflights inventory+download because it resolves/reads version metadata before streaming content. Added reusable `scripts/smoke_package_capabilities.py` as explicit opt-in Docker acceptance tooling, not a production entrypoint or CI/native execution gate. Canonical API/worker images built for arm64 and amd64 and imported Hub0.3.1; each isolated registered-app runtime passed182 checks, with real SQLite/CAS persistence across restart and recreation, owned upload/range bytes, real Redis tickets and synthetic current Keystone. Frozen root client/credential/CLI/BuildKit selection passed309 tests. Source integration and verification are separate checkpoints; see [exact commands and storage boundary](docs/project-package-registry.md#docker-backed-registered-http-acceptance).
 
-The acceptance runner derives a smoke-only API image containing hash-pinned development `aiosqlite0.22.1`, installs a dedicated SQLite engine/session factory and serves the unchanged production `main:app` with lifespan off. It does not override authorization, routes or blob services. Actual canonical bootstrap probes failed with MySQL `connect_timeout` passed to SQLite; production database code/dependencies/Dockerfile stay unchanged. This is a retained finding, not canonical MySQL/MariaDB/lifespan, Redis-auth, TLS, deployment, KVM or cloud proof. Both disposable runtimes were torn down and exact SQL/blob evidence volumes retained. Afterglow integration source was not edited; production credentials/roles were not used; no shared index/commit/push was changed. Named Astra/Sol pairing and independent approval are not claimed.
+The acceptance runner derives a smoke-only API image containing hash-pinned development `aiosqlite0.22.1`, installs a dedicated SQLite engine/session factory and serves the unchanged production `main:app` with lifespan off. It does not override authorization, routes or blob services. Historical canonical bootstrap probes failed because MySQL `connect_timeout` reached SQLite. Current `init_db` passes MySQL connection/read timeouts only to asyncmy, removing that driver-argument incompatibility; the historical probe result is not a current bootstrap verdict, and the smoke still records each supplied image's actual probe outcome. This isolated harness is not canonical MySQL/MariaDB/lifespan, Redis-auth, TLS, deployment, KVM or cloud proof. Both disposable runtimes were torn down and exact SQL/blob evidence volumes retained. Afterglow integration source was not edited; production credentials/roles were not used; no shared index/commit/push was changed. Named Astra/Sol pairing and independent approval are not claimed.
 
 2026-10-07 deferred export credential isolation (local OpenSpec `isolate-service-execution-credentials`): reviewed `openstack.py`, `services/image_exports.py`, `auth.py`, `config.py`, `models.py`, `migrate.py`, `worker.py`, the export routes in `api/hub.py`, Kolla defaults/precheck and installed keystoneauth1 5.15.0 / python-keystoneclient 5.4.0 / openstacksdk 3.3.0 trust APIs. Removed `get_admin_connection_for_project`. Deferred Glance I/O now runs only through a requester-created, impersonating, least-role Trust with a finite expiry. The default delegated role is `member`, because Glance's default `download_image` policy requires it. The new additive `palimpsest_image_export_delegations` table records it. The worker revalidates current authority and verifies the trust token, accepting only the implied-role closure, before I/O. Durable cleanup covers terminal, deleted, exhausted and abandoned admissions. Native package original-token/key planes, local KVM/build and CAS domains are unchanged. Status: source-reviewed and test-passed only against a synthetic Keystone, not live. Results: Hub lane 285 passed; `test_export_delegation.py` 28 passed; Kolla contracts 45 passed; lane manifest check passed. No live Keystone/Glance, deployment or architecture stamp. The marker below remains historical for the parent integrator.
 
@@ -2045,9 +2068,9 @@ provider provisioning. Fresh multi-instance evidence is recorded separately.
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "c12dd31fbb4e2eeab13d88724bbda4005b90e2e7654cb9e728be1f39a78dd063",
-  "reviewed_at": "2026-10-31T03:42:19Z",
-  "summary": "Reviewed fixed named service-image900s pack profile after actual retainedoci-packer-timeout; canonical120 defaults/keys unchanged, parent/child stable policyfingerprint/keyauthority and strictrequestv3/responsev4, no arbitrarytimeout orleaseextension; originalabsolute3600job/remainingCPUdeadline stillfences. Focused652 passed6 skipped and independentreview clean; lint passed/ownedformat done. Native selectedprofile/defaultkey fixture and newlargeAPI GPUacceptance remain pending; all old failures/accounting preserved."
+  "source_sha256": "e872fcd9dee398be60b1725839538ec3f01aa72d625d1b71ba37353a0f0d9155",
+  "reviewed_at": "2026-10-31T09:38:36Z",
+  "summary": "Reviewed explicitasyncmy finiteper-read30s policy withactual0.2.13driver/localcandidateengine silent-socket boundedfailure andpeerclose; nooveralltransactiondeadline/no retry. PreserveCAS/resumablestagingafterfinalcommitstarts inall5legacy/native/imagecompensationpaths; originalsource6behaviornodesfail andcorrected276pass2skip. FullHub1301pass7skip342.76s, last2strongerpostpublish-precommitcases2pass separately; lint/format/offlinelockpass andindependentfinalsource/testclean. CanonicalfreshSQLitebootstrap20tables/integrityok, obsoletedirectengineharnessremoved, asyncmyfloorpinonly/noresolvedversionchanges. NoAPI3stackcauseorprodrecoveryclaim; active95d9imageuntouched/candidateonly."
 }
 ```
 <!-- architecture-review:end -->

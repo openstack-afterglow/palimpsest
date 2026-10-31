@@ -151,6 +151,11 @@ python3 scripts/smoke_package_capabilities.py run --api-image palimpsest-scope-a
 uv run --frozen --extra dev python -m pytest -q tests/unit/test_packages.py tests/unit/test_package_credentials.py tests/unit/test_cli_registry.py tests/unit/test_buildkit.py
 ```
 
+The commands above record the historical run. The current helper revision must
+use freshly built current-source API images exposing `init_db(read_timeout=...)`;
+it is not compatible with retained pre-change API images or the older published
+0.3.10 image solely because their version label matches.
+
 Reruns require a new or empty evidence directory; omitting `--evidence-dir`
 creates a unique directory. The runner requires Docker and the built images,
 downloads the hash-pinned `aiosqlite` wheel from `hub/uv.lock` (or accepts the
@@ -161,16 +166,20 @@ removed. It does not contact production endpoints or use caller cloud secrets.
 
 **Storage/lifespan distinction:** canonical images deliberately omit the
 development-only SQLite driver. A smoke-only image derived from each built API
-installs exactly `aiosqlite==0.22.1` from the lockfile. The harness creates the
-SQLite engine/schema/session factory and installs it in `palimpsest_hub.database`,
-then serves the production app with Uvicorn `lifespan=off`. Authentication,
+installs exactly `aiosqlite==0.22.1` from the lockfile. The harness invokes the
+production database initialization/schema helpers, then serves the production app
+with Uvicorn `lifespan=off` and explicit fixture startup/shutdown. Authentication,
 registered routes, SQL services and blob storage are not mocked or replaced.
-Both actual canonical bootstrap probes exited 1 with
-`TypeError: 'connect_timeout' is an invalid keyword argument for Connection()`:
-`init_db` uses MySQL connection arguments. This finding is retained, not fixed
-or hidden by substituting MariaDB. Therefore the smoke proves persistent
-SQLite/CAS route behavior, **not** the canonical production database/lifespan,
-MariaDB, Redis credentials, TLS transport or deployment health.
+The historical canonical bootstrap probes exited 1 with
+`TypeError: 'connect_timeout' is an invalid keyword argument for Connection()`.
+Current `init_db` sends MySQL connection/read timeout arguments only to asyncmy;
+that driver-argument incompatibility no longer applies to SQLite. A fresh local
+canonical bootstrap completed with20tables and integrity_check=ok; this is not a
+new Docker smoke-image result. The runner still records each supplied image's
+separate actual bootstrap outcome. The served
+smoke still proves persistent SQLite/CAS route behavior, **not** the canonical
+production database/lifespan, MariaDB, Redis credentials, TLS transport or
+deployment health.
 
 Observed route proof includes:
 
@@ -259,7 +268,7 @@ Publication steps:
 2. Stream into staging with last-acknowledged offsets; no package/tag visibility yet.
 3. Verify the complete graph and archive transport digest, re-check actor/membership/key and tag precondition.
 4. Under sorted digest locks and a package/tag lock, publish verified CAS bytes and commit version/graph/package/tag metadata in one SQL transaction. Commit completes before a successful response/list visibility.
-5. Rollback only this operation's new/unreferenced staging/CAS files. Never delete a pre-existing/shared blob or another project's grant.
+5. Before metadata commit starts, compensate only this operation's new CAS files after fresh reference checks. Once commit starts, any exception leaves its outcome uncertain: retain published bytes and resumable verified staging, propagate the exception, and do not reset the upload's state based on an absent reference read. Exception compensation must not overwrite a late authoritative completion. After confirmed success, an idempotent re-push may prune only its newly created, unreferenced bytes. Never delete a pre-existing/shared blob or another project's grant.
 
 Content-addressed deduplication does not confer access. No global `exists(digest)` shortcut creates a package, transfers a grant or proves ownership. Same-project/package/version re-push is idempotent after fresh authorization; another project must independently supply a valid authorized package graph.
 

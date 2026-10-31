@@ -362,6 +362,7 @@ async def upload_context(request, token_info, digest, size):
         _locked_blob(store, digest),
     ):
         created = await _run_blocking(store.publish_verified, path, verified)
+        commit_started = False
         try:
             async with sql_mutex(_factory_or_503(), "build-api:image:project:" + project) as session:
                 context = await session.get(PalimpsestHubBuildContext, (project, digest))
@@ -375,9 +376,10 @@ async def upload_context(request, token_info, digest, size):
                         )
                     )
                 await retain_blob(session, digest, "context", digest)
+                commit_started = True
                 await session.commit()
         except BaseException:
-            if created:
+            if created and not commit_started:
                 await _discard_unregistered_blob(store, _factory_or_503(), digest)
             raise
     return {"digest": digest, "size_bytes": size}
@@ -594,6 +596,7 @@ async def stage_output(job_id, lease, request: Request, digest, size):
                 return job
             job = await owned(session, job_id, lease, live=True)
             created = await _run_blocking(store.publish_verified, path, verified)
+            commit_started = False
             try:
                 job = await owned(session, job_id, lease, live=True)
                 if not any(item["digest"] == digest for item in job.staged_outputs):
@@ -602,11 +605,13 @@ async def stage_output(job_id, lease, request: Request, digest, size):
                         {"digest": digest, "size_bytes": size, "blob_md5": verified.blob_md5},
                     ]
                 await retain_blob(session, digest, "image-job", job.id)
+                commit_started = True
                 await session.commit()
             except BaseException:
-                await session.rollback()
-                if created:
-                    await _discard_unregistered_blob(store, _factory_or_503(), digest)
+                if not commit_started:
+                    await session.rollback()
+                    if created:
+                        await _discard_unregistered_blob(store, _factory_or_503(), digest)
                 raise
             return job
 
