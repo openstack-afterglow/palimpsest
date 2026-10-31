@@ -438,8 +438,12 @@ completed job's ordered stack and runtime, not a user-written descriptor flag.
 `POST /v1/instances` persists retained inputs and a private versioned preparation
 intent, then requests **one image-backed Cinder root**, never a Nova server. The
 root binds original project, image, size, instance ID, request digest and boot
-role in exact metadata. `creating`/`downloading` are observed asynchronously:
-public status remains `booting`, with `provider_phase=volume_preparing`. No Nova/
+role in exact metadata. The create response supplies only a candidate UUID.
+An exact-ID authoritative detail GET must establish full owner/markers/size/image
+binding and no attachment before that UUID is persisted; absent, mismatched or
+failed reads retain the durable uncertain intent and never authorize another
+POST. `creating`/`downloading` are observed asynchronously: public status remains
+`booting`, with `provider_phase=volume_preparing`. No Nova/
 Cinder/GPU-host wait configuration is changed, and HTTP admission does not wait
 ten minutes for image download. Available roots expose `volume_ready`.
 
@@ -470,9 +474,12 @@ after a possible effect never resets that evidence or licenses replay. No raw
 caller token or bootstrap capability is stored, and no SQL schema is added.
 
 Lost Cinder replies recover only after a complete bounded original-project
-inventory (at most1000 entries), exactly one marker/owner/size/image match and
-no attachment; truncated, ambiguous, foreign or empty reads never authorize a
-replacement allocation. Bound UUID reads must return that same UUID. Expired/
+inventory (at most1000 entries), using the original project-scoped connection
+without a provider-side `project_id` filter: actual Cinder rejects that query400.
+Exact owner and all intent markers are still checked client-side; exactly one
+matching size/image and no attachment are required. Truncated, ambiguous, foreign
+or empty reads never authorize a replacement allocation. Bound UUID reads must
+return that same UUID. Expired/
 revoked pre-Nova intents remain eligible for ownership observation/recovery,
 never a new server. Lost Nova replies likewise use bounded exact ownership/
 intent discovery without replay. Public `provider_phase` is one of
@@ -1413,6 +1420,19 @@ uv run python scripts/test_lanes.py run gate2
 
 ## Maintenance
 
+2026-10-31 prepared-volume provider-contract review: Cinder accepted the actual
+80GiB root POST202, but rejected detailed inventory's `project_id` query400;
+Hub observation therefore failed502 and no Nova advance occurred. The SDK
+accepts and forwards that query, so recovery now uses token-scoped inventory
+with unchanged exact client-side ownership/marker/size/image/bound/ambiguity
+checks. A partial create response is never ownership authority: validate its UUID,
+read that exact detailed resource and validate it before binding. Unknown response
+or detail reads keep the durable uncertain POST intent; no provider replay,
+SQL schema, bootstrap expiry, allocation authority or GPU-host policy changes.
+Actual initial POST-response fields remain unobserved; missing owner fields are
+a plausible contract gap, not a proven incident exception. Parent smoke/tests
+and subsequent canonical deployment evidence are recorded separately.
+
 2026-10-30 service-repair review: inspected durable worker journal transitions,
 both authenticated claim routers, SQL-mutex ownership/commit boundaries,
 bounded channel/protocol receipts and additive offline migration. Keep the
@@ -2109,9 +2129,9 @@ provider provisioning. Fresh multi-instance evidence is recorded separately.
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "94f84860870edec8162bcb3a0dc5566449c72d62f159779267ab3840654eb180",
-  "reviewed_at": "2026-10-31T10:54:40Z",
-  "summary": "Finalexactabsencecorrection: legacyknownservermissing cannotterminaldeleteunboundrootUUIDorSDKNone. Unboundrootretaineddeleting/provider_boot_volume_unknown, boundNone502, onlyliteralCindergetexact404 deleted. Independentdelta/callerscorrect; finalallinstances253pass5skip12.99s+lintpass/formatted6boundarycases. EarliercombinedAPI/rootqualification retained(Hub1396pass7skip317.80s/root265pass/realTCPsyntheticproviderHTTPpassed/private17pass), finalhostedfullsuitependingcorrectedsuccessor. No effects releasedonsuperseded1a/e87, noGPU/newresources/refund/replay, oldworker7cretained."
+  "source_sha256": "4dd8d0c867e044117397743d7c1025e9336f8ba6666f16b09d605e834bab984b",
+  "reviewed_at": "2026-10-31T19:32:59Z",
+  "summary": "Cinder contract repair: original-project detailed inventory without rejected project_id query; partial POST UUID is only an exact-detail selector, full owner/markers/size/image/unattached proof before binding; durable uncertainty/no replay and schema/expiry unchanged. Independent authority+SDK reviews clean. Target22 pass, instances267 pass5skip15.62s, fullHub1416 pass7skip340.58s, actual Python3.12 SDK3.3 loopback POST/detail/unfiltered recovery old-fail/new-pass smoke. Historical initial POST exception remains unproven; no new deployment/GPU claim."
 }
 ```
 <!-- architecture-review:end -->

@@ -597,23 +597,27 @@ def checked_prepared_volume(row, volume, *, image_required=False):
     return volume
 
 
+def get_exact_prepared_volume(conn, row, volume_id):
+    try:
+        volume = conn.block_storage.get_volume(volume_id)
+    except Exception as exc:
+        if getattr(exc, "status_code", None) == 404:
+            return None
+        raise
+    if volume is None:
+        raise HTTPException(502, "Provider did not prove prepared volume presence or absence")
+    if str(value(volume, "id", "")) != volume_id:
+        raise HTTPException(409, "Provider returned a different prepared boot volume identity")
+    return checked_prepared_volume(row, volume)
+
+
 def get_prepared_volume(conn, row):
     if row.boot_volume_id:
-        try:
-            volume = conn.block_storage.get_volume(row.boot_volume_id)
-        except Exception as exc:
-            if getattr(exc, "status_code", None) == 404:
-                return None
-            raise
-        if volume is None:
-            raise HTTPException(502, "Provider did not prove prepared volume presence or absence")
-        if str(value(volume, "id", "")) != row.boot_volume_id:
-            raise HTTPException(409, "Provider returned a different prepared boot volume identity")
-        return checked_prepared_volume(row, volume)
+        return get_exact_prepared_volume(conn, row, row.boot_volume_id)
     # Exhaust the project inventory before adopting anything. A truncated or
     # ambiguous read is not absence and cannot authorize another POST.
     matches = []
-    for index, volume in enumerate(conn.block_storage.volumes(details=True, project_id=row.project_id)):
+    for index, volume in enumerate(conn.block_storage.volumes(details=True)):
         if index >= 1000:
             raise HTTPException(409, "Prepared volume recovery inventory exceeds observation bound")
         metadata = value(volume, "metadata", {}) or {}
@@ -741,7 +745,13 @@ async def advance_prepared_boot(session, row, actor, conn, settings, *, allocate
                 image_id=row.spec_json["image_id"],
                 metadata=volume_markers(row),
             )
-            checked_prepared_volume(row, volume)
+            # Cinder's create response is partial: only its UUID selects the
+            # authoritative detail read. Never bind or launch from POST fields.
+            volume_id = str(value(volume, "id", ""))
+            uuid.UUID(volume_id)
+            volume = await run_blocking(get_exact_prepared_volume, conn, row, volume_id)
+            if volume is None or value(volume, "attachments", []):
+                raise HTTPException(409, "Created boot volume is absent or already attached")
         except Exception:
             # Provider uncertainty is already durable. Never retry POST or a
             # possibly-failed SQL COMMIT in a provider exception handler.

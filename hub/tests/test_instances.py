@@ -2439,13 +2439,138 @@ async def test_cinder_preparation_waits_for_exact_available_volume_before_one_no
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("volume_status", ["creating", "available"])
+async def test_partial_cinder_post_binds_only_authoritative_exact_detail(instance_hub, monkeypatch, volume_status):
+    h = instance_hub
+    h.provider.volume_status = volume_status
+    create = h.provider.create_volume
+
+    def partial_create(**kwargs):
+        volume = create(**kwargs)
+        return {"id": volume["id"]}  # Real Cinder POST need not include tenant ownership.
+
+    monkeypatch.setattr(h.provider, "create_volume", partial_create)
+    body = request_body()
+    response = await h.client.post("/v1/instances", json=body)
+    assert response.status_code == 202, response.text
+    item = response.json()
+    volume_id = next(iter(h.provider.volumes_by_id))
+    assert item["boot_volume_id"] == volume_id and item["server_id"] is None
+    assert item["provider_phase"] == ("volume_preparing" if volume_status == "creating" else "volume_ready")
+    assert h.provider.volume_reads and set(h.provider.volume_reads) == {volume_id}
+    assert h.provider.volume_lists == [] and h.provider.creates == []
+    assert len(h.provider.volume_creates) == 1
+    async with h.factory() as session:
+        row = await session.get(PalimpsestHubInstance, item["id"])
+        assert row.boot_volume_id == volume_id and row.capability_hash is None
+    assert (await h.client.post("/v1/instances", json=body)).json()["id"] == item["id"]
+    assert len(h.provider.volume_creates) == 1 and h.provider.creates == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "observation", ["exact", "absent", "multiple", "foreign", "changed-marker", "attached", "wrong-image", "wrong-size"]
+    "detail",
+    ["other-id", "missing-owner", "foreign-owner", "none", "missing", "throws", "attached", "image", "size", "marker"],
 )
-async def test_lost_cinder_post_recovers_only_one_exact_owned_intent(instance_hub, observation):
+async def test_partial_cinder_post_unproven_detail_stays_durably_uncertain(instance_hub, monkeypatch, detail):
+    h = instance_hub
+    create = h.provider.create_volume
+    get = h.provider.get_volume
+
+    def partial_create(**kwargs):
+        return {"id": create(**kwargs)["id"]}
+
+    def unproven_detail(volume_id):
+        volume = dict(get(volume_id))
+        if detail == "other-id":
+            volume["id"] = str(uuid4())
+        elif detail == "missing-owner":
+            volume.pop("project_id")
+        elif detail == "foreign-owner":
+            volume["project_id"] = OTHER
+        elif detail == "none":
+            return None
+        elif detail == "missing":
+            from openstack.exceptions import NotFoundException
+
+            raise NotFoundException("exact created volume is absent", http_status=404)
+        elif detail == "throws":
+            raise TimeoutError("private detail diagnostics must not escape")
+        elif detail == "attached":
+            volume["attachments"] = [{"server_id": str(uuid4())}]
+        elif detail == "image":
+            volume["volume_image_metadata"] = {"image_id": str(uuid4())}
+        elif detail == "size":
+            volume["size"] += 1
+        else:
+            volume["metadata"] = {**volume["metadata"], "palimpsest_volume_role": "other"}
+        return volume
+
+    monkeypatch.setattr(h.provider, "create_volume", partial_create)
+    monkeypatch.setattr(h.provider, "get_volume", unproven_detail)
+    body = request_body()
+    response = await h.client.post("/v1/instances", json=body)
+    assert response.status_code == 202, response.text
+    item = response.json()
+    assert item["status"] == "uncertain" and item["boot_volume_id"] is None and item["server_id"] is None
+    assert item["error_code"] == "provider_volume_create_uncertain" and item["server_create_attempted"] is False
+    assert "private detail diagnostics" not in response.text
+    assert h.provider.volume_reads == list(h.provider.volumes_by_id)
+    assert h.provider.volume_lists == [] and len(h.provider.volume_creates) == 1 and h.provider.creates == []
+    async with h.factory() as session:
+        row = await session.get(PalimpsestHubInstance, item["id"])
+        assert row.boot_volume_id is None and row.server_id is None and row.capability_hash is None
+        assert service.preparation(row)["phase"] == "volume_create_uncertain"
+        assert service.preparation(row)["volume_create_attempted"] is True
+    repeated = await h.client.post("/v1/instances", json=body)
+    assert repeated.status_code == 202 and repeated.json()["id"] == item["id"], repeated.text
+    assert len(h.provider.volume_creates) == 1 and h.provider.creates == []
+
+
+@pytest.mark.asyncio
+async def test_partial_cinder_post_invalid_uuid_never_selects_detail_or_reposts(instance_hub, monkeypatch):
+    h = instance_hub
+    create = h.provider.create_volume
+
+    def invalid_identity(**kwargs):
+        create(**kwargs)
+        return {"id": "not-a-volume-uuid"}
+
+    monkeypatch.setattr(h.provider, "create_volume", invalid_identity)
+    body = request_body()
+    response = await h.client.post("/v1/instances", json=body)
+    assert response.status_code == 202, response.text
+    item = response.json()
+    assert item["status"] == "uncertain" and item["boot_volume_id"] is None and item["server_id"] is None
+    assert h.provider.volume_reads == [] and h.provider.volume_lists == [] and h.provider.creates == []
+    assert len(h.provider.volume_creates) == 1
+    async with h.factory() as session:
+        row = await session.get(PalimpsestHubInstance, item["id"])
+        assert service.preparation(row)["phase"] == "volume_create_uncertain"
+        assert service.preparation(row)["volume_create_attempted"] is True
+    repeated = await h.client.post("/v1/instances", json=body)
+    assert repeated.status_code == 202 and repeated.json()["id"] == item["id"], repeated.text
+    assert len(h.provider.volume_creates) == 1 and h.provider.creates == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "observation",
+    ["exact", "absent", "multiple", "foreign", "changed-marker", "attached", "wrong-image", "wrong-size", "overbound"],
+)
+async def test_lost_cinder_post_recovers_only_one_exact_owned_intent(instance_hub, monkeypatch, observation):
     h = instance_hub
     h.provider.timeout_after_volume_create = True
     h.provider.volume_status = "creating"
+    volumes = h.provider.volumes
+
+    def project_scoped_volumes(**kwargs):
+        assert h.provider._afterglow_project_id == PROJECT
+        if "project_id" in kwargs:
+            raise HTTPException(400, "Invalid filters: project_id")
+        return volumes(**kwargs)
+
+    monkeypatch.setattr(h.provider, "volumes", project_scoped_volumes)
     body = request_body()
     accepted = await h.client.post("/v1/instances", json=body)
     assert accepted.status_code == 202, accepted.text
@@ -2470,6 +2595,10 @@ async def test_lost_cinder_post_recovers_only_one_exact_owned_intent(instance_hu
         volume["volume_image_metadata"]["image_id"] = str(uuid4())
     elif observation == "wrong-size":
         volume["size"] += 1
+    elif observation == "overbound":
+        for _ in range(1000):
+            other_id = str(uuid4())
+            h.provider.volumes_by_id[other_id] = {**volume, "id": other_id, "metadata": {}}
     path = "/v1/instances/" + item["id"]
     for _ in range(2):
         observed = await h.client.get(path)
