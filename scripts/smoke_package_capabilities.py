@@ -9,12 +9,14 @@ publication artifact; the report records both image IDs.
 
 The API container serves the unmodified registered ``palimpsest_hub.main:app``
 (routes, middleware and exception handlers) through uvicorn with lifespan off.
-``hub-serve`` replicates the lifespan except ``init_db``: production
-``init_db`` passes MySQL ``connect_timeout`` to every driver, which SQLite
-rejects, so the harness installs its own SQLite engine/session factory and
-records the canonical ``palimpsest-hub-bootstrap`` failure as an observation.
-This is isolated acceptance of the HTTP contract, not proof of the canonical
-database, lifespan or deployment.
+``hub-serve`` explicitly invokes the production database initialization/schema
+helpers while managing its own isolated SQLite fixture startup and shutdown.
+The supplied API image must contain this source's ``init_db(read_timeout=...)``
+interface; older published images are not supported by this helper revision.
+MySQL-only timeout arguments are restricted to asyncmy; the historical SQLite
+rejection of ``connect_timeout`` is obsolete. The harness records each supplied
+image's canonical ``palimpsest-hub-bootstrap`` probe outcome. This remains
+isolated HTTP acceptance, not canonical full-lifespan or deployment proof.
 
 Identity is a synthetic Keystone HTTP directory (``keystone-serve``) with
 unique global role IDs, zero service implication edges and live assignments. The
@@ -640,7 +642,7 @@ def keystone_serve(_args) -> int:
 
 
 def hub_serve(_args) -> int:
-    """Serve unmodified main:app; replicate lifespan except the MySQL-only init_db."""
+    """Serve unmodified main:app with canonical database helpers and fixture lifecycle."""
     if os.geteuid() == 0:
         raise RuntimeError("The policy/config smoke must run as the image's nonroot Hub user")
     import asyncio
@@ -652,8 +654,6 @@ def hub_serve(_args) -> int:
     from palimpsest_hub.config import get_settings
     from palimpsest_hub.logging import configure_logging
     from palimpsest_hub.main import app
-    from palimpsest_hub.models import Base
-    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
     async def main():
         configure_logging()
@@ -661,11 +661,16 @@ def hub_serve(_args) -> int:
         if not settings.database_url.startswith("sqlite+aiosqlite:///"):
             raise SystemExit("hub-serve is the isolated SQLite harness only")
         configure_blocking_operations(settings.palimpsest_hub_max_blocking_operations)
-        engine = create_async_engine(settings.database_url)
-        async with engine.begin() as connection:
-            await connection.run_sync(Base.metadata.create_all)
-        database._engine = engine
-        database._session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        database.init_db(
+            settings.database_url,
+            pool_size=settings.database_pool_size,
+            max_overflow=settings.database_max_overflow,
+            connect_timeout=settings.database_connect_timeout,
+            read_timeout=settings.database_read_timeout,
+            pool_timeout=settings.database_pool_timeout,
+            unhealthy_seconds=settings.database_unhealthy_seconds,
+        )
+        await database.create_schema()
         server = uvicorn.Server(
             uvicorn.Config(
                 app,

@@ -901,3 +901,39 @@ async def test_slow_delegation_delete_holds_fence_past_ttl_and_drains_cancellati
     finally:
         release.set()
         await asyncio.gather(first, *([second] if second is not None else []), return_exceptions=True)
+
+
+async def test_stale_delegation_attempt_cannot_delete_or_complete_new_attempt(hub, monkeypatch):
+    await _admit(hub)
+    async with hub.factory() as session, session.begin():
+        await session.execute(update(PalimpsestImageExport).values(status=image_exports.STATUS_ERROR))
+    deletes = []
+    monkeypatch.setattr(image_exports, "delete_export_trust", lambda delegation: deletes.append(delegation) or True)
+    async with role_lease(hub.factory, "export-delegation-cleanup") as lease:
+        fences = 0
+
+        @asynccontextmanager
+        async def advanced_attempt():
+            nonlocal fences
+            fences += 1
+            if fences == 2:
+                async with hub.factory() as session, session.begin():
+                    await session.execute(
+                        update(PalimpsestImageExportDelegation).values(
+                            cleanup_attempts=2,
+                            cleanup_next_at=datetime.now(UTC) + timedelta(minutes=10),
+                        )
+                    )
+            async with lease.fence() as session:
+                yield session
+
+        assert (
+            await image_exports._run_delegation_cleanup(
+                SimpleNamespace(fence=advanced_attempt), limit=20, export_id=None
+            )
+            == 0
+        )
+    assert deletes == []
+    _, [row] = await _rows(hub)
+    assert row.state == image_exports.DELEGATION_CLEANUP and row.cleanup_attempts == 2
+    assert row.finished_at is None

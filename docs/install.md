@@ -21,6 +21,71 @@ Historical DMS Lab deployment receipts preserve private listen port `18021`, int
 
 Package references require a separate trusted `palimpsest_package_public_origin`; it was empty in the inspected runtime. For the Afterglow key-gateway deployment, use the approved `https://cloud.dmslab.re.kr` origin rather than inferring it from Hub Host or the internal transport. Verify nonempty exact protected IDs, current requester service leaves and original-token `/v1/projects/current` through Afterglow. Do not use admin/service credentials for package acceptance, grant ordinary users automatically, or claim health 200 proves authenticated reads/writes.
 
+### Unreleased GPU and fixed k3s runtime profiles
+
+These candidate contracts are not enabled by installing the client wheel alone.
+`palimpsest_instance_gpu_profiles` and `palimpsest_instance_cluster_profiles`
+default to empty. Profiles require exact original project IDs and a separately
+content-pinned guest image in `palimpsest_instance_base_images`; preserve existing
+operator values rather than copying a historical image/flavor into production.
+
+GPU entries pin image/flavor/PCI aliases, actual driver version and device count.
+The guest base must already contain working NVIDIA driver and vendor CLI/library
+1.18+. CUDA `base`/`runtime`/`devel` container tags describe application CUDA/cuDNN
+components, not proof that this guest injection runtime or a compatible kernel
+driver is installed. The tested CUDA12.6 devel image supplied nvcc12.6.85 and no
+`nvidia-container-cli`. Do not install drivers/toolkits during measured workload
+bootstrap; use a separately approved base-creation worker and immutable result.
+
+Cluster entries pin image, permitted CPU flavor IDs and original projects. Only
+the fixed two-node `cluster_profile` grants the whole-VM root/writable-cgroup
+exception; normal CPU/GPU policy remains unchanged. Runtime inputs require the
+fixed offline k3s image recipe and hash-pinned airgap archive. `cluster_server_id`
+selects the same original user's unexpired server and exact retained stack, not an
+arbitrary join URL/token or remote shell. See [precise execution/proof boundaries](benchmarks.md#fixed-api-k3s-qualification).
+
+The prepared-root instance API requires a coordinated reviewed API/client source
+cutover; installing a client wheel alone does not deploy it. Initial instance
+creation allocates only one exact-project image-backed Cinder root and returns
+while it is preparing. Pure GET observes `provider_phase=volume_ready` without
+starting a VM. Explicit `POST /v1/instances/{id}/advance` with
+`{"operation":"create-server","request_id":"<original UUID>","boot_volume_id":"<bound UUID>"}`
+is the only first-Nova path. Nova attaches that existing volume, not an image
+source. Preserve the original bootstrap expiration and all current Nova/Cinder/
+GPU-host settings; this repair does not increase provider wait limits.
+
+Deploy source-compatible callers together: record each explicit advancement
+intent before sending once, then use GET-only settlement after an unknown reply.
+Do not assume an older client which only creates and polls GET will start Nova.
+Prepared-volume-only DELETE records cleanup intent without deleting Cinder;
+when GET exposes `delete_volume_ready`, advance with `operation="delete-volume"`
+and the same original request/boot identity. Unknown provider deletion remains
+GET-only until actual404. `server_create_attempted=false` is a versioned no-call
+certificate; null legacy/unknown state is never evidence that no server exists.
+Existing server-backed DELETE may still remove Nova. This change adds private
+versioned state to the existing instance spec JSON and uses `boot_volume_id`;
+no new database column or raw-token persistence is required. Preserve existing
+server-backed rows and uncertain journals rather than replaying old creates.
+See the [instance state and ownership contract](../ARCHITECTURE.md#instance-effects-guest-boundary-and-result-semantics).
+
+For the fixed k3s context, set explicit matching API/worker
+`palimpsest_max_context_bytes` and `palimpsest_max_context_expanded_bytes` to at
+least256MiB; keep worker RUN network `none`. Larger TensorFlow contexts require
+their own explicit bounds and physically reserved scratch. Increasing a logical
+limit does not create disk capacity. Never prune shared caches or resize/reformat
+existing disks to hide insufficient capacity.
+
+Operator storage administration uses a separate project-scoped application
+credential, not workload auth or repeated global-admin password attempts. In the
+current bounded worker preparation, the required private file onwireguardserver
+is `/home/pieroot/.config/palimpsest/worker-storage-clouds.yaml`, ownerpieroot,
+parent0700/file0600, cloud `palimpsest-worker-storage`, `v3applicationcredential`,
+verified public Keystone `/v3` andRegionOne. The token's actual project must match
+the exact approved worker project before Cinder or attachment effects. Do not put
+secrets in chat, persist caller tokens, change IAM, reset administrator passwords,
+or fall back to a different identity after authentication fails.
+
+
 ### Hub liveness and readiness (0.3.6)
 
 `GET /health` and `GET /v1/health` remain dependency-free liveness endpoints
@@ -730,20 +795,36 @@ stopping the Hub API to avoid an uncertain claim.
 
 Keep scratch private and persistent across restarts. Its `worker.lock` flock
 and `worker.json` journal are recovery authority; do not remove either merely
-to unblock polling. Operator disposition depends on the recorded phase:
+to unblock polling. The current source retains an `idle` checkpoint containing
+the worker's private channel and monotonic claim sequence; an idle journal is
+not an uncertain job and must not be deleted to reset that sequence. Operator
+disposition and automatic settlement depend on the recorded phase:
 
-- `claim_pending`: a lost claim response means the API may have assigned a
-  lease the worker never learned. The worker halts permanently for operator
-  disposition; inspect server state/deadline and retained journal without
-  replaying the claim or deleting uncertainty. Expiry is terminal, not requeue.
+- Identified `claim_pending`: the API durably binds the channel, protocol and
+  sequence to an empty outcome or an exact job/lease under the claim SQL mutex.
+  Authenticated claim recovery settles that identity; it never blindly retries
+  the original claim POST. Recovery also fences an unseen request so a delayed
+  original POST cannot assign a new job afterward. This recovery endpoint can
+  write the claim cursor and is **not a read-only diagnostic**. A recovered job
+  retains the no-reexecution rule and is settled through its exact lease.
+- Legacy `claim_pending` without durable request identity remains fail-closed:
+  preserve its journal and establish an explicitly authorized disposition.
+  Counts of current nonterminal rows or unexpired leases alone cannot prove
+  that no claim occurred; compare attempt/lease/status fields against the
+  pre-worker baseline. Never clear a journal merely to resume polling.
 - `claimed` / `executing`: restart never re-executes a recorded job. Preserve
   the tree while the cleanup helper verifies exact process groups and loops;
   a parent-death fence and `builder.pid` / `helper-UUID.pid` records bind
   PID/start ticks/boot ID. Stale records matching the current helper PID are
   previous lifetimes, not authority to kill that helper.
-- `output_pending` / `fail_pending`: a lost mutation response is settled by
-  **status only**, `GET /v1/build-worker/builds/{id}` for the exact lease
-  (including terminal status), not automatic output/failure replay.
+- Recipe `output_pending` and all `fail_pending` records settle through exact-
+  lease status, not blind mutation replay. Image `output_pending` additionally
+  uses a private authoritative publication receipt: bind the complete descriptor,
+  rehash retained packed spans, skip exact committed digest/size stages and send
+  only absent exact idempotent stages. Completion requires that same bound result
+  and unchanged lease deadline. This never re-executes a build or extends an
+  expired attempt. Deploy all API replicas before the compatible worker; pending
+  descriptors stay hidden from public image-job results until completion.
 - `terminal`: cleanup still must be established before deleting the job or
   claiming another. `preflight <worker_pid> <scratch_root>` and
   `cleanup <job_dir> <worker_pid>` are executor modes, not a license for broad
@@ -751,9 +832,12 @@ to unblock polling. Operator disposition depends on the recorded phase:
   journal and inspect exact owned processes/mounts/loops; never detach unknown
   loops, kill PID-only matches or erase the tree to manufacture recovery.
 
-These recovery contracts are source-reviewed; the 0.3.5 production receipt
-records `claim_pending` disposition and resumed idle polling, not native build
-or recipe execution/restart/cleanup qualification.
+The identified-claim protocol requires the additive `palimpsest_worker_claims`
+table and coordinated API/worker deployment. Bootstrap it only through an
+explicit reviewed deployment after paired SQL/CAS backup and isolated restore;
+preserve existing tables and legacy journals. Historical 0.3.5 recovery used
+operator disposition, not this protocol, and is not current live qualification.
+Record current-source tests, deployment and native workload proof separately.
 
 ### Hub API and worker logs
 
@@ -769,6 +853,19 @@ or exception text. Hub disables Uvicorn's raw-target access logger at startup,
 including when launched through the direct `uvicorn palimpsest_hub.main:app`
 command. Do not enable third-party HTTP/SQL trace logging or an independent
 server access logger that emits raw targets in production.
+
+For image-build failures the worker retains one private owner-only
+`last-image-failure.json` beside `worker.json`, after exact executor cleanup and
+before deleting the disposable job tree. It contains the last64KiB from each
+executor/BuildKit stream as base64 plus fixed category/errno metadata; final JSON
+is limited to266240bytes. Treat these raw tool tails as potentially sensitive:
+inspect only through approved operator access, never copy them into public API
+errors, ordinary logs or reports. A later failure atomically replaces this one
+artifact. It is not journal/claim authority; do not delete an uncertain journal
+or adopt diagnostic staging to resume work. Executor stderr survives normal
+failed-child finalization, not an arbitrary worker SIGKILL before the tail is
+persisted. BuildKit uses a short socket in the existing per-executor private
+`/run` tmpfs so persistent job path length cannot exceed its Unix-socket limit.
 
 On a reused asyncmy connection whose uvloop TCP transport was already closed,
 Hub marks the failed pool pre-ping as a disconnect and obtains a fresh connection
@@ -983,6 +1080,8 @@ The required settings are:
 | `PALIMPSEST_HUB_PACKAGE_FORBIDDEN_PROJECT_IDS` | JSON array of exact protected project IDs, for example `'["<project-id>"]'`. A comma-separated list does not parse. Empty policy disables ordinary member/key authority with 503; independently verified human system management supersedes these mixed protected-owner exclusions. |
 | `PALIMPSEST_HUB_PACKAGE_FORBIDDEN_USER_IDS` | JSON array of exact protected administrator/service principal IDs, for example `'["<user-id>"]'`. Empty policy disables ordinary member/key authority with 503. Human system management independently excludes actual validator/trustee IDs and service/delegated authentication. |
 
+Human administration and admin-issued bounded key use freshly read the native user's home-domain ID and selected project's domain ID, verify each exact domain resource and require explicit boolean enabled=true. Disabled native requester/project/home/target domains deny with 403; missing/malformed/unavailable metadata is 503. The reader additionally needs complete native domain get/list, configured-domain filtered user lookup, user-group membership and raw user/group exact-system assignments, alongside existing subject/role/graph reads. Configure `OS_USER_DOMAIN_NAME`/`OS_USERNAME` to one existing native trustee domain/user; missing, ambiguous or partial lookup fails closed. Original token or saved key-provenance domain names never skip configured-service ID exclusion after a domain rename. These are read-only prerequisites, not permission to change IAM or fall back to service-password authentication.
+
 Optional settings and defaults:
 
 | Environment setting | Default / constraint |
@@ -990,6 +1089,7 @@ Optional settings and defaults:
 | `DATABASE_POOL_SIZE` | `10`, valid 1–100 |
 | `DATABASE_MAX_OVERFLOW` | `20`, valid 0–100 |
 | `DATABASE_CONNECT_TIMEOUT` | `10` seconds, valid 1–120 |
+| `DATABASE_READ_TIMEOUT` | `30` seconds, valid 1–120; asyncmy handshake/response read limit, separate from TCP connection and pool checkout timeouts; applies to API, export worker and offline bootstrap |
 | `DATABASE_POOL_TIMEOUT` | `30` seconds, valid 1–120 |
 | `DATABASE_UNHEALTHY_SECONDS` | `30` seconds, valid 1–3600 |
 | `PALIMPSEST_HUB_MAX_BLOB_BYTES` | `107374182400` bytes (100 GiB), minimum 1 |
@@ -1006,6 +1106,14 @@ Optional settings and defaults:
 | `OS_REGION_NAME` | `RegionOne` |
 | `OS_INTERFACE` | `internal` |
 | `SSL_VERIFY` | `true` |
+
+`DATABASE_READ_TIMEOUT` limits each asyncmy wait for incoming protocol data,
+including handshake/pre-ping/query responses; it is not an overall SQL transaction
+deadline and does not bound a peer that continually supplies partial data. It
+does not introduce retries. A response timeout after a mutation or COMMIT leaves
+an uncertain outcome: preserve the original durable claim/publication receipt
+and use its existing authoritative settlement, never assume rollback or replay.
+The separate HTTPS-only build worker does not consume this database setting.
 
 ### Remote build worker settings
 
@@ -1024,20 +1132,20 @@ Optional settings and defaults:
 
 The `OS_USERNAME`/`OS_PASSWORD` service identity remains separate from the read-only validator. The validator authenticates itself with `system_scope="all"` and validates the **presented subject token** through Keystone's token-read API; it never exchanges that token for a new default-project token and never falls back to service/admin credentials. `X-Project-Id`, if supplied, is only an exact assertion against the original scope, not a re-scope request. Downstream caller-scoped OpenStack requests reuse the validated original token and catalog. A missing reader identity/policy response fails closed (503), invalid/expired tokens fail 401, and scope assertions fail 403.
 
-Operator-owned Keystone policy must let this reader call token validation (`tokens.validate`), `users.get`, `projects.get` and `role_assignments.list`, including fresh direct system grants as well as effective project assignments. On every native package-key use, enabled user/project, current membership and current service authority are checked, not cached token membership. Native owners need current `member` or `reader` in the original project and remain forbidden by `admin`, `manager` or `service` assignments, protected IDs or validator identity. Direct system-grant lookup also attenuates existing native keys immediately when the owner is promoted. Read-only members cannot delegate writes; empty protected sets fail closed, and admin authority is not a native upload workaround. Deferred Glance exports retain this native owner policy.
+Operator-owned Keystone policy must let this reader call token validation (`tokens.validate`), `users.get`, `projects.get`, native domain/group reads and complete role-assignment collections. Every native package-key use freshly checks enabled owner/project, current authority and declared key ceilings. Ordinary member keys retain protected-owner and elevated `admin`/`manager`/`service` exclusions; independently issued human-admin keys retain explicit issuer provenance and fresh system-authority checks. A later owner promotion never upgrades an ordinary key. Missing/incomplete metadata fails closed; package keys cannot gain system management, key administration or OpenStack execution authority.
 
-The separate system-administrator gate uses `role_assignments.list(user=SUBJECT, system="all", include_names=True)` without effective expansion. Qualify that exact direct query with the dedicated reader and confirm immediate revocation; a project-oriented effective listing can omit a valid direct system-all admin assignment. Project-token admin/service grades are not substitutes for this system check. This does not change the fresh effective membership query used for ordinary package owners, and does not grant package keys builder/GC authority.
+The separate human system-administrator gate resolves complete raw exact-`system:all` user and current-group grants through the trusted unique-global role-ID implication graph; project-oriented effective expansion may omit these grants and is not evidence of their absence. Qualify raw user/group reads and immediate revocation with the dedicated reader. Tenant administrative/service grades never substitute for native system authority. Original `X-Project-Id` asserts caller scope; separate `X-Target-Project-Id` selects a verified logical management target without exchanging/re-scoping the original token. See [current credential contracts](project-package-registry.md#3-identity-and-authorization).
 
-For **legacy image/layer upload**, the 2026-10-14 owner-approved source policy
-treats a system administrator as an ordinary current-project user: both
-current original-project membership and current `palimpsest-publish_editor`
-are required. Publish authority derives only from ordinary direct/group/
-inherited assignment roots, excluding builtin `admin`/`manager` roots and
-Keystone implied copies tagged `links.prior_role`. Admin privilege alone never
-grants publication. Service identities, protected users/projects and validator
-identity remain denied. `/v1/me` projects this upload check for admins;
-delete/build remain system-admin. This does not relax native keys/owner policy
-or claim that live 0.3.3 has the candidate policy.
+**Historical legacy-publication policy (2026-10-14, before 0.3.10):** that
+candidate treated a system administrator as an ordinary project publisher,
+requiring current original-project membership and publication authority from
+nonadministrative assignment roots. Preserve its dated qualification records;
+do not apply that older rule as the current human-system management contract.
+Current 0.3.10 additionally admits independently revalidated human system
+administrators for policy-authorized target-bound publication without fabricated
+target membership or service leaves. Original requester audit, native domain
+enablement, delegated/service-identity vetoes and bounded key ceilings remain;
+deferred Glance Trust-export admission retains its separate stricter boundary.
 
 Keystone user/project IDs are exact bounded ASCII identifiers (up to 64 characters), including federated 64-hex user IDs. Do not parse them as UUIDs, case-fold or strip them. UUID formatting applies only to Hub-generated key/upload IDs. Protected sets and namespace binding values must preserve exact identity bytes. For a conventional project UUID, the conditional operator configuration is:
 

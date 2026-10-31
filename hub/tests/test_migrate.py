@@ -13,6 +13,7 @@ from palimpsest_hub.models import (
     PalimpsestHubBuild,
     PalimpsestImageExport,
     PalimpsestImageExportDelegation,
+    PalimpsestWorkerClaim,
     PalimpsestWorkerLease,
 )
 
@@ -23,6 +24,11 @@ _TABLES = (
     "palimpsest_image_exports",
     "palimpsest_image_export_delegations",
     "palimpsest_hub_builds",
+    "palimpsest_worker_claims",
+    "palimpsest_hub_build_contexts",
+    "palimpsest_hub_image_jobs",
+    "palimpsest_hub_instances",
+    "palimpsest_runtime_blob_references",
     "palimpsest_package_namespaces",
     "palimpsest_packages",
     "palimpsest_package_keys",
@@ -266,6 +272,55 @@ async def test_migration_preserves_build_receipt_and_deadline_but_retires_sql_ex
             assert after["status"] == "error" and after["lease_owner"] == "00000000-0000-4000-8000-000000000002"
             assert "execution_node" not in after
             assert await original.scalar(text("SELECT execution_node FROM palimpsest_hub_builds")) == "retired-kvm-node"
+    finally:
+        await source.dispose()
+        await destination.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("include_receipts", [False, True])
+async def test_migration_preserves_claim_cursors_or_accepts_old_schema(tmp_path, include_receipts):
+    source_url = f"sqlite+aiosqlite:///{tmp_path / 'claim-source.sqlite'}"
+    destination_url = f"sqlite+aiosqlite:///{tmp_path / 'claim-destination.sqlite'}"
+    source, destination = create_async_engine(source_url), create_async_engine(destination_url)
+    receipts = PalimpsestWorkerClaim.__table__
+    try:
+        async with source.begin() as connection:
+            tables = [table for table in Base.metadata.sorted_tables if include_receipts or table != receipts]
+            await connection.run_sync(lambda sync: Base.metadata.create_all(sync, tables=tables))
+            if include_receipts:
+                await connection.execute(
+                    receipts.insert(),
+                    [
+                        {
+                            "channel": "00000000-0000-4000-8000-000000000001",
+                            "protocol": "image",
+                            "sequence": 81,
+                            "result_json": None,
+                        },
+                        {
+                            "channel": "00000000-0000-4000-8000-000000000001",
+                            "protocol": "recipe",
+                            "sequence": 82,
+                            "result_json": {
+                                "id": "00000000-0000-4000-8000-000000000002",
+                                "lease": "00000000-0000-4000-8000-000000000003",
+                            },
+                        },
+                    ],
+                )
+        async with destination.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        copied = await migrate(source_url, destination_url)
+        assert copied[receipts.name] == (2 if include_receipts else 0)
+        async with destination.connect() as connection:
+            after = list((await connection.execute(select(receipts).order_by(receipts.c.protocol))).mappings())
+        if include_receipts:
+            async with source.connect() as connection:
+                before = list((await connection.execute(select(receipts).order_by(receipts.c.protocol))).mappings())
+            assert after == before
+        else:
+            assert after == []
     finally:
         await source.dispose()
         await destination.dispose()

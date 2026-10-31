@@ -72,6 +72,36 @@ The table below describes the native `/v1` endpoint surface supported by the sta
 | `DELETE` | `/v1/uploads/{session_id}` | Cancel active upload session |
 | `POST` | `/v1/bundles` | Generate bundle tarball for stack (`refs`, `include_base_image`) |
 | `POST` | `/v1/bundles/import` | Import OCI image-layout bundle with content-addressed digest re-verification |
+| `POST` | `/v1/instances` | Retain immutable original request and allocate one exact-project image-backed Cinder root only; never Nova |
+| `GET` | `/v1/instances`, `/v1/instances/{id}` | Observe retained/provider state only; never provider POST/DELETE |
+| `POST` | `/v1/instances/{id}/advance` | Explicit exact-request/boot-volume advancement: `create-server` or pending `delete-volume` |
+| `POST` | `/v1/instances/{id}/stop` | Original-writer exact-owned server stop |
+| `DELETE` | `/v1/instances/{id}` | Exact-owned lifecycle deletion intent; prepared-volume-only cleanup dispatches separately through advance |
+
+The prepared-root advance body requires `operation` (`create-server` or
+`delete-volume`), original `request_id` UUID and exact bound `boot_volume_id`
+UUID; additional fields are rejected422. Identity/phase conflicts return409,
+foreign resources404 and missing original-subject writer authority403. Creation
+advance requires current payload permission and the unchanged acceptance expiry;
+cleanup does not extend or depend on creation lifetime. Both operations retain
+durable non-replayed effect intents. Clients must journal each advancement before
+its one HTTP attempt and use GET-only settlement after an unknown reply.
+
+Instance projection retains existing fields and adds `provider_phase` with
+`volume_preparing`, `volume_ready`, `server_attempted`, `delete_volume_pending`,
+`delete_volume_ready`, `deleted`, `uncertain` or `legacy`, plus nullable
+`server_create_attempted`. Only recognized private version1 with literal
+no-attempt evidence emits false; legacy/malformed/missing history emits null,
+never implied absence. Detail GET includes `Cache-Control: no-store` because SQL
+observation can settle retained state, but GET cannot start/stop/delete provider
+resources. A pending image download stays publicly `booting`; actual Nova is
+requested only by explicit ready-volume advance. Prepared-volume-only DELETE
+returns202 without Cinder DELETE even if already available. After
+`delete_volume_ready`, explicit deletion advance performs at most one ordinary
+unattached exact-owned volume DELETE; unknown replies remain unresolved until
+actual Cinder404. Existing server-backed DELETE can still issue Nova DELETE.
+No old client GET-poll loop implicitly starts a server, and no new instance
+allocation is resumed for legacy server-backed records.
 
 ### Liveness and readiness
 

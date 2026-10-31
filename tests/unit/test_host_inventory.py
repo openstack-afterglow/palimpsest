@@ -600,7 +600,7 @@ def external_libvirt(tmp_path, monkeypatch):
         policy = " persistent_state='yes'" if native["tpm_persistent"] else ""
         tpm_xml = f"<tpm><backend type='emulator'{policy}/></tpm>" if native["tpm"] else ""
         return (
-            f"<domain><name>{native['name']}</name><uuid>{native['uuid']}</uuid>"
+            f"<domain type='{native.get('type', 'hvf')}'><name>{native['name']}</name><uuid>{native['uuid']}</uuid>"
             f"<metadata>{native['metadata']}</metadata><os><nvram>{nvram}</nvram></os>"
             f"<devices><disk type='file' device='disk'><source file='{disk}'/><target dev='vda'/></disk>{tpm_xml}</devices></domain>"
         )
@@ -618,6 +618,7 @@ def external_libvirt(tmp_path, monkeypatch):
     )
     conn = SimpleNamespace(
         lookupByUUIDString=lookup,
+        lookupByName=lambda name: domain if native["exists"] and name == native["name"] else lookup("missing"),
         close=lambda: None,
         listAllDomains=lambda: [domain] if native["exists"] else [],
         listAllNetworks=list,
@@ -630,6 +631,7 @@ def external_libvirt(tmp_path, monkeypatch):
         VIR_DOMAIN_UNDEFINE_MANAGED_SAVE=1,
         VIR_DOMAIN_UNDEFINE_SNAPSHOTS_METADATA=2,
         VIR_DOMAIN_UNDEFINE_KEEP_TPM=64,
+        VIR_DOMAIN_XML_INACTIVE=2,
         openReadOnly=lambda uri: conn,
     )
     monkeypatch.setitem(sys.modules, "libvirt", libvirt)
@@ -657,7 +659,7 @@ def test_observed_libvirt_removal_preserves_disks_and_nvram(
     from palimpsest_local import host_vm_control
 
     native = external_libvirt["native"]
-    native.update(active=active, persistent=persistent)
+    native.update(active=active, persistent=persistent, type="kvm" if backend == "kvm" else "hvf")
     monkeypatch.setattr(platforms, "detect_host", lambda: platforms.HostPlatform(system, machine))
     row = host_inventory.observe()["vms"][0]
     assert row["backend"] == backend and row["run_id"] is None
@@ -700,6 +702,7 @@ def test_lima_removal_identity_rejects_unsafe_native_directories(tmp_path, monke
     monkeypatch.setenv("LIMA_HOME", str(home))
     native = home / "native"
     native.mkdir(mode=0o700)
+    (native / "lima.yaml").write_text("vmType: vz\n")
     instance = {"name": "native", "vmType": "vz", "dir": str(native), "config": {}}
     assert host_vm_control.lima_removal_identity(instance) is not None
     if damage == "symlink":
@@ -975,3 +978,40 @@ def test_lima_backends_share_named_disks_but_not_default_user_networks(monkeypat
         ("krun-two",),
     }
     assert next(network for network in networks if network["name"] == "vzNAT")["attachments"][0]["name"] == "vz"
+
+
+@pytest.mark.parametrize("damage", ["wrong-backend", "lifecycle-without-run"])
+def test_native_libvirt_classification_retains_source_selection_guards(external_libvirt, monkeypatch, damage):
+    from palimpsest_local import host_vm_control
+
+    monkeypatch.setattr(platforms, "detect_host", lambda: platforms.HostPlatform("Darwin", "aarch64"))
+    native = external_libvirt["native"]
+    row = host_inventory.observe()["vms"][0]
+    if damage == "wrong-backend":
+        native["xml_override"] = external_libvirt["domain"].XMLDesc().replace("type='hvf'", "type='kvm'")
+    else:
+        native["metadata"] = f"<pal:lifecycle xmlns:pal='{host_inventory.kvm.DOMAIN_MARKER_NAMESPACE}'/>"
+    with pytest.raises(StateError, match="classification changed"):
+        host_vm_control.remove_vm(row, expected_identity=row["removal_identity"], roots=external_libvirt["roots"])
+    assert native["active"] and native["exists"] and native["flags"] is None
+
+
+def test_native_libvirt_inactive_tpm_is_retained_before_stop(external_libvirt, monkeypatch):
+    from palimpsest_local import host_vm_control
+
+    monkeypatch.setattr(platforms, "detect_host", lambda: platforms.HostPlatform("Darwin", "aarch64"))
+    native = external_libvirt["native"]
+    row = host_inventory.observe()["vms"][0]
+    original = external_libvirt["domain"].XMLDesc
+
+    def xml(flags=0):
+        definition = original(flags)
+        if flags == external_libvirt["libvirt"].VIR_DOMAIN_XML_INACTIVE:
+            definition = definition.replace("</devices>", "<tpm><backend type='emulator'/></tpm></devices>")
+        return definition
+
+    monkeypatch.setattr(external_libvirt["domain"], "XMLDesc", xml)
+    del external_libvirt["libvirt"].VIR_DOMAIN_UNDEFINE_KEEP_TPM
+    with pytest.raises(StateError, match="TPM state"):
+        host_vm_control.remove_vm(row, expected_identity=row["removal_identity"], roots=external_libvirt["roots"])
+    assert native["active"] and native["exists"] and native["flags"] is None

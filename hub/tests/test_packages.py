@@ -15,7 +15,8 @@ import httpx
 import pytest
 from fastapi import FastAPI, HTTPException, Request
 from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from palimpsest_hub import policy as native_policy
 from palimpsest_hub.api import hub as legacy
@@ -33,6 +34,7 @@ from palimpsest_hub.models import (
 )
 from palimpsest_hub.services import image_exports
 from palimpsest_hub.services import package_registry as registry
+from palimpsest_hub.services.blob_references import blob_referenced
 from palimpsest_hub.services.hub_store import LocalPathBlobStore
 
 MANIFEST = "application/vnd.oci.image.manifest.v1+json"
@@ -338,6 +340,67 @@ async def publish(hub, namespace, credential, payload, body, *, package="test"):
     return result, path, upload
 
 
+@pytest.mark.parametrize("resource", ["package", "cache"])
+@pytest.mark.asyncio
+async def test_native_upload_unknown_commit_outcome_preserves_cas_staging_and_validating(hub, monkeypatch, resource):
+    """Unknown-outcome injection, not evidence of a real server COMMIT landing later."""
+    namespace, _, credential = await key(hub, actions=["packages:read", "packages:write", "cache:read", "cache:write"])
+    if resource == "cache":
+        binding = {
+            "project_id": "Project-A",
+            "namespace": namespace,
+            "package": "test",
+            "build_key": digest(b"unknown build"),
+            "cache_scope": "default",
+            "platform": "linux/amd64",
+            "builder_fingerprint": digest(b"unknown builder"),
+        }
+        archive = cache_archive(binding)
+        body = {key: value for key, value in binding.items() if key not in {"project_id", "namespace", "package"}}
+        body.update(archive_digest=digest(archive), archive_size_bytes=len(archive))
+        blobs = {digest(archive): archive}
+    else:
+        archive, body, graph = image_archive(b"unknown package commit")
+        blobs = {**graph, digest(archive): archive}
+    path, upload = await staged(hub, namespace, credential, archive, body, resource=resource)
+    upload_id = upload["upload_id"].replace("-", "")
+    original_commit = AsyncSession.commit
+    validating_committed = False
+    failure = OperationalError("COMMIT", {}, TimeoutError("unknown COMMIT outcome"), connection_invalidated=True)
+
+    async def unknown_final_commit(session):
+        nonlocal validating_committed
+        row = await session.get(PackageUpload, upload_id)
+        if row is not None and row.status == "complete":
+            assert validating_committed
+            assert row.result is not None
+            # Metadata is prepared, but deliberately never committed by this injection.
+            assert all(hub.store.blob_path(value).read_bytes() == payload for value, payload in blobs.items())
+            raise failure
+        await original_commit(session)
+        if row is not None and row.status == "validating":
+            validating_committed = True
+
+    monkeypatch.setattr(AsyncSession, "commit", unknown_final_commit)
+    with pytest.raises(OperationalError) as raised:
+        await hub.client.put(path, params={"package": "test"}, headers=credential, json={})
+    assert raised.value is failure
+    async with hub.factory() as session:
+        # This new nonlocking read sees no references; it is not a rollback proof.
+        assert not any([await blob_referenced(session, value) for value in blobs])
+        row = await session.get(PackageUpload, upload_id)
+        assert row.status == "validating" and row.result is None
+        assert row.received_bytes == len(archive)
+        assert await session.scalar(select(func.count()).select_from(PackageVersion)) == 0
+        assert await session.scalar(select(func.count()).select_from(PackageCache)) == 0
+    state = await hub.client.get(path, params={"package": "test"}, headers=credential)
+    assert state.status_code == 200 and state.json()["status"] == "validating"
+    assert hub.store.upload_path(upload_id).read_bytes() == archive
+    for expected, payload in blobs.items():
+        retained = hub.store.blob_path(expected).read_bytes()
+        assert retained == payload and digest(retained) == expected
+
+
 @pytest.mark.asyncio
 async def test_private_complete_image_preserves_federated_owner_and_graph(hub):
     namespace, issued, credential = await key(hub)
@@ -505,11 +568,11 @@ async def test_tag_compare_and_set_retains_winner_and_immutable_history(hub):
     namespace, _, credential = await key(hub)
     first_archive, first, _ = image_archive(b"initial")
     assert (await publish(hub, namespace, credential, first_archive, first))[0].status_code == 201
-    one_archive, one, _ = image_archive(b"one contender")
-    two_archive, two, _ = image_archive(b"two contender")
+    one_archive, one, one_graph = image_archive(b"one contender")
+    two_archive, two, two_graph = image_archive(b"two contender")
     one["expected_tag_digest"] = two["expected_tag_digest"] = first["root_digest"]
-    one_path, _ = await staged(hub, namespace, credential, one_archive, one)
-    two_path, _ = await staged(hub, namespace, credential, two_archive, two)
+    one_path, one_upload = await staged(hub, namespace, credential, one_archive, one)
+    two_path, two_upload = await staged(hub, namespace, credential, two_archive, two)
     results = await asyncio.gather(
         *[
             hub.client.put(path, params={"package": "test"}, headers=credential, json={})
@@ -526,6 +589,20 @@ async def test_tag_compare_and_set_retains_winner_and_immutable_history(hub):
         await hub.client.get(f"/v1/projects/{namespace}/versions", params={"package": "test"}, headers=credential)
     ).json()["items"]
     assert {row["root_digest"] for row in history} == {first["root_digest"], winner}
+    contenders = [
+        (one_path, one_upload, one_archive, one_graph),
+        (two_path, two_upload, two_archive, two_graph),
+    ]
+    loser = next(item for item, result in zip(contenders, results, strict=True) if result.status_code == 412)
+    loser_path, loser_upload, loser_archive, loser_graph = loser
+    loser_state = await hub.client.get(loser_path, params={"package": "test"}, headers=credential)
+    assert loser_state.json()["status"] == "uploading"
+    assert hub.store.upload_path(loser_upload["upload_id"].replace("-", "")).read_bytes() == loser_archive
+    assert not hub.store.exists(digest(loser_archive))
+    async with hub.factory() as session:
+        for expected in loser_graph:
+            if not await blob_referenced(session, expected):
+                assert not hub.store.exists(expected)
 
 
 @pytest.mark.asyncio

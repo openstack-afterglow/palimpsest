@@ -1,9 +1,11 @@
 # Environment benchmarks and experiment controller
 
-Every new performance workflow first measures its disk and network environment.
-Keep successful comparisons concise; retain failures and troubleshooting in a
-separate issue report. Historical runs without this preflight remain historical:
-never attach a later baseline to them as if it were contemporaneous.
+Owner policy (2026-10-29): use one retained4vCPU/8192MiB OpenStack calibration VM
+with a dedicated500GiB Cinder disk. During active experiments, measure Internet
+download/upload at30–60minute intervals (default60minutes), not per workload.
+Both providers run from that same VM in one timestamped cohort; keep each result
+and their equal-weight mean. Missing directions remain N/A. Historical data is
+never retroactively qualified by a later or differently located sample.
 
 ## Commands
 
@@ -38,6 +40,570 @@ OpenStack SDK/SSH research remains a separately labelled lane; neither it nor
 access to controller/compute management endpoints is a product prerequisite.
 The2026-10-28 owner correction withdraws the earlier proposed node-SSH checklist;
 retain its diagnostic evidence, but do not execute it as the next acceptance step.
+
+## Reproducible scenario scripts (working source)
+
+Do not generate a new benchmark driver for each run. The tracked scenario engine
+owns a fixed program, input digest, approval-wide resource ledger, original SDK
+receipts, append-only events and reports. Workload changes require source review;
+configuration selects bounded resources and pinned images, not arbitrary hooks.
+The implementation is not part of published0.3.10.
+
+| Fixed script under `scripts/benchmarks/` | Real success condition |
+| --- | --- |
+| `environment.py` | Create the4CPU/8GiB station and500GiB data disk once, retain/reuse them, measure eligible hourly cohorts and report both provider means without recreating a VM |
+| `torch_cpu.py` | Explicit CPU PyTorch matrix multiplication with complete numerical verification |
+| `torch_cuda.py` | Actual CUDA allocation/matmul, synchronized iterations, GPU inventory and numerical verification; CPU fallback refused |
+| `cuda.py` | NVIDIA inventory, real `nvcc` compilation and synchronized vector-add kernel with every output checked; requires a pinned **devel** image |
+| `tensorflow_cpu.py` | Explicit TensorFlow CPU matmul with numerical verification |
+| `tensorflow_cuda.py` | Explicit GPU matmul **and convolution**, device placement, cuDNN and numerical checks; CPU fallback refused |
+| `k3s.py` | One server plus separately created agent VMs running digest-pinned `rancher/k3s`; all expected nodes Ready, matching private addresses, real pinned-image probe Deployment/pod results |
+
+The environment script owns a persistent station; the other scripts own bounded
+workload runs which reference its recent checkpoint:
+
+```sh
+python scripts/benchmarks/environment.py plan --config station.json
+python scripts/benchmarks/environment.py create --config station.json --output results/station
+python scripts/benchmarks/environment.py sample --output results/station
+python scripts/benchmarks/environment.py run --output results/station --duration-seconds 7200
+python scripts/benchmarks/environment.py status --output results/station
+python scripts/benchmarks/environment.py report --output results/station
+python scripts/benchmarks/torch_cpu.py plan --config torch-cpu.json
+python scripts/benchmarks/torch_cpu.py run --config torch-cpu.json --output results/torch-001
+```
+
+Installed equivalents are `palimpsest benchmark station
+{plan,create,sample,run,status,report,cleanup}` and `palimpsest benchmark scenario
+{list,plan,run,status,report,cleanup}` for workloads. Station `run` is a finite
+resident sampling window; only due cohorts perform probes. Repeated `sample`
+within the interval returns recorded state without HTTP or guest probes, even
+after failure. Station VM/data persist when a window finishes; `cleanup` is an
+explicit destructive owner action, not an automatic benchmark epilogue.
+Workload planning allocates no resources; API lanes no longer create a separate
+SDK calibration VM. Failed/lost mutations never authorize a create/delete replay.
+
+Station input schema is `palimpsest.benchmark-station.v1`: original project/actor,
+exact4vCPU/8192MiB flavor,20GiB OS boot, separate `data_disk` of500GiB `ceph_hdd`
+at `/mnt/palimpsest-benchmark`, original SSH route/pins, one-time approval ledger,
+and `measurement`. Its provider list contains exact `provider_id` values
+`cloudflare` and `ovh`, each with explicit verified HTTPS down/up URLs, bounded
+byte counts and one repetition by default. `interval_seconds` is1800–3600,
+default3600; a persisted pre-request claim consumes the interval on failure too.
+The two directional provider means are averaged with equal weights only when
+both are valid. No missing provider is zeroed or silently replaced.
+
+The same cohort measures regular-file O_DIRECT fio on the500GiB data filesystem
+(default1GiB scratch dataset,20seconds/profile,5repetitions,depth16), not all500GiB
+of payload and not a separate workload's boot disk. It also records private TCP
+send/reverse receive. Raw bounded probe logs are hash-checked before reports;
+volume UUID/size/attachments, boot ID, source SHA and timestamps bind the result.
+Both endpoint inputs, actual byte counts and failures are retained. A provider
+403 is a partial context, not grounds to block unrelated CPU computation or
+recreate the calibration VM. Disk/host identity failure still prevents use.
+
+If disk-only requalification is needed, use the same retained VM and data disk:
+
+```sh
+palimpsest benchmark station repair-access --output results/station
+palimpsest benchmark station disk --output results/station --checkpoint-output results/station/disk-checkpoint-001
+```
+
+`repair-access` is an explicit narrow repair for an original root-owned0711
+mount that safe descriptor traversal cannot read: verify original500GiB volume,
+boot/serial/ext4 UUID/root metadata/private child, then change only that mount
+root to0755. Metadata0600 and measurement child0700 are unchanged. It cannot
+format, mount, reattach, recursively chmod/chown or alter unknown filesystems.
+The disk command performs direct fio only—no curl, Internet/private TCP or VM
+creation. A distinct output preserves prior attempts/protocol versions. Its
+guest probe start/finish and later read-only recovery time remain separate.
+An explicit `environment_context.disk_checkpoint_root` joins a recent successful
+disk checkpoint only when station/project/boot/data UUID/filesystem/source match
+the original hourly network reference. Both references retain their own times;
+the original partial cohort and its failure are never rewritten as success.
+
+All probe and lifecycle commands share `station-active-operation.lock` in the
+canonical station directory. It is acquired before metadata/output-specific
+receipt locks and held through guest execution and evidence recovery. Selecting
+a different disk checkpoint output does not permit concurrent fio; cleanup and
+permission repair refuse while a probe owns the station. Busy sampling returns
+recorded status with a bounded future wake-up, not a tight polling loop. CLI
+mutators reject a busy station before private authentication, and backend APIs
+hold the same fence across the complete operation. Read-only status is unaffected.
+
+
+For unattended execution use the existing resident controller, not an AI polling
+loop or a notebook-dependent SSH session:
+
+```sh
+palimpsest benchmark init --root scenario-queue
+python scripts/benchmarks/torch_cpu.py submit --root scenario-queue --config torch-cpu.json
+palimpsest benchmark worker --root scenario-queue
+# In another terminal, or after reconnecting:
+palimpsest benchmark status --root scenario-queue JOB_ID
+palimpsest benchmark scenario status --output scenario-queue/results/JOB_ID
+```
+
+Install the reviewed package and its `cloud` extra on the resident controller.
+Keep its SDK cloud credentials and SSH private key in that controller's private
+configuration. Scripts use the original SDK-authenticated human/project; no
+caller token is persisted in the queue, forwarded to a worker/guest, or printed.
+The queue retains its existing single-executor/no-replay behavior and blocks
+subsequent work after an interrupted/failed job pending explicit inspection.
+No production worker, retired N5 controller or existing queue is upgraded or
+replayed automatically by these scripts.
+
+### Fresh private throughput peer and authentication
+
+When no separately approved private iperf3 peer/bastion exists, the fixed helper
+`scripts/benchmarks/peer.py` provides `create`, `status`, and `cleanup` for a
+`palimpsest.benchmark-peer.v1` configuration. It requires its own explicit grant
+and shared ledger: a20GiB/2-vCPU/8192-MiB peer, one new SG and one newly allocated
+FIP on that peer only. The helper's bounded grant permits at most three cumulative
+VMs/two live/80GiB, not an open-ended resource allowance. It cannot borrow an
+existing SG/FIP or change shared network/IAM/production configuration.
+
+```sh
+python scripts/benchmarks/peer.py create --config peer.json --output results/peer-001
+python scripts/benchmarks/peer.py status --output results/peer-001
+# After every benchmark target has been ordinarily removed:
+python scripts/benchmarks/peer.py cleanup --output results/peer-001
+```
+
+Only peer placement accepts `floating_network_id`; ordinary benchmark placement
+must omit it. Peer output `connection.json` supplies its actual private iperf3
+address, SG IDs, SSH jump and console-pinned SSH config/known-host references.
+Copy those noncredential values into target `environment.network.internal`,
+`ssh.jump` and `ssh.config_file`, and set target `ssh.known_hosts` to the peer's
+`pinned_known_hosts`. The transport applies one known-host policy to both jump
+and target: an empty seed omits the peer pin and fails before measurement, even
+if the jump config points to a different known-host file. Never disable checking.
+The target adds its own fresh console pin while excluding inherited keys for
+that target alias. Port5201 is private to the new SG, not public. SSH ingress is limited to execution-host addresses
+172.31.0.50/32 and172.30.0.50/32; egress permits same-group TCP22/5201 plus
+HTTP/HTTPS/DNS/NTP. An existing qualified Docker engine is preserved. The helper
+stops only an unmodified package-owned `iperf3.service` on its fresh VM before
+starting its own private listener; unknown listeners/overrides fail closed.
+
+For an execution host without a stored cloud profile, fixed `run`/`cleanup` and
+peer `create`/`cleanup` also accept `--auth-stdin`. Feed a **private pipe**, not a
+regular credential file. The bounded JSON accepts original-caller `v3token`
+(token) or `v3password` (username/password and exactly one user-domain field),
+plus `auth_url`, `project_id`, and `region_name`; the endpoint must be verified
+HTTPS. YAML/OS-environment SDK configuration is disabled for this path, and
+actual session TLS verification is checked before authenticating on the execution
+host. Errors never print raw provider credential details. Queue execution uses
+its controller's existing private SDK configuration and never persists these
+inputs in a job. Original-receipt cleanup does not require local SSH files or a
+still-admitted flavor; it still requires the original actor/project and verified
+provider ownership. Unknown outcomes never become mutation retries.
+
+
+### Execution lanes are explicit
+
+`method` must be one of the following; no lane silently falls back to another:
+
+| Method | Provisioning and execution boundary | Creates per repetition |
+| --- | --- | --- |
+| retained station | One4vCPU/8GiB VM with20GiB OS and500GiB data, reused across all sampling windows | 0 per measurement; 1 initial |
+| `openstack-container`, ML | Create workload VM, reuse hourly station context without probes, pull pinned image outside computation, run container | 1 |
+| `openstack-container`, k3s | Reuse station context; create server plus agents and prove real Kubernetes workload | 1 + agent count |
+| `api-import` | Reuse station context; public Hub registry import and instance creation; SDK only observes provider identity | 1 |
+| `api-build` | Reuse station context; public Dockerfile build and instance creation | 1 |
+| `api-reuse` | Reuse station context; two sequential public consumers with identical ordered digests and separate writable disks | 2, sequential |
+| `api-cold-warm` (unpublished candidate) | One external image job, then fresh sequential cold/warm consumers; warm selects the retained exact stack and never submits another image job | 2, sequential |
+| `api-cluster` (unpublished candidate) | External fixed airgap-context build once; two simultaneously live API consumers form one exact k3s server/agent pair; later repetitions reuse the same completed job | 2, simultaneous |
+
+API image/consumer timing and SDK reference timing remain different boundaries.
+Deployed1afca684 has no GPU injection or privileged cluster profile. This
+unpublished candidate adds explicit `api-cold-warm` GPU profiles and the separately
+admitted fixed `api-cluster` path. Other unsupported methods fail before allocation,
+without a Docker/SDK fallback disguised as API qualification.
+
+An operator `palimpsest_instance_gpu_profiles` entry must pin the permitted project
+IDs, exact qualified Glance image and content hash, flavor/PCI aliases, driver
+version and actual GPU count. The base already supplies working NVIDIA drivers
+and vendor CLI/library1.18+; no workload guest installs/resets drivers or builds
+layers. API bootstrap uses fixed vendor compute/utility injection in its private
+namespace and preserves the image UID/GID. Default profiles are empty/disabled.
+Private flavor eligibility uses the same original caller's explicit
+`is_public=True` listing (Nova public-or-project grants), not administrative
+whole-tenant ACL enumeration. SDK3.3 omission sends `is_public=None`/all flavors
+and is not a project-access fence. Actual CPU/GPU reads with the explicit filter
+passed without creating a VM. Absent/revoked flavors still fail before allocation;
+no IAM change or admin fallback is used.
+
+SDK reference guests separately require their existing Docker NVIDIA runtime.
+
+For `api-cold-warm`, one repetition consumes two cumulative VM/boot reservations
+but at most one live consumer. Cold uses one continuous controller monotonic
+interval from external dependency/context/image preparation through verified GPU
+output. Warm begins immediately before the second consumer request, reuses the
+same ordered Hub digests and profile, and requires distinct instance/Nova/boot
+identities. Acquisition/build, consumer-only and synchronized inner-compute clocks
+are reported separately, never summed. Warm still includes current guest HTTPS
+layer transfer; it is not guest-local-cache warm, Manila or zero-copy. Shared
+OS/CDN cache state is unknown and is never flushed. A failed pair yields no
+successful comparison rows.
+
+The fixed TensorFlow recipe is a derived runtime, not untouched original-image
+success: pinned Torch2.8 CUDA12.6/cuDNN9 base plus TensorFlow2.21 and17 supplemental
+hash-pinned wheels. The external resident client downloads the18 fixed wheels
+under absolute time/byte/hash fences and uploads a bounded offline context. The
+server builds with read-only BuildKit bind mounts and pip `--no-index --no-deps
+--require-hashes`; wheel archives are not intentionally copied into runtime layers.
+Worker RUN networking remains `none`. Cold includes this dependency preparation;
+warm performs none of it. The streamed client default remains16MiB; larger
+contexts require explicit `hub.max_context_bytes` and matching approval/server
+limits, capped1GiB. The pre-send guard runs after hashing, immediately before POST.
+
+The first3060/32GiB prerequisite failed Nova scheduling before boot; its ordinary
+cleanup and spent budget remain historical. Under a new bounded approval, an
+Ada8vCPU/16GiB prerequisite booted with driver535.309.01/capability8.9 but lacked
+`nvidia-container-cli`. A separately approved same-image rebuild failed before
+qualification; its VM later disappeared without an assistant DELETE, cause/actor
+unknown, and its exact retained boot was ordinarily removed. The last approved
+fresh base-builder installed signed/hash-verified Toolkit1.20.1 without changing
+driver/kernel. Private image17085575 was captured, and that exact builder/boot
+were ordinarily removed with absence proof; three prerequisite slots/240GiB stay
+spent. CUDA12.6 devel supplies nvcc, not guest-host injection tooling. Actual API
+GPU injection and numerical timings remain unqualified until those paths run.
+
+For older/newer GPUs, CUDA compilation selects a validated actual device0 compute
+capability and explicitly emits its `sm_xy` code; the program and result validator
+require the capability written by the executed kernel's `__CUDA_ARCH__` to match
+the selected GPU; a host compiler define is not device evidence. One trailing
+float in the existing output buffer carries that observation, outside the checked
+numerical elements/operation count. This avoids default-target PTX JIT against an
+older driver. Real sm61/sm89 compilation is distinct from GPU execution proof.
+
+### Fixed API k3s qualification
+
+`cluster_profile` is disabled by default and separate from GPU privilege. It binds
+original projects, exact content-qualified Linux guest base and permitted CPU
+flavors. `cluster_server_id` connects only the same original user's live,
+unexpired, identically qualified server to its one immutable agent, with the exact
+ordered worker-built layer/runtime provenance. Both admission and effect fences
+revalidate source eligibility; no caller-controlled command/readiness argv is
+accepted for this fixed mode.
+
+The image contains pinned k3s1.37.1, its exact hash/size-checked offline airgap
+archive, static BusyBox and the exact sandbox-image digest. The guest mounts and
+executes it; it does not acquire/build layers, download registry images or install
+Palimpsest. Whole-VM root privilege, writable cgroups, native containerd snapshotter
+and original-network server/agent communication are explicit exceptions, never a
+relaxation of ordinary CPU/GPU chroot policy. A private expiry-bound capability
+provides a domain-separated HMAC join token; no plaintext token is persisted in
+SQL, public projection, argv, environment or logs. New dedicated SG ingress is
+self-group only; no external ingress or FIP is required.
+
+One cold repetition includes external airgap acquisition/context upload/image
+build and a fresh two-node pair. A prepared repetition reuses the exact completed
+job and ordered layers, creates two new writable guests, and performs no image
+job/acquisition. Shared-ledger reservation atomically holds both live slots;
+`cluster.timeout_seconds` separately bounds each pair's deployment/proof interval.
+Hub callback readiness and Nova ACTIVE are independently observed before provider
+identity checks. Cleanup deletes agent before server through API; ambiguous
+effects are observed, not replayed, and cumulative consumption is never refunded.
+
+The fixed proof checks the exact two Ready node identities/IPs/versions, one
+digest-pinned numerical pod per node, successful4950 output and zero unexpected
+restarts. It does **not** claim the older campaign's DNS/HTTP/PVC/service-restart
+or VM-reboot gates. Old conductor RPC MessagingTimeout and Cinder attachment502
+failed before k3s execution and remain provider evidence, not framework failures.
+
+This study asks whether the intended build→layer→consumer→workload→cleanup path
+works and whether measured boundaries are explainable—not whether a faster number
+can be produced. Keep acquisition bytes/time, guest transfer, boot, cluster/GPU
+proof and inner computation distinct; report exact numerical invariants, GPU/CPU/
+RAM/source identities, clock agreement, failures and unavailable stages. One pair
+does not establish dispersion or p90, and different GPU/memory combinations must
+not be pooled as controlled hardware comparisons.
+Reported `operations` are source-defined mathematical work, not hardware
+instruction counters. TensorFlow's inner interval includes device-to-host
+completion and convolution; its rate is not directly interchangeable with
+PyTorch matmul or CUDA vector-add throughput.
+
+
+### Saved configuration and immutable inputs
+
+Schema: `palimpsest.benchmark-scenario.v1`. These fields are the reusable run input,
+not values to invent at execution time:
+
+| Field | Contract |
+| --- | --- |
+| `job_id` | Unique lower-case identifier, 1–32 characters; never reuse a consumed run ID |
+| `scenario`, `method` | Fixed profile and supported explicit lane above |
+| `cloud`, `project_id`, `project_name`, `project_domain_name` | SDK cloud alias and exact project realm; original authenticated user must match approval |
+| `placement` | Exact `image_id`, `flavor_id`, `network_id`, unique `security_group_ids`, `boot_gib`, `writable_gib`; optional boot-volume type remains explicit |
+| `ssh` | Existing private `identity_file`, corresponding `public_key_file`, pinned bastion `known_hosts`, `user`; optional `config_file`/`jump`; `direct_private=true` only for an explicitly routed private network. No FIP is automatically allocated or borrowed |
+| `images` | Required profile keys use `repository[:tag]@sha256:DIGEST`; mutable tag-only inputs refused. k3s also requires `k3s-probe`. Station calibration is separate and needs no OCI image |
+| `environment_context` | Absolute controller `measurement_root`, exact `station_id`, `project_id`, `data_volume_id`, and `max_age_seconds`≤3600. Read-only cached checkpoint; no per-experiment Internet probes and no attribution to workload-local hardware |
+| `resources` | Per-run `max_creates`, `max_live`, cumulative `max_boot_gib`, sufficient for the entire planned scenario |
+| `approval` | Exact `id`, `project_id`, `user_id`, `allowed_scenarios`, `allowed_flavor_ids`, per-VM `max_vcpus`/`max_ram_mib`, cumulative limits, timezone-aware `expires_at`, absolute private shared `ledger_root`; GPU/cluster additionally need `allow_gpu=true`/`allow_cluster=true` |
+| `hub` | API lanes: verified HTTPS `url`, optional additional `ca_file`; original token comes from the SDK session, not configuration |
+| `gpu_profile` | `api-cold-warm` GPU-only explicit operator profile ID; no caller-controlled library paths or device bypass |
+| `cluster_profile`, `k3s_version` | `api-cluster`: exact operator privilege profile and fixed `v1.37.1+k3s1`; pinned k3s and sandbox references, one server/one agent, two proof replicas |
+| `workload` | Bounded `iterations`, `matrix_size`, `timeout_seconds`; fixed actual numerical program, not caller shell |
+| `cluster` | `servers=1`, `agents`, bounded deployment/probe timeout and probe replicas; network/SG must already permit required node traffic |
+| `repetitions`, `deadline_seconds`, `timeouts` | Explicit finite repetition count, global bound and optional bounded ACTIVE/readiness/delete/guest windows |
+
+The approval object is an operator declaration, **not** cloud authorization or
+permission to exceed an approval granted outside the script. Its immutable shared
+ledger is the same across runs under that grant. Reserve before allocation;
+uncertain outcomes retain reservations. Proven deletion releases concurrent-live
+capacity only: it never refunds consumed creations or cumulative boot capacity.
+Use the original ledger, never a fresh path to manufacture replacement allowance.
+
+New Debian/Ubuntu guests install Python/fio/curl/iperf3/mount tools during setup,
+outside measured workload windows. Existing Docker engines/configuration are
+preserved; CPU/reference setup installs `docker.io` only when Docker is absent.
+GPU images must already provide their qualified Docker/NVIDIA runtime: missing
+GPU Docker fails without replacing an engine or installing/resetting a driver.
+Disk probes write only an exclusive regular scratch file on the dedicated data
+filesystem, with no host-global cache flush. Station creation formats only its
+newly created, metadata/serial/500GiB-size-matched volume once, with a predetermined
+filesystem UUID and boot-device exclusion; existing unknown data is never formatted.
+SDK SSH hosts are pinned from the exact newly created VM's serial-console identity,
+not accepted with `StrictHostKeyChecking=no`. k3s joining uses private stdin and
+root-owned token files; token contents/kubeconfig are never report/log material.
+
+### Durable evidence and interpretation
+
+Each new output directory records `config.json`, `runner-source.json` (actual
+source hashes/Python/controller), `result.json`, ordered `events.jsonl`, original
+SDK/API intents/acceptances/provider/flavor/volume receipts, bounded command
+stdout/stderr and remote evidence references. Configuration uses credential
+**references**, never literal passwords, tokens or signed URLs. Status polling,
+state transitions, setup/acquisition, runtime, failures and ordinary cleanup are
+separate recorded stages. Source changes or clock disagreement invalidate timing.
+
+Read `overview.html`/`report.md` for successful scenario boundaries and
+`environment.html`/`environment.md` for disk/network tables; failures and held
+resources remain in `issues.md`, not successful timing rows. Missing data is N/A,
+not zero or a synthetic fallback. CUDA/k3s definitions and unit tests are not live
+GPU or cluster qualification; only a completed real run may claim those results.
+
+`scripts/smoke_hub_execution.py` separately provides a **functional**, original-human
+HTTP/SDK acceptance sequence: layer upload/query/conditional update/exact download,
+real registry acquisition, safe-symlink multistage Dockerfile build, two sequential
+consumer VMs, stop/delete, same-digest reuse and SDK absence checks. It publishes no
+performance result and consumes its own exact remaining approval envelope; it is
+not a substitute for the recent retained-station context required by benchmarks.
+
+**Actual qualification (2026-10-29, unpublished):** the installed private CLI
+created one real4vCPU/8GiB station and500GiB data disk, completed both providers'
+down/up from that same VM, recorded arithmetic means, and returned the exact same
+attempt on another within-hour sample without repeating probes. A finite resident
+worker likewise reused the cohort and stopped while retaining the station.
+Original first-cohort disk failure (root0711 descriptor access) remains preserved;
+guarded access repair and a separate real disk-only checkpoint succeeded on the
+same boot/data/filesystem with64 full hash-verified logs. Probe completion and
+later recovery timestamps are separate; the network cohort was not rewritten.
+
+Installed `benchmark scenario run` then created a real Torch CPU workload VM,
+reused the hourly network and separate disk references without new speed tests,
+pulled the exact pinned image and checked all65,536elements across five256×256
+matmul iterations (PyTorch2.9.0+cu128, actual CPU, zero errors). Overall scenario
+elapsed1034.474s includes VM/setup/image acquisition/transport/cleanup; inner
+computation0.001534s and guest-command transport50.698s are different boundaries,
+not VM startup latency or a steady-state performance/SLA result. The referenced
+station checkpoint was admitted at run start; its exact original timestamps are
+retained, not presented as a fresh probe at every later workload phase.
+
+Exact SDK GET404 verified the workload VM/boot and both obsolete failed targets
+were ordinarily removed. Station/data and its owned SSH/iperf peer remain ACTIVE
+for reuse. The4preexisting servers/35volumes remain present, borrowed FIP stays
+unbound, SG quota stays20 and this operation made zero quotaPUTs. No GPU/cluster,
+native OCI-root, production rollout, or new deployed public execution endpoint is
+proved by this SDK-container run. The named deployed Palimpsest OpenAPI still
+lacks the unpublished image/instance routes; do not relabel this reference as
+those product APIs. Earlier disposable attempts and consumed grants remain dated
+failure evidence and are superseded by the retained-station owner policy.
+
+
+
+## Public API execution contract (working source, not deployed0.3.10)
+
+The external benchmark controller calls the Hub's native `/v1` APIs; it does not
+replace those operations with client Skopeo/BuildKit or SDK/SSH provisioning.
+SDK authentication/read-only provider observations and the separately labelled
+retained-station/reference lanes above remain explicit. The dedicated
+Linux worker owns registry acquisition, canonical OCI-to-SquashFS conversion and
+Dockerfile execution. Instance allocation uses the original authenticated
+requester's project-scoped OpenStack connection inside the API. No requester
+Keystone token is persisted in a job or forwarded to the worker or guest.
+
+| Operation | Public HTTP contract | Completion evidence |
+| --- | --- | --- |
+| Upload layer bytes | `POST /v1/uploads`, offset-bound `PATCH /v1/uploads/{id}`, metadata `PUT /v1/uploads/{id}` | Computed SHA-256 and registered descriptor |
+| Query/download | `GET /v1/layers`, `GET /v1/layers/{digest}`, `GET /v1/layers/{digest}/blob` | Exact project visibility and downloaded byte hash |
+| Update metadata | `PATCH /v1/layers/{digest}` with `If-Match: "config_digest"` | New descriptor digest; immutable blob bytes/architecture/ancestry |
+| Server registry import | `POST /v1/registry-imports` | `GET /v1/image-jobs/{id}` reaches `complete` with ordered output digests and source manifest/config identities |
+| Upload Dockerfile context | `POST /v1/build-contexts`, raw `application/x-tar`, `X-Content-SHA256`, exact `Content-Length` | Verified project-bound context digest |
+| Direct Dockerfile build | `POST /v1/dockerfile-builds` | Same image-job completion contract; no client build |
+| Create consumer | `POST /v1/instances` | Creates only the exact image-backed Cinder root; pure `GET /v1/instances/{id}` observes `provider_phase=volume_ready` before a separately authorized Nova attempt |
+| Reuse previously connected layers | `POST /v1/instances` with `source_instance_id` | New consumer binds the previous immutable ordered stack and runtime provenance |
+| Advance prepared root | `POST /v1/instances/{id}/advance` with `operation="create-server"`, original `request_id`, exact `boot_volume_id` | One explicit Nova attempt after durable intent and fresh original approval/deadline checks; then pure GET observes provider/guest result |
+| Observe/stop/remove consumer | `GET /v1/instances`, `GET /v1/instances/{id}`, `POST /v1/instances/{id}/stop`, `DELETE /v1/instances/{id}` | Exact-owned provider observation and terminal lifecycle state |
+| Finish deferred root removal | The same explicit advance route with `operation="delete-volume"` after DELETE and pure GET reports `delete_volume_ready` | One exact-owned deletion attempt; actual Cinder GET404 plus either exact Nova absence or certified `server_create_attempted=false`/null server proves completion |
+
+### Requests and retained identity
+Consumer GET/list/status never allocates or deletes provider resources. Manual API
+clients must retain the original create request and returned root identity, journal
+the advance operation before sending it once, and only observe with GET after an
+unknown response; retrying the mutation is not a recovery strategy. Scenario
+pollers use the same original cumulative reservation (no new slot or refund), and
+check both approval expiry and the original scenario deadline before the advance
+intent and immediately before its POST. Cleanup never advances creation. A null
+legacy/unknown server identity is a HOLD, not proof that Nova was never attempted.
+An `error`/`deleting` row whose provider phase is `uncertain` remains eligible
+for exact-root cleanup only with positive `server_create_attempted=false`, a
+known bound root and no historical server binding in the original receipts or
+reservation. Uncertain phase alone never proves Nova absence.
+An exact pre-cleanup Cinder GET404 is recorded as `volume_already_absent=true`
+and permits the official API DELETE to settle the bound row without another
+provider deletion. Budget release still requires Hub `deleted`, the positive
+no-Nova certificate and a final exact Cinder GET404; null/non404 failures HOLD.
+Per-operation `*-advance.json` retains the immutable original binding;
+`*-advance-result.json` distinguishes accepted responses, definitive HTTP4xx
+rejections, pre-effect no-call fences and unknown responses. Rejected/no-call
+operations require explicit disposition rather than automatic resubmission;
+unknown responses remain GET-only. The first exact visible Nova identity is
+bound to the original reservation before workload verification. Successful
+cleanup persists `*-absence.json` before releasing its live hold.
+
+
+Registry import accepts `request_id` (UUID), `name`, `reference`, and
+`platform="linux/amd64"`. Docker Hub shorthand such as `alpine:3` normalizes to
+`docker.io/library/alpine:3`. External registries must be explicitly admitted by
+`palimpsest_registry_hosts`; credentials and arbitrary URL transports are refused.
+Acquisition verifies actual manifest, config and layer descriptors. The result
+pins the image that was acquired, not a promise that a mutable tag never changes.
+
+Dockerfile build accepts `request_id`, `name`, inline `dockerfile`, optional
+`context_digest`, `target`, and `build_args`. Context files, multistage `COPY` and
+safe internal relative symlinks are supported. Absolute/escaping/cyclic symlinks,
+symlink-ancestor writes, hardlinks, devices, FIFOs, sparse members and duplicate
+paths are rejected. Defaults bound context transfer to16MiB, expansion to256MiB
+and members to10000. Dockerfile text is at most1MiB. Build arguments and original
+Dockerfile text are not returned by job inventory/status. BuildKit has a private
+per-job daemon, native snapshotter and context; no host Docker socket, forwarded
+credentials, arbitrary remote frontend, remote ADD/Git source or insecure
+entitlement is admitted. `palimpsest_image_run_network` defaults to `none`;
+operator-selected `default` enables isolated worker RUN networking when the
+workload actually requires it. The dedicated worker VM remains the privileged
+kernel boundary, not hostile-code or arbitrary-network isolation.
+
+Persist each `request_id` before POST. Repeating the identical project/request
+returns its existing job/instance; changing that request returns409. A lost
+response does not authorize a new request ID or a second provider allocation.
+Image jobs have one fixed execution lease, bounded staging and atomic multi-layer
+publication. Expired/uncertain attempts do not requeue. HTTP202 proves admission,
+not worker execution. Image worker claims, inputs, staged outputs and completion
+use a separate authenticated HTTPS protocol and durable no-replay local journal.
+
+### Instance input and actual runtime
+
+Instance requests select `request_id`, `name`, `image_id`, `flavor_id`,
+`network_id`, optional `security_group_ids`, `boot_gib`, `writable_gib`, optional
+`command` and `readiness_argv`, plus one source:
+
+- `image_job_id` selects an exact completed project registry/Dockerfile job and
+  its ordered layers, OCI entrypoint/CMD, environment, working directory and UID.
+- `layer_digests` selects a complete visible application-layer chain with exact
+  uploaded cloud-image provenance, or an unambiguous completed OCI job stack.
+- `source_instance_id` reuses the previous instance's sealed stack/runtime even
+  after that instance was deleted. It cannot be combined with another source.
+
+The Glance boot image must be active, explicitly x86_64 Linux raw/qcow2, and
+already provide cloud-init, Python3, systemd, mount/loop utilities, e2fsprogs,
+SquashFS/OverlayFS and HTTPS trust. Network/security groups must belong to the
+original request project; no service/admin credential fallback provisions access.
+Application layers additionally require the Glance image's `palimpsest_digest`
+property to match their exact Hub cloud-image base digest. Unknown or incompatible
+architecture, base provenance and runtime identity fail before allocation.
+
+The guest receives a fixed-expiry capability for only its exact layer downloads
+and bounded result callback, never a Keystone token. It checks SHA-256, mounts
+read-only SquashFS lowers, and creates a guest-private disk-backed ext4 writable
+filesystem on its boot volume. `writable_gib` defaults to8, is smaller than
+`boot_gib`, and is capped by `palimpsest_instance_max_writable_gib` (default64).
+Guest free-space verification reserves capacity before formatting its exclusive
+regular backing file; it never formats a discovered block device. Writable data
+does not share RAM-only tmpfs, another VM's upper/work or Hub source bytes.
+
+OCI image execution is explicitly **`oci-chroot`**: the cloud-image guest keeps
+its kernel/systemd and executes the verified image root in a private chroot.
+This is not native OCI-root stage-1/PID1 boot or Docker daemon compatibility.
+Application mode retains its exact cloud base as the bottom lower. Commands are
+actual argv execution under the declared OCI UID/GID and working directory.
+With `readiness_argv`, a successful probe can attest a still-running workload;
+otherwise command exit0 is required. API readiness is timestamped point-in-time
+guest evidence, not continuous health, provider `ACTIVE`, reboot/SLA or GPU proof.
+Stdout/stderr are independently bounded, and capability-equivalent bytes are
+redacted from reported output.
+
+### Owner-selected reuse and benchmark meaning
+
+The2026-10-28 owner selected **same Hub digest reuse**, not shared-Cinder original
+reattachment. A new VM downloads the same retained bytes, without rebuilding or
+reacquiring the registry image, and obtains independent disk-backed writable
+state. Do not label this a Cinder warm-cache/zero-copy/multiattach measurement or
+mix its timing with the earlier Cinder benchmark. Global layer rows identify
+physical bytes; ordered OCI occurrences and runtime metadata belong to the
+completed image job. Repeated physical digests do not invent global parent links.
+
+The later2026-10-29 owner architecture correction supersedes that storage target:
+the external Palimpsest control plane owns acquisition/build/orchestration, layer
+payloads belong on CephFS exposed through Manila, authoritative metadata belongs
+in the Hub DB, and execution consumers mount read-only payloads. The HTTPS
+download/`oci-chroot` route described here is the current source implementation,
+not implementation or deployment evidence for that Manila target. Scenario
+integration does not add guest-side Palimpsest control, manual provisioning, or
+the older RW-Cinder-store/seal/RO-reattach prototype.
+
+Names may be conditionally updated even on retained layers. Other descriptive
+compatibility hints cannot retarget referenced descriptors. Publication changes
+require fresh human system-management authority. Content replacement always means
+uploading new bytes/new digest, never overwriting an old digest. Retained image
+contexts, staging, outputs and instance sources have indexed SQL references;
+source deletion/GC is refused even after consumer deletion so reuse remains valid.
+
+The stdlib `HubClient` exposes `update_layer`, `upload_build_context`,
+`import_registry_image`, `build_dockerfile`, `get_image_job`, `list_image_jobs`,
+`create_instance`, `get_instance`, `advance_instance`, `list_instances`,
+`stop_instance` and `delete_instance` without client-side SDK/SSH or automatic
+mutation retries. `advance_instance(id, operation="create-server",
+request_id=original_request_id, boot_volume_id=exact_boot_id)` is the explicit
+prepared-root transition; use `operation="delete-volume"` only for pending cleanup.
+Publication, Kolla rollout, existing worker quarantine disposition and real cloud
+resource proofs remain separately scoped actions. The historical N5 private
+SDK/SSH harness is not automatically migrated or reauthorized by these APIs.
+New workload results reference their actual recent same-station time cohort and
+preserve exact request-to-workload/result/cleanup evidence. Calibration source,
+hardware/location and cache scope stay separate from workload-local claims.
+
+## Ordinary VM create-to-SSH observation — 2026-10-29
+
+One newly created OpenStack VM with **4 vCPU, 8 GiB RAM and a 500 GiB
+`ceph_hdd` boot disk** reached the first observed, authenticated SSH probe
+**144.149 seconds** after its Nova create intent; Nova ACTIVE was observed at
+**23.727 seconds**. The existing Ubuntu 24.04 cloud image received only SSH
+setup and a console host-key marker, with no added layer or application package.
+The 500 GiB boot disk is not the retained station's separate measurement disk.
+The console-pinned probe began after host-key publication and used the existing
+Mini/peer path, so this n1 result is not the exact earliest possible SSH time,
+variance, an SLA or a workload-readiness measurement. The new VM and boot disk
+were ordinarily deleted and their absence verified. See the [handoff](development-handoff.md#ordinary-openstack-vm-request-to-ssh-measurement--2026-10-29) for the exact timings, source and evidence.
+
+An independent **8 vCPU / 32 GiB** VM with the same image, network and 500 GiB
+boot-disk type reached Nova ACTIVE in **24.180 seconds** and the first observed
+authenticated SSH probe in **180.030 seconds**. Both results are n1 at different
+times and cannot establish a causal effect of CPU/RAM size. The separately
+created VM and its boot disk were deleted; their absence was verified. Full
+measurements and the separate Notion entry are in the handoff above.
+
 
 ## Environment input
 
@@ -114,7 +680,11 @@ and exact-owned cleanup remain outside the probe implementation.
 ## Five-method workflow input
 
 Schema `palimpsest.benchmark-workflow.v1` requires a unique `job_id`, `mode`
-(`local` or `openstack`), `environment`, and exactly these five `cases`:
+(`local` or `openstack`), and exactly these five `cases`. Current cloud workflows
+select the hourly `environment_context` described above. Explicit standalone
+`environment` calibration remains available for separately approved diagnostic
+work; it cannot be combined with `environment_context` and is not an instruction
+to repeat Internet probes for each experiment:
 
 | Method | Measurement scope |
 | --- | --- |
@@ -132,21 +702,33 @@ JSON `status=success`, matching `method` and `job_id`. OpenStack proof also need
 `flavor.requested.id` and actual allocation flavor. These are trusted operator
 programs, not a remote arbitrary-command service for untrusted tenants.
 
-`setup_hooks` may explicitly provision/install only the qualification prerequisites
-before the preflight (maximum16 bounded hooks per group). A deferred
-`environment.config_file` lets that setup publish the exact newly owned target.
-`before_hooks`/`after_hooks` are explicit argv+timeout objects; no automatic
-retry or cleanup inference. Before-hooks run **after environment qualification**
-and can release qualification peers before timed resource creation. Failed
-preflight prevents measured cases and before/after hooks; case/proof/clock failure
-stops advancement. Optional `controller_hostname` rejects execution elsewhere.
+`setup_hooks` may explicitly provision/install only qualification prerequisites
+(maximum16 bounded hooks per group). For current station-context workflows they
+must not create calibration VMs or repeat Internet tests. The controller reads
+the saved cohort without probes, records its original reference and scope, and
+allows partial provider context without zeroing missing means; unusable station
+or disk identity blocks measured cases.
+
+For explicit standalone calibration only, deferred `environment.config_file`
+lets setup publish the exact newly owned target. `before_hooks`/`after_hooks`
+are explicit argv+timeout objects; no automatic retry or cleanup inference.
+Before-hooks run **after environment qualification**; standalone-only hooks can
+release their disposable qualification peers. Failed qualification prevents
+measured cases and before/after hooks; case/proof/clock failure stops advancement.
+Optional `controller_hostname` rejects execution elsewhere.
 All command evidence is private. `result.json`, `report.md`, `overview.html` and
 `issues.md` are emitted; failures never become successful elapsed times.
 
-The existing `scripts/benchmark_nova_gpu.py` additionally requires an
-`environment_benchmark` OpenStack configuration and `environment_release_argv`.
-It verifies that qualification peers are gone before its original serial GPU
-matrix. Historical private plans are not silently upgraded or replayed.
+**Historical opt-in only:** `scripts/benchmark_nova_gpu.py` retains its original
+eight-case × five-repetition (40-attempt), serial GPU campaign contract. It still
+requires an `environment_benchmark` OpenStack configuration and
+`environment_release_argv`, then verifies that all project peers are gone. This
+is superseded by the retained-station policy for current experiments: use the
+fixed `torch_cuda.py`, `tensorflow_cuda.py` and `cuda.py` scenarios with hourly
+`environment_context` instead. The old script is preserved for truthful source
+and historical-plan provenance, not as a current default or permission to dispose
+of the retained station/peer. Historical private plans are never upgraded or
+replayed automatically; a historical campaign needs separate explicit authority.
 
 ## Always-on controller and recovery
 

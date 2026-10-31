@@ -24,6 +24,843 @@ files_modified:
 [ARCHITECTURE.md](../ARCHITECTURE.md), 실행 경계는 [testing.md](testing.md),
 세부 결과는 아래 링크된 문서와 source다.
 
+## Available-GPU and API k3s precision-study resumption — 2026-10-30
+
+- **PAUSED by user, 2026-10-30 ~09:30UTC.** Resume from the private state file
+  `~/.local/share/palimpsest-proofs/gpu-cold-warm-20261030/resume-available-gpu-k3s-01/RESUME-STATE.md`
+  (not in git). Production is still `1afca684`; nothing from this candidate is
+  deployed. Owner selected `정상 정지·보존 후 새 scratch로 배포` for the existing
+  worker, but its private helpers were edited and **never executed or smoke-tested**;
+  no worker stop, scratch creation, package install or Kolla action has happened.
+  No GPU/k3s consumer VM was created, so there are no new cold/warm timings.
+
+- Final runtime follow-up **`57ab180c5429ced6fa477a883d1b9ba6645d72bf`** is pushed
+  to PR37; source guard **`99c52ed4825fc722b38c8d65826b19b95522729edcce4101faf7fdbd347ff814`**,
+  581files. Exact root8704passed/305skipped in472.87s; Hub1228passed/7skipped
+  in325.77s; five canonical images built/executed with matching runtime hashes,
+  final root/Hub distributions built and Python3.11.15 wheel imports passed.
+  Hosted Test41027257296 and PR-image41027257364 passed; only afterward SHA
+  publisher41028278198 succeeded. All three immutable published images were
+  pulled/executed with full57ab180revision and matching runtime source bytes.
+  Native KVM remains policy-skipped; no new GPU/cluster consumer was created.
+- **New actual rollout blocker,09:00UTC:** before any package install, service
+  stop, config replacement or Kolla reconfigure, the read-only worker preflight
+  failed its live identity fence. Separate exact-state/journal/log diagnosis found
+  existing container `cf7642d70ebc86f733d6cee966f0e5d200b52cf9be4416e012fd977763136bfc`
+  restarting773times, PID0/exit1, retaining a47-byte image `claim_pending` journal
+  SHA256 `3616650fae78c3a998e24e25040e3fa942dd80ba8f0480485b43e25b1e7bea78`
+  in `palimpsest_build_worker_scratch_1afca684_20261030_95b7f432`; noid/lease.
+  Logs report retained-state halt. This is persistent uncertainty, not a harmless
+  idle-poll transient. Cause of the first uncertain claim is unknown. Do not clear,
+  replay, bypass the guard or silently restart it on the same scratch.
+- The six controller services still run1afca684 with restart0. Current read-only
+  service-DB census has19tables,0actionable build/export/upload/delegation/instance/
+  image-job rows, no activeattempts and stale claim mutexes; limited SQL visibility
+  and empty job rows do not certify that an uncertain claim never had an effect.
+  Historical quarantine journal87837860… remains exact and unattached. Zero
+  production package/config/service/SQL/CAS mutations occurred in this follow-up;
+  only owned helper/receipt distribution and bounded read-only probes ran.
+- New resident exact-wheel environment is installed and payload-verified onMini:
+  client wheel `a9783f73c706d924dab4a397d5570d0bac699501cb4b2ba496af1b49ccf7e54f`,
+  actual Python3.12.13/openstacksdk4.22.0 (Hub image remains lockedSDK3.3.0).
+  Existing private release tools/uv was located after normalPATH absence, without
+  tool bootstrap. Shared ledger was created once with3spent/released80GiB rows,
+  240GiB cumulative/0live; no refund. Only original station-config mode0644→0600
+  was tightened; its hash/grant and station identity/schedule bytes are unchanged.
+  Actual resident install/ledger/station prerequisite checks passed without auth,
+  Internet sampling or workload calls. Live qualification is still blocked by
+  current-worker disposition and user-prepared worker-project scratch credential.
+
+- Reviewed candidate `ffcbb26c0ce9a1fb7fbf89297f2daa53abf9a4b3` was committed/pushed
+  to the approved feature branch and [PR37](https://github.com/openstack-afterglow/palimpsest/pull/37).
+  Hosted Test41015857634 and PR-image41015857469 passed; SHA publisher41016837151
+  was dispatched only afterward. Neither publication nor local tests deploy the
+  service. Before rollout, a later precision review identified host macro echo in
+  CUDA architecture evidence. The follow-up writes `__CUDA_ARCH__` from device
+  code into the existing buffer tail and validates it, removing host architecture
+  defines. Real nvcc first failed undefined intrinsic in its host pass; a standard
+  device-pass guard corrected it, and real sm61/sm89 compilation passed. New source/
+  wheel checks and exact publisher identity must supersede the earlier snapshot
+  before consumers run; no historical result/source stamp is relabelled.
+- Actual pinned k3s bundle preflight additionally failed `/bin/k3s kubectl` with
+  `unknown command`; the image's `/bin/kubectl` multicall basename succeeds. The
+  runtime now strips that fixed selector and executes the dedicated entrypoint,
+  while `--version` stays onk3s. Actual current-helper capture/subreaper smoke
+  against pinned binaries returned exact1.37.1versions and reaped all commands.
+  The full Hub suite after this correction passed1226/7 in337.04s; root after the
+  CUDA correction passed8704/305 in488.15s. Offline preflight verified the exact
+  195939840-byte airgap archive and its native pause manifest412c/indexf548. A
+  standalone read-only containerd fixture could import eight tags but could not
+  initialize its CRI service; this is not pod readiness or a production-source bug.
+  No cloud VM was spent on these preflights and no numerical timing is fabricated.
+- Final five canonical images built and executed read-only/networkless for API/
+  exportarm64+amd64 and build-workeramd64; runtime hashes matched the then-reviewed
+  source. A subsequent actual Hub SDK3.3 metadata smoke found Ada admission called
+  admin-only whole-tenant flavor ACL enumeration and received403, although exact
+  flavor/extra specs/list reads succeeded. Peer review caught that SDK3.3 omitted
+  `is_public` means all flavors, not Nova's default project filter. Final code uses
+  explicit `is_public=True` (public OR caller-project grants) at both fences; real
+  CPU/GPU reads passed with zero creates/no IAM fallback. New final images/checks
+  must bind these later bytes before publication/deployment. A consumer-visible
+  admin-ungranted-private regression and private-visible→revoked fence are retained.
+- Actual synthetic temporary SQL-probe cleanup exposed plain Python PID1 ignoring
+  ordinary TERM. The failed probe naturally exited, then was ordinarily removed.
+  Private preservation and shared capture/restore helpers now require Docker init;
+  actual nonce-owned networkless/no-DB smokes passed TERM→exit143/PID0→ordinaryrm.
+  This is local teardown evidence, not production backup/restore qualification.
+- Owner expanded GPU selection beyond3060 to available1080Ti/TITAN X/other GPUs,
+  permits8/16GiB flavors and requires functional/measurement explanation rather
+  than a speed-improvement claim. The screenshot is capacity context, not
+  original-project flavor access or a successful placement. Fresh original-human
+  inventory exposes only3060LHR8c32g and2000Ada8c16g;1080Ti/TITAN X flavors are not
+  currently returned even with private flavors included. No IAM/flavor grant was
+  changed or another user's GPU/VM adopted.
+- New explicit selections **제한 캠페인 실행 / 검증 후 자동 갱신** bind the existing
+  feature branch:9newGPU creates(3prerequisites+6measured),4CPUk3screates, max2live/
+  GPU1, VM≤8CPU/32GiB, GPU boot≤80GiB/CPU≤40GiB, cumulativeboot≤880GiB, one fresh
+  80GiB scratch on the exact existing worker,12-hour expiry. Failed/deleted slots
+  stay consumed. Reviewed exact source may be committed/pushed/PR-tested and SHA
+  images canonically rolled to the existing seven Palimpsest services; no protected
+  merge, formal release, broker/IAM/host GPU change or foreign resource mutation.
+- Actual one-shot Mini prerequisite `gpu-resume-ada16-qual-01`, Nova
+  `23074a82-c46a-4905-9303-af52c13ad9be`, boot
+  `9bc058c4-306f-4f26-933f-b4ce1aa1c1e7`, reachedACTIVE on8CPU/16GiB. Serial evidence
+  records NVIDIA RTX2000Ada/16GiB VRAM/capability8.9, driver535.309.01,
+  kernel6.8.0-57, successful SMI and driver API initialization. Vendor CLI was
+  absent, so neither API injection nor framework GPU timing is qualified.
+- User asked to check CUDA container images before making a base. Actual pinned
+  CUDA12.6.3 devel ran networkless locally: nvcc12.6.85 is present, Container Toolkit
+  CLI/packages absent. NVIDIA's documented stack places libnvidia-container/CLI on
+  the container host (here the workload guest base), distinct from image CUDA/
+  cuDNN. CUDA13 images are not an interchangeable fix for driver535 or all Pascal
+  GPUs. Preserve exact runtime/driver/architecture qualification instead of silently
+  changing framework versions.
+- Separate owner approval allows exact new builder preparation and one private
+  image, plus one dedicated self-only k3s SG. The builder inherited an unrelated
+  baked RSA login key, not the legitimate resident key. Without cycling keys or
+  resetting credentials, owner selected one same-image Nova2.93 rebuild of this
+  exact VM with bounded private bootstrap. It conservatively consumes a second
+  prerequisite/80GiB budget. Accepted HTTP202 request
+  `req-1510c06f-3712-4f4f-b941-b5567cc5b399`; transient console404 whileREBUILD is
+  retained as observer failure, not server absence or authority to repeat rebuild.
+  The separate finite Mini observer only reads the accepted operation. Cinder
+  resident GET observed the boot volume `downloading`, attachmentsempty; notebook
+  Cinder connection timed out, so network-origin failure is not recast as GPU error.
+- Dedicated SG `94f05500-797f-4f00-abc6-9736e476db20` belongs to original SYSTEM.
+  Only self-group6443/TCP,10250/TCP,8472/UDP plus boundedHTTPS/DNS/NTP egress were
+  added; auto-created broad egress was removed only on this new SG. Existing peer
+  SG/FIP/resources were unchanged. Exact worker metadata confirms UUID
+  `49b87ab3-340c-4e2d-ab89-4d4f40bd8bb3`, ownerproject
+  `9cdd693a8af8414f8eaa7f026a7b95f9`; original benchmark credentials must not be used
+  to fabricate cross-project disk attachment. No scratch volume was created yet.
+- Current k3s SDK/Docker reference is not API proof. A separate fixed
+  `api-cluster` implementation now uses one worker-built offline k3s job and two
+  simultaneously live original-human consumers, private expiring join capability,
+  exact nodes and4950 numerical pod checks, then agent-first API cleanup. Default
+  CPU/GPU privilege stays unchanged. No DNS/HTTP/PVC/reboot equivalence is claimed.
+  Before-fix actual BusyBox `/probe` dispatch failed `applet not found`; fixed pod
+  executes basename `/busybox`. Independent reviews found source-expiry/profile,
+  descendantPID, output-capture, atomic-capacity, callback/Nova-ACTIVE and per-pair
+  deadline defects; fixes and final verification must close before deployment.
+- Local checkpoint before those review fixes:140Hub instance tests and382root
+  focused tests passed. A guessed nonexistent test filename caused one collection
+  error; corrected invocation used actual existing test modules. New test-defined
+  behavior is not a final test pass or native cluster proof. Actual CUDA12.6 nvcc
+  produced sm61/sm89 cubins with the real numerical source; no GPU execution was
+  performed by that networkless compiler smoke.
+- Final scoped review closed all seven cluster admission/capture/cleanup/capacity/
+  timing findings, including missing-timeout defaults. Locking current reads retain
+  source eligibility across MariaDB repeatable-read snapshots through allocation.
+  Full Hub1226passed/7skipped in341.11s, focused root402passed. Five canonical API/
+  export arm64+amd64 and build-workeramd64 images built and executed networkless,
+  read-only; actual four runtime file hashes match reviewed working source. This
+  verifies nativearm64/emulatedamd64 image payloads, not native GPU/cluster work.
+  Real unprivileged Linux smoke passed child capture, overflow, trickle, escaped
+  sessions and adopted-runtime-child preservation until final cleanup. Representative
+  four-layer cluster bootstrap measured60052Nova bytes below65535; larger inputs
+  still fail closed. Actual client/Hub wheels+sdists built, fixed context/lock assets
+  present and Python3.11.15 installed-wheel imports passed.
+- First full root gate:8702passed/305skipped with two failures. The subprocess
+  package check lacked `~/.local/bin` onPATH and could not finduv. The unrelated
+  ancestor fixture inherited mutable shared `/tmp` ctime; only simulated ancestors
+  now freeze ctime while the target and actual mutation regressions remain live.
+  No production ancestor guard was relaxed. Focused42cases passed, then the
+  corrected complete root gate passed8704tests/305skipped in497.73s.
+- The accepted same-image rebuild later reachedERROR without a public fault;
+  subsequently exact VM GET/list returned404 without an assistant DELETE. Cause
+  and deletion actor are unknown; do not call that successful builder cleanup.
+  Its exact80GiB boot was verifiedavailable/unattached/originalimage-bound, then
+  explicitly ordinarily deleted; resident GET confirmed absence. Original create
+  and rebuild budgets stay spent. Owner separately selected the final fresh
+  Ada16GiB base-builder slot with the same fixed Toolkit bootstrap on first boot;
+  `gpu-resume-ada16-base-final` is the last prerequisite, not another open retry grant.
+- Worker scratch remains **credential-blocked**: four production Kollaadmin
+  password attempts returned401 across rendered/canonical and project/system
+  scopes. Both stored sources fail; missing-role is not established as cause.
+  All further admin login variants, credential resets and IAM changes are stopped.
+  Read-only rendered Keystone security_compliance keys were unset oncontroller1;
+  that is not proof that identity lockout/rate limits cannot apply. Zero scratch
+  Cinder creates/attachments/formats occurred. User will prepare a separate exact
+  project application credential onwireguardserver at
+  `/home/pieroot/.config/palimpsest/worker-storage-clouds.yaml`, profile
+  `palimpsest-worker-storage`,v3applicationcredential,RegionOne/public/verifiedTLS,
+  file0600/parent0700, ownerpieroot. Its project must be9cdd693a8af8414f8eaa7f026a7b95f9
+  and permit bounded Cinder create/read/delete plus Nova attachment/read/detach on
+  worker49b87ab3 only. No secrets inchat, original benchmark credential replacement
+  or globaladmin is needed. Inactive helper now accepts only this file and never
+  falls back to blockedadmin credentials; do not execute it before user preparation.
+- Private evidence root: `~/.local/share/palimpsest-proofs/gpu-cold-warm-20261030/`
+  `resume-available-gpu-k3s-01/`; original grants/failures are unchanged. User's
+  question-format correction is now explicit: provide facts/unknowns, why a
+  decision is needed, option-specific effects/risks/recovery and exclusions before
+  blocking for a choice; do not compress that context into terse labels.
+
+## GPU API cold/warm attempt and current block — 2026-10-30
+
+- Owner selected official API GPU enhancement, one cold/warm pair each CUDA,
+  Torch and TensorFlow; separate worktree `palimpsest-gpu-cold-warm-20261030`,
+  branch `feature/gpu-cold-warm-api-20261030`, base05cba09. Existing production
+  source1afca684 and all original dirty worktrees remain unchanged.
+- New strict operator GPU profiles, both provider/original-human authority fences,
+  vendor1.18+ guest injection and bounded callback errors are implemented locally.
+  Independent GPU admission/namespace reviews closed their findings. One approved
+  Docker Desktop private native proof passed real mount tracking/overmount
+  preservation/exact loop detach and ordinary stopped-container removal; no NVIDIA
+  device or vendor injection was qualified by that proof.
+- Fixed `api-cold-warm` performs one external image import/build and two fresh
+  API consumers, with identical retained ordered layers and separate writable boot
+  state. Cold continuously includes dependency/context/image acquisition/build;
+  warm includes existing-Hub-layer consumer boot/HTTPS transfer, not local-cache,
+  Manila or zero-copy. TensorFlow uses the exact historical18-total-wheel lock on
+  the pinned Torch CUDA/cuDNN9 base; original TensorFlow image failure is preserved.
+  Absolute curl process deadlines, post-hash/post-fsync expiry fences and no-call
+  cleanup are independently reviewed; final local gate results are recorded below
+  only after actual completion, not inherited from earlier source snapshots.
+- Final local verification, not GPU qualification:327root focused tests and111Hub
+  instance tests passed under their separate canonical configurations;67Kolla
+  contract tests passed with the existing Ansible venv on PATH. Fourteen changed
+  Python files passed Ruff lint/format and the lane manifest is valid. Source
+  review guard `b5b7133fdd0c28a877d0d72dbb2e7395faf35a8824b84d76a3a9c9ad1a0e8f84`,579files.
+  Preserved failed attempts:54Kolla failures from missing Ansible PATH; combined
+  root+Hub collection used the wrong async fixture config; one new test selected
+  a UUID-sorted pending warm reservation instead of its consumer1 role. The latter
+  was corrected to role-bound selection, not a product exception suppression.
+  The final327/111 runs include the deadline/upload/cleanup corrections. No new
+  service-image build, native NVIDIA injection, production workload or publication
+  pass is inferred from these local results.
+- Approved resource cap: seven cumulative GPU VM creates (one prerequisite plus
+  six measured consumers), one live,8CPU/32GiB/80GiB boot each; one fresh80GiB
+  scratch disk on the existing worker. No automatic replacements, host GPU reset/
+  reassignment, unrelated resources, protected merge or formal release. Conditional
+  branch/image publication and canonical Kolla rollout require successful GPU
+  qualification, independent review and required verification; that condition has
+  **not** been met. The scratch disk was not created, and nothing was committed,
+  pushed, image-published or redeployed for this candidate.
+- Actual Mini prerequisite helper SHA256
+  `73ffcfed291734c10236a6dcab817a7012629498c69c3d698441494439d5c949`
+  created `gpu-base-20261030-once`, Nova
+  `e09c0309-959f-4afb-a6c3-4d5608f5fe79`, in original pieroot/SYSTEM project.
+  Nova returnedERROR/code500 `No valid host was found` before a guest booted.
+  Existing DMSLab-paper uses3060 and jisu_model uses2000Ada, but these observations
+  do **not** prove the exact scheduler rejection cause; detailed hypervisor
+  inspection returnedForbidden. Do not call2000Ada free/available.
+- Exact receipt/project/name/job/spec markers, ERROR state and zero attachments
+  were checked before ordinary deletion; final Nova404 and no residual named
+  volume were observed. One cumulative create/80GiB slot remains spent, six
+  measurement slots remain, and no automatic new prerequisite/replacement is
+  authorized. No Docker Hub workload acquisition or GPU numerical benchmark ran;
+  all six requested timings remain N/A. Do not infer GPU compatibility failure
+  from this scheduling failure or publish despite its unmet qualification gate.
+- Private evidence: `~/.local/share/palimpsest-proofs/gpu-cold-warm-20261030/`
+  contains resource authority, original-human Hub GET200, read-only baseline,
+  native proof outcome/cleanup and `qualification-failure-and-cleanup.json`.
+  The Mini retains the original single-create receipt; no credentials were stored.
+
+<a id="owner-contract-and-next-step-2026-10-29"></a>
+## Full current integration and Kolla rollout — 2026-10-30
+
+### Actual publication and controller rollout
+
+- **Published source:** `1afca6843356116859de61aaa94d6d97c1567548`, branch
+  `integrate/all-current-20261030`, [PR36](https://github.com/openstack-afterglow/palimpsest/pull/36).
+  This55-file commit follows the earlier44-file Hub commit; all actual remaining
+  current changes are reconciled. Hosted [Test40908581775](https://github.com/openstack-afterglow/palimpsest/actions/runs/40908581775)
+  and PR image validation40908581864 passed; native KVM was skipped, not passed.
+  No protected merge or formal version/tag/PyPI release occurred.
+- **Fresh owner selections:** actual production maintenance plus **원장 보존 후 새
+  scratch로 재배포** on the existing dedicated worker VM. Scope includes exact
+  wheel/role and immutable images, six controller-writer drain, encrypted paired
+  recovery≤6GiB, isolated proof≤3.5GiB/3CPU/192PIDs and20minutes per unit,
+  offline four-table bootstrap and canonical Kolla. No new VM/GPU/IAM operation,
+  original uncertain claim replay, production restore/drop or unrelated restart.
+- **Operator/artifacts:** exact private wheel SHA256
+  `8dc8f65141bcc9d0db80f94a8046e97d448870ab251fb3c064b4a6a7addb9b27`
+  installed183verified members in `/etc/kolla/.venv`; all109non-target package
+  payloads and non-target lock entries preserved. The exact wheel is a persistent
+  local uv source, not relabelled as the official0.3.10 PyPI wheel. Original operator
+  payload/config/lock and symlink targets were encrypted and stream-verified before
+  mutation; the first strict regular-file preflight refused an existing secret-file
+  symlink before any install intent. No permission weakening was used.
+- **Images:** approved [manual image publisher40910605238](https://github.com/openstack-afterglow/palimpsest/actions/runs/40910605238)
+  passed after hosted CI. All three linux/amd64 images carry full revision1afca684;
+  actual native Kolla targets pulled and checked their labels/IDs. Selected index
+  digests: API `84ec6f90754f8757f37d502db7be7d94fca429e11cad4e3773007ed0be5ddb27`,
+  export `4817f5a4b6b457751f1d67a310ab8699c0f8203885b350911c9a5b21dfa2904a`,
+  build-worker `3aa3265c3a3d0759d7e5d54f3f62e3add1b73ac51789abeb0a74bc78a717e793`.
+- **Recovery:** all six original controller writers received ordinary TERM,
+  exit0/PID0 and restart=no. Root-private encrypted per-host policy/config/inspect
+  archives and original worker archive were decrypt-verified. Fresh paired SQL/CAS
+  capture R2 at `/var/backups/palimpsest/pre-current-20261030-95b7f432-r2`
+  preserved15tables/15rows and44CASfiles/884,748,288bytes including numeric
+  UID/GID/modes/mtime. Successful isolated attempt004 used a network-none database
+  and probes sharing only its private loopback namespace. Old schema/rows/CAS were
+  exact, only four expected empty tables appeared, and a second bootstrap left the
+  complete schema/rows unchanged. Temporary owned containers/tmpfs were cleaned.
+  Backup keys remain private; no offsite-recovery claim is made.
+- **Preserved failures:** first capture failed solely on nondeterministic Docker
+  mount-list order; exact canonical content equality was proved and a new R2 pair
+  created without relabelling that failure. First restore failed in local encrypted
+  CAS→tmpfs extraction amid observed host pressure; underlying cause was not proved,
+  and its cleanup's Docker timeout later settled. Attempt002 proved extraction but
+  rejected a bridge's later IPv6 link-local host address. The replacement private
+  loopback design changes no host-global sysctl/network policy. Attempt003 exposed
+  an asymmetric SQL-collation/Python `names` ordering comparator; both sides now use
+  identical normalization while all DDL/columns/indexes/FKs/rows stay exact. These
+  failed attempts remain failed; source reviews and successful004 are separate.
+- **Production schema and actual canonical deployment:** exact new-image bootstrap
+  ran only after that isolated proof, exit0; live schema15→19 with existing rows/
+  metadata preserved and the four additions empty. Wireguard `/etc/kolla` ran
+  `kolla-ansible reconfigure -i multinode --tag palimpsest --limit dms-controller1,dms-controller2,dms-controller3 --skip-tags haproxy`
+  with existing venv PATH/C.UTF-8 and typed delegate-facts=[]/preconditions=false/
+  source-mode=false. Return0 in46.932s. All six actual container image IDs match
+  approved native pulls/revision, restart0; every prior36effective settings match,
+  all prior operator environment values are preserved. All three direct and public
+  verified-TLS readiness checks report database+Redis+blob_store ok. Nineteen-table
+  census retains five complete/one error recipes and zero new jobs/instances/contexts.
+- **Human gate and completed fresh worker:** user directly logged into cmux as
+  `pieroot`/SYSTEM. The first session expired during recovery; no token refresh or
+  cookie/credential export was performed. User logged in again in visible surface
+ 1000010020; native Hub `/me` and project context through the existing browser BFF
+  both returned200 with exact user0665ef750b0a4533af760d038ecc6098 and
+  projecta4da5d82465b44d5afda1dc0388b687d. Every API retained the original effective
+  worker key, and the actual worker-network verified TLS readiness/new route.
+  Only then did Wireguard run canonical dedicated-playbook `reconfigure` on the
+  existing `palimpsest-hub-build-worker-034`, return0 in80.580s, recap94ok/2changed/
+ 0failed/0unreachable. Actual container
+  `cf7642d70ebc86f733d6cee966f0e5d200b52cf9be4416e012fd977763136bfc`
+  executes approved revision1afca684/image ID3aa3265c… on the new labelled volume
+  `palimpsest_build_worker_scratch_1afca684_20261030_95b7f432`.
+- **Actual worker/runtime/data verification:** four observations over15seconds
+  retained one live PID, restart0 and no uncertain/job journal. Actual private
+  cgroup `0::/`, memory.max6442450944/swap0, pids.max512 and cpu.max200000/100000
+  match6GiB/2CPU/512PIDs; mounts are only private fresh scratch and read-only key.
+  Independent SQL observations showed both image and recipe claim mutex timestamps
+  advance, without a synthetic claim or submitted workload. Old named scratch is
+  unattached, and its26-byte claim_pending journal remains SHA
+  `878378605d8ce777d519b583a3471d50a48d765cecc07a6e5b63080043909347`.
+  Canonical replacement removed the old container object, not its preserved volume/
+  encrypted inspect/config/journal archive. Final14non-mutex table fingerprints and
+  all44CASfiles' bytes/UID/GID/modes/mtime match the cold pair; intended claim mutex
+  updates are recorded separately. The four added tables remain empty and historical
+  recipe states stay5complete/1error. This is real seven-service deployment and idle
+  protocol proof, **not** a fresh registry build/consumer/GPU/Manila qualification.
+
+
+**New owner instruction supersedes the earlier documentation-only/Hub-only scope:**
+organize, commit and push all current changes, then perform the actual Kolla
+Ansible deployment. Integration branch `integrate/all-current-20261030` starts at
+the already pushed Hub/API commit `5c9a30bd5595d5c2246ca2ef823814e6537f9f88`.
+Original shared/release worktree files and indexes remain preserved. Full dirty
+inventories contain220shared and71release paths; overlaps and released/superseded
+implementations require semantic reconciliation, not blind copying. In particular,
+the released HTTPS worker, process/journal/security fixes and remediated Hub/API
+authority/scratch behavior must not regress to old dirty variants.
+
+This scope includes scenario/station programs, their dependencies, the previously
+excluded `scripts/smoke_hub_execution.py`, visual source-guide artifacts and
+unpublished historical evidence. Prior results below remain bound to their own
+source hashes; they are not fresh tests or new resource authority. Internet/GPU/
+cloud benchmark campaigns are not rerun for integration or deployment. The target
+remains external control + Hub DB metadata + Manila-managed CephFS RO execution;
+current HTTPS fetch/verified RO SquashFS is not that storage cutover.
+
+Fresh read-only operator inspection reached `wireguardserver` as UID1003 in
+`/etc/kolla`. Actual API/export containers on `dms-controller1,2,3` still use the
+official0.3.10 immutable images and API health is reported healthy by Docker.
+The inventory also names `palimpsest-hub-build-worker-034`. Publication precedes
+deployment; exact committed source, image IDs, selected role, paired SQL/CAS/config
+restore proof, new-table schema changes and all-writer fence must be established
+before replacement. Existing uncertain worker claims are not automatically
+disposed/replayed. Read-only diagnostics, not a deployment, have run at this point.
+Private evidence root: `~/.local/share/palimpsest-proofs/all-current-kolla-20261030/`.
+Named Astra participation remains unavailable; independent review is source
+review only and does not grant operational authority.
+
+**Fresh integration checks:** imported benchmark/environment/workflow tests555passed;
+focused host inventory/removal/retention/web-operation tests315passed. Actual
+`benchmark scenario list`, fixed acceptance-harness help, CLI-reference generation
+and lane-manifest validation ran without cloud effects. All527Python files pass
+Ruff lint/format after formatting only four changed lifecycle/test files; root
+and Hub wheel/sdist builds passed. Hub production/config/lock, client/build helpers,
+Dockerfile and Kolla files match `5c9a30b` byte-for-byte, so its1127/2Hub and bounded
+storage results remain applicable to those unchanged bytes rather than being
+rerun or relabelled. Full root qualification runs separately on the integration.
+
+The initial direct `uv run pytest -q tests` launcher failed collection because
+`tests.kvm` was absent from that console-script import path; canonical lane uses
+`python -m pytest` and is the final gate. An actual filesystem guard smoke first
+refused a macOS `/var` alias as noncanonical, then passed with the physical path:
+changed/private config, protected VM, unsafe file mode and renamed surviving
+directory were rejected; actual directory removal was distinguished. No real VM
+was deleted; VZ stop/retention/deletion remains unqualified by this smoke.
+
+**Fresh live read-only census:** fifteen production tables, five complete and one
+error recipe, no exports or active worker leases. Exact candidate metadata adds
+**four** tables: `palimpsest_hub_build_contexts`, `palimpsest_hub_image_jobs`,
+`palimpsest_hub_instances`, `palimpsest_runtime_blob_references`. Earlier three-table
+research omitted the retention ledger and is corrected here. Public verified-TLS
+`/v1/ready` returned ready/database+Redis+blob_store ok. Exact old build-worker
+container `f4efb6071c9107cf4939c75fe02cdb4788f4714a1b12423118dc605dbddcd55a`
+remains stopped/PID0/restart-policy=no. Neither readiness nor terminal census
+releases its uncertain claim or proves schema/restore compatibility.
+
+**Final corrected-source gate:** canonical full root8610passed/272skipped in
+523.54s, following170focused scenario/station recovery cases. Pre-fix8574/272
+remains the earlier checkpoint, not a substitute. All six independent integration
+findings are source-closed: hardened acceptance-script authentication, original
+consumer DELETE journals/no replay, image and station-data allocation expiry,
+definite pre-request station cleanup and monotonic validated disk-latest recovery.
+Frozen-before regressions18scenario failures and5station failures/1control pass
+demonstrate the defects. Actual synthetic-loopback authentication made1plaintext
+request before and was rejected before0requests after the shared-helper cutover.
+
+Final staged guard `6fb894d4f3ebd53f2f7e15fe34223ce3a8d3799c64fdddfb1f7f1ed7835adbd1`
+covers575source files. Ruff527files, CLI-reference/manifest, both wheel/sdist
+builds and minimumPython3.11.15 installed-wheel hashes passed. Five supported
+images passed health/OpenAPI smoke; after the client-only corrections the worker
+was rebuilt and four corrected installed modules hash-matched. API/export source
+and configs stayed byte-identical, so no extra rebuild was attributed to unrelated
+client edits. Whole-worktree original220/71files and both original indexes were
+hash-checked unchanged. Every266unique dirty path has a disposition record in the
+private evidence root; historical already-published/unsafe superseded variants were
+not restored. Exact visual artifact bytes retained their original identities.
+
+Deployment preparation remains distinct: private recovery helpers are being
+prepared under a fresh ownership namespace, not transferred/executed yet. Current
+four-table bootstrap requires exact-source isolated SQL/CAS recovery/compatibility
+proof before production. Per-controller policy/config and operator wheel/role/lock
+must be preserved; old-image-only rollback after new writes is unsafe because old
+GC does not understand new runtime references. Any such uncertainty holds writers
+for explicit disposition rather than overwriting newly admitted data. The existing
+worker's uncertain original journal remains preserved; image selection alone is
+not upgraded/running-worker or completed image-job acceptance evidence.
+
+
+### Historical owner-contract documentation checkpoint (shared snapshot)
+
+The dated priority/next-step statements in this preserved checkpoint describe the earlier documentation-only request, not the current commit/push/deployment instruction. Its README hash belongs to that original shared README; the integrated README necessarily has a new identity. Guide/diagram artifacts are carried byte-for-byte, without relabelling old runtime or browser evidence.
+
+### Owner contract and next step — 2026-10-29
+
+**현재 우선순위는 설명·그림 수정과 사용자 문서 검토다.** [Architecture owner contract](../ARCHITECTURE.md#owner-architecture-contract-2026-10-29)가 아래의 과거 Nova/Cinder 그림·N5/R5 재개 계획보다 우선한다. 기존 기준 VM 관측, retained station과 isolated API acceptance는 이미 완료된 각자의 증거로 보존하며, 문서 수정을 위해 old campaign replay·새 reference VM·benchmark·Internet probe를 실행하지 않는다.
+
+- **Target:** Docker처럼 외부 Palimpsest가 image 취득/build/변환, lifecycle, ordered layer와 mount 구성을 제어한다. Workload guest는 최소 mount/runtime만 수행하며 Palimpsest CLI·독립 orchestration·수동 SSH provisioning의 장소가 아니다. Payload는 **Manila-managed CephFS**, authoritative metadata는 **Hub DB**다. Build/layer-creation 경로의 RW는 새 staged bytes와 검증된 atomic publication/등록을 위한 것이며, 공개된 digest의 bytes를 in-place 변경하지 않는다. Runtime consumer는 provider-enforced **RO**, upper/work는 workload별로 분리한다.
+- **Current implementation, 정확한 provenance:** 이 shared checkout의 base는 `aa397a0fd976e35302974a347748a9773e3084bf`다. 별도 `/Users/pieroot/code/palimpsest-release-latest-r2-20261028`(base `977c4f297e57eb05dc53f5991bdcb4d4a95c8f23`)의 `hub/src/palimpsest_hub/services/instance_bootstrap.py:127–149`는 guest HTTPS payload fetch→hash/size 검증→RO loop mount를 수행한다. 이미 guest CLI/build/변환/orchestration은 없다. Gap은 새 guest CLI 제거가 아니라 payload acquisition과 server-controlled mount를 target에 맞추는 것이다. 해당 구현을 이 older shared tree나 deployed0.3.10과 동일시하지 않는다.
+- **아직 없는 qualification:** share identity/export binding, provider RO grant, project/workload namespace와 negative isolation, 발급·회수·mount 수명 및 실제 RO/revocation proof가 필요하다. DB metadata visibility 또는 generic Kolla shared-mount check는 그 증거가 아니다. Guest에 storage master key를 주지 않는 자격 경계가 필요하며 protocol/credential 방식은 아직 선택했다고 주장하지 않는다. RW-Cinder→seal/detach→RO-reattach는 historical prototype이지 새 target이 아니다.
+- **완료된 증거와 한계:** 별도 worktree handoff의 `Integrated qualification follow-through`는 실제 registry/Dockerfile→두 API consumer/reuse/lifecycle, exact-owned 4VM/4boot/FIP/SG cleanup, retained4vCPU/8GiB/전용500GiB station의 hourly network/disk-only checkpoint와 Torch CPU 결과를 기록한다. 이 기능·측정 성공은 Manila runtime, 물리 Ceph 성능 원리/SLA, GPU/k3s 또는 production consumer 배포를 입증하지 않는다. Production0.3.10 API/export와 stopped old0.3.7 worker quarantine은 그대로다. 아래 연대순 실패·원래 receipt·spent grant는 유지한다.
+
+**다음 순서:** (1) README/HTML guide/architecture·sequence가 target과 current implementation을 구분하도록 고친 문서를 사용자에게 검토받는다. (2) 그 뒤에만 미완료 share/access/isolation/revocation/mount 계약과 migration 범위를 구체화한다. (3) runtime/config/storage/cloud 변경·배포·live proof는 별도로 승인된 범위에서 수행한다. 과거 N5 new-reference 계획을 자동 재개하거나, 오래된 timing을 새 backend의 성능 근거로 승격하지 않는다.
+
+**Docs-only maintenance:** 이 entry와 Architecture의 scoped maintenance는 문서 수정 범위만 기록한다. Source/runtime/config/service/cloud 변경, 테스트·build·benchmark, architecture-marker stamp, commit/push/publication은 수행하지 않았다. 기존 dirty work·index·source guard를 보존하며 named-role sign-off나 whole-worktree certification을 주장하지 않는다. 아래 guide의 과거 hash/verification은 당시 산출물에만 귀속하며 이번 수정본의 검증으로 재사용하지 않는다.
+
+**Final documentation verification — 2026-10-29:** independent read-only cross-review of README584–668/894, guide58–165 and both diagram JSONs found no material factual issue: target external control, immutable RW publication/RO consumption and guest mount ownership are clear; the active worktree's current HTTPS guest (already no CLI) is not depicted as implemented Manila runtime. Final local `shasum -a 256` matched all six shared-checkout artifacts below, including the final VM-boundary tags and clarified current-implementation cards; these identities supersede earlier guide/diagram hashes, not historical runtime evidence.
+
+| Shared-checkout artifact | SHA256 |
+|---|---|
+| `README.md` | `8f5b3aa1b482e348112194519287058e852c62de0f3a971ffb4876f8877f4769` |
+| `docs/palimpsest-source-guide.html` | `53b7967553eb89e36ab1dcae7539a66c6d6672d33dd06b0df244126d8a702dba` |
+| `docs/diagrams/palimpsest-source-map.architecture.json` | `1e54ac803b3a482d924af666c296b0b752c04562df70362d1fd5dacd90b76ba9` |
+| `docs/diagrams/palimpsest-source-map.architecture.html` | `8265754cf1a35bb5dc94f71b0d333d1e64103d0efa52b5328bbdf2354b12b4fa` |
+| `docs/diagrams/palimpsest-build.sequence.json` | `2d3629d4bd4a7a1e996a064de32cf4d0ea15cc298acece3e878f0784d504c623` |
+| `docs/diagrams/palimpsest-build.sequence.html` | `3fcc2a2f122a2489377743f3ebf7c3cab43675aea59e63e3aab9818e04ba2475` |
+
+Private QA receipts originate in `/tmp/palimpsest-target-diagram-qa/`; durable evidence destination is `~/.local/share/palimpsest-proofs/source-guide-target-20261029/`. Exact `palimpsest-source-map.architecture.deliver.json` and `palimpsest-build.sequence.deliver.json` bind final specification/HTML bytes and each record9/9showcase,0errors/0warnings; matching `*.visual-check.json` record automated-browser `pass` at1440×900/1600×1000/1920×1080/2048×1320, separately retaining `visualReview: pending`. `source-claim-receipt.json` records53valid local paths/anchors, tabs/contained scrolling and0browser errors; `final-guide-browser.json` records final1440/375light/dark-preference containment with loaded light-pinned SVGs. Embedded SVG normalization differs from canonical exports only by root `data-theme="light"`, as separately recorded. Parent actually inspected final architecture1440light, sequence1440dark and guide375dark screenshots: labels/VM membership and primary contained mobile scrolling were readable. **Known375px generated-viewer limitation:** leftmost theme control is partly clipped (`x=-62.46875`,width80); T shortcut and focused Enter work, but this is not an all-controls visual mobile pass. These bounded documentation checks do not qualify application source, backend cutover/deployment, architecture markers or Astra approval; no application/runtime/service/cloud action was taken.
+
+Persistence completed to that new durable root; `persistence-receipt.json` preserves final artifact/receipt identities and explains that canonical receipt paths still name their truthful `/tmp` inspection origin. No historical proof directory was overwritten.
+
+**Portable provenance amendment:** removed developer-local worktree paths from the public README/package readme and HTML guide; both now identify an unpublished separate worktree by base `977c4f2` and repository-relative `hub/src/palimpsest_hub/services/instance_bootstrap.py`. The table above and current source/persistence receipts bind the revised bytes; prior receipts are retained as `*.before-portable-provenance.json`. Earlier full guide/browser evidence remains tied to its original guide SHA, not relabelled. `portable-provenance-browser.json` records the revised text, loaded diagrams, no page overflow at1440/375px and no page errors; public-file scans found no developer-home paths. Standalone diagrams and embedded SVG bytes were unchanged. Dedicated file-access browser launch timed out; a managed shared tab completed the bounded smoke and was closed. No packaging/publication, backend or cloud action occurred.
+
+
+
+
+## Hub/API scoped publication — 2026-10-29
+
+The owner requested commit/push of all current Hub/API changes. Candidate branch `feature/hub-execution-api-20261029` starts at current `origin/dev` `49b57d34781ede527ea45965817a0078f09dc5ff`; original dirty shared and release worktrees and their indexes remain untouched. Candidate includes current Hub/server APIs, dedicated worker and companion child, matching client methods, Kolla/Docker policy, behavioral tests and scoped contracts. Older shared authentication/policy/catalog/API changes inspected are already represented or superseded by released0.3.10; its stale SQL-connected worker is not restored. One additional stale-delegation-attempt regression is ported narrowly. Benchmark scenario/station tooling and its coupled live harness remain separate, with no broken imports in product paths. Package version remains0.3.10; no release/tag/merge/deployment or remote mutation is authorized by this request.
+
+Fresh remediated-source evidence: full Hub suite1127passed/2skipped; `build-registry` lane575passed/4skipped; Kolla/architecture/lane contracts164passed; manifest and generated CLI-reference checks passed. Hub/changed-root Ruff lint and71-file format checks passed. Initial focused Hub checks408passed/8failed because a Hub-only environment lacked the worker companion; manual editable install initially closed that test setup, then was removed. Canonical CI now gets companion source through pytest-only `pythonpath = ["../src"]`, not a new controller dependency or workflow change; a final Hub-only suite verifies this configuration separately. Initial full-suite300s timeout remains an incomplete attempt, not a pass. Initial root72passed/1failed/2skipped exposed Python3.13 non-strict resolve accepting cycles; strict resolution preserves valid dangling links and rejects cycles. The newly added stale-delegation regression passed.
+
+Actual canonical Dockerfile builds succeeded for API/export `linux/amd64` and `linux/arm64`, plus dedicated worker `linux/amd64`. Each image executed network-none with bounded memory/PIDs, imported all service entry modules and served actual loopback `/v1/health` and OpenAPI containing the new routes; worker reported BuildKitv0.34.1/x86_64. Lifespan was disabled: no SQL/Redis/native executor/deployment readiness is claimed. Root and Hub wheel/sdist builds passed. Actual host loopback HTTP with registered main app, temporary SQLite/CAS and synthetic identity exercised context upload, durable registry admission/replay, Dockerfile/context admission, changed-intent409, cross-project404 and wrong-subject403; zero cloud requests. A first smoke invocation used a nonexistent helper name and settled/cleaned before the corrected `build_dockerfile` invocation passed.
+
+The owner selected **수정 후 push** after independent review found aggregate scratch exhaustion and abandoned acquisition temporary files. Fixed source uses fully preallocated bounded ext4 workspace/output reserve, journal headroom, owned Python/tool temporary storage and exact cgroup-before-loop cleanup. Follow-up review also closed the formatter capacity limit and packed-span EOF defects. Separate instance review closed missing download authority, failed-create cleanup, surviving boot-volume settlement, serialized-output expansion and definite no-call quota traps. Both independent reviewers report no remaining actionable finding in those scoped fixes; this is not Astra approval, and Astra participation remains unavailable.
+
+The separately approved **one** local privileged Docker Desktop container had1GiB RAM/128PIDs, networknone, no host directory bind and264MiB bounded new data (under512MiB authority). The exact repository native scratch regression ran via a standard-library launcher from an offline derivative image: actual many-file ENOSPC, still-writable outer journal/output reserve, killed temporary-state containment and exact owned loop detachment passed. Exit0 was inspected; only that settled container and labelled private volume were removed without force, and both absences were observed. This is actual local Linux-kernel filesystem/loop proof with emulated amd64 userspace, not native-amd64/cgroup-kill/cloud/Manila qualification. Evidence: `~/.local/share/palimpsest-proofs/hub-api-push-20261029/local-storage-proof-{authorization,intent,result,cleanup}.json` and `final-service-image-smoke.json`.
+
+Runtime wheel private-path scans and scoped production-source Gitleaks scans passed. An intentionally broader sdist scan found historical developer paths in existing docs/tests, so no whole-sdist path-free claim is made. Optional gbrain synchronization was unavailable because its CLI is not installed; no agent/context configuration was changed. No production deployment, schema/IAM mutation, new cloud resource, package release or protected-branch merge occurred. Manila-managed CephFS/RO access remains a separate unimplemented target.
+
+**Final publication gate:** canonical Hub-only environment (manual client distribution removed) passed28image-executor checks and then the complete Hub suite1127passed/2skipped in322.91s. The exact staged architecture guard is `e945fae4067723af3f958aea71bb804c031de1763f16bb426ec7072604d2a81a`/549covered files. All44scoped candidate files are staged in the isolated feature worktree, not either original index. Gitleaks found0staged-diff findings. Five exact-source image builds and runtime surfaces passed again after the test-only CI closure; `staged-source-service-image-smoke.json` records their actual IDs. Commit/push targets only this feature branch; no PR merge, tag, release or deployment follows automatically.
+
+### Preserved earlier evidence
+
+The following checkpoints retain their original source identities, failures, pending-at-the-time statements and spent grants. They are not fresh verification of the current integration or new deployment authority. Later final receipts within each checkpoint supersede that checkpoint's initial setup/pending text.
+
+## Public execution API qualification — 2026-10-28 (uncommitted; native functional flow verified)
+
+- **Source and authority:** active isolated source is
+  `/Users/pieroot/code/palimpsest-release-latest-r2-20261028`, base
+  `977c4f297e57eb05dc53f5991bdcb4d4a95c8f23`; preserve the separate original
+  dirty checkout and all existing production-cutover records below. The new
+  layer PATCH/context/registry/Dockerfile/image-job/instance/client/Kolla work
+  is **unpublished**, not part of released or production0.3.10. Latest source
+  changes add exact-content-qualified unannotated Glance base admission and
+  bounded guest CA trust, alongside the original-human/provider-intent,
+  retained physical-CAS/ordered-occurrence and disk-backed guest execution
+  contracts in [architecture](../ARCHITECTURE.md#working-source-public-execution-api--2026-10-28-unpublished-native-functional-flow-verified).
+  Latest qualification/CA regressions and final integrated source guard are
+  pending; the old architecture review marker is not a review of these bytes.
+  Astra participation is unavailable; independent source reviews are neither
+  Astra approval nor authority for publication, deployment or resource effects.
+- **Evidence boundary:** earlier r3 focused Hub verification passed **431**
+  tests. The five-image matrix passed for the **previous** working-source
+  fingerprint `de7d9f42329115ba24436dc43f72a558736a12164182de372db627da5cc65855`
+  only (API/export amd64+arm64, build-worker amd64); do not attach it to latest
+  source or call amd64 emulation native qualification. Actual registered-app
+  fixture CRUD succeeded, but Mini's bubblewrap **ENOSYS** stopped native image
+  flow; fixture CRUD/health/admission are not a registry import, Dockerfile build,
+  real consumer or API-visible workload result. Latest source changes require
+  the parent's fresh integrated checks; this documentation task ran none.
+- **Fresh execution realm and caps:** only the separately approved
+  `dmslab/SYSTEM` project `a4da5d82465b44d5afda1dc0388b687d` belongs to this
+  native API qualification. The envelope is **4 cumulative VM creations /3
+  concurrent VMs /100GiB boot reservation** (`20+40+20+20`); two setup VMs
+  exist and consumer creations remain **0**. Deletion does not refund cumulative
+  creation authority. No GPU/IAM/production mutation, old campaign replay or
+  release of the production worker quarantine is included. Historical N5/R5
+  performance campaigns and their limits in [benchmarks.md](benchmarks.md) are
+  separate, not reusable launch authority or public API acceptance.
+- **Actual setup resources:** API server
+  `145a29e9-cbd1-4ac3-b81f-9b4adfdbe8b8`, private `192.168.0.248`, public
+  `172.30.103.30`; worker `f72a4253-1149-401e-9f54-3555b70dd911`, private
+  `192.168.0.24`; SG `a80d1ad7-662c-425d-b673-af525261b10f`; FIP
+  `4c54943f-f3c2-4c5e-a133-30066e2a7cf9`. Nova-console-pinned SSH confirmed
+  both actual guests are native **x86_64**, cloud-init complete, dpkg audit
+  empty, Linux kernel **6.8.0-57-generic**, Docker **29.1.3/linux/amd64**.
+  These are real boot/tool prerequisites only: **no new API Kolla deployment,
+  image job, consumer or workload execution has run** at this checkpoint.
+- **Boot-image correction:** `f648a685-7463-4574-8694-6ca5f7edc7c6` is a
+  data-only `external-layer-store`, not a boot image, and was rejected. Existing
+  Ubuntu image `2a57a904-fc77-46e6-851a-148e8cb0ca98` was independently
+  qualified by its exact Glance SHA512 descriptor and the two real native boots;
+  no Glance metadata/property edits were made. SHA512:
+  `66b04eb63a398a4ba0162de07d9a5398b2f93a7922e4ffecc96138f0829f48b4360184faae2e25e921b63041907faea56e3698d448cd06877e9329ebdec44c3f`.
+  Working configuration can pin this UUID/content/architecture/Linux identity;
+  source behavior is not yet qualified by the earlier image matrix or these
+  setup boots. CA trust is an explicit operator-supplied public trust anchor,
+  not TLS verification disablement or a copied credential.
+- **Quota race preserved:** before the approved security-group quota18→19
+  effect, the observed quota had already changed externally to **20**. The
+  exact-baseline guard refused `quota baseline changed; no overwrite`; our
+  quota **PUT count0**, no effect intent existed, and the later read showed
+  limit20/used18/reserved0. Preserve20; do not replay the18→19 effect or claim
+  our code increased it. That receipt's VM-creations0 is its earlier quota-stage
+  observation, not the current two-VM setup count.
+- **Reuse and production exclusions:** `source_instance_id` binds the same
+  retained ordered Hub digest/runtime/provenance snapshot to a new guest; it is
+  **not** prepared-Cinder reattachment, shared writable state or zero-copy block
+  reuse. The actual new native image/build→consumer→second-consumer flow remains
+  unexercised. All six production controller API/export containers remain on
+  published0.3.10, unchanged by this work; the old stopped0.3.7 build worker,
+  restart policy `no` and uncertain `claim_pending` journal remain quarantined.
+- **Receipt location:** private evidence root is
+  `~/.local/share/palimpsest-proofs/k3s-r5-74592e35e9cd-notebook/resume-01/deep-diagnosis-01/mac-mini-cutover-01/release-latest-01/api-implementation-20261028T064428Z-99fed3/`.
+  Public facts above are bound by `qualified-native-boot-image.json`,
+  `verify-new-{api,worker}-native-kernel-and-bootstrap.stdout`,
+  `inspect-quota-guard-refusal-no-replay.stdout` and
+  `approved-system-security-group-quota-18-to-19.stderr`; never copy private
+  credentials, bootstrap capabilities or user-data into this handoff.
+
+### Integrated qualification follow-through
+
+- **Latest owner policy supersedes disposable calibration (2026-10-29):** Internet
+  speed probes are not per experiment. One retained4vCPU/8192MiB VM with a
+  dedicated500GiB data disk provides same-location30–60minute cohorts (default60).
+  Both providers' actual results and equal-weight directional means are retained;
+  incomplete directions remain N/A. Workloads reference recent time-cohort context
+  and never run Internet probes themselves or claim station measurements as their
+  own disk/hardware. Owner explicitly resumed benchmarking with sufficient VM
+  resources; no further tiny resource-budget question is needed for this station.
+- **Exact reachability/placement preflight:** original `pieroot`/dmslab/SYSTEM
+  identity was rechecked from Mini, exact flavor `b9d8422a-ef0a-47e5-9e55-3cb01c7f0d68`
+  (`cpu.4c_8g`,4vCPU8192MiB,disk0) exists and has capacity. Station allocates20GiB
+  OS plus one500GiB `ceph_hdd` data volume, using only the existing owned peer's
+  private SSH/iperf route and SG, with no additional SG/FIP or shared quota/IAM
+  change. New allocation authority is separate from the consumed failed grants.
+  Obsolete extra environment VM `e7df6b32-12a0-4a26-9bae-2a2e4bb5cb4d` was
+  ordinarily deleted through fixed scenario cleanup after complete raw-log
+  recovery; its consumed create stays preserved. The peer remains available.
+- **Implementation and source review:** fixed `environment.py`/installed
+  `benchmark station` creates once, retains/reuses, samples only eligible slots,
+  runs finite resident windows and reads compact status/provider-aware reports.
+  Independent disk/cadence reviews found and fixed repeat inspection labels,
+  premature latest-checkpoint replacement, monotonic next-wake spinning, accepted
+  worker/profile deadlines and lost provider-report routing. Mutation intents,
+  predetermined filesystem UUID, exact data serial/size/attachment/root-device
+  checks and no unknown-filesystem reformat remain strict. Mini changed-node
+  checks351passed/2skipped, canonical Ruff/lane manifest passed; new private wheel/
+  sdist and minimumPython3.11 CLI passed, unpublished. Actual station creation
+  and subsequent sample/CPU results remain pending until their receipts complete.
+- **Retained station actual creation and first cohort:** VM
+  `cef2c1a0-6326-4b5f-bb32-4c62d41bf356`, actual `cpu.4c_8g`4vCPU8192MiB,
+  OS `f4eec036-75ed-49b9-b1f5-e5e27068bc34`20GiB and data
+  `7f36c4f5-5410-47ed-8741-84c924c10330`500GiB, ext4 UUID
+  `e5a1d436-2671-5778-89f5-4b8dab8758c7`, original boot
+  `919d3cac-46be-4ac6-9ce5-6d506a7af8d5`. No replacement VM/volume was created.
+  Installed private-runtime cohort `e1d97f40a06447ecb63decaaa86b8e4e` completed
+  both providers' down/up (one10MiB transfer per direction/provider): Cloudflare
+ 45.2498925/20.2123510MiB/s; OVH1.1813923/2.8970602MiB/s; equal-weight
+  mean23.2156424/11.5547056MiB/s. Internal TCP also succeeded. A second actual
+  `sample` returned the exact same attempt with `cache.reused=true` and no guest
+  probe/network replay, confirming the within-hour fence on the real station.
+- **Disk permission failure is not hidden:** first cohort remains partial because
+  fio's safe component-wise `O_RDONLY|O_DIRECTORY` traversal hit root-owned0711
+  mount permissions before any fio test. Read-only diagnosis observed UID1000,
+  measurement child1000:10000700, exact EACCES at the mount root; this is not a
+  Cinder or storage-performance failure. Guarded installed `repair-access`
+  verified original UUID/serial500GiB/exclusive attachment/root metadata and changed
+  only this mount root0711→0755; metadata0600 and private child0700 stayed intact.
+  Disk-only proof is a separately timestamped checkpoint on that same filesystem,
+  with no repeated Internet/private-TCP probes and no retrospective rewrite of
+  the original partial cohort. Workloads join explicit network and disk references.
+  Parent-reviewed recovery checks418passed/2skipped. Earlier whole-root checkpoint
+ 8118passed/232skipped; supported5-image fingerprint
+  `aea5be87937f2378b971b904b67da425e85b5be3fb13f456d87f23e475fc4573`
+  and private Python3.11 CLI passed before the narrow mount/disk-recovery delta.
+  Corrected immutable resident wheel SHA
+  `2738db472f665cff59aeef1ebff86a744a71f5a73fa69d11cd3bde6f43227e7c`.
+- **Final disk and CPU continuation completed:** final disk-only checkpoint
+  `c6c13491f8bb4a71808926193201fee7` succeeded on the same station/boot/500GiB
+  volume and recovered64complete hashed raw logs. Guest measurement window
+  `1793259650.1369474–1793260107.9150422` is distinct from controller recovery
+  `1793260177.7143629`; delayed recovery does not make old data fresh. The prior
+  disk-driver result/protocol remains separate, never overwritten/relabelled.
+  Installed final private wheel SHA
+  `588059d1d8b8df0ea9d5e3663de0f07155b6cb970a8abeaf98873c79c67e3f0b`
+  then ran fixed Torch CPU scenario successfully: PyTorch2.9.0+cu128, explicit CPU,
+ 256×256float32,5iterations,65,536checked elements per iteration,327,680completed,
+  checksum33,554,432 and0errors. Whole scenario1034.473704s includes creation,
+  setup/image acquisition/guest command/ordinary cleanup; guest command50.698258s
+  and inner compute0.00153399s are separate, not startup/SLA/parity claims.
+  It referenced the unchanged original paired Internet cohort and explicit disk
+  checkpoint, with0per-workload speed probes and the original partial warning.
+- **Final resource and resident checks:** exact SDK GET404 proved workload server
+  `05f6f85e-c4d0-401e-b463-6742e95a5033` and40GiB boot
+  `773a3343-ea39-49f9-bf29-efd7b25a2160`, plus both failed disposable environment
+  targets/boots, were ordinarily removed. Station/data and the owned SSH/iperf
+  peer remain ACTIVE for reuse;4original servers/35volumes are present, borrowed
+  FIP remains unbound, SG quota20 and quotaPUTcount0. A finite installed30s
+  resident window reused the same hourly attempt, emitted heartbeat/state and
+  stopped with retention; independent installed status/report commands ran.
+  `runtime-v3/bin/palimpsest` is an operation-owned launcher, not a global package
+  replacement or production service. No repeating notebook/model polling is
+  needed for future explicitly bounded active measurement windows.
+- **Latest reviewed source/evidence:** focused420passed/2skipped; final whole-root
+ 8187passed/232skipped; supported5-image source fingerprint
+  `aabb1fafbde35d0c6661e0cd0fd0dd8cc73803e00fc97e3bd36c110ba91062d1`;
+  private wheel/sdist and minimumPython3.11 installed CLI passed. Working guard
+  `f5c4523b88ba02f763fe139f877d2f5a425fab47bf0d8e020be789326ea9f18e`,575files
+  was stamped/checked on Mini and actual development bytes/modes matched.
+ 529evidence files were independently hash-verified under notebook short root
+  `/Users/pieroot/.local/share/palimpsest-proofs/retained-station-20261029`, archive
+  SHA `0fe894fe5ed3f4b07acb35ae73ea15e98b88ea26eb4753224947617e7a5c78bb`.
+  Original-password exact-match audit scanned1748owned files/55,733,768bytes and
+  found0matches; no private SSH key was copied. `completion.json` on Mini and
+  notebook records precise data/limits. No commit/push/publication/production
+  rollout, native OCI-root, new GPU/k3s proof or physical-Ceph/SLA guarantee follows
+  from this SDK reference. Astra/gbrain remain unavailable; independent source
+  reviewers were used without treating review as operational authority.
+- **Post-measurement station-wide concurrency correction:** late review correctly
+  identified that independent hourly/disk output locks did not exclude lifecycle
+  cleanup or probes targeting different disk output directories. Added one
+  canonical `station-active-operation.lock` held before output/metadata locks for
+  complete sample/disk/create/repair/cleanup operations. Busy resident sampling
+  returns a future wake time; CLI mutators reject before reading private auth.
+  Threaded cross-output/cross-probe/lifecycle and symlink regressions passed;
+  actual installed cross-process `cleanup` under a held fence exited1 before
+  authentication, with original station metadata byte-identical and zero cloud
+  requests/probes. No retained resource was cleaned up or remeasured for this fix.
+  Updated checks422passed/2skipped, full root8189passed/232skipped, five supported
+  images at source `3c34675a5428c1517cf6b84dce701ea56f2a856f4ef21fe29c2794d725aecb10`;
+  private minimumPython3.11 CLI passed. New immutable wheel SHA
+  `441340d172d2ea4ecacf3f3885260884043a6228c76871f6523095cbf992dcaf`
+  is in `runtime-v4`; stable owned `bin/palimpsest` and the former owned launcher
+  select it without changing global/production packages. Earlier v3 wheel and
+  benchmark source provenance remain intact, not relabelled as v4 proofs.
+  New working guard `cfd26a92faa8fd0cedf0834a235cfbb26dcc132e09385ac1c41d3f1aa9f1fb41`,
+ 575files, passed on Mini and matches actual development bytes/modes. No commit,
+  publication, network sampling, cloud mutation or active unattended producer was
+  introduced. `station-fence-amendment.json` records this distinct safety delta.
+
+
+
+- **Actual named service inspection, not deployment:** `cloud.dmslab.re.kr/`
+  returned200; `palimpsest.dmslab.re.kr/openapi.json` returned200 with unchanged
+  SHA `1426494645f8cba7b6397a2c781e6bd0643584705aee327cb55042965d3038c2`.
+  Its deployed schema lacks `/v1/registry-imports`, `/v1/dockerfile-builds`, and
+  `/v1/instances`; SDK reference timing cannot be relabelled as those API paths.
+  An unauthenticated `/ready` lookup returned404 (not a service outage claim).
+  Initial Apple Python3.9 TLS protocol failure was corrected by using the existing
+  supported SDK interpreter, never disabling certificate verification. No
+  production service/container/worker configuration was changed.
+
+
+- **2026-10-29 verification correction:** the reusable SDK scenario lifecycle is
+  test-passed, not yet live-verified. The separate successful API acceptance uses
+  `ScenarioCloud(observation_only=True)` and therefore does not prove the new
+  adapter's create/cloud-init/console SSH pin/environment/log collection/delete
+  and budget-release path. Offline plans and standalone CPU programs do not
+  close this gap. Owner explicitly selected a fresh independent grant: three
+  cumulative VMs/two live, each2vCPU8192MiB, peer20GiB + environment20GiB +
+  Torch CPU40GiB =80GiB, one new SG and one new FIP bound only to the peer.
+  Original dmslab/SYSTEM actor remains exact; GPU/IAM/production/borrowed-FIP/
+  force-cleanup permissions remain absent. Old4VM/100GiB grant stays consumed.
+  Fixed `environment.py run` and `torch_cpu.py run` with a pinned CPU execution
+  image must finish actual fresh measurement, evidence collection, status/report,
+  ordinary deletion and provider absence before claiming this new live proof.
+- **Fresh SDK attempt and preserved failure:** fixed `peer.py create` produced
+  peer `cf1d3ddd-4107-46cf-8419-a33eddc49ba0`, private192.168.0.233,
+  FIP `08696c78-54fa-4e00-97e6-462b90423ea7`/172.30.104.48 and SG
+  `cbdedfca-6504-4ff1-a60f-39f31959465d`; its process/socket readiness and
+  released executor lock were verified after an SSH transport disconnect, with
+  no create replay. First fixed `environment.py run` created target
+  `f68e3002-d45d-427c-88ff-7ea04255dc26`, original20GiB boot
+  `2f505bf8-b3a7-49e3-b652-7141af5f92d0`, then failed **SSH255 before any
+  measurement**: target known-host seed omitted the peer's console pin. The
+  original message called this cloud-init failure, but read-only diagnosis using
+  both original console pins showed `cloud-init status: done`, errors/recoverable
+  errors empty. Do not attribute this to Nova/cloud-init or report timing data.
+  Fixed scenario `cleanup` then ordinarily deleted this exact target/boot and
+  released its live slot, without refunding its cumulative create.
+- **Explicit extra authority:** owner selected `1대·20GiB 추가`, aggregate limit
+  now4cumulative/2live/100GiB with unchanged oneSG/oneFIP and noGPU/IAM/production
+  authority. Original3/80 ledger/policy stays immutable; a separate1/20 approval
+  executes the extra environment VM only after the failed target's404. Original
+  remaining40GiB allocation remains exclusively for Torch CPU, admitted only
+  after extra environment cleanup/absence. SG port guards retain the peer while
+  either grant has attached target ports. No old N5/native grant was reused.
+- **Independent source review corrections:** cleanup no longer requires local
+  SSH keys/current flavor admission, while original actor/project/receipt checks
+  stay strict. Peer SG cleanup reconciles durable original Nova IDs before port
+  membership checks. A new console pin excludes inherited entries for its alias.
+  Private-stdin auth disables YAML/OS-environment SDK configuration and requires
+  actual session TLS verification before authentication; credential-bearing
+  provider errors are withheld. Executed probe SHA and final source identity
+  must match recorded source, otherwise rows become unqualified. Mini focused
+  regression275passed/2skipped; the optional ambient-SDK isolation test separately
+  passed with the actual installed SDK. These checks are not yet a successful
+  fresh VM environment/performance result.
+
+
+
+- **2026-10-29 owner priority:** fixed, repository-tracked per-scenario programs replace per-turn benchmark drivers. Added `scripts/benchmarks/{environment,torch_cpu,torch_cuda,cuda,tensorflow_cpu,tensorflow_cuda,k3s}.py`, shared `scripts/benchmark_scenario.py`, installed `benchmark scenario` commands and existing resident-queue integration. SDK original-human scope/provider observations remain explicit; API build/consumer effects do not silently become SDK/SSH effects. Every performance run requires fresh VM fio/HTTPS down+up/private TCP both directions. Approval-wide actor/flavor/CPU/RAM/create/live/boot budgets persist before requests; cleanup is forward-only and does not refund cumulative allowance. Complete bounded raw probe logs are recovered/hash-checked before ordinary measurement-VM deletion. GPU/cluster profiles have real programs and fail-closed prerequisites, **not live GPU/cluster verification**.
+- **Independent scenario reviews and corrections:** fixed TensorFlow argv exceeding Hub's4096-byte argument bound with deterministic compressed shared programs and offline argv checks; API iteration vectors are capped64 for the8KiB result channel. Shared CPU threading policy is set before framework import in both lanes. k3s readiness follows completed numerical probe output and empty logs are observed within the existing deadline. The shared Hub client factory rejects non-HTTPS/credentialed/non-origin URLs before requesting a token. Expired queued requests become durable no-effect holds; kernel executor locks permit crash-left running records to be inspected/cleaned without concurrent cancellation. API boot/writable bounds and underscore display-name normalization are checked before baseline allocation. Removed source-text/copy/default pins rather than repinning incidental implementations.
+- **Actual framework functional checks:** generated programs ran on Mini using actual PyTorch2.9.0 and TensorFlow2.20.0, explicit CPU, checksum8192 and256checked elements for each. These are native ARM CPU numerical checks, **not VM/image/GPU or disk/network-qualified benchmark results**. `cpu-program-functional-r7-tool-fixed/` retains output. Earlier smoke failed before execution because `/opt/homebrew/bin/uv` was absent; the existing retained `tools/uv` was selected, without replacing global tools.
+- **Portable and package checks:** latest integrated source at the recorded r8 checkpoint:1092Hub passed/2skipped;7914root unit passed/220skipped;279focused scenario/environment/report/queue passed/1skipped;68Kolla contracts passed. Actual `scenario list` and fixed-script help ran. A private wheel/sdist built and the installed CLI ran on minimumPython3.11; no package/version/tag/publication changed. Source fingerprint for the final responsive-report five-image matrix is `cf746872b09fb20f973080a25b83fce1b04e4d004539d7217f65b5760a978ea8` (API/export amd64+arm64, build-worker amd64); source bytes and actual tool versions were checked in each supported image. These are unpublished candidate images even though the base version string remains0.3.10.
+- **Canonical isolated deployment:** Wireguard `/etc/kolla` used a private exact-two-host inventory/configdir/role overlay, stock toolbox/MariaDB/Valkey, DB-only bootstrap (no Keystone preconditions), API `reconfigure --tag palimpsest`, and byte-identical installed dedicated worker play content **without tags**. Installed/copied worker-play SHA `dd4346c019770d0eb6abba03e88876860ac73a6daa97f83acf9d637aa070e947`. Source-mode image names are local candidate names, not official release identities. New-host apt timers were disabled/masked only after bounded writer settlement and clean dpkg audit. API TLS leaf SANs cover172.30.103.30/192.168.0.248; proof CA SHA `24a6ca999a370f0d5bdce7ab548a1080957948b3d095c494d5b73632b54219ec`. Private TLS key never left Wireguard except its exact API-host installation. Caller bootstrap origin is privateHTTPS192.168.0.248:8443; external client uses verifiedHTTPS172.30.103.30:8443.
+- **Deployment failures retained and fixed:** initial API start rejected a numeric Docker environment value for writable GiB; source and proof override now serialize it with `string`. Actual controller-network auth URL `http://172.30.0.253:5000/v3` was unreachable from the tenant API VM, returning503validator-unavailable; switched only the new API config to the original human-verified public `https://keystone.dmslab.re.kr/v3`, preserving service/reader credentials and no IAM changes. A post-reconfigure listener refusal was startup timing, not suppressed; actual readiness and original-human `/v1/me` subsequently returned200 with exact `pieroot`/SYSTEM IDs. First functional invocation lacked SDK in the root test venv and failed before authentication/effects; the existing Hub SDK-capable venv was selected.
+- **Separately approved new-worker disposition:** API reconfiguration interrupted a claim before any image/recipe jobs existed. New test worker journal `claim_pending`, protocolimage, no job/lease ID, SHA `3616650fae78c3a998e24e25040e3fa942dd80ba8f0480485b43e25b1e7bea78` was preserved. Owner explicitly selected **신규 worker만 안전 해소**. Canonical worker stop, stoppedPID0, empty SQL image/recipe job counts and absent fresh scratch were verified; only this new worker was recreated with `native99fed3_build_worker_scratch_disposition01`. Original volume/journal were not cleared or replayed. The existing production0.3.7 worker quarantine remains untouched.
+- **Fixed real HTTP/SDK acceptance passed:** tracked `scripts/smoke_hub_execution.py`, not the prepared private ad-hoc driver, completed layer upload/query/namePATCH/stale412/exact4096-byte download, real Alpine registry acquisition, safe-symlink multistage Dockerfile COPY/RUN/USER and two sequential API-created consumers. Registry job `cd80ce17-41d6-448c-b1b6-e89d541bc4fb`; Dockerfile job `870dba46-cd86-4831-b0b2-afefbff9f0c5`. Pinned Alpine amd64 child manifest `sha256:c26612752c78b18faacd63c7d50f4592c2e7b0f25e0e20e82bd74e465c57ab0d`; source reference and actual result are retained, not a mutable-tag promise.
+- **Actual consumer results:** first instance `46384101-9da2-48e2-af36-75c6b9f2d4e1`, Nova `da13272a-0a15-40ca-814f-674ac8a02fd2`, boot `803d4535-0693-4f60-99b7-7f543d7bca61`; second instance `28fedd17-106f-4123-828c-f22411befd41`, Nova `52861d94-3ade-44b0-920d-414b5dfbae65`. Both reported actual exit0, UID1000/GID2000-readable copied file and `PRIVATE_DISK_UID_GID_OK` after checking a fresh absent marker and writing it on their independent8GiB disk-backed writable filesystem. Second source_instance_id binds the first, with identical ordered digests and output; no second image build/import. First stop→stopped then delete, second delete, and SDK exact server+original boot-volume absence passed. Mode remains **oci-chroot**, not native OCI-root/PID1 or performance/SLA/GPU qualification.
+- **Budget/remaining cleanup:** four cumulative VM creations and100GiB cumulative boot capacity consumed exactly, never refunded; at most three live. Both consumer VMs/disks proved absent. Owner additionally selected **증거 보관 후 모두 정리**: independently verified original worker-volume files/hash/numeric owner/mode archived to Wireguard/notebook/Mini (`cc4544eb86f7e37c80a390347d19d4b3e92d3427ec014fb88a2e32dbe91b99f1`), then only the new setup VM/boot/FIP/SG resources may be ordinarily deleted. Archive is file-content evidence, not retention of the original block volume/inode. Exact final-image health/cleanup outcomes and working-source guard are appended below when completed.
+- **Artifact/report evidence:** `fixed-native-api-acceptance-success.json`, Mini `fixed-functional-api-run-auth-fixed/`, retained native API SquashFS blobs with reverified SHA256 in `retained-native-api-artifacts/`, canonical Kolla per-step intents/outcomes and preserved failure receipts remain under the evidence roots above. Actual browser desktop/mobile report checks had0JSerrors; a narrow-screen wrapped-column defect was fixed with readable nonwrapping columns and contained horizontal scrolling. No synthetic timing was promoted into a benchmark result. Astra and gbrain remain unavailable; independent source review does not grant publication/resource authority.
+- **Fixed-script import regression found by actual command execution:** running a repository wrapper inside the old release venv initially imported the stale installed `benchmark_cli`, despite current test imports. Both fixed script entrypoints now follow the repository's existing source-pinning convention. Real `environment.py plan` ran with PYTHONPATH removed and produced the same no-effect1VM/20GiB plan as the installed-command source check; a stale-package-shadow subprocess regression prevents recurrence. This is offline planning proof, not a new environment benchmark run.
+- **Final deployed identity and observation, before cleanup:** content-unique source tags `afterglow-local/palimpsest-hub-{api,worker,build-worker}:cf746872b09f` avoided mutable base-HEAD tag ambiguity. Canonical API/export imageIDs `c4fa3946dd1adad0c8ff4991e1b45a7491ea49ee0c450bb3c47607096db95f95` / `80f54fb3c990318d2f4d6c61b43a18f0715c8602a0a109a8d17538478ba1e134`; build-worker `b1da106d24dbb31fc822d667645cf6b7745e89441d1c3e927770c67f9d7b36b1`. Actual three-service image match/running/restart0, APIhealthy/database+Redis+CASready and retained API2complete image jobs/2deleted consumers passed. The installed final native image's scenario CLI listed all7profiles. This is `cf7468…` service/runtime evidence, not a published release. Keep the intermediate mutable-tag mismatch and corrected content-tag receipts; successful Ansible recap alone did not identify running bytes.
+- **Real Linux cleanup invariant:** the permanent acquisition/materialization detached-setsid test body ran in an exact-labelled, network-none, bounded private-cgroup test container on the new native worker. Both stages passed after intentional termination of only the private test executor; cleanup removed its detached child/cgroup. An interactive-stdin launcher first timed out; the exact test container was independently absent, and a file-backed invocation produced both passing receipts. Neither the actual service worker nor any production process was fault-injected.
+- **Final client-only preservation correction:** SDK guest setup must not blindly install `docker.io` over an existing qualified Docker CE/NVIDIA engine. It now preserves an existing Docker binary/configuration, installs an engine only for a missing CPU/reference engine during unmeasured setup, and refuses a missing GPU engine without installation. Focused complete scenario/workflow checks after this last client-only change:176passed/1skipped; the final generated-program/installed-Python3.11 and source-script import checks remain distinct. Its supported five-image build/source-import matrix passed at source fingerprint `67cb6f05cecb061a835636d32526637569fac9cbefb77b72417479e3c7a094a3`; **this final SDK client-only delta was not redeployed after the temporary resources were retired**. Hub routes and the actual image executor/guest runtime were unchanged by it. No new VM or GPU allowance was inferred to repeat qualification.
+- **Final cleanup and preservation audit:** all4new Nova servers, all4original boot volumes, both explicit setup ports, exact new SG and exact new FIP individually returned absence; native helper also recorded empty owned resources/zero uncertain actions. The4preexisting servers and35preexisting volumes remained present; borrowed FIP `3b103b3e-0dd4-48a3-ab5e-01fe534d1685` remained unbound. SG quota remains20, our quotaPUTcount0. Cumulative4creates/100GiB stayed consumed. No force deletion, device/GPU reset, IAM mutation, publication or old campaign replay. Preserved native layer bytes and journal archive remain on the resident controller; retired only this operation's plaintext private config copy, deployment SSH key and API TLS private key after ownership/public-key/certificate matching. Original production credentials/config were not changed; unlinking is not a secure-erasure guarantee.
+- **Retention and final bounds:** actual cleanup receipt `final-exact-native-resource-audit.json`; original-claim archive SHA `cc4544eb86f7e37c80a390347d19d4b3e92d3427ec014fb88a2e32dbe91b99f1`; exact final service observations `final-runtime-qualified.json`; native functional acceptance `fixed-native-api-acceptance-success.json`. The earlier explicitly retained local Mini fixture volumes `api-http-99fed3-{secrets,scratch,data}` remain failure evidence, not live cloud resources or production credentials. Fresh environment/ML/GPU/k3s performance campaigns were **not** run with the exhausted native-functional grant. Scripts and capability checks do not create new execution authority.
+- **Earlier API/scenario checkpoint (superseded for current source):** working guard `8d187f3611e8642f27dd1127d3391924829eb7b21baf818a35c3380c4b2365e0`,564files and its installed Python3.11 CLI checks remain dated evidence. `scenario-delivery-completion.json` describes that checkpoint, not the subsequent live SDK campaign. No commit/push/tag/publication occurred; the immutable published0.3.10 release and original dirty checkout/index remain separate.
+- **Current reviewed SDK/peer source:** working guard `346cf8efd161c26dcfa4974d80074e930d52de469dfb5f8ffc9017800c0d19f2`,567files was stamped/checked on Mini; actual development-worktree bytes and modes matched its complete source manifest. Supported API/export amd64+arm64 and worker amd64 builds passed at source fingerprint `67a6f6d7da31a99b1310adaff4a0072d9cd18944acf76ac687d80a0b5271b6ab`; private wheel/sdist and installed minimumPython3.11 CLI passed, with no publication or production/native-service redeployment. These are distinct hash scopes and are not new Git commits or proof of successful live scenario measurements.
+
+
+## Canonical Wireguard Kolla0.3.10 cutover — 2026-10-28 (controllers verified; build worker remains quarantined)
+
+- **Fresh authority and actual deployment:** owner approved the existing three-controller cutover, paired SQL/CAS backup/isolated restore and offline schema prerequisite, excluding new VM/GPU/IAM changes, worker quarantine release and uncertain recipe replay. Owner then required standard `kolla-ansible reconfigure -i multinode --tag palimpsest` from `wireguardserver`. It ran in `/etc/kolla` with the existing venv on PATH, `LANG=LC_ALL=C.UTF-8`, explicit `--limit dms-controller1,dms-controller2,dms-controller3 --skip-tags haproxy` and command-last typed `kolla_ansible_delegate_facts_hosts: []`, `palimpsest_run_preconditions: false`, `palimpsest_source_mode: false`. Actual return0 in46.279s; recaps controller1=137ok/5changed, controller2/3=127ok/5changed, all unreachable/failed0. No manual Docker service replacement, deploy/upgrade, reader password reset, IAM provisioning or shared loadbalancer reconfigure.
+- **Fresh baseline and cold barrier:** API/export were actually0.3.9 on all three controllers, not the earlier0.3.7 snapshot. The existing0.3.7 build worker was stopped, restart policy `no`, journal `claim_pending` SHA `878378605d8ce777d519b583a3471d50a48d765cecc07a6e5b63080043909347`, no loops. Six controller writers received exact-container SIGTERM and exited0/PID0 without force; fresh all-four-host inspection confirmed the barrier before capture. SQL had15tables/15rows, six terminal builds, no uploads/exports or active leases. Per-controller effective definitions/configuration were encrypted privately before replacement; ordered operator configuration and previous immutable refs are retained.
+- **Paired recovery proof:** encrypted SQL/CAS/config captured at `/var/backups/palimpsest/pre-0.3.10-20261028-6264cd57` during the no-writers interval. CAS44files/884,748,288bytes; all15SQL rows and numeric CAS owners/modes/mtime/content matched isolated restore. Bounded CPU/memory/IO/file-size/systemd envelopes, internal-only temporary MariaDB/tmpfs and exact-owned non-force cleanup were exercised. A second isolated restore ran the official0.3.10 `palimpsest-hub-bootstrap`: exit0, exact unchanged rows/columns/indexes/FKs. The live schema already contained the additions, so **no production DDL was needed or executed**. No offsite recovery or kernel-uninterruptible-I/O deadline guarantee is claimed.
+- **Actual post-cutover verification:** all six controller containers execute Hub0.3.10, revision `c63d9507b774220164babd1bb6e7eb450a693c26`, restart count0; all three direct readiness endpoints and verified-TLS public readiness return200/database+Redis+CAS ok. Startup bounded log checks found0 error markers. All36 existing effective setting hashes match before drain; complete live SQL-row fingerprints and CAS byte/numeric metadata still match the cold capture. Original human external `/v1/me`, `/v1/policy/capabilities`, build inventory each return200; anonymous me/capabilities401, and the new policy route is present in public OpenAPI. Protocol schema `1.0.0` is not the product version. No new build or workload was submitted.
+- **Quarantine and concurrency remain explicit:** the dedicated worker's0.3.10 image was canonically pulled only; the existing stopped0.3.7 container, restart policy and uncertain journal are byte/state-identical. Its standalone reconfigure would start it and is therefore excluded. All731 original unrelated containers retained identity/image/running/start fields; ten new Neutron namespace containers appeared during the window, not attributed to this operation. The actual Kolla task audit has no Neutron tasks and only the three approved recap hosts; do not relabel the whole unrelated inventory unchanged.
+- **Review/failure limits and evidence:** independent schema/lifecycle reviews allowed this cold cutover; Astra was unavailable. A separate P2 source finding remains: policy-path-only warm reconfigure does not include the policy TOML in restart identity, so cached settings may remain stale; this cold image replacement avoids that trigger and applies no source hotpatch. Parser-only Kolla/drain-launcher errors, missing backup parent, successful-capture multi-JSON parsing, unrelated-inventory additions and wrong-loopback probe assumptions remain recorded, not erased as successes. Private receipt `~/.local/share/palimpsest-proofs/k3s-r5-74592e35e9cd-notebook/resume-01/deep-diagnosis-01/mac-mini-cutover-01/release-latest-01/api-verification-resume-20261028T053107Z-0ccd3a/approved-cutover/completion.json`, SHA `fb6772ad934efeca8d728e8b35bb7eb3d9633ebd8798f3df55807edf9134635b`; operator logs `/home/pieroot/.local/share/palimpsest-rollout-0.3.10-c63d9507-20261028-efa4925a`. No tag/publication/source/stamp/index changes. External API build→artifact→consumer/workload remains blocked by separately owned worker disposition/resource authority, not replaced by SDK/SSH research.
+
+
+## Beginner visual source guide — 2026-10-29
+
+- At the owner's request, added [`docs/palimpsest-source-guide.html`](palimpsest-source-guide.html), a self-contained Korean guide to the current working-tree structure, local versus Hub boundaries, immutable layers, conventional versus OCI-root execution, build paths and source entrypoints. It links to the separately generated [`palimpsest-source-map.architecture.html`](diagrams/palimpsest-source-map.architecture.html) and editable JSON. These are source-based illustrations, not evidence of current deployment or successful live execution; they describe dirty `dev` at HEAD `aa397a0fd976e35302974a347748a9773e3084bf` plus the preserved staged/unstaged/untracked source, not the separate release worktree. The generated diagram's fixed viewer controls remain English.
+- Independent read-only source review identified the difference between libvirt cloud-init activation and Lima's post-start copy/mount; the guide was corrected and links both implementations. Independent visual/accessibility review identified insufficient connector/focus contrast; both were corrected. Named Astra/Sol roles were not available; independent reviewer agents performed these bounded checks instead.
+- Verification: actual 1440×900 and 390×844 browser views, additional 320/375/768/1024/1440 CSS-width containment checks, cloud/OCI tab clicks and keyboard navigation, source-link opening, 42 local links/anchors and duplicate-ID check passed; no page script errors. The default desktop first screen contains both overview paths. Archify validation/delivery reported 9/9 checks, zero composition errors/warnings and 19 verified source references; its separate automated browser inspection passed at 1440×900, 1600×1000, 1920×1080 and 2048×1320 with light/dark screenshots. Guide SHA256 `193a78e34e1146c7e2a740631e5a96264394948127cf4d34b327dd7cd428e037`; diagram JSON `d6b3555053b6300e51623a315caf72c7f9dc3a81ee99eb75201126d6f5f3449a`; diagram HTML `0e1db9b5b0d7e3809d18ea878173ab09542e69c06e8800fa1b79cc87dae79d77`. The previous working architecture guard had already reported a stale dirty-source snapshot; it was not rerun or stamped over unrelated work. No cloud resources, deployment, publication, commit or push were performed.
+- Follow-on at the owner's request: the same guide now contains an inline Nova capture-build/Cinder/consumer mount diagram, a separate sequence, and an illustrative command-to-file example. The Cinder ext4 build store is RW, SquashFS parent lowers are RO, capture upper/work is on that build store, and preparing/attaching the consumer's RO store is a separate operational step. The local tmpfs capture and consumer `/opt/layers/merged` path are distinct. No claim is made that this path uses Manila/CephFS or that its underlying Cinder backend or GPU execution was observed. A source reviewer found no material factual issues; a visual reviewer identified low-contrast sequence lifelines, which were darkened and checked at 4.70:1 against white. These were independent reviewer agents, not the named Astra/Sol roles.
+- The earlier **Verification** bullet records the original guide delivery and its original hashes; its browser receipt and screenshots were discarded at that time. The first expanded guide had SHA256 `bcf2ae1ed73875605968bf11d5e0655cfb3fdbda9c6ddca8f1cfc6bd39d9e54c`; after correcting its shared capture-worker label, the guide SHA256 is `b9ab288761e7bcbbc901af02b1526dd9c1b51401646b6c39cb6c0d2eaad38f89`. Current architecture JSON `2b9e996e1cf58dcb008f4ce976d1ae8cd978779e8706cf8d0353f71027c62908` and HTML `699f7501843461230817a539b0c52c86f58d4f2a154befbb227b7ebee9ec6891` include the clarified libvirt-specific cloud-init label. The interactive sequence JSON is `fff7ec2bfde20b98cd6f87a2448d2d5a237093368729d9f54f217a30c80db355` and HTML is `62bfb797cf13a0d916361e2a69a100dbf18d3a813362f95763d40677fb5246de`. Both Archify artifacts passed all 9 delivery checks; the architecture has 19 verified source references.
+- New artifact-bound automated browser receipts and four theme screenshots per artifact are retained privately under `~/.local/share/palimpsest-proofs/source-guide-build-20261029/`: sequence receipt SHA256 `7b98670fe58ccea9c9726bdbc8d33db528fbb5d228ffeeabf3a9df3bb55f2a06`; architecture receipt `03a1c57d6bd555624acc3625d4262ebec923166583b7409ba1dc131dcbe74d92`. Both automated checks passed; their own `visualReview` fields remain pending. The generated sequence was also visually inspected in light/dark screenshots and its theme/zoom controls exercised. Main guide: desktop and 320/390/768/1024/1280/1440 widths checked, keyboard horizontal scrolling on mobile exercised, tab navigation and sequence link worked, 49 local links/anchors and duplicate IDs checked, and no browser errors observed. No build, VM, cloud operation, device mutation, publication, commit or push was performed for this documentation follow-on.
+- README follow-on: added Korean source-derived explanations directly under `Building layers`, including a Mermaid Nova/Cinder mount flow, ordered sequence, command/check fragment, consumer path and the local/Hub/OCI and storage/GPU limitations. Consumer mountpoints/manifest are prepared on the single writer before separate safe unmount and provider RO sealing. Corrected the HTML source-list label to distinguish libvirt cloud-init from the capture worker shared by libvirt, Lima and Nova. README SHA256 is `f18b99ac805430f5b8b335e260d247ad64127be7c85a0f368691f8538d0ff7d6`; the guide's updated hash is in the previous bullet.
+- Verification for this follow-on: inspected the relevant worker, Nova storage/registration and consumer source; rendered the README section locally with marked and Mermaid 12.2.0 in a real browser (both diagrams produced SVG), visually inspected it at 1440 and 390 CSS px, checked the six section links and the JSON fragment, and saw no preview or guide page errors. The 390 px preview had no page-level horizontal overflow after splitting a long path; actual GitHub rendering was not exercised. No build, cloud/resource mutation, deployment, commit or push was performed. The existing stale architecture guard result remains unchanged and was not restamped; Astra/Sol roles remain unavailable.
+
+
+## Ordinary OpenStack VM request-to-SSH measurement — 2026-10-29
+
+- The owner requested one ordinary VM, selected exact-owned cleanup, and specified **4 vCPU / 8 GiB / 500 GiB**. On the original `dmslab/SYSTEM` project, one `cpu.4c_8g` guest used the existing Ubuntu 24.04 cloud image and a **500 GiB `ceph_hdd` boot volume**; no additional data disk, Palimpsest layer, application package or workload was installed. Cloud-init provided only the SSH public key and the serial host-key marker. This is a pre-existing cloud image, not an empty filesystem.
+- At **2026-10-29 07:17:11.983884 UTC** the notebook controller recorded the create intent immediately before its Nova request. The same monotonic clock observed Nova **ACTIVE after 23.727 s**, the console-pinned host key after **130.160 s**, and the first authenticated SSH probe returning the expected marker after **144.149 s**. SSH used the existing Mini and peer as its transport, with strict Ed25519 host-key pinning. The wall/monotonic elapsed-time difference was 0.000223 s.
+- This is **one observed successful probe**, not an exact first-possible-SSH time: probing began only after the guest published its host key and the successful probe included the multi-hop connection. No variance, SLA, disk throughput, Internet speed or product-API acceptance is implied. The500 GiB boot disk is distinct from the retained500 GiB measurement-station data disk.
+- The requested ordinary cleanup deleted only the newly created server `52d94b80-5370-4e18-b593-b7134d936f4d` and its original boot volume `8844773b-fdc1-45d1-9356-f8cb0e4b576b`; their absence and the owned port's absence were verified. The existing peer remained ACTIVE. No force, other resource deletion, extra Internet probe or source mutation occurred. Private evidence: `~/.local/share/palimpsest-proofs/plain-vm-ssh-9d93e3cb18f7/` (`result.json` SHA256 `165a364b8331c3ce166b64aa841555f4154fad8baa623054388171e95b02daa3`; its cleanup-pending field is the original pre-cleanup snapshot; `cleanup-result.json` SHA256 `64ae421c3abf5358b96865b534aaced1aa66461c7784c3ee2660689e02ee7b59` records the completed cleanup). Controller source SHA256 `ba7963fa4370829f85035505105e030ac5351e1006f2b73627ff235d791f7a8e`; checkout HEAD `aa397a0fd976e35302974a347748a9773e3084bf`. No repeat or new VM is authorized by this result.
+- The first read-only preflight stopped before mutation because it checked the SDK image's absent `os_hash_value` attribute; the corrected `hash_value` matched the pinned SHA-512, original user/project, flavor, network, peer and quota. After the documentation update, `python3 scripts/check_architecture.py` reported the existing dirty checkout's source snapshot stale. No architecture marker was stamped over unrelated unreviewed source. Astra/Sol role availability and independent review were not established for this measurement.
+- The owner-requested Notion publication was appended without changing historical tables or embedded reports: [실험 한 장 보고서 — 일반 VM 생성부터 SSH 접속 확인](https://app.notion.com/p/403067c015d0816ebcb9c2e5fd58eaec). The saved page was fetched again and its three observed times, 4-vCPU/8-GiB/500-GiB boot-disk scope, SSH-observation caveat, cleanup and both evidence hashes were confirmed. Private readback receipt `notion-publication.json` SHA256 `2d4ba3031b14698a150b2253b3fa75e5979fc819a12ab224b249b19c16c3ec72`; no new VM or benchmark was run for publication.
+- **8-vCPU/32-GiB comparison:** the owner requested the same ordinary VM measurement with `cpu.8c_32g`, 32 GiB RAM, and the same **500 GiB `ceph_hdd` boot disk**, Ubuntu image, network and Mini/peer SSH path. One VM was requested at **2026-10-29 07:31:09.591257 UTC**; the same notebook monotonic clock observed Nova ACTIVE at **24.180 s**, the console host key at **161.797 s** and successful pinned SSH at **180.030 s**. Wall/monotonic elapsed difference was 0.000848 s. No extra data disk, GPU, Palimpsest layer, application package or workload was added. This n1 observation does not prove earliest possible SSH availability, variance, an SLA or that larger CPU/RAM caused the difference from the earlier n1 4-vCPU result.
+- Same exact-owned ordinary cleanup removed only server `ec2c1188-e092-43f0-8996-966d8d449225` and original boot volume `c224a40b-4582-4819-ba99-48daa08eb96e`; server, volume and port absence were verified and the existing peer remained ACTIVE. Private evidence is `~/.local/share/palimpsest-proofs/plain-vm-ssh-64b6784cbf24/`: `result.json` SHA256 `804c199508b0919273bbc2ed106daaf6f115a9e89a9549661a11213cd313aca8` is the immutable pre-cleanup snapshot; `cleanup-result.json` SHA256 `4192a6c07cecc7b7ff01289f03c1e98bc76ea6b5ba4cb9bc7c06e9fd05967edd` confirms cleanup. Controller source hash and exact image match the earlier measurement; no repeated network or disk throughput benchmark was run.
+- The 8-vCPU result was added as a distinct n1 section to the same [Notion one-page report](https://app.notion.com/p/403067c015d0816ebcb9c2e5fd58eaec), retaining the earlier 4-vCPU result. Saved-page readback confirmed all three timings, resource scope, limitation, cleanup and evidence hashes; private `notion-publication.json` SHA256 `6ae8204fa87b7ab880bb5a636acbc6222cead510056abbeaeebce99e54657cd3`. The working architecture guard again reported the dirty checkout's source snapshot stale; no unrelated source was stamped.
+
+
+**2026-10-25 final native catalog/unpack qualification (supersedes unexecuted slice below):** Dirty dev remains based on `aa397a0fd976e35302974a347748a9773e3084bf`; shared staged/unstaged work and review marker preserved. Complete native Hub710passed/2skip and focused CLI54passed. Original root core2046passed/2skip/27failed solely missing ansible-playbook; existing real root Ansible Core2.19.14/Python3.11.15/Jinja3.1.6 completes only those27cases:27passed18.30s. Combined2073passed/2skip is two-run qualification, not a new green full run. Earlier wrong Hub environment/Jinja2 failure remains non-evidence. Actual source CLI unpack and runtime resolver locate one qcow2x86_64base+two dependency layers automatically using synthetic bytes, not a real guest. New unpack is source-only, not published0.3.5, and new catalog routes require matching reviewed Hub rollout. No deploy/publication/commit/schema/IAM changes. [Exact evidence/boundaries](testing.md#native-dashboard-catalog-and-bundle-unpack-2026-10-25-source-qualified-not-deployed); archived native change verification records scoped final guards without stamping unrelated shared changes.
+
+Final restored-source follow-through: catalog22passed after catalog-only formatting; unrelated CLI/Nova and lane formatting restored exactly from original captured diagnostics (snapshot tags1F82/1D64), no HEAD/reset. Final CLI contract/reference/lane/unpack342passed22.58s; actual help/reference/lane and9owned-file style checks pass. Final17file alternate-index digest `bc918dbd56e96a552458345d7f6c2c9a4852bb94213bcf3d17846f5d78c32431` supersedes formatted-byte76b30155digest; inherited507file marker excluded. Shared index/marker unchanged. Original Ansible failures were root .venv/bin not on PATH, not missing installation.
+
+
+
+**Historical implementation-slice checkpoint, superseded by final qualification above:** Native catalog added visible named bundles and fresh-human-system global inventory/detail, SQL-only output-linked provenance and escaped cursor-bound package search. At implementation handoff, router/SQL/loopback fixtures were test-defined but unexecuted and stamping deferred. Those are historical boundaries, not a statement that final checks remain pending. Final evidence and remaining rollout/runtime boundaries now reside in `openspec/changes/archive/2026-10-25-add-dashboard-asset-catalog/verification.md`; shared index/review marker remained untouched throughout.
+
+**2026-10-21 local service-policy cutover:** Palimpsest now uses real registered oslo.policy actions after fresh native global bindings/membership. Grade-only roles need no service implication edges or baseline co-role; original-token/current-owner and issued-key ceilings share operator YAML. Final local proof passed **650 Hub tests + 2 opt-in skips**, **41 Kolla contracts**, **2 separate native MariaDB/process cases**, **49 standalone fresh-human-system HTTP statuses** and **185 Docker HTTP checks on each architecture**. Four canonical API/worker targets were built and nonroot-probed. [Exact evidence, image IDs, failures corrected and limitations](testing.md#service-local-hub-policy-verification--2026-10-21) distinguish synthetic Keystone/guest boundaries from real MariaDB/Redis/HTTP/container effects. No existing service/config/data, production IAM, Git index or publication barrier was changed by this verification.
+
+**Policy config/security boundary:** native Kolla API/worker explicitly select `/etc/palimpsest/palimpsest.conf` from their read-only policy directory; `policy.conf.j2` renders that nonsecret TOML root:root0644. Original `/app/palimpsest.conf` remains root:root0640. Actual image UID:GID1000:1000 could not read it, while TOML/YAML/policy.d enforcement worked on both architectures without user/group overrides. Casefold uniqueness validates trusted binding keys without rewriting actual roles. Native parser error/exception reports are observed only for the loading thread and the original logger is restored in `finally`; malformed Boolean expressions return503 and repaired files recover. API/system/key/project ceilings remain mandatory under `@`. Proof root is `/Users/pieroot/.local/share/afterglow-proofs/service-policy-20261020-palimpsest-019qotth`; only task-owned disposable DB/permission resources were removed, while the driver's evidence SQL/CAS volumes were retained.
+
+**2026-10-21 personal project policy extension (test-defined; unexecuted):** Native Hub derives project-only personal authority from fresh exact project owner extras, enabled native `Personal` domain/user/home/project and complete direct-member raw/effective provenance. Project package/cache/own-key defaults accept the internal boolean through existing oslo.policy; ordinary members do not qualify. Exact-project package metadata deletion also admits fresh personal human owners, with original-token/owner/provenance/policy revalidation before mutation and before commit; no shared CAS unlink, fabricated admin context, ordinary-member/service-admin/key deletion or general human-write bypass. Original human restrictions, operator deny, key/package/action ceilings and owner/publication revalidation remain. Shared artifact deletion/GC, public layer publication, builds and system management stay system-only. New deletion tests preserve another package's readable references and CAS bytes and fence owner/token/provenance/policy revocation with rollback. This extension has not run tests/build/lint, architecture stamping or deployment; prior policy-cutover counts above do not qualify it.
+
+**Current local checkpoint (2026-10-02):** The basic checkout prepares unpublished root `palimpsest-client 0.3.0` and independent Hub `0.3.0` package-registry candidates; the Kolla image-tag candidate is also `0.3.0` and its source default is the reviewed immutable candidate SHA. The last published root version is `0.2.3`. The final candidate integration checkpoint below records fresh gates and publication barriers. Earlier dated versions, native proofs and publication entries remain historical, not authorization or verification of this candidate.
+
+**2026-10-06 local Hub endpoint wiring:** The `dev` working tree now derives the
+public HAProxy hostname from `palimpsest_public_endpoint_url`, retaining opt-in
+exposure and HTTPS-origin consistency checks. Corresponding Afterglow Kolla
+changes project the explicit URL into both generated services TOML layers while
+preserving detailed TOML when unset. Real Ansible exercised 11 configuration and
+rejection cases; stock Kolla template/map output ran in actual amd64/arm64
+HAProxy 3.2.25 containers with certificate-verified HTTPS routing to a synthetic
+HTTP upstream (200; unrelated hostname 404). No Hub API/image/schema, production
+configuration, persistent volume, native/cloud proof, commit or publication was
+changed. The older Hub's missing package API is a separate deployment prerequisite.
+
+
+**2026-09-19 기록 안내:** 아래 `현재 스냅샷`과 frontmatter의
+2026-09-14 값은 당시 기록이다. 당시 작업트리의 source 상태와 승인 대기는
+[Hub web API build checkpoint](#hub-web-api-build-2026-09-19) 및 그때의 Git 상태를
+우선했다. 당시 snapshot을 지금의 서버 실행 상태로 읽지 않는다.
+
+
+
 ## Latest-source formal release0.3.10 — 2026-10-28 (published; operator selection updated, no service rollout)
 
 ### Completion — 2026-10-27 20:02UTC
@@ -4784,4 +5621,84 @@ Exact selectors and caveats: [testing](testing.md#host-vm-removal-across-state-r
 - **Integration gaps, not an instruction to add a second orchestrator:** inspected HubClient/CLI does not submit/poll Hub build jobs automatically; direct `cloud_cli` SDK/SSH paths remain different workflows. New experimental Nova/OCI modules are not automatically server APIs or deployed images. Afterglow catalog admission snapshots managed published artifacts and explicitly selects `transport="nfs"` at creation/execution; separate Cinder block code is not evidence this route consumes block layers. A Hub output digest/catalog asset does not itself establish a published managed environment or live artifact-to-consumer bridge. Required result is a connected API-owned build/artifact/consume/workload/lifecycle contract, with sanitized job diagnostics rather than assistant node access.
 - **Executed source audits on the Mini, not live API proofs:** `M/api-first-architecture-review-01/route-inventory.json` SHA256 `cce6a8e6cb0ec1fa3bcb473a258cbebf6f03d2f1bf1f3461cf0458c1cc0beeac` verified15 source files and mounted Hub decorators:54 route declarations in each selected generation, worker routes0(old)/5(release), runtime routes0 in those Hub routers. `consumer-route-inventory.json` SHA256 `6ec228acbebe390090fc77a68c305832cefec31abc698b9ca9f2c5c278354b70` verified five Afterglow files, actual mounted prefixes and NFS literals. These are bounded offline AST inventories, not FastAPI runtime, test-suite, dependency readiness or current API availability. No production auth/API call, infrastructure-node connection, service change, deployment, new resource or failed-job replay occurred.
 - **Corrected continuation:** use the reviewed service-release baseline; map unpublished feature deltas into existing API admission/durable job and resource ownership/worker/result contracts; deploy reviewed API and worker images through actual Kolla entrypoints; then use the Mini as an external original-user/project API client to prove build ID → exact output digest → supported consumer binding → workload readiness/output → API lifecycle/cleanup. A new research reference VM or direct-node route is not the next prerequisite. Existing n5 accounting/receipts remain immutable and separate. Final review receipt `M/api-first-architecture-review-01/architecture-reassessment.json` SHA256 `0640dbf51e306909201d46174315ae4b3c8dcfa4998e1cb09f70342a7eb4aa9c`. README, architecture overview, contributor workflow and benchmark scope now carry this boundary. This is a source/evidence reassessment, not new feature implementation, release, architecture stamp or deployment authorization.
+
+## Durable worker claim recovery and API cuDNN acceptance repair — 2026-10-30
+
+- Owner explicitly requested iterative repair of the actual Palimpsest services until the official API acquires a CUDA image and an OpenStack GPU consumer proves `nvidia-smi` plus actual cuDNN computation. This supersedes waiting for a journal-only option selection; unrelated cloud resources, IAM, broker and GPU-host mutations remain out of scope. Astra was unavailable; development and an independent source review were performed without claiming Astra approval.
+- Production correction: six controller services were actually updated to `57ab180` via canonical Kolla and verified; the new build worker `840b6043…` subsequently halted with a preserved recipe `claim_pending` journal. The earlier assertion that no claim reached the API was incorrect: a bounded log sample missed 44 HTTP204 image/recipe claims. The final API recipe response took12.9265s; its inferred start precedes the worker halt by approximately10s, matching the socket timeout. Exact request attribution and the underlying latency cause remain inference, not captured exception evidence.
+- The initial nonterminal/unexpired-lease census proved only no currently active attempt. A stronger whole-row comparison against the cold baseline found18of19tables identical, including all six build rows and empty image-job/context tables; only two claim-mutex rows differed. The non-mutex project lease matched exactly. This is observed data stability, not a global SQL fence or a license to erase an uncertain journal.
+- Actual new retirement: encrypted/decrypt-verified current configuration, container inspection, bounded logs and all three legacy journals; disabled restart and ordinarily stopped exactly `840b6043…` using Docker29.1.3 `stop --timeout=-1` (no SIGKILL deadline). Result PID0/not-running/exit1; no clean-exit claim. All journals remained byte-identical. Created only an empty root-owned0700 `claim-cursor-20261030-02` subdirectory in the same Docker volume; no new Cinder/Docker volume or journal deletion. Evidence: private `repair-current-worker-retired-and-fresh-root.json` under the existing GPU campaign proof root.
+- Source fix: durable worker channel/sequence in the existing journal with an idle checkpoint; additive `palimpsest_worker_claims` cursor per channel/protocol under the original selection SQL mutex. Authenticated GET recovery is explicitly a mutating settlement: it fences unseen delayed POSTs or returns exact assigned identity. No blind claim POST retry; recovered jobs retain exact-lease fail/status and no-reexecution semantics. Legacy unidentified pending journals remain fail-closed. The10-second socket timeout is unchanged; an earlier30-second handoff claim was superseded.
+- Parent verification: affected seven Hub modules251passed/2skipped; complete Hub suite1266passed/7skipped in309.30s on Python3.13.12; full Hub Ruff and67-file formatting check passed. Standalone real loopback HTTP smoke exercised unseen-request fencing, deliberately lost POST response settlement, stale409 and bounded single cursor with zero cloud requests. Independent `ReviewClaimSafety` read the complete changed source and found no concrete blocker; real database commit-loss and production qualification were not exercised by that review. Client canonical build/install/tool smoke passed on Python3.11.15; Hub wheel/sdist build passed. Local artifacts retain version0.3.10 but are private candidate bytes, not official PyPI0.3.10.
+- CUDA acceptance preparation: pinned CUDA12.2.2/cuDNN8 runtime and GCC11 compiler, server-side multistage Dockerfile plus native C probe. Planned proof calls actual `cudnnConvolutionForward`, synchronizes CUDA, copies nine distinct outputs back and checks checksum5724/max error0 and the CUDA/NVIDIA PCI identity. Source review and C syntax check are not GPU proof. Independent runner review fixed an exact-owned NovaERROR/no-boot cleanup gap. Actual resident CLI smoke exposed a missing `resident_driver` import; exact fixed-path loading corrected it and `--help` returned0. No CUDA image job or GPU consumer has run at this checkpoint.
+- Read-only deployment inspection found API output bounds100GiB on all three controllers versus worker4GiB, which rejects image claims before execution. Planned repair preserves the global API contract, matches worker logical maximum100GiB and bounds each image operation by24GiB physical scratch (6GiB packed output/18GiB ext4) on the existing root with approximately31.7GB free. Actual image fit/compression deadlines remain unproven; this is not a whole-worker/recipe quota. The previously requested80GiB Cinder credential is absent but is not a prerequisite for this selected bounded path.
+- Next: publish reviewed branch-only repair artifacts, explicit additive-schema bootstrap after a new paired SQL/CAS backup and isolated official-bootstrap proof, canonical controller then worker rollout, actual identity/settings/data preservation and advancing idle cursors. Then run one official-API CUDA/cuDNN GPU acceptance on the resident Mini, preserving cumulative campaign spend and exact API cleanup. No protected merge, formal release, production DDL/new repaired deployment or GPU/cuDNN success is claimed by this checkpoint.
+
+### Actual claim-cursor deployment and subsequent image socket blocker
+
+- Candidate `ed540b46984b12d827564fdee9736dccae743791`, source008d0a64…/582files, was pushed on the existing feature branch. Hosted Test41061037388, PR image41061037375 and explicit SHA publisher41061076108 passed; native KVM remained policy-skipped. No protected merge or formal release occurred.
+- Actual new paired encrypted SQL/CAS capture and isolated restore preserved all19existing tables and884748288CASbytes/metadata; the official repaired bootstrap added only an empty `palimpsest_worker_claims` table in isolation, then canonical production bootstrap did the same. Canonical controller and worker reconfigure completed; all seven native services were verified, original-human `/v1/me`200 with build permission passed, and the new worker0069fefc… retained one PID/restart0 while both protocol cursors advanced with a durable idle checkpoint. Three legacy journals stayed byte-identical. Canonical recreation removed retired container840b…; its encrypted inspection/config and old image remain, not the old container itself. Actual receipts: private `repair-rollout-completion.json`, `repair-gpu-ready-runtime-facts.json`, `repair-worker-channel-qualified.json`, `repair-worker-final-disposition.json`.
+- Capacity was checked **after** pulling the new worker image. It failed the31,146,901,504B admission gate; only exact unreferenced superseded1afca684 image3aa3265c… was ordinarily removed after archived inspection and no-container ownership proof. No force/prune/volume deletion. Actual free31,664,521,216B later passed; the formal0.3.10, retired57ab180 and newed540 images were retained. No80GiB Cinder attachment or credential fallback.
+- Preserved operational failures: initial controller stop failed before inner intent on Docker Mounts list ordering; full dictionaries were normalized by Destination without dropping fields, no-call proof preceded distinct continuation. Capture certification stale-fence attempts wrote no final receipt and did not repeat capture; fresh observations combined in one SSH process completed certification. Initial production bootstrap failed changed0 before Docker/DDL because the bootstrap-only play lacked network facts; all19tables/no-container evidence preceded separately reviewed `gather_facts:true` continuation. One0600operator validation JSON briefly contained resolved DB/Redis URLs; it was removed, a bounded in-memory-secret scan of23new validation artifacts found no remaining match, and only sanitized hashes/endpoint metadata were retained. This incident is not a claim that credentials were never persisted; no values were printed or copied to this handoff.
+- Actual external API CUDA attempts9223d29c… andbb31fa12… both became `build_failed` before any consumer/reservation/GPU VM. The second used distinct request/job identities and `COPY --link`; it was not a replay or demonstrated fix. Original errors and three spent qualification rows remain unchanged. No nvidia-smi or cuDNN workload success exists at this checkpoint.
+- A deterministic image-path blocker was then reproduced using the installed native BuildKit binary in private mount/network namespaces: the production-length generated socket is120bytes and is refused; the29-byte private `/run/palimpsest-buildkit.sock` reached actual Linux-amd64 worker RPC readiness with zero registry/workload requests. An initial smoke harness used unsupported worker network mode `none`; changing only that isolated harness to supported `host` inside its private network namespace established the result. Production network policy was not relaxed. Evidence: `buildkit-socket-native-smoke-supported-network.json`.
+- Source repair uses that private short socket and retains bounded final executor/BuildKit tails only after exact cleanup, outside disposable mounted scratch and then as one266240B private last-failure artifact. Public failure bodies remain fixed codes. Independent `ReviewImageRepair` found no concrete blocker; final affected tests231passed/3skipped in1.57s and owned Ruff/format passed. Initial fixture failures (reused consumed response objects; a marker containing its own forbidden prefix) were corrected without production workarounds. Arbitrary-SIGKILL stderr durability is not claimed. Next cutover is **worker-only**, explicitly retaining ed540 controllers and the existing identified channel/journal; no further schema change is required.
+
+### Snapshotter follow-through and ordered five-success comparisons — 2026-10-31
+
+- Worker-only82dc8fb cutover actually completed on native image023588ef… with the same channel/root/inode, advancing idle cursors and preserved historical journals; the six controller services remain explicitlyed540. After this repair the third real CUDA image attemptaa2edf91… progressed through BuildKit rather than the long-socket refusal, but ended `worker_interrupted` at its3600-second deadline. Worker restarted once and reconciled its exact recorded lease without replay. No complete image, GPU consumer or GPU reservation resulted. Retained private tails show one compiler layer downloaded in8.5s but extracted in2832.8s; exact native-copy volume and the underlying per-file I/O cause were not measured. Post-restart pressure readings are contextual endpoints, not failed-build benchmarks.
+- The source now requires overlayfs on quota-bound ext4 after actual copy-up/whiteout/lower-preservation checks, with no native fallback or deadline increase. Failed mount/unmount return code and bounded stderr enter the existing retained diagnostic slot; successful probes leave daemon logging untouched. Focused final preformat run69passed/3skipped; lint passed and two owned files were formatted. Independent `ReviewOverlayRepair` found no remaining concrete blocker. Actual privileged kernel/loop smoke and registry-backed BuildKit timing remain separate pending proofs.
+- Old12-hour grantgpu-k3s-resume-20261030-01 expired unchanged at2026-10-30T16:16:38.775Z. The owner separately selected continued functional GPU verification: new12-hour grantgpu-cudnn-functional-renewal-20261030-02 permits at most3newGPUcreates,1live, each8vCPU/16GiB/80GiBboot,240GiBcumulative, originalproject/user/Ada profile, evidence followed by API cleanup. Old ledgers, three spent qualification rows and all failed jobs remain immutable. New functional accounting is isolated; no implicit refund or extension.
+- Latest owner instruction adds a strictly subsequent benchmark phase: **only after all functional acceptance passes**, compare CUDA/PyTorch/TensorFlow/k3s until each has5successful repetitions; retain previous cold/warm semantics, failures and exact resource cleanup. GPU occupancy remains bounded to1 with deletion/provider-release verification before recycling; CPU may use at most5concurrent instances when actual capacity permits. Network and disk analysis are required. Keep the retained station's two-provider30–60minute sampling cadence rather than per-run Internet bursts, and separate station context from actual workload disk/I/O/latency. Benchmark execution and successful GPU/cuDNN acceptance remain zero at this checkpoint; no synthetic timing, completed repetitions or expanded old-grant spending is claimed.
+
+### Actual overlay build and authoritative publication repair
+
+- Candidate90508622…/source1ba05d65… passed hosted Test41095851165, PR image41095851241 and publisher41095869697. Private kernel smoke verified32MiB lower data unchanged across two overlay layers, each upper4096B; native candidate BuildKit actually reported overlayfs on a155-byte production-length root with a29-byte private socket and exported an offline COPY image. Canonical worker-only cutover then deployed nativeef554818…/container0c3c5a17…, same identified channel/root and retained failure artifact; six controller services remaineded540. No schema change.
+- Actual public API pinned-Alpine job8b540bf1… completed registry-backed RUN arithmetic; its public digest-verified layera63439ec… was independently inspected with unsquashfs and contained `/answer` equal to437. This is a real API build result, not GPU/cuDNN acceptance. No VM was created by this proof.
+- Renewed functional casecudnn-functional-02-a1/job115ac2ed… actually compiled/exported/materialized11CUDA layers totaling2067193856B and completed exact executor cleanup. It then remained in identified `output_pending` sequence3807; no resource/helper ledgers or active executor remained. SQL and API logs established six committed stages totaling1360572416B, including one1268977664B layer with successful HTTP200 after29.2082s. Worker halt preceded that commit by11.57s; the ten-second client response timeout is strong timing/source inference, not a retained original exception. The next69632B layer and complete request were never sent. Public status GET had a transient HubError and the client exited; safe bounded accepted-ID read retry was subsequently independently reviewed/tested, with no POST/PUT/DELETE retry widening.
+- Worker crash-loop was ordinarily halted after exact encrypted/decrypt-verified inspection/config/journal/result/resource preservation under output-pending incident05. PID0/restart-no/exit1 is not a clean-exit claim. The6GiB packed output and18GiB backing remain in place with explicit metadata-only preservation, not full payload hash proof. Three historical journals and the older diagnostic remained exact. No journal clearing, pack deletion, upload replay, GPU consumer or reservation occurred. New functional ledger remains empty; old spent rows remain unchanged.
+- Source repair adds private descriptor-bound publication intent and authoritative staged digest/size/deadline receipts under the same per-job output lock, using existing result_json and hiding pending results publicly. Recovery rehashes retained spans and skips committed stages; only exact idempotent missing outputs and bound completion can proceed, never a rebuilt job or renewed lease. Bulk response wait uses the original absolute deadline. APIs must precede worker. Independent ReviewImageRepair found no concrete blocker; focused220passed and full Hub1287passed/7skipped in309.36s, full Hub lint/67-file formatting passed. Actual verified-TLS loopback PUT received an11-second delayed response within its unchanged18-second deadline. Coordinated no-DDL rollout and actual GPU/cuDNN proof remain pending; all benchmark success counts remain zero.
+
+### Uniform publication rollout and a2 diagnostic follow-through — 2026-10-31
+
+- Publication code was committed asc60afe1; hosted macOS size-descendant test failed because the fixture wrote an oversize archive before spawning/recording its child. Test-only3721456 reordered readiness before the intended error; both local real-child cases passed. Hosted Test41109754301, PR images41109754443 and publisher41109774361 then all passed; no native KVM qualification was claimed.
+- Actual restore-capacity gate held the original5GiBtmpfs plan: controller1MemAvailable7564951552B was below8589934592B. A separately reviewed disk-backed variant preserved the old plan/evidence, preallocated a4GiBext4 quota in a private namespace, and passed actualO_TMPFILE/linkat/LOOP_CONFIGURE/mount/free-space/normal-cleanup prerequisites. Its paired SQL/CAS capture and isolated official bootstrap preserved all20tables, populated claim rows, expired pending attempt and2249234432CASbytes plus specified metadata; official bootstrap was a strict no-op. No production bootstrap/DDL occurred. Six controllers then worker were canonically updated to uniform3721456, native image refs8044ff63…/a3e62914…/373c5d37…. Public original-human `/v1/me`200/build permission and all7runtime/settings/data gates passed. Worker normally settled expired115ac2ed as error/worker_interrupted and disposed its own retained24GiB files; no manual reset, lease extension or build replay. Same claim channel/root and historical journals survived.
+- Renewed functional casea2/jobef81e7f8… started2026-10-30T19:50:54UTC and failedbuild_failed at20:18:01UTC, before any consumer or reservation. Actual BuildKit OCI export completed around20:00; retained executor tail still contained only genericException/noerrno. The materialization cause is **unknown**. Later worker inspection found uniform372 healthy, samePID1375242/restart0 and about31.65GBfree. Lost watcher/kernel state was recovered read-only from durable resident results; no operation was resubmitted. No nvidia-smi/cuDNN acceptance or benchmark repetition is implied.
+- Diagnostic source now propagates allowlisted structured child failure codes and I/O errno through response wirev4, separately retaining an actually observed operation phase. An intake error during tar emission must report packing; packed-stream failure during publication reports derived store, not a phase inferred from exception type. Messages/paths/locals/rawstderr remain excluded. Initial real-boundary test spoofed globalsys.platform=linux on Darwin, reaching syscall437/openat2 and terminating pytest withSIGSYS; the test now changes only the packer module's platform guard before the intentional emission failure. That isolated regression passed; no production platform guard was weakened. Full final checks/review and actual new-child candidate smoke are required before the next attempt. Old/new grant ledgers and all failed cases remain preserved; functional GPU and all four benchmark success counts remain zero.
+
+### Observed packer timeout and fixed service-image profile — 2026-10-31
+
+- Diagnosticd51e71394c2824a5c6a3c69341346f4e7c99e0a9/sourcea940c8e1… passed all hosted gates41159561232/41159561267/41159578355. Actual native191payload and parent→exec-child→mksquashfs success/corrupt-tar typed-failure probes passed; canonical worker-only cutover preserved the existing channel/root/journals/failure artifact and left six controllers372. New worker1275ee36…/index0f22dcb6… remainedPID1388800/restart0 and advanced both cursors. Temporary-candidate-only escalation authority never applied to production; actual cleanup/manifests—not earlier IRC hashes—are operative evidence.
+- Fresh public-API casea3/jobfea4063a… failed at2026-10-31T03:29:24UTC before any consumer/reservation. The retained executor now reports **stage=squashfs_packing, category=OCIHardWorkerError, code=oci-packer-timeout, errno=null**. This proves rejection by the120-second packer policy for this attempt; no ENOSPC/network or historical a2 cause is inferred. Worker stayed healthy/restart0 and normally disposed the failed attempt. Native GPU and benchmark successes remain0.
+- Source repair introduces a fixed named service-image900-second policy, selected only by the image service through LayerCache/materializer/requestv3/child. Canonical default120 policy/keys stay unchanged; the service fingerprint is stable rather than based on per-attempt remaining time. Parent/child require exact profile/key agreement; unknown profile, arbitrary timeout fields and requestv2 are rejected. The enclosing original3600-second job deadline and earlier remaining-time/CPU fence still apply; no failed job or lease is renewed. Independent ReviewServicePackAuthority found no blocker. Focused652passed/6skipped, lint passed and three owned files were formatted; a fixture's incorrect compressor header was fixed to zstdID6 without weakening production validation. Actual published native profile/default-key separation and large API acceptance remain required before claiming success.
+- Fixed-profile7c4bb06222760c2ebbfcf8658ebc67956b05d4f8/sourcec12dd31f… passed Test41165520445, PRimages41165520343 and publisher41165541655. Canonical operation09 installed only worker indexc0068eb6…: native191payload, actual parent→exec child→mksquashfs named900/default120 distinct keys/same4096B artifact and typed-corrupt-input probe passed; exact temporary resources cleaned. Six controllers372 stayed byte/identity-exact; same worker channel/rootinode811391 and retained a3diagnostic remained. Ordinary non-escalating old-worker stop, encrypted/decrypt-verified journals/config, current e0865a31…/PID1401153/restart0, two advancing cursors/nulls and all7ready were actually observed at08:43UTC. After pull, only freshly proved unreferenced retired373c image was ordinarily removed without force/prune; current/rollback0f22 retained. Free31,651,487,744B exceeded the unchanged31,146,901,504B admission gate. Operator distribution remainsed540 with30identical packaged role bytes; not falsely installed7c4.
+- Owner selected the same cumulative3GPU/one-live/240GiB cap with a new12-hour window through2026-10-31T20:33:38.487566UTC. Original02grant/ledger/root were not edited: old ledger actually0spent,8,140files unchanged. Isolated03root/ledger derives3remaining and holds the original executor read-only shared lock plus exact parent ledger/grant/budget hash fences. Original-human post09 private-stdin identity/policy/build/image-inventory GETs all200, exact user/project/build capability checked; no credentials persisted. New official API casecudnn-functional-03-a1 accepted image95d9ea54-ef68-4bc8-8889-7d9a21a6c30c. An observer RemoteDisconnected and subsequent setupConnectTimeout were preserved; explicit continue-image observes only this exact ID under its original deadline, never re-POSTs/rebuilds or renews a lease. Later auth/flavor/image GETs succeeded and still reportedbuilding. No GPU/cuDNN/benchmark success is claimed yet.
+
+### Finite asyncmy reads and unknown-COMMIT byte preservation — 2026-10-31
+
+- During the same accepted image95d9… run, current captures at09:04–09:06UTC found worker7c still executing/restart0 with real IO progress; BuildKit export completed278.7s. Source-import/copy was **inferred** from open-file offsets, not a sampled Python stack; no packer process was then observed. Current IO PSI was high, but neither that short sample nor the already allocated output reserve proves why a historical failure occurred. Controller1/2 readiness200; exact unchanged controller3/372 was unhealthy with database timeout/Redis-CASok. Publicready and later original auth/flavor/image reads succeeded. These observations do **not** attribute either observer disconnect to controller3.
+- Read-only controller3 TCP reachability worked0.025s; a new finite-read SELECT1 worked0.0088s while its old API pool stayed unhealthy. Actual driver versions0.2.13/SQLAlchemy2.0.51 matched local reproduction. API3's precise pending task/await point and incident cause remain unproven. Independently, an actual silent loopback MySQL peer proved connect_timeout alone does not bound handshake reads:0.08s connect setting remained pending until external0.4s cancellation; read_timeout0.08s produced driverOperationalError in0.08195s. Actual candidate Hub init_db/session smoke with readlimit1 completed1.00349s, peerEOF,0retained peers,0production requests; not a production recovery proof.
+- New source adds DATABASE_READ_TIMEOUT default30s/range1–120 only for asyncmy; TCPconnect/pool defaults and retained readiness tasks stay unchanged. All API/export/bootstrap callers migrated, SQLite receives neither MySQL kwarg, and asyncmy floor now0.2.13 with unchanged resolved dependency versions. The cap is per read wait, not total SQL/transaction time, and adds no retry/lease extension.
+- Independent review initially blocked publication because a timed-out COMMIT may still land after a fresh nonlocking absence read. All five affected compensation paths now mark final commit start and preserve published CAS on uncertain outcome: legacy upload/bundle, image context/output and native package/cache. Native finalization also skips its own exception-driven validating reset; no broader concurrent admin-retry guarantee is asserted. Known precommit cleanup and successful reference-aware cleanup remain; anonymous receive temporaries still clean normally. Six behavioral nodes across all five paths fail the isolated original7c functions and pass in the corrected focused suite276passed/2skipped21.12s. Real hash-verified CAS/staging bytes are asserted, with injected unknown COMMIT outcomes—not a claim that a delayed real server COMMIT was reproduced. Independent source review is clean; final full-suite/test review and hosted publication remain separate gates. No deployment or interruption of active95d9 was performed for this repair.
+- Final independent ReviewDatabaseReadFence source/test review is clean, including all five compensation callers, metadata-only dependency-floor update and removal of the obsolete private SQLite engine/session wiring in the smoke helper. The helper now invokes canonical init_db/create_schema and requires current-source API images; older same-version images are not silently supported. Actual local canonical bootstrap with isolated fake offline settings exited0,20tables,integrity_check=ok; no Docker/cloud authentication or request occurred. Full Hub collection passed1301/7skipped342.76s; two last precommit tests were then strengthened to fail **after actual CAS publication** and passed2/2 separately0.67s. Lint/format and offline lock check passed. The historical prior-policy source copy and throwaway SQLite databases were removed; durable diagnostic receipts remain private. Candidate source qualification is not deployment or API3 incident recovery; active95d9 remains protected.
+
+### Official CUDA image completed; Nova root-volume wait failed — 2026-10-31
+
+- Official image95d9ea54-ef68-4bc8-8889-7d9a21a6c30c completed2026-10-31T09:40:10.268084UTC with11ordered layer digests and preserved CUDA/cuDNN probe runtime identity. Image creation08:49:16.960918UTC and completion are actual API timestamps, not a qualified cold/warm benchmark. No layer total size is inferred from this public receipt, which lacks sizes. The service900 profile/native key binding and successful large image path are observed; no uncaptured exact pack duration or counterfactual120-second success/failure is claimed.
+- First GPU consumer9c9934b3-8a72-46ab-aeaa-7161ff0d686b/Novae3c114b5-e0c8-4060-a313-ab6f6cb1966a created09:40:21.626UTC and reachedproviderERROR09:44:14.125UTC before any callback/probe. After separately authorized exact-instance existing Nova compute log read, **VolumeNotCreated** was directly observed09:43:41.619UTC: exact boot volume59f703a0-2597-4c99-a728-1733e2205f8d stilldownloading after186seconds/61attempts; **BuildAbortException** followed09:44:03.293UTC. PlacementPUT204, Cinder creation and fault shareglobalreq8857bc4d…; placementDELETE20409:44:16.876UTC proves that allocation release. Cinder finished image conversion09:47:23 and volume creation09:50:34—after Nova aborted. Not NoValidHost, GPU occupancy, or GPU compute failure.
+- Original API cleanup deleted the exact Nova instance, but boot_volume_id wasnull and structured boot_volume_absent wasnull. The result's prose claiming both absent was an overstatement, corrected in a separate immutable outcome receipt without rewriting the old case. A complete original-project39-volume census found59f7; exact logs/request correlation then proved ownership. Owner explicitly authorized only its conditional cleanup after fresh original-project/unattached/image/80GiB identity checks and preservation. Ordinary Cinder DELETE was accepted once; an unsupported get_volume(ignore_missing=...) observer argument failed afterward and was corrected by GET-only actual404 settlement, **not another DELETE**. Exact boot absence now separately proved. One failed create/80GiB stays spent; two creates/160GiB remain under the shared03ceiling, no refund. No nvidia-smi/cuDNN or benchmark success occurred.
+- The next source repair prepares the exact image-backed Cinder root before an explicit Nova effect instead of changing Nova/Cinder/GPU-host timeouts. The final contract keeps GET allocation-free, initial create Cinder-only, and uses an explicitly bound POSTadvance for create-server/delete-volume. SQL commit/re-fence races, no-call versus uncertain effects, raw-capability nonpersistence/original expiry, cleanup-only callers and approval expiry are mandatory review/test gates. Existing completed image95d9 may be reused only by a new immutable consumer case; faileda1 is never resumed/adopted, and no repeated image build is needed. Candidate1a357091/sourcee872… passed all hosted gates41189535436/41189535516/41189531951 but is superseded for deployment by this combined repair; actual six controllers remain372 and worker7c until separate full-cutover gates pass.
+- Prepared-root source/API and every root client/benchmark/smoke caller are now migrated: create is Cinder-only, GET performs no provider mutation, explicit advance has exactly operation/request_id/boot_volume_id, and prepared-volume DELETE is intent-only even when available. Sole Cinder deletion effect is advance(delete-volume); ordinary server-backed Nova deletion stays explicit. Strict private version/tri-state attempt history rejects null/nonbool as no-call; commits are followed by the same SQL fence and refresh, terminal no-call failure is atomic, expired lost-response roots still bind only exact owned inventory for cleanup, and no raw capability/renewal/provider retry is introduced. Root cleanup handles certified no-Nova terminal uncertain states and preexisting exact Cinder404, but not SDKNone/other failures/legacy unknown history; first visible Nova ID binds the original reservation. Independent ReviewPreparedRootAuthority final source/test/caller review is clean0.93, not live-provider proof.
+- Actual checks: complete Hub1396passed/7skipped317.80s; prepared-root instance247passed/5skipped14.04s; root public client/scenario265passed7.09s; final private consumer-only driver17synthetic tests passed0.207s with8hash-verified original-image receipts and no real provider calls. Initial four fixture failures came from the old-ID404 monkeypatch still applied to a later new-quota-admitted volume; restoring the normal getter before that new request fixed the fixture without weakening production validation. Real TCP HTTP smoke on Python3.12.13 passed against actual routes/SQLiteORM/CAS, with explicitly synthetic auth/provider: CinderPOST2/DELETE1,NovaPOST1/DELETE0. Operative harnessSHA9e762e0d… matches executed evidence; the earlierb5b5 handoff was superseded17minutes before execution, not modified during the run. Current private driver819a9956… adds exact prepared-boot attachment verification and immediate post-journal/post-auth creation-budget fences; no resident install or second real GPU allocation yet.
+- All18 frozen operation10 private helper hashes and syntax compiled, common import and four missing-input guards rejected without effects. Independent lifecycle/cold resource review is separate from operational release. Hard4GiB restore storage, bounded memory with serialized renewal observers, TERM-only/SendSIGKILL=no and no production KILL remain. Future exact combined candidate/refs/native191/role30/CI/fresh SQL-CAS-census and paired restoration evidence are still required before canonical six-controller cutover and unchanged7c worker resume. No production DDL, Nova/Cinder/GPU-host configuration change, IAM action or original failed-case replay occurred.
+- Final narrow legacy settlement review corrected an untouched absence hole before operational release: after a known Nova server disappears, an unbound boot UUID now remainsdeleting/provider_boot_volume_unknown, a bound SDKNone raises502, and only actual exact-ID Cinder404 marksdeleted. Independent delta review approved source/callers; six new DELETE/GET boundary cases were added. Final instance suite253passed/5skipped12.99s and lint passed; only those test lines were formatted. Full1396/7 evidence above precedes this six-case correction; final hosted gates must bind the corrected successor, not superseded e87d1f6 or1a35709. No service/helper effects were released on either superseded candidate.
+
+### Actual seven-service recovery and prepared-volume SDK failure — 2026-10-31
+
+- Final candidate6ffb990d17cc3f62d17a2f4a4a2e2072a0ca29f4/source94f84860… passed hosted Test41194662196, PR images41194662115 and publisher41194658822. Operation10 actually verified native47Hub files in each selected API/export image, captured and isolated-restored20tables/82rows and CAS83objects/78files/2,955,855,872B, and proved official candidate bootstrap a strict no-op. Six controllers were canonically replaced once; then a separately fresh, original-human-admitted fixed03 flow resumed the retained7c worker once. Controller outcome9fa9b53a… and worker outcomebc238b33… both returned rc0. No production DDL or forced kill occurred.
+- A real stopped-worker comparison sample differed only by Docker Mounts array order. Complete mount dictionaries and all other payload fields matched. The shared read-copy comparator now ignores only entry ordering, rejects changed values/duplicate destinations, and preserves raw archives. The original slot02 failed comparison objects were not captured; attributing that individual failure to the reproduced ordering behavior remains inference. Old02 timeout/null exit, raw active journal and absent C3HOLD remain unchanged; fixed03 is a distinct explicitly admitted successor, not a retroactive success or generic retry.
+- Fixed03 pre-effect SQL/CAS preservation was exact; SQL age80.044s at canonical intent stayed below120s, scratch31,636,406,272B exceeded31,146,901,504B, and actual original-human me/policy/build/image checks were200. Same worker CIDe0865a31…/imagec0068eb6… started19:04:31.96852605UTC with PID1429161. Three actual idle checkpoints24944→24946→24948 were bracketed by authoritative NULL image cursor24943→24949 and recipe24942→24950. Current restart count0/delta0 follows the explicit start; retirement104 history is preserved separately. Three API/export pairs passed source/settings/ready checks. All four SQL probes exited0 and were removed; new03 journal completed without a newHOLD. This is post-start runtime/cursor qualification, not a new full post-claim SQL/CAS equality proof or global continuous fence. Evidence: private controller-read-rollout-10/actual-seven-service-controller-worker-completion-summary.json, SHAf1744f69…; raw runtime qualificationb3625e99….
+- Actual all-seven bound resident ready preflight passed; parent then ran new immutable consumer-only casecudnn-functional-03-a2 once, reusing completed95d9…/all11layers without an image POST/rebuild. API acceptede726620a-5d6b-4f72-b210-08c523f8e4be/requestc4808c12… with uncertain volume creation, bootUUIDnull and server_create_attempted=false. Six subsequent observation502s ended the driver inHOLD; cleanup absence is unknown and no Nova advance is recorded. Conservative cumulative accounting is2creates/160GiB spent,1create/80GiB remaining, with a2 live hold retained and no refund. Original grant expiry20:33:38.487566UTC and original consumer bootstrap expiry are unchanged.
+- Original-caller scoped SDK listing found exact80GiB unattached volumee851aa60-bac5-4bd2-ac64-d97795bd8179 with original project and all four markers. Controller Cinder logs independently prove its POST202/requestreq059f8702… and exact image linkage. Both actual external SDK and internal Cinder logs prove that detailed inventory with queryproject_id returns400, `Invalid filters project_id are found in query options`; that failure becomes Hub502. SDK3.3 accepts and forwards the query, so this is a provider-side filter rejection, not a local invalid-argument error or failed Cinder POST. The original POST-response body/exception remains unobserved; omitted owner fields are a candidate, not established cause. Preserve case/result/intent/charge and volume; no repeated POST or manual SQL binding. Source repair and a reviewed original-consumer continuation are pending; no GPU/cuDNN or comparison success is claimed. Private diagnosis SHA1afa7cd7… binds bounded sanitized controller evidence.
+- The narrow source correction removes only the unsupported provider query, retaining scoped connection and all exact client-side checks, and treats POST representation as a candidate UUID followed by authoritative exact detail validation. Parent targeted22passed1.65s, complete instances267passed/5skipped15.62s, and full Hub1416passed/7skipped340.58s. Two independent source reviews found no blocker; no Astra approval is claimed. Actual Python3.12/SDK3.3 loopback HTTP smoke passed with7CinderPOST/0Nova: old partial-response handling remains uncertain, old filtered recovery receives400, and corrected exact-detail/unfiltered recovery plus foreign/mismatched/ambiguous/overbound guards pass. Responses/auth/SQL in that smoke are synthetic; it proves wire compatibility, not the unknown historical POST exception. Initial smoke used a raw SDK Session without its required Connection and sent no HTTP; corrected harness attaches the real Connection and retains captured exceptions. Earlier test attempts selected the old editable package or lacked private fixture inputs/permissions; corrected current-source environment/complete0600copies passed without weakening product guards. Working/staged source guard, branch publication and new canonical API-only rollout are separate subsequent barriers. Existing exact Cinder root is now directly observed available/unattached; original case, charge and bootstrap expiry remain unchanged.
 

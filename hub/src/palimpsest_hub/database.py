@@ -4,7 +4,13 @@ from collections.abc import AsyncGenerator
 
 from fastapi import HTTPException
 from sqlalchemy import inspect, text
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.engine import make_url
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 _engine: AsyncEngine | None = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
@@ -33,6 +39,7 @@ def init_db(
     pool_size: int,
     max_overflow: int,
     connect_timeout: int,
+    read_timeout: int,
     pool_timeout: int,
     unhealthy_seconds: int,
 ) -> None:
@@ -40,13 +47,17 @@ def init_db(
     global _engine, _session_factory
     if _engine is not None:
         return
+    connect_args = {}
+    if make_url(database_url).get_driver_name() == "asyncmy":
+        # TCP connect timeout does not bound asyncmy's handshake or response reads.
+        connect_args = {"connect_timeout": connect_timeout, "read_timeout": read_timeout}
     _engine = create_async_engine(
         database_url,
         pool_pre_ping=True,
         pool_size=pool_size,
         max_overflow=max_overflow,
         pool_timeout=pool_timeout,
-        connect_args={"connect_timeout": connect_timeout},
+        connect_args=connect_args,
     )
     if _engine.sync_engine.dialect.driver == "asyncmy":
         _recover_closed_transport_ping(_engine)
@@ -68,6 +79,8 @@ async def get_session() -> AsyncGenerator[AsyncSession, None]:
 async def create_schema() -> None:
     if _engine is None:
         raise RuntimeError("database is not initialized")
+    # Register the independent image-job and instance ledgers before cold bootstrap.
+    from palimpsest_hub import image_models, instance_models  # noqa: F401
     from palimpsest_hub.models import Base
 
     async with _engine.begin() as connection:

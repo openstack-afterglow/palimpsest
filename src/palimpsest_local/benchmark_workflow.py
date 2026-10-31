@@ -85,8 +85,16 @@ def validate_workflow(config: dict) -> None:
         or {c.get("method") for c in cases} != set(METHODS)
     ):
         raise ArtifactValidationError("benchmark requires all five distinct methods")
-    if not isinstance(config.get("environment"), dict):
-        raise ArtifactValidationError("every workflow requires a fresh disk/network environment benchmark")
+    if "environment_context" in config:
+        from .benchmark_scenarios import _validate_environment_context
+
+        _validate_environment_context(config["environment_context"])
+        if "environment" in config:
+            raise ArtifactValidationError(
+                "select hourly station context or explicit standalone calibration, never both"
+            )
+    elif not isinstance(config.get("environment"), dict):
+        raise ArtifactValidationError("workflow requires explicit hourly station context or standalone calibration")
     if config.get("controller_hostname") is not None and config["controller_hostname"] != platform.node():
         raise ArtifactValidationError("benchmark request belongs to a different execution controller")
     for case in cases:
@@ -107,7 +115,7 @@ def validate_workflow(config: dict) -> None:
 
 def run_workflow(config: dict, output: Path, *, environment_runner=None) -> dict:
     validate_workflow(config)
-    if environment_runner is None:
+    if environment_runner is None and "environment_context" not in config:
         if config["mode"] == "openstack":
             from .benchmark_openstack import run_openstack_environment
 
@@ -135,12 +143,32 @@ def run_workflow(config: dict, output: Path, *, environment_runner=None) -> dict
     try:
         for i, hook in enumerate(config.get("setup_hooks", [])):
             _run(hook["argv"], output, f"setup-{i}", hook["timeout_seconds"])
-        environment_config = config["environment"]
-        if "config_file" in environment_config:
-            environment_config = load_config(Path(environment_config["config_file"]))
-        record["environment"] = environment_runner(environment_config, output / "environment")
-        if record["environment"].get("status") != "success":
-            raise ArtifactValidationError("disk/network preflight failed; workflow commands were not started")
+        if "environment_context" in config:
+            from .benchmark_scenarios import _environment_context
+
+            record["environment"], sample = _environment_context(
+                {
+                    "environment_context": config["environment_context"],
+                    "project_id": config["environment_context"]["project_id"],
+                }
+            )
+            record["environment_reference"] = sample["sample_reference"]
+            if sample["status"] != "success":
+                record["issues"].append(
+                    {
+                        "category": "station-context-partial",
+                        "message": "Hourly Internet context is partial; missing vendor means are unavailable, not a workload failure",
+                    }
+                )
+        else:
+            environment_config = config["environment"]
+            if "config_file" in environment_config:
+                environment_config = load_config(Path(environment_config["config_file"]))
+            record["environment"] = environment_runner(environment_config, output / "environment")
+            if record["environment"].get("status") != "success":
+                raise ArtifactValidationError(
+                    "explicit standalone disk/network preflight failed; workflow commands were not started"
+                )
         for i, hook in enumerate(config.get("before_hooks", [])):
             _run(hook["argv"], output, f"before-{i}", hook["timeout_seconds"])
         for case in config["cases"]:

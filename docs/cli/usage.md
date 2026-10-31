@@ -539,8 +539,10 @@ observations or warnings.
 Web **Remove** also supports external Lima VZ/QEMU/krunkit and libvirt KVM/HVF VMs. It requires
 `--allow-control`, the selected stable inventory ID, the original native removal
 identity and exact typed VM name. A Lima identity binds its physical instance
-directory/device/inode and optional run marker; libvirt uses its native domain
-UUID. Missing, changed, stale or colliding identities fail closed. Unmarked VMs
+directory/device/inode, safe owned `lima.yaml` bytes, protected native state and
+optional run marker; libvirt uses its native domain UUID, native backend and
+lifecycle-marker classification. Missing, changed, stale or colliding identities
+fail closed. Unmarked VMs
 can be removed without obtaining guest credentials; this does not unlock their
 consoles or start/stop actions. OCI-root removal still requires its original
 managed runtime.
@@ -557,6 +559,14 @@ before stopping. External removal never deletes another state's run tree or
 independent data volumes. Completion reports actual storage policy/archive ID.
 Recheck after any backend failure; a failed or ambiguous operation is not
 reported as successful.
+
+Removal stays in `host_vm_control.py` through the shared inventory contract;
+it does not adopt a foreign run or introduce a second lifecycle authority.
+Descriptor-pinned Lima deletion must establish that the selected directory is
+gone even if it was renamed during deletion. Libvirt retention preflight reads
+inactive domain metadata, including TPM state, before any stop/undefine effect.
+These guards preserve the default root/topology retention and separate explicit
+owned-instance purge; console access and selected-run start/stop are unchanged.
 
 VM detail probes run only for the open VM, not every resource in list refreshes.
 Running logs are the bounded guest system journal; stopped selected libvirt

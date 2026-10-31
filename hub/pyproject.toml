@@ -8,7 +8,7 @@ version = "0.3.10"
 description = "Dedicated Palimpsest Hub API, Glance export worker, and isolated build queue"
 requires-python = ">=3.12"
 dependencies = [
-    "asyncmy>=0.2.0",
+    "asyncmy>=0.2.13",
     "fastapi==0.133.0",
     "openstacksdk==3.3.0",
     "python-keystoneclient==5.4.0",
@@ -54,6 +54,7 @@ packages = ["src/palimpsest_hub"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+pythonpath = ["../src"]
 
 [tool.ruff]
 line-length = 120

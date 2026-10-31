@@ -211,7 +211,8 @@ def test_cleaning_does_not_follow_recipe_symlinks(tmp_path):
     assert not (upper / "etc" / "hosts").is_symlink()
 
 
-def test_loop_intent_is_durable_before_attachment(tmp_path, monkeypatch):
+@pytest.mark.parametrize("readonly", [True, False])
+def test_loop_intent_is_durable_before_attachment(tmp_path, monkeypatch, readonly):
     path = tmp_path / "base.raw"
     path.write_bytes(b"base")
     executor = hub_builder._Executor(tmp_path, 60)
@@ -222,11 +223,12 @@ def test_loop_intent_is_durable_before_attachment(tmp_path, monkeypatch):
         record = json.loads((tmp_path / "resources.json").read_text())["loops"][0]
         assert record["path"] == str(path)
         assert record["ino"] == path.stat().st_ino
+        assert ("--read-only" in argv) is readonly
         raise RuntimeError("interrupted attach")
 
     monkeypatch.setattr(executor, "command", command)
     with pytest.raises(RuntimeError, match="interrupted attach"):
-        executor.loop(path)
+        executor.loop(path, readonly=readonly)
     assert (tmp_path / "resources.json").exists()
 
 
@@ -702,3 +704,13 @@ def test_worker_sigkill_during_cleanup_fences_helper_before_restart_detach(tmp_p
                 pass
         worker_process.stdout.close()
         worker_process.stderr.close()
+
+
+def test_child_file_limit_never_raises_inherited_hard_ceiling(monkeypatch):
+    calls = []
+    monkeypatch.setattr(hub_builder, "_fence", lambda parent: None)
+    monkeypatch.setattr(hub_builder.ctypes, "CDLL", lambda *args, **kwargs: SimpleNamespace(prctl=lambda *args: 0))
+    monkeypatch.setattr(hub_builder.resource, "getrlimit", lambda kind: (100, 100))
+    monkeypatch.setattr(hub_builder.resource, "setrlimit", lambda kind, limits: calls.append((kind, limits)))
+    hub_builder._child_limits(1234, 1000)
+    assert calls[-1] == (hub_builder.resource.RLIMIT_FSIZE, (100, 100))

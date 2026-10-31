@@ -12,7 +12,10 @@ from uuid import uuid4
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.exception_handlers import http_exception_handler, request_validation_exception_handler
+from fastapi.exception_handlers import (
+    http_exception_handler,
+    request_validation_exception_handler,
+)
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel
@@ -26,6 +29,8 @@ from palimpsest_hub.api.builds import router as build_router
 from palimpsest_hub.api.catalog import router as catalog_router
 from palimpsest_hub.api.hub import configure_blocking_operations
 from palimpsest_hub.api.hub import router as hub_router
+from palimpsest_hub.api.image_jobs import router as image_job_router
+from palimpsest_hub.api.instances import router as instance_router
 from palimpsest_hub.api.packages import router as package_router
 from palimpsest_hub.api.policy import router as policy_router
 from palimpsest_hub.cache import close_redis, get_redis
@@ -82,6 +87,7 @@ async def lifespan(_: FastAPI):
         pool_size=settings.database_pool_size,
         max_overflow=settings.database_max_overflow,
         connect_timeout=settings.database_connect_timeout,
+        read_timeout=settings.database_read_timeout,
         pool_timeout=settings.database_pool_timeout,
         unhealthy_seconds=settings.database_unhealthy_seconds,
     )
@@ -105,11 +111,27 @@ app.include_router(build_router, prefix="/v1", tags=["builds"])
 app.include_router(package_router, prefix="/v1", tags=["packages"])
 app.include_router(policy_router, prefix="/v1")
 app.include_router(catalog_router, prefix="/v1")
+app.include_router(image_job_router, prefix="/v1", tags=["image-jobs"])
+app.include_router(instance_router, prefix="/v1", tags=["instances"])
 
 
 def _package_path(request: Request) -> bool:
     path = request.scope.get("path", "")
     return path in {"/v1/auth/me", "/v1/policy/capabilities", "/v1/projects"} or path.startswith("/v1/projects/")
+
+
+def _execution_path(request: Request) -> bool:
+    path = request.scope.get("path", "")
+    roots = (
+        "/v1/build-contexts",
+        "/v1/registry-imports",
+        "/v1/dockerfile-builds",
+        "/v1/image-jobs",
+        "/v1/image-worker",
+        "/v1/instances",
+        "/v1/instance-bootstrap",
+    )
+    return any(path == root or path.startswith(root + "/") for root in roots)
 
 
 def _package_error(
@@ -148,6 +170,13 @@ async def handle_http_error(request: Request, exc: StarletteHTTPException):
 
 @app.exception_handler(RequestValidationError)
 async def handle_validation_error(request: Request, exc: RequestValidationError):
+    if _execution_path(request):
+        # Dockerfile/context/runtime inputs may contain secrets; never echo them.
+        return JSONResponse(
+            {"detail": "Invalid execution request"},
+            status_code=422,
+            headers={"Cache-Control": "no-store", "X-Request-Id": request.state.request_id},
+        )
     if not _package_path(request):
         return await request_validation_exception_handler(request, exc)
     # Validation inputs can contain credentials/provenance; never echo them.
@@ -184,7 +213,7 @@ async def log_request(request: Request, call_next):
             if _package_path(request)
             else PlainTextResponse("Internal Server Error", status_code=500)
         )
-    if request.scope.get("path") == "/v1/me":
+    if request.scope.get("path") == "/v1/me" or _execution_path(request):
         response.headers["Cache-Control"] = "no-store"
     if _package_path(request):
         response.headers["Cache-Control"] = "no-store"

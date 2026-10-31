@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "클라우드 목표 구조 · VM 밖에서 제어",
+    "quality_profile": "showcase",
+    "viewBox": [1350, 780],
+    "repository": {"url":"https://github.com/openstack-afterglow/palimpsest","provider":"github","link_mode":"local-only","revision":"aa397a0fd976e35302974a347748a9773e3084bf"},
+    "views": [
+      {"id":"target-control","label":"외부 제어","focus":["target-client","target-control","target-metadata","target-helper"],"note":"레이어 선택·순서·접근권한·lease·Nova 수명주기는 VM 밖에서 결정합니다."},
+      {"id":"target-payload","label":"RW 발행 → RO 실행","focus":["target-builder","target-bytes","target-lower","target-private","target-workload"],"note":"새 digest 발행만 RW입니다. 소비자는 공유 바이트를 RO로 읽고 VM 전용 upper에만 씁니다."}
+    ]
+  },
+  "components": [
+    {"id":"target-client","type":"frontend","label":"클라이언트","sublabel":"VM 밖 · CLI / API 사용자","pos":[35,110],"size":[220,78],"sources":[{"path":"ARCHITECTURE.md","label":"소유자 목표 계약 · 2026-10-29"}]},
+    {"id":"target-control","type":"backend","label":"Hub API · 외부 제어","sublabel":"선택 · mount 명세 · lease · Nova","pos":[365,110],"size":[245,78],"sources":[{"path":"ARCHITECTURE.md","label":"목표와 현재 구현 차이"}]},
+    {"id":"target-metadata","type":"database","label":"Hub DB · 메타데이터","sublabel":"digest · size · 순서 · runtime","tag":"job · provenance","pos":[730,110],"size":[245,78],"sources":[{"path":"ARCHITECTURE.md","label":"권위 있는 메타데이터"},{"path":"hub/src/palimpsest_hub/models.py","label":"현재 SQL 모델"}]},
+    {"id":"target-builder","type":"backend","label":"별도 빌드 worker","sublabel":"획득 · 빌드 · 변환 · 검증","pos":[365,350],"size":[245,78],"sources":[{"path":"ARCHITECTURE.md","label":"빌드 작업자 경계"},{"path":"hub/src/palimpsest_hub/build_worker.py","label":"현재 빌드 worker"}]},
+    {"id":"target-bytes","type":"database","label":"Manila 관리 CephFS","sublabel":"레이어 실제 바이트 · SquashFS","tag":"발행된 digest는 불변","pos":[730,350],"size":[245,78],"sources":[{"path":"ARCHITECTURE.md","label":"목표 공유 저장소 · 미구현"}]},
+    {"id":"target-private","type":"database","label":"VM 전용 쓰기 공간","sublabel":"upper · work / 공유 lower와 분리","tag":"워크로드 VM 내부","pos":[1060,350],"size":[245,78],"sources":[{"path":"ARCHITECTURE.md","label":"소비자 쓰기 격리 계약"}]},
+    {"id":"target-helper","type":"backend","label":"최소 게스트 mount helper","sublabel":"확정 명세 실행 · CLI/제어면 아님","tag":"워크로드 VM 내부","pos":[365,600],"size":[245,78],"sources":[{"path":"ARCHITECTURE.md","label":"게스트 책임 · 현재 HTTPS 차이"}]},
+    {"id":"target-lower","type":"backend","label":"RO 공유 → SquashFS RO","sublabel":"VM 안 · 지정 순서의 RO lower","tag":"워크로드 VM 내부","pos":[730,600],"size":[245,78],"sources":[{"path":"ARCHITECTURE.md","label":"공유와 lower의 이중 RO 경계"}]},
+    {"id":"target-workload","type":"backend","label":"OverlayFS → 워크로드","sublabel":"VM 안 · RO lower + 개인 upper/work","tag":"워크로드 VM 내부","pos":[1060,600],"size":[245,78],"sources":[{"path":"ARCHITECTURE.md","label":"실행 소비자 경계"}]}
+  ],
+  "connections": [
+    {"id":"target-request","from":"target-client","to":"target-control","label":"요청"},
+    {"id":"target-db-record","from":"target-control","to":"target-metadata","label":"조회 · 기록"},
+    {"id":"target-build-dispatch","from":"target-control","to":"target-builder","label":"빌드 작업","labelAt":[487,270]},
+    {"id":"target-publish","from":"target-builder","to":"target-bytes","label":"RW · 새 digest 발행","variant":"emphasis"},
+    {"id":"target-configure-helper","from":"target-control","to":"target-helper","label":"외부 확정 명세 · 접근권한","fromSide":"left","toSide":"left","via":[[290,149],[290,639]]},
+    {"id":"target-apply-mount","from":"target-helper","to":"target-lower","label":"명세대로 마운트"},
+    {"id":"target-read-bytes","from":"target-bytes","to":"target-lower","label":"소비자 RO","variant":"security","labelAt":[852,510]},
+    {"id":"target-compose-lower","from":"target-lower","to":"target-workload","label":"RO lower"},
+    {"id":"target-compose-private","from":"target-private","to":"target-workload","label":"개인 RW","labelAt":[1182,510]}
+  ],
+  "cards": [
+    {"dot":"emerald","title":"목표 · 아직 구현/실기 검증 아님","items":["운영으로 확정할 Manila 공유 경로·RO 접근권한","프로토콜·자격증명 방식은 미선정. 발행된 digest는 덮어쓰지 않습니다."]},
+    {"dot":"amber","title":"현재 구현과 혼동 금지","items":["활성 구현 게스트는 HTTPS 다운로드 후 RO loop mount. Palimpsest CLI는 없습니다.","Cinder RW→봉인→RO 프로토타입·과거 측정은 이 목표의 검증이 아닙니다."]},
+    {"dot":"cyan","title":"별도 선택 모드 · 로컬 실행 유지","items":["로컬 CLI → 로컬 저장소 → Lima/VZ 또는 KVM → 게스트","이 목표도는 클라우드용입니다. 로컬 catalog를 클라우드 권위로 쓰지 않습니다."]}
+  ]
+}

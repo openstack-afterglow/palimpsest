@@ -35,7 +35,7 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import func, select
 
 from palimpsest_hub.auth import (
@@ -47,6 +47,7 @@ from palimpsest_hub.auth import (
     require_token,
     revalidate_package_admin,
     validate_package_owner,
+    validate_token,
 )
 from palimpsest_hub.cache import get_redis
 from palimpsest_hub.config import get_settings
@@ -296,6 +297,46 @@ class HubLayerMeta(BaseModel):
         if normalized is None:
             raise ValueError("digest 는 sha256:<64hex> 형식이어야 합니다")
         return normalized
+
+
+class HubLayerPatch(BaseModel):
+    """Only descriptive metadata is mutable; bytes and graph identity are not."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = None
+    ubuntu_base: str | None = None
+    python_version: str | None = None
+    os_variant: str | None = None
+    is_published: bool = Field(default=False, strict=True)
+
+    @field_validator("name")
+    @classmethod
+    def _check_name(cls, value: str | None) -> str:
+        if value is None:
+            raise ValueError("name cannot be null")
+        return HubLayerMeta._check_name(value)
+
+    @field_validator("ubuntu_base")
+    @classmethod
+    def _check_base(cls, value: str | None) -> str | None:
+        return HubLayerMeta._check_base(value)
+
+    @field_validator("python_version")
+    @classmethod
+    def _check_py(cls, value: str | None) -> str | None:
+        return HubLayerMeta._check_py(value)
+
+    @field_validator("os_variant")
+    @classmethod
+    def _check_os_variant(cls, value: str | None) -> str | None:
+        return HubLayerMeta._check_os_variant(value)
+
+    @model_validator(mode="after")
+    def _require_changes(self):
+        if not self.model_fields_set:
+            raise ValueError("At least one metadata field is required")
+        return self
 
 
 class BundleExportRequest(BaseModel):
@@ -1118,6 +1159,100 @@ async def get_hub_layer(digest: str, token_info: dict = Depends(_legacy_inventor
         }
 
 
+@router.patch("/layers/{digest}", response_model=HubLayerResponse, operation_id="update_hub_layer")
+async def update_hub_layer(
+    digest: str,
+    patch: HubLayerPatch,
+    request: Request,
+    response: Response,
+    token_info: dict = Depends(_legacy_writer),
+) -> dict[str, Any]:
+    """Conditionally edit an exact-owned descriptor without relabeling stored bytes."""
+    normalized = normalize_digest(digest)
+    if normalized is None:
+        raise HTTPException(status_code=422, detail="digest 는 sha256:<64hex> 형식이어야 합니다")
+    project_id = _required_project_id(token_info)
+    factory = _factory_or_503()
+    store = _store_or_503()
+    changes = patch.model_dump(exclude_unset=True)
+    publication_requested = "is_published" in changes
+    async with _locked_blob(store, normalized), factory() as session:
+        row = (
+            await session.execute(
+                select(PalimpsestHubLayer)
+                .where(
+                    PalimpsestHubLayer.blob_digest == normalized,
+                    exact_identity(PalimpsestHubLayer.project_id, project_id),
+                )
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if row is None or row.project_id != project_id:
+            raise HTTPException(status_code=404, detail="레이어를 찾을 수 없습니다")
+        expected = request.headers.get("If-Match")
+        if expected is None:
+            raise HTTPException(status_code=428, detail="If-Match config_digest header is required")
+        if expected not in {row.config_digest, f'"{row.config_digest}"'}:
+            raise HTTPException(status_code=412, detail="Layer config_digest has changed")
+        if publication_requested and (
+            not token_info.get("is_package_system_admin")
+            or "system:manage" not in token_info.get("package_actions", ())
+        ):
+            raise HTTPException(status_code=403, detail="System publication policy denied")
+        descriptor_changes = {
+            field: value for field, value in changes.items() if field != "is_published" and getattr(row, field) != value
+        }
+        # Display names do not change execution or ancestry; allow retained blobs
+        # to be named without rewriting a consumer's immutable runtime snapshot.
+        if descriptor_changes.keys() - {"name"}:
+            dependent = await session.scalar(
+                select(PalimpsestHubLayer.id)
+                .where(
+                    (PalimpsestHubLayer.parent_digest == normalized)
+                    | (PalimpsestHubLayer.config_json["base_image_digest"].as_string() == normalized)
+                )
+                .limit(1)
+            )
+            if dependent is not None:
+                raise HTTPException(status_code=409, detail="Referenced layer descriptors cannot be changed")
+            from palimpsest_hub.services.blob_references import runtime_blob_referenced
+
+            if await runtime_blob_referenced(session, normalized):
+                raise HTTPException(status_code=409, detail="Retained execution descriptors cannot be changed")
+        if descriptor_changes:
+            config = dict(row.config_json or {})
+            config.update(descriptor_changes)
+            for field, value in descriptor_changes.items():
+                setattr(row, field, value)
+            row.config_json = config
+            row.config_digest = compute_config_digest(config)
+        if publication_requested:
+            row.is_published = patch.is_published
+        if token_info.get("is_package_system_admin"):
+            current = await revalidate_package_admin(token_info)
+            if not current.get("is_package_system_admin"):
+                raise HTTPException(status_code=403, detail="Current human system administrator authority is required")
+        else:
+            original = await asyncio.to_thread(validate_token, token_info["token"], token_info["project_id"])
+            if original.get("user_id") != token_info.get("user_id") or original.get("project_id") != token_info.get(
+                "project_id"
+            ):
+                raise HTTPException(status_code=403, detail="Original package subject or scope changed")
+            current = await get_package_member_info(token_info=original)
+        if (
+            current.get("user_id") != token_info.get("user_id")
+            or current.get("project_id") != token_info.get("project_id")
+            or _required_project_id(current) != project_id
+        ):
+            raise HTTPException(status_code=403, detail="Original package subject or target changed")
+        await _legacy_writer(current)
+        if publication_requested and "system:manage" not in current.get("package_actions", ()):
+            raise HTTPException(status_code=403, detail="System publication policy denied")
+        await session.commit()
+        response.headers["ETag"] = f'"{row.config_digest}"'
+        return _layer_dict(row, current)
+
+
 @router.get("/layers/{digest}/ancestors", response_model=list[HubLayerResponse], operation_id="get_hub_layer_ancestors")
 async def get_hub_layer_ancestors(digest: str, token_info: dict = Depends(_legacy_inventory)) -> list[dict[str, Any]]:
     """루트 → 자기 자신 순서. 누락된 조상은 상세 조회의 chain_complete 로 판별한다."""
@@ -1312,8 +1447,8 @@ async def _locked_blobs(store: LocalPathBlobStore, digests: list[str]):
 async def _discard_unregistered_blob(store: LocalPathBlobStore, factory, digest: str) -> None:
     """Remove rolled-back CAS bytes only when SQL proves no layer references them.
 
-    The caller still owns this digest lock, so an ambiguous commit that actually
-    landed keeps its bytes instead of losing them to its own compensation.
+    The caller owns the digest lock and must not compensate an uncertain commit:
+    a fresh reference read cannot rule out a commit still in flight.
     """
     try:
         async with factory() as session:
@@ -1496,8 +1631,10 @@ async def _finalize_upload_locked(
         "base_image_digest": meta.base_image_digest,
     }
     created = False
+    commit_started = False
     existing: PalimpsestHubLayer | None = None
-    async with _locked_blob(store, finalized.blob_digest):
+    lock_digests = [digest for digest in (finalized.blob_digest, meta.parent_digest, meta.base_image_digest) if digest]
+    async with _locked_blobs(store, lock_digests):
         if token_info.get("is_package_system_admin"):
             token_info = await revalidate_package_admin(token_info)
             await _legacy_writer(token_info)
@@ -1571,9 +1708,10 @@ async def _finalize_upload_locked(
                     await _legacy_writer(token_info)
                     if meta.is_published and "system:manage" not in token_info["package_actions"]:
                         raise HTTPException(status_code=403, detail="System publication policy denied")
+                commit_started = True
                 await session.commit()
         except BaseException:
-            if created:
+            if created and not commit_started:
                 await _discard_unregistered_blob(store, factory, finalized.blob_digest)
             raise
 
@@ -1793,7 +1931,14 @@ async def import_bundle(file: UploadFile, token_info: dict = Depends(_legacy_wri
 
         if publishable:
             created: list[str] = []
-            async with _locked_blobs(store, [finalized.blob_digest for _, finalized, _ in publishable]):
+            commit_started = False
+            lock_digests = [
+                digest
+                for _, finalized, meta in publishable
+                for digest in (finalized.blob_digest, meta.parent_digest, meta.base_image_digest)
+                if digest
+            ]
+            async with _locked_blobs(store, lock_digests):
                 try:
                     if token_info.get("is_package_system_admin"):
                         token_info = await revalidate_package_admin(token_info)
@@ -1890,11 +2035,13 @@ async def import_bundle(file: UploadFile, token_info: dict = Depends(_legacy_wri
                         if token_info.get("is_package_system_admin"):
                             token_info = await revalidate_package_admin(token_info)
                             await _legacy_writer(token_info)
+                        commit_started = True
                         await session.commit()
                 except BaseException:
-                    imported.clear()
-                    for digest in reversed(created):
-                        await _discard_unregistered_blob(store, factory, digest)
+                    if not commit_started:
+                        imported.clear()
+                        for digest in reversed(created):
+                            await _discard_unregistered_blob(store, factory, digest)
                     raise
 
     return {"imported": imported, "imported_count": len(imported), "skipped": skipped}
@@ -1913,7 +2060,7 @@ async def delete_hub_layer(digest: str, token_info: dict = Depends(require_admin
         raise HTTPException(status_code=422, detail="digest 는 sha256:<64hex> 형식이어야 합니다")
     factory = _factory_or_503()
 
-    async with factory() as session:
+    async with _locked_blob(_store_or_503(), normalized), factory() as session:
         row = (
             await session.execute(
                 select(PalimpsestHubLayer).where(
@@ -1931,6 +2078,10 @@ async def delete_hub_layer(digest: str, token_info: dict = Depends(require_admin
         ).scalar_one_or_none()
         if child is not None:
             raise HTTPException(status_code=409, detail="자식 레이어가 있어 삭제할 수 없습니다")
+        from palimpsest_hub.services.blob_references import runtime_blob_referenced
+
+        if await runtime_blob_referenced(session, normalized):
+            raise HTTPException(status_code=409, detail="Layer is retained by an image job or instance")
         if token_info.get("is_package_system_admin"):
             token_info = await revalidate_package_admin(token_info)
             if "system:manage" not in token_info["package_actions"]:

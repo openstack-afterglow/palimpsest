@@ -243,3 +243,33 @@ No limits or unrelated services were changed; no unacknowledged app command
 was replayed. The guest binary and builder were unchanged, so the full guest
 boot matrix and image rebuild were not repeated. Historical Gate 2 evidence
 remains separately recorded, not counted as a new full Gate 2 run here.
+
+## Current materializer response v4 — 2026-10-31
+
+The current worker package migrates both response producer and parent consumer
+to strict v4. It carries allowlisted domain failure codes, a separately validated
+I/O errno allowlist, and the observed operation phase. The historical v3 resource
+`failure_stage`/EAGAIN/ENOMEM constraints remain distinct and are not widened.
+An intake-domain error raised during packing reports the observed packing
+operation; a packed-stream error while publishing reports derived-store
+operation. Unknown or newly raised cleanup failures do not borrow an earlier
+phase. Success responses cannot carry non-null failure attribution. Nonce/request
+binding, canonical wire validation, size limits and artifact authority remain.
+
+This diagnostic extension does not raise limits, retry jobs, change successful
+SquashFS bytes, or prove a historical failure cause. No exception message, path,
+traceback locals or raw child stderr crosses the wire. Actual native child
+execution and production GPU acceptance must be reported separately from source
+tests and the historical failed proofs above.
+
+## Fixed service-image profile and request v3 — 2026-10-31
+
+After actual retained diagnostics identified `oci-packer-timeout`, the image
+service explicitly selects a fixed900-second packer policy. Default canonical
+callers keep120seconds and their existing fingerprint. The strict request moves
+to v3 with a required known `pack_profile`; the selected policy fingerprint is
+validated against the derived key in both parent and child. No arbitrary timeout
+is accepted through the wire, and remaining-time values do not enter recipe keys.
+The original outer deadline still bounds execution and can stop packing before
+900seconds. A fixed policy extension does not extend an expired job or convert a
+timeout into success. Response v4 diagnostic constraints remain unchanged.

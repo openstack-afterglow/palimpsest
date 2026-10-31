@@ -13,10 +13,142 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+from asyncmy.errors import OperationalError as AsyncmyOperationalError
+from pydantic import ValidationError
 from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from palimpsest_hub.database import _recover_closed_transport_ping
+
+
+@pytest.mark.parametrize("timeout", [0, 121])
+def test_database_read_timeout_rejects_unbounded_values(timeout):
+    from palimpsest_hub.config import DatabaseSettings
+
+    with pytest.raises(ValidationError):
+        DatabaseSettings(
+            database_url="mysql+asyncmy://synthetic:synthetic@127.0.0.1/hub", database_read_timeout=timeout
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("finite_reads", [False, True], ids=["connect-timeout-only", "bounded-hub-reads"])
+async def test_real_asyncmy_silent_handshake_read_lifetime(monkeypatch, finite_reads):
+    """A real asyncmy/SQLAlchemy connection must terminate without an outer cancellation."""
+    from palimpsest_hub import database
+    from palimpsest_hub.config import DatabaseSettings
+
+    monkeypatch.setattr(database, "_engine", None)
+    monkeypatch.setattr(database, "_session_factory", None)
+    accepted = asyncio.Event()
+    peer_closed = asyncio.Event()
+    peers = set()
+    handlers = []
+    received = []
+
+    async def silent_peer(reader, writer):
+        # Accept TCP but send no MySQL greeting: connect_timeout alone is insufficient.
+        peers.add(writer)
+        handlers.append(asyncio.current_task())
+        accepted.set()
+        try:
+            received.append(await reader.read())
+        finally:
+            writer.close()
+            await writer.wait_closed()
+            peers.remove(writer)
+            peer_closed.set()
+
+    server = await asyncio.start_server(silent_peer, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    settings = DatabaseSettings(
+        database_url=f"mysql+asyncmy://synthetic:synthetic@127.0.0.1:{port}/hub",
+        database_read_timeout=1,
+    )
+    if finite_reads:
+        database.init_db(
+            settings.database_url,
+            pool_size=settings.database_pool_size,
+            max_overflow=settings.database_max_overflow,
+            connect_timeout=settings.database_connect_timeout,
+            read_timeout=settings.database_read_timeout,
+            pool_timeout=settings.database_pool_timeout,
+            unhealthy_seconds=settings.database_unhealthy_seconds,
+        )
+        engine = database._engine
+    else:
+        # Previous Hub policy, through the real driver; no mocked argument capture.
+        engine = create_async_engine(
+            settings.database_url,
+            pool_pre_ping=True,
+            connect_args={"connect_timeout": settings.database_connect_timeout},
+        )
+
+    async def connect():
+        async with engine.connect():
+            raise AssertionError("a silent MySQL peer cannot complete authentication")
+
+    task = asyncio.create_task(connect())
+    try:
+        await asyncio.wait_for(accepted.wait(), timeout=3)
+        done, pending = await asyncio.wait({task}, timeout=3 if finite_reads else 1.5)
+        if finite_reads:
+            # asyncio.wait does not cancel: this must be the driver's bounded failure.
+            assert done == {task} and not pending, "asyncmy read outlived the outer deadline"
+            assert not task.cancelled()
+            with pytest.raises(OperationalError) as raised:
+                await task
+            assert isinstance(raised.value.orig, AsyncmyOperationalError)
+        else:
+            assert not done and pending == {task}, "connect_timeout unexpectedly bounded the handshake"
+            assert not peer_closed.is_set()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        # Both driver timeout and explicit control cancellation must close the real socket.
+        await asyncio.wait_for(peer_closed.wait(), timeout=3)
+        assert task.done() and not peers
+        assert len(handlers) == 1 and received == [b""]
+        await asyncio.wait_for(asyncio.gather(*handlers), timeout=3)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        server.close()
+        await server.wait_closed()
+        for writer in tuple(peers):
+            writer.close()
+        await asyncio.wait_for(asyncio.gather(*handlers, return_exceptions=True), timeout=3)
+        if finite_reads:
+            await database.close_db()
+        else:
+            await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_database_initialization_keeps_sqlite_adapter_clean(tmp_path, monkeypatch):
+    from palimpsest_hub import database
+    from palimpsest_hub.config import DatabaseSettings
+
+    monkeypatch.setattr(database, "_engine", None)
+    monkeypatch.setattr(database, "_session_factory", None)
+    settings = DatabaseSettings(database_url=f"sqlite+aiosqlite:///{tmp_path / 'initialized.db'}")
+    database.init_db(
+        settings.database_url,
+        pool_size=settings.database_pool_size,
+        max_overflow=settings.database_max_overflow,
+        connect_timeout=settings.database_connect_timeout,
+        read_timeout=settings.database_read_timeout,
+        pool_timeout=settings.database_pool_timeout,
+        unhealthy_seconds=settings.database_unhealthy_seconds,
+    )
+    try:
+        factory = database.get_session_factory()
+        assert factory is not None
+        async with factory() as session:
+            assert await session.scalar(text("SELECT 1")) == 1
+    finally:
+        await database.close_db()
 
 
 @pytest.mark.asyncio
@@ -117,12 +249,12 @@ def _ownership_process(url, root, lock_path, mode, channel, gate):
             if gate is not None:
                 await asyncio.to_thread(gate.wait)
             if mode == "claim":
-                claim = await builds.claim_build()
+                claim = await builds.claim_build(str(uuid4()), 1)
                 channel.send({"claim": claim["id"] if claim else None, "lease": claim["lease"] if claim else None})
             elif mode == "build":
                 from starlette.requests import Request
 
-                claim = await builds.claim_build()
+                claim = await builds.claim_build(str(uuid4()), 1)
                 assert claim is not None
                 tree = Path(root) / "private-worker" / claim["id"]
                 tree.mkdir(parents=True)

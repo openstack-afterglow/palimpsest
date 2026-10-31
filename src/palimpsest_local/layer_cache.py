@@ -13,6 +13,7 @@ import json
 import os
 import re
 import stat
+import time
 import uuid
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
@@ -23,10 +24,10 @@ from . import registry_intake
 from .errors import ArtifactValidationError
 from .oci_converter import DEFAULT_LAYER_CONVERSION_LIMITS, LAYER_INTAKE_POLICY_ID
 from .oci_image import OCIImageRef, resolve_image, strict_json_object
-from .oci_materializer import materialize_image_hard
+from .oci_materializer import OCIHardWorkerError, materialize_image_hard
 from .oci_packer import (
-    DEFAULT_SQUASHFS_PACK_POLICY,
     SQUASHFS_PACK_POLICY_ID,
+    SquashFSPackProfile,
     discover_squashfs_toolchain,
 )
 from .oci_provenance import Descriptor, Platform
@@ -605,8 +606,23 @@ class LayerCache:
             return self._view(catalog, root)
 
     def materialize(
-        self, root_digest: str, *, packer_path: Path = Path("/usr/bin/mksquashfs"), timeout_seconds: float = 300.0
+        self,
+        root_digest: str,
+        *,
+        packer_path: Path = Path("/usr/bin/mksquashfs"),
+        timeout_seconds: float = 300.0,
+        pack_profile: SquashFSPackProfile = SquashFSPackProfile.CANONICAL,
     ) -> dict[str, Any]:
+        if not isinstance(pack_profile, SquashFSPackProfile):
+            raise LayerCacheError("layer cache pack profile is invalid")
+        if (
+            not isinstance(timeout_seconds, (int, float))
+            or isinstance(timeout_seconds, bool)
+            or not 0 < float(timeout_seconds) < float("inf")
+        ):
+            raise LayerCacheError("layer cache deadline is invalid")
+        deadline = time.monotonic() + float(timeout_seconds)
+        policy = pack_profile.policy
         with self._locked() as (fd, _fresh):
             catalog = self._load(fd)
             snapshot = self._verified(catalog, _digest(root_digest))
@@ -626,7 +642,12 @@ class LayerCache:
                         raise LayerCacheError("layer cache packer changed while identifying it")
                 finally:
                     os.close(packer_fd)
-            toolchain = discover_squashfs_toolchain(packer_path, expected_packer_sha256=digest.hexdigest())
+            toolchain = discover_squashfs_toolchain(
+                packer_path, expected_packer_sha256=digest.hexdigest(), policy=policy
+            )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise OCIHardWorkerError("oci-worker-timeout", "layer cache materialization deadline expired")
             receipt = materialize_image_hard(
                 snapshot,
                 source_cas_root=self.roots.oci_source_cas,
@@ -634,7 +655,8 @@ class LayerCache:
                 store=self._store,
                 packer_path=packer_path,
                 toolchain=toolchain,
-                timeout_seconds=timeout_seconds,
+                timeout_seconds=remaining,
+                pack_profile=pack_profile,
             )
             for ordinal, result in enumerate(receipt.results):
                 occurrence = DerivedLayerOccurrence.from_image(snapshot, ordinal)
@@ -643,7 +665,7 @@ class LayerCache:
                     intake_policy_id=LAYER_INTAKE_POLICY_ID,
                     intake_policy_fingerprint=DEFAULT_LAYER_CONVERSION_LIMITS.fingerprint,
                     pack_policy_id=SQUASHFS_PACK_POLICY_ID,
-                    pack_policy_fingerprint=DEFAULT_SQUASHFS_PACK_POLICY.fingerprint,
+                    pack_policy_fingerprint=policy.fingerprint,
                     toolchain=toolchain,
                 )
                 value = {

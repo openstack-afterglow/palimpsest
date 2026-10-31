@@ -8,9 +8,11 @@ import re
 import tomllib
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 from urllib.parse import urlsplit
+from uuid import UUID
 
-from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from redis.asyncio.connection import SSLConnection, parse_url
 
@@ -31,6 +33,37 @@ def default_project_namespace(project_id: str) -> str:
     return "p-h-" + hashlib.sha256(project_id.encode("ascii")).hexdigest()[:56]
 
 
+DEFAULT_REGISTRY_HOSTS = ("docker.io", "registry-1.docker.io", "ghcr.io", "quay.io")
+
+
+def validate_registry_hosts(values: tuple[str, ...]) -> tuple[str, ...]:
+    """Operators explicitly select registry authorities, never caller-supplied URLs."""
+    if not 1 <= len(values) <= 64 or len(set(values)) != len(values):
+        raise ValueError("registry authorities must be a distinct list of 1..64 hosts")
+    for value in values:
+        parsed = urlsplit("https://" + value)
+        try:
+            port = parsed.port
+        except ValueError:
+            raise ValueError("registry authority port is invalid") from None
+        if (
+            value != value.lower()
+            or len(value) > 259
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path
+            or parsed.query
+            or parsed.fragment
+            or any(character.isspace() for character in value)
+            or (port is not None and not 1 <= port <= 65535)
+            or not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?(?::[0-9]{1,5})?", value)
+            or any(not label or len(label) > 63 for label in parsed.hostname.split("."))
+        ):
+            raise ValueError("registry authorities must be explicit lowercase hostname[:port] values")
+    return values
+
+
 class DatabaseSettings(BaseSettings):
     model_config = SettingsConfigDict(case_sensitive=False, extra="ignore")
 
@@ -38,8 +71,67 @@ class DatabaseSettings(BaseSettings):
     database_pool_size: int = Field(default=10, ge=1, le=100)
     database_max_overflow: int = Field(default=20, ge=0, le=100)
     database_connect_timeout: int = Field(default=10, ge=1, le=120)
+    database_read_timeout: int = Field(default=30, ge=1, le=120)
     database_pool_timeout: int = Field(default=30, ge=1, le=120)
     database_unhealthy_seconds: int = Field(default=30, ge=1, le=3600)
+
+
+class InstanceGpuProfile(BaseModel):
+    """Operator-qualified guest/PCI tuple, never caller-selected host paths."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    image_id: str
+    flavor_id: str = Field(min_length=1, max_length=64, pattern=r"^[a-zA-Z0-9_.-]+$")
+    pci_alias: str = Field(min_length=3, max_length=575)
+    driver_version: str = Field(pattern=r"^[0-9]{3}\.[0-9]{1,3}(?:\.[0-9]{1,3})?$")
+    device_count: int = Field(ge=1, le=16)
+    project_ids: list[str] = Field(min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def exact_gpu_tuple(self) -> InstanceGpuProfile:
+        if str(UUID(self.image_id)) != self.image_id:
+            raise ValueError("GPU guest image must be a canonical UUID")
+        aliases = self.pci_alias.split(",")
+        if (
+            len(aliases) > 8
+            or any(re.fullmatch(r"[a-zA-Z0-9_.-]{1,64}:(?:[1-9]|1[0-6])", item) is None for item in aliases)
+            or len({item.split(":", 1)[0] for item in aliases}) != len(aliases)
+        ):
+            raise ValueError("GPU PCI aliases must be distinct exact alias:count pairs")
+        if len(set(self.project_ids)) != len(self.project_ids) or any(
+            UUID(identity).hex != identity for identity in self.project_ids
+        ):
+            raise ValueError("GPU project_ids must be distinct canonical OpenStack UUID hex identifiers")
+        return self
+
+
+class InstanceClusterProfile(BaseModel):
+    """Explicit whole-VM root privilege qualification for the fixed k3s runtime."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+    image_id: str
+    flavor_ids: tuple[str, ...] = Field(min_length=1, max_length=64)
+    project_ids: tuple[str, ...] = Field(min_length=1, max_length=64)
+
+    @field_validator("flavor_ids", "project_ids", mode="before")
+    @classmethod
+    def json_sequences(cls, value):
+        return tuple(value) if isinstance(value, list) else value
+
+    @model_validator(mode="after")
+    def exact_cluster_tuple(self) -> InstanceClusterProfile:
+        if str(UUID(self.image_id)) != self.image_id:
+            raise ValueError("Cluster guest image must be a canonical UUID")
+        if len(set(self.flavor_ids)) != len(self.flavor_ids) or any(
+            re.fullmatch(r"[a-zA-Z0-9_.-]{1,64}", item) is None for item in self.flavor_ids
+        ):
+            raise ValueError("Cluster flavors must be distinct bounded identifiers")
+        if len(set(self.project_ids)) != len(self.project_ids) or any(
+            UUID(item).hex != item for item in self.project_ids
+        ):
+            raise ValueError("Cluster projects must be distinct canonical OpenStack UUID hex identifiers")
+        return self
 
 
 class Settings(DatabaseSettings):
@@ -59,6 +151,21 @@ class Settings(DatabaseSettings):
     # The control plane admits remote builds only when a worker secret is configured.
     palimpsest_hub_build_worker_key: SecretStr = SecretStr("")
     palimpsest_hub_build_timeout_seconds: int = Field(default=3600, ge=60, le=3600)
+    palimpsest_hub_registry_hosts: tuple[str, ...] = DEFAULT_REGISTRY_HOSTS
+    palimpsest_hub_image_run_network: Literal["none", "default"] = "none"
+    palimpsest_hub_image_cgroup_root: str = "/sys/fs/cgroup"
+    palimpsest_hub_max_context_bytes: int = Field(default=16 * 1024**2, ge=1, le=1024**3)
+    palimpsest_hub_max_context_expanded_bytes: int = Field(default=256 * 1024**2, ge=1, le=32 * 1024**3)
+    palimpsest_hub_max_context_members: int = Field(default=10000, ge=1, le=250000)
+    palimpsest_hub_instance_bootstrap_ttl_seconds: int = Field(default=3600, ge=60, le=86400)
+    palimpsest_hub_max_instances_per_project: int = Field(default=16, ge=1, le=1000)
+    palimpsest_hub_instance_max_boot_gib: int = Field(default=256, ge=1, le=4096)
+    palimpsest_hub_instance_max_writable_gib: int = Field(default=64, ge=1, le=1024)
+    # Operators may qualify an unannotated Glance image only by exact content hash.
+    palimpsest_hub_instance_base_images: dict[str, dict[str, str]] = Field(default_factory=dict)
+    palimpsest_hub_instance_gpu_profiles: dict[str, InstanceGpuProfile] = Field(default_factory=dict)
+    palimpsest_hub_instance_cluster_profiles: dict[str, InstanceClusterProfile] = Field(default_factory=dict)
+    palimpsest_hub_instance_ca_certificates: tuple[str, ...] = ()
     palimpsest_hub_package_forbidden_project_ids: tuple[str, ...] = ()
     palimpsest_hub_package_forbidden_user_ids: tuple[str, ...] = ()
     palimpsest_hub_package_namespace_bindings: dict[str, str] = Field(default_factory=dict)
@@ -84,6 +191,88 @@ class Settings(DatabaseSettings):
     os_reader_username: str = ""
     os_reader_password: SecretStr = SecretStr("")
     os_reader_user_domain_name: str = "Default"
+
+    @field_validator("palimpsest_hub_registry_hosts")
+    @classmethod
+    def registry_hosts(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return validate_registry_hosts(value)
+
+    @field_validator("palimpsest_hub_instance_base_images")
+    @classmethod
+    def qualified_base_images(cls, value: dict[str, dict[str, str]]) -> dict[str, dict[str, str]]:
+        if len(value) > 64:
+            raise ValueError("at most 64 content-pinned instance base images are allowed")
+        for identity, record in value.items():
+            if str(UUID(identity)) != identity or set(record) != {
+                "architecture",
+                "os_type",
+                "os_hash_algo",
+                "os_hash_value",
+            }:
+                raise ValueError("qualified base image requires UUID, architecture, Linux and immutable Glance hash")
+            algorithm = record["os_hash_algo"]
+            size = {"sha256": 64, "sha512": 128}.get(algorithm)
+            if (
+                record["architecture"] != "x86_64"
+                or record["os_type"] != "linux"
+                or size is None
+                or re.fullmatch(r"[0-9a-f]{" + str(size) + r"}", record["os_hash_value"]) is None
+            ):
+                raise ValueError("qualified base image content and target are invalid")
+        return value
+
+    @field_validator("palimpsest_hub_instance_gpu_profiles")
+    @classmethod
+    def qualified_gpu_profiles(cls, value: dict[str, InstanceGpuProfile]) -> dict[str, InstanceGpuProfile]:
+        if len(value) > 64 or any(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", key) is None for key in value):
+            raise ValueError("GPU qualification requires at most 64 bounded profile identifiers")
+        return value
+
+    @field_validator("palimpsest_hub_instance_cluster_profiles")
+    @classmethod
+    def qualified_cluster_profiles(cls, value: dict[str, InstanceClusterProfile]) -> dict[str, InstanceClusterProfile]:
+        if len(value) > 64 or any(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", key) is None for key in value):
+            raise ValueError("Cluster qualification requires at most 64 bounded profile identifiers")
+        return value
+
+    @model_validator(mode="after")
+    def cluster_images_are_content_pinned(self) -> Settings:
+        if any(
+            profile.image_id not in self.palimpsest_hub_instance_base_images
+            for profile in self.palimpsest_hub_instance_cluster_profiles.values()
+        ):
+            raise ValueError("Every cluster profile requires an exact content-pinned instance base image")
+        return self
+
+    @model_validator(mode="after")
+    def gpu_images_are_content_pinned(self) -> Settings:
+        if any(
+            profile.image_id not in self.palimpsest_hub_instance_base_images
+            for profile in self.palimpsest_hub_instance_gpu_profiles.values()
+        ):
+            raise ValueError("Every GPU profile requires an exact content-pinned instance base image")
+        return self
+
+    @field_validator("palimpsest_hub_instance_ca_certificates")
+    @classmethod
+    def instance_ca_certificates(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) > 4 or any(
+            len(cert.encode()) > 16384
+            or not cert.startswith("-----BEGIN CERTIFICATE-----\n")
+            or not cert.rstrip().endswith("-----END CERTIFICATE-----")
+            for cert in value
+        ):
+            raise ValueError("instance trust requires at most four bounded PEM CA certificates")
+        return value
+
+    @field_validator("palimpsest_hub_image_cgroup_root")
+    @classmethod
+    def image_cgroup_root(cls, value: str) -> str:
+        path = Path(value)
+        root = Path("/sys/fs/cgroup")
+        if "\x00" in value or ".." in path.parts or not (path == root or root in path.parents):
+            raise ValueError("image cgroup root must stay within the worker cgroup namespace")
+        return value
 
     @field_validator("redis_sentinel_addresses")
     @classmethod
@@ -216,13 +405,34 @@ class Settings(DatabaseSettings):
 class BuildWorkerSettings(BaseSettings):
     """A remote executor has HTTPS access and local scratch, never control-plane credentials."""
 
-    model_config = SettingsConfigDict(case_sensitive=False, extra="ignore")
+    model_config = SettingsConfigDict(case_sensitive=False, extra="ignore", hide_input_in_errors=True)
 
     palimpsest_hub_url: str
     palimpsest_hub_build_worker_key_file: str
     palimpsest_hub_build_work_path: str
     palimpsest_hub_build_timeout_seconds: int = Field(default=3600, ge=60, le=3600)
     palimpsest_hub_max_blob_bytes: int = Field(default=107374182400, ge=1)
+    palimpsest_hub_registry_hosts: tuple[str, ...] = DEFAULT_REGISTRY_HOSTS
+    palimpsest_hub_image_run_network: Literal["none", "default"] = "none"
+    palimpsest_hub_image_cgroup_root: str = "/sys/fs/cgroup"
+    palimpsest_hub_image_scratch_bytes: int = Field(default=4 * 1024**3, ge=256 * 1024**2, le=64 * 1024**3)
+    palimpsest_hub_max_context_bytes: int = Field(default=16 * 1024**2, ge=1, le=1024**3)
+    palimpsest_hub_max_context_expanded_bytes: int = Field(default=256 * 1024**2, ge=1, le=32 * 1024**3)
+    palimpsest_hub_max_context_members: int = Field(default=10000, ge=1, le=250000)
+
+    @field_validator("palimpsest_hub_registry_hosts")
+    @classmethod
+    def registry_hosts(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return validate_registry_hosts(value)
+
+    @field_validator("palimpsest_hub_image_cgroup_root")
+    @classmethod
+    def image_cgroup_root(cls, value: str) -> str:
+        path = Path(value)
+        root = Path("/sys/fs/cgroup")
+        if "\x00" in value or ".." in path.parts or not (path == root or root in path.parents):
+            raise ValueError("image cgroup root must stay within the worker cgroup namespace")
+        return value
 
     @field_validator("palimpsest_hub_url")
     @classmethod

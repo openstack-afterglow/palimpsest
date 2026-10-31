@@ -23,6 +23,7 @@ from palimpsest_hub.api.hub import (
     _factory_or_503,
     _grant_layer_access,
     _locked_blob,
+    _locked_blobs,
     _locked_file,
     _registration_conflicts,
     _run_blocking,
@@ -32,6 +33,7 @@ from palimpsest_hub.api.hub import (
 )
 from palimpsest_hub.config import get_settings
 from palimpsest_hub.models import PalimpsestHubBuild, PalimpsestHubLayer
+from palimpsest_hub.services import claim_recovery
 from palimpsest_hub.services.digest import compute_config_digest
 from palimpsest_hub.services.hub_store import MEDIA_TYPE_LAYER_SQUASHFS, HubStoreError
 from palimpsest_hub.services.worker_leases import sql_mutex
@@ -138,9 +140,13 @@ async def _inputs(session, store, job: PalimpsestHubBuild) -> list[PalimpsestHub
     return rows
 
 
-async def claim_build() -> dict | None:
+async def claim_build(channel: str, sequence: int, *, recover: bool = False) -> dict | None:
     store = _store_or_503()
     async with _global_lock(store) as session:
+        cursor, settled = await claim_recovery.prepare(session, "recipe", channel, sequence)
+        if recover or settled:
+            await session.commit()
+            return claim_recovery.settlement(cursor) if recover else cursor.result_json
         active = (
             await session.scalars(
                 select(PalimpsestHubBuild).where(PalimpsestHubBuild.status == "building").with_for_update()
@@ -198,6 +204,7 @@ async def claim_build() -> dict | None:
                 ],
                 "max_output_bytes": get_settings().palimpsest_hub_max_blob_bytes,
             }
+            cursor.result_json = result
             await session.commit()
             return result
         await session.commit()
@@ -294,6 +301,7 @@ async def upload_output(build_id: str, lease: str, request: Request, expected: s
                     raise HTTPException(status_code=409, detail="completed build output conflicts")
                 # Receipt retries cannot hold staging and its lock indefinitely.
                 deadline = _now() + timedelta(seconds=get_settings().palimpsest_hub_build_timeout_seconds)
+            input_digests = [job.base_digest, *job.layer_digests]
         staging_id = uuid4().hex
         try:
             await _run_blocking(store.start_upload, staging_id)
@@ -322,8 +330,8 @@ async def upload_output(build_id: str, lease: str, request: Request, expected: s
             finalized = await _run_blocking(store.inspect_file, staged, max_bytes=size)
             if finalized.blob_digest != expected or not await _run_blocking(_squashfs_magic, staged):
                 raise HTTPException(status_code=422, detail="build output digest or SquashFS magic mismatch")
-            # Digest lock spans durable CAS publication and the SQL reference commit.
-            async with _locked_blob(store, expected), _global_lock(store) as session:
+            # Stable source descriptors and output publication share lexical CAS locks.
+            async with _locked_blobs(store, [expected, *input_digests]), _global_lock(store) as session:
                 job = await _owned(session, build_id, lease)
                 if job.status == "complete":
                     if (job.output_digest, job.output_size_bytes) != (expected, size):

@@ -9,6 +9,9 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.exc import NoSuchTableError
 from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 
+# Keep the complete destination metadata available to offline migration callers.
+from palimpsest_hub import image_models, instance_models  # noqa: F401
+
 _TABLES = (
     "palimpsest_hub_layers",
     "palimpsest_hub_layer_access",
@@ -16,6 +19,11 @@ _TABLES = (
     "palimpsest_image_exports",
     "palimpsest_image_export_delegations",
     "palimpsest_hub_builds",
+    "palimpsest_worker_claims",
+    "palimpsest_hub_build_contexts",
+    "palimpsest_hub_image_jobs",
+    "palimpsest_hub_instances",
+    "palimpsest_runtime_blob_references",
     "palimpsest_package_namespaces",
     "palimpsest_packages",
     "palimpsest_package_keys",
@@ -68,7 +76,12 @@ async def migrate(source_url: str, destination_url: str, *, dry_run: bool = Fals
                     if table_name not in {
                         "palimpsest_hub_layer_access",
                         "palimpsest_hub_builds",
+                        "palimpsest_worker_claims",
                         "palimpsest_image_export_delegations",
+                        "palimpsest_hub_build_contexts",
+                        "palimpsest_hub_image_jobs",
+                        "palimpsest_hub_instances",
+                        "palimpsest_runtime_blob_references",
                     } and not table_name.startswith(("palimpsest_package_", "palimpsest_packages")):
                         raise
                     copied[table_name] = 0

@@ -488,7 +488,7 @@ async def upload_io(operation, *args):
 
 
 async def rollback_created(blob_store, digests):
-    # Called with sorted digest locks held. Unknown commit outcome retains data.
+    # Called with sorted digest locks held, before commit or after a confirmed commit.
     for digest in reversed(digests):
         try:
             async with factory()() as session:
@@ -760,6 +760,7 @@ async def finalize_upload(actor, namespace, package, upload_id, resource):
             row.updated_at = now()
             row.expires_at = now() + _IDLE
             await session.commit()
+        commit_started = False
         try:
             await _run_blocking(blob_store.reconcile_upload, upload_id, data["archive_size_bytes"])
             archive = await _run_blocking(
@@ -845,12 +846,14 @@ async def finalize_upload(actor, namespace, package, upload_id, resource):
                             upload.status = "complete"
                             upload.result = result
                             upload.updated_at = now()
+                            commit_started = True
                             await session.commit()
                         # An idempotent re-push may carry a distinct archive for an existing root.
                         # Retain only references committed by this or another independent publication.
                         await rollback_created(blob_store, created)
                     except BaseException:
-                        await rollback_created(blob_store, created)
+                        if not commit_started:
+                            await rollback_created(blob_store, created)
                         raise
             try:
                 await _run_blocking(blob_store.abort_upload, upload_id)
@@ -858,16 +861,20 @@ async def finalize_upload(actor, namespace, package, upload_id, resource):
                 _logger.warning("committed native upload staging could not be removed")
             return result, changed
         except (PackageContentError, HubStoreError, ValueError) as exc:
+            if commit_started:
+                raise
             await fail_upload(upload_id)
             status = 413 if isinstance(exc, (HubStoreLimit, PackageContentLimitError)) else 422
             raise RegistryError(status, "CONTENT_INVALID", "archive or selected graph validation failed") from None
         except BaseException:
-            # Retryable tag/identity/SQL failures retain verified staging, not stale approval.
-            async with factory()() as session:
-                upload = await session.get(PackageUpload, upload_id)
-                if upload and upload.status == "validating":
-                    upload.status = "uploading"
-                    await session.commit()
+            # Once commit starts, even an absent reference may precede a late commit.
+            if not commit_started:
+                # Retryable pre-commit failures retain verified staging, not stale approval.
+                async with factory()() as session:
+                    upload = await session.get(PackageUpload, upload_id)
+                    if upload and upload.status == "validating":
+                        upload.status = "uploading"
+                        await session.commit()
             raise
 
 

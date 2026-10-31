@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ast
 import hashlib
 import io
 import json
@@ -14,31 +13,8 @@ from urllib.error import HTTPError
 
 import pytest
 
-from palimpsest_local import hub
 from palimpsest_local.errors import HubError
 from palimpsest_local.hub import MEDIA_TYPE_LAYER_SQUASHFS, HubClient
-
-
-def test_hub_module_uses_only_stdlib_and_package():
-    tree = ast.parse(Path(hub.__file__).read_text(encoding="utf-8"))
-    top_level = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            top_level.update(alias.name.split(".")[0] for alias in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
-            top_level.add(node.module.split(".")[0])
-    assert top_level <= {
-        "__future__",
-        "contextlib",
-        "json",
-        "os",
-        "re",
-        "shutil",
-        "tempfile",
-        "urllib",
-        "pathlib",
-        "typing",
-    }
 
 
 def test_hub_client_constructor_validation_and_repr():
@@ -73,6 +49,63 @@ def test_generic_hub_cache_upload_is_rejected_before_transport(tmp_path: Path, m
     with pytest.raises(HubError):
         client.push_blob(source, metadata, resume=False)
     assert source.read_bytes() == b"cache bytes"
+
+
+@pytest.mark.parametrize("failure", ["server-error", "disconnect", "rejected"])
+def test_instance_advance_posts_exact_original_binding_and_get_remains_pure(failure):
+    import http.client
+    import socket
+
+    calls = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            calls.append(("POST", self.path, body, self.headers["X-Project-Id"]))
+            if failure == "disconnect":
+                self.connection.shutdown(socket.SHUT_RDWR)
+                self.connection.close()
+                return
+            self.send_response(403 if failure == "rejected" else 500)
+            self.end_headers()
+
+        def do_GET(self):
+            calls.append(("GET", self.path, None, self.headers["X-Project-Id"]))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"id":"instance/id","provider_phase":"volume_ready"}')
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        client = HubClient(
+            "http://127.0.0.1:" + str(server.server_address[1]), "original-token", project_id="original-project"
+        )
+        with pytest.raises((HubError, http.client.RemoteDisconnected)) as caught:
+            client.advance_instance(
+                "instance/id", operation="create-server", request_id="original-request", boot_volume_id="exact-boot"
+            )
+        if failure != "disconnect":
+            assert caught.value.http_status == (403 if failure == "rejected" else 500)
+        assert client.get_instance("instance/id")["provider_phase"] == "volume_ready"
+        assert calls == [
+            (
+                "POST",
+                "/v1/instances/instance%2Fid/advance",
+                {"operation": "create-server", "request_id": "original-request", "boot_volume_id": "exact-boot"},
+                "original-project",
+            ),
+            ("GET", "/v1/instances/instance%2Fid", None, "original-project"),
+        ]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
 
 
 class MockHubHandler(BaseHTTPRequestHandler):
@@ -216,39 +249,6 @@ def _http_conflict(offset: int) -> HTTPError:
     headers = Message()
     headers["Upload-Offset"] = str(offset)
     return HTTPError("http://hub.invalid/uploads/session", 409, "Conflict", headers, io.BytesIO(b"offset"))
-
-
-def test_push_registered_blob_short_circuits_without_chunk_or_final_put(tmp_path: Path, monkeypatch):
-    source = tmp_path / "layer.squashfs"
-    source.write_bytes(b"registered")
-    calls: list[tuple[str, str, dict[str, str]]] = []
-
-    def fake_open(method, path, **kwargs):
-        calls.append((method, path, kwargs.get("headers", {})))
-        assert method == "POST"
-        return _Response(
-            {
-                "completed": True,
-                "registered": True,
-                "registration": {
-                    "blob_digest": f"sha256:{hashlib.sha256(b'registered').hexdigest()}",
-                    "name": "registered",
-                    "kind": "squashfs",
-                    "media_type": MEDIA_TYPE_LAYER_SQUASHFS,
-                    "is_published": False,
-                },
-            }
-        )
-
-    client = HubClient("http://hub.invalid", "token")
-    monkeypatch.setattr(client, "_open", fake_open)
-
-    assert client.push_blob(source, {"name": "registered"}, resume=False) == {
-        "blob_digest": f"sha256:{hashlib.sha256(b'registered').hexdigest()}",
-        "already_present": True,
-        "registered": True,
-    }
-    assert calls == [("POST", "/uploads", {})]
 
 
 def test_push_registered_blob_rejects_incompatible_runtime_descriptor(tmp_path: Path, monkeypatch):

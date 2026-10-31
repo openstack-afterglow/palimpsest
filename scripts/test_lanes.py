@@ -49,13 +49,16 @@ PORTABLE_FILES = {
         cloud_runtime cloud_runtime_arch cloudinit_guest experimental_oci_vm kvm_contract lima pci_preflight
         named_volumes retained_instances oci_volume_policy nova_build nova_metrics
         environment_benchmark benchmark_workflow benchmark_openstack benchmark_reporting
+        benchmark_scenarios benchmark_scenario_cloud benchmark_scenario_peer benchmark_scenario_workloads
+        benchmark_tensorflow_context
+        benchmark_station_cli benchmark_station_cloud benchmark_station_disk benchmark_station_measurements
         platforms process_session project project_adapter project_runtime project_volumes oci_host
         oci_run_request oci_run_adapter oci_public_cli oci_resource_status oci_docker_hub_cli_live_contract
         oci_docker_hub_services_live_contract oci_ml_cpu_live_contract oci_network oci_network_live_contract
         oci_exec_cli_live_contract oci_stdio_cli_live_contract
     """),
     "build-registry": _units(
-        "build buildkit docker_hub hub_builder hub_contract registry packages package_credentials remote_artifacts"
+        "build buildkit docker_hub hub_builder hub_image_builder hub_contract registry packages package_credentials remote_artifacts"
     ),
     "oci-store": _units("""
         oci_changeset oci_convert_security oci_converter_first_pass oci_image oci_root_volume_inventory
@@ -124,6 +127,10 @@ SPECIAL_FILES = {
             "database_pool",
             "hub_api",
             "image_exports",
+            "image_jobs",
+            "image_executor",
+            "instances",
+            "execution_boundaries",
             "export_delegation",
             "migrate",
             "upload_limits",

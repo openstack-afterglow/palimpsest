@@ -1,5 +1,109 @@
 # Fast feedback without dropping coverage
 
+## GPU and fixed API-cluster candidate — 2026-10-30
+
+Changed-node validation uses the separate root and Hub configurations, never a
+combined root collection that loses Hub's async-fixture mode. Latest complete Hub
+run1226passed/7skipped; root focused402passed. Five canonical Docker targets built
+and executed for API/exportarm64+amd64 and build-workeramd64. Actual installed
+runtime hashes match source; arm64 was native andamd64 emulated. No container
+health/OpenAPI/import check is a two-node or GPU numerical result.
+
+Unprivileged networkless/read-only Linux smoke exercised real streaming overflow,
+trickle deadlines, escaped sessions, direct-child reaping and preservation of live
+adopted k3s children during command-local cleanup. The fixed CUDA source compiled
+real sm61/sm89 cubins with nvcc12.6.85. Neither proof ran GPU arithmetic or a live
+Kubernetes workload. A representative four-layer cluster cloud-init consumed60052
+of65535Nova bytes; admission still rejects larger bootstrap payloads before create.
+
+The first full-root run retained8702pass/305skip/two failures: missinguv on the
+explicit PATH, and simulated shared ancestor ctime affected by unrelated `/tmp`
+churn. Only the test fixture freezes non-target simulated ctime; production guard
+and real-target mutation detection remain unchanged. The corrected focused42cases
+passed. The corrected complete root gate then passed8704tests/305skipped in497.73s;
+skipped native proofs remain unqualified and both initial failures remain recorded.
+
+Actual Ada8CPU/16GiB guest boot/SMI succeeded, vendor injection tools were missing,
+and the separately approved builder rebuild failed at the provider. Cold/warm GPU
+and k3s acceptance require actual externally controlled deployed-API consumers and
+their sealed numerical/provenance/lifecycle proofs. Historical n1/N5 matrices,
+portable results and the still-blocked worker disk do not supply those samples.
+
+## Full-current integration — 2026-10-30
+
+Canonical full-root entrypoint is `uv run python scripts/test_lanes.py run full`
+(`python -m pytest`), not the console-script launcher with a different import path.
+Pre-final-review baseline:8574passed/272skipped in610.63s. That result does not
+qualify the later six review corrections. Their regression cases exercise original
+API delete journals, accepted/lost responses, no early budget release, before/after
+intent expiry, station Cinder allocation expiry, definite no-call cleanup and
+interrupted disk-latest publication without reprobes. Parent demonstrated18scenario
+failures and5station failures/1control pass against the frozen pre-fix source;
+corrected scenario45 and station cloud/disk125 cases passed separately. The final
+complete root run is recorded in the latest handoff when settled.
+
+An actual owned loopback authentication smoke made1plaintext HTTP request from
+the old acceptance-script path, then the corrected shared helper rejected the HTTP
+endpoint before0requests. All credentials were synthetic; no real endpoint/token
+was used. Initial reproduction hit ambient SDK configuration instead and is not
+claimed as transport proof. The temporary config/directory guard smoke exercised
+real filesystem identity and rename/removal distinctions, not a real VM deletion.
+
+API/export source is byte-identical to pushed `5c9a30b`, so its canonical1127/2Hub
+proof remains bound to those bytes. The integrated five-image matrix passed;
+the worker alone was rebuilt after companion scenario/station fixes and its four
+corrected installed modules were hash-matched to source. All image smokes used
+networknone/read-only containers, and amd64 execution was emulated. No new
+privileged kernel, native-cloud, GPU, provider isolation or production proof is
+implied by these source-integration checks.
+
+
+## Hub execution API candidate — 2026-10-29
+
+This source-only feature branch adds layer PATCH, durable image-job and instance
+APIs. It does not release a new package, deploy services or implement the target
+Manila-managed CephFS runtime. Start with the changed-node checks and canonical
+Hub environment; pytest includes `../src` for the dedicated worker's companion
+tests without adding client dependencies to the Hub controller package:
+
+```sh
+uv sync --frozen --extra dev --extra cloud
+uv sync --project hub --frozen --extra dev
+uv run --project hub pytest -q hub/tests
+uv run python scripts/test_lanes.py run build-registry
+uv run pytest -q tests/test_kolla_remote_build.py tests/unit/test_architecture_guard.py tests/unit/test_test_lanes.py
+uv run python scripts/test_lanes.py list --check
+uv run python scripts/generate_cli_reference.py --check
+```
+
+Fresh remediated-source checkpoints: Hub1127passed/2skipped, build-registry575
+passed/4skipped and Kolla/guard/lane164passed. Ruff lint/format, root/Hub
+wheel/sdist builds and minimumPython3.11 imports passed. Canonical Dockerfile
+builds and network-none real health/OpenAPI smokes covered API/export arm64 and
+amd64 plus the amd64 build worker; x86 execution used local emulation, not a
+native amd64 worker. The registered main app also served real host-loopback
+requests against temporary SQLite/CAS and synthetic identity: context bytes,
+registry request-id idempotency, Dockerfile admission, conflict409, cross-project
+404 and wrong-subject403 passed. These are not live Keystone/provider effects.
+
+The separately approved single privileged local container ran the exact
+`test_native_scratch_bounds_temp_kill_journal_and_exact_loop_cleanup` body via a
+standard-library launcher: real256MiB preallocation, many-file ENOSPC, writable
+outer journal/output reserve, killed temporary-state containment and exact loop
+detachment passed within264MiB peak new data. The container had1GiB RAM/128PIDs,
+networknone and no host binds; its settled container/private volume were removed
+and absence checked. Evidence remains private under
+`~/.local/share/palimpsest-proofs/hub-api-push-20261029/`.
+
+The permanent Linux scratch regression is opt-in via
+`PALIMPSEST_IMAGE_SCRATCH_LINUX_SMOKE=1`; it requires a separately authorized
+disposable root Linux environment with mount/loop permissions and non-CoW
+ext4/xfs/tmpfs backing. Do not enable it on a shared host implicitly. Existing
+detached-session cgroup cleanup tests need their separate delegated-cgroup
+prerequisites and were not newly qualified by the scratch proof. No cloud VM,
+GPU, production schema, Manila grant/revocation or deployment proof is claimed.
+
+
 ## Supervisor frame-commitment qualification — 2026-10-27
 
 Patch0.3.9 is prepared from fetched origin/dev `73667c8f4065215416e775f12cb0a6f578853044` (published0.3.8). Native amd64 control exposed a real equal-metadata non-tail rewrite defect despite hosted release success; the previous receipt remains unchanged under `~/.local/share/afterglow-proofs/palimpsest-qualification-20261026/release-stall/native-amd64-server/`. Compact trusted frame commitments repair requested-frame integrity, not instant auditing of unrequested history. Deterministic coarse-stamp tests preserve actual file bytes, inode/path/ownership checks; stamp-change tests explicitly advance mtime rather than depending on clock resolution.
@@ -2125,6 +2229,25 @@ resource bounds, and non-GPU scope.
 Keep the SHA, selected lanes/shards, platform, pass/skip counts and elapsed time
 with each result. Do not report a selected subset as a full regression.
 
+
+## Integrated native-selection guards — 2026-10-30 source
+
+The current integration retains `host_vm_control.py` and `retained_instances.py`
+as the host-removal/retention implementation; it does not restore a parallel
+`vm_removal.py`. It carries forward safe owned Lima configuration/protected-state
+binding, descriptor-pinned deletion checks across rename, and libvirt native
+backend/lifecycle-marker classification with inactive TPM retention preflight.
+Existing default root/firmware/topology retention, separately confirmed
+owned-instance purge, independent named data disks and console capabilities
+remain the current contracts described in [CLI usage](cli/usage.md).
+
+Parent qualification must cover the focused host-inventory/host-VM-control,
+retained-instance, inventory and UI regressions, including changed config/state,
+renamed selected native directories, backend/marker disagreement and unsupported TPM
+retention before any stop/undefine effect. No checks or native lifecycle effects
+were run in this documentation-integration slice. The dated receipt below
+remains evidence only for its original source; its pass counts and observed
+host state do not qualify these integrated guards or a deployed service.
 
 ## External host VM removal — 2026-10-16
 
