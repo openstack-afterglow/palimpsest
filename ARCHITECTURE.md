@@ -2109,9 +2109,9 @@ provider provisioning. Fresh multi-instance evidence is recorded separately.
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "e5e0a3d0dcf0680fe718d2a41709ef40b583d3ca0a0f4063a7b1806d08518b9b",
-  "reviewed_at": "2026-10-31T10:51:15Z",
-  "summary": "Reviewed officialAPI Cinder-only admission andexplicit boundcreate-server/delete-volume advance; GETneverproviderwrites, noNova/Cinder/GPUhosttimeoutmutation. Durablestrictversionedprivatephase/refenceaftercommit, originalsubject/expiry/payload+qualification, atomicknownnocall, unknownPOST/COMMITno-replay, exactmetadata/literal404/Cinder-onlycleanup history retained; everyrootclient/poller/cleanup/smoke migrated. Hub1396pass7skip317.80s, instances247pass5skip14.04s, root265pass7.09s, realPython3.12 TCPHTTPactualrouter/SQLite/CAS smoke passed withsyntheticidentity/provider, independentwholeproductreviewclean0.93. Privatefinal17syntheticpass0.207s/noGPUeffects. ActualpriorCUDAimage95d9complete11layers butGPUconsumerVolumeNotCreated186s vsCinder599sfailed; exactownedorphanordinarydelete+404proved/1spent80notrefunded. Native191/role30/CI/pairedrestore/canonicalcontrollercutover andactualGPUcuDNN stillpending; worker7cretained."
+  "source_sha256": "94f84860870edec8162bcb3a0dc5566449c72d62f159779267ab3840654eb180",
+  "reviewed_at": "2026-10-31T10:54:40Z",
+  "summary": "Finalexactabsencecorrection: legacyknownservermissing cannotterminaldeleteunboundrootUUIDorSDKNone. Unboundrootretaineddeleting/provider_boot_volume_unknown, boundNone502, onlyliteralCindergetexact404 deleted. Independentdelta/callerscorrect; finalallinstances253pass5skip12.99s+lintpass/formatted6boundarycases. EarliercombinedAPI/rootqualification retained(Hub1396pass7skip317.80s/root265pass/realTCPsyntheticproviderHTTPpassed/private17pass), finalhostedfullsuitependingcorrectedsuccessor. No effects releasedonsuperseded1a/e87, noGPU/newresources/refund/replay, oldworker7cretained."
 }
 ```
 <!-- architecture-review:end -->

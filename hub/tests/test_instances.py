@@ -821,6 +821,59 @@ async def test_deleted_server_retains_capacity_until_bound_volume_disappears(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("via", ["observe", "delete"])
+@pytest.mark.parametrize("root_observation", ["unbound", "none", "404"])
+async def test_legacy_missing_server_requires_bound_root_actual_404(instance_hub, monkeypatch, via, root_observation):
+    h = instance_hub
+    h.settings.palimpsest_hub_max_instances_per_project = 1
+    item = (await create_and_advance(h, json=request_body())).json()
+    path = "/v1/instances/" + item["id"]
+    server = h.provider.servers_by_id.pop(item["server_id"])
+    volume_id = server["volume_id"]
+    async with h.factory() as session:
+        row = await session.get(PalimpsestHubInstance, item["id"])
+        row.spec_json = {key: val for key, val in row.spec_json.items() if key != "_boot_prepare"}
+        row.boot_volume_id = None if root_observation == "unbound" else volume_id
+        if via == "observe":
+            row.status = "deleting"
+        await session.commit()
+    original_get_volume = h.provider.get_volume
+    if root_observation == "none":
+
+        def unavailable(identity):
+            assert identity == volume_id
+            return None
+
+        monkeypatch.setattr(h.provider, "get_volume", unavailable)
+    elif root_observation == "404":
+        h.provider.volumes_by_id.pop(volume_id)
+    response = await (h.client.get(path) if via == "observe" else h.client.delete(path))
+    assert response.status_code == (502 if root_observation == "none" else 200 if via == "observe" else 202)
+    async with h.factory() as session:
+        row = await session.get(PalimpsestHubInstance, item["id"])
+        if root_observation == "404":
+            assert row.status == "deleted" and row.boot_volume_id == volume_id
+        else:
+            assert row.status != "deleted"
+            if root_observation == "unbound":
+                assert row.status == "deleting" and row.error_code == "provider_boot_volume_unknown"
+                assert row.boot_volume_id is None
+            else:
+                assert row.boot_volume_id == volume_id
+    if root_observation != "404":
+        observed = await h.client.get(path)
+        assert observed.status_code == (502 if root_observation == "none" and via == "observe" else 200)
+        if observed.status_code == 200:
+            assert observed.json()["status"] != "deleted"
+        assert (await h.client.post("/v1/instances", json=request_body())).status_code == 429
+        assert volume_id in h.provider.volumes_by_id
+    else:
+        monkeypatch.setattr(h.provider, "get_volume", original_get_volume)
+        assert (await h.client.post("/v1/instances", json=request_body())).status_code == 202
+    assert h.provider.deletes == [] and h.provider.volume_deletes == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("via", ["observe", "delete"])
 async def test_volume_observation_failure_never_fabricates_absence_or_frees_capacity(instance_hub, monkeypatch, via):
     h = instance_hub
     h.settings.palimpsest_hub_max_instances_per_project = 1

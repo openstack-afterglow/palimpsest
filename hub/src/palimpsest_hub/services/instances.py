@@ -961,18 +961,20 @@ def inspect_boot_volume(conn, row, server, *, deleting=False):
 
 
 async def settle_missing_server(row, conn):
-    if row.boot_volume_id is not None:
-        try:
-            volume = await run_blocking(conn.block_storage.get_volume, row.boot_volume_id)
-        except Exception as exc:
-            if getattr(exc, "status_code", None) == 404:
-                volume = None
-            else:
-                raise HTTPException(502, "Provider boot volume observation unavailable") from None
-        if volume is not None:
-            row.status, row.error_code = "deleting", "provider_boot_volume_pending"
+    row.capability_hash = None
+    if row.boot_volume_id is None:
+        row.status, row.error_code = "deleting", "provider_boot_volume_unknown"
+        return  # Missing Nova does not identify or prove absence of its old root.
+    try:
+        volume = await run_blocking(conn.block_storage.get_volume, row.boot_volume_id)
+    except Exception as exc:
+        if getattr(exc, "status_code", None) == 404:
+            row.status, row.error_code = "deleted", None
             return
-    row.status, row.error_code, row.capability_hash = "deleted", None, None
+        raise HTTPException(502, "Provider boot volume observation unavailable") from None
+    if volume is None:
+        raise HTTPException(502, "Provider did not prove boot volume presence or absence")
+    row.status, row.error_code = "deleting", "provider_boot_volume_pending"
 
 
 async def dispose_prepared_volume(session, row, actor, conn, *, allow_delete=False):
