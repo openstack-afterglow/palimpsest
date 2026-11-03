@@ -12,6 +12,7 @@ import struct
 import sys
 import tarfile
 import tempfile
+import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import replace
@@ -1319,6 +1320,21 @@ def test_parent_worker_boundary_terminates_and_reaps_timed_out_group(tmp_path: P
         os.kill(process.pid, signal.SIGCONT)
 
 
+def _wait_for_descendant_ready(process, pid_file: Path) -> None:
+    # The PID is published after the child's TERM handler is installed. Arm the
+    # boundary against that real descendant, not Python startup scheduling.
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        try:
+            if pid_file.read_text(encoding="utf-8").isdecimal():
+                return
+        except FileNotFoundError:
+            pass
+        assert process.poll() is None, "worker leader exited before descendant readiness"
+        time.sleep(0.01)
+    raise AssertionError("worker descendant did not publish its readiness PID")
+
+
 @pytest.mark.skipif(os.name != "posix", reason="process-group signals require POSIX")
 def test_parent_worker_boundary_kills_a_term_ignoring_child_after_leader_exit(tmp_path: Path) -> None:
     request = _request()
@@ -1331,12 +1347,8 @@ def test_parent_worker_boundary_kills_a_term_ignoring_child_after_leader_exit(tm
     )
     leader_script = (
         "import pathlib,subprocess,sys,time\n"
-        "sys.stdin.buffer.read()\n"
         f"subprocess.Popen([sys.executable, '-c', {child_script!r}])\n"
-        f"path = pathlib.Path({os.fspath(child_pid_file)!r})\n"
-        "deadline = time.monotonic() + 2\n"
-        "while not path.exists() and time.monotonic() < deadline:\n"
-        "    time.sleep(0.01)\n"
+        "sys.stdin.buffer.read()\n"
         "time.sleep(30)\n"
     )
 
@@ -1347,6 +1359,7 @@ def test_parent_worker_boundary_kills_a_term_ignoring_child_after_leader_exit(tm
             timeout_seconds=0.2,
             grace_seconds=0.5,
             command=(sys.executable, "-c", leader_script),
+            register_worker=lambda process: _wait_for_descendant_ready(process, child_pid_file),
         )
 
     child_pid = int(child_pid_file.read_text(encoding="utf-8"))
@@ -1366,12 +1379,8 @@ def test_parent_worker_boundary_rejects_success_with_a_live_descendant(tmp_path:
     )
     leader_script = (
         "import pathlib,subprocess,sys,time\n"
-        "sys.stdin.buffer.read()\n"
         f"subprocess.Popen([sys.executable, '-c', {child_script!r}])\n"
-        f"path = pathlib.Path({os.fspath(child_pid_file)!r})\n"
-        "deadline = time.monotonic() + 2\n"
-        "while not path.exists() and time.monotonic() < deadline:\n"
-        "    time.sleep(0.01)\n"
+        "sys.stdin.buffer.read()\n"
         "sys.stdout.write('{}')\n"
     )
 
@@ -1379,9 +1388,10 @@ def test_parent_worker_boundary_rejects_success_with_a_live_descendant(tmp_path:
         materializer._spawn_and_exchange(
             request,
             scratch=tmp_path,
-            timeout_seconds=2,
+            timeout_seconds=30,
             grace_seconds=0.5,
             command=(sys.executable, "-c", leader_script),
+            register_worker=lambda process: _wait_for_descendant_ready(process, child_pid_file),
         )
 
     child_pid = int(child_pid_file.read_text(encoding="utf-8"))

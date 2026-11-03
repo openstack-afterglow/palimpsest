@@ -878,6 +878,7 @@ requires-dist = [
     { name = "jinja2", marker = "extra == 'dev'", specifier = ">=3.1.6" },
     { name = "libvirt-python", marker = "extra == 'kvm'", specifier = ">=10.0.0" },
     { name = "openstacksdk", marker = "extra == 'cloud'", specifier = ">=3.3,<5" },
+    { name = "openstacksdk", marker = "extra == 'dev'", specifier = ">=3.3,<5" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=9.0.3" },
     { name = "pyyaml", marker = "extra == 'cloud'", specifier = ">=6.0" },
     { name = "pyyaml", marker = "extra == 'dev'", specifier = ">=6.0" },

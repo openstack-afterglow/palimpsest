@@ -726,6 +726,7 @@ enable_palimpsest_hub_build_worker: "yes"
 palimpsest_build_worker_hub_origin: "https://palimpsest.dmslab.re.kr"
 palimpsest_build_worker_scratch_volume: palimpsest_build_worker_scratch
 palimpsest_build_worker_scratch_path: /var/lib/palimpsest/build-worker
+palimpsest_build_worker_work_path: "{{ palimpsest_build_worker_scratch_path }}"
 palimpsest_build_worker_timeout_seconds: 3600
 palimpsest_build_worker_max_blob_bytes: 107374182400
 palimpsest_build_worker_cpus: 2
@@ -733,6 +734,14 @@ palimpsest_build_worker_memory: 6g
 palimpsest_build_worker_pids_limit: 512
 palimpsest_build_worker_etc_hosts: {}
 ```
+
+`palimpsest_build_worker_scratch_path` is the persistent volume's container mount;
+`palimpsest_build_worker_work_path` selects the actual private journal directory
+inside it and defaults to that mount. Preserve an already qualified subdirectory
+explicitly, together with the original volume and mount. Before any worker apply,
+compare the fully rendered volume/mount/`PALIMPSEST_HUB_BUILD_WORK_PATH` tuple to
+the actual container; neither a fresh volume nor a legacy parent journal is a
+replacement for the current identified cursor. Never clear uncertainty to deploy.
 
 `palimpsest_build_worker_etc_hosts` optionally maps the exact origin hostname
 to an operator-verified reachable IP **inside the worker container only** when

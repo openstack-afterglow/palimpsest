@@ -2447,9 +2447,9 @@ provider provisioning. Fresh multi-instance evidence is recorded separately.
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "b4246065b8568290e1fa3496b94e958b8345813e6495a57796375f33f6adca15",
-  "reviewed_at": "2026-11-03T09:38:00Z",
-  "summary": "OwnedSDK0.3.11isolatedrelease. Concurrentunqualifiedstandard-role/auth/API/UIeditsdetectedinprimaryandpreserved; notsilentlyfixedorpublished. Recoveredall90ownedfilesfromactualfullsourceSDistd8fec740... matchingall58Hubruntimefilesinthequalified58imageand161clientfilesinb672wheel, verifiedallunownedHubruntimebytesagainstHEAD7962. OnlyAST-provenparentOSguard/decoratedNULcases,Findercontextfilterandownarchitectureproseoverlaid; foreignimagesfixtureandpolicy/docsnotcopied. Newisolatedvenv/checksavoidsharededitableimports. ActualMariaDB10.11.19fivebootstrapcases+twoJSONcopy/reviewedmappingcasespassed; full58Hub1612/7beforeNUL, fourteenlastguardcasespassed. Finalisolatedfullchecksinprogress. SixstrictCI/nativefalse unchanged; noProdmutation/tag; nativeissuer/mount/budgetsnotimplicitlyenabled."
+  "source_sha256": "4cff3945c4291f60420cd90833a173dbc68a6154ccd40f7cf9f372a67fe4adda",
+  "reviewed_at": "2026-11-03T11:17:20Z",
+  "summary": "CI64166hostedportablefailuresreviewedallshards,notblindlyrerun. RealSDKrecoverytestdependencydeclaredindevwithsamecloudrange; base[]/packageversions/CIpolicyunchanged, locksmetadataonly. Cleanpy3.12devNativeCloud232passed. ControlledrealchildresolverstallprovedHTTPServer.getfqdnblockingdependency; fixednumericbootstrapbindavoidsDNS,noTLS/grant/listenchanges; originalmacCItimeoutcauseunconfirmed. Ready-descendantregisterhandoffpreservesactual0.2sdeadlineandrealprocesscleanup, no startup-schedulingassumption; mTLS/CLIidle+dripTERM/noResolver+childsmoke65passed. Completeportable9669/228passedin627.72s. NewKollaJournal-subdirselectionregressionfailedbeforethenall30remote-rendercasespassedafterseparatemount/workpathvar. Installedrolelacksoldcapability; exact57abvolume/parentmount/qualifiedsubdirpinnedinoperator99withprivatebackups,allotherconfigs/images/servicesunchanged. Activeknownrecipe58848/SQL58846image58847cachednone; legacyrootand1afunboundmarkersretained;noGETsettlement/schema/serviceactions. Newclientpackagee51e8125...; nativeprofiles/issuerremainunset. Source-isolatedonly,primaryauthsliceuntouched. FinalrendereddockercomparisonrequiredafterqualifiedroleinstallbeforeKolla."
 }
 ```
 <!-- architecture-review:end -->

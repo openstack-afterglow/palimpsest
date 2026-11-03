@@ -51,6 +51,13 @@ All notable changes to Palimpsest Local are documented here.
 - Preserve inherited reuse ceilings through MariaDB's reflected JSON/LONGTEXT
   representation, binding decoded policy lists for the destination type. Reject
   blank or oversized UTF-8 OS declarations before image-worker admission.
+- Declare the real OpenStack SDK used by provider-recovery contract tests in the
+  developer extra, leaving dependency-free base installs and CI safety policy intact.
+- Remove unnecessary reverse DNS from the fixed numeric bootstrap listener and
+  synchronize descendant readiness before process-boundary assertions; production
+  allocation and worker deadlines are unchanged.
+- Keep the persistent build-worker mount separate from its selected journal
+  subdirectory so canonical reconfiguration cannot orphan an identified claim.
 
 - Consolidate the remaining local worktree features and port final allocation-expiry/no-send recovery without reverting prepared-root or paired-budget ownership. Preserve original staged work and historical evidence outside retired checkouts; no remote merge or release is implied.
 - Fix imported cloud result registration, deletion replay, SSH isolation, bounded retained output and native tunnel/key-cleanup prerequisites. Controlled SIGTERM uses owned cleanup; experimental actual-root/GPU acceptance remains unqualified.

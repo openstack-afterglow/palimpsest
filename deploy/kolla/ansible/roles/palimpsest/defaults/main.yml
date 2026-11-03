@@ -28,6 +28,8 @@ palimpsest_build_worker_key_path: "{{ palimpsest_config_dir }}/build-worker.key"
 palimpsest_build_worker_container_key_path: /run/palimpsest/build-worker.key
 palimpsest_build_worker_scratch_volume: palimpsest_build_worker_scratch
 palimpsest_build_worker_scratch_path: /var/lib/palimpsest/build-worker
+# Keep the persistent mount independent from an already-qualified journal subdirectory.
+palimpsest_build_worker_work_path: "{{ palimpsest_build_worker_scratch_path }}"
 palimpsest_build_worker_memory: 6g
 palimpsest_build_worker_cpus: 2
 palimpsest_build_worker_pids_limit: 512
@@ -276,7 +278,7 @@ palimpsest_hub_build_worker_service:
   environment:
     PALIMPSEST_HUB_URL: "{{ palimpsest_build_worker_hub_origin }}"
     PALIMPSEST_HUB_BUILD_WORKER_KEY_FILE: "{{ palimpsest_build_worker_container_key_path }}"
-    PALIMPSEST_HUB_BUILD_WORK_PATH: "{{ palimpsest_build_worker_scratch_path }}"
+    PALIMPSEST_HUB_BUILD_WORK_PATH: "{{ palimpsest_build_worker_work_path }}"
     PALIMPSEST_HUB_BUILD_TIMEOUT_SECONDS: "{{ palimpsest_build_worker_timeout_seconds | string }}"
     PALIMPSEST_HUB_MAX_BLOB_BYTES: "{{ palimpsest_build_worker_max_blob_bytes | string }}"
     PALIMPSEST_HUB_REGISTRY_HOSTS: "{{ palimpsest_registry_hosts | to_json }}"

@@ -25,6 +25,7 @@ import time
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from socketserver import TCPServer
 from typing import Any
 
 CONFIG_SCHEMA = "palimpsest.nova-bootstrap-service.v1"
@@ -316,6 +317,12 @@ class BootstrapHTTPServer(ThreadingHTTPServer):
                 os.close(descriptor)
             self._directories.clear()
             raise BootstrapError("bootstrap service initialization failed") from None
+
+    def server_bind(self):
+        # HTTPServer resolves its display name with getfqdn(), which can block
+        # on the host resolver. This fixed numeric loopback listener needs no DNS.
+        TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
 
     def get_request(self):
         connection, address = super().get_request()

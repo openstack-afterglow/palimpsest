@@ -175,6 +175,21 @@ def service(tmp_path, pki, plan):
         running.close()
 
 
+def test_listener_does_not_resolve_loopback_hostname(tmp_path, pki, plan, monkeypatch):
+    def unexpected_resolution(*args, **kwargs):
+        raise AssertionError("numeric loopback listener must not resolve a hostname")
+
+    monkeypatch.setattr(socket, "getfqdn", unexpected_resolution)
+    root = tmp_path.resolve()
+    root.chmod(0o700)
+    local = LocalService(root, pki, plan)
+    local.start()
+    try:
+        assert local.request()[0] == 200
+    finally:
+        local.close()
+
+
 def test_real_mutual_tls_returns_exact_enrolled_plan_and_no_cmd_invention(service):
     status, response, headers = service.request()
     assert status == 200

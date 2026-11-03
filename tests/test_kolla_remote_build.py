@@ -403,3 +403,34 @@ def test_worker_renders_explicit_small_bounded_scratch_override(tmp_path):
     workers = [args for _, args in _docker_records(records) if args["name"] == "palimpsest_hub_build_worker"]
     assert workers
     assert all(int(args["env"]["PALIMPSEST_HUB_IMAGE_SCRATCH_BYTES"]) == 256 * 1024**2 for args in workers)
+
+
+def test_worker_reconfigure_keeps_identified_journal_on_its_original_volume(tmp_path):
+    volume = tmp_path / "retained-volume"
+    active = volume / "claim-cursor-retained"
+    active.mkdir(parents=True)
+    legacy = {"phase": "claim_pending", "protocol": "recipe"}
+    identified = {"phase": "idle", "channel": "62843e8e-a279-468c-950a-ea28f1ebdfcf", "sequence": 30261}
+    (volume / "worker.json").write_text(json.dumps(legacy))
+    (active / "worker.json").write_text(json.dumps(identified))
+    render_root = tmp_path / "render"
+    render_root.mkdir()
+    records, _ = _run_lifecycle(
+        render_root,
+        ["reconfigure"],
+        {
+            "palimpsest_build_worker_scratch_volume": "retained_claim_volume",
+            "palimpsest_build_worker_scratch_path": "/var/lib/palimpsest/build-worker",
+            "palimpsest_build_worker_work_path": "/var/lib/palimpsest/build-worker/claim-cursor-retained",
+        },
+    )
+    worker = next(
+        args
+        for _, args in _docker_records(records)
+        if args["name"] == "palimpsest_hub_build_worker" and args.get("state") == "started"
+    )
+    mount = next(item for item in worker["volumes"] if item.startswith("retained_claim_volume:"))
+    container_root = Path(mount.split(":")[1])
+    selected = volume / Path(worker["env"]["PALIMPSEST_HUB_BUILD_WORK_PATH"]).relative_to(container_root)
+    assert json.loads((selected / "worker.json").read_text()) == identified
+    assert json.loads((volume / "worker.json").read_text()) == legacy
