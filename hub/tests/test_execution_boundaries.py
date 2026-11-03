@@ -26,6 +26,8 @@ from palimpsest_hub.main import app
     [
         ("/v1/instances", {"command": [{"private-input": "never-reflect-execution-secret"}]}),
         ("/v1/dockerfile-builds", {"dockerfile": {"private-input": "never-reflect-execution-secret"}}),
+        ("/v1/published-images", {"manifest": {"private-input": "never-reflect-execution-secret"}}),
+        ("/v1/native-instances", {"command": [{"private-input": "never-reflect-execution-secret"}]}),
     ],
 )
 async def test_invalid_execution_inputs_are_not_reflected_or_cached(path, payload):
@@ -125,3 +127,32 @@ def test_generated_guest_reporter_bounds_actual_json_envelope_and_retries_identi
     assert "[redacted bootstrap capability]" in result.stdout
     assert result.stdout and result.stderr
     assert len(result.stdout) <= 8192 and len(result.stderr) <= 8192
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"root": "relative/native"},
+        {"grant_path": "/srv/native/../shared/grant.json"},
+        {"root": "/srv/shared"},
+        {"root": "/srv/shared/private"},
+        {"grant_path": "/srv/shared/grant.json"},
+    ],
+)
+def test_native_profile_cannot_place_private_state_in_consumer_payload_storage(change):
+    from palimpsest_hub.config import NativeProfile
+
+    values = {
+        "environment": "sdk-proof",
+        "root": "/srv/native",
+        "grant_path": "/srv/native/grant.json",
+        "project_id": "a" * 32,
+        "user_id": "b" * 32,
+        "manifest_digest": "sha256:" + "c" * 64,
+        "share_id": "11111111-2222-4333-8444-555555555555",
+        "export": "192.0.2.1:6789:/volumes/approved",
+        "publication_root": "/srv/shared",
+        **change,
+    }
+    with pytest.raises(ValidationError):
+        NativeProfile.model_validate(values)

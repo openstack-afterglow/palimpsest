@@ -1,5 +1,91 @@
 # Palimpsest Architecture
 
+## SDK image authority and namespace-native integration — 2026-11-03
+
+**`0.3.11` release source; publication, deployed state and native qualification have separate receipts.**
+`image_manifest.py` owns bounded canonical metadata and single-parent logical
+node identities, separately from physical payload digests. `image_models.py`
+adds published images, ordered memberships, creator-bound staging and inherited
+reuse ceilings. `services/published_images.py` is the common publication engine
+for `image_jobs.complete` and SDK pushes/extensions. The extension API resolves
+the exact authorized base on the server and preserves its private runtime rather
+than reconstructing it from a redacted catalog response.
+
+Offline bootstrap upgrades pre-publication image tables before creating dependent
+FKs: historical job visibility is `internal`, proven creators become part of the
+context key, and unknown creators block before DDL. Missing legacy creator/OS
+declarations are quarantined before worker effects; admission and replay share
+nonblank, NUL-free,128-byte UTF-8 OS bounds. Audience ceilings are validated as
+decoded lists and bound to the destination's JSON or reflected LONGTEXT type.
+No migration synthesizes authors, OS facts, catalog images or reuse permission.
+MariaDB cutover requires all writers stopped and paired SQL/CAS restore proof.
+
+Visibility is immutable per publication: private selects the exact creator
+(including that user's other authenticated projects), internal selects the origin
+project, and public selects all authenticated service-authorized readers.
+Visible membership gates graph/image/blob discovery; old project-wide physical
+layer routes cannot expose or mutate new `image-payload` rows. Borrowed audience
+ceilings survive intermediate images and cannot be erased by public aliases for
+the same bytes. The explicit conventional HTTPS/chroot instance backend can bind
+an authorized canonical image without broad physical-blob visibility; personal
+published-image results remain creator-only in that backend.
+
+For Manila, `ceph_scoped_store.py` verifies the exact mount/device/filesystem and
+scope directory/file pool and namespace layouts. Each complete image resides in
+one private-user/internal-project/public namespace. Payloads deduplicate within
+that scope; publication across security scopes copies bytes once. MDS paths alone
+do not isolate raw RADOS access, so no hardlink-view/broad data-tag solution is
+used. `ceph_path_access.py` creates finite per-run credentials with exact
+read-only MDS path and OSD pool/namespace caps using a separately provisioned
+private issuer. Mutation intents, process custody, final original-grant checks,
+key fingerprints and auth absence are retained; no blind auth replay or global
+eviction is added.
+
+`api/native_instances.py` and `services/native_instances.py` resolve authorized
+Hub images and return durable creating/deleting intents before background work.
+That work obtains a freshly validated original-human connection; tokens are not
+persisted and service credentials are not an execution fallback. The existing
+native carrier/PID1 is reused with an explicit canonical published-image variant
+and pinned namespace storage plan. Native GET/list are SQL-only. Kept successful
+VMs are idle after a bounded command, not long-lived application readiness.
+Exact-image grants remain exact; project-image grants are explicitly CPU-only,
+share one cumulative allowance across different image IDs and retain spent
+history across deletion. Controller death/ambiguous commits or still-owned
+processes remain HOLD, not authorization to restart or refund.
+
+Hub and client package metadata are an exact unpublished pair. Kolla exposes
+disabled operator mount/profile settings but does not create shares, issuers,
+worker preparations or approvals. Existing populated ACL schemas missing required
+ownership/visibility are not silently reinterpreted. Real namespace/RADOS denial,
+native warm reuse, container/deployment and exact resource closure require their
+own final-source/resource authorization. The earlier N-tree actual-root/CUDA
+success remains historical evidence for its different package and storage path.
+
+## Consolidated local source — 2026-11-02
+
+The primary `dev` checkout now includes the committed PR36/PR37 lineage through
+`7962b18e45cd87534ee1cf0c1d5c30af68e0a8a9`, plus the retained local SDK/Manila
+experimental source and semantically ported allocation-expiry repair. This is a
+local source cutover, not a remote protected-branch merge, release or deployment.
+Dated sections below retain their original source/deployment identities.
+
+Nova's final provider-thread deadline uses the actual integer guest expiry.
+Certified no-call settlement survives cancellation but retains the prepared
+Cinder root, quota and references until exact cleanup/404. Benchmark guards bind
+original request identity and durable no-send evidence; live capacity release
+never refunds cumulative budgets. Later prepared-root and cold/warm contracts
+remain intact. Cinder/auxiliary-network final-effect expiry gaps are not claimed
+solved by this port.
+
+The separate local `cloud` path publishes immutable CephFS layers with per-consumer
+RO access, but its local/share metadata is not Hub-authoritative metadata. Native
+root/GPU execution remains unqualified. Consolidation review repairs result
+registration, one-shot deletion recovery, SSH credential isolation, bounded
+retained output, native tunnel admission and complete bounded authorized-key
+removal. Controlled SIGTERM enters existing cleanup and restores its handler;
+controller death still does not provide autonomous cleanup. No provider policy
+or live credential is changed by these source fixes.
+
 ## Finite database reads and uncertain commit preservation — 2026-10-31
 
 The Hub configures a separate asyncmy protocol read wait limit, default30seconds
@@ -306,6 +392,137 @@ User-authorized commit/push scope on `feature/hub-execution-api-20261029`, based
 ### Current implementation
 
 The API candidate retains externally authored HTTPS payload fetch, SHA/size verification and read-only SquashFS mounts. The guest already has no Palimpsest CLI/build/conversion orchestration. This is not a Manila shared-storage implementation.
+
+### Local SDK execution check — 2026-11-01
+
+The owner requested a local-first check of Dockerfile input → an existing Nova
+worker → Manila CephFS layer publication → a separate Nova consumer → actual
+package/library use. `cloud_cli.py` dispatches this path to `cloud_env.py`, which
+uses the named `clouds.yaml` connection via `cloud_cli._connect`. Credentials stay
+on the external client; the worker receives source/context and its own CephX
+write grant, while consumers receive separate read-only grants. This is not a
+change to Hub API authentication or a shared-service deployment.
+
+`cloud_transport.py` supplies `OneShotSession` through the SDK's supported
+cloud-region session constructor. Factory users (CloudEnv, NovaController and
+the importing benchmark adapters) retain original auth/public/TLS settings,
+but POST/PUT/PATCH/DELETE never silently retry, reauthenticate or follow a
+redirect, even when an SDK service default requests retries. Mutation3xx fails
+closed; GET/HEAD discovery behavior is unchanged. Independent connectors that
+do not call this factory are intentionally outside this cutover.
+
+`cloud_layer_worker.py` runs BuildKit and reuses `LayerCache`/the canonical OCI
+materializer to produce ordered SquashFS blobs. The consumer mounts those files
+from CephFS, verifies digests, assembles read-only lowers plus private upper/work,
+and executes an explicit command inside the merged root. It does not install the
+Palimpsest CLI in the consumer. The conventional Ubuntu VM boots first; this is
+not an OCI-root VM boot or container-isolation claim.
+
+The local environment/image receipt is execution evidence for this requested
+check, not a replacement for Hub-authoritative metadata in the target contract
+above. The existing Hub path still downloads layers over HTTPS; neither the Hub
+DB nor production service credentials were changed. A single CPU live check
+observed eight layers, NumPy computation, Requests import, jq and linked shared
+libraries; it does not qualify CUDA or any five-success comparison. Exact live
+source, retained resources and later local-only review fixes are recorded in the
+handoff. See [local command usage](docs/vm-workflow.md#local-driven-openstack-layers-on-manila-cephfs).
+
+The subsequent registry-intake slice adds `cloud image-pull`: only the worker
+acquires a digest-pinned OCI image. `LayerCache.materialize(on_layer=...)` commits
+each validated derived-cache result and synchronously hands it to the publisher
+before the next ordinal. The worker publishes the unique CephFS blob, an immutable
+content-addressed provenance receipt and its ordered job journal; final image
+publication requires the complete exact sequence. Callback errors or deadlines
+retain the committed prefix without claiming image success. Existing verified
+blobs incur no duplicate CephFS payload copy. The original config/manifest,
+compressed descriptors and DiffIDs are retained; graph identity is distinct from
+manifest identity. Client request/job/source/runtime checks precede local retention.
+
+The owner then explicitly required the CUDA image to become the Nova VM's actual
+root and required real GPU computation. This is not implemented by the prior
+conventional cloud-image/chroot consumer or by registry intake. See
+[native-root/GPU gates](docs/oci-gpu-support.md#registrycephfs-acceptance-selected-on-2026-11-01).
+No new boot artifact, native-root VM, CUDA execution or GPU allowance is implied
+by the registry-intake source checks.
+
+A separate experimental native candidate now has explicit ownership boundaries:
+`nova_boot_carrier.py` builds a BIOS kernel/initramfs carrier and private upper;
+`nova_ceph_boot.py` is initramfs PID1 and moves the verified CephFS-backed overlay
+onto the actual root; `nova_bootstrap_service.py` provides per-run mTLS enrollment,
+credential delivery and immutable result receipt; `nova_native_cloud.py` owns the
+grant-bound SDK lifecycle and exact cleanup. The standalone CUDA probe in
+`guest/nova/cuda_probe.c` is carried outside the unchanged upstream layers and
+requires both real Driver API/PTX arithmetic and cuBLAS SGEMM from the image.
+The protected local stage-1 parser/device/control-channel contracts are unchanged.
+
+Bootstrap media carries short-lived per-run identity, never a CephX or OpenStack
+credential. The loopback service is reached via a source-IP-restricted SSH forward
+to the existing worker; it has no cloud credentials and exposes no new SG ingress.
+Fresh controller identity/binding, client certificate fingerprint, nonce and
+expiry gate the selected RO grant. This trusted-workload proof is neither remote
+attestation nor confidentiality from a root workload/private-carrier owner.
+Source preparation preserves predecessor bytes and metadata as `.prior`; ordinary
+`env up` cannot bypass that cutover to replace recorded source. Source/carrier
+construction, actual CPU-root boot and actual GPU output remain separate gates.
+If the controller dies, expiry stops new bootstrap access but does not autonomously
+delete cloud resources; cleanup retains exact IDs and needs current bounded authority.
+
+Explicit recovery grants bind the exact predecessor preparation, all cleaned
+failed-run digests and the ordered failure-resource history. Fresh exact404
+reads, revoked enrollment, terminal builders and no orphan native records precede
+any new reservation. Acknowledgment does not rewrite failed outcomes, refund
+old counters or qualify CPU results. Source replacement additionally confirms
+the old bootstrap unit inactive/dead/MainPID0 and preserves its preparation in
+`preparation_history`; new CA/runtime/probe/service artifacts use a fresh
+`generation-<package-sha256>` directory and suffixed unit. The original kernel
+bundle path and DNS remain unchanged. `cleanup_reserve_seconds` subtracts from
+the post-Nova execution deadline, not the allocation allowance. Cleanup overruns
+fail both CPU and GPU outcomes; even acknowledged CPU overruns cannot open GPU.
+
+
+Failed native runs now attempt an exact-owned Nova serial-console read before
+cleanup. Private no-clobber evidence retains at most256KiB of sanitized UTF-8
+console tail; known carried secrets, private-key material and credential-labelled
+lines are redacted before truncation. The SDK session temporarily uses5s
+connect/read timeouts and zero proxy retries, then restores its settings. This is
+not an absolute response deadline or a new allocation allowance. Missing/invalid
+console evidence never qualifies a run or prevents ordinary cleanup. Positive
+ACTIVE/enrollment timestamps and pre-failure phase survive enrollment revocation.
+PID1 failure handling additionally emits a bounded serial diagnostic containing
+only a fixed operation label, an exact allowlisted exception type and bounded
+numeric errno. It never includes exception messages, paths, arbitrary class
+names, traceback locals or keys. Labels survive the unchanged console credential
+sanitizer. Existing failure/HOLD/result/PID1 behavior and all admission gates are
+unchanged; this diagnostic-only successor is not evidence of a repaired boot.
+Completed nonzero builder transports now retain a separate private no-clobber
+diagnostic before exact cleanup: sanitized stdout/stderr tails of64KiB each,
+bounded serialized payload, transport-client exit code and remote_outcome
+unconfirmed. A returned SSH exit status never substitutes for the existing
+carrier-terminal/custody check; interruptions remain TERM-only unknown holds.
+The carrier deliberately rejects source identity/ctime changes while copying
+live host runtime files. Operators must establish a fully configured, quiescent
+package cohort before another explicitly approved case; updater activity is not
+permission to disable updates, replay a failed build or reuse its partial tree.
+Carrier data uses one image-proxy PUT with the same Glance path/media/size
+headers as Image.upload. Its scalar socket timeout is min(remaining pre-Nova
+deadline,600s): requests sends body chunks under the connect timeout as well as
+using the read timeout for responses, so a small connect component is unsafe.
+This is not a total HTTP deadline; source reads and completion reject expiry,
+and no Nova POST can follow an expired grant. Metadata keeps its40s session
+default. No shared timeout/retry settings or full-carrier memory buffer change.
+Safe upload-failure diagnostics retain at most eight exception class/errno
+records, source bytes read (not delivered), expected size and HTTP status;
+messages, arguments, headers, URLs and tracebacks are not stored.
+
+Existing deleting intents are observation-only until authoritative404, including
+Cinder's deleting state; volume origin remains bound to its durable image intent
+if the live image record disappears. Retained upload clients block recovery.
+Strict no-replay can leave a paid resource present when the original DELETE
+never arrived. That is an explicit HOLD requiring separately authorized manual
+provider disposition, not permission to infer no effect from ConnectFailure or
+a fresh non-deleting GET and automatically dispatch another DELETE.
+
+
 
 
 #### Ownership and source map
@@ -887,6 +1104,7 @@ flowchart LR
 | native dashboard asset catalog | [`catalog_dto.py`](hub/src/palimpsest_hub/catalog_dto.py), [`api/catalog.py`](hub/src/palimpsest_hub/api/catalog.py), [`services/catalog.py`](hub/src/palimpsest_hub/services/catalog.py) | SQL-only visible complete named leaves and separately fresh-human-system global graph/provenance inventory; exact shared DTOs, no CAS/provider synchronization or VM API. |
 | anonymous registry acquisition | [`registry_intake.py`](src/palimpsest_local/registry_intake.py)의 `pull_anonymous_oci_archive`; CLI `oci pull` | 명시적 registry reference → 익명 TLS Skopeo → private staging → 기존 LocalArchiveSource/SourceCAS 검증 → non-overwrite archive. Docker store/Hub credential과 분리; caller가 지정한 local/private authority도 허용하되 system TLS trust는 유지 |
 | explicit Nova build/runtime | [`nova_build.py`](src/palimpsest_local/nova_build.py)의 `NovaController`, `build_nova_layer_user_data`; [`cloud_cli.py`](src/palimpsest_local/cloud_cli.py); [`nova_runtime.py`](src/palimpsest_local/nova_runtime.py) | `build --executor nova --nova-config`가 explicit project/flavor/network/retained Cinder policy로 원래 cloud-init을 전달한다. GPU 할당은 Nova flavor가 소유하며 nested libvirt/host rebind는 없다. capture upper/output은 UUID·serial·size-bound `/srv/palimpsest` ext4에 기록한다. ACTIVE와 checked guest success를 구분하고 uncertain create는 재생하지 않는다. |
+| original-caller mutation transport | [`cloud_transport.py`](src/palimpsest_local/cloud_transport.py)의 `OneShotSession`; [`cloud_cli.py`](src/palimpsest_local/cloud_cli.py)의 `_connect` | Supported session constructor preserves original identity/TLS/public scope; mutation connect/status retries, implicit reauth and redirects are disabled, mutation3xx fails closed, metadata reads retain SDK behavior. Bulk Glance PUT separately binds one-pass byte/hash proof and remaining-deadline socket waits. |
 | cloud assets/internal registry worker | [`nova_assets.py`](src/palimpsest_local/nova_assets.py)의 `AssetCatalog`; [`registry_worker.py`](src/palimpsest_local/registry_worker.py)의 `run_job` | canonical LayerCache/OCIStore bytes를 재사용하는 project-bound permanent catalog와 durable internal jobs. Source manifest/config/compressed/DiffID/recipe/output identities 및 contextual occurrence parents를 구분한다. Runtime preparation은 copy/hardlink 없이 canonical blob paths와 empty RO mountpoints를 만든다. Consumer release는 metadata-only다. |
 | local OCI build asset adapter | [`oci_build_assets.py`](src/palimpsest_local/oci_build_assets.py)의 `LocalBuildEvidence`, `register_local_oci_build`; [`nova_assets.py`](src/palimpsest_local/nova_assets.py) | Verify actual paired BuildKit records/spec keys/archive bytes and source OCI→local export→assembly artifact, then reuse canonical LayerCache materialization and occurrence catalog with distinct `oci-build` provenance. No fabricated registry job, repack or native-only timestamp relaxation. |
 | sequential Nova measurements | [`nova_metrics.py`](src/palimpsest_local/nova_metrics.py); [`scripts/benchmark_nova_gpu.py`](scripts/benchmark_nova_gpu.py) | 실제 guest diskstats/network counters와 monotonic request→ordinary-user NVIDIA readiness를 수집한다. Torch/TensorFlow × cloud-init/Nova-layer/registry-layer/Ansible × 5를 순차 실행하고 exact-owned VM만 회수하며 boot/data는 보존한다. CPU fallback·다른 boot/device·불완전 횟수·측정 실패를 성공으로 승격하지 않는다. |
@@ -1419,6 +1637,106 @@ uv run python scripts/test_lanes.py run gate2
 구조 영향이 없는 bugfix/refactor도 source를 읽은 뒤 이 문서 `Maintenance`의 최신 summary에 영향 없음과 이유를 남긴다. 계획 문서나 roadmap만 갱신하고 구현 상태를 승격하지 않는다.
 
 ## Maintenance
+
+2026-11-03 SDK publication/native review: reviewed canonical manifests, physical
+and logical identities, visibility/reuse ceilings, common worker/local registration,
+private staging and legacy-route boundaries, descriptor-pinned Ceph namespace
+publication, finite issuer/process custody, carrier/guest envelope closure,
+original-caller async admission, shared grant high-water history and uncertain
+terminal commits. Rejected path-only MDS isolation using Ceph's documented raw
+RADOS boundary before implementing consumer credentials. Local real
+SquashFS/HTTP/SQLite SDK smoke exercised seven images, three unique payloads,
+visibility discovery, private-runtime-preserving local extension and common
+worker registration. Focused1597/8 passed; independent focused source reviews
+closed concrete carrier/import/bounds/mount/upload/custody/expiry findings.
+No container deployment, real Ceph isolation or new cloud/native/GPU proof is
+implied; final source/package and remaining checks are recorded in the handoff.
+
+
+2026-11-02 worktree consolidation review: retained committed7962b18 lineage,
+ported original expiry/no-send repairs without reverting prepared-root and paired
+capacity rules, and integrated the local SDK/Manila experimental checkpoint.
+Independent review of cloud result/cleanup, SSH isolation, bounded evidence,
+native tunnel admission/key-file preservation and scoped cancellation closed
+concrete findings. The caught TERM handler, unlike SIG_IGN, preserves child
+termination semantics. Reviewed late boot correction keeps DHCP CIDR/gateway
+binding while using seed-bound authenticated DNS, not advertised DHCP resolvers.
+Portable9567/228, fullHub1426/7 and final affected620results have distinct source
+boundaries in testing/handoff; no deployed or native-root/GPU claim is added.
+
+2026-11-02 bulk Glance/one-shot review: the exact06PUT was authenticated but
+ended with an empty chunk-size line/400 after client abandonment. Historical
+reset versus write-timeout cause is not uniquely established; available local
+proxy files predate the interval. Real SDK backpressure reproduces the same
+ConnectFailure/partial body under a short metadata timeout, while scoped waits
+complete one PUT. Real metadata503 reproduced a hidden second POST. The new
+factory session disables every mutation replay route, rejects3xx and preserves
+read discovery; uploads use deadline-bound scalar waits with no shared-state
+mutation. Safe cause/progress diagnostics, observation-only deleting intents,
+durable volume image origin and unreaped-client recovery refusal preserve
+failure/custody gates. Host-runtime passed2666/1skipped; no source-image/kernel/probe
+change or live root/GPU qualification is implied by these portable results.
+
+2026-11-02 pre-Nova diagnostic review: concurrent autonomous Python package
+replacement overlapped the first recovery carrier's source copy. Exact stderr
+was lost, so retain fail-closed copy guards and preserve that failed tree rather
+than claim a guest-boot diagnosis. Builder transport output now has private
+bounded redaction/no-clobber persistence; transport exit remains unconfirmed
+remote custody. Privacy and custody reviews closed;814selected tests passed
+with3skipped, and real nonzero-child diagnostic smoke passed. Native root/GPU
+acceptance is still separate and no updater policy or package was changed by us.
+
+2026-11-02 explicit native recovery review: preserved failed-run/preparation and
+ordered absence-history digests replace no state or spent ledger. Fresh provider
+absence and stopped predecessor service gate a new immutable preparation generation.
+No automatic attempt is admitted under a grant that already failed. A cleanup
+reserve stays inside the original allocation; CPU budget overruns are failed
+prerequisites even after acknowledgment. Independent review found and corrected
+bundle/DNS drift and recovered-overrun GPU admission; the latter has a failing-
+before regression. No kernel/driver, protected stage-1, Hub or CI change is made.
+Local checks and SDK loopback evidence are separate from native-root acceptance.
+
+2026-11-02 failed native CPU follow-through: the one admitted CPU run was cleaned
+without an authenticated root result; GPU was not submitted. Nova create-event
+success and controller enrollment do not prove guest boot. Final enrolled=false
+is revocation state, not evidence that enrollment never occurred. Console bytes
+were lost at deletion; retained interpreter/file/module checks and current network
+admission do not diagnose the guest failure. The local-only successor fixes that
+evidence-loss path before any future separately authorized execution. The executed
+worker package and spent grant remain unchanged; there is no retry, state reset,
+driver mutation, Hub/CI topology change or GPU qualification.
+
+Native candidate follow-through: reviewed modules separately own carrier assembly,
+initramfs root transition, loopback mTLS enrollment/results and SDK lifecycle.
+Kernel6.8.0-147/NVIDIA580.178.04 preparation is separate from workload layers and
+does not load a worker/compute-host driver. The original CUDA manifest/config and
+all ten layers stay unchanged. One verified and cleaned native CPU case gates GPU;
+the GPU probe additionally uses original-image cudart/cuBLAS, not only injected
+driver code. Explicit grant counts, prepared Cinder roots, no-replay intents,
+TERM-only holds, source `.prior` preservation and provider absence bound effects.
+No protected local stage-1, Hub schema/authentication or CI topology change is made.
+Review and portable checks do not establish native boot or GPU qualification.
+
+2026-11-01 registry-intake review: optional synchronous per-layer materializer/cache
+callbacks preserve existing return contracts and deadlines while durably recording
+prefixes. Worker direct pinned pulls, unique blob reuse and ordered provenance
+journals replace no Dockerfile or upstream image configuration. `CloudEnv.pull`
+uses a durable bound intake intent and never automatically upgrades/replays a
+worker. Tests include the real cache/store serialization boundary because graph
+and manifest digests and serialized receipt fields are distinct. Native CephFS
+root/NVIDIA integration remains an explicitly unsatisfied acceptance requirement;
+no fallback chroot or CPU result is counted toward it.
+
+2026-11-01 local-first SDK/Manila review: isolated `cloud_env.py` orchestrates
+named-cloud OpenStack lifecycle and guest transport; `cloud_layer_worker.py`
+reuses the existing OCI conversion pipeline on a Nova worker and publishes
+CephFS-backed layers. `cloud_cli.py` owns CLI dispatch, with focused behavioral
+tests assigned to the host-runtime lane. This is a scoped local execution path,
+not a Hub authentication change or authoritative-metadata migration. Review
+identified partial-create/replay, cleanup-absence, concurrent publication and
+exit-status hazards; corrective source and local checks are separate from the
+earlier successful CPU live package-use evidence. No CI topology, schema,
+production deployment, GPU or publication change is included.
 
 2026-10-31 prepared-volume provider-contract review: Cinder accepted the actual
 80GiB root POST202, but rejected detailed inventory's `project_id` query400;
@@ -2129,9 +2447,9 @@ provider provisioning. Fresh multi-instance evidence is recorded separately.
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "4dd8d0c867e044117397743d7c1025e9336f8ba6666f16b09d605e834bab984b",
-  "reviewed_at": "2026-10-31T19:32:59Z",
-  "summary": "Cinder contract repair: original-project detailed inventory without rejected project_id query; partial POST UUID is only an exact-detail selector, full owner/markers/size/image/unattached proof before binding; durable uncertainty/no replay and schema/expiry unchanged. Independent authority+SDK reviews clean. Target22 pass, instances267 pass5skip15.62s, fullHub1416 pass7skip340.58s, actual Python3.12 SDK3.3 loopback POST/detail/unfiltered recovery old-fail/new-pass smoke. Historical initial POST exception remains unproven; no new deployment/GPU claim."
+  "source_sha256": "b4246065b8568290e1fa3496b94e958b8345813e6495a57796375f33f6adca15",
+  "reviewed_at": "2026-11-03T09:38:00Z",
+  "summary": "OwnedSDK0.3.11isolatedrelease. Concurrentunqualifiedstandard-role/auth/API/UIeditsdetectedinprimaryandpreserved; notsilentlyfixedorpublished. Recoveredall90ownedfilesfromactualfullsourceSDistd8fec740... matchingall58Hubruntimefilesinthequalified58imageand161clientfilesinb672wheel, verifiedallunownedHubruntimebytesagainstHEAD7962. OnlyAST-provenparentOSguard/decoratedNULcases,Findercontextfilterandownarchitectureproseoverlaid; foreignimagesfixtureandpolicy/docsnotcopied. Newisolatedvenv/checksavoidsharededitableimports. ActualMariaDB10.11.19fivebootstrapcases+twoJSONcopy/reviewedmappingcasespassed; full58Hub1612/7beforeNUL, fourteenlastguardcasespassed. Finalisolatedfullchecksinprogress. SixstrictCI/nativefalse unchanged; noProdmutation/tag; nativeissuer/mount/budgetsnotimplicitlyenabled."
 }
 ```
 <!-- architecture-review:end -->

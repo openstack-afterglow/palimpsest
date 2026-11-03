@@ -254,6 +254,46 @@ class InterruptedAllocationCloud(Cloud):
         self.budget.release(resource["reservation_id"])
 
 
+class AbortedAllocationCloud(InterruptedAllocationCloud):
+    """The final local Nova guard denied a request before the provider call."""
+
+    def create(self, role):
+        self.connection.creates += 1
+        resource = {
+            "source": "sdk",
+            "role": role,
+            "job_id": self.config["job_id"] + "-peer",
+            "project_id": self.project_id,
+            "phase": "create-intent",
+            "nova_spec_digest": "sha256:" + "a" * 64,
+            "reservation_id": self.budget.reserve(role, 20),
+        }
+        self.connection.live.append(resource)
+        original = {
+            "schema": "palimpsest.nova-job.v1",
+            "job_id": resource["job_id"],
+            "project_id": self.project_id,
+            "name": resource["job_id"],
+            "spec_digest": resource["nova_spec_digest"],
+            "phase": "aborted-before-request",
+            "request_started": False,
+            "uncertain_create": False,
+        }
+        original.update(self.connection.original_receipt_mutation)
+        peer._new_json(self.output / (resource["job_id"] + "-nova.json"), original)
+        raise KeyboardInterrupt
+
+    def _verify_aborted(self, resource, record):
+        from palimpsest_local.benchmark_scenario_cloud import ScenarioCloud
+
+        ScenarioCloud._verify_aborted(self, resource, record)
+
+    def delete(self, resource):
+        self._verify_aborted(resource, self.controller.inspect(resource["job_id"]))
+        self.budget.release_unbound(resource["reservation_id"], resource["role"])
+        self.connection.live = [r for r in self.connection.live if r["job_id"] != resource["job_id"]]
+
+
 @pytest.fixture
 def setup(tmp_path, monkeypatch):
     identity, public, known = (tmp_path / name for name in ("session-key", "session-key.pub", "known-hosts"))
@@ -384,6 +424,30 @@ def test_missing_adapter_id_requires_certain_exact_original_nova_receipt(setup, 
     assert peer.cleanup_peer(output, connection=connection)["status"] == "held"
     assert connection.live and not connection.deleted and connection.creates == 1
     assert connection.network.effects == before
+
+
+@pytest.mark.parametrize("valid", [True, False])
+def test_peer_cleanup_requires_valid_no_call_receipt_before_group_removal(setup, monkeypatch, valid):
+    config, output, connection = setup
+    connection.inspections = []
+    connection.original_receipt_mutation = {} if valid else {"request_started": True}
+    monkeypatch.setattr(peer, "ScenarioCloud", AbortedAllocationCloud)
+    with pytest.raises(KeyboardInterrupt):
+        peer.create_peer(config, output, connection=connection)
+    result = peer.status_peer(output)
+    ledger = json.loads((Path(config["approval"]["ledger_root"]) / "new-grant.json").read_text())
+    reservation = next(iter(ledger["reservations"].values()))
+    assert connection.creates == 1 and not connection.deleted
+    if valid:
+        assert result["status"] == "failed"
+        assert not connection.network.groups and not connection.live
+        assert reservation["released"] is True
+        assert peer.cleanup_peer(output, connection=connection)["status"] == "deleted"
+    else:
+        assert result["status"] == "held"
+        assert connection.network.groups and connection.live
+        assert reservation["released"] is False
+        assert peer.cleanup_peer(output, connection=connection)["status"] == "held"
 
 
 def test_recovered_original_id_does_not_authorize_unmatched_group_port(setup, monkeypatch):

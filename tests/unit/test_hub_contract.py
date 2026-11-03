@@ -418,3 +418,230 @@ def test_pull_blob_drops_partial_for_malformed_content_range(tmp_path: Path, mon
     assert not destination.exists()
     assert not part.exists()
     assert not sidecar.exists()
+
+
+def test_instance_send_guard_runs_after_serialization_and_request_construction(monkeypatch):
+    from types import SimpleNamespace
+
+    from palimpsest_local import hub
+
+    client = HubClient("https://hub.example", "token")
+    events = []
+    dumps = hub.json.dumps
+    request = hub.urllib.request.Request
+    response = _Response({"id": "original-instance"})
+
+    def serialize(payload):
+        events.append("serialize")
+        return dumps(payload)
+
+    def construct(*args, **kwargs):
+        events.append("request")
+        return request(*args, **kwargs)
+
+    def guard():
+        events.append("guard")
+
+    def send(prepared, **kwargs):
+        events.append("send")
+        assert prepared.full_url == "https://hub.example/v1/instances"
+        assert prepared.method == "POST"
+        assert prepared.data == b'{"request_id": "original-request"}'
+        return response
+
+    monkeypatch.setattr(hub.json, "dumps", serialize)
+    monkeypatch.setattr(hub.urllib.request, "Request", construct)
+    client._opener = SimpleNamespace(open=send)
+    assert client.create_instance({"request_id": "original-request"}, before_send=guard) == {"id": "original-instance"}
+    assert events == ["serialize", "request", "guard", "send"]
+
+
+def test_instance_send_guard_refusal_never_opens_transport():
+    from types import SimpleNamespace
+
+    from palimpsest_local.errors import ArtifactValidationError
+
+    client = HubClient("https://hub.example", "token")
+    client._opener = SimpleNamespace(open=lambda *a, **kw: pytest.fail("refused request reached transport"))
+    refusal = ArtifactValidationError("approval expired before allocation")
+
+    def guard():
+        raise refusal
+
+    with pytest.raises(ArtifactValidationError) as caught:
+        client.create_instance({"request_id": "original-request"}, before_send=guard)
+    assert caught.value is refusal
+
+
+def test_instance_send_guard_does_not_wrap_transport_failure():
+    from types import SimpleNamespace
+    from urllib.error import URLError
+
+    client = HubClient("https://hub.example", "token")
+    events = []
+
+    def send(*args, **kwargs):
+        events.append("send")
+        raise URLError("uncertain provider response")
+
+    client._opener = SimpleNamespace(open=send)
+    with pytest.raises(HubError, match="uncertain provider response"):
+        client.create_instance({"request_id": "guarded"}, before_send=lambda: events.append("guard"))
+    assert events == ["guard", "send"]
+
+
+def image_manifest_for_sdk(payloads):
+    from palimpsest_local.image_manifest import manifest_from_result
+
+    return manifest_from_result(
+        {
+            "layers": [
+                {"digest": "sha256:" + hashlib.sha256(payload).hexdigest(), "size_bytes": len(payload)}
+                for payload in payloads
+            ],
+            "runtime": {
+                "entrypoint": [],
+                "cmd": ["/bin/true"],
+                "env": ["TOKEN=private"],
+                "working_dir": "/",
+                "user": "0",
+            },
+            "source": {},
+        },
+        os_family="unknown",
+        os_version="unknown",
+        source_kind="local",
+        metadata={"label": "actual local build"},
+    )
+
+
+def test_sdk_push_image_partial_payloads_still_registers_every_logical_manifest(tmp_path, monkeypatch):
+    client = HubClient("https://hub.invalid", "original-token", project_id="alpha")
+    base, child = b"hsqsbase", b"hsqsnewchild"
+    child_path = tmp_path / "child.sqfs"
+    child_path.write_bytes(child)
+    manifest = image_manifest_for_sdk((base, child))
+    calls = []
+
+    def opened(method, path, **kwargs):
+        calls.append((method, path, kwargs["body"].read()))
+        return io.BytesIO(b"{}")
+
+    def json_request(method, path, payload=None, **kwargs):
+        calls.append((method, path, payload))
+        return {"id": "hub-image-id", "leaf_id": payload["manifest"]["layers"][-1]["id"]}
+
+    monkeypatch.setattr(client, "_open", opened)
+    monkeypatch.setattr(client, "_json_request", json_request)
+    value = client.push_image(
+        manifest, {manifest["layers"][1]["digest"]: child_path}, name="local-child", request_id="request"
+    )
+    assert calls[0] == ("PUT", "/published-images/blobs/" + manifest["layers"][1]["digest"], child)
+    assert calls[1][0:2] == ("POST", "/published-images")
+    assert calls[1][2]["manifest"] == manifest
+    assert calls[1][2]["visibility"] == "private"
+    assert value["id"] == "hub-image-id"
+    calls.clear()
+    client.push_image(manifest, {}, name="local-child", request_id="request")
+    assert len(calls) == 1 and calls[0][0:2] == ("POST", "/published-images")
+    calls.clear()
+    client.push_image(manifest, {}, name="shared-child", request_id="shared", visibility="internal")
+    assert calls[0][2]["visibility"] == "internal"
+
+
+def test_logical_manifest_parent_identity_and_public_projection():
+    from palimpsest_local.image_manifest import (
+        manifest_digest,
+        native_image_projection,
+        normalize_manifest,
+        public_manifest,
+    )
+
+    first = image_manifest_for_sdk((b"hsqsbase", b"hsqscommon"))
+    other = image_manifest_for_sdk((b"hsqsother", b"hsqscommon"))
+    assert first["layers"][-1]["digest"] == other["layers"][-1]["digest"]
+    assert first["layers"][-1]["id"] != other["layers"][-1]["id"]
+    forged = {**first, "layers": [{**first["layers"][0], "parent_id": other["layers"][0]["id"]}]}
+    with pytest.raises(ValueError):
+        normalize_manifest(forged)
+    first["source"]["metadata"] = {"config": {"Env": ["TOKEN=private"]}}
+    first["layers"][0]["source"] = {
+        "oci_layer": {
+            "compressed": {
+                "digest": "sha256:" + "a" * 64,
+                "size": 71,
+                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+            },
+            "diff_id": "sha256:" + "b" * 64,
+        },
+        "conversion": {
+            "receipt": {
+                "key_digest": "sha256:" + "c" * 64,
+                "image_digest": first["layers"][0]["digest"],
+                "secret": "private",
+            }
+        },
+    }
+    public = public_manifest(first)
+    assert "private" not in json.dumps(public)
+    assert public["metadata"] == first["metadata"]
+    assert public["layers"][0]["source"]["compressed_size"] == 71
+    assert public["layers"][0]["source"]["key_digest"] == "sha256:" + "c" * 64
+    assert public["layers"][0]["id"] == first["layers"][0]["id"]
+    projection = native_image_projection(first)
+    assert projection["source"]["manifest_digest"] == manifest_digest(first)
+    assert projection["source"]["manifest"]["runtime"]["env"] == ["TOKEN=private"]
+    assert projection["layers"] == [
+        {"ordinal": index, "digest": layer["digest"], "size": layer["size_bytes"]}
+        for index, layer in enumerate(first["layers"])
+    ]
+
+
+def test_sdk_extension_transfers_only_new_payload_and_never_reconstructs_private_base(tmp_path, monkeypatch):
+    client = HubClient("https://hub.invalid", "original-token", project_id="alpha")
+    payload = b"hsqs-new-sdk-extension"
+    child = tmp_path / "new.sqfs"
+    child.write_bytes(payload)
+    digest = "sha256:" + hashlib.sha256(payload).hexdigest()
+    calls = []
+
+    def opened(method, path, **kwargs):
+        calls.append((method, path, kwargs["body"].read()))
+        return io.BytesIO(b"{}")
+
+    def json_request(method, path, body=None, **kwargs):
+        calls.append((method, path, body, kwargs))
+        return {"id": "server-extended-image"}
+
+    monkeypatch.setattr(client, "_open", opened)
+    monkeypatch.setattr(client, "_json_request", json_request)
+    value = client.push_image_extension(
+        "base-hub-id",
+        [
+            {"digest": digest, "size_bytes": len(payload), "id": "discard-id", "parent_id": "discard-parent"},
+        ],
+        {digest: child},
+        name="child",
+        request_id="extension-id",
+        visibility="internal",
+        metadata={"label": "child"},
+    )
+    assert value == {"id": "server-extended-image"}
+    assert calls[0] == ("PUT", "/published-images/blobs/" + digest, payload)
+    assert calls[1][0:2] == ("POST", "/published-images/extensions")
+    assert calls[1][2] == {
+        "base_image_id": "base-hub-id",
+        "layers": [{"digest": digest, "size_bytes": len(payload)}],
+        "name": "child",
+        "request_id": "extension-id",
+        "visibility": "internal",
+        "metadata": {"label": "child"},
+    }
+    assert len(calls) == 2
+    calls.clear()
+    client.get_layer_node("node", project_id="origin", image_id="base-hub-id")
+    client.get_layer_children("node", project_id="origin", image_id="base-hub-id")
+    client.get_layer_ancestors("node", project_id="origin", image_id="base-hub-id")
+    assert all(
+        call[3]["query"]["project_id"] == "origin" and call[3]["query"]["image_id"] == "base-hub-id" for call in calls
+    )

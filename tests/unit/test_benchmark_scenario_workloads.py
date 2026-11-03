@@ -20,6 +20,7 @@ def config(scenario="torch-cpu", method="openstack-container"):
             scenario: CUDA_IMAGE if scenario == "cuda" else IMAGE,
             **({"k3s-probe": IMAGE} if scenario == "k3s" else {}),
         },
+        "image_metadata": {scenario: {"os_family": "fixture-os", "os_version": "1"}},
         "workload": {"iterations": 2, "matrix_size": 16, "timeout_seconds": 30},
         "cluster": {"servers": 1, "agents": 1, "timeout_seconds": 60},
     }

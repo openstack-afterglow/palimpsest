@@ -31,8 +31,10 @@ from palimpsest_hub.api.hub import configure_blocking_operations
 from palimpsest_hub.api.hub import router as hub_router
 from palimpsest_hub.api.image_jobs import router as image_job_router
 from palimpsest_hub.api.instances import router as instance_router
+from palimpsest_hub.api.native_instances import router as native_instance_router
 from palimpsest_hub.api.packages import router as package_router
 from palimpsest_hub.api.policy import router as policy_router
+from palimpsest_hub.api.published_images import router as published_image_router
 from palimpsest_hub.cache import close_redis, get_redis
 from palimpsest_hub.config import get_settings
 from palimpsest_hub.database import close_db, get_session_factory, init_db
@@ -113,6 +115,8 @@ app.include_router(policy_router, prefix="/v1")
 app.include_router(catalog_router, prefix="/v1")
 app.include_router(image_job_router, prefix="/v1", tags=["image-jobs"])
 app.include_router(instance_router, prefix="/v1", tags=["instances"])
+app.include_router(published_image_router, prefix="/v1", tags=["published-images"])
+app.include_router(native_instance_router, prefix="/v1", tags=["native-instances"])
 
 
 def _package_path(request: Request) -> bool:
@@ -130,6 +134,9 @@ def _execution_path(request: Request) -> bool:
         "/v1/image-worker",
         "/v1/instances",
         "/v1/instance-bootstrap",
+        "/v1/published-images",
+        "/v1/layer-nodes",
+        "/v1/native-instances",
     )
     return any(path == root or path.startswith(root + "/") for root in roots)
 

@@ -672,10 +672,14 @@ def _hash(path: Path) -> str:
     return "sha256:" + digest.hexdigest()
 
 
-def materialized_result(materialized: dict, directory: Path, maximum: int) -> dict:
+def materialized_result(materialized: dict, directory: Path, maximum: int, publication: dict | None = None) -> dict:
     receipt = materialized["receipt"]
     paths = materialized["blob_paths"]
-    if not 0 < len(paths) <= MAX_LAYERS or len(paths) != len(receipt["results"]):
+    if (
+        not 0 < len(paths) <= MAX_LAYERS
+        or len(paths) != len(receipt["results"])
+        or len(paths) != len(receipt["layers"])
+    ):
         raise ValueError("invalid materialized layer count")
     config_descriptor = materialized["image"]["config_descriptor"]
     # Use the retained path returned by LayerCache rather than a second CAS layout.
@@ -732,6 +736,40 @@ def materialized_result(materialized: dict, directory: Path, maximum: int) -> di
             outgoing.flush()
             os.fsync(outgoing.fileno())
         result["layers"].append({"digest": digest, "size_bytes": size})
+    from .image_manifest import manifest_from_result
+
+    options = publication or {}
+    request = options.get("request", {})
+    enriched = {
+        **result,
+        "layers": [
+            {
+                **layer,
+                "source": {
+                    "conversion": receipt["results"][ordinal],
+                    "oci_layer": receipt["layers"][ordinal],
+                },
+            }
+            for ordinal, layer in enumerate(result["layers"])
+        ],
+    }
+    enriched["source"] = {
+        **result["source"],
+        "metadata": {
+            "materialization": receipt,
+            "image": materialized["image"],
+        },
+    }
+    if options.get("kind") == "registry" and request.get("reference"):
+        enriched["source"]["reference"] = request["reference"]
+    enriched["source"]["diff_ids"] = [layer["diff_id"] for layer in receipt["layers"]]
+    result["manifest"] = manifest_from_result(
+        enriched,
+        os_family=request.get("os_family", "unknown"),
+        os_version=request.get("os_version", "unknown"),
+        source_kind="local" if options.get("kind") == "dockerfile" else "registry",
+        metadata=request.get("metadata", {}),
+    )
     return result
 
 
@@ -784,7 +822,7 @@ def run_image(manifest: dict, directory: Path) -> dict:
                 timeout_seconds=remaining,
                 pack_profile=SquashFSPackProfile.SERVICE_IMAGE,
             )
-            result = materialized_result(materialized, directory, maximum)
+            result = materialized_result(materialized, directory, maximum, manifest)
     _save(directory / "result.json", result)
     return result
 

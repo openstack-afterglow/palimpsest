@@ -4,8 +4,28 @@ All notable changes to Palimpsest Local are documented here.
 
 ## [Unreleased]
 
+## [0.3.11] - 2026-11-03
+
 ### Added
 
+- Add one canonical image publication engine for worker output and locally built
+  SDK pushes/extensions, authoritative Hub manifests and metadata discovery,
+  parent-aware single-parent logical layers, immutable payload references and
+  private/internal/public image membership with transitive reuse restrictions.
+- Add namespace-qualified Manila/CephFS publication and exact MDS-path plus OSD
+  pool/namespace read-only consumer credentials. Scope changes copy payloads;
+  same-scope reuse remains content-addressed. Path-only isolation and
+  cross-namespace hardlinks are explicitly rejected.
+- Add an opt-in native SDK lifecycle with fast durable HTTP202 admission,
+  fresh-original-caller background connections, project-scoped cumulative
+  CPU-image grants, exact cleanup and SQL/private-journal uncertainty fences.
+  Pair client/Hub `0.3.11` with an exact companion dependency. Local amd64
+  container and database qualification are distinct from production deployment,
+  actual namespace isolation and a new Nova warm-start proof.
+
+- Add an explicit experimental `cloud native` candidate: separate BIOS carrier/initramfs PID1, authenticated loopback mTLS bootstrap with per-run restricted SSH transport, CephFS-backed actual-root assembly, separately pinned NVIDIA driver injection, and grant-bound Cinder-before-Nova lifecycle/cleanup. The standalone probe uses original-image cudart/cuBLAS plus Driver API computation. Source preparation preserves predecessor bytes; this entry does not claim an executed native boot or GPU proof.
+- Add digest-pinned `cloud image-pull` on the Nova worker, with sequential layer conversion/publication/receipt commits, original OCI provenance, no-copy verified CephFS blob reuse, and durable no-replay intake identities. This does not implement or qualify native CephFS-root Nova GPU boot.
+- Add local-driven `palimpsest cloud env up|status|down`, `cloud dockerfile-build` and `cloud layer-run`: the CLI uses a `clouds.yaml` cloud through openstacksdk to provision a Manila CephFS layer share and a Nova build worker (read-write cephx identity), builds a Dockerfile there with pinned BuildKit, converts it into ordered SquashFS layers published write-once to CephFS, then boots fresh consumer VMs with a separate read-only cephx rule that loop-mount the layers read-only under an overlay and run a command. No Palimpsest code runs in consumers; created resources are recorded per environment and deleted only by recorded ID.
 - Add disabled-by-default API GPU profiles bound to original projects, exact qualified guest content, flavor/PCI aliases, driver and GPU count; use preinstalled NVIDIA vendor injection with preserved image identity and owned namespace cleanup. Actual GPU workload qualification remains blocked, not passed.
 - Add one-job/two-consumer API cold/warm measurements with continuous cold timing, existing ordered-layer warm reuse, fresh writable state and explicit HTTPS-transfer/cache limits. Keep a fixed offline hash-pinned derived TensorFlow recipe and bounded streaming context upload; no GPU timing or deployment qualification is claimed.
 - Add separately admitted two-node API k3s profiles, an external fixed offline-airgap build context, private expiring join capabilities and exact node/numerical-pod proofs. Cold/prepared pairs hold two live reservations and reuse one immutable image job; default CPU/GPU privilege is unchanged.
@@ -17,7 +37,28 @@ All notable changes to Palimpsest Local are documented here.
 - Preserve the Korean visual guide and four interactive diagram artifacts byte-for-byte from the 2026-10-29 working-tree snapshot. README illustrations explain the external-control/Hub-metadata/Manila-managed-CephFS target, explicitly separate from current HTTPS bootstrap and historical Cinder prototypes; illustrations are not deployment or runtime evidence.
 
 ### Fixed
+- Exclude non-distributed Finder `.DS_Store` metadata from deterministic worker
+  source archives after actual Linux container qualification found editable and
+  installed package fingerprints differed despite identical distributed code.
+  Preserve the code-byte/grant pin instead of weakening the integrity check.
+- Upgrade existing image-job visibility as historical project-wide `internal`
+  before creating dependent tables. Preserve proven context creators in the
+  creator-aware primary key; reject unknown creators before DDL, and quarantine
+  legacy jobs lacking creator/OS declarations before worker effects. Schema
+  cutover requires all writers stopped and a restorable paired SQL/CAS backup.
+- Make copied public Hub source readable in all three runtime images without
+  relying on root DAC capabilities; private configuration permissions are unchanged.
+- Preserve inherited reuse ceilings through MariaDB's reflected JSON/LONGTEXT
+  representation, binding decoded policy lists for the destination type. Reject
+  blank or oversized UTF-8 OS declarations before image-worker admission.
 
+- Consolidate the remaining local worktree features and port final allocation-expiry/no-send recovery without reverting prepared-root or paired-budget ownership. Preserve original staged work and historical evidence outside retired checkouts; no remote merge or release is implied.
+- Fix imported cloud result registration, deletion replay, SSH isolation, bounded retained output and native tunnel/key-cleanup prerequisites. Controlled SIGTERM uses owned cleanup; experimental actual-root/GPU acceptance remains unqualified.
+- Preserve sanitized, private, no-clobber Nova console evidence before failed experimental native-run cleanup; retain positive ACTIVE/enrollment timestamps and failure phase across revocation. Bound SDK connect/read timeouts through the actual session and restore transport settings even on cancellation. Diagnostic failure does not prevent cleanup, refund attempts or satisfy the CPU/GPU gate. This evidence-retention repair does not identify or qualify the failed native boot.
+- Preserve fixed-operation/type/errno serial context for experimental PID1 failures without exposing exception messages, file paths, arbitrary class names or credentials. Keep labels compatible with the existing console sanitizer and preserve HOLD/result/gate semantics. This diagnostic-only candidate does not establish the cause or repair of the observed native boot failure.
+- Add exact-approved recovery for cleaned native failures without resetting their outcomes or spent ledgers: bind predecessor preparation/run/history digests, recheck provider absence and stopped bootstrap service, and preserve preparation assets in separate source generations with unchanged kernel bundle/DNS. Reserve cleanup time inside the allocation and reject recovered over-budget CPU results as GPU prerequisites. Local verification does not qualify the undiagnosed native boot.
+- Preserve private redacted carrier-builder stdout/stderr tails before failed pre-Nova cleanup, without interpreting an SSH exit status as remote-actor completion. Keep interrupted transports TERM-only and fail-closed source-identity checks intact; concurrent package-update evidence is not a guest-boot result or a refunded allocation.
+- Give one-pass Glance carrier PUTs deadline-bound scalar socket waits without changing metadata defaults or shared sessions. Prevent hidden SDK mutation replay on connection/status failures, reauthentication and redirects through the original-caller factory; reject mutation3xx and retain only safe upload cause/progress fields. Observe existing deletion intents rather than resending, bind Cinder origin to its durable image intent, and refuse recovery with unreaped upload clients. Strict no-replay retains paid-resource HOLDs for separately authorized manual disposition; it is not an automatic cleanup guarantee.
 - Recover prepared roots through original-project scoped Cinder inventory without the provider-rejected `project_id` query. Treat create responses as partial: bind a returned UUID only after an exact detail read verifies original owner, intent, size, image and no attachment; retain unknown POST outcomes without retries or Nova allocation.
 - Prepare each official Hub instance root as one durable exact-project image-backed Cinder volume before Nova. Initial create is Cinder-only; GET never mutates providers, and explicit request/volume-bound advance dispatches the first volume-source Nova attempt or one deferred exact-owned volume deletion. Preserve original bootstrap expiry, private no-call/uncertain history, strict tri-state server-attempt certificates, mutex fences across COMMIT, bounded lost-response recovery and actual404-only cleanup without changing cloud wait settings or persisting raw credentials. Existing server-backed rows remain lifecycle-only; source/client cutover is not deployment or GPU acceptance evidence.
 - Bound Hub asyncmy handshake/response reads with `DATABASE_READ_TIMEOUT` (default 30 seconds, valid 1–120) in API, export worker and offline bootstrap. Keep TCP connect/pool limits and readiness single-flight/closed-transport pre-ping semantics unchanged; do not pass MySQL-only connection arguments to SQLite.

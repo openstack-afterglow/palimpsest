@@ -145,6 +145,18 @@ def materialization(tmp_path):
             "root_descriptor": {"digest": sha(b"root")},
             "manifest_digest": sha(b"manifest"),
             "results": results,
+            "layers": [
+                {
+                    "ordinal": ordinal,
+                    "compressed": {
+                        "digest": sha(b"compressed" + bytes([ordinal])),
+                        "size": 50 + ordinal,
+                        "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    },
+                    "diff_id": sha(b"diff" + bytes([ordinal])),
+                }
+                for ordinal in range(len(layers))
+            ],
         },
         "blob_paths": layers,
         "root": str(tmp_path),
@@ -1066,3 +1078,50 @@ def test_run_image_selects_service_profile_without_extending_absolute_deadline(
         assert builder.run_image(manifest, tmp_path) == {"complete": True}
         assert observed == [{"timeout_seconds": 3350.0, "pack_profile": SquashFSPackProfile.SERVICE_IMAGE}]
     assert manifest["timeout_seconds"] == 3600
+
+
+def test_materialized_publication_retains_original_compressed_and_conversion_provenance(tmp_path):
+    from palimpsest_local.image_manifest import public_manifest
+
+    materialized = materialization(tmp_path)
+    original_layers = [
+        {
+            "ordinal": index,
+            "compressed": {
+                "digest": sha(b"compressed" + bytes([index])),
+                "size": 50 + index,
+                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+            },
+            "diff_id": sha(b"diff" + bytes([index])),
+        }
+        for index in range(2)
+    ]
+    materialized["receipt"]["layers"] = original_layers
+    materialized["receipt"]["process"] = {"env": ["DO_NOT_EXPOSE=private"]}
+    materialized["receipt"]["results"][0]["receipt"]["key_digest"] = sha(b"conversion-key")
+    (tmp_path / "outputs.pack").write_bytes(bytes(1024))
+    result = builder.materialized_result(
+        materialized,
+        tmp_path,
+        1024,
+        {
+            "kind": "registry",
+            "request": {
+                "os_family": "alpine",
+                "os_version": "3",
+                "reference": "docker.io/library/alpine:3",
+                "metadata": {"purpose": "queryable"},
+            },
+        },
+    )
+    manifest = result["manifest"]
+    assert manifest["layers"][0]["source"]["oci_layer"] == original_layers[0]
+    assert manifest["layers"][0]["source"]["conversion"] == materialized["receipt"]["results"][0]
+    assert manifest["source"]["metadata"]["materialization"] == materialized["receipt"]
+    assert manifest["source"]["metadata"]["image"] == materialized["image"]
+    assert manifest["source"]["diff_ids"] == [item["diff_id"] for item in original_layers]
+    public = public_manifest(manifest)
+    assert public["metadata"] == {"purpose": "queryable"}
+    assert public["layers"][0]["source"]["compressed_digest"] == original_layers[0]["compressed"]["digest"]
+    assert public["layers"][0]["source"]["key_digest"] == sha(b"conversion-key")
+    assert "DO_NOT_EXPOSE" not in json.dumps(public)

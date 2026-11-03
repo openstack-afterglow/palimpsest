@@ -10,7 +10,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from palimpsest_hub.api.hub import (
     _factory_or_503,
@@ -124,6 +124,13 @@ async def list_instances(limit: int = Query(50, ge=1, le=100), actor: dict = Dep
             await session.scalars(
                 select(PalimpsestHubInstance)
                 .where(exact_identity(PalimpsestHubInstance.project_id, package_target_project_id(actor)))
+                .where(
+                    or_(
+                        PalimpsestHubInstance.spec_json["published_visibility"].as_string().is_(None),
+                        PalimpsestHubInstance.spec_json["published_visibility"].as_string() != "private",
+                        exact_identity(PalimpsestHubInstance.created_by, actor["user_id"]),
+                    )
+                )
                 .order_by(PalimpsestHubInstance.created_at.desc(), PalimpsestHubInstance.id.desc())
                 .limit(limit)
             )

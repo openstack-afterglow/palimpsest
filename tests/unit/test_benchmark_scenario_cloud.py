@@ -5,6 +5,8 @@ import copy
 import hmac
 import json
 import os
+import stat
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,7 +14,7 @@ import pytest
 import yaml
 
 from palimpsest_local import benchmark_scenario_cloud as module
-from palimpsest_local.errors import ArtifactValidationError, BuildError
+from palimpsest_local.errors import ArtifactValidationError, BuildError, StateError
 
 
 class Budget:
@@ -24,10 +26,13 @@ class Budget:
         self.aux_bound = {}
         self.aux_released = []
 
-    def reserve(self, role, boot_gib):
+    def reserve(self, role, boot_gib, deadline=None):
         identity = f"reservation-{len(self.reserved)}"
         self.reserved.append((identity, role, boot_gib))
         return identity
+
+    def check_allocation(self, deadline=None):
+        pass
 
     def bind(self, identity, server):
         self.bound[identity] = server
@@ -37,6 +42,11 @@ class Budget:
         if guard:
             guard()
         self.released.append(identity)
+
+    def release_unbound(self, identity, role):
+        assert any(row[:2] == (identity, role) for row in self.reserved)
+        assert identity not in self.bound
+        self.release(identity)
 
     def reserve_aux(self, kind, role):
         if self.aux_reserved:
@@ -232,6 +242,324 @@ def _create(adapter, monkeypatch):
     with monkeypatch.context() as patch:
         patch.setattr(instance, "run_guest", ready)
         return instance.create("baseline")
+
+
+def _guarded_adapter(adapter, tmp_path, monkeypatch, *, purpose="benchmark"):
+    from palimpsest_local.benchmark_scenarios import ResourceBudget
+
+    instance, cloud, _, events = adapter
+    clock = SimpleNamespace(monotonic=100.0, wall=1700000000.0)
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock.monotonic)
+    monkeypatch.setattr(module.time, "time", lambda: clock.wall)
+    config = copy.deepcopy(instance.config)
+    config["deadline_seconds"] = 60
+    config["resources"] = {"max_creates": 4, "max_live": 1, "max_boot_gib": 80}
+    config["approval"].update(
+        id="approval-one",
+        project_id=config["project_id"],
+        allowed_scenarios=["environment"],
+        max_creates=4,
+        max_live=1,
+        max_boot_gib=80,
+        expires_at=datetime.fromtimestamp(clock.wall + 60, UTC).isoformat(),
+        ledger_root=str(tmp_path / "approval-ledger"),
+    )
+    if purpose == "station":
+        config["data_disk"] = {"mountpoint": "/mnt/palimpsest-benchmark"}
+    budget = ResourceBudget(config, instance.output)
+    instance = module.ScenarioCloud(
+        config,
+        instance.output,
+        lambda name, data: events.append((name, data)),
+        connection=cloud,
+        budget=budget,
+        purpose=purpose,
+        deadline=160.0,
+    )
+    return instance, cloud, budget, events, clock
+
+
+def _expire_during_create(instance, cloud, clock, monkeypatch, *, boundary, expiry):
+    def expire():
+        if expiry == "approval":
+            clock.wall += 60
+        else:
+            clock.monotonic = instance.deadline
+
+    if boundary == "provider-get":
+        original, calls = cloud.image.get_image, []
+
+        def get_image(identity):
+            calls.append(identity)
+            result = original(identity)
+            if len(calls) == 2:  # Internal controller GET after reservation.
+                expire()
+            return result
+
+        monkeypatch.setattr(cloud.image, "get_image", get_image)
+    elif boundary == "request-encoding":
+        original = module.base64.b64encode
+
+        def encode(value):
+            result = original(value)
+            expire()
+            return result
+
+        monkeypatch.setattr(module.base64, "b64encode", encode)
+    else:
+        original, triggered = module.os.fsync, []
+        directory = instance.receipts.stat()
+
+        def fsync(fd):
+            original(fd)
+            info = os.fstat(fd)
+            if (
+                not triggered
+                and stat.S_ISDIR(info.st_mode)
+                and (info.st_dev, info.st_ino) == (directory.st_dev, directory.st_ino)
+            ):
+                assert module._read(instance.receipts / "job-one-baseline.json")["phase"] == "create-intent"
+                triggered.append(True)
+                expire()
+
+        monkeypatch.setattr(module.os, "fsync", fsync)
+
+
+@pytest.mark.parametrize("expiry", ["approval", "deadline"])
+def test_real_adapter_expiry_during_placement_get_consumes_no_reservation(adapter, tmp_path, monkeypatch, expiry):
+    instance, cloud, budget, _, clock = _guarded_adapter(adapter, tmp_path, monkeypatch)
+    original = cloud.image.get_image
+
+    def slow_get(identity):
+        image = original(identity)
+        if expiry == "approval":
+            clock.wall += 60
+        else:
+            clock.monotonic = instance.deadline
+        return image
+
+    monkeypatch.setattr(cloud.image, "get_image", slow_get)
+    with pytest.raises(ArtifactValidationError, match=expiry):
+        instance.create("baseline")
+    assert not cloud.requests and not budget.path.exists()
+    assert instance.resources() == [] and not list(instance.receipts.iterdir())
+
+
+@pytest.mark.parametrize("purpose", ["benchmark", "peer", "station"])
+@pytest.mark.parametrize("expiry", ["approval", "deadline"])
+@pytest.mark.parametrize("boundary", ["provider-get", "intent-fsync", "request-encoding"])
+def test_real_controller_final_guard_expires_without_provider_request(
+    adapter, tmp_path, monkeypatch, purpose, expiry, boundary
+):
+    instance, cloud, budget, _, clock = _guarded_adapter(adapter, tmp_path, monkeypatch, purpose=purpose)
+    _expire_during_create(instance, cloud, clock, monkeypatch, boundary=boundary, expiry=expiry)
+    with pytest.raises(module.NovaCreateAborted, match=expiry):
+        instance.create("baseline")
+    assert not cloud.requests and not cloud.deleted
+    receipt = instance.controller.inspect("job-one-baseline")
+    assert receipt["phase"] == "aborted-before-request"
+    assert receipt["request_started"] is False and receipt["uncertain_create"] is False
+    operation = module._read(instance.operations / "baseline.json")
+    assert operation["phase"] == "aborted-before-request" and operation["budget_released"] is True
+    assert operation["nova_spec_digest"] == receipt["spec_digest"]
+    rows = json.loads(budget.path.read_text())["reservations"]
+    assert len(rows) == 1
+    row = next(iter(rows.values()))
+    assert row["released"] is True and row["server_id"] is None and row["boot_gib"] == 20
+    assert instance.resources() == []
+    clock.monotonic, clock.wall = 100.0, 1700000000.0
+    with pytest.raises(ArtifactValidationError, match="role intent"):
+        instance.create("baseline")
+    with pytest.raises(ArtifactValidationError, match="role consumed"):
+        budget.reserve("baseline", 20, deadline=instance.deadline)
+    with pytest.raises(ArtifactValidationError, match="intent already exists"):
+        instance.controller.create(
+            job_id="job-one-baseline",
+            name="job-one-baseline",
+            image_id="image-one",
+            flavor_id="flavor-one",
+            network_id="network-one",
+            security_group_ids=["sg-one"],
+            user_data="#cloud-config\n",
+            require_gpu=False,
+        )
+
+
+@pytest.mark.parametrize("explicit_deadline", [False, True])
+def test_real_adapter_preserves_original_deadline_across_constructor_preflight(
+    adapter, tmp_path, monkeypatch, explicit_deadline
+):
+    instance, cloud, budget, _, clock = _guarded_adapter(adapter, tmp_path, monkeypatch)
+    original = cloud.compute.get_flavor
+
+    def slow_get(identity):
+        result = original(identity)
+        clock.monotonic = 161.0
+        return result
+
+    monkeypatch.setattr(cloud.compute, "get_flavor", slow_get)
+    kwargs = {"deadline": 160.0} if explicit_deadline else {}
+    restarted = module.ScenarioCloud(
+        instance.config, instance.output, lambda *_: None, connection=cloud, budget=budget, **kwargs
+    )
+    assert restarted.deadline == 160.0
+    with pytest.raises(ArtifactValidationError, match="deadline"):
+        restarted.create("baseline")
+    assert not cloud.requests and not budget.path.exists()
+
+
+def test_real_controller_valid_guard_preserves_positive_allocation(adapter, tmp_path, monkeypatch):
+    instance, cloud, budget, events, _ = _guarded_adapter(adapter, tmp_path, monkeypatch)
+    resource = _create((instance, cloud, budget, events), monkeypatch)
+    assert len(cloud.requests) == 1 and resource["server_id"] == "server-one"
+    row = next(iter(json.loads(budget.path.read_text())["reservations"].values()))
+    assert row["released"] is False and row["server_id"] == resource["server_id"]
+    assert instance.controller.inspect(resource["job_id"])["phase"] == "active-not-ready"
+
+
+@pytest.mark.parametrize("error", [TimeoutError, module.NovaCreateAborted])
+def test_real_controller_provider_error_never_becomes_no_call(adapter, tmp_path, monkeypatch, error):
+    instance, cloud, budget, _, clock = _guarded_adapter(adapter, tmp_path, monkeypatch)
+
+    def lost_response(**request):
+        cloud.create_server(**request)
+        clock.monotonic = instance.deadline
+        raise error("lost create response")
+
+    monkeypatch.setattr(cloud.compute, "create_server", lost_response)
+    with pytest.raises((error, ArtifactValidationError)):
+        instance.create("baseline")
+    assert len(cloud.requests) == 1
+    receipt = instance.controller.inspect("job-one-baseline")
+    assert receipt["phase"] == "create-intent" and receipt["uncertain_create"] is True
+    operation = instance.resources()[0]
+    assert operation["phase"] == "create-intent" and not operation.get("budget_released")
+    row = next(iter(json.loads(budget.path.read_text())["reservations"].values()))
+    assert row["released"] is False
+    with pytest.raises(ArtifactValidationError, match="uncertain"):
+        instance.delete(operation)
+    (instance.receipts / "job-one-baseline.json").unlink()
+    with pytest.raises(ArtifactValidationError, match="missing Nova receipt"):
+        instance.delete(operation)
+    assert not cloud.deleted
+    assert next(iter(json.loads(budget.path.read_text())["reservations"].values()))["released"] is False
+
+
+def _interrupted_abort(adapter, tmp_path, monkeypatch):
+    instance, cloud, budget, events, clock = _guarded_adapter(adapter, tmp_path, monkeypatch)
+    _expire_during_create(instance, cloud, clock, monkeypatch, boundary="intent-fsync", expiry="deadline")
+
+    def crash_before_outer_settlement(resource):
+        raise OSError("interrupted before outer settlement")
+
+    monkeypatch.setattr(instance, "_release_unallocated", crash_before_outer_settlement)
+    with pytest.raises(OSError, match="interrupted"):
+        instance.create("baseline")
+    assert not cloud.requests
+    operation = instance.resources()[0]
+    assert operation["phase"] == "create-intent" and not operation.get("budget_released")
+    restarted = module.ScenarioCloud(
+        instance.config, instance.output, lambda *_: None, connection=cloud, budget=budget, cleanup_only=True
+    )
+    return restarted, cloud, budget, operation
+
+
+def test_real_controller_abort_cleanup_settles_after_restart_idempotently(adapter, tmp_path, monkeypatch):
+    instance, cloud, budget, operation = _interrupted_abort(adapter, tmp_path, monkeypatch)
+    settled = instance.delete(operation)
+    assert settled["phase"] == "aborted-before-request" and settled["budget_released"] is True
+    assert instance.delete(settled) == settled
+    assert instance.resources() == [] and not cloud.deleted
+    rows = json.loads(budget.path.read_text())["reservations"]
+    assert len(rows) == 1 and next(iter(rows.values()))["released"] is True
+
+
+@pytest.mark.parametrize("field", ["job_id", "role", "server_id"])
+def test_real_controller_abort_keeps_changed_or_bound_reservation(adapter, tmp_path, monkeypatch, field):
+    instance, cloud, budget, operation = _interrupted_abort(adapter, tmp_path, monkeypatch)
+    with budget._locked() as ledger:
+        ledger["reservations"][operation["reservation_id"]][field] = "different-identity"
+    with pytest.raises(ArtifactValidationError, match="unbound reservation changed"):
+        instance.delete(operation)
+    row = json.loads(budget.path.read_text())["reservations"][operation["reservation_id"]]
+    assert row["released"] is False and not cloud.deleted
+
+
+@pytest.mark.parametrize("mutation", ["schema", "job", "project", "name", "descriptor", "digest", "started", "server"])
+def test_real_controller_abort_cleanup_rejects_changed_receipt(adapter, tmp_path, monkeypatch, mutation):
+    from palimpsest_local.nova_build import spec_digest
+
+    instance, cloud, budget, operation = _interrupted_abort(adapter, tmp_path, monkeypatch)
+    path = instance.receipts / "job-one-baseline.json"
+    receipt = module._read(path)
+    if mutation == "descriptor":
+        receipt["descriptor"]["image_id"] = "different-image"
+        receipt["spec_digest"] = spec_digest(receipt["descriptor"])
+    elif mutation == "started":
+        receipt["request_started"] = True
+    elif mutation == "server":
+        receipt["server_id"] = "server-one"
+    else:
+        key = {"job": "job_id", "project": "project_id", "digest": "spec_digest"}.get(mutation, mutation)
+        receipt[key] = "different-identity"
+    module.atomic_write_json(path, receipt)
+    with pytest.raises(ArtifactValidationError, match="receipt|operation"):
+        instance.delete(operation)
+    assert not cloud.deleted
+    assert json.loads(budget.path.read_text())["reservations"][operation["reservation_id"]]["released"] is False
+
+
+@pytest.mark.parametrize("failure", ["save", "verify"])
+def test_real_controller_failed_abort_proof_keeps_live_budget(adapter, tmp_path, monkeypatch, failure):
+    instance, cloud, budget, _, clock = _guarded_adapter(adapter, tmp_path, monkeypatch)
+    _expire_during_create(instance, cloud, clock, monkeypatch, boundary="provider-get", expiry="approval")
+    if failure == "save":
+
+        def fail_save(record):
+            raise OSError("abort durability failed")
+
+        monkeypatch.setattr(instance.controller, "_save", fail_save)
+    else:
+
+        def fail_read(job_id):
+            raise OSError("abort verification failed")
+
+        monkeypatch.setattr(instance.controller, "_read", fail_read)
+    with pytest.raises(OSError, match="abort"):
+        instance.create("baseline")
+    operation = instance.resources()[0]
+    assert operation["phase"] == "create-intent" and not operation.get("budget_released")
+    assert not cloud.requests and not cloud.deleted
+    assert json.loads(budget.path.read_text())["reservations"][operation["reservation_id"]]["released"] is False
+
+
+def test_real_controller_abort_fsync_failure_holds_budget_until_reverified_cleanup(adapter, tmp_path, monkeypatch):
+    instance, cloud, budget, _, clock = _guarded_adapter(adapter, tmp_path, monkeypatch)
+    _expire_during_create(instance, cloud, clock, monkeypatch, boundary="provider-get", expiry="approval")
+    original_fsync = module.os.fsync
+    directory = instance.receipts.stat()
+
+    def fail_abort_directory_fsync(fd):
+        info = os.fstat(fd)
+        if stat.S_ISDIR(info.st_mode) and (info.st_dev, info.st_ino) == (directory.st_dev, directory.st_ino):
+            receipt = module._read(instance.receipts / "job-one-baseline.json")
+            if receipt["phase"] == "aborted-before-request":
+                raise OSError("abort directory sync failed after replacement")
+        original_fsync(fd)
+
+    monkeypatch.setattr(module.os, "fsync", fail_abort_directory_fsync)
+    with pytest.raises(StateError, match="durably sync"):
+        instance.create("baseline")
+    operation = instance.resources()[0]
+    assert operation["phase"] == "create-intent" and not operation.get("budget_released")
+    assert json.loads(budget.path.read_text())["reservations"][operation["reservation_id"]]["released"] is False
+    with pytest.raises(OSError, match="abort directory sync"):
+        instance.delete(operation)
+    assert not cloud.requests and not cloud.deleted
+    monkeypatch.setattr(module.os, "fsync", original_fsync)
+    settled = instance.delete(operation)
+    assert settled["phase"] == "aborted-before-request" and settled["budget_released"] is True
+    assert len(json.loads(budget.path.read_text())["reservations"]) == 1
 
 
 @pytest.mark.parametrize("marker", ["", "@cert-authority ", "@revoked "])

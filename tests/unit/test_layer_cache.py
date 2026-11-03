@@ -690,3 +690,152 @@ def test_materialize_pre_worker_expiry_preserves_coded_failure_summary(tmp_path,
     assert summary["code"] == "oci-worker-timeout"
     assert summary["stage"] == "materialization"
     assert summary["category"] == "OCIHardWorkerError"
+
+
+def _sequential_materialization_probe(tmp_path, monkeypatch, *, repeat=True, worker_failure=None):
+    import test_oci_store as fixtures
+
+    from palimpsest_local import oci_materializer
+    from palimpsest_local.oci_store import DerivedLayerOccurrence
+
+    source, root, _ = _layout(tmp_path / "layout", repeat=repeat)
+    cache = _cache(tmp_path / "cache")
+    cache.import_source(source)
+    packer = tmp_path / "packer"
+    packer.write_bytes(b"pinned-packer")
+    toolchain = fixtures._toolchain_capability()
+    monkeypatch.setattr(layer_cache, "discover_squashfs_toolchain", lambda *a, **k: toolchain)
+    events = []
+    produced = []
+
+    def materialize(selected, ordinal, **kwargs):
+        events.append(("materialize", ordinal))
+        if ordinal == worker_failure:
+            raise RuntimeError("conversion failed")
+        occurrence = DerivedLayerOccurrence.from_image(selected, ordinal)
+        return kwargs["store"].materialize_observed(
+            occurrence, fixtures._key(occurrence), fixtures._producer(occurrence, produced, fixtures._squashfs())
+        )
+
+    monkeypatch.setattr(oci_materializer, "materialize_layer_hard", materialize)
+    return cache, root, packer, events, produced
+
+
+def test_materialize_commits_each_layer_before_callback_and_reuses_same_blob(tmp_path, monkeypatch):
+    import fcntl
+
+    from palimpsest_local.oci_store import DerivedLayerReceipt
+
+    cache, root, packer, events, produced = _sequential_materialization_probe(tmp_path, monkeypatch)
+    callbacks = []
+    marker = cache.roots.state / "layer-cache.json"
+
+    def on_layer(ordinal, blob_path, receipt):
+        events.append(("callback", ordinal))
+        # Reentry is forbidden: another independently opened lock cannot enter.
+        with (cache.root / ".layer-cache.lock").open("rb") as lock_probe:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(lock_probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert isinstance(blob_path, Path)
+        assert DerivedLayerReceipt.from_dict(receipt).ordinal == ordinal
+        assert _sha(blob_path.read_bytes()) == receipt["image_digest"]
+        committed = json.loads(marker.read_bytes())["derived"][receipt["key_digest"]]
+        assert committed["image_digest"] == receipt["image_digest"]
+        assert committed["image_size"] == receipt["image_size"]
+        callbacks.append((ordinal, blob_path, receipt))
+
+    result = cache.materialize(root, packer_path=packer, on_layer=on_layer)
+
+    assert events == [("materialize", 0), ("callback", 0), ("materialize", 1), ("callback", 1)]
+    assert produced == [0]
+    assert [item[2] for item in callbacks] == [item["receipt"] for item in result["receipt"]["results"]]
+    assert [item["cache_result"] for item in result["receipt"]["results"]] == ["cold_miss", "warm_hit"]
+    assert callbacks[0][1] == callbacks[1][1]
+    assert result["blob_paths"] == [os.fspath(item[1]) for item in callbacks]
+    assert len(LayerCache(cache.root).inspect(root)["derived"]) == 1
+
+
+@pytest.mark.parametrize("failure", ["callback", "worker"])
+def test_materialize_failure_retains_committed_prefix_and_stops_next_layer(tmp_path, monkeypatch, failure):
+    cache, root, packer, events, produced = _sequential_materialization_probe(
+        tmp_path, monkeypatch, worker_failure=1 if failure == "worker" else None
+    )
+    injected = RuntimeError("publication failed")
+
+    def on_layer(ordinal, blob_path, receipt):
+        events.append(("callback", ordinal))
+        assert blob_path.exists()
+        assert receipt["ordinal"] == ordinal
+        if failure == "callback":
+            raise injected
+
+    with pytest.raises(RuntimeError) as caught:
+        cache.materialize(root, packer_path=packer, on_layer=on_layer)
+
+    if failure == "callback":
+        assert caught.value is injected
+        assert events == [("materialize", 0), ("callback", 0)]
+    else:
+        assert str(caught.value) == "conversion failed"
+        assert events == [("materialize", 0), ("callback", 0), ("materialize", 1)]
+    retained = LayerCache(cache.root).inspect(root)
+    assert len(retained["derived"]) == 1
+    assert len(retained["derived_blob_paths"]) == 1
+    assert produced == [0]
+    if failure == "callback":
+        events.clear()
+        retried = LayerCache(cache.root).materialize(root, packer_path=packer)
+        assert events == [("materialize", 0), ("materialize", 1)]
+        assert produced == [0]
+        assert [item["cache_result"] for item in retried["receipt"]["results"]] == ["warm_hit", "warm_hit"]
+
+
+@pytest.mark.parametrize("repeat", [False, True])
+def test_materialize_callback_consumes_original_deadline_without_final_success(tmp_path, monkeypatch, repeat):
+    from types import SimpleNamespace
+
+    from palimpsest_local import oci_materializer
+
+    cache, root, packer, events, produced = _sequential_materialization_probe(tmp_path, monkeypatch, repeat=repeat)
+    clock = SimpleNamespace(now=0.0)
+    time_source = SimpleNamespace(monotonic=lambda: clock.now)
+    monkeypatch.setattr(layer_cache, "time", time_source)
+    monkeypatch.setattr(oci_materializer, "time", time_source)
+
+    def on_layer(ordinal, blob_path, receipt):
+        events.append(("callback", ordinal))
+        clock.now = 10.0
+
+    with pytest.raises(oci_materializer.OCIHardWorkerError, match="deadline expired"):
+        cache.materialize(root, packer_path=packer, timeout_seconds=10, on_layer=on_layer)
+
+    assert events == [("materialize", 0), ("callback", 0)]
+    assert produced == [0]
+    assert len(LayerCache(cache.root).inspect(root)["derived"]) == 1
+
+
+@pytest.mark.parametrize("fault", ["missing_callbacks", "different_results"])
+def test_materialize_requires_final_results_to_match_committed_sequence(tmp_path, monkeypatch, fault):
+    from dataclasses import replace
+
+    cache, root, packer, events, produced = _sequential_materialization_probe(tmp_path, monkeypatch)
+    materialize_image = layer_cache.materialize_image_hard
+
+    def inconsistent_materializer(*args, **kwargs):
+        if fault == "missing_callbacks":
+            kwargs.pop("on_layer")
+        receipt = materialize_image(*args, **kwargs)
+        if fault == "different_results":
+            return replace(
+                receipt, results=(replace(receipt.results[0], cache_result="warm_hit"), *receipt.results[1:])
+            )
+        return receipt
+
+    monkeypatch.setattr(layer_cache, "materialize_image_hard", inconsistent_materializer)
+    with pytest.raises(LayerCacheError, match="contradict the committed layer sequence"):
+        cache.materialize(root, packer_path=packer)
+
+    assert events == [("materialize", 0), ("materialize", 1)]
+    assert produced == [0]
+    retained = LayerCache(cache.root).inspect(root)
+    assert len(retained["derived"]) == (0 if fault == "missing_callbacks" else 1)

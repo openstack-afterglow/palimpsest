@@ -48,6 +48,8 @@ PORTABLE_FILES = {
     "host-runtime": _units("""
         cloud_runtime cloud_runtime_arch cloudinit_guest experimental_oci_vm kvm_contract lima pci_preflight
         named_volumes retained_instances oci_volume_policy nova_build nova_metrics
+        cloud_env cloud_layers cloud_layer_worker
+        nova_bootstrap_service nova_boot_carrier nova_ceph_boot nova_cuda_probe nova_native_cloud
         environment_benchmark benchmark_workflow benchmark_openstack benchmark_reporting
         benchmark_scenarios benchmark_scenario_cloud benchmark_scenario_peer benchmark_scenario_workloads
         benchmark_tensorflow_context

@@ -8,7 +8,12 @@ from types import SimpleNamespace
 import pytest
 
 from palimpsest_local.errors import ArtifactValidationError
-from palimpsest_local.nova_build import NovaController, build_nova_layer_user_data, validate_build_spec
+from palimpsest_local.nova_build import (
+    NovaController,
+    NovaCreateAborted,
+    build_nova_layer_user_data,
+    validate_build_spec,
+)
 
 
 @pytest.fixture
@@ -169,6 +174,37 @@ def test_older_nova_flavor_get_without_extra_specs_still_accepts_real_gpu_and_pr
     with pytest.raises(ArtifactValidationError, match="identity"):
         controller.delete("job-one")
     assert "server-one" in provider.servers
+
+
+def test_before_create_guard_receives_original_digest_after_durable_intent(tmp_path):
+    controller, provider = _controller(tmp_path)
+    checked = []
+
+    def before_create(digest):
+        receipt = json.loads((controller.receipts / "job-one.json").read_text())
+        assert receipt["phase"] == "create-intent" and receipt["spec_digest"] == digest
+        assert provider.servers == {}
+        checked.append(digest)
+
+    record = controller.create(**_request(), before_create=before_create)
+    assert checked == [record["spec_digest"]] and record["phase"] == "created"
+    assert len(provider.servers) == 1
+
+
+def test_denied_before_create_guard_leaves_verified_abort_and_no_replay(tmp_path):
+    controller, provider = _controller(tmp_path)
+
+    def deny(digest):
+        raise ArtifactValidationError("approval expired before allocation")
+
+    with pytest.raises(NovaCreateAborted, match="approval expired"):
+        controller.create(**_request(), before_create=deny)
+    record = controller.inspect("job-one")
+    assert record["phase"] == "aborted-before-request"
+    assert record["request_started"] is False and record["uncertain_create"] is False
+    assert provider.servers == {}
+    with pytest.raises(ArtifactValidationError, match="intent already exists"):
+        controller.create(**_request())
 
 
 def test_lost_create_response_leaves_durable_uncertain_intent_not_a_second_vm(tmp_path):

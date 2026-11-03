@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Palimpsest — 실제 성공한 CUDA 실행 경로</title>
+<style>
+:root{color-scheme:light;--paper:#f7f6f1;--surface:#fff;--ink:#172832;--muted:#55666d;--line:#d8e1dd;--green:#126852;--green-light:#e9f4ed;--blue:#275e76;--blue-light:#eaf3f6;--amber:#815320;--amber-light:#fbf3e4;--violet:#614d7b;--violet-light:#f1edf7;--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;--sans:-apple-system,BlinkMacSystemFont,"Apple SD Gothic Neo","Malgun Gothic",sans-serif;--serif:Georgia,"AppleMyungjo",serif}
+:root[data-theme="dark"]{color-scheme:dark;--paper:#111c20;--surface:#19272b;--ink:#e9f1ec;--muted:#b4c4c4;--line:#3c5155;--green:#a2dfc3;--green-light:#203d34;--blue:#a8d5e8;--blue-light:#233c48;--amber:#eed09c;--amber-light:#3a3327;--violet:#d4c2ee;--violet-light:#342d43}
+*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:15px/1.6 var(--sans);-webkit-font-smoothing:antialiased}::selection{background:var(--green);color:var(--surface)}a{color:var(--green);text-underline-offset:4px}a:hover{text-decoration-thickness:2px}button{font:inherit;color:inherit;cursor:pointer}button:disabled{cursor:default;opacity:.45}button:focus-visible,a:focus-visible{outline:3px solid var(--green);outline-offset:4px}code{font:.88em/1.6 var(--mono);overflow-wrap:anywhere}h1,h2,h3,p{margin:0}h1,h2,h3{word-break:keep-all;text-wrap:balance}p,li{word-break:keep-all;overflow-wrap:anywhere}.skip{position:absolute;top:-100px;left:20px;z-index:9;background:var(--surface);padding:10px}.skip:focus{top:10px}.page{max-width:1640px;margin:auto;padding:24px 36px 22px}.masthead{display:flex;justify-content:space-between;align-items:center;gap:20px;padding-bottom:16px;border-bottom:1px solid var(--line)}.brand{font-size:19px;letter-spacing:-.025em;font-weight:750}.context{color:var(--muted);font-size:13px;margin-left:14px}.utility{display:flex;gap:14px;align-items:center}.quiet-button{border:1px solid var(--line);border-radius:5px;background:var(--surface);padding:6px 12px;font-size:13px}.hero{display:flex;justify-content:space-between;align-items:flex-end;gap:30px;padding:27px 0 23px}h1{font-size:clamp(28px,2.6vw,42px);line-height:1.24;letter-spacing:-.035em}.intro{color:var(--muted);margin-top:10px;max-width:75ch}.status{color:var(--green);display:flex;align-items:center;gap:8px;white-space:nowrap;font-size:14px}.status svg{width:18px;height:18px;flex:none}.workspace{display:grid;grid-template-columns:minmax(0,1fr) 316px;border:1px solid var(--line);border-radius:7px;background:var(--surface)}.flow-panel{min-width:0;padding:20px 23px 18px}.section-head{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:14px}.section-head h2{font-size:17px}.section-head p{font-size:12px;color:var(--muted)}.graph{position:relative;display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:30px 26px;isolation:isolate}.connections{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;z-index:-1;color:var(--muted)}.connections path{fill:none;stroke:currentColor;stroke-width:1.35;vector-effect:non-scaling-stroke}.connections .arrowhead{fill:currentColor;stroke:none}.step{position:relative;display:flex;flex-direction:column;text-align:left;min-width:0;min-height:130px;background:var(--surface);border:1px solid var(--line);border-radius:5px;padding:12px 13px 11px;grid-row:var(--row);grid-column:var(--col)}.step:hover{border-color:var(--muted)}.step[aria-pressed="true"]{border-color:var(--green);outline:2px solid var(--green);outline-offset:2px}.step-top{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:7px}.ordinal{font:600 11px var(--mono);color:var(--muted)}.kind{font-size:11px;font-weight:650;color:var(--green)}.step[data-phase="boot"] .kind{color:var(--blue)}.step[data-phase="store"] .kind{color:var(--violet)}.step[data-phase="gate"] .kind{color:var(--amber)}.step strong{font-size:15px;line-height:1.35;letter-spacing:-.02em;word-break:keep-all}.step .summary{font-size:12px;line-height:1.6;color:var(--muted);margin-top:7px;word-break:keep-all}.step .datum{font:11px/1.55 var(--mono);margin-top:auto;padding-top:7px;color:var(--green);overflow-wrap:anywhere}.scope-note{grid-row:3;grid-column:4;padding:8px 2px 0;align-self:center}.scope-note h3{font-size:13px;color:var(--amber);margin-bottom:5px}.scope-note p{font-size:12px;color:var(--muted);line-height:1.7}.reading-note{margin-top:17px;padding-top:12px;border-top:1px solid var(--line);color:var(--muted);font-size:12px}.inspector{padding:20px 23px;border-left:1px solid var(--line);min-width:0;display:flex;flex-direction:column}.inspector-head{display:flex;justify-content:space-between;align-items:center;gap:12px;color:var(--muted);font-size:12px;margin-bottom:15px}.nav-buttons{display:flex;gap:6px}.nav-buttons button{padding:2px 9px;background:var(--surface);border:1px solid var(--line);border-radius:4px;font-size:14px}.inspector h2{font-size:22px;line-height:1.35;letter-spacing:-.025em}.detail-lead{margin-top:12px;font-size:14px;line-height:1.75}.facts{margin:17px 0 0;padding-left:17px;font-size:13px;line-height:1.75}.facts li{margin:7px 0}.inspector h3{font-size:12px;color:var(--muted);margin:20px 0 7px}.source-path{font-size:12px;line-height:1.65;overflow-wrap:anywhere}.source-symbol{display:block;margin-top:3px;color:var(--muted)}.proof-link{display:block;font-size:12px;overflow-wrap:anywhere;margin-top:7px}.boundary{margin-top:auto;padding-top:20px;font-size:11px;color:var(--muted)}.fixes{display:grid;grid-template-columns:1fr 1fr;gap:30px;padding:18px 0 16px;border-bottom:1px solid var(--line)}.fixes article{min-width:0}.fixes h2{font-size:14px;margin-bottom:5px}.fixes p{font-size:13px;color:var(--muted)}.footer{display:flex;justify-content:space-between;align-items:flex-start;gap:25px;margin-top:14px;font-size:11px;color:var(--muted)}.footer p{max-width:90ch}.footer-links{display:flex;gap:16px;flex-shrink:0}.source-pin{display:block;margin-top:4px}.noscript{margin:15px 0;padding:12px;border:1px solid var(--line);font-size:13px}.noscript p{margin-top:8px}
+.page{padding:20px 36px 16px}.hero{padding:20px 0 16px}h1{font-size:clamp(28px,2.4vw,34px)}.inspector-head{margin-bottom:12px}.facts{margin-top:12px}.facts li{margin:5px 0}.inspector h3{margin-top:14px}.boundary{padding-top:12px}.fixes{padding:12px 0 10px}.back-to-flow{display:none}
+@media(min-width:1800px) and (min-height:1000px){.page{padding-top:32px}.hero{padding:37px 0 30px}.flow-panel,.inspector{padding-top:27px;padding-bottom:25px}.graph{row-gap:42px}.step{min-height:161px;padding:16px}.step strong{font-size:17px}.step .summary{font-size:14px}.step .datum{font-size:12px}.inspector h2{font-size:25px}.detail-lead{font-size:15px}.facts{font-size:14px}.fixes{padding-top:24px;padding-bottom:22px}}
+@media(max-width:1199px){.page{padding:20px}.workspace{grid-template-columns:minmax(0,1fr) 285px}.flow-panel{padding:18px 16px}.graph{gap:28px 19px}.step{padding:10px;min-height:146px}.step strong{font-size:14px}.step .summary{font-size:12px}.step .datum{font-size:11px}.inspector{padding:18px}.context{display:none}}
+@media(max-width:960px){.workspace{grid-template-columns:1fr}.inspector{border-left:0;border-top:1px solid var(--line)}.boundary{margin-top:5px}.hero{display:block}.status{margin-top:13px}.graph{gap:28px}.step{min-height:132px}.section-head{align-items:flex-start}.footer{flex-direction:column;gap:10px}.facts{columns:2;column-gap:35px}.facts li{break-inside:avoid}}
+@media(max-width:960px){.back-to-flow{display:block;margin-top:16px;font-size:13px}}
+@media(max-width:640px){.page{padding:17px 16px}.masthead{gap:10px}.brand{font-size:17px}.utility{gap:6px}.utility a{display:none}.hero{padding:23px 0 20px}h1{font-size:29px}.intro{font-size:14px}.section-head{display:block}.section-head p{margin-top:5px}.graph{grid-template-columns:1fr;gap:24px}.step{grid-column:1;grid-row:auto;min-height:115px;padding:13px 15px}.step strong{font-size:16px}.step .summary{font-size:13px}.step .datum{font-size:11px;margin-top:6px;padding-top:0}.scope-note{grid-column:1;grid-row:auto;padding:0}.fixes{grid-template-columns:1fr;gap:18px}.facts{columns:1}.flow-panel{padding:18px}.inspector{padding:20px}.footer-links{flex-wrap:wrap}.status{font-size:13px}.section-head h2{font-size:16px}}
+@media print{.page{max-width:none;padding:0}.quiet-button,.nav-buttons,.skip{display:none}.workspace{grid-template-columns:1fr}.inspector{border-left:0;border-top:1px solid var(--line)}body{font-size:12px}.step{break-inside:avoid}.footer{font-size:11px}.hero{padding-top:15px}.step{min-height:120px}}
+</style>
+</head>
+<body>
+<a class="skip" href="#flow">실행 흐름으로 건너뛰기</a>
+<div class="page">
+<header class="masthead"><div><span class="brand">Palimpsest</span><span class="context">실제로 성공한 실행 경로</span></div><div class="utility"><a href="../development-handoff.md" style="font-size:12px">프로젝트 인수인계</a><button class="quiet-button" id="theme" type="button" aria-pressed="false">어두운 화면</button></div></header>
+<main>
+<div class="hero"><div><h1>원본 CUDA → VM의 실제 / → GPU 연산</h1><p class="intro">외부 SDK가 제어하고, CephFS가 레이어를 제공하고, Nova 게스트는 마운트와 실행을 맡았습니다.</p></div><p class="status"><svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><circle cx="10" cy="10" r="8" stroke="currentColor" stroke-width="1.5"/><path d="m6 10 2.5 2.5L14 7" stroke="currentColor" stroke-width="1.5"/></svg>승인10 · CPU → GPU · 정리 완료 기록</p></div>
+<div class="workspace">
+<section class="flow-panel" id="flow" aria-labelledby="flow-title">
+<div class="section-head"><h2 id="flow-title">취득에서 종료까지, 실제 실행 순서</h2><p>단계를 선택하면 실행 소스와 확인 근거가 표시됩니다.</p></div>
+<div class="graph" id="graph">
+<svg class="connections" id="connections" aria-hidden="true"><defs><marker id="arrow" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path class="arrowhead" d="M0 0 7 3.5 0 7Z"/></marker></defs><g id="edges"></g></svg>
+<button class="step" data-step="0" data-phase="store" style="--row:1;--col:1" aria-pressed="false"><span class="step-top"><span class="ordinal">01</span><span class="kind">원본</span></span><strong>Docker Hub · CUDA</strong><span class="summary">원본 OCI blob 전체 취득·검증<br>amd64 digest 고정</span><span class="datum">sha256:131e238d…</span></button>
+<button class="step" data-step="1" data-phase="store" style="--row:1;--col:2" aria-pressed="false"><span class="step-top"><span class="ordinal">02</span><span class="kind">워커</span></span><strong>한 레이어씩 게시</strong><span class="summary">SquashFS 변환 → cache commit<br>CephFS 게시·기록 후 다음 층</span><span class="datum">callback 완료 → 다음 ordinal</span></button>
+<button class="step" data-step="2" data-phase="store" style="--row:1;--col:3" aria-pressed="false"><span class="step-top"><span class="ordinal">03</span><span class="kind">공유 저장소</span></span><strong>Manila · CephFS</strong><span class="summary">digest별 최종 payload 1개<br>검증된 기존 파일은 재사용</span><span class="datum">10 immutable SquashFS layers</span></button>
+<button class="step" data-step="3" data-phase="boot" style="--row:1;--col:4" aria-pressed="false"><span class="step-top"><span class="ordinal">04</span><span class="kind">외부 제어</span></span><strong>캐리어 · boot 준비</strong><span class="summary">kernel · initramfs · 전용 upper<br>boot 볼륨 준비 후 Nova 생성</span><span class="datum">공유 레이어 payload 미포함</span></button>
+<button class="step" data-step="4" data-phase="boot" style="--row:2;--col:4" aria-pressed="false"><span class="step-top"><span class="ordinal">05</span><span class="kind">게스트</span></span><strong>등록 · 계획 검증</strong><span class="summary">DHCP → SSH 터널 → mTLS<br>인증된 계획과 RO 권한 수신</span><span class="datum">instance · seed · plan 바인딩</span></button>
+<button class="step" data-step="5" data-phase="boot" style="--row:2;--col:3" aria-pressed="false"><span class="step-top"><span class="ordinal">06</span><span class="kind">스토리지 권한</span></span><strong>서버 측 RO 입증</strong><span class="summary">쓰기 시도에 저장소가 거부<br>그 뒤 로컬 RO로 재마운트</span><span class="datum">EACCES · errno 13</span></button>
+<button class="step" data-step="6" data-phase="boot" style="--row:2;--col:2" aria-pressed="true"><span class="step-top"><span class="ordinal">07</span><span class="kind">실제 루트</span></span><strong>이미지가 실제 /</strong><span class="summary">RO lowers + 전용 upper/work<br>initramfs PID 1의 루트 전환</span><span class="datum">/ = /proc/1/root · OverlayFS</span></button>
+<button class="step" data-step="7" data-phase="proof" style="--row:2;--col:1" aria-pressed="false"><span class="step-top"><span class="ordinal">08</span><span class="kind">CPU 검증</span></span><strong>원본 런타임 실행</strong><span class="summary">원본 Entrypoint와 명령 실행<br>CUDA 버전·라이브러리 확인</span><span class="datum">exit 0 · GPU 미할당</span></button>
+<button class="step" data-step="8" data-phase="gate" style="--row:3;--col:1" aria-pressed="false"><span class="step-top"><span class="ordinal">09</span><span class="kind">순차 게이트</span></span><strong>CPU 삭제 확인</strong><span class="summary">VM · boot · port · image 404<br>RO 권한 부재 후 GPU 허용</span><span class="datum">CPU 소비자 정리 → GPU 생성</span></button>
+<button class="step" data-step="9" data-phase="proof" style="--row:3;--col:2" aria-pressed="false"><span class="step-top"><span class="ordinal">10</span><span class="kind">새 GPU VM</span></span><strong>원본 CUDA로 계산</strong><span class="summary">04–07을 새 VM에서 재실행<br>RTX 2000 Ada · 실제 연산</span><span class="datum">PTX 330 · cuBLAS SGEMM 621</span></button>
+<button class="step" data-step="10" data-phase="gate" style="--row:3;--col:3" aria-pressed="false"><span class="step-top"><span class="ordinal">11</span><span class="kind">종료</span></span><strong>증거 보존 · 정리</strong><span class="summary">GPU 자원도 404 · 서비스 중지<br>공유 빌더·레이어·이력 보존</span><span class="datum">원장 0 · MainPID 0</span></button>
+<div class="scope-note"><h3>성공 범위를 넘겨 읽지 않기</h3><p>외부 SDK 실험의 기능 검증입니다. 운영 Hub/API 통합, 보안 attestation, cuDNN 연산과 5회 비교 실험은 미검증입니다.</p></div>
+</div>
+<p class="reading-note">번호 순서로 읽으세요. GPU는 CPU VM에 붙인 것이 아니라, CPU 자원 부재를 확인한 뒤 <strong>새 VM</strong>으로 같은 부팅 경로를 통과했습니다.</p>
+</section>
+<aside class="inspector" aria-labelledby="detail-title">
+<div class="inspector-head"><span id="detail-index">단계 07 / 11</span><div class="nav-buttons"><button id="previous" type="button" aria-label="이전 단계">←</button><button id="next" type="button" aria-label="다음 단계">→</button></div></div>
+<div id="detail" aria-live="polite" aria-atomic="true"><h2 id="detail-title" tabindex="-1">initramfs PID 1이<br>이미지의 루트로 전환</h2><p class="detail-lead">Ubuntu 아래의 자식 chroot가 아니라, initramfs PID 1 자체의 루트 전환입니다.</p><ul class="facts"><li>10개 레이어의 digest와 크기를 검증한 뒤 read-only loop/SquashFS로 마운트</li><li>lowerdir 순서는 원본의 역순인 9 → 0</li><li>전용 ext4의 비어 있는 upper/work 사용</li><li>실제 결과: device 27, inode 2, PID 1 = 1</li></ul><h3>실행 소스</h3><p class="source-path"><code>nova_ceph_boot.py</code><code class="source-symbol">Runtime.assemble → switch_actual_root</code></p><h3>확인 근거</h3><a class="proof-link" href="file:///Users/pieroot/.local/share/palimpsest-proofs/registry-native-root-20261101/native-10-final-retained-state.json">native-10-final-retained-state.json</a></div>
+<a class="back-to-flow" href="#flow">실행 흐름으로 돌아가기</a>
+<p class="boundary">2026-11-02 UTC에 수집한 성공 기록을 설명합니다. 현재 클라우드 상태를 조회하거나 새 VM을 생성하지 않습니다.</p>
+</aside>
+</div>
+<section class="fixes" aria-label="성공 경로에 반영한 부팅 수정"><article><h2>DHCP가 연결 경로를 지우지 않도록</h2><p><code>ip -4 route flush default</code>로 IPv4의 기본 경로만 선택합니다. BusyBox의 unspecified-family 선택 문제를 피합니다.</p></article><article><h2>DNS의 권위는 인증된 계획에</h2><p>DHCP DNS와의 동일성 요구만 제거했습니다. 인스턴스·주소·CIDR·gateway·seed-bound plan 검증은 그대로 유지합니다.</p></article></section>
+<noscript><div class="noscript"><strong>JavaScript 없이도 위 실행 순서를 읽을 수 있습니다.</strong><p>단계 상세 탐색과 화면 전환만 JavaScript를 사용합니다. 실제 성공 근거는 아래 최종 확인 JSON과 활성 작업 트리 인수인계에 있습니다.</p></div></noscript>
+</main>
+<footer class="footer"><p>검증 소스: <code>palimpsest-local-manila-20261101</code> · uncommitted / base <code>7962b18</code><span class="source-pin">package <code>ee37acc91b545ce3e99a4fbe7f19aea403fd0b24a1f38ce4a4f76222a6d33c3b</code></span></p><div class="footer-links"><a href="file:///Users/pieroot/.local/share/palimpsest-proofs/registry-native-root-20261101/native-10-final-retained-state.json">최종 확인 JSON</a><a href="file:///Users/pieroot/code/palimpsest-local-manila-20261101/docs/development-handoff.md">실기 인수인계</a></div></footer>
+</div>
+<script>
+'use strict';
+const evidenceRoot = 'file:///Users/pieroot/.local/share/palimpsest-proofs/registry-native-root-20261101/';
+const sourceRoot = 'file:///Users/pieroot/code/palimpsest-local-manila-20261101/src/palimpsest_local/';
+const steps = [
+ {title:'원본 이미지와 digest 고정',lead:'워커가 원본 OCI blob 전체를 먼저 취득·검증했습니다. Dockerfile로 비슷한 환경을 새로 만들거나 라이브러리를 대체한 실행이 아닙니다.',facts:['원본: nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04','amd64 manifest: sha256:131e238d724ee145317f10d6c8eba0d301439c6c8764b02473510e7035756e81','원본 config·manifest·Entrypoint·환경과 레이어 순서 보존'],source:'cloud_layer_worker.py',symbol:'cloud image-pull · canonical OCI materializer',proof:'cuda-first-intake.json'},
+ {title:'취득 완료 후, 변환·게시를 한 층씩',lead:'원본 OCI blob 전체 취득·검증이 끝난 뒤, 각 ordinal의 SquashFS 변환 → cache commit → CephFS 게시 → receipt·journal 기록을 마치고 다음 ordinal로 진행했습니다.',facts:['LayerCache.materialize(on_layer=...)의 동기 callback으로 게시 연결','다운로드와 게시가 레이어마다 교대로 실행된 경로는 아님','중간 실패 시 검증된 완료 prefix를 보존하고 전체 성공으로 표시하지 않음','기존에 검증된 digest는 다시 payload를 복사하지 않고 재사용'],source:'layer_cache.py',symbol:'LayerCache.materialize(on_layer=...)',proof:'cuda-first-intake.json'},
+ {title:'바이트는 CephFS, 공유 권한은 분리',lead:'실제 실행 바이트는 Manila가 관리하는 CephFS에 있습니다. 워커의 RW 권한과 소비자의 RO 권한을 분리했습니다.',facts:['10개 SquashFS의 digest·크기·순서가 CPU와 GPU 결과에서 일치','digest별 최종 payload는 하나이며 같은 파일을 재사용','이 실험의 로컬 image/job 기록을 운영 Hub DB 통합 완료로 해석하지 않음'],source:'cloud_layer_worker.py',symbol:'immutable payload · provenance · ordered journal',proof:'dedupe-verification.json'},
+ {title:'원본 payload와 부팅 장치를 분리',lead:'캐리어는 부팅에 필요한 kernel·initramfs·드라이버·probe와 seed를 제공합니다. 원본 CUDA 레이어를 캐리어 안에 다시 넣지는 않습니다.',facts:['BIOS GRUB carrier와 전용 writable upper 구성','새 private image 업로드와 Cinder boot 준비 후 Nova 생성','공유 레이어는 인증 후 CephFS에서 마운트','GPU probe는 원본 이미지 밖 /run/palimpsest-probe에 제공'],source:'nova_boot_carrier.py',symbol:'carrier construction · nova_native_cloud.py lifecycle',proof:'native-gpu-10-case.json'},
+ {title:'DHCP 다음에 인증된 계획 수신',lead:'initramfs PID 1이 네트워크를 구성하고 제한된 SSH 터널 위에서 mTLS bootstrap을 수행합니다.',facts:['메타데이터 instance ID와 DHCP 주소를 계획에 바인딩','seed-bound plan digest에 DNS 정책도 포함','CIDR/gateway 관측값은 계속 대조하고 DNS는 인증된 계획 값 적용','이 소비자에 한정된 CephX RO 접근 정보 수신'],source:'nova_ceph_boot.py',symbol:'Runtime.network → Runtime.bootstrap',proof:'native-gpu-10-case.json'},
+ {title:'마운트 옵션이 아니라 저장소가 거부',lead:'로컬 RO 옵션만으로 저장소 권한을 입증하지 않았습니다. 초기 RW 마운트에서 실제 파일 생성을 시도해 서버 측 거부를 확인했습니다.',facts:['Ceph export와 소비자 identity를 검증','쓰기 시도는 실제 EACCES / errno 13으로 거부','그 뒤 로컬 bind remount도 RO·nosuid·nodev·noexec로 제한','공유 워커의 RW 규칙은 유지'],source:'nova_ceph_boot.py',symbol:'Runtime.ceph',proof:'native-10-final-retained-state.json'},
+ {title:'initramfs PID 1이 이미지의 루트로 전환',lead:'Ubuntu 아래의 자식 chroot가 아니라, initramfs PID 1 자체의 루트 전환입니다.',facts:['10개 레이어의 digest와 크기를 검증한 뒤 read-only loop/SquashFS로 마운트','lowerdir 순서는 원본의 역순인 9 → 0','전용 ext4의 비어 있는 upper/work 사용','실제 결과: device 27, inode 2, PID 1 = 1'],source:'nova_ceph_boot.py',symbol:'Runtime.assemble → switch_actual_root',proof:'native-10-final-retained-state.json'},
+ {title:'GPU 없이 실제 루트부터 통과',lead:'원본 NVIDIA Entrypoint 뒤에 승인된 shell 명령을 실행하고 CPU actual-root 성공을 먼저 확정했습니다.',facts:['CUDA_VERSION = 12.2.2와 원본 cudart·cuBLAS·cuDNN 파일 읽기 확인','exit 0 · uid/gid 0 · gpu.enabled = false','CPU run: native-96219005f0174db0a044837703d20b63','이 파일 확인은 cuDNN 연산 성공을 뜻하지 않음'],source:'nova_ceph_boot.py',symbol:'Runtime.execute · original runtime_vector',proof:'native-cpu-10-case.json'},
+ {title:'성공만으로 다음 GPU를 열지 않음',lead:'CPU 결과 보존 뒤 테스트 VM과 독점 부팅 자원을 정리하고, 독립적인 원 프로젝트 API 조회로 부재를 확인한 다음 GPU를 허용했습니다.',facts:['CPU server·boot volume·port·carrier image 모두 authoritative 404','소비자 RO 규칙과 identity 부재','정리 시간은 원래 allocation 안에 포함','CPU/GPU 동시 소비자 없음 · 추가 slot/자동 retry/예산 환급 없음'],source:'nova_native_cloud.py',symbol:'NativeCloud._successful · grant-bound cleanup gate',proof:'native-cpu-10-final-verification.json'},
+ {title:'새 GPU VM에서 원본 CUDA 연산',lead:'새 GPU VM이 04–07의 공통 부팅을 다시 통과한 뒤, 원본 Entrypoint로 고정된 CUDA probe를 실행했습니다.',facts:['NVIDIA RTX 2000 Ada Generation · driver 580.178.04 · kernel 6.8.0-147-generic','원본 cudart runtime_version = 12020','실제 Driver/PTX 결과 checksum = 330','원본 cuBLAS SGEMM 결과 checksum = 621','연산·드라이버·nvidia-smi의 GPU UUID 일치 · exit 0','GPU run: native-639aaced1b424c41b4410358c0a2fe8e'],source:'nova_ceph_boot.py',symbol:'Runtime.gpu → Runtime.execute → validate_cuda_result · guest/nova/cuda_probe.c',proof:'native-gpu-10-case.json'},
+ {title:'결과를 보존하고 정확한 자원만 정리',lead:'GPU도 동일하게 증거 보존·정리·부재 검증을 완료했습니다. 전용 bootstrap 서비스만 중지하고 이전 준비 세대는 남겼습니다.',facts:['CPU/GPU 합계 8개 server·boot·port·image 객체 모두 최종 404','소비자 RO 규칙 없음 · 모든 native 활성 리소스 원장 0','전용 서비스 inactive/dead · MainPID 0 · NRestarts 0','공유 빌더·레이어 share·측정 VM/peer·과거 unit/CA/runtime/source 세대 보존','CPU1/GPU1 승인 소진 · 더 실행할 수 있는 잔여 허가 아님'],source:'nova_native_cloud.py',symbol:'exact-owned cleanup · service-only stop · independent final GETs',proof:'native-10-final-retained-state.json'}
+];
+const buttons = [...document.querySelectorAll('.step')];
+let selected = 6;
+function selectStep(index, focus = false) {
+ selected = Math.max(0, Math.min(steps.length - 1, index));
+ const step = steps[selected];
+ buttons.forEach((button, i) => button.setAttribute('aria-pressed', String(i === selected)));
+ document.getElementById('detail-index').textContent = `단계 ${String(selected + 1).padStart(2,'0')} / 11`;
+ const detail = document.getElementById('detail');
+ detail.replaceChildren();
+ const heading = document.createElement('h2'); heading.id = 'detail-title'; heading.tabIndex = -1; heading.textContent = step.title;
+ const lead = document.createElement('p'); lead.className = 'detail-lead'; lead.textContent = step.lead;
+ const list = document.createElement('ul'); list.className = 'facts';
+ for (const fact of step.facts) { const item = document.createElement('li'); item.textContent = fact; list.append(item); }
+ const sourceHeading = document.createElement('h3'); sourceHeading.textContent = '실행 소스';
+ const source = document.createElement('p'); source.className = 'source-path';
+ const sourceLink = document.createElement('a'); sourceLink.href = sourceRoot + step.source; sourceLink.textContent = step.source;
+ const symbol = document.createElement('code'); symbol.className = 'source-symbol'; symbol.textContent = step.symbol;
+ source.append(sourceLink,symbol);
+ const proofHeading = document.createElement('h3'); proofHeading.textContent = '확인 근거';
+ const proof = document.createElement('a'); proof.className = 'proof-link'; proof.href = evidenceRoot + step.proof; proof.textContent = step.proof;
+ detail.append(heading,lead,list,sourceHeading,source,proofHeading,proof);
+ document.getElementById('previous').disabled = selected === 0;
+ document.getElementById('next').disabled = selected === steps.length - 1;
+ if (focus) buttons[selected].focus();
+}
+buttons.forEach((button, i) => {
+ button.addEventListener('click', () => {
+  selectStep(i);
+  if (window.matchMedia('(max-width:960px)').matches) {
+   document.getElementById('detail-title').focus({preventScroll:true});
+   document.querySelector('.inspector').scrollIntoView({block:'start',behavior:'auto'});
+  }
+ });
+ button.addEventListener('keydown', event => {
+  let next;
+  if (event.key === 'ArrowRight' || event.key === 'ArrowDown') next = i + 1;
+  if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') next = i - 1;
+  if (event.key === 'Home') next = 0;
+  if (event.key === 'End') next = steps.length - 1;
+  if (next !== undefined) { event.preventDefault(); selectStep(next,true); }
+ });
+});
+document.getElementById('previous').addEventListener('click', () => selectStep(selected - 1));
+document.getElementById('next').addEventListener('click', () => selectStep(selected + 1));
+document.querySelector('.back-to-flow').addEventListener('click', event => {
+ event.preventDefault();
+ buttons[selected].focus();
+ buttons[selected].scrollIntoView({block:'center',behavior:'auto'});
+});
+const themeButton = document.getElementById('theme');
+function setTheme(dark) { document.documentElement.dataset.theme = dark ? 'dark' : 'light'; themeButton.textContent = dark ? '밝은 화면' : '어두운 화면'; themeButton.setAttribute('aria-pressed',String(dark)); }
+setTheme(window.matchMedia('(prefers-color-scheme: dark)').matches);
+themeButton.addEventListener('click', () => setTheme(document.documentElement.dataset.theme !== 'dark'));
+let pendingFrame = 0;
+function drawConnections() {
+ const graph = document.getElementById('graph');
+ const bounds = graph.getBoundingClientRect();
+ const svg = document.getElementById('connections');
+ svg.setAttribute('viewBox',`0 0 ${bounds.width} ${bounds.height}`);
+ const paths = [];
+ for (let i = 0; i < buttons.length - 1; i++) {
+  const a = buttons[i].getBoundingClientRect(), b = buttons[i+1].getBoundingClientRect();
+  let x1,y1,x2,y2;
+  if (Math.abs(a.top-b.top) < 2) {
+   const forward = b.left > a.left;
+   x1 = (forward ? a.right : a.left) - bounds.left; x2 = (forward ? b.left : b.right) - bounds.left;
+   y1 = a.top + a.height/2 - bounds.top; y2 = b.top + b.height/2 - bounds.top;
+  } else { x1 = a.left+a.width/2-bounds.left; x2 = b.left+b.width/2-bounds.left; y1 = a.bottom-bounds.top; y2 = b.top-bounds.top; }
+  const path = document.createElementNS('http://www.w3.org/2000/svg','path');
+  path.setAttribute('d',`M ${x1} ${y1} L ${x2} ${y2}`); path.setAttribute('marker-end','url(#arrow)'); path.dataset.from=String(i); path.dataset.to=String(i+1); paths.push(path);
+ }
+ document.getElementById('edges').replaceChildren(...paths);
+}
+function scheduleConnections(){ cancelAnimationFrame(pendingFrame); pendingFrame=requestAnimationFrame(drawConnections); }
+new ResizeObserver(scheduleConnections).observe(document.getElementById('graph'));
+window.addEventListener('resize',scheduleConnections);
+selectStep(6); scheduleConnections();
+</script>
+</body>
+</html>

@@ -28,6 +28,10 @@ class RegistryImportRequest(BaseModel):
     name: str = Field(pattern=r"^[a-z0-9][a-z0-9.+-]{0,63}$")
     reference: str = Field(min_length=1, max_length=512)
     platform: Literal["linux/amd64"] = "linux/amd64"
+    os_family: str = Field(min_length=1, max_length=128)
+    os_version: str = Field(min_length=1, max_length=128)
+    metadata: dict = Field(default_factory=dict)
+    visibility: Literal["private", "internal", "public"] = "private"
 
 
 class DockerfileBuildRequest(BaseModel):
@@ -37,6 +41,10 @@ class DockerfileBuildRequest(BaseModel):
     dockerfile: str = Field(min_length=1, max_length=1024 * 1024)
     context_digest: str | None = None
     platform: Literal["linux/amd64"] = "linux/amd64"
+    os_family: str = Field(min_length=1, max_length=128)
+    os_version: str = Field(min_length=1, max_length=128)
+    metadata: dict = Field(default_factory=dict)
+    visibility: Literal["private", "internal", "public"] = "private"
     target: str | None = Field(default=None, pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$")
     build_args: dict[str, str] = Field(default_factory=dict, max_length=64)
 
@@ -114,6 +122,7 @@ class CompleteRequest(BaseModel):
     layers: list[OutputLayer] = Field(min_length=1, max_length=128)
     source: Source
     runtime: Runtime
+    manifest: dict
 
 
 class Failure(BaseModel):
@@ -206,7 +215,10 @@ async def list_jobs(limit: int = Query(50, ge=1, le=100), token_info: dict = Dep
         rows = (
             await session.scalars(
                 select(PalimpsestHubImageJob)
-                .where(exact_identity(PalimpsestHubImageJob.project_id, package_target_project_id(token_info)))
+                .where(
+                    exact_identity(PalimpsestHubImageJob.project_id, package_target_project_id(token_info)),
+                    exact_identity(PalimpsestHubImageJob.created_by, token_info["user_id"]),
+                )
                 .order_by(PalimpsestHubImageJob.created_at.desc(), PalimpsestHubImageJob.id.desc())
                 .limit(limit)
             )
@@ -218,7 +230,11 @@ async def list_jobs(limit: int = Query(50, ge=1, le=100), token_info: dict = Dep
 async def get_job(job_id: UUID, token_info: dict = Depends(_legacy_inventory)):
     async with _factory_or_503()() as session:
         row = await session.get(PalimpsestHubImageJob, str(job_id))
-        if row is None or row.project_id != package_target_project_id(token_info):
+        if (
+            row is None
+            or row.project_id != package_target_project_id(token_info)
+            or row.created_by != token_info["user_id"]
+        ):
             raise HTTPException(status_code=404, detail="image job not found")
         return service.serialize_job(row)
 
@@ -272,7 +288,8 @@ async def stage_output(job_id: UUID, digest: str, request: Request, lease: str =
 async def publication_intent(job_id: UUID, request: Request, lease: str = Depends(require_build_lease)):
     req = await bounded_json(request, CompleteRequest, 512 * 1024)
     return service.serialize_job(
-        await service.publication_intent(str(job_id), lease, req.model_dump(mode="json")), worker=True
+        await service.publication_intent(str(job_id), lease, req.model_dump(mode="json", exclude_none=True)),
+        worker=True,
     )
 
 
@@ -283,7 +300,9 @@ async def publication_intent(job_id: UUID, request: Request, lease: str = Depend
 )
 async def complete(job_id: UUID, request: Request, lease: str = Depends(require_build_lease)):
     req = await bounded_json(request, CompleteRequest, 512 * 1024)
-    return service.serialize_job(await service.complete(str(job_id), lease, req.model_dump(mode="json")), worker=True)
+    return service.serialize_job(
+        await service.complete(str(job_id), lease, req.model_dump(mode="json", exclude_none=True)), worker=True
+    )
 
 
 @router.post("/image-worker/jobs/{job_id}/fail", operation_id="fail_image_job", openapi_extra=request_body(Failure))

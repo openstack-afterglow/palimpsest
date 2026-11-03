@@ -59,6 +59,12 @@ def run(config, output, *, connection=None):
         raise ArtifactValidationError("functional smoke envelope cannot contain exactly two sequential consumers")
     if not re.fullmatch(r"[a-z0-9./:@_-]+@sha256:[0-9a-f]{64}", config["smoke"]["image_reference"]):
         raise ArtifactValidationError("functional smoke requires a digest-pinned image")
+    if any(
+        not isinstance(config["smoke"].get(key), str)
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.+-]{0,63}", config["smoke"][key]) is None
+        for key in ("os_family", "os_version")
+    ):
+        raise ArtifactValidationError("functional smoke requires explicit image OS family and version")
     output.mkdir(mode=0o700, parents=False, exist_ok=False)
     state = {
         "schema": "palimpsest.hub-execution-smoke.v1",
@@ -121,6 +127,8 @@ def run(config, output, *, connection=None):
             "name": "smoke-registry-" + config["job_id"],
             "reference": config["smoke"]["image_reference"],
             "platform": "linux/amd64",
+            "os_family": config["smoke"]["os_family"],
+            "os_version": config["smoke"]["os_version"],
         }
         atomic_write_json(output / "registry-intent.json", request)
         event("registry-submission", {"request_id": request["request_id"]})
@@ -177,6 +185,8 @@ def run(config, output, *, connection=None):
             "dockerfile": definition,
             "context_digest": context["digest"],
             "platform": "linux/amd64",
+            "os_family": config["smoke"]["os_family"],
+            "os_version": config["smoke"]["os_version"],
         }
         atomic_write_json(output / "dockerfile-intent.json", request)
         accepted = client.build_dockerfile(request)

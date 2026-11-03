@@ -28,7 +28,7 @@ from pathlib import Path
 from .cloud_cli import _connect
 from .errors import ArtifactValidationError
 from .layer_cache import _directory, _private_directory
-from .nova_build import NovaController, _field
+from .nova_build import NovaController, NovaCreateAborted, _field
 from .state import atomic_write_json
 
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
@@ -315,6 +315,7 @@ class ScenarioCloud:
         *,
         purpose="benchmark",
         cleanup_only=False,
+        deadline=None,
     ):
         if type(observation_only) is not bool:
             _fail("observation_only must be a boolean")
@@ -322,6 +323,7 @@ class ScenarioCloud:
             _fail("cleanup_only must be a boolean")
         if cleanup_only and observation_only:
             _fail("cleanup_only and observation_only are mutually exclusive")
+        self.deadline = time.monotonic() + config.get("deadline_seconds", 7200) if deadline is None else deadline
         self.cleanup_only = cleanup_only
         self.observation_only = observation_only
         validate_cloud_config(config, require_ssh=not (observation_only or cleanup_only), purpose=purpose)
@@ -348,7 +350,6 @@ class ScenarioCloud:
             budget = ResourceBudget(config, output)
         self.budget = budget
         self._capabilities_checked = False
-        self.deadline = time.monotonic() + config.get("deadline_seconds", 7200)
 
     def _require_sdk(self, *, allow_cleanup=False):
         if self.observation_only:
@@ -498,8 +499,13 @@ class ScenarioCloud:
         original = _read(self.operations / (role + ".json"))
         if (
             original.get("source") != "sdk"
+            or original.get("project_id") != self.project_id
+            or original.get("job_id") != self.config["job_id"] + "-" + role
             or (not allow_unallocated and not original.get("server_id"))
-            or any(resource.get(k) != original.get(k) for k in ("server_id", "job_id", "reservation_id"))
+            or any(
+                resource.get(k) != original.get(k)
+                for k in ("server_id", "job_id", "reservation_id", "nova_spec_digest")
+            )
         ):
             _fail("resource differs from original SDK creation receipt")
         return original
@@ -660,7 +666,7 @@ class ScenarioCloud:
         if len(userdata.encode()) > 65535:
             _fail("complete cloud-init exceeds Nova user-data bound")
         p = self.config["placement"]
-        reservation = self.budget.reserve(role, p["boot_gib"])
+        reservation = self.budget.reserve(role, p["boot_gib"], deadline=self.deadline)
         resource = {
             "source": "sdk",
             "role": role,
@@ -672,6 +678,15 @@ class ScenarioCloud:
             "image_at_request": self._image_at_request,
         }
         _new_json(path, resource)
+        guard_entered = False
+
+        def before_create(nova_spec_digest):
+            nonlocal guard_entered
+            guard_entered = True
+            resource["nova_spec_digest"] = nova_spec_digest
+            self._save(resource)
+            self.budget.check_allocation(deadline=self.deadline)
+
         try:
             record = self.controller.create(
                 job_id=job_id,
@@ -684,18 +699,22 @@ class ScenarioCloud:
                 boot_gib=p["boot_gib"],
                 boot_volume_type=p.get("boot_volume_type"),
                 require_gpu=self.config["scenario"] in {"cuda", "torch-cuda", "tensorflow-cuda"},
+                before_create=before_create,
             )
+        except NovaCreateAborted:
+            # The controller verified its durable abort after denying the
+            # guard, before ever entering create_server.
+            original = self._own(resource, allow_unallocated=True)
+            self._verify_aborted(original, self.controller.inspect(job_id))
+            self._release_unallocated(original)
+            raise
         except Exception:
-            # NovaController fsyncs its exclusive intent BEFORE its request.
-            # No intent means no provider request; cumulative/role budget is
-            # still consumed, but this known-unallocated live slot can close.
+            # Missing intent is proof only during this synchronous preflight,
+            # before the controller's final guard could have been entered.
+            # A lost response or failed abort durability remains uncertain.
             intent = self.receipts / (job_id + ".json")
-            if not intent.exists() and not intent.is_symlink():
-                resource["phase"] = "aborted-before-request"
-                self._save(resource)
-                self.budget.release(reservation)
-                resource["budget_released"] = True
-                self._save(resource)
+            if not guard_entered and not intent.exists() and not intent.is_symlink():
+                self._release_unallocated(resource)
             raise
         resource.update(
             server_id=record["server_id"],
@@ -1509,6 +1528,31 @@ finally:os.close(directory)
                 _fail("original boot volume detach deadline expired; retained")
             time.sleep(min(2, max(0, deadline - time.monotonic())))
 
+    def _verify_aborted(self, resource, record):
+        if (
+            record.get("phase") != "aborted-before-request"
+            or record.get("schema") != "palimpsest.nova-job.v1"
+            or record.get("request_started") is not False
+            or "server_id" in record
+            or record.get("uncertain_create") is not False
+            or record.get("name") != resource["job_id"]
+            or record.get("job_id") != resource["job_id"]
+            or record.get("project_id") != resource["project_id"]
+            or not resource.get("nova_spec_digest")
+            or record.get("spec_digest") != resource["nova_spec_digest"]
+        ):
+            _fail("aborted Nova receipt differs from original operation")
+
+    def _release_unallocated(self, resource):
+        resource["phase"] = "aborted-before-request"
+        self._save(resource)
+        if _read(self.operations / (resource["role"] + ".json")) != resource:
+            _fail("aborted-before-request operation changed before verification")
+        if not resource.get("budget_released"):
+            self.budget.release_unbound(resource["reservation_id"], resource["role"])
+            resource["budget_released"] = True
+            self._save(resource)
+
     def delete(self, resource: dict) -> dict:
         """First-time ordinary deletes; later cleanup only settles recorded intents."""
         self._require_sdk(allow_cleanup=True)
@@ -1518,6 +1562,10 @@ finally:os.close(directory)
             path = self.receipts / (original["job_id"] + ".json")
             if path.exists() or path.is_symlink():
                 created = self.controller.inspect(original["job_id"])
+                if created.get("phase") == "aborted-before-request":
+                    self._verify_aborted(original, created)
+                    self._release_unallocated(original)
+                    return original
                 if created.get("uncertain_create") or not created.get("server_id"):
                     _fail("original create remains uncertain; no broad discovery or destructive replay")
                 original.update(
@@ -1528,11 +1576,9 @@ finally:os.close(directory)
                 self._save(original)
                 self.budget.bind(original["reservation_id"], original["server_id"])
             else:
-                original["phase"] = "aborted-before-request"
-                self._save(original)
-                self.budget.release(original["reservation_id"])
-                original["budget_released"] = True
-                self._save(original)
+                if original.get("phase") != "aborted-before-request":
+                    _fail("original create remains uncertain; missing Nova receipt is not no-call proof")
+                self._release_unallocated(original)
                 return original
         phase = original.get("phase")
         volume_id = original.get("boot_volume_id")

@@ -7,18 +7,15 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential \
     && rm -rf /var/lib/apt/lists/*
 RUN pip install --no-cache-dir uv==0.8.14
+# Resolve the Hub's exact companion dependency from this same source checkout.
+COPY pyproject.toml README.md /app/
+COPY src/ /app/src/
+COPY deploy/kolla/ansible/roles/palimpsest/ /app/deploy/kolla/ansible/roles/palimpsest/
+COPY deploy/kolla/ansible/palimpsest-build-worker.yml /app/deploy/kolla/ansible/palimpsest-build-worker.yml
 COPY hub/src/ ./src/
 COPY hub/pyproject.toml hub/uv.lock ./
 RUN uv sync --frozen --no-dev
 
-FROM builder AS build-worker-builder
-
-COPY pyproject.toml README.md /app/client/
-COPY src/ /app/client/src/
-COPY deploy/kolla/ansible/roles/palimpsest/ /app/client/deploy/kolla/ansible/roles/palimpsest/
-COPY deploy/kolla/ansible/palimpsest-build-worker.yml /app/client/deploy/kolla/ansible/palimpsest-build-worker.yml
-RUN uv build --wheel --out-dir /app/wheels /app/client \
-    && uv pip install --no-cache --python /app/hub/.venv/bin/python /app/wheels/*.whl
 
 FROM python:3.12-slim AS runtime
 
@@ -26,17 +23,17 @@ WORKDIR /app/hub
 COPY --from=builder /app/hub/.venv /app/hub/.venv
 COPY hub/src/ ./src/
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl qemu-utils \
+    && apt-get install -y --no-install-recommends curl qemu-utils openssh-client openssl ca-certificates ceph-common \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --shell /usr/sbin/nologin palimpsest \
-    && chown -R palimpsest:palimpsest /app
+    && chown -R palimpsest:palimpsest /app \
+    && chmod -R a+rX /app/hub/src
 ENV PATH="/app/hub/.venv/bin:$PATH"
 USER palimpsest
 
 FROM runtime AS palimpsest-hub-build-worker
 
 USER root
-COPY --from=build-worker-builder /app/hub/.venv /app/hub/.venv
 COPY --from=buildkit-tools /usr/bin/buildctl /usr/bin/buildkitd /usr/bin/buildkit-runc /usr/bin/
 COPY --from=buildkit-tools /usr/bin/buildkit-cni-bridge /usr/bin/buildkit-cni-loopback /usr/bin/buildkit-cni-host-local /usr/bin/buildkit-cni-firewall /usr/bin/
 RUN apt-get update \

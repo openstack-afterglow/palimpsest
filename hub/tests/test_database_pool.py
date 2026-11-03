@@ -219,6 +219,721 @@ async def test_bootstrap_upgrades_legacy_build_ownership_without_inventing_an_ow
         await engine.dispose()
 
 
+# Frozen SQLite DDL compiled from v0.3.10 models.py (15 tables, including indexes).
+# Kept literal: this fixture must not silently follow the current ORM metadata.
+_RELEASE_0310_SQL = (
+    """
+    CREATE TABLE palimpsest_hub_builds (
+        id CHAR(36) NOT NULL,
+        project_id VARCHAR(64) NOT NULL,
+        created_by VARCHAR(128),
+        name VARCHAR(64) NOT NULL,
+        recipe TEXT NOT NULL,
+        recipe_digest VARCHAR(71) NOT NULL,
+        base_digest VARCHAR(71) NOT NULL,
+        layer_digests JSON NOT NULL,
+        status VARCHAR(16) NOT NULL,
+        output_digest VARCHAR(71),
+        output_size_bytes BIGINT,
+        error_code VARCHAR(32),
+        lease_owner VARCHAR(128),
+        lease_expires_at DATETIME,
+        created_at DATETIME NOT NULL,
+        started_at DATETIME,
+        completed_at DATETIME,
+        PRIMARY KEY (id)
+    )
+    """,
+    """
+    CREATE INDEX idx_palimpsest_builds_project_created ON palimpsest_hub_builds (project_id, created_at)
+    """,
+    """
+    CREATE TABLE palimpsest_hub_layers (
+        id INTEGER NOT NULL,
+        blob_digest VARCHAR(71) NOT NULL,
+        blob_md5 CHAR(32),
+        size_bytes BIGINT NOT NULL,
+        media_type VARCHAR(128) NOT NULL,
+        disk_format VARCHAR(16),
+        arch VARCHAR(16),
+        os_variant VARCHAR(64),
+        config_digest VARCHAR(71) NOT NULL,
+        chain_id VARCHAR(71),
+        parent_digest VARCHAR(71),
+        name VARCHAR(64) NOT NULL,
+        kind VARCHAR(16) NOT NULL,
+        ubuntu_base VARCHAR(64),
+        python_version VARCHAR(16),
+        config_json JSON NOT NULL,
+        project_id VARCHAR(64),
+        is_published BOOLEAN DEFAULT '0' NOT NULL,
+        created_by VARCHAR(128),
+        created_at DATETIME NOT NULL,
+        PRIMARY KEY (id),
+        UNIQUE (blob_digest)
+    )
+    """,
+    """
+    CREATE INDEX ix_palimpsest_hub_layers_blob_md5 ON palimpsest_hub_layers (blob_md5)
+    """,
+    """
+    CREATE INDEX ix_palimpsest_hub_layers_chain_id ON palimpsest_hub_layers (chain_id)
+    """,
+    """
+    CREATE INDEX ix_palimpsest_hub_layers_kind ON palimpsest_hub_layers (kind)
+    """,
+    """
+    CREATE INDEX ix_palimpsest_hub_layers_name ON palimpsest_hub_layers (name)
+    """,
+    """
+    CREATE INDEX ix_palimpsest_hub_layers_parent_digest ON palimpsest_hub_layers (parent_digest)
+    """,
+    """
+    CREATE INDEX ix_palimpsest_hub_layers_project_id ON palimpsest_hub_layers (project_id)
+    """,
+    """
+    CREATE TABLE palimpsest_hub_uploads (
+        id CHAR(32) NOT NULL,
+        declared_digest VARCHAR(71),
+        received_bytes BIGINT NOT NULL,
+        project_id VARCHAR(64),
+        created_by VARCHAR(128),
+        created_at DATETIME NOT NULL,
+        updated_at DATETIME NOT NULL,
+        PRIMARY KEY (id)
+    )
+    """,
+    """
+    CREATE INDEX ix_palimpsest_hub_uploads_project_id ON palimpsest_hub_uploads (project_id)
+    """,
+    """
+    CREATE TABLE palimpsest_image_export_delegations (
+        trust_id VARCHAR(64) NOT NULL,
+        export_id CHAR(36),
+        project_id VARCHAR(64) NOT NULL,
+        trustor_user_id VARCHAR(64) NOT NULL,
+        trustee_user_id VARCHAR(64) NOT NULL,
+        role_names JSON NOT NULL,
+        expires_at DATETIME NOT NULL,
+        state VARCHAR(16) NOT NULL,
+        cleanup_attempts INTEGER DEFAULT '0' NOT NULL,
+        cleanup_next_at DATETIME,
+        created_at DATETIME NOT NULL,
+        updated_at DATETIME NOT NULL,
+        finished_at DATETIME,
+        PRIMARY KEY (trust_id)
+    )
+    """,
+    """
+    CREATE INDEX idx_palimpsest_export_delegations_cleanup ON palimpsest_image_export_delegations (state, cleanup_next_at)
+    """,
+    """
+    CREATE INDEX idx_palimpsest_export_delegations_export ON palimpsest_image_export_delegations (export_id, state)
+    """,
+    """
+    CREATE TABLE palimpsest_image_exports (
+        id CHAR(36) NOT NULL,
+        project_id VARCHAR(64) NOT NULL,
+        created_by VARCHAR(128),
+        source_image_id VARCHAR(64) NOT NULL,
+        source_name VARCHAR(255) NOT NULL,
+        source_disk_format VARCHAR(16) NOT NULL,
+        source_size_bytes BIGINT NOT NULL,
+        source_virtual_size_bytes BIGINT,
+        source_checksum VARCHAR(64),
+        source_hash_algo VARCHAR(16),
+        source_hash_value VARCHAR(128),
+        source_updated_at VARCHAR(64),
+        source_fingerprint CHAR(64) NOT NULL,
+        artifact_key CHAR(64) NOT NULL,
+        target_disk_format VARCHAR(16) NOT NULL,
+        result_blob_digest VARCHAR(71),
+        result_size_bytes BIGINT,
+        status VARCHAR(16) DEFAULT 'queued' NOT NULL,
+        progress_pct INTEGER DEFAULT '0' NOT NULL,
+        error_code VARCHAR(64),
+        error_message TEXT,
+        attempts INTEGER DEFAULT '0' NOT NULL,
+        next_at DATETIME NOT NULL,
+        lease_owner VARCHAR(128),
+        lease_expires_at DATETIME,
+        created_at DATETIME NOT NULL,
+        updated_at DATETIME NOT NULL,
+        started_at DATETIME,
+        completed_at DATETIME,
+        deleted_at DATETIME,
+        PRIMARY KEY (id),
+        CONSTRAINT uq_palimpsest_exports_project_artifact UNIQUE (project_id, artifact_key)
+    )
+    """,
+    """
+    CREATE INDEX idx_palimpsest_exports_artifact ON palimpsest_image_exports (artifact_key)
+    """,
+    """
+    CREATE INDEX idx_palimpsest_exports_claim ON palimpsest_image_exports (status, next_at)
+    """,
+    """
+    CREATE INDEX idx_palimpsest_exports_digest ON palimpsest_image_exports (result_blob_digest)
+    """,
+    """
+    CREATE INDEX idx_palimpsest_exports_project_created ON palimpsest_image_exports (project_id, deleted_at, created_at)
+    """,
+    """
+    CREATE TABLE palimpsest_package_namespaces (
+        project_id VARCHAR(64) NOT NULL,
+        namespace VARCHAR(63) NOT NULL,
+        project_name VARCHAR(255) NOT NULL,
+        created_at DATETIME NOT NULL,
+        PRIMARY KEY (project_id),
+        UNIQUE (namespace)
+    )
+    """,
+    """
+    CREATE TABLE palimpsest_worker_leases (
+        name VARCHAR(255) NOT NULL,
+        token VARCHAR(64) NOT NULL,
+        expires_at DATETIME NOT NULL,
+        PRIMARY KEY (name)
+    )
+    """,
+    """
+    CREATE TABLE palimpsest_hub_layer_access (
+        blob_digest VARCHAR(71) NOT NULL,
+        project_id VARCHAR(64) NOT NULL,
+        created_by VARCHAR(128),
+        created_at DATETIME NOT NULL,
+        PRIMARY KEY (blob_digest, project_id),
+        FOREIGN KEY(blob_digest) REFERENCES palimpsest_hub_layers (blob_digest) ON DELETE CASCADE
+    )
+    """,
+    """
+    CREATE TABLE palimpsest_package_caches (
+        id CHAR(32) NOT NULL,
+        project_id VARCHAR(64) NOT NULL,
+        package VARCHAR(255) NOT NULL,
+        build_key CHAR(71) NOT NULL,
+        cache_scope VARCHAR(48) NOT NULL,
+        platform VARCHAR(64) NOT NULL,
+        builder_fingerprint VARCHAR(128) NOT NULL,
+        archive_digest CHAR(71) NOT NULL,
+        archive_size_bytes BIGINT NOT NULL,
+        created_at DATETIME NOT NULL,
+        created_by VARCHAR(64) NOT NULL,
+        PRIMARY KEY (id),
+        FOREIGN KEY(project_id) REFERENCES palimpsest_package_namespaces (project_id)
+    )
+    """,
+    """
+    CREATE INDEX idx_package_cache_partition ON palimpsest_package_caches (project_id, package, cache_scope, platform, builder_fingerprint)
+    """,
+    """
+    CREATE INDEX ix_palimpsest_package_caches_archive_digest ON palimpsest_package_caches (archive_digest)
+    """,
+    """
+    CREATE TABLE palimpsest_package_keys (
+        id CHAR(32) NOT NULL,
+        project_id VARCHAR(64) NOT NULL,
+        owner_user_id VARCHAR(64) NOT NULL,
+        secret_hash CHAR(64) NOT NULL,
+        name VARCHAR(128) NOT NULL,
+        scope JSON NOT NULL,
+        actions JSON NOT NULL,
+        admin_issuer_context JSON,
+        created_at DATETIME NOT NULL,
+        expires_at DATETIME NOT NULL,
+        revoked_at DATETIME,
+        PRIMARY KEY (id),
+        FOREIGN KEY(project_id) REFERENCES palimpsest_package_namespaces (project_id)
+    )
+    """,
+    """
+    CREATE INDEX ix_palimpsest_package_keys_owner_user_id ON palimpsest_package_keys (owner_user_id)
+    """,
+    """
+    CREATE TABLE palimpsest_packages (
+        id CHAR(32) NOT NULL,
+        project_id VARCHAR(64) NOT NULL,
+        name VARCHAR(255) NOT NULL,
+        package_type VARCHAR(32) NOT NULL,
+        created_at DATETIME NOT NULL,
+        updated_at DATETIME NOT NULL,
+        PRIMARY KEY (id),
+        UNIQUE (project_id, name),
+        FOREIGN KEY(project_id) REFERENCES palimpsest_package_namespaces (project_id)
+    )
+    """,
+    """
+    CREATE TABLE palimpsest_package_uploads (
+        id CHAR(32) NOT NULL,
+        project_id VARCHAR(64) NOT NULL,
+        package VARCHAR(255) NOT NULL,
+        key_id CHAR(32),
+        owner_user_id VARCHAR(64) NOT NULL,
+        resource VARCHAR(16) NOT NULL,
+        request JSON NOT NULL,
+        received_bytes BIGINT NOT NULL,
+        status VARCHAR(16) NOT NULL,
+        result JSON,
+        created_at DATETIME NOT NULL,
+        updated_at DATETIME NOT NULL,
+        expires_at DATETIME NOT NULL,
+        PRIMARY KEY (id),
+        FOREIGN KEY(project_id) REFERENCES palimpsest_package_namespaces (project_id),
+        FOREIGN KEY(key_id) REFERENCES palimpsest_package_keys (id)
+    )
+    """,
+    """
+    CREATE INDEX ix_palimpsest_package_uploads_project_id ON palimpsest_package_uploads (project_id)
+    """,
+    """
+    CREATE TABLE palimpsest_package_versions (
+        package_id CHAR(32) NOT NULL,
+        root_digest CHAR(71) NOT NULL,
+        root_media_type VARCHAR(128) NOT NULL,
+        graph JSON NOT NULL,
+        platforms JSON NOT NULL,
+        archive_digest CHAR(71) NOT NULL,
+        archive_size_bytes BIGINT NOT NULL,
+        total_bytes BIGINT NOT NULL,
+        provenance JSON NOT NULL,
+        pushed_by VARCHAR(64) NOT NULL,
+        pushed_key_id CHAR(32),
+        pushed_at DATETIME NOT NULL,
+        PRIMARY KEY (package_id, root_digest),
+        FOREIGN KEY(package_id) REFERENCES palimpsest_packages (id),
+        FOREIGN KEY(pushed_key_id) REFERENCES palimpsest_package_keys (id)
+    )
+    """,
+    """
+    CREATE TABLE palimpsest_package_blob_references (
+        package_id CHAR(32) NOT NULL,
+        root_digest CHAR(71) NOT NULL,
+        blob_digest CHAR(71) NOT NULL,
+        PRIMARY KEY (package_id, root_digest, blob_digest),
+        FOREIGN KEY(package_id, root_digest) REFERENCES palimpsest_package_versions (package_id, root_digest)
+    )
+    """,
+    """
+    CREATE INDEX ix_palimpsest_package_blob_references_blob_digest ON palimpsest_package_blob_references (blob_digest)
+    """,
+    """
+    CREATE TABLE palimpsest_package_tags (
+        package_id CHAR(32) NOT NULL,
+        tag VARCHAR(128) NOT NULL,
+        root_digest CHAR(71) NOT NULL,
+        updated_at DATETIME NOT NULL,
+        updated_by VARCHAR(64) NOT NULL,
+        revision BIGINT NOT NULL,
+        PRIMARY KEY (package_id, tag),
+        FOREIGN KEY(package_id, root_digest) REFERENCES palimpsest_package_versions (package_id, root_digest)
+    )
+    """,
+)
+
+
+async def _create_release_0310_schema(connection):
+    for statement in _RELEASE_0310_SQL:
+        await connection.execute(text(statement))
+
+
+@pytest.mark.asyncio
+async def test_released_0310_full_fifteen_table_schema_bootstraps_then_orm_claims(tmp_path, monkeypatch):
+    from sqlalchemy import inspect, select
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    from palimpsest_hub import database
+    from palimpsest_hub.image_models import PalimpsestHubImageJob
+    from palimpsest_hub.services import image_jobs
+    from palimpsest_hub.services.digest import compute_config_digest
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'released-0310.db'}")
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    monkeypatch.setattr(database, "_engine", engine)
+    monkeypatch.setattr(image_jobs, "_factory_or_503", lambda: factory)
+    monkeypatch.setattr(
+        image_jobs,
+        "get_settings",
+        lambda: SimpleNamespace(
+            palimpsest_hub_registry_hosts=("docker.io",),
+            palimpsest_hub_build_timeout_seconds=60,
+            palimpsest_hub_max_blob_bytes=4096,
+        ),
+    )
+    try:
+        async with engine.begin() as connection:
+            await _create_release_0310_schema(connection)
+            names = set(await connection.run_sync(lambda sync: inspect(sync).get_table_names()))
+            assert len(names) == 15
+            assert "palimpsest_hub_image_jobs" not in names
+            await connection.execute(
+                text("""
+                INSERT INTO palimpsest_hub_layers (
+                    id, blob_digest, size_bytes, media_type, config_digest, name, kind,
+                    config_json, project_id, is_published, created_at
+                ) VALUES (1, :digest, 123, 'test/squashfs', :digest, 'legacy-layer',
+                    'squashfs', '{}', 'original-project', 0, '2026-11-02 01:02:03.123456')
+            """),
+                {"digest": "sha256:" + "1" * 64},
+            )
+        await database.create_schema()
+        await database.create_schema()
+        async with factory() as session:
+            assert (await session.scalars(select(PalimpsestHubImageJob))).all() == []
+            request = {
+                "reference": "docker.io/library/alpine:3",
+                "platform": "linux/amd64",
+                "os_family": "alpine",
+                "os_version": "3",
+                "visibility": "private",
+            }
+            session.add(
+                PalimpsestHubImageJob(
+                    id="00000000-0000-4000-8000-000000000001",
+                    project_id="original-project",
+                    created_by="original-user",
+                    request_id="00000000-0000-4000-8000-000000000002",
+                    kind="registry",
+                    name="new-job",
+                    request_digest=compute_config_digest({"kind": "registry", **request}),
+                    request_json=request,
+                )
+            )
+            await session.commit()
+        claimed = await image_jobs.claim("00000000-0000-4000-8000-000000000003", 1)
+        assert claimed["id"] == "00000000-0000-4000-8000-000000000001"
+        async with factory() as session:
+            job = (await session.scalars(select(PalimpsestHubImageJob))).one()
+            assert job.visibility == "private" and job.status == "building"
+        async with engine.connect() as connection:
+            assert await connection.scalar(text("SELECT count(*) FROM palimpsest_hub_layers")) == 1
+            assert await connection.scalar(text("SELECT count(*) FROM palimpsest_hub_published_images")) == 0
+    finally:
+        await engine.dispose()
+
+
+async def _create_prepublication_image_schema(
+    connection, *, creator="original-user", publication_ready=False, missing_fact=None
+):
+    """Full released base plus literal post-release HEAD image-table extensions."""
+    import json
+
+    from palimpsest_hub.services.digest import compute_config_digest
+
+    await _create_release_0310_schema(connection)
+
+    await connection.execute(
+        text("""
+        CREATE TABLE palimpsest_hub_build_contexts (
+            project_id VARCHAR(64) NOT NULL, digest VARCHAR(71) NOT NULL,
+            size_bytes BIGINT NOT NULL, created_by VARCHAR(128), created_at DATETIME NOT NULL,
+            PRIMARY KEY (project_id, digest)
+        )
+    """)
+    )
+    await connection.execute(
+        text("""
+        CREATE TABLE palimpsest_hub_image_jobs (
+            id CHAR(36) NOT NULL PRIMARY KEY, project_id VARCHAR(64) NOT NULL,
+            created_by VARCHAR(128), request_id CHAR(36) NOT NULL, kind VARCHAR(16) NOT NULL,
+            name VARCHAR(64) NOT NULL, request_digest VARCHAR(71) NOT NULL, request_json JSON NOT NULL,
+            context_digest VARCHAR(71), status VARCHAR(16) NOT NULL, staged_outputs JSON NOT NULL,
+            output_digests JSON NOT NULL, result_json JSON, error_code VARCHAR(32),
+            lease_owner VARCHAR(128), lease_expires_at DATETIME, created_at DATETIME NOT NULL,
+            started_at DATETIME, completed_at DATETIME,
+            CONSTRAINT uq_image_job_project_request UNIQUE (project_id, request_id)
+        )
+    """)
+    )
+    await connection.execute(
+        text("CREATE INDEX idx_image_jobs_project_created ON palimpsest_hub_image_jobs (project_id, created_at)")
+    )
+    await connection.execute(
+        text("""
+        INSERT INTO palimpsest_hub_build_contexts
+        (project_id, digest, size_bytes, created_by, created_at)
+        VALUES ('original-project', :digest, 123, :creator, '2026-11-02 01:02:03.123456')
+    """),
+        {"digest": "sha256:" + "a" * 64, "creator": creator},
+    )
+    request = {"reference": "docker.io/library/alpine:3", "platform": "linux/amd64"}
+    if publication_ready and missing_fact != "os":
+        # Explicit fixture facts, not a migration's inferred OS or invented owner.
+        request.update(os_family="alpine", os_version="3")
+    await connection.execute(
+        text("""
+        INSERT INTO palimpsest_hub_image_jobs
+        (id, project_id, created_by, request_id, kind, name, request_digest, request_json,
+         status, staged_outputs, output_digests, created_at)
+        VALUES ('00000000-0000-4000-8000-000000000001', 'original-project', :job_creator,
+         '00000000-0000-4000-8000-000000000002', 'registry', 'legacy-job', :digest,
+         :request, 'queued', '[]', '[]', '2026-11-02 01:02:03.123456')
+    """),
+        {
+            "digest": compute_config_digest({"kind": "registry", **request}),
+            "request": json.dumps(request),
+            "job_creator": creator if publication_ready and missing_fact != "creator" else None,
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_prepublication_image_schema_upgrade_is_idempotent_and_real_orm_claim_works(tmp_path, monkeypatch):
+    from sqlalchemy import inspect, select
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    from palimpsest_hub import database
+    from palimpsest_hub.image_models import PalimpsestHubBuildContext, PalimpsestHubImageJob
+    from palimpsest_hub.services import image_jobs
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / '0310.db'}")
+    monkeypatch.setattr(database, "_engine", engine)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    monkeypatch.setattr(image_jobs, "_factory_or_503", lambda: factory)
+    monkeypatch.setattr(
+        image_jobs,
+        "get_settings",
+        lambda: SimpleNamespace(
+            palimpsest_hub_registry_hosts=("docker.io",),
+            palimpsest_hub_build_timeout_seconds=60,
+            palimpsest_hub_max_blob_bytes=4096,
+        ),
+    )
+    try:
+        async with engine.begin() as connection:
+            await _create_prepublication_image_schema(connection, publication_ready=True)
+        await database.create_schema()
+        await database.create_schema()
+        async with engine.connect() as connection:
+            primary = await connection.run_sync(
+                lambda sync: inspect(sync).get_pk_constraint("palimpsest_hub_build_contexts")["constrained_columns"]
+            )
+            assert primary == ["project_id", "digest", "created_by"]
+            columns = await connection.run_sync(lambda sync: inspect(sync).get_columns("palimpsest_hub_image_jobs"))
+            assert next(column for column in columns if column["name"] == "visibility")["nullable"] is False
+            assert await connection.scalar(text("SELECT count(*) FROM palimpsest_hub_published_images")) == 0
+        async with factory() as session:
+            context = (await session.scalars(select(PalimpsestHubBuildContext))).one()
+            job = (await session.scalars(select(PalimpsestHubImageJob))).one()
+            assert context.created_by == "original-user" and context.size_bytes == 123
+            assert context.created_at.microsecond == 123456
+            assert job.visibility == "internal" and job.created_by == "original-user"
+            assert "visibility" not in job.request_json  # Preserve original digest/request bytes.
+            session.add(
+                PalimpsestHubBuildContext(
+                    project_id=context.project_id, digest=context.digest, size_bytes=123, created_by="second-user"
+                )
+            )
+            await session.commit()
+        claimed = await image_jobs.claim("00000000-0000-4000-8000-000000000003", 1)
+        assert claimed["id"] == "00000000-0000-4000-8000-000000000001"
+        assert (await image_jobs.claim("00000000-0000-4000-8000-000000000003", 1)) == claimed
+        await database.create_schema()
+        async with factory() as session:
+            job = (await session.scalars(select(PalimpsestHubImageJob))).one()
+            assert job.status == "building" and job.visibility == "internal"
+            assert job.lease_owner == claimed["lease"]
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing_fact", [None, "creator", "os"], ids=["supported", "missing-creator", "missing-os"])
+@pytest.mark.parametrize("inflight", [False, True], ids=["queued", "already-building"])
+async def test_upgraded_image_worker_http_complete_preserves_publication_authority(
+    tmp_path, monkeypatch, missing_fact, inflight
+):
+    import httpx
+    from fastapi import FastAPI
+    from palimpsest_local.image_manifest import manifest_from_result
+    from sqlalchemy import select
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    from palimpsest_hub import database
+    from palimpsest_hub.api import image_jobs as image_api
+    from palimpsest_hub.api.builds import require_build_lease
+    from palimpsest_hub.image_models import PalimpsestHubImageJob, PalimpsestHubPublishedImage
+    from palimpsest_hub.services import image_jobs, published_images
+    from palimpsest_hub.services.hub_store import LocalPathBlobStore
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'legacy-complete.db'}")
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    store = LocalPathBlobStore(tmp_path / "cas")
+    settings = SimpleNamespace(
+        palimpsest_hub_registry_hosts=("docker.io",),
+        palimpsest_hub_build_timeout_seconds=60,
+        palimpsest_hub_max_blob_bytes=4096,
+    )
+    monkeypatch.setattr(database, "_engine", engine)
+    monkeypatch.setattr(image_jobs, "_factory_or_503", lambda: factory)
+    monkeypatch.setattr(image_jobs, "_store_or_503", lambda: store)
+    for module in (image_jobs, image_api, published_images):
+        monkeypatch.setattr(module, "get_settings", lambda: settings)
+    app = FastAPI()
+    app.include_router(image_api.router, prefix="/v1")
+    try:
+        async with engine.begin() as connection:
+            await _create_prepublication_image_schema(connection, publication_ready=True, missing_fact=missing_fact)
+            if inflight:
+                await connection.execute(
+                    text("""
+                    UPDATE palimpsest_hub_image_jobs SET status='building', lease_owner=:lease,
+                    started_at=:started, lease_expires_at=:expires
+                """),
+                    {
+                        "lease": "00000000-0000-4000-8000-000000000004",
+                        "started": datetime.now(UTC),
+                        "expires": datetime.now(UTC) + timedelta(minutes=5),
+                    },
+                )
+        await database.create_schema()
+        await database.create_schema()
+        async with factory() as session:
+            original = (await session.scalars(select(PalimpsestHubImageJob))).one()
+            original_request = dict(original.request_json)
+        claimed = (
+            {"id": original.id, "lease": original.lease_owner}
+            if inflight
+            else await image_jobs.claim("00000000-0000-4000-8000-000000000003", 1)
+        )
+        if missing_fact and not inflight:
+            assert claimed is None
+            async with factory() as session:
+                job = (await session.scalars(select(PalimpsestHubImageJob))).one()
+                assert job.status == "error" and job.error_code == "publication_metadata_required"
+                assert job.visibility == "internal"
+                assert (job.created_by is None) == (missing_fact == "creator")
+                assert job.lease_owner is None and job.started_at is None
+                assert job.request_json == original_request
+                assert (await session.scalars(select(PalimpsestHubPublishedImage))).all() == []
+            return  # No worker execution, byte upload or publication is authorized.
+        app.dependency_overrides[require_build_lease] = lambda: claimed["lease"]
+        payload = b"hsqs-synthetic-legacy-output"
+        digest = "sha256:" + hashlib.sha256(payload).hexdigest()
+        descriptor = {
+            "layers": [{"digest": digest, "size_bytes": len(payload)}],
+            "source": {key: "sha256:" + "2" * 64 for key in ("root_digest", "manifest_digest", "config_digest")},
+            "runtime": {"entrypoint": ["/bin/sh"], "cmd": [], "env": [], "working_dir": "/", "user": "0"},
+        }
+        descriptor["manifest"] = manifest_from_result(
+            descriptor, os_family="alpine", os_version="3", source_kind="registry"
+        )
+        path = "/v1/image-worker/jobs/" + claimed["id"]
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://legacy.test") as client:
+            if not missing_fact:
+                staged = await client.put(path + "/outputs/" + digest, content=payload)
+                assert staged.status_code == 200, staged.text
+            response = await client.post(path + "/complete", json=descriptor)
+            if missing_fact:
+                assert response.status_code == 409, response.text
+                assert response.json()["detail"] == "image publication requires proven creator and OS declarations"
+                async with factory() as session:
+                    job = (await session.scalars(select(PalimpsestHubImageJob))).one()
+                    assert job.request_json == original_request
+                    assert (await session.scalars(select(PalimpsestHubPublishedImage))).all() == []
+                return
+            assert response.status_code == 200, response.text
+            assert response.json()["status"] == "complete"
+            assert response.json()["visibility"] == "internal"
+            assert response.json()["published_image_id"] == claimed["id"]
+            replay = await client.post(path + "/complete", json=descriptor)
+            assert replay.status_code == 200, replay.text
+        async with factory() as session:
+            images = (await session.scalars(select(PalimpsestHubPublishedImage))).all()
+            assert len(images) == 1
+            assert images[0].created_by == "original-user" and images[0].visibility == "internal"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("creator", [None, "", "   "])
+async def test_legacy_unknown_context_creator_blocks_all_bootstrap_ddl(tmp_path, monkeypatch, creator):
+    from sqlalchemy import inspect
+
+    from palimpsest_hub import database
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'unknown.db'}")
+    monkeypatch.setattr(database, "_engine", engine)
+    try:
+        async with engine.begin() as connection:
+            await _create_prepublication_image_schema(connection, creator=creator)
+            before = set(await connection.run_sync(lambda sync: inspect(sync).get_table_names()))
+        with pytest.raises(RuntimeError, match="explicitly quarantine"):
+            await database.create_schema()
+        async with engine.connect() as connection:
+            assert set(await connection.run_sync(lambda sync: inspect(sync).get_table_names())) == before
+            columns = await connection.run_sync(lambda sync: inspect(sync).get_columns("palimpsest_hub_image_jobs"))
+            assert "visibility" not in {column["name"] for column in columns}
+            assert await connection.scalar(text("SELECT count(*) FROM palimpsest_hub_build_contexts")) == 1
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_schema_failure_rolls_back_context_rebuild_and_visibility(tmp_path, monkeypatch):
+    from sqlalchemy import inspect
+
+    from palimpsest_hub import database
+    from palimpsest_hub.models import Base
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'rollback.db'}")
+    monkeypatch.setattr(database, "_engine", engine)
+    try:
+        async with engine.begin() as connection:
+            await _create_prepublication_image_schema(connection)
+
+        def fail_after_upgrade(*args, **kwargs):
+            raise RuntimeError("synthetic create-all failure after actual SQLite upgrade DDL")
+
+        monkeypatch.setattr(Base.metadata, "create_all", fail_after_upgrade)
+        with pytest.raises(RuntimeError, match="synthetic create-all failure"):
+            await database.create_schema()
+        async with engine.connect() as connection:
+            primary = await connection.run_sync(
+                lambda sync: inspect(sync).get_pk_constraint("palimpsest_hub_build_contexts")["constrained_columns"]
+            )
+            assert primary == ["project_id", "digest"]
+            columns = await connection.run_sync(lambda sync: inspect(sync).get_columns("palimpsest_hub_image_jobs"))
+            assert "visibility" not in {column["name"] for column in columns}
+            assert (
+                await connection.scalar(text("SELECT created_by FROM palimpsest_hub_build_contexts")) == "original-user"
+            )
+            assert "__palimpsest_upgrade_build_contexts" not in await connection.run_sync(
+                lambda sync: inspect(sync).get_table_names()
+            )
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_incompatible_legacy_fk_parent_blocks_before_any_upgrade(tmp_path, monkeypatch):
+    from sqlalchemy import inspect
+
+    from palimpsest_hub import database
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'bad-parent.db'}")
+    monkeypatch.setattr(database, "_engine", engine)
+    try:
+        async with engine.begin() as connection:
+            await _create_prepublication_image_schema(connection)
+            await connection.execute(text("DROP TABLE palimpsest_hub_layers"))
+            await connection.execute(
+                text("CREATE TABLE palimpsest_hub_layers (id INTEGER PRIMARY KEY, blob_digest VARCHAR(71))")
+            )
+        with pytest.raises(RuntimeError, match="incompatible legacy key"):
+            await database.create_schema()
+        async with engine.connect() as connection:
+            primary = await connection.run_sync(
+                lambda sync: inspect(sync).get_pk_constraint("palimpsest_hub_build_contexts")["constrained_columns"]
+            )
+            assert primary == ["project_id", "digest"]
+            assert "palimpsest_hub_layer_nodes" not in await connection.run_sync(
+                lambda sync: inspect(sync).get_table_names()
+            )
+    finally:
+        await engine.dispose()
+
+
 def _ownership_process(url, root, lock_path, mode, channel, gate):
     """Real API SQL/process consumer; recipes/provider deletes remain synthetic."""
     from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -652,4 +1367,67 @@ async def test_shared_sql_process_ownership_smoke(tmp_path, worker_count):
         if owns_schema and all(not process.is_alive() for process, _ in children):
             async with engine.begin() as connection:
                 await connection.run_sync(Base.metadata.drop_all)
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_adds_missing_execution_tables_without_changing_existing_rows(tmp_path, monkeypatch):
+    from sqlalchemy import inspect, select
+
+    from palimpsest_hub import database, image_models, instance_models, native_models  # noqa: F401
+    from palimpsest_hub.models import Base, PalimpsestHubBuild, RuntimeBlobReference
+
+    new_tables = {
+        image_models.PalimpsestHubBuildContext.__tablename__,
+        image_models.PalimpsestHubImageJob.__tablename__,
+        instance_models.PalimpsestHubInstance.__tablename__,
+        RuntimeBlobReference.__tablename__,
+    }
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'legacy-execution.db'}")
+    monkeypatch.setattr(database, "_engine", engine)
+    builds = PalimpsestHubBuild.__table__
+    now = datetime(2026, 10, 30, 1, 2, 3, 456789, tzinfo=UTC)
+    try:
+        async with engine.begin() as connection:
+            legacy = [table for table in Base.metadata.sorted_tables if table.name not in new_tables]
+            await connection.run_sync(lambda sync: Base.metadata.create_all(sync, tables=legacy))
+            await connection.execute(
+                builds.insert().values(
+                    id="00000000-0000-4000-8000-000000000001",
+                    project_id="original-project",
+                    created_by="original-user",
+                    name="retained-build",
+                    recipe="RUN true",
+                    recipe_digest="sha256:" + "1" * 64,
+                    base_digest="sha256:" + "2" * 64,
+                    layer_digests=[],
+                    status="error",
+                    error_code="worker_interrupted",
+                    lease_expires_at=now,
+                    created_at=now,
+                )
+            )
+
+        async def snapshot():
+            async with engine.connect() as connection:
+                objects = list(
+                    (await connection.execute(text("SELECT type, name, tbl_name, sql FROM sqlite_master"))).all()
+                )
+                row = (await connection.execute(select(builds))).mappings().one()
+                names = await connection.run_sync(lambda sync: set(inspect(sync).get_table_names()))
+                return {tuple(item) for item in objects}, dict(row), names
+
+        before_schema, before_row, before_tables = await snapshot()
+        assert not (before_tables & new_tables)
+        await database.create_schema()
+        after_schema, after_row, after_tables = await snapshot()
+        assert after_tables - before_tables == new_tables
+        assert before_schema <= after_schema
+        assert after_row == before_row
+        await database.create_schema()
+        repeated_schema, repeated_row, repeated_tables = await snapshot()
+        assert repeated_schema == after_schema
+        assert repeated_row == before_row
+        assert repeated_tables == after_tables
+    finally:
         await engine.dispose()

@@ -63,3 +63,28 @@
   tags: precheck
   when:
     - palimpsest_public_haproxy_enabled | bool
+
+- name: Precheck | Require the explicit pre-provisioned namespace mount
+  ansible.builtin.assert:
+    that:
+      - palimpsest_publication_manila_host_path is match('^/[^:\\r\\n]+$')
+      - palimpsest_publication_manila_root is match('^/[^:\\r\\n]+$')
+      - palimpsest_publication_manila_share_id | length > 0
+      - palimpsest_publication_manila_export | length > 0
+      - palimpsest_publication_manila_fs_name | length > 0
+      - palimpsest_publication_manila_data_pool | length > 0
+    fail_msg: "Namespace publication requires an already mounted exact share/export, filesystem and data pool"
+  when: palimpsest_publication_manila_root | length > 0
+  tags: precheck
+
+- name: Precheck | Require private native state separate from exported payloads
+  ansible.builtin.assert:
+    that:
+      - palimpsest_publication_manila_root | length > 0
+      - palimpsest_native_operator_host_path is match('^/[^:\\r\\n]+$')
+      - palimpsest_native_operator_container_path is match('^/[^:\\r\\n]+$')
+      - palimpsest_native_operator_container_path != palimpsest_publication_manila_root
+      - not palimpsest_native_operator_container_path.startswith(palimpsest_publication_manila_root.rstrip('/') ~ '/')
+    fail_msg: "Native profiles require an explicitly provisioned private journal/issuer mount outside exported payloads"
+  when: palimpsest_native_profiles | length > 0
+  tags: precheck

@@ -163,7 +163,7 @@ def retain_failure(instance, record: dict, exc: Exception | None = None) -> None
 
 
 def validate_result(result: dict, maximum: int) -> dict:
-    if not isinstance(result, dict) or set(result) != {"layers", "source", "runtime"}:
+    if not isinstance(result, dict) or set(result) != {"layers", "source", "runtime", "manifest"}:
         raise ValueError("invalid image result")
     layers = result["layers"]
     if not isinstance(layers, list) or not 0 < len(layers) <= 128:
@@ -195,6 +195,17 @@ def validate_result(result: dict, maximum: int) -> dict:
         count = 4096 if key == "working_dir" else 256
         if not isinstance(runtime[key], str) or "\0" in runtime[key] or len(runtime[key]) > count:
             raise ValueError("invalid runtime metadata")
+    if "manifest" in result:
+        from palimpsest_local.image_manifest import normalize_manifest
+
+        manifest = normalize_manifest(result["manifest"])
+        if (
+            manifest["runtime"] != runtime
+            or [{key: layer[key] for key in ("digest", "size_bytes")} for layer in manifest["layers"]] != layers
+            or any(manifest["source"].get(key) != value for key, value in result["source"].items())
+        ):
+            raise ValueError("canonical manifest contradicts worker output")
+        result = {**result, "manifest": manifest}
     if len(json.dumps(result).encode()) > 512 * 1024:
         raise ValueError("image completion descriptor exceeds wire limit")
     return result

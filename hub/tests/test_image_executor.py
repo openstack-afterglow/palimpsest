@@ -51,17 +51,26 @@ def claim():
         "kind": "registry",
         "platform": "linux/amd64",
         "max_output_bytes": 4096,
-        "request": {"reference": "docker.io/library/alpine:3"},
+        "request": {
+            "reference": "docker.io/library/alpine:3",
+            "os_family": "alpine",
+            "os_version": "3",
+            "metadata": {},
+        },
         "context": None,
     }
 
 
 def result():
-    return {
+    value = {
         "layers": [{"digest": sha(b"hsqsone"), "size_bytes": 7}, {"digest": sha(b"hsqstwo"), "size_bytes": 7}],
         "source": {"root_digest": sha(b"root"), "manifest_digest": sha(b"manifest"), "config_digest": sha(b"config")},
         "runtime": {"entrypoint": [], "cmd": ["/bin/true"], "env": [], "working_dir": "/", "user": "0"},
     }
+    from palimpsest_local.image_manifest import manifest_from_result
+
+    value["manifest"] = manifest_from_result(value, os_family="alpine", os_version="3", source_kind="registry")
+    return value
 
 
 class Response:
@@ -302,7 +311,8 @@ def test_image_runtime_rejected_before_unrecoverable_output_staging(key, value):
 def test_image_completion_escape_expansion_is_bounded_before_output_staging():
     descriptor = result()
     descriptor["runtime"]["env"] = ["A=" + "\u2603" * 4000] * 32
-    with pytest.raises(ValueError, match="wire limit"):
+    descriptor["manifest"]["runtime"]["env"] = descriptor["runtime"]["env"]
+    with pytest.raises(ValueError):
         image.validate_result(descriptor, 4096)
 
 
@@ -744,3 +754,18 @@ def test_restart_receipt_wait_uses_saved_lease_after_more_than_ten_seconds(harne
     retained = json.loads((harness.journal.root / image.FAILURE_FILE).read_bytes())
     assert retained["publication_failure"] == old_failure
     assert harness.executions == [JOB]
+
+
+def test_worker_result_requires_full_manifest_and_rejects_private_runtime_contradictions():
+    value = result()
+    value.pop("manifest")
+    with pytest.raises(ValueError, match="invalid image result"):
+        image.validate_result(value, 4096)
+    value = result()
+    value["manifest"]["runtime"]["env"] = ["TOKEN=altered-after-conversion"]
+    with pytest.raises(ValueError, match="contradicts"):
+        image.validate_result(value, 4096)
+    value = result()
+    value["manifest"]["layers"][1]["parent_id"] = None
+    with pytest.raises(ValueError, match="parent chain"):
+        image.validate_result(value, 4096)

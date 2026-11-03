@@ -868,8 +868,26 @@ wheels = [
 ]
 
 [[package]]
+name = "palimpsest-client"
+version = "0.3.11"
+source = { directory = "../" }
+
+[package.metadata]
+requires-dist = [
+    { name = "ansible-core", marker = "extra == 'dev'", specifier = ">=2.19.12,<2.20" },
+    { name = "jinja2", marker = "extra == 'dev'", specifier = ">=3.1.6" },
+    { name = "libvirt-python", marker = "extra == 'kvm'", specifier = ">=10.0.0" },
+    { name = "openstacksdk", marker = "extra == 'cloud'", specifier = ">=3.3,<5" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=9.0.3" },
+    { name = "pyyaml", marker = "extra == 'cloud'", specifier = ">=6.0" },
+    { name = "pyyaml", marker = "extra == 'dev'", specifier = ">=6.0" },
+    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.7.0" },
+]
+provides-extras = ["kvm", "cloud", "dev"]
+
+[[package]]
 name = "palimpsest-hub"
-version = "0.3.10"
+version = "0.3.11"
 source = { editable = "." }
 dependencies = [
     { name = "asyncmy" },
@@ -877,6 +895,7 @@ dependencies = [
     { name = "openstacksdk" },
     { name = "oslo-config" },
     { name = "oslo-policy" },
+    { name = "palimpsest-client" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
     { name = "python-keystoneclient" },
@@ -909,6 +928,7 @@ requires-dist = [
     { name = "openstacksdk", specifier = "==3.3.0" },
     { name = "oslo-config", specifier = ">=9.6.0" },
     { name = "oslo-policy", specifier = ">=4.5.0" },
+    { name = "palimpsest-client", directory = "../" },
     { name = "pydantic", specifier = "==2.13.4" },
     { name = "pydantic-settings", specifier = "==2.14.2" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=9.0.3" },

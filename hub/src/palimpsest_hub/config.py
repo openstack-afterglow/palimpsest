@@ -134,6 +134,71 @@ class InstanceClusterProfile(BaseModel):
         return self
 
 
+class NativeProfile(BaseModel):
+    """Operator-owned native journal and finite grant; never a caller-supplied path."""
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True, frozen=True)
+
+    enabled: bool = Field(default=False, strict=True)
+    environment: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{0,30}$")
+    root: Path
+    grant_path: Path
+    project_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    user_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    manifest_digest: str | None = Field(default=None, pattern=r"^sha256:[0-9a-f]{64}$")
+    share_id: str
+    export: str
+    publication_root: Path
+    ceph_fs_name: str = Field(default="", pattern=r"^[A-Za-z0-9_.-]{0,64}$")
+    ceph_data_pool: str = Field(default="", pattern=r"^[A-Za-z0-9_.-]{0,128}$")
+    ceph_issuer_client: str = Field(default="", pattern=r"^(?:client\.[A-Za-z0-9_.-]{1,128})?$")
+    ceph_conf_file: Path | None = None
+    ceph_keyring_file: Path | None = None
+
+    @field_validator("root", "grant_path", "publication_root", "ceph_conf_file", "ceph_keyring_file")
+    @classmethod
+    def private_absolute_path(cls, value: Path | None) -> Path | None:
+        if value is None:
+            return None
+        if not value.is_absolute() or ".." in value.parts or "\x00" in str(value):
+            raise ValueError("native paths must be absolute and traversal-free")
+        return value
+
+    @field_validator("share_id")
+    @classmethod
+    def canonical_share_id(cls, value: str) -> str:
+        if str(UUID(value)) != value:
+            raise ValueError("native share must be a canonical UUID")
+        return value
+
+    @field_validator("export")
+    @classmethod
+    def canonical_export(cls, value: str) -> str:
+        from palimpsest_local.cloud_env import _ceph_source_identity
+
+        try:
+            _ceph_source_identity(value)
+        except (TypeError, ValueError):
+            raise ValueError("native export must bind literal Ceph monitors and a share path") from None
+        return value
+
+    @model_validator(mode="after")
+    def private_state_outside_payloads(self) -> NativeProfile:
+        for path in (self.root, self.grant_path, self.ceph_conf_file, self.ceph_keyring_file):
+            if path is not None and (path == self.publication_root or self.publication_root in path.parents):
+                raise ValueError("native private state and issuer keys must remain outside consumer payload storage")
+        capability_fields = (
+            self.ceph_fs_name,
+            self.ceph_data_pool,
+            self.ceph_issuer_client,
+            self.ceph_conf_file,
+            self.ceph_keyring_file,
+        )
+        if any(capability_fields) and not all(capability_fields):
+            raise ValueError("native namespace issuer requires filesystem, pool, client, config and keyring together")
+        return self
+
+
 class Settings(DatabaseSettings):
     model_config = SettingsConfigDict(case_sensitive=False, extra="ignore", hide_input_in_errors=True)
 
@@ -165,6 +230,13 @@ class Settings(DatabaseSettings):
     palimpsest_hub_instance_base_images: dict[str, dict[str, str]] = Field(default_factory=dict)
     palimpsest_hub_instance_gpu_profiles: dict[str, InstanceGpuProfile] = Field(default_factory=dict)
     palimpsest_hub_instance_cluster_profiles: dict[str, InstanceClusterProfile] = Field(default_factory=dict)
+    # Publication is local unless an exact operator-bound CephFS mount is selected.
+    palimpsest_hub_publication_manila_share_id: str = ""
+    palimpsest_hub_publication_manila_export: str = ""
+    palimpsest_hub_publication_manila_root: str = ""
+    palimpsest_hub_publication_manila_fs_name: str = ""
+    palimpsest_hub_publication_manila_data_pool: str = ""
+    palimpsest_hub_native_profiles: dict[str, NativeProfile] = Field(default_factory=dict)
     palimpsest_hub_instance_ca_certificates: tuple[str, ...] = ()
     palimpsest_hub_package_forbidden_project_ids: tuple[str, ...] = ()
     palimpsest_hub_package_forbidden_user_ids: tuple[str, ...] = ()
@@ -191,6 +263,33 @@ class Settings(DatabaseSettings):
     os_reader_username: str = ""
     os_reader_password: SecretStr = SecretStr("")
     os_reader_user_domain_name: str = "Default"
+
+    @model_validator(mode="after")
+    def coherent_manila_publication(self) -> Settings:
+        values = (
+            self.palimpsest_hub_publication_manila_share_id,
+            self.palimpsest_hub_publication_manila_export,
+            self.palimpsest_hub_publication_manila_root,
+            self.palimpsest_hub_publication_manila_fs_name,
+            self.palimpsest_hub_publication_manila_data_pool,
+        )
+        if any(values):
+            if not all(values):
+                raise ValueError("Manila publication requires share, export, root, filesystem and data pool together")
+            if str(UUID(values[0])) != values[0]:
+                raise ValueError("Manila publication share must be a canonical UUID")
+            NativeProfile.canonical_export(values[1])
+            NativeProfile.private_absolute_path(Path(values[2]))
+            if any(re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}", name) is None for name in values[3:]):
+                raise ValueError("Manila filesystem and data pool must be exact bounded Ceph names")
+        return self
+
+    @field_validator("palimpsest_hub_native_profiles")
+    @classmethod
+    def bounded_native_profiles(cls, value: dict[str, NativeProfile]) -> dict[str, NativeProfile]:
+        if len(value) > 64 or any(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", key) is None for key in value):
+            raise ValueError("native profiles require at most64 bounded operator-selected names")
+        return value
 
     @field_validator("palimpsest_hub_registry_hosts")
     @classmethod

@@ -3061,3 +3061,29 @@ def test_hub_compatible_layers_scan_past_incomplete_first_page(tmp_path, monkeyp
         server.shutdown()
         server.server_close()
         thread.join(5)
+
+
+def test_cloud_consumer_sigterm_runs_cleanup_and_restores_handler(tmp_path):
+    import subprocess
+    import sys
+
+    marker = tmp_path / "cleanup"
+    program = """
+import os, signal, sys
+from pathlib import Path
+from palimpsest_local.cloud_cli import _interruptible_consumer
+previous = signal.getsignal(signal.SIGTERM)
+try:
+    with _interruptible_consumer(True):
+        try:
+            os.kill(os.getpid(), signal.SIGTERM)
+        finally:
+            os.kill(os.getpid(), signal.SIGTERM)
+            Path(sys.argv[1]).write_text("owned cleanup reached")
+except KeyboardInterrupt:
+    pass
+assert signal.getsignal(signal.SIGTERM) == previous
+"""
+    result = subprocess.run([sys.executable, "-c", program, str(marker)], capture_output=True, timeout=10)
+    assert result.returncode == 0, result.stderr.decode()
+    assert marker.read_text() == "owned cleanup reached"

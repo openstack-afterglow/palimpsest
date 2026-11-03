@@ -1,7 +1,7 @@
 ---
 # Palimpsest kolla role defaults
 
-palimpsest_image_tag: "0.3.10"
+palimpsest_image_tag: "0.3.11"
 palimpsest_image_namespace: "ghcr.io/openstack-afterglow"
 palimpsest_api_image: "{{ palimpsest_image_namespace }}/palimpsest-hub-api"
 palimpsest_worker_image: "{{ palimpsest_image_namespace }}/palimpsest-hub-worker"
@@ -56,6 +56,18 @@ palimpsest_instance_gpu_profiles: {}
 # Separately admitted whole-VM cluster privilege; normal CPU/GPU paths stay unchanged.
 palimpsest_instance_cluster_profiles: {}
 palimpsest_instance_ca_certificates: []
+# Explicit publisher mount and scoped native profiles; namespace isolation is required.
+# Empty values never mount a share, prepare a worker or allocate an instance.
+palimpsest_publication_manila_share_id: ""
+palimpsest_publication_manila_export: ""
+palimpsest_publication_manila_root: ""
+palimpsest_publication_manila_fs_name: ""
+palimpsest_publication_manila_data_pool: ""
+# These mounts must already exist. Kolla does not create a share or issuer key.
+palimpsest_publication_manila_host_path: ""
+palimpsest_native_operator_host_path: ""
+palimpsest_native_operator_container_path: "/var/lib/palimpsest/native-operator"
+palimpsest_native_profiles: {}
 # Optional exact hostname -> IP pins for the worker container only, e.g. when
 # the service network's DNS lacks the public Hub name. TLS still verifies the
 # certificate for the configured origin hostname.
@@ -174,11 +186,16 @@ palimpsest_hub_api_service:
   network_mode: host
   command: ["uvicorn", "palimpsest_hub.main:app", "--host", "{{ palimpsest_api_listen_address }}", "--port", "{{ palimpsest_api_listen_port | string }}", "--proxy-headers", "--no-access-log"]
   restart_policy: unless-stopped
-  volumes:
-    - "{{ palimpsest_config_dir }}/palimpsest.conf:/app/palimpsest.conf:ro"
-    - "{{ palimpsest_config_dir }}/policy:/etc/palimpsest:ro"
-    - "{{ palimpsest_hub_shared_path if palimpsest_hub_storage_mode == 'shared' else palimpsest_hub_volume }}:{{ palimpsest_hub_path }}"
-    - "kolla_logs:/var/log/kolla/"
+  volumes: >-
+    {{ [
+      palimpsest_config_dir ~ '/palimpsest.conf:/app/palimpsest.conf:ro',
+      palimpsest_config_dir ~ '/policy:/etc/palimpsest:ro',
+      (palimpsest_hub_shared_path if palimpsest_hub_storage_mode == 'shared' else palimpsest_hub_volume) ~ ':' ~ palimpsest_hub_path,
+      'kolla_logs:/var/log/kolla/'
+    ] + ([palimpsest_publication_manila_host_path ~ ':' ~ palimpsest_publication_manila_root ~ ':rw']
+         if palimpsest_publication_manila_root | length > 0 else [])
+      + ([palimpsest_native_operator_host_path ~ ':' ~ palimpsest_native_operator_container_path ~ ':rw']
+         if palimpsest_native_profiles | length > 0 else []) }}
   environment:
     PALIMPSEST_CONFIG: "/etc/palimpsest/palimpsest.conf"
     PALIMPSEST_HUB_BUILD_WORKER_KEY: "{{ palimpsest_build_worker_key if (enable_palimpsest_hub_build_worker | bool) else '' }}"
@@ -215,6 +232,12 @@ palimpsest_hub_api_service:
     PALIMPSEST_HUB_INSTANCE_GPU_PROFILES: "{{ palimpsest_instance_gpu_profiles | to_json }}"
     PALIMPSEST_HUB_INSTANCE_CLUSTER_PROFILES: "{{ palimpsest_instance_cluster_profiles | to_json }}"
     PALIMPSEST_HUB_INSTANCE_CA_CERTIFICATES: "{{ palimpsest_instance_ca_certificates | to_json }}"
+    PALIMPSEST_HUB_PUBLICATION_MANILA_SHARE_ID: "{{ palimpsest_publication_manila_share_id }}"
+    PALIMPSEST_HUB_PUBLICATION_MANILA_EXPORT: "{{ palimpsest_publication_manila_export }}"
+    PALIMPSEST_HUB_PUBLICATION_MANILA_ROOT: "{{ palimpsest_publication_manila_root }}"
+    PALIMPSEST_HUB_PUBLICATION_MANILA_FS_NAME: "{{ palimpsest_publication_manila_fs_name }}"
+    PALIMPSEST_HUB_PUBLICATION_MANILA_DATA_POOL: "{{ palimpsest_publication_manila_data_pool }}"
+    PALIMPSEST_HUB_NATIVE_PROFILES: "{{ palimpsest_native_profiles | to_json }}"
     OS_AUTH_URL: "{{ palimpsest_keystone_auth_url }}"
     OS_USERNAME: "{{ palimpsest_keystone_user }}"
     OS_PROJECT_NAME: "{{ palimpsest_service_project_name }}"

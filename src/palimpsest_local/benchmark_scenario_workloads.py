@@ -155,6 +155,14 @@ def validate_profile(config: dict) -> None:
             command = _cuda_argv(options) if scenario == "cuda" else _python_argv(scenario, options)
             if len(command) > 256 or any(len(item.encode()) > 4096 for item in command):
                 raise ArtifactValidationError("workload argv exceeds the public instance result contract")
+    if method.startswith("api-"):
+        metadata = config.get("image_metadata", {}).get(scenario)
+        if not isinstance(metadata, dict) or any(
+            not isinstance(metadata.get(key), str)
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.+-]{0,63}", metadata[key]) is None
+            for key in ("os_family", "os_version")
+        ):
+            raise ArtifactValidationError("API image requests require explicit image_metadata OS family and version")
 
 
 _PYTHON_PREAMBLE = r"""
@@ -420,6 +428,7 @@ def api_image_recipe(config):
     validate_profile(config)
     base = config["images"][config["scenario"]]
     provenance = {"base_reference": base, "guest_installation": False}
+    metadata = {key: config["image_metadata"][config["scenario"]][key] for key in ("os_family", "os_version")}
     if config["method"] == "api-cluster":
         from .benchmark_cluster_context import AIRGAP_BYTES, AIRGAP_SHA256, K3S_VERSION
 
@@ -440,7 +449,7 @@ def api_image_recipe(config):
             required_operator_image_run_network="none",
             external_dependency_context=True,
         )
-        return {"dockerfile": dockerfile}, provenance
+        return {"dockerfile": dockerfile, **metadata}, provenance
     if config["scenario"] == "tensorflow-cuda":
         lock = Path(__file__).with_name("tensorflow_delta.lock").read_text()
         dockerfile = (
@@ -466,10 +475,13 @@ def api_image_recipe(config):
             untouched_tensorflow_image=False,
             historical_lock="api-nvidia-kms6qrv4/plain-ubuntu-hotplug-20261021/srv-cinder-runtime/tensorflow-delta.lock",
         )
-        return {"dockerfile": dockerfile}, provenance
+        return {"dockerfile": dockerfile, **metadata}, provenance
     if config["method"] == "api-build":
-        return {"dockerfile": "FROM " + base + "\nCMD " + json.dumps(workload_argv(config)) + "\n"}, provenance
-    return {"reference": base}, provenance
+        return {
+            "dockerfile": "FROM " + base + "\nCMD " + json.dumps(workload_argv(config)) + "\n",
+            **metadata,
+        }, provenance
+    return {"reference": base, **metadata}, provenance
 
 
 def validate_cluster_result(config, stdout, members, observations):

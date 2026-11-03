@@ -690,16 +690,20 @@ def materialize_image_hard(
     timeout_seconds: float = 300.0,
     terminate_grace_seconds: float = 1.0,
     pack_profile: SquashFSPackProfile = SquashFSPackProfile.CANONICAL,
+    on_layer: Callable[[MaterializationResult], None] | None = None,
 ) -> OCIImageMaterializationReceipt:
     """Materialize every layer occurrence in order under one wall-clock deadline.
 
-    Results are immutable cache entries, not runtime leases.  If a later
-    occurrence fails, earlier cache entries may remain available for retry.
+    Results are immutable cache entries, not runtime leases. The synchronous
+    callback runs before the next occurrence and consumes the same deadline.
+    Callback failures propagate; earlier cache entries remain available.
     """
     if not isinstance(image, SnapshottedOCIImage):
         raise OCIHardWorkerError("oci-worker-input", "materializer image is invalid")
     if not isinstance(pack_profile, SquashFSPackProfile):
         raise OCIHardWorkerError("oci-worker-input", "materializer pack profile is invalid")
+    if on_layer is not None and not callable(on_layer):
+        raise OCIHardWorkerError("oci-worker-input", "materializer layer callback is invalid")
     for value in (timeout_seconds, terminate_grace_seconds):
         if not isinstance(value, (int, float)) or isinstance(value, bool) or not 0 < float(value) < float("inf"):
             raise OCIHardWorkerError("oci-worker-input", "materializer deadline is invalid")
@@ -724,6 +728,10 @@ def materialize_image_hard(
         if time.monotonic() - started > float(timeout_seconds):
             raise OCIHardWorkerError("oci-worker-timeout", "late image materialization success was discarded")
         results.append(result)
+        if on_layer is not None:
+            on_layer(result)
+        if time.monotonic() - started >= float(timeout_seconds):
+            raise OCIHardWorkerError("oci-worker-timeout", "image materialization deadline expired")
     return OCIImageMaterializationReceipt(
         source_snapshot_binding_digest=image.binding_digest,
         source_image_digest=image.image.digest,

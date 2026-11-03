@@ -22,7 +22,6 @@ from starlette.responses import StreamingResponse
 from palimpsest_hub.api.hub import (
     _discard_unregistered_blob,
     _factory_or_503,
-    _grant_layer_access,
     _legacy_writer,
     _locked_blob,
     _locked_blobs,
@@ -37,17 +36,36 @@ from palimpsest_hub.auth import (
     validate_token,
 )
 from palimpsest_hub.config import get_settings
-from palimpsest_hub.image_models import PalimpsestHubBuildContext, PalimpsestHubImageJob
-from palimpsest_hub.models import PalimpsestHubLayer, exact_identity
+from palimpsest_hub.image_models import LEGACY_JOB_VISIBILITY, PalimpsestHubBuildContext, PalimpsestHubImageJob
+from palimpsest_hub.models import exact_identity
 from palimpsest_hub.services import claim_recovery
 from palimpsest_hub.services.blob_references import retain_blob
 from palimpsest_hub.services.digest import compute_config_digest
-from palimpsest_hub.services.hub_store import MEDIA_TYPE_LAYER_SQUASHFS, HubStoreError
+from palimpsest_hub.services.hub_store import HubStoreError
 from palimpsest_hub.services.worker_leases import sql_mutex
 
 
 def now():
     return datetime.now(UTC)
+
+
+def _valid_os_declarations(payload):
+    # Match manifest byte/NUL bounds and the worker's nonblank requirement.
+    for name in ("os_family", "os_version"):
+        value = payload.get(name)
+        if not isinstance(value, str) or not value.strip() or "\x00" in value:
+            return False
+        try:
+            if len(value.encode("utf-8")) > 128:
+                return False
+        except UnicodeError:
+            return False
+    return True
+
+
+def _has_publication_declarations(job):
+    # Historical jobs cannot borrow an actor or invented OS declarations.
+    return isinstance(job.created_by, str) and bool(job.created_by.strip()) and _valid_os_declarations(job.request_json)
 
 
 def iso(value):
@@ -56,6 +74,9 @@ def iso(value):
 
 def serialize_job(row, *, worker=False):
     result = row.result_json if row.status == "complete" else None
+    # Pre-publication-era completed jobs are historical execution receipts, not
+    # catalog images. Do not manufacture a reusable image ID for those rows.
+    published_image_id = row.id if isinstance((result or {}).get("manifest"), dict) else None
     if result and not worker:
         runtime = result["runtime"]
         result = {
@@ -65,17 +86,23 @@ def serialize_job(row, *, worker=False):
                 "cmd": runtime["cmd"],
                 "working_dir": runtime["working_dir"],
                 "user": runtime["user"],
-                "env_names": [item.partition("=")[0] for item in runtime["env"]],
+                "env_names": [
+                    item.partition("=")[0]
+                    for item in runtime["env"]
+                    if "=" in item and item.partition("=")[0].isascii() and item.partition("=")[0].isidentifier()
+                ],
             },
         }
     value = {
         "id": row.id,
         "name": row.name,
         "kind": row.kind,
+        "visibility": row.visibility,
         "status": row.status,
         "request_id": row.request_id,
         "request_digest": row.request_digest,
         "output_digests": row.output_digests,
+        "published_image_id": published_image_id,
         "result": result,
         "error_code": row.error_code,
         "created_at": iso(row.created_at),
@@ -166,10 +193,19 @@ async def fresh_writer(token_info):
 
 
 async def admit(kind, payload, token_info):
+    if not _valid_os_declarations(payload):
+        raise HTTPException(
+            status_code=422, detail="OS declarations must be nonblank, NUL-free and at most 128 UTF-8 bytes"
+        )
     settings = get_settings()
     if not settings.palimpsest_hub_build_worker_key.get_secret_value():
         raise HTTPException(status_code=503, detail="isolated image worker is not configured")
     project = package_target_project_id(token_info)
+    payload = {**payload, "visibility": payload.get("visibility", "private")}
+    from palimpsest_hub.services.published_images import visibility_value
+
+    visibility_value(payload["visibility"])
+
     descriptor = {"kind": kind, **payload}
     fingerprint = compute_config_digest(descriptor)
     context_digest = payload.get("context_digest")
@@ -185,12 +221,20 @@ async def admit(kind, payload, token_info):
             )
         )
         if existing is not None:
-            if existing.request_digest != fingerprint:
+            if existing.created_by != token_info["user_id"] or existing.request_digest != fingerprint:
                 raise HTTPException(status_code=409, detail="request_id is already bound to another descriptor")
             return existing
         if context_digest:
-            context = await session.get(PalimpsestHubBuildContext, (project, context_digest))
-            if context is None or context.project_id != project or not store.exists(context_digest):
+            context = await session.get(
+                PalimpsestHubBuildContext,
+                {"project_id": project, "digest": context_digest, "created_by": token_info["user_id"]},
+            )
+            if (
+                context is None
+                or context.project_id != project
+                or context.created_by != token_info["user_id"]
+                or not store.exists(context_digest)
+            ):
                 raise HTTPException(status_code=404, detail="build context not found")
         count = await session.scalar(
             select(func.count())
@@ -210,6 +254,7 @@ async def admit(kind, payload, token_info):
             request_id=payload["request_id"],
             kind=kind,
             name=payload["name"],
+            visibility=payload["visibility"],
             request_digest=fingerprint,
             request_json=payload,
             context_digest=context_digest,
@@ -365,8 +410,15 @@ async def upload_context(request, token_info, digest, size):
         commit_started = False
         try:
             async with sql_mutex(_factory_or_503(), "build-api:image:project:" + project) as session:
-                context = await session.get(PalimpsestHubBuildContext, (project, digest))
-                if context is not None and (context.project_id != project or context.size_bytes != size):
+                context = await session.get(
+                    PalimpsestHubBuildContext,
+                    {"project_id": project, "digest": digest, "created_by": token_info["user_id"]},
+                )
+                if context is not None and (
+                    context.project_id != project
+                    or context.created_by != token_info["user_id"]
+                    or context.size_bytes != size
+                ):
                     raise HTTPException(status_code=409, detail="build context descriptor conflicts")
                 await fresh_writer(token_info)
                 if context is None:
@@ -418,8 +470,11 @@ async def owned(session, job_id, lease, *, live=False):
 async def context_for(session, job):
     if not job.context_digest:
         return None
-    context = await session.get(PalimpsestHubBuildContext, (job.project_id, job.context_digest))
-    if context is None or context.project_id != job.project_id:
+    context = await session.get(
+        PalimpsestHubBuildContext,
+        {"project_id": job.project_id, "digest": job.context_digest, "created_by": job.created_by},
+    )
+    if context is None or context.project_id != job.project_id or context.created_by != job.created_by:
         raise HTTPException(status_code=409, detail="build context unavailable")
     return {"digest": context.digest, "size_bytes": context.size_bytes}
 
@@ -450,8 +505,13 @@ async def claim(channel: str, sequence: int, *, recover: bool = False):
             )
         ).all()
         for job in jobs:
+            if not _has_publication_declarations(job):
+                job.status, job.error_code, job.completed_at = "error", "publication_metadata_required", now()
+                continue
             try:
                 if compute_config_digest({"kind": job.kind, **job.request_json}) != job.request_digest:
+                    raise HTTPException(status_code=409)
+                if job.request_json.get("visibility", LEGACY_JOB_VISIBILITY) != job.visibility:
                     raise HTTPException(status_code=409)
                 if job.kind == "registry":
                     normalize_registry_reference(job.request_json["reference"])
@@ -616,20 +676,6 @@ async def stage_output(job_id, lease, request: Request, digest, size):
             return job
 
 
-def compatible(row, size):
-    config = row.config_json or {}
-    return (
-        row.size_bytes == size
-        and row.kind == "squashfs"
-        and row.media_type == MEDIA_TYPE_LAYER_SQUASHFS
-        and row.arch == "x86_64"
-        and row.parent_digest is None
-        and row.chain_id is None
-        and row.disk_format is None
-        and config.get("base_image_digest") is None
-    )
-
-
 async def complete(job_id, lease, descriptor):
     store = _store_or_503()
     layers = descriptor["layers"]
@@ -642,6 +688,12 @@ async def complete(job_id, lease, descriptor):
         locked_jobs() as session,
     ):
         job = await owned(session, job_id, lease)
+        if not _has_publication_declarations(job):
+            raise HTTPException(status_code=409, detail="image publication requires proven creator and OS declarations")
+        if job.visibility != job.request_json.get("visibility", LEGACY_JOB_VISIBILITY) or (
+            compute_config_digest({"kind": job.kind, **job.request_json}) != job.request_digest
+        ):
+            raise HTTPException(status_code=409, detail="image publication visibility or request binding changed")
         if job.status == "complete":
             if job.result_json != descriptor:
                 raise HTTPException(status_code=409, detail="completed image descriptor conflicts")
@@ -654,59 +706,32 @@ async def complete(job_id, lease, descriptor):
             stages[item["digest"]]["size_bytes"] != item["size_bytes"] for item in layers
         ):
             raise HTTPException(status_code=409, detail="complete descriptor does not match staged outputs")
-        # The job stores the contextual OCI occurrence graph. Global blob rows
-        # stay parentless, so shared/repeated bytes are not assigned fake parents.
-        for item in {item["digest"]: item for item in layers}.values():
-            digest, size = item["digest"], item["size_bytes"]
-            try:
-                verified = await _run_blocking(store.inspect_file, store.blob_path(digest), max_bytes=size)
-            except HubStoreError:
-                raise HTTPException(status_code=409, detail="staged output bytes unavailable") from None
-            if verified.blob_digest != digest or verified.size_bytes != size:
-                raise HTTPException(status_code=409, detail="staged output bytes changed")
-            existing = await session.scalar(
-                select(PalimpsestHubLayer).where(PalimpsestHubLayer.blob_digest == digest).with_for_update()
-            )
-            if existing is not None:
-                if not compatible(existing, size):
-                    raise HTTPException(status_code=409, detail="output conflicts with an existing layer structure")
-                await _grant_layer_access(session, digest, {"project_id": job.project_id, "user_id": job.created_by})
-            else:
-                # Names and image runtime are NOT global blob identities. A source image's
-                # runtime is bound to this completed job, not overwritten onto shared bytes.
-                name = "oci-" + digest[7:]
-                name = name[:64]
-                config = {
-                    "name": name,
-                    "kind": "squashfs",
-                    "ubuntu_base": None,
-                    "python_version": None,
-                    "parent_digest": None,
-                    "chain_id": None,
-                    "blob_digest": digest,
-                    "disk_format": None,
-                    "arch": "x86_64",
-                    "os_variant": None,
-                    "base_image_digest": None,
-                    "instance_mode": "oci-layer",
-                }
-                session.add(
-                    PalimpsestHubLayer(
-                        blob_digest=digest,
-                        blob_md5=verified.blob_md5,
-                        size_bytes=size,
-                        media_type=MEDIA_TYPE_LAYER_SQUASHFS,
-                        arch="x86_64",
-                        config_digest=compute_config_digest(config),
-                        parent_digest=None,
-                        name=name,
-                        kind="squashfs",
-                        config_json=config,
-                        project_id=job.project_id,
-                        is_published=False,
-                        created_by=job.created_by,
-                    )
-                )
+        from palimpsest_hub.services.published_images import normalized, register_image
+
+        canonical = descriptor["manifest"]
+        canonical = normalized(canonical)
+        if (
+            canonical["os_family"] != job.request_json["os_family"]
+            or canonical["os_version"] != job.request_json["os_version"]
+            or canonical["mode"] != "oci-root"
+            or canonical["platform"] != job.request_json.get("platform", "linux/amd64")
+            or canonical["source"]["kind"] != ("registry" if job.kind == "registry" else "local")
+            or canonical["metadata"] != job.request_json.get("metadata", {})
+            or canonical["runtime"] != descriptor["runtime"]
+            or [{key: item[key] for key in ("digest", "size_bytes")} for item in canonical["layers"]] != layers
+            or any(canonical["source"].get(key) != value for key, value in descriptor["source"].items())
+        ):
+            raise HTTPException(status_code=409, detail="image manifest contradicts admitted output")
+        await register_image(
+            session,
+            store,
+            {"project_id": job.project_id, "user_id": job.created_by},
+            job.request_id,
+            job.name,
+            canonical,
+            image_id=job.id,
+            visibility=job.visibility,
+        )
         # Disk verification and SQL flush must not extend the immutable execution lease.
         await session.flush()
         if now() >= deadline(job):

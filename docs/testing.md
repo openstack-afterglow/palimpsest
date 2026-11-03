@@ -1,5 +1,36 @@
 # Fast feedback without dropping coverage
 
+## Local worktree consolidation — 2026-11-02
+
+Use separate client and Hub environments. Select `host-runtime`, CLI/source/cache
+nodes and benchmark expiry nodes; do not run `full`, Docker guest-stage1,
+privileged mounts, BuildKit or cloud/native/GPU proofs for this cleanup.
+Local loopback HTTP, temporary-file publication and owned subprocess signal
+checks do not require any OpenStack resource.
+
+New Hub regressions distinguish the guest's integer expiry from fractional SQL
+expiry, queued provider dispatch, repeated cancellation, uncertain provider
+responses and exact Cinder404 cleanup. A definite Nova no-call still retains
+prepared-volume quota and blob references. SQLite bootstrap/migration regressions
+preserve populated real models but do not qualify MariaDB or paired production
+SQL/CAS restore.
+
+The first affected-Hub run produced291passed/7skipped/6failed: the new cleanup
+helper incorrectly pinned a deleted row's incidental error code. Removed that
+pin without changing production cleanup; the six failed cases then passed.
+The first benchmark selection produced566passed/2failed; original failure output
+is retained in the private consolidation receipts. Final results below belong
+only to the exercised consolidated bytes, not earlier source or deployments.
+
+Final portable selection: **9567passed/228skipped in530.91s**. Complete separate
+Hub suite: **1426passed/7skipped in364.24s**. Subsequent reviewed pinned-DNS and
+interruption/UTF-8 corrections passed the four affected cloud/CLI/native suites:
+**620passed in9.49s**. The broad portable result precedes those last corrections;
+it is not relabelled as a rerun. Ruff lint/format passed all548Python files.
+Real loopback HTTP, immutable temporary-file publication, public CLI help/version
+and controlled parent/child TERM smoke passed. No real cloud/GPU/native/Docker
+proof ran. Historical warnings/failures remain recorded above.
+
 ## GPU and fixed API-cluster candidate — 2026-10-30
 
 Changed-node validation uses the separate root and Hub configurations, never a

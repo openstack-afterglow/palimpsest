@@ -6,11 +6,11 @@ initial configuration, upgrades, and administrator-owned Linux deployment.
 Released installations use pinned published bytes; trusted local installation below uses the actual checkout's bytes.
 
 Palimpsest Local requires Python 3.11 or newer; Hub requires Python 3.12+.
-This release source prepares0.3.10 on published0.3.9
-(`5c0fef0604ca631bef40ed505a0d02d742ccba9a`). Root/Hub metadata, module versions,
+This release source prepares0.3.11 on the published0.3.10 lineage.
+SDK publication and native execution remain separately qualified. Root/Hub metadata, module versions,
 generated locks and Kolla image defaults move together. After formal publication,
 install exact client bytes with
-`uv tool install --python 3.11 palimpsest-client==0.3.10`, or install a trusted
+`uv tool install --python 3.11 palimpsest-client==0.3.11`, or install a trusted
 local checkout with `uv tool install --force --python 3.11 .`.
 A root wheel upgrade neither deploys Hub nor qualifies actual build/run behavior.
 Git/outbound GitHub HTTPS is needed only for VCS installation.
@@ -243,13 +243,14 @@ do not authorize another rollout or native qualification.
    restore. Preserve unknown scratch/loops/jobs/Trusts; never replay them or
    delete volumes to force a clean start.
 4. **Apply reviewed schema offline.** Run the new pinned API image's
-   `palimpsest-hub-bootstrap` with approved private database/config inputs while
-   every writer remains stopped. Current bootstrap creates missing tables
-   (including `palimpsest_worker_leases`) and adds nullable build
-   `lease_expires_at` when absent; there is no migration ledger, ownership
-   backfill or legacy guest adoption. Empty-database smoke is not compatibility
-   proof for the actual existing schema. `reconfigure.yml` does **not** bootstrap;
-   `deploy`/`upgrade` do, but neither orchestrates the all-writer stop/backup.
+   `palimpsest-hub-bootstrap` with private database/config inputs while every
+   writer remains stopped.0.3.11 upgrades pre-publication image tables before
+   dependent FKs: historical jobs receive `visibility=internal`, and build
+   contexts use `(project_id,digest,created_by)` only when every original creator
+   is proven. Unknown creators stop before DDL; no owner/OS/catalog image is
+   invented. MariaDB DDL commits implicitly: recovery is paired SQL/CAS restore,
+   not transaction rollback or a blind bootstrap replay. `reconfigure` does not
+   bootstrap; `deploy`/`upgrade` do, but neither drains all old writers for you.
    Migration into a separate empty initialized database is a distinct operation;
    it copies durable rows, not blob bytes or transient maintenance leases.
 5. **Use the existing image-mode lifecycle.** After the approved operator wheel
@@ -262,6 +263,34 @@ do not authorize another rollout or native qualification.
    kolla-ansible reconfigure -i /etc/kolla/multinode --tags palimpsest \
      --limit dms-controller1 --skip-tags haproxy
    ```
+   A single-controller limit still needs facts for every inventory host used by
+   HA Sentinel address rendering. Do not override
+   `kolla_ansible_delegate_facts_hosts` with an empty list when the selected role
+   resolves cross-controller `kolla_address` values. Retain standard fact
+   delegation, or explicitly scope it to the exact reviewed Sentinel controller
+   hosts; for the three-controller placement above:
+
+   ```sh
+   -e '{"kolla_ansible_delegate_facts_hosts":["dms-controller1","dms-controller2","dms-controller3"]}'
+   ```
+
+   This changes read-only setup delegation, not the single-controller apply
+   limit. Verify the installed gather-facts play and unchanged Sentinel assertion
+   in the **same** Ansible process; separately preloading facts into a render
+   harness does not prove a limited reconfigure has them. Never disable Sentinel
+   coherence checks or change network interfaces to hide missing host facts.
+
+   A canonical reconfigure is not by itself a no-force-stop guarantee. The
+   Palimpsest role uses `community.docker.docker_container`; when replacing a
+   running image with no explicit stop timeout, its stop request permits Docker's
+   finite default grace and subsequent SIGKILL. If the approved operation forbids
+   forced running-process termination, first use a separately reviewed,
+   exact-container ordinary stop with indefinite grace, verify its normal exit
+   and prevent automatic restart, then let canonical Kolla perform replacement
+   and start. Retain healthy peer APIs and immutable before/stopped/after records;
+   an ambiguous stop is HOLD, never a second signal or forced removal. Changing
+   the module's stop timeout may also persist a different container setting and
+   is not an implicit permission to change the reviewed target configuration.
 
    Between pull and reconfigure, complete the offline schema gate above.
    The deployed aggregate does not target `palimpsest-build-worker`; use the
@@ -1538,3 +1567,117 @@ See [platform compatibility](compatibility.md), [Linux storage and
 logging](linux-storage-logging.md), [registry intake](registry-intake.md),
 [Docker/OCI registry profiles](registries.md), [BuildKit workflow](buildkit-block-workflow.md),
 and the [command workflows](cli/workflows.md) for operational details.
+
+## SDK image/native integration: operator prerequisites
+
+The `0.3.11` Hub distribution declares the exact matching client dependency.
+Checkout resolution uses `hub`'s explicit parent-path source; installed release
+bytes must match the same immutable tag and reviewed image digests. Paired wheel
+or local container checks do not establish production upgrade or native readiness.
+The canonical Docker builder includes API native helpers, SSH/OpenSSL and
+`ceph-common`; issuer provisioning and backend isolation remain operator gates.
+
+New catalog, user-owned staging, membership/visibility and native-intent tables
+are part of the0.3.11 schema. The reviewed offline bootstrap upgrades legacy
+image-job visibility as `internal` and known context creators; other populated
+ACL tables with missing owner/reuse facts require explicit reviewed mapping or
+quarantine. `create_all` alone is not an upgrade and historical jobs are not
+invented catalog images. Drain writers and prove paired SQL/CAS recovery first.
+
+All new execution profiles and namespace mounts default to inactive/unset.
+Manila publication requires the coherent settings
+`PALIMPSEST_HUB_PUBLICATION_MANILA_SHARE_ID`, `_EXPORT`, `_ROOT`, `_FS_NAME`
+and `_DATA_POOL` (the latter four share the same `PALIMPSEST_HUB_PUBLICATION_MANILA`
+prefix). The root must be the exact pre-mounted CephFS export, not a descendant
+or an ordinary directory. Kernel mount ID/device, export and explicit
+`fs`/`mds_namespace` selection are checked. Private staging remains outside it.
+Absence or mismatch never falls back to local storage for native execution.
+
+The publisher needs layout-setting permission (`p`) inside the approved share
+and write permission for its selected pool/namespaces. An ordinary Manila RW
+credential must not be assumed sufficient. New scope directories receive layout
+before payload creation; existing incompatible scope/file layouts are rejected,
+not migrated or rewritten automatically.
+
+Each `PALIMPSEST_HUB_NATIVE_PROFILES` entry binds:
+
+- exact original project/user, existing environment and private state root;
+- private original `grant_path`, share/base export and publication root;
+- optional exact `manifest_digest` (omit/null only for the explicit project-image
+  CPU grant, not an implicit wildcard);
+- `ceph_fs_name`, `ceph_data_pool`, dedicated `ceph_issuer_client`,
+  `ceph_conf_file` and `ceph_keyring_file`.
+
+Issuer files must be bounded, owned, private, no-follow regular files outside the
+exported payload tree. The manager rejects `client.admin`, bootstrap/default
+service identities and ambient credential fallback. Operator provisioning of the
+issuer's finite auth-command authority is separate from use of that authority:
+API startup never installs keys, expands caps, rotates a cluster key or prepares
+a native worker. Per-run keys allow only the selected MDS path and OSD namespace;
+global `tag cephfs data=...` consumer caps are not used.
+
+Kolla exposes `palimpsest_publication_manila_host_path` for the already-mounted
+publisher share and `palimpsest_native_operator_host_path` for private journals,
+approved grants and issuer files. The latter is mounted at
+`palimpsest_native_operator_container_path`; profile paths must use container
+locations and remain outside the exported root. These mounts must be deliberately
+pre-provisioned with the API UID/permissions; the role does not create a share or
+issuer principal. Native source/service preparation is an explicit operator
+operation. `cloud native prepare` may omit its tag only with the project-scoped
+CPU preparation grant. The original exact-image local proof path is separate.
+
+Before enabling this path, qualify: actual scope directory/file layouts,
+cross-scope path **and raw RADOS** read denial, provider-side write denial,
+actual-root identity and workload output, then exact VM/boot/port/carrier-image
+absence and Ceph auth absence. Auth removal alone does not establish immediate
+session eviction. Finish and clean each test consumer before the next; no old
+spent grant, retained VM or historical success provides a new allowance.
+
+The Kolla/container path, dedicated issuer setup, new cloud resources and native
+proof still require explicit final-source/resource approval. Current local
+source/package checks are not deployment or live multi-tenant isolation proof.
+
+Namespace-qualified **new** consumer keys do not revoke existing broad keys.
+Before activation, the operator must qualify the filesystem/data pool against
+other untrusted clients that may still have filesystem-wide data-tag or
+pool-wide read caps. If such clients exist, use an independently qualified
+dedicated backend/filesystem or obtain a separately approved owner migration;
+do not change foreign keys as a side effect of this feature. Cluster/service
+administrators and the trusted publisher/issuer remain outside consumer isolation.
+No current-cloud capability census or dedicated-backend qualification is implied
+by the local source tests.
+
+### Operator handoff for the observed backend
+
+Approved read-only observations found Ceph19.2.3/Squid, filesystem `manila`,
+data pool `manila_data` and existing worker/share resources still present. The
+existing root and original layer use the share's `fsvolumens_…` namespace, not
+the new visibility scopes. Its mount does not expose an explicit filesystem
+selection; the candidate intentionally refuses to infer the default. The exact
+worker key cannot read even its own auth record (exit13). These observations
+do not qualify layout-setting or auth-issuer authority.
+
+Before a live test, the operator must provide, without posting key material in
+chat or the repository:
+
+1. The approved backend/share identity and a pre-mounted root with an explicit
+   kernel-visible filesystem selection, plus a statement/evidence that other
+   untrusted clients cannot read its new namespaces with broader pool/tag caps.
+2. A publisher identity permitted to set the empty scope-directory layout and
+   write the intended pool/namespaces. Do not repurpose the retained worker rule
+   or rewrite existing layer layouts as an implicit migration.
+3. A dedicated issuer identity with reviewed auth-command authority, and private
+   minimal Ceph config/keyring paths owned by the executing API UID. Ordinary
+   global `ceph.conf` permissions or renaming an admin key are not qualification.
+4. The private profile/state/artifact preparation and separately approved
+   source-package, allocation/cleanup expiry and cumulative CPU/resource limits.
+   No new GPU allowance is requested by this feature.
+
+A run's key reads its selected **security scope** (personal, project, or public),
+not just one image within that scope. Do not treat it as confidentiality between
+mutually untrusted workloads sharing that audience. Neither that scope model nor
+auth-record deletion provides attestation or immediate eviction of a live client.
+
+The operator selected preparation outside this assistant's current read-only
+window. Until it is supplied and the exact deployment/test resources are
+approved, keep profiles inactive and report native warm-start acceptance pending.

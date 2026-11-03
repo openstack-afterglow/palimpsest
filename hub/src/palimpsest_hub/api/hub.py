@@ -247,6 +247,8 @@ class HubLayerMeta(BaseModel):
                 raise ValueError("cloud-image media_type 이 disk_format 과 일치하지 않습니다")
         elif self.kind == KIND_BUILDKIT_CACHE:
             raise ValueError("legacy cache registration is retired; use native package-bound cache uploads")
+        elif self.kind == "image-payload":
+            raise ValueError("image-payload is reserved for ACL-protected image publications")
         elif self.disk_format:
             raise ValueError("disk_format 은 kind='cloud-image' 에서만 사용합니다")
         elif self.media_type is not None and self.media_type != MEDIA_TYPE_LAYER_SQUASHFS:
@@ -577,10 +579,13 @@ def _visible_filter(stmt, token_info: dict):
         .exists()
     )
     return stmt.where(
-        (PalimpsestHubLayer.is_published.is_(True))
-        | (PalimpsestHubLayer.project_id.is_(None))
-        | exact_identity(PalimpsestHubLayer.project_id, project_id)
-        | shared_access
+        (PalimpsestHubLayer.kind != "image-payload")
+        & (
+            (PalimpsestHubLayer.is_published.is_(True))
+            | (PalimpsestHubLayer.project_id.is_(None))
+            | exact_identity(PalimpsestHubLayer.project_id, project_id)
+            | shared_access
+        )
     )
 
 
@@ -1182,6 +1187,7 @@ async def update_hub_layer(
                 select(PalimpsestHubLayer)
                 .where(
                     PalimpsestHubLayer.blob_digest == normalized,
+                    PalimpsestHubLayer.kind != "image-payload",
                     exact_identity(PalimpsestHubLayer.project_id, project_id),
                 )
                 .with_for_update()
@@ -2065,6 +2071,7 @@ async def delete_hub_layer(digest: str, token_info: dict = Depends(require_admin
             await session.execute(
                 select(PalimpsestHubLayer).where(
                     PalimpsestHubLayer.blob_digest == normalized,
+                    PalimpsestHubLayer.kind != "image-payload",
                     exact_identity(PalimpsestHubLayer.project_id, _required_project_id(token_info)),
                 )
             )

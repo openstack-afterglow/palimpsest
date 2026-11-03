@@ -1,9 +1,10 @@
 # GPU support boundary and implementation path
 
-GPU use is **not implemented or live-qualified in the OCI-root runtime**.
-Downloading a CUDA/PyTorch/TensorFlow image does not assign a GPU, install a
-guest kernel driver, or prove CUDA computation. CPU framework qualification
-is a separate check.
+GPU use is **not live-qualified in the OCI-root runtime**. The protected local
+stage-1 still has no GPU integration. A separately reviewed experimental Nova
+network-root candidate is described below; source and package preparation are
+not evidence that it boots or computes on a GPU. Downloading an image alone
+does not assign a device or supply a guest kernel driver.
 
 ## Why a device mount is insufficient
 
@@ -82,6 +83,114 @@ Nested Palimpsest/L2 assignment is not a prerequisite for this target. Nova
 and its compute operator own physical GPU allocation and host rebinding;
 Palimpsest must consume the assigned device inside that instance. This choice
 does not authorize compute-host changes or qualify any existing GPU instance.
+
+### Registry/CephFS acceptance selected on 2026-11-01
+
+The owner explicitly selected **the image as the Nova VM's actual root** and
+**real GPU execution**, not a conventional Ubuntu VM plus a chroot command.
+Worker acquisition must pull the unmodified pinned registry image, retain its
+original manifest/config/ordered DiffIDs, and publish each converted layer and
+its durable receipt to Manila CephFS before starting publication of the next.
+Digest-addressed payloads are shared once; image occurrence records retain order
+even when a payload is reused.
+
+The metadata-only registry check selected linux/amd64
+`docker.io/nvidia/cuda@sha256:131e238d724ee145317f10d6c8eba0d301439c6c8764b02473510e7035756e81`
+(tag `12.2.2-cudnn8-runtime-ubuntu22.04`). Its config declares ten filesystem
+DiffIDs and Entrypoint `/opt/nvidia/nvidia_entrypoint.sh`, with no Cmd field.
+Do not synthesize a default shell or confuse this original image with the earlier
+eleven-layer image containing a compiled probe. A test command can be explicitly
+supplied without modifying the original image configuration.
+
+The existing local stage-1 supports attached block-device lowers and a local
+virtio-serial control channel. It has no early CephFS mount/credential transport
+or NVIDIA admission. The conventional `cloud layer-run` path therefore cannot
+satisfy this selection. Required new evidence includes a Nova-compatible boot
+carrier/kernel/initramfs, authenticated per-instance early-network/CephFS mount,
+actual PID1/root transition onto the verified layer overlay, kernel-matched
+NVIDIA modules/userspace injection, and synchronized GPU computation. The boot
+carrier must remain separate from unchanged upstream layer payloads. Registry
+intake tests alone do not establish any of these runtime gates.
+
+The earlier GPU allowance is exhausted. This selection does not retroactively
+extend it or authorize compute-host driver changes, new storage, helper
+installation, or deletion of the held local1 worker/share. Exact source/resource
+scope and artifact identities must be established before another cloud effect.
+
+### Experimental Nova network-root candidate
+
+`nova_boot_carrier.py` constructs a separate BIOS kernel/initramfs carrier and
+exclusive writable upper. `nova_ceph_boot.py` starts as initramfs PID1, obtains a
+controller-bound plan, verifies CephFS-backed SquashFS layers, moves the overlay
+onto the actual `/`, and supervises the original image Entrypoint plus an
+explicit test command. It does not run that command in a child chroot inside a
+conventional Ubuntu guest. Existing protected local stage-1 is unchanged; this
+candidate is a trusted-workload functional proof, not its security equivalent.
+
+The owner selected authenticated credential delivery. `nova_bootstrap_service.py`
+serves only loopback mTLS; per-run restricted SSH forwarding requires the existing
+security-group policy to allow consumer-to-worker TCP22. Read-only admission
+checks that prerequisite before consuming a grant; it never adds ingress.
+Controller-enrolled client certificate, run/nonce, expiry and current
+server/project/image/network bindings gate the per-consumer CephFS RO credential.
+Boot media contains short-lived bootstrap identity, not the CephX key or OpenStack credentials. A root workload or a
+principal allowed to read its private carrier still lies inside the bootstrap
+identity trust boundary: this is not remote attestation or confidentiality from
+that principal.
+
+`nova_native_cloud.py` uses explicit source- and image-bound resource grants,
+Cinder-before-Nova allocation, durable one-shot intents, and exact-owned cleanup.
+A verified, cleaned native-root CPU case gates the GPU case. The separately
+carried CUDA probe requires a real Driver API/PTX result and actual cuBLAS SGEMM
+through libraries in the original CUDA layers; missing drivers/libraries fail.
+The pinned boot preparation uses kernel6.8.0-147 and NVIDIA580.178.04 after the
+owner explicitly approved that baseline. It neither installs a worker driver nor
+changes Nova compute-host device binding.
+
+**Controller lifetime limit:** the controller can time out and attempt ordinary
+cleanup, but its death does not autonomously delete Nova/Cinder/Glance/Manila
+resources. Only tunnel-key and enrollment expiries act independently. Cleanup
+failure retains exact IDs/HOLD state; it is not a released GPU or refunded budget.
+After the bounded cleanup tail, a new explicit cleanup-only recovery grant is
+required. Source checks, carrier construction, actual root boot, and GPU output
+must be recorded as separate verification levels.
+
+The first separately authorized native CPU run on2026-11-02 failed without an
+authenticated root result and was cleaned; no GPU run followed. Nova's create
+event and controller enrollment succeeded, but neither establishes guest boot.
+The serial console was not retained before deletion, so the early boot cause is
+unknown. Retained interpreter/inventory/module and current SG/firewall checks
+are diagnostic prerequisites only. At that first-failure checkpoint the diagnostic
+successor was source-only; later separately approved worker preparation does not
+retroactively qualify that guest. The original CPU reservation remains spent,
+and further attempts require exact authority and preserved-state reconciliation.
+
+The local recovery path now accepts only a separate approval bound to the full
+predecessor preparation, cleaned-failure and ordered resource-history digests.
+It rechecks exact absence and a stopped bootstrap unit, preserves old source/CA
+and preparation evidence, and creates new immutable generation paths. The kernel
+bundle/DNS stay fixed. Cleanup reservation reduces the guest execution window;
+it does not extend the allocation. Acknowledged failures and even numerically
+successful but over-budget CPU results remain ineligible GPU prerequisites.
+This admission repair does not identify the original boot cause or prove a GPU.
+
+The next two approved CPU reservations also failed before any new Nova server:
+05 overlapped an autonomous Python-package replacement while copying runtime
+assets;06 built a complete carrier but its Glance PUT ended with a partial-body
+error. A separately approved transport repair07 completed publication, Cinder
+and Nova creation. Terminal serial evidence proves kernel6.8.0-147, initramfs
+PID1, Ceph module loading and carrier read-only ext4 mount, then a generic
+`native_boot_failed` HOLD. This is not the image-layer overlay root or a GPU
+result. The controller separately stopped on an SDKException; its exact cause
+was not retained.07 was cleaned in226.118seconds from Nova POST to server absence;
+its image/volume/port are freshly404 and the bootstrap unit is stopped. The
+installed worker package remains045b5e35…. All three additional CPU reservations
+are spent, none refunded, and no GPU was submitted. Further consumer allocation
+requires new exact authority; retained staged inventory/TLS checks do not identify
+the guest exception or retroactively qualify the run.
+
+
+
 
 The first integration should establish a CPU-only bootable image before adding
 a guest GPU runtime. The intended artifact is a self-contained boot disk,
