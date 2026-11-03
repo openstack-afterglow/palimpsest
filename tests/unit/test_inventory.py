@@ -2521,6 +2521,7 @@ def test_remove_vm_canonical_disk_retention_never_deletes_project_or_arbitrary_f
     native = home / "selected"
     native.mkdir(parents=True, mode=0o700)
     (native / "diffdisk").write_bytes(b"native root sentinel")
+    (native / "lima.yaml").write_text("vmType: vz\n")
     monkeypatch.setenv("LIMA_HOME", str(home))
     instance = {
         "name": "selected",

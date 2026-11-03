@@ -1475,6 +1475,124 @@ def test_materialize_image_hard_stops_after_first_failed_occurrence(
     assert calls == [0, 1]
 
 
+def test_materialize_image_hard_callbacks_precede_next_occurrence_under_same_deadline(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    layout, manifest, _, _ = _direct_layout(tmp_path / "layout", layer_payloads=(b"one", b"two", b"three"))
+    image = layout.source(manifest).snapshot(_ref(), SourceCAS(tmp_path / "source-cas"))
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(oci_materializer, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    events = []
+    callbacks = []
+    remaining = []
+
+    def materialize(selected, ordinal, **kwargs):
+        events.append(("materialize", ordinal))
+        remaining.append(kwargs["timeout_seconds"])
+        return _derived_result(selected, ordinal)
+
+    def on_layer(result):
+        events.append(("callback", result.receipt.ordinal))
+        callbacks.append(result)
+        clock.now += 1
+
+    monkeypatch.setattr(oci_materializer, "materialize_layer_hard", materialize)
+    receipt = oci_materializer.materialize_image_hard(
+        image,
+        source_cas_root=tmp_path / "source-cas",
+        roots=object(),
+        store=object(),
+        packer_path=Path("/usr/bin/mksquashfs"),
+        toolchain=object(),
+        timeout_seconds=10,
+        on_layer=on_layer,
+    )
+
+    assert events == [
+        ("materialize", 0),
+        ("callback", 0),
+        ("materialize", 1),
+        ("callback", 1),
+        ("materialize", 2),
+        ("callback", 2),
+    ]
+    assert remaining == [10, 9, 8]
+    assert tuple(callbacks) == receipt.results
+    assert all(callback is result for callback, result in zip(callbacks, receipt.results, strict=True))
+
+
+@pytest.mark.parametrize("fail_ordinal", [0, 2])
+def test_materialize_image_hard_propagates_callback_failure_without_later_or_final_success(
+    tmp_path, monkeypatch, fail_ordinal
+):
+    layout, manifest, _, _ = _direct_layout(tmp_path / "layout", layer_payloads=(b"one", b"two", b"three"))
+    image = layout.source(manifest).snapshot(_ref(), SourceCAS(tmp_path / "source-cas"))
+    events = []
+    injected = RuntimeError("publication failed")
+
+    def materialize(selected, ordinal, **kwargs):
+        events.append(("materialize", ordinal))
+        return _derived_result(selected, ordinal)
+
+    def on_layer(result):
+        events.append(("callback", result.receipt.ordinal))
+        if result.receipt.ordinal == fail_ordinal:
+            raise injected
+
+    monkeypatch.setattr(oci_materializer, "materialize_layer_hard", materialize)
+    with pytest.raises(RuntimeError) as caught:
+        oci_materializer.materialize_image_hard(
+            image,
+            source_cas_root=tmp_path / "source-cas",
+            roots=object(),
+            store=object(),
+            packer_path=Path("/usr/bin/mksquashfs"),
+            toolchain=object(),
+            on_layer=on_layer,
+        )
+
+    assert caught.value is injected
+    assert events == [
+        event for ordinal in range(fail_ordinal + 1) for event in (("materialize", ordinal), ("callback", ordinal))
+    ]
+
+
+@pytest.mark.parametrize("layer_count", [1, 3])
+def test_materialize_image_hard_callback_exhaustion_blocks_next_layer_and_final_success(
+    tmp_path, monkeypatch, layer_count
+):
+    from types import SimpleNamespace
+
+    layout, manifest, _, _ = _direct_layout(tmp_path / "layout", layer_payloads=(b"layer",) * layer_count)
+    image = layout.source(manifest).snapshot(_ref(), SourceCAS(tmp_path / "source-cas"))
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(oci_materializer, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    events = []
+
+    def materialize(selected, ordinal, **kwargs):
+        events.append(("materialize", ordinal))
+        return _derived_result(selected, ordinal)
+
+    def on_layer(result):
+        events.append(("callback", result.receipt.ordinal))
+        clock.now = 10
+
+    monkeypatch.setattr(oci_materializer, "materialize_layer_hard", materialize)
+    with pytest.raises(oci_materializer.OCIHardWorkerError, match="deadline expired"):
+        oci_materializer.materialize_image_hard(
+            image,
+            source_cas_root=tmp_path / "source-cas",
+            roots=object(),
+            store=object(),
+            packer_path=Path("/usr/bin/mksquashfs"),
+            toolchain=object(),
+            timeout_seconds=10,
+            on_layer=on_layer,
+        )
+
+    assert events == [("materialize", 0), ("callback", 0)]
+
+
 def _acquisition_layout(root, *, architecture="arm64", plain=False, bad_diff_id=False, wire_payload=None):
     raw = b"platform-independent layer bytes" * 32
     wire = raw if plain else gzip.compress(raw, mtime=0)

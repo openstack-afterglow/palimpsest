@@ -18,6 +18,7 @@ import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
 from typing import BinaryIO
 
@@ -169,6 +170,20 @@ class SquashFSPackPolicy:
 
 
 DEFAULT_SQUASHFS_PACK_POLICY = SquashFSPackPolicy()
+SERVICE_IMAGE_SQUASHFS_PACK_POLICY = SquashFSPackPolicy(packer_timeout_seconds=900.0)
+
+
+class SquashFSPackProfile(StrEnum):
+    """Fixed recipe policies, independent of the enclosing attempt's deadline."""
+
+    CANONICAL = "canonical"
+    SERVICE_IMAGE = "service-image"
+
+    @property
+    def policy(self) -> SquashFSPackPolicy:
+        if self is SquashFSPackProfile.SERVICE_IMAGE:
+            return SERVICE_IMAGE_SQUASHFS_PACK_POLICY
+        return DEFAULT_SQUASHFS_PACK_POLICY
 
 
 @dataclass(frozen=True, slots=True)
@@ -1101,6 +1116,7 @@ def pack_staged_squashfs(
 __all__ = [
     "DEFAULT_SQUASHFS_PACK_POLICY",
     "DEFAULT_SQUASHFS_PACK_EXECUTION",
+    "SERVICE_IMAGE_SQUASHFS_PACK_POLICY",
     "SQUASHFS_PACK_POLICY_ID",
     "SQUASHFS_PACKER_ARGV_CONTRACT_ID",
     "SQUASHFS_BLOCK_DEVICE_ALIGNMENT",
@@ -1111,6 +1127,7 @@ __all__ = [
     "SquashFSPackError",
     "SquashFSPackExecution",
     "SquashFSPackPolicy",
+    "SquashFSPackProfile",
     "SquashFSToolchainIdentity",
     "VerifiedSquashFSToolchain",
     "discover_squashfs_toolchain",

@@ -184,6 +184,21 @@ class PalimpsestHubBuild(Base):
     __table_args__ = (Index("idx_palimpsest_builds_project_created", "project_id", "created_at"),)
 
 
+class PalimpsestWorkerClaim(Base):
+    """Bounded response receipt per private worker channel and claim protocol.
+
+    The sequence is never reset within a channel. An empty receipt also fences
+    a delayed POST after recovery; rows must not be pruned while a channel lives.
+    """
+
+    __tablename__ = "palimpsest_worker_claims"
+
+    channel: Mapped[str] = mapped_column(CHAR(36), primary_key=True)
+    protocol: Mapped[str] = mapped_column(VARCHAR(8), primary_key=True)
+    sequence: Mapped[int] = mapped_column(BIGINT, nullable=False)
+    result_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+
 class PalimpsestWorkerLease(Base):
     """Shared maintenance roles and reserved API mutexes; tokens are not credentials."""
 
@@ -312,3 +327,14 @@ class PackageCache(Base):
     __table_args__ = (
         Index("idx_package_cache_partition", "project_id", "package", "cache_scope", "platform", "builder_fingerprint"),
     )
+
+
+class RuntimeBlobReference(Base):
+    """Retained API execution inputs/results, independent of a consumer's lifecycle."""
+
+    __tablename__ = "palimpsest_runtime_blob_references"
+
+    resource_kind: Mapped[str] = mapped_column(VARCHAR(16), primary_key=True)
+    resource_id: Mapped[str] = mapped_column(VARCHAR(71), primary_key=True)
+    digest: Mapped[str] = mapped_column(VARCHAR(71), primary_key=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False, default=_now)

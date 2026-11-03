@@ -22,7 +22,8 @@ import pytest
 from fastapi import HTTPException, Response, UploadFile
 from fastapi.testclient import TestClient
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from starlette.requests import Request
 
 from palimpsest_hub import cache as hub_cache
@@ -43,6 +44,7 @@ from palimpsest_hub.models import (
     PalimpsestHubUpload,
 )
 from palimpsest_hub.services import hub_store
+from palimpsest_hub.services.blob_references import blob_referenced
 from palimpsest_hub.services.digest import compute_config_digest
 from palimpsest_hub.services.hub_bundle import (
     ANNOTATION_CONFIG_DIGEST,
@@ -696,6 +698,42 @@ async def test_import_rejects_conflicting_shared_descriptor_without_publishing(
         async with factory() as session:
             assert (await session.execute(select(PalimpsestHubLayer))).scalars().all() == []
         assert not destination.exists(root.blob_digest)
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_bundle_import_unknown_commit_outcome_retains_unregistered_cas(
+    store: LocalPathBlobStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Inject an unknown COMMIT outcome, not a real server-side delayed commit."""
+    chain = _chain(store)
+    payload = _gzip_bundle(store, chain)
+    expected_bytes = {layer.blob_digest: store.blob_path(layer.blob_digest).read_bytes() for layer in chain}
+    destination = LocalPathBlobStore(tmp_path / "unknown-bundle-destination")
+    engine, factory = await _prepared_hub(tmp_path, "unknown-bundle-commit.sqlite", destination, monkeypatch)
+    failure = OperationalError("COMMIT", {}, TimeoutError("unknown COMMIT outcome"), connection_invalidated=True)
+    commit_failed = False
+
+    async def unknown_commit(session):
+        nonlocal commit_failed
+        # Schema/setup is committed already; all imported descriptors must be prepared.
+        rows = (await session.scalars(select(PalimpsestHubLayer))).all()
+        assert {row.blob_digest for row in rows} == set(expected_bytes)
+        commit_failed = True
+        raise failure
+
+    monkeypatch.setattr(AsyncSession, "commit", unknown_commit)
+    try:
+        response = await _import_bundle_over_http(payload)
+        assert response.status_code == 500 and commit_failed
+        async with factory() as session:
+            # A fresh empty reference read does not prove the original COMMIT rolled back.
+            for expected in expected_bytes:
+                assert not await blob_referenced(session, expected)
+        for expected, original in expected_bytes.items():
+            retained = destination.blob_path(expected).read_bytes()
+            assert retained == original and _sha256(retained) == expected
     finally:
         await engine.dispose()
 
@@ -1426,6 +1464,7 @@ async def test_upload_remains_retryable_after_blob_promotion_precedes_registrati
         with pytest.raises(RuntimeError, match="interrupted"):
             await finalize_upload(session_id, descriptor, request, identity)
         assert store.upload_path(session_id).read_bytes() == payload
+        assert not store.exists(digest)
         monkeypatch.setattr(hub_api, "compute_config_digest", compute)
         registered = await finalize_upload(session_id, descriptor, request, identity)
         assert registered["blob_digest"] == digest
@@ -1433,6 +1472,53 @@ async def test_upload_remains_retryable_after_blob_promotion_precedes_registrati
         assert not store.upload_path(session_id).exists()
         async with factory() as session:
             assert await session.get(PalimpsestHubUpload, session_id) is None
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_upload_unknown_commit_outcome_retains_cas_and_verified_staging(
+    store: LocalPathBlobStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Inject an unknown COMMIT outcome, not a real server-side delayed commit."""
+    engine, factory = await _prepared_hub(tmp_path, "unknown-upload-commit.sqlite", store, monkeypatch)
+    identity = {"project_id": "alpha", "user_id": "member"}
+    payload = b"verified layer with unknown registration outcome"
+    digest = _sha256(payload)
+    session_id = (await start_upload(HubUploadStartRequest(digest=digest), identity))["session_id"]
+    store.upload_path(session_id).write_bytes(payload)
+    async with factory() as session:
+        upload = await session.get(PalimpsestHubUpload, session_id)
+        upload.received_bytes = len(payload)
+        await session.commit()
+    request = Request(
+        {
+            "type": "http",
+            "method": "PUT",
+            "path": f"/v1/uploads/{session_id}",
+            "headers": [(b"upload-offset", str(len(payload)).encode())],
+        }
+    )
+    failure = OperationalError("COMMIT", {}, TimeoutError("unknown COMMIT outcome"), connection_invalidated=True)
+
+    async def unknown_commit(session):
+        # Installed after all setup commits; this is the prepared registration transaction.
+        assert await session.scalar(select(PalimpsestHubLayer).where(PalimpsestHubLayer.blob_digest == digest))
+        raise failure
+
+    monkeypatch.setattr(AsyncSession, "commit", unknown_commit)
+    try:
+        with pytest.raises(OperationalError) as raised:
+            await finalize_upload(session_id, HubLayerMeta(name="unknown-outcome"), request, identity)
+        assert raised.value is failure
+        async with factory() as session:
+            # Absence in a new read is deliberately NOT proof the original COMMIT rolled back.
+            assert not await blob_referenced(session, digest)
+            upload = await session.get(PalimpsestHubUpload, session_id)
+            assert upload is not None and upload.received_bytes == len(payload)
+        assert store.upload_path(session_id).read_bytes() == payload
+        retained = store.blob_path(digest).read_bytes()
+        assert retained == payload and _sha256(retained) == digest
     finally:
         await engine.dispose()
 
@@ -1842,6 +1928,7 @@ async def test_private_artifact_visibility_is_exact_on_case_insensitive_legacy_s
 
     app.dependency_overrides[hub_api._legacy_inventory] = identity
     app.dependency_overrides[hub_api._legacy_download] = identity
+    app.dependency_overrides[hub_api._legacy_writer] = identity
     try:
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
             for project in ("Project-A", "Granted-A"):
@@ -1851,6 +1938,14 @@ async def test_private_artifact_visibility_is_exact_on_case_insensitive_legacy_s
                 headers = {"X-Project-Id": project}
                 assert (await client.get("/v1/layers", headers=headers)).json() == []
                 assert (await client.get(f"/v1/layers/{digest}/blob", headers=headers)).status_code == 404
+            for project in ("project-a", "Granted-A", "granted-a"):
+                rejected = await client.patch(
+                    f"/v1/layers/{digest}",
+                    headers={"X-Project-Id": project, "If-Match": _sha256(b"config")},
+                    json={"name": "not-owned"},
+                )
+                assert rejected.status_code == 404
+                assert "private" not in rejected.text
     finally:
         app.dependency_overrides.clear()
         await engine.dispose()
@@ -2219,6 +2314,358 @@ async def _upload_arch_fixture(client, payload: bytes, meta: dict, *, headers: d
         aborted = await client.delete(f"/v1/uploads/{upload}", headers=headers)
         assert aborted.status_code == 204, aborted.text
     return response
+
+
+@asynccontextmanager
+async def _layer_patch_client(tmp_path, store, monkeypatch, *, admin=False):
+    engine, factory = await _prepared_hub(tmp_path, "layer-patch.sqlite", store, monkeypatch)
+    original = {
+        "user_id": "original-human",
+        "project_id": "operator-home" if admin else "Project-A",
+        "token": "fixture-original-token",
+        "auth_methods": ["password"],
+        "is_system_admin": admin,
+        "is_package_system_admin": admin,
+        "package_actions": {"packages:inventory", "packages:read", "packages:write"},
+    }
+    if admin:
+        original.update(target_project_id="Project-A")
+        original["package_actions"].add("system:manage")
+    state = {"current": {}}
+
+    async def identity(request: Request):
+        info = {**original, "package_actions": set(original["package_actions"])}
+        if "x-project-id" in request.headers:
+            field = "target_project_id" if admin else "project_id"
+            info[field] = request.headers["x-project-id"]
+        if state.get("authenticated") is not None:
+            state["authenticated"].set()
+        return info
+
+    async def recheck(token_info):
+        return {**token_info, **state["current"]}
+
+    app.dependency_overrides[hub_api.get_package_manager_info] = identity
+    monkeypatch.setattr(hub_api, "get_package_member_info", recheck)
+    monkeypatch.setattr(hub_api, "revalidate_package_admin", recheck)
+
+    def validate(token, project):
+        if state.get("token_revoked"):
+            raise HTTPException(status_code=401, detail="Original token is no longer valid")
+        return {**original, "project_id": project}
+
+    monkeypatch.setattr(hub_api, "validate_token", validate)
+    try:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            yield client, factory, state, original
+    finally:
+        app.dependency_overrides.clear()
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_layer_patch_http_round_trip_preserves_bytes_and_structural_identity(tmp_path, store, monkeypatch):
+    async with _layer_patch_client(tmp_path, store, monkeypatch) as (client, _, _, _):
+        payload = b"exact immutable layer payload\x00\xff"
+        registered = await _upload_arch_fixture(
+            client, payload, {"name": "before", "arch": "x86_64", "ubuntu_base": "22.04"}
+        )
+        assert registered.status_code == 200, registered.text
+        digest = registered.json()["blob_digest"]
+        before = (await client.get(f"/v1/layers/{digest}")).json()
+        assert (await client.get("/v1/layers")).json()[0]["config_digest"] == before["config_digest"]
+        changes = {"name": "after", "ubuntu_base": "24.04", "python_version": "3.12", "os_variant": "server"}
+        updated = await client.patch(
+            f"/v1/layers/{digest}", headers={"If-Match": f'"{before["config_digest"]}"'}, json=changes
+        )
+        assert updated.status_code == 200, updated.text
+        body = updated.json()
+        assert all(body[field] == value for field, value in changes.items())
+        assert body["config_digest"] == compute_config_digest({**before["config_json"], **changes})
+        assert body["config_digest"] != before["config_digest"]
+        assert updated.headers["etag"] == f'"{body["config_digest"]}"'
+        for field in (
+            "blob_digest",
+            "blob_md5",
+            "size_bytes",
+            "kind",
+            "arch",
+            "disk_format",
+            "media_type",
+            "parent_digest",
+            "base_image_digest",
+            "chain_id",
+            "project_id",
+            "created_by",
+            "created_at",
+        ):
+            assert body[field] == before[field]
+        assert (await client.get(f"/v1/layers/{digest}")).json()["config_digest"] == body["config_digest"]
+        assert (await client.get("/v1/layers")).json()[0]["name"] == "after"
+        downloaded = await client.get(f"/v1/layers/{digest}/blob")
+        assert downloaded.status_code == 200 and downloaded.content == payload
+        assert _sha256(downloaded.content) == digest
+        cleared = await client.patch(
+            f"/v1/layers/{digest}",
+            headers={"If-Match": body["config_digest"]},
+            json={"ubuntu_base": None, "python_version": None, "os_variant": None},
+        )
+        assert cleared.status_code == 200, cleared.text
+        assert all(cleared.json()[field] is None for field in ("ubuntu_base", "python_version", "os_variant"))
+
+
+@pytest.mark.asyncio
+async def test_layer_patch_requires_current_config_and_serializes_competing_updates(tmp_path, store, monkeypatch):
+    async with _layer_patch_client(tmp_path, store, monkeypatch) as (client, _, _, _):
+        registered = await _upload_arch_fixture(client, b"concurrent layer", {"name": "before"})
+        assert registered.status_code == 200, registered.text
+        digest = registered.json()["blob_digest"]
+        before = (await client.get(f"/v1/layers/{digest}")).json()
+        assert (await client.patch(f"/v1/layers/{digest}", json={"name": "missing"})).status_code == 428
+        headers = {"If-Match": before["config_digest"]}
+        competing = await asyncio.gather(
+            client.patch(f"/v1/layers/{digest}", headers=headers, json={"name": "first"}),
+            client.patch(f"/v1/layers/{digest}", headers=headers, json={"name": "second"}),
+        )
+        assert sorted(response.status_code for response in competing) == [200, 412]
+        accepted = next(response.json() for response in competing if response.status_code == 200)
+        assert (await client.get(f"/v1/layers/{digest}")).json()["name"] == accepted["name"]
+        stale = await client.patch(f"/v1/layers/{digest}", headers=headers, json={"name": "stale"})
+        assert stale.status_code == 412
+        for condition in (
+            "*",
+            f'W/"{accepted["config_digest"]}"',
+            f"{before['config_digest']}, {accepted['config_digest']}",
+        ):
+            denied = await client.patch(
+                f"/v1/layers/{digest}", headers={"If-Match": condition}, json={"name": "invalid-condition"}
+            )
+            assert denied.status_code == 412
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("project", ["Project-B", "project-a", "Granted-Project"])
+async def test_layer_patch_denies_foreign_and_shared_projects_without_metadata_leak(
+    tmp_path, store, monkeypatch, project
+):
+    async with _layer_patch_client(tmp_path, store, monkeypatch) as (client, factory, _, _):
+        registered = await _upload_arch_fixture(client, b"private owner bytes", {"name": "owner-private"})
+        assert registered.status_code == 200, registered.text
+        digest = registered.json()["blob_digest"]
+        before = (await client.get(f"/v1/layers/{digest}")).json()
+        async with factory() as session:
+            session.add(PalimpsestHubLayerAccess(blob_digest=digest, project_id="Granted-Project"))
+            await session.commit()
+        headers = {"X-Project-Id": project, "If-Match": before["config_digest"]}
+        if project == "Granted-Project":
+            visible = await client.get(f"/v1/layers/{digest}", headers=headers)
+            assert visible.status_code == 200
+            assert visible.json()["project_id"] is None and visible.json()["created_by"] is None
+            assert (await client.get(f"/v1/layers/{digest}/blob", headers=headers)).content == b"private owner bytes"
+        rejected = await client.patch(f"/v1/layers/{digest}", headers=headers, json={"name": "foreign-edit"})
+        assert rejected.status_code == 404
+        assert "owner-private" not in rejected.text and "original-human" not in rejected.text
+        assert (await client.get(f"/v1/layers/{digest}")).json() == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"kind": "cloud-image"},
+        {"arch": "aarch64"},
+        {"parent_digest": "sha256:" + "a" * 64},
+        {"base_image_digest": "sha256:" + "b" * 64},
+        {"chain_id": "sha256:" + "c" * 64},
+        {"blob_digest": "sha256:" + "d" * 64},
+        {"config_digest": "sha256:" + "e" * 64},
+        {"size_bytes": 1},
+        {"blob_md5": "f" * 32},
+        {"media_type": "application/octet-stream"},
+        {"disk_format": "raw"},
+        {"project_id": "Project-B"},
+        {"config_json": {"arch": "aarch64"}},
+        {"name": None},
+        {"name": "INVALID"},
+        {"ubuntu_base": "../escape"},
+        {"python_version": "3"},
+        {"os_variant": "../escape"},
+        {"is_published": "true"},
+        {},
+    ],
+)
+async def test_layer_patch_rejects_structural_and_invalid_metadata(tmp_path, store, monkeypatch, changes):
+    async with _layer_patch_client(tmp_path, store, monkeypatch) as (client, _, _, _):
+        registered = await _upload_arch_fixture(client, b"unchanged layer", {"name": "before", "arch": "x86_64"})
+        assert registered.status_code == 200, registered.text
+        digest = registered.json()["blob_digest"]
+        before = (await client.get(f"/v1/layers/{digest}")).json()
+        rejected = await client.patch(
+            f"/v1/layers/{digest}", headers={"If-Match": before["config_digest"]}, json=changes
+        )
+        assert rejected.status_code == 422, rejected.text
+        assert (await client.get(f"/v1/layers/{digest}")).json() == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("published", [False, True])
+async def test_layer_patch_publication_requires_system_management_even_for_explicit_false(
+    tmp_path, store, monkeypatch, published
+):
+    async with _layer_patch_client(tmp_path, store, monkeypatch) as (client, _, _, _):
+        registered = await _upload_arch_fixture(client, b"member layer", {"name": "private"})
+        assert registered.status_code == 200, registered.text
+        digest = registered.json()["blob_digest"]
+        before = (await client.get(f"/v1/layers/{digest}")).json()
+        rejected = await client.patch(
+            f"/v1/layers/{digest}",
+            headers={"If-Match": before["config_digest"]},
+            json={"name": "not-committed", "is_published": published},
+        )
+        assert rejected.status_code == 403
+        assert (await client.get(f"/v1/layers/{digest}")).json() == before
+
+
+@pytest.mark.asyncio
+async def test_layer_patch_admin_publication_and_unpublication_preserve_original_target(tmp_path, store, monkeypatch):
+    async with _layer_patch_client(tmp_path, store, monkeypatch, admin=True) as (client, _, _, original):
+        snapshot = {**original, "package_actions": set(original["package_actions"])}
+        registered = await _upload_arch_fixture(client, b"admin owned layer", {"name": "private"})
+        assert registered.status_code == 200, registered.text
+        digest = registered.json()["blob_digest"]
+        before = (await client.get(f"/v1/layers/{digest}")).json()
+        for published in (True, False):
+            updated = await client.patch(
+                f"/v1/layers/{digest}",
+                headers={"If-Match": before["config_digest"]},
+                json={"is_published": published},
+            )
+            assert updated.status_code == 200, updated.text
+            expected = {key: value for key, value in before.items() if key not in {"ancestors", "chain_complete"}}
+            assert updated.json() == {**expected, "is_published": published}
+            foreign = await client.get(f"/v1/layers/{digest}", headers={"X-Project-Id": "Project-B"})
+            assert foreign.status_code == (200 if published else 404)
+            if published:
+                assert foreign.json()["project_id"] is None and foreign.json()["created_by"] is None
+                denied = await client.patch(
+                    f"/v1/layers/{digest}",
+                    headers={"X-Project-Id": "Project-B", "If-Match": before["config_digest"]},
+                    json={"is_published": False},
+                )
+                assert denied.status_code == 404
+        assert original == snapshot
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("admin", [False, True])
+@pytest.mark.parametrize("revocation", ["write", "subject", "project", "target", "system"])
+@pytest.mark.parametrize("published", [False, True])
+async def test_layer_patch_fresh_authority_revocation_rolls_back_all_changes(
+    tmp_path, store, monkeypatch, admin, revocation, published
+):
+    async with _layer_patch_client(tmp_path, store, monkeypatch, admin=admin) as (client, _, state, _):
+        registered = await _upload_arch_fixture(
+            client, b"revocation layer", {"name": "before", "is_published": admin and not published}
+        )
+        assert registered.status_code == 200, registered.text
+        digest = registered.json()["blob_digest"]
+        before = (await client.get(f"/v1/layers/{digest}")).json()
+        if revocation == "write":
+            state["current"] = {"package_actions": {"packages:read", "packages:inventory", "system:manage"}}
+        elif revocation == "subject":
+            state["current"] = {"user_id": "different-human"}
+        elif revocation == "project":
+            state["current"] = {"project_id": "different-token-scope"}
+        elif revocation == "target":
+            state["current"] = {"target_project_id": "Project-B"} if admin else {"project_id": "Project-B"}
+        else:
+            state["current"] = {"package_actions": {"packages:read", "packages:inventory", "packages:write"}}
+        changes = {
+            "name": "must-not-commit",
+            **({"is_published": published} if admin or revocation == "system" else {}),
+        }
+        rejected = await client.patch(
+            f"/v1/layers/{digest}", headers={"If-Match": before["config_digest"]}, json=changes
+        )
+        assert rejected.status_code == 403, rejected.text
+        assert (await client.get(f"/v1/layers/{digest}")).json() == before
+        assert (await client.get(f"/v1/layers/{digest}/blob")).content == b"revocation layer"
+
+
+@pytest.mark.asyncio
+async def test_layer_patch_rejects_token_revoked_while_waiting_for_blob_lock(tmp_path, store, monkeypatch):
+    async with _layer_patch_client(tmp_path, store, monkeypatch) as (client, _, state, _):
+        uploaded = await _upload_arch_fixture(client, b"revoked-token source", {"name": "before"})
+        digest = uploaded.json()["blob_digest"]
+        before = (await client.get(f"/v1/layers/{digest}")).json()
+        state["authenticated"] = asyncio.Event()
+        async with hub_api._locked_blob(store, digest):
+            pending = asyncio.create_task(
+                client.patch(
+                    f"/v1/layers/{digest}", headers={"If-Match": before["config_digest"]}, json={"name": "forbidden"}
+                )
+            )
+            await asyncio.wait_for(state["authenticated"].wait(), timeout=5)
+            state["token_revoked"] = True
+        response = await asyncio.wait_for(pending, timeout=5)
+        assert response.status_code == 401
+        assert (await client.get(f"/v1/layers/{digest}")).json() == before
+        assert (await client.get(f"/v1/layers/{digest}/blob")).content == b"revoked-token source"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reference", ["parent_digest", "base_image_digest"])
+async def test_layer_patch_rejects_referenced_descriptor_retargeting(tmp_path, store, monkeypatch, reference):
+    async with _layer_patch_client(tmp_path, store, monkeypatch, admin=True) as (client, _, _, _):
+        meta = {"name": "base", "arch": "x86_64"}
+        if reference == "base_image_digest":
+            meta.update(kind="cloud-image", disk_format="qcow2")
+        base = await _upload_arch_fixture(client, b"base layer bytes", meta)
+        assert base.status_code == 200, base.text
+        digest = base.json()["blob_digest"]
+        child = await _upload_arch_fixture(
+            client, b"dependent layer bytes", {"name": "child", "arch": "x86_64", reference: digest}
+        )
+        assert child.status_code == 200, child.text
+        child_digest = child.json()["blob_digest"]
+        before = (await client.get(f"/v1/layers/{digest}")).json()
+        child_before = (await client.get(f"/v1/layers/{child_digest}")).json()
+        denied = await client.patch(
+            f"/v1/layers/{digest}", headers={"If-Match": before["config_digest"]}, json={"os_variant": "ubuntu24.04"}
+        )
+        assert denied.status_code == 409
+        assert (await client.get(f"/v1/layers/{digest}")).json() == before
+        assert (await client.get(f"/v1/layers/{child_digest}")).json() == child_before
+        published = await client.patch(
+            f"/v1/layers/{digest}", headers={"If-Match": before["config_digest"]}, json={"is_published": True}
+        )
+        assert published.status_code == 200
+        assert published.json()["config_digest"] == before["config_digest"]
+
+
+@pytest.mark.asyncio
+async def test_retained_instance_layer_allows_display_name_but_retains_source(tmp_path, store, monkeypatch):
+    from palimpsest_hub.services.blob_references import retain_blob
+
+    async with _layer_patch_client(tmp_path, store, monkeypatch, admin=True) as (client, factory, _, actor):
+        payload = b"immutable reusable instance source"
+        uploaded = await _upload_arch_fixture(client, payload, {"name": "retained", "arch": "x86_64"})
+        digest = uploaded.json()["blob_digest"]
+        before = (await client.get(f"/v1/layers/{digest}")).json()
+        async with factory() as session:
+            await retain_blob(session, digest, "instance", "retained-deleted-instance")
+            await session.commit()
+        renamed = await client.patch(
+            f"/v1/layers/{digest}", headers={"If-Match": before["config_digest"]}, json={"name": "display-name"}
+        )
+        assert renamed.status_code == 200
+        assert renamed.json()["config_digest"] != before["config_digest"]
+        assert renamed.json()["blob_digest"] == digest and renamed.json()["arch"] == before["arch"]
+        with pytest.raises(HTTPException) as deletion:
+            await hub_api.delete_hub_layer(digest, actor)
+        assert deletion.value.status_code == 409
+        assert (await client.get(f"/v1/layers/{digest}")).json()["name"] == "display-name"
+        assert (await client.get(f"/v1/layers/{digest}/blob")).content == payload
 
 
 @pytest.mark.asyncio

@@ -53,6 +53,33 @@
     fail_msg: "Remote worker needs private absolute paths, a dedicated scratch volume, timeout 60-3600s, positive byte limit and at most 2 CPUs/6GiB/512 PIDs"
     quiet: true
 
+- name: Precheck | Validate bounded image execution policy
+  ansible.builtin.assert:
+    that:
+      - palimpsest_registry_hosts is sequence and palimpsest_registry_hosts is not string
+      - 1 <= (palimpsest_registry_hosts | length) <= 64
+      - palimpsest_registry_hosts | unique | length == palimpsest_registry_hosts | length
+      - palimpsest_image_run_network in ['none', 'default']
+      - 268435456 <= (palimpsest_image_scratch_bytes | int) <= 68719476736
+      - 1 <= (palimpsest_max_context_bytes | int) <= 1073741824
+      - 1 <= (palimpsest_max_context_expanded_bytes | int) <= 34359738368
+      - 1 <= (palimpsest_max_context_members | int) <= 250000
+      - palimpsest_image_cgroup_root is match('^/sys/fs/cgroup(?:/[^:\s]+)*$')
+      - palimpsest_image_cgroup_root is not search('(^|/)\.{1,2}(/|$)')
+    fail_msg: "Image jobs require explicit registry authorities, finite context/scratch bounds and a worker-private cgroup root"
+    quiet: true
+
+- name: Precheck | Validate each admitted registry authority
+  ansible.builtin.assert:
+    that:
+      - item is string
+      - item is match('^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?(?::[0-9]{1,5})?$')
+      - item | length <= 259
+    fail_msg: "Registry authorities must be exact lowercase hostname[:port], without URLs or credentials"
+    quiet: true
+  loop: "{{ palimpsest_registry_hosts }}"
+
+
 - name: Precheck | Validate worker hostname pins
   ansible.builtin.assert:
     that:

@@ -3,7 +3,7 @@
 
 This file is generated from `palimpsest_local.cli.build_parser`. It inventories every command, positional, option, choice, and parser default. For behavior, examples, and runtime restrictions, read [the usage guide](usage.md). Every command except raw `docker` pass-through accepts automatic `-h`/`--help`.
 
-Coverage: **125 command paths**, **333 positional/option definitions** (excluding automatic `-h/--help`).
+Coverage: **154 command paths**, **406 positional/option definitions** (excluding automatic `-h/--help`).
 
 ## `palimpsest`
 
@@ -29,10 +29,10 @@ Subcommands: `cloud`, `benchmark`, `image`, `layer`, `bundle`, `oci`, `build`, `
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest cloud [-h] {build-user-data,build,instance,launch-batch,assets,prepare-runtime,registry-worker} ...
+usage: palimpsest cloud [-h] {build-user-data,build,instance,launch-batch,assets,prepare-runtime,registry-worker,env,dockerfile-build,image-pull,layer-run,native} ...
 ```
 
-Subcommands: `build-user-data`, `build`, `instance`, `launch-batch`, `assets`, `prepare-runtime`, `registry-worker`.
+Subcommands: `build-user-data`, `build`, `instance`, `launch-batch`, `assets`, `prepare-runtime`, `registry-worker`, `env`, `dockerfile-build`, `image-pull`, `layer-run`, `native`.
 
 ### `palimpsest cloud build-user-data`
 
@@ -323,6 +323,207 @@ usage: palimpsest cloud registry-worker [-h] --cache-root CACHE_ROOT --jobs-root
 | `--assets-root` | Path | required | Existing project-bound cloud asset catalog directory beside canonical retained payloads. |
 | `request` | Path | required | Validated internal OCI acquisition request JSON; executed in the worker instance. |
 
+### `palimpsest cloud env`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest cloud env [-h] {up,status,down} ...
+```
+
+Subcommands: `up`, `status`, `down`.
+
+### `palimpsest cloud env up`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest cloud env up [-h] --cloud CLOUD --network NETWORK --external-network EXTERNAL_NETWORK --image IMAGE --worker-flavor WORKER_FLAVOR [--worker-boot-gib WORKER_BOOT_GIB] [--share-gib SHARE_GIB] [--share-type SHARE_TYPE] [--ssh-cidr SSH_CIDR] [--security-group SECURITY_GROUP] [--dns DNS] name
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `name` | string | required | environment name ([a-z0-9-], at most 31 characters) |
+| `--cloud` | string | required | clouds.yaml cloud name |
+| `--network` | string | required | tenant network name or ID for the VMs |
+| `--external-network` | string | required | network providing floating IPs |
+| `--image` | string | required | Ubuntu 24.04 cloud image name or ID |
+| `--worker-flavor` | string | required | Nova flavor for the build worker |
+| `--worker-boot-gib` | int | `80` | worker boot volume size in GiB |
+| `--share-gib` | int | `50` | Manila CephFS share size in GiB |
+| `--share-type` | string | `'cephfs'` | Manila share type with the CEPHFS protocol |
+| `--ssh-cidr` | string; repeatable | `[]` | allowed SSH source CIDR for an owned group |
+| `--security-group` | string | `None` | reuse an existing project security group (not modified or deleted) |
+| `--dns` | string; repeatable | `[]` | guest DNS server override (repeatable) |
+
+### `palimpsest cloud env status`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest cloud env status [-h] name
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `name` | string | required | environment name |
+
+### `palimpsest cloud env down`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest cloud env down [-h] name
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `name` | string | required | environment name |
+
+### `palimpsest cloud dockerfile-build`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest cloud dockerfile-build [-h] [-f FILE] -t TAG [--timeout TIMEOUT] name context
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `name` | string | required | environment name |
+| `context` | Path | required | build context directory |
+| `-f`, `--file` | Path | `None` | Dockerfile (default CONTEXT/Dockerfile) |
+| `-t`, `--tag` | string | required | image name recorded in the share and environment |
+| `--timeout` | float | `3600` | worker build deadline in seconds |
+
+### `palimpsest cloud image-pull`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest cloud image-pull [-h] -t TAG [--timeout TIMEOUT] name reference
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `name` | string | required | environment name |
+| `reference` | string | required | fully qualified registry/repository@sha256:digest |
+| `-t`, `--tag` | string | required | immutable image name in the share |
+| `--timeout` | float | `3600` | worker acquisition and conversion deadline in seconds |
+
+### `palimpsest cloud layer-run`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest cloud layer-run [-h] --flavor FLAVOR [--boot-gib BOOT_GIB] [--keep] [--no-verify] name tag command [command ...]
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `name` | string | required | environment name |
+| `tag` | string | required | image name from a previous dockerfile-build |
+| `--flavor` | string | required | Nova flavor for the consumer VM |
+| `--boot-gib` | int | `20` | consumer boot volume size in GiB |
+| `--keep` | flag | `False` | retain the consumer VM and its read-only access |
+| `--no-verify` | flag | `False` | skip in-guest SHA-256 verification of each layer |
+| `command` | string (one or more) | required | command run inside the assembled layer root |
+
+### `palimpsest cloud native`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest cloud native [-h] {prepare,run,status,cleanup} ...
+```
+
+Subcommands: `prepare`, `run`, `status`, `cleanup`.
+
+### `palimpsest cloud native prepare`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest cloud native prepare [-h] --grant GRANT --config CONFIG name [tag]
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `name` | string | required | existing project-bound cloud environment name |
+| `tag` | string (optional) | `None` | existing registry receipt for exact-image grants; omitted only for explicit project-scope preparation |
+| `--grant` | Path | required | owned mode-0600 approval JSON permitting preparation |
+| `--config` | Path | required | owned mode-0600 JSON with explicit source/service choices, bundle/runtime/probe paths and DNS |
+
+### `palimpsest cloud native run`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest cloud native run [-h] --grant GRANT --phase {cpu,gpu} --timeout TIMEOUT [--keep] name tag command [command ...]
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `name` | string | required | existing prepared cloud environment name |
+| `tag` | string | required | digest-bound original registry image receipt name |
+| `--grant` | Path | required | owned mode-0600 run+cleanup approval with cumulative budgets and exact flavor IDs |
+| `--phase` | one of: `cpu`, `gpu` | required | CPU native-root gate or subsequent GPU computation proof |
+| `--timeout` | int | required | maximum allocation/result window in seconds from Nova POST; preparation uses the outer grant expiry |
+| `--keep` | flag | `False` | retain successful idle PID1 consumer only with allow_retained approval; exact cleanup remains required |
+| `command` | string (one or more) | required | explicit OCI Cmd override, preserving original Entrypoint; use -- before workload options |
+
+### `palimpsest cloud native status`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest cloud native status [-h] [--run-id RUN_ID] name
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `name` | string | required | existing cloud environment name |
+| `--run-id` | string | `None` | exact native run ID; omit to list all retained run summaries |
+
+### `palimpsest cloud native cleanup`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest cloud native cleanup [-h] --grant GRANT [--stop-service] name [run_id]
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `name` | string | required | existing cloud environment name; worker and share are preserved |
+| `run_id` | string (optional) | `None` | exact recorded run ID; omit only for service-only --stop-service |
+| `--grant` | Path | required | original bounded cleanup-tail grant or separately approved cleanup-only recovery grant |
+| `--stop-service` | flag | `False` | also stop the exact owned bootstrap unit with TERM only, after all consumers are cleaned |
+
 ## `palimpsest benchmark`
 
 [Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
@@ -330,10 +531,10 @@ usage: palimpsest cloud registry-worker [-h] --cache-root CACHE_ROOT --jobs-root
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest benchmark [-h] {local,openstack,workflow,report,init,submit,worker,status} ...
+usage: palimpsest benchmark [-h] {local,openstack,workflow,report,station,scenario,init,submit,worker,status} ...
 ```
 
-Subcommands: `local`, `openstack`, `workflow`, `report`, `init`, `submit`, `worker`, `status`.
+Subcommands: `local`, `openstack`, `workflow`, `report`, `station`, `scenario`, `init`, `submit`, `worker`, `status`.
 
 ### `palimpsest benchmark local`
 
@@ -394,6 +595,248 @@ usage: palimpsest benchmark report [-h] --output OUTPUT results [results ...]
 | --- | --- | --- | --- |
 | `results` | Path (one or more) | required | recorded environment/workflow result JSON files |
 | `--output` | Path | required | new directory for report.md, overview.html and issues.md |
+
+### `palimpsest benchmark station`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest benchmark station [-h] {plan,create,sample,run,status,report,repair-access,disk,cleanup} ...
+```
+
+Subcommands: `plan`, `create`, `sample`, `run`, `status`, `report`, `repair-access`, `disk`, `cleanup`.
+
+### `palimpsest benchmark station plan`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest benchmark station plan [-h] --config CONFIG
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `--config` | Path | required | Explicit operator-authored cloud/worker JSON configuration; no inferred cloud resources. |
+
+### `palimpsest benchmark station create`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest benchmark station create [-h] --config CONFIG --output OUTPUT [--auth-stdin]
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `--config` | Path | required | Explicit operator-authored cloud/worker JSON configuration; no inferred cloud resources. |
+| `--output` | Path | required | Write or copy output at this path. |
+| `--auth-stdin` | flag | `False` | consume original-caller auth through private stdin, never argv/environment/files |
+
+### `palimpsest benchmark station sample`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest benchmark station sample [-h] --output OUTPUT [--auth-stdin]
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `--output` | Path | required | Write or copy output at this path. |
+| `--auth-stdin` | flag | `False` | consume original-caller auth through private stdin, never argv/environment/files |
+
+### `palimpsest benchmark station run`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest benchmark station run [-h] --output OUTPUT [--auth-stdin] [--duration-seconds DURATION_SECONDS]
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `--output` | Path | required | Write or copy output at this path. |
+| `--auth-stdin` | flag | `False` | consume original-caller auth through private stdin, never argv/environment/files |
+| `--duration-seconds` | int | `7200` | finite active-experiment window; station is retained afterward |
+
+### `palimpsest benchmark station status`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest benchmark station status [-h] --output OUTPUT
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `--output` | Path | required | Write or copy output at this path. |
+
+### `palimpsest benchmark station report`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest benchmark station report [-h] --output OUTPUT
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `--output` | Path | required | Write or copy output at this path. |
+
+### `palimpsest benchmark station repair-access`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest benchmark station repair-access [-h] --output OUTPUT [--auth-stdin]
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `--output` | Path | required | Write or copy output at this path. |
+| `--auth-stdin` | flag | `False` | consume original-caller auth through private stdin, never argv/environment/files |
+
+### `palimpsest benchmark station disk`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest benchmark station disk [-h] --output OUTPUT [--checkpoint-output CHECKPOINT_OUTPUT] [--auth-stdin]
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `--output` | Path | required | Write or copy output at this path. |
+| `--checkpoint-output` | Path | `None` | new explicitly selected disk checkpoint root; original attempts are never overwritten or replayed |
+| `--auth-stdin` | flag | `False` | consume original-caller auth through private stdin, never argv/environment/files |
+
+### `palimpsest benchmark station cleanup`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest benchmark station cleanup [-h] --output OUTPUT [--auth-stdin]
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `--output` | Path | required | Write or copy output at this path. |
+| `--auth-stdin` | flag | `False` | consume original-caller auth through private stdin, never argv/environment/files |
+
+### `palimpsest benchmark scenario`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest benchmark scenario [-h] {list,plan,run,status,report,cleanup} ...
+```
+
+Subcommands: `list`, `plan`, `run`, `status`, `report`, `cleanup`.
+
+### `palimpsest benchmark scenario list`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest benchmark scenario list [-h]
+```
+
+### `palimpsest benchmark scenario plan`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest benchmark scenario plan [-h] --config CONFIG
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `--config` | Path | required | Explicit operator-authored cloud/worker JSON configuration; no inferred cloud resources. |
+
+### `palimpsest benchmark scenario run`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest benchmark scenario run [-h] --config CONFIG --output OUTPUT [--auth-stdin]
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `--config` | Path | required | Explicit operator-authored cloud/worker JSON configuration; no inferred cloud resources. |
+| `--output` | Path | required | Write or copy output at this path. |
+| `--auth-stdin` | flag | `False` | read private original-caller v3token/v3password JSON from stdin, never argv/environment/files |
+
+### `palimpsest benchmark scenario status`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest benchmark scenario status [-h] --output OUTPUT
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `--output` | Path | required | Write or copy output at this path. |
+
+### `palimpsest benchmark scenario report`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest benchmark scenario report [-h] --output OUTPUT
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `--output` | Path | required | Write or copy output at this path. |
+
+### `palimpsest benchmark scenario cleanup`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest benchmark scenario cleanup [-h] --output OUTPUT [--auth-stdin]
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `--output` | Path | required | Write or copy output at this path. |
+| `--auth-stdin` | flag | `False` | Read bounded original-caller v3token/v3password JSON from private stdin; never command arguments, environment or evidence files. |
 
 ### `palimpsest benchmark init`
 

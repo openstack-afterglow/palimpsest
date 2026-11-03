@@ -82,6 +82,9 @@ def _child_limits(parent: int, file_limit: int) -> None:
         raise OSError(ctypes.get_errno(), "cannot restrict privilege acquisition")
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     resource.setrlimit(resource.RLIMIT_NOFILE, (256, 256))
+    hard = resource.getrlimit(resource.RLIMIT_FSIZE)[1]
+    if hard != resource.RLIM_INFINITY:
+        file_limit = min(file_limit, hard)
     resource.setrlimit(resource.RLIMIT_FSIZE, (file_limit, file_limit))
 
 
@@ -196,7 +199,7 @@ class _Executor:
     def command(self, argv: list[str], **kwargs: Any) -> bytes:
         return _command(argv, self.deadline, **kwargs)
 
-    def loop(self, path: Path, *, partitions: bool = False) -> str:
+    def loop(self, path: Path, *, partitions: bool = False, readonly: bool = True) -> str:
         device = self.command(["losetup", "--find"], capture=True).decode("ascii").strip()
         if re.fullmatch(r"/dev/loop[0-9]+", device) is None:
             raise RuntimeError("invalid free loop device")
@@ -205,7 +208,15 @@ class _Executor:
         self.loops.append(record)
         # Intent is durable BEFORE attach, closing the kill-between-attach-and-journal gap.
         _save(self.job_dir / "resources.json", {"loops": self.loops})
-        self.command(["losetup", "--read-only", *(["--partscan"] if partitions else []), device, str(path)])
+        self.command(
+            [
+                "losetup",
+                *(["--read-only"] if readonly else []),
+                *(["--partscan"] if partitions else []),
+                device,
+                str(path),
+            ]
+        )
         if _loop_identity(device) != (info.st_dev, info.st_ino):
             raise RuntimeError("loop attachment identity mismatch")
         return device

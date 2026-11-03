@@ -17,7 +17,11 @@ import pytest
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from palimpsest_hub.models import Base, PalimpsestImageExport, PalimpsestImageExportDelegation
+from palimpsest_hub.models import (
+    Base,
+    PalimpsestImageExport,
+    PalimpsestImageExportDelegation,
+)
 from palimpsest_hub.services import image_exports
 from palimpsest_hub.services.hub_store import LocalPathBlobStore
 from palimpsest_hub.services.image_exports import (
@@ -485,6 +489,36 @@ async def test_competing_maintenance_role_skips_shared_blob_removal(export_db):
         assert blob.exists()
     await image_exports.run_export_maintenance(max_age_seconds=1)
     assert not blob.exists()
+
+
+@pytest.mark.asyncio
+async def test_maintenance_preserves_retained_image_and_deleted_instance_sources(export_db):
+    from palimpsest_hub.services.blob_references import retain_blob
+
+    store = export_db.store
+    payloads = {
+        "context": b"retained Dockerfile context",
+        "image-job": b"staged OCI output",
+        "instance": b"deleted instance reusable lower",
+    }
+    retained = {}
+    for index, (kind, payload) in enumerate(payloads.items()):
+        identity = "sha256:" + hashlib.sha256(payload).hexdigest()
+        store.blobs_dir.mkdir(parents=True, exist_ok=True)
+        path = store.blob_path(identity)
+        path.write_bytes(payload)
+        os.utime(path, (1, 1))
+        async with export_db.factory() as session:
+            await retain_blob(session, identity, kind, str(index))
+            await session.commit()
+        retained[identity] = payload
+    garbage = store.blobs_dir / ("f" * 64)
+    garbage.write_bytes(b"unreferenced expired staging")
+    os.utime(garbage, (1, 1))
+    await image_exports.run_export_maintenance(max_age_seconds=1)
+    assert not garbage.exists()
+    for identity, payload in retained.items():
+        assert store.blob_path(identity).read_bytes() == payload
 
 
 @pytest.mark.asyncio

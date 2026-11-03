@@ -8,6 +8,7 @@
 !hub/src/**
 !deploy/kolla/ansible/palimpsest-build-worker.yml
 !deploy/kolla/ansible/roles/palimpsest/**
+**/.DS_Store
 **/__pycache__/
 **/*.pyc
 **/.venv

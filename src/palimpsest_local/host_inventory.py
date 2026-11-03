@@ -828,7 +828,9 @@ def _observe_libvirt() -> tuple[list[dict[str, Any]], list[dict[str, Any]], list
                         "updated_at": None,
                         "managed": False,
                         "source": "host-backend",
-                        "removal_identity": host_vm_control.libvirt_removal_identity(dom, definition=dom_tree),
+                        "removal_identity": host_vm_control.libvirt_removal_identity(
+                            dom, definition=dom_tree, backend=backend
+                        ),
                     }
                     vms.append(vm_row)
 

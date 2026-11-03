@@ -17,10 +17,12 @@ import json
 import os
 import re
 import shutil
+import stat
 import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -167,9 +169,10 @@ class HubClient:
         path: str,
         *,
         query: dict[str, Any] | None = None,
-        body: bytes | None = None,
+        body: Any = None,
         content_type: str | None = None,
         headers: dict[str, str] | None = None,
+        before_send: Callable[[], None] | None = None,
     ):
         prefix = HUB_API_PREFIX.rstrip("/")
         if not path.startswith(prefix):
@@ -189,6 +192,8 @@ class HubClient:
         if headers:
             request_headers.update(headers)
         request = urllib.request.Request(url, data=body, method=method, headers=request_headers)
+        if before_send is not None:
+            before_send()
         try:
             return self._opener.open(request, timeout=self._timeout_seconds)  # noqa: S310 - operator-controlled URL
         except urllib.error.HTTPError:
@@ -201,7 +206,9 @@ class HubClient:
             detail = exc.read(4096).decode("utf-8", errors="replace")
         except OSError:
             detail = ""
-        return HubError(self._redact(f"{method} {path} failed (HTTP {exc.code}): {detail[:300]}"))
+        error = HubError(self._redact(f"{method} {path} failed (HTTP {exc.code}): {detail[:300]}"))
+        error.http_status = exc.code
+        return error
 
     def _json_request(
         self,
@@ -210,6 +217,8 @@ class HubClient:
         payload: dict[str, Any] | None = None,
         *,
         query: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+        before_send: Callable[[], None] | None = None,
     ) -> Any:
         body = json.dumps(payload).encode("utf-8") if payload is not None else None
         try:
@@ -218,7 +227,9 @@ class HubClient:
                 path,
                 query=query,
                 body=body,
+                headers=headers,
                 content_type="application/json" if body is not None else None,
+                before_send=before_send,
             ) as resp:
                 raw = resp.read()
         except urllib.error.HTTPError as exc:
@@ -229,6 +240,318 @@ class HubClient:
             return json.loads(raw)
         except json.JSONDecodeError as exc:
             raise HubError(f"malformed JSON response from hub for {method} {path}") from exc
+
+    def push_image(
+        self, manifest: dict, blobs: dict[str, Path], *, name: str, request_id: str, visibility: str = "private"
+    ) -> dict:
+        """Transfer supplied new payloads, then ALWAYS register the full logical image.
+
+        Existing physical bytes never short-circuit graph/image registration.
+        Uploads use user-and-project staging, not legacy mutable layer descriptors.
+        """
+        from .image_manifest import normalize_manifest
+
+        if visibility not in ("private", "internal", "public"):
+            raise HubError("invalid image visibility")
+        full = normalize_manifest(manifest)
+        unique = {item["digest"]: item for item in full["layers"]}
+        self._stage_image_payloads(unique, blobs)
+        return self.publish_image(full, name=name, request_id=request_id, visibility=visibility)
+
+    def _stage_image_payloads(self, unique: dict, blobs: dict[str, Path]) -> None:
+        if set(blobs) - set(unique):
+            raise HubError("image blob mapping contains payloads absent from manifest")
+        for digest, source in blobs.items():
+            item, path = unique[digest], Path(source)
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+            with os.fdopen(os.open(path, flags), "rb") as stream:
+                before = os.fstat(stream.fileno())
+                if not stat.S_ISREG(before.st_mode) or before.st_size != item["size_bytes"]:
+                    raise HubError("image payload size/type differs from manifest")
+                import hashlib
+
+                sha = hashlib.sha256()
+                while chunk := stream.read(_DOWNLOAD_CHUNK):
+                    sha.update(chunk)
+                if "sha256:" + sha.hexdigest() != digest:
+                    raise HubError("image payload digest differs from manifest")
+                stream.seek(0)
+                route = f"/published-images/blobs/{digest}"
+                try:
+                    with self._open(
+                        "PUT",
+                        route,
+                        body=stream,
+                        content_type="application/octet-stream",
+                        headers={"Content-Length": str(before.st_size), "X-Content-SHA256": digest},
+                    ) as response:
+                        response.read()
+                except urllib.error.HTTPError as exc:
+                    raise self._wrap_http_error(exc, "PUT", route) from exc
+                after = os.fstat(stream.fileno())
+                if any(
+                    getattr(before, field) != getattr(after, field)
+                    for field in ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+                ):
+                    raise HubError("image payload changed during upload")
+
+    def publish_image(self, manifest: dict, *, name: str, request_id: str, visibility: str = "private") -> dict:
+        """Register exact user-staged or authorized reusable payload references."""
+        from .image_manifest import normalize_manifest
+
+        if visibility not in ("private", "internal", "public"):
+            raise HubError("invalid image visibility")
+        return self._json_request(
+            "POST",
+            "/published-images",
+            {
+                "manifest": normalize_manifest(manifest),
+                "name": name,
+                "request_id": request_id,
+                "visibility": visibility,
+            },
+        )
+
+    def push_image_extension(
+        self,
+        base_image_id: str,
+        layers: list[dict],
+        blobs: dict[str, Path],
+        *,
+        name: str,
+        request_id: str,
+        visibility: str = "private",
+        metadata: dict | None = None,
+    ) -> dict:
+        """Extend the Hub's full base without exposing its private runtime values."""
+        if visibility not in ("private", "internal", "public"):
+            raise HubError("invalid image visibility")
+        if not isinstance(layers, list) or not 1 <= len(layers) <= 128:
+            raise HubError("extension requires one to 128 new layers")
+        clean, unique = [], {}
+        for layer in layers:
+            if not isinstance(layer, dict) or set(layer) - {"digest", "size_bytes", "source", "id", "parent_id"}:
+                raise HubError("invalid extension layer fields")
+            digest = normalize_digest(layer.get("digest", ""))
+            size = layer.get("size_bytes")
+            if digest is None or type(size) is not int or size < 1:
+                raise HubError("invalid extension payload descriptor")
+            if digest in unique and unique[digest]["size_bytes"] != size:
+                raise HubError("extension payload sizes conflict")
+            item = {"digest": digest, "size_bytes": size}
+            if "source" in layer:
+                item["source"] = layer["source"]
+            clean.append(item)
+            unique[digest] = item
+        self._stage_image_payloads(unique, blobs)
+        return self._json_request(
+            "POST",
+            "/published-images/extensions",
+            {
+                "base_image_id": base_image_id,
+                "layers": clean,
+                "name": name,
+                "request_id": request_id,
+                "visibility": visibility,
+                "metadata": metadata,
+            },
+        )
+
+    def list_published_images(self, *, limit: int = 100, offset: int = 0) -> dict:
+        return self._json_request("GET", "/published-images", query={"limit": limit, "offset": offset})
+
+    def get_published_image(self, image_id: str) -> dict:
+        return self._json_request("GET", "/published-images/" + urllib.parse.quote(image_id, safe=""))
+
+    def get_layer_node(self, node_id: str, *, project_id: str | None = None, image_id: str | None = None) -> dict:
+        return self._json_request(
+            "GET",
+            "/layer-nodes/" + urllib.parse.quote(node_id, safe=""),
+            query={"project_id": project_id, "image_id": image_id},
+        )
+
+    def get_layer_children(
+        self,
+        node_id: str,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        project_id: str | None = None,
+        image_id: str | None = None,
+    ) -> dict:
+        return self._json_request(
+            "GET",
+            "/layer-nodes/" + urllib.parse.quote(node_id, safe="") + "/children",
+            query={"limit": limit, "offset": offset, "project_id": project_id, "image_id": image_id},
+        )
+
+    def get_layer_ancestors(self, node_id: str, *, project_id: str | None = None, image_id: str | None = None) -> dict:
+        return self._json_request(
+            "GET",
+            "/layer-nodes/" + urllib.parse.quote(node_id, safe="") + "/ancestors",
+            query={"project_id": project_id, "image_id": image_id},
+        )
+
+    def create_native_instance(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Run a finite native workload through an explicitly approved server profile."""
+        return self._json_request("POST", "/native-instances", request)
+
+    def list_native_instances(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        return self._json_request("GET", "/native-instances", query={"limit": limit})
+
+    def get_native_instance(self, instance_id: str) -> dict[str, Any]:
+        return self._json_request("GET", "/native-instances/" + urllib.parse.quote(instance_id, safe=""))
+
+    def delete_native_instance(self, instance_id: str) -> dict[str, Any]:
+        """Delete the exact server-bound native run under its original cleanup authority."""
+        return self._json_request("DELETE", "/native-instances/" + urllib.parse.quote(instance_id, safe=""))
+
+    def update_layer(self, digest: str, changes: dict[str, Any], *, config_digest: str) -> dict[str, Any]:
+        """Conditionally update descriptor metadata, never overwrite digest-addressed bytes."""
+        normalized = normalize_digest(digest)
+        expected = normalize_digest(config_digest)
+        if normalized is None or expected is None:
+            raise HubError("layer and config identities must be SHA-256 digests")
+        return self._json_request("PATCH", f"/layers/{normalized}", changes, headers={"If-Match": f'"{expected}"'})
+
+    def upload_build_context(
+        self, source: Path, *, max_bytes: int = 16 * 1024 * 1024, before_send=None
+    ) -> dict[str, Any]:
+        """Stream one descriptor-bound tar; larger operator grants are explicit."""
+        import hashlib
+
+        if type(max_bytes) is not int or not 1 <= max_bytes <= 1024**3:
+            raise HubError("build context maximum must be 1..1073741824 bytes")
+        fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as stream:
+            original = os.fstat(stream.fileno())
+            if (
+                not stat.S_ISREG(original.st_mode)
+                or original.st_uid != os.geteuid()
+                or original.st_nlink != 1
+                or original.st_mode & 0o022
+            ):
+                raise HubError("build context must be a single-link owned regular file without external writers")
+            if not 1 <= original.st_size <= max_bytes:
+                raise HubError(f"build context must contain 1..{max_bytes} bytes")
+
+            def unchanged():
+                current = os.fstat(stream.fileno())
+                if any(
+                    getattr(current, field) != getattr(original, field)
+                    for field in (
+                        "st_dev",
+                        "st_ino",
+                        "st_size",
+                        "st_mtime_ns",
+                        "st_ctime_ns",
+                        "st_nlink",
+                        "st_uid",
+                        "st_mode",
+                    )
+                ):
+                    raise HubError("build context changed during its original upload; never replay")
+
+            digest = hashlib.sha256()
+            remaining = original.st_size
+            while remaining:
+                unchanged()
+                chunk = stream.read(min(remaining, 1024**2))
+                if not chunk:
+                    raise HubError("build context truncated before upload")
+                digest.update(chunk)
+                remaining -= len(chunk)
+            unchanged()
+            expected = digest.hexdigest()
+            stream.seek(0)
+
+            class Payload:
+                def __init__(self):
+                    self.remaining = original.st_size
+                    self.digest = hashlib.sha256()
+
+                def read(self, size=1024**2):
+                    unchanged()
+                    if self.remaining == 0:
+                        if self.digest.hexdigest() != expected:
+                            raise HubError("build context bytes changed during upload; never replay")
+                        return b""
+                    chunk = stream.read(min(self.remaining, 1024**2, size if size > 0 else 1024**2))
+                    if not chunk:
+                        raise HubError("build context truncated during upload; never replay")
+                    self.remaining -= len(chunk)
+                    self.digest.update(chunk)
+                    return chunk
+
+            payload = Payload()
+            try:
+                if before_send is not None:
+                    before_send()
+                with self._open(
+                    "POST",
+                    "/build-contexts",
+                    body=payload,
+                    content_type="application/x-tar",
+                    headers={"X-Content-SHA256": "sha256:" + expected, "Content-Length": str(original.st_size)},
+                ) as response:
+                    unchanged()
+                    if payload.remaining or payload.digest.hexdigest() != expected:
+                        raise HubError("build context transport did not consume the exact original bytes; never replay")
+                    raw = response.read(1024**2 + 1)
+                    if len(raw) > 1024**2:
+                        raise HubError("build context response exceeds bounded JSON size")
+                    receipt = json.loads(raw)
+                    if (
+                        not isinstance(receipt, dict)
+                        or receipt.get("digest") != "sha256:" + expected
+                        or receipt.get("size_bytes") != original.st_size
+                    ):
+                        raise HubError("build context receipt differs from original upload; never replay")
+                    return receipt
+            except urllib.error.HTTPError as exc:
+                raise self._wrap_http_error(exc, "POST", "/build-contexts") from exc
+
+    def import_registry_image(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Submit one request_id-bound server import; never execute or retry it locally."""
+        return self._json_request("POST", "/registry-imports", request)
+
+    def build_dockerfile(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Submit Dockerfile text and an optional previously uploaded context digest."""
+        return self._json_request("POST", "/dockerfile-builds", request)
+
+    def list_image_jobs(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        return self._json_request("GET", "/image-jobs", query={"limit": limit})
+
+    def get_image_job(self, job_id: str) -> dict[str, Any]:
+        return self._json_request("GET", "/image-jobs/" + urllib.parse.quote(job_id, safe=""))
+
+    def create_instance(
+        self, request: dict[str, Any], *, before_send: Callable[[], None] | None = None
+    ) -> dict[str, Any]:
+        """Create through the Hub API; optionally guard immediately before transport."""
+        return self._json_request("POST", "/instances", request, before_send=before_send)
+
+    def list_instances(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        return self._json_request("GET", "/instances", query={"limit": limit})
+
+    def get_instance(self, instance_id: str) -> dict[str, Any]:
+        return self._json_request("GET", "/instances/" + urllib.parse.quote(instance_id, safe=""))
+
+    def advance_instance(
+        self, instance_id: str, *, operation: str, request_id: str, boot_volume_id: str
+    ) -> dict[str, Any]:
+        """Submit one explicit bound provider effect; never transparently retry it."""
+        return self._json_request(
+            "POST",
+            "/instances/" + urllib.parse.quote(instance_id, safe="") + "/advance",
+            {"operation": operation, "request_id": request_id, "boot_volume_id": boot_volume_id},
+        )
+
+    def stop_instance(self, instance_id: str) -> dict[str, Any]:
+        return self._json_request("POST", "/instances/" + urllib.parse.quote(instance_id, safe="") + "/stop")
+
+    def delete_instance(self, instance_id: str) -> dict[str, Any]:
+        return self._json_request("DELETE", "/instances/" + urllib.parse.quote(instance_id, safe=""))
 
     # -- search / read ----------------------------------------------------------
 

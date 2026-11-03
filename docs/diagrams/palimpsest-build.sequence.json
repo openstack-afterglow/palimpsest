@@ -1,0 +1,40 @@
+{
+  "schema_version":1,
+  "diagram_type":"sequence",
+"meta": {"title": "클라우드 목표 · 빌드 발행에서 RO 마운트까지", "viewBox": [1450, 610], "column_fit": "spread", "quality_profile": "showcase"},
+  "participants":[
+    {"id":"target-user","type":"external","label":"클라이언트 · VM 밖"},
+    {"id":"target-orchestrator","type":"backend","label":"Hub API · 외부 제어"},
+    {"id":"target-db","type":"database","label":"Hub DB · 메타데이터"},
+    {"id":"target-build-worker","type":"backend","label":"별도 빌드 worker"},
+    {"id":"target-cephfs","type":"database","label":"Manila · CephFS 바이트"},
+    {"id":"target-runtime-guest","type":"backend","label":"VM 안 · mount helper"},
+    {"id":"target-workload-view","type":"backend","label":"VM 안 · 워크로드"}
+  ],
+  "segments":[
+{"from": 150, "to": 307, "label": "빌드 · 새 digest 발행"},
+{"from": 313, "to": 447, "label": "외부에서 선택 · 접근 · VM 제어"},
+{"from": 453, "to": 529, "label": "게스트는 마운트 · 실행만"}
+  ],
+  "messages":[
+{"id": "target-build-request", "from": "target-user", "to": "target-orchestrator", "y": 160, "label": "빌드 요청", "variant": "emphasis"},
+{"id": "target-job-record", "from": "target-orchestrator", "to": "target-db", "y": 188, "label": "job · 입력 · provenance 기록"},
+{"id": "target-worker-dispatch", "from": "target-orchestrator", "to": "target-build-worker", "y": 216, "label": "별도 worker에서 획득 · 빌드 · 변환 · 검증"},
+{"id": "target-payload-publication", "from": "target-build-worker", "to": "target-cephfs", "y": 244, "label": "RW: staging → 새 digest 불변 발행", "variant": "emphasis"},
+{"id": "target-result-finalize", "from": "target-build-worker", "to": "target-orchestrator", "y": 272, "label": "검증된 digest · size · 결과", "variant": "return"},
+{"id": "target-metadata-finalize", "from": "target-orchestrator", "to": "target-db", "y": 300, "label": "레이어 순서 · runtime · 결과 확정"},
+{"id": "target-run-request", "from": "target-user", "to": "target-orchestrator", "y": 328, "label": "이 레이어들로 실행 요청", "variant": "emphasis"},
+{"id": "target-resolve-metadata", "from": "target-orchestrator", "to": "target-db", "y": 356, "label": "권한 · digest · 순서 · lease 확인"},
+{"id": "target-authorize-share", "from": "target-orchestrator", "to": "target-cephfs", "y": 384, "label": "운영으로 확정할 공유 경로·RO 접근권한", "variant": "security"},
+{"id": "target-nova-lifecycle", "from": "target-orchestrator", "to": "target-runtime-guest", "y": 412, "label": "Nova 수명주기 · 확정 mount 명세 전달"},
+{"id": "target-readonly-share", "from": "target-runtime-guest", "to": "target-cephfs", "y": 440, "label": "지정 공유를 RO로 읽기", "variant": "security"},
+{"id": "target-mount-lower", "from": "target-runtime-guest", "to": "target-workload-view", "y": 468, "label": "SquashFS RO lower"},
+{"id": "target-private-overlay", "from": "target-runtime-guest", "to": "target-workload-view", "y": 496, "label": "개인 upper/work · 실행"},
+{"id": "target-execute-workload", "from": "target-runtime-guest", "to": "target-orchestrator", "y": 524, "label": "실행 상태를 외부에서 관찰", "variant": "return"}
+  ],
+  "cards":[
+    {"dot":"emerald","title":"목표 계약 · 운영 경로 미확정","items":["Manila export 프로토콜·자격증명은 미선정","RO 권한·격리·해제/회수는 전환 전 검증 필요"]},
+    {"dot":"cyan","title":"게스트 책임은 최소화","items":["Palimpsest CLI · 획득 · 빌드 · 제어면 없음","공유 CephFS에 upper/work나 copy-up을 쓰지 않음"]},
+    {"dot":"amber","title":"그림은 실행 증거가 아님","items":["활성 구현 게스트의 HTTPS 다운로드 경로와 별개","Cinder 과거 측정은 이 목표를 검증하지 않음"]}
+  ]
+}

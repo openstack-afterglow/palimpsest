@@ -107,7 +107,7 @@ async def test_api_single_flight_uses_sql_not_shared_cas_or_worker_identity(owne
     async def claim_from(store):
         token = h.selected.set(store)
         try:
-            return await builds.claim_build()
+            return await builds.claim_build(str(uuid4()), 1)
         finally:
             h.selected.reset(token)
 
@@ -135,7 +135,7 @@ async def test_api_single_flight_uses_sql_not_shared_cas_or_worker_identity(owne
 async def test_persisted_deadline_survives_api_timeout_changes_without_replay(ownership):
     h = ownership
     job_id = await h.enqueue()
-    claim = await builds.claim_build()
+    claim = await builds.claim_build(str(uuid4()), 1)
     async with h.factory() as session:
         original = await session.get(PalimpsestHubBuild, job_id)
         deadline = original.lease_expires_at.replace(tzinfo=UTC)
@@ -147,18 +147,18 @@ async def test_persisted_deadline_survives_api_timeout_changes_without_replay(ow
     async with h.factory() as session, session.begin():
         row = await session.get(PalimpsestHubBuild, job_id)
         row.lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
-    assert await builds.claim_build() is None
+    assert await builds.claim_build(str(uuid4()), 1) is None
     status = await builds.worker_status(job_id, claim["lease"])
     assert status.status == "error" and status.error_code == "worker_interrupted"
     assert status.lease_owner == claim["lease"] and status.output_digest is None
-    assert await builds.claim_build() is None
+    assert await builds.claim_build(str(uuid4()), 1) is None
 
 
 @pytest.mark.asyncio
 async def test_publication_is_private_and_old_nonce_has_no_effect(ownership):
     h = ownership
     await h.enqueue("beta")
-    claim = await builds.claim_build()
+    claim = await builds.claim_build(str(uuid4()), 1)
     stale = {**claim, "lease": str(uuid4())}
     payload = b"hsqsprivate-publication"
     with pytest.raises(HTTPException) as error:
@@ -181,7 +181,7 @@ async def test_publication_is_private_and_old_nonce_has_no_effect(ownership):
 async def test_cancelled_publication_drains_before_disjoint_api_can_claim(ownership, monkeypatch):
     h = ownership
     await h.enqueue()
-    claim = await builds.claim_build()
+    claim = await builds.claim_build(str(uuid4()), 1)
     started, release, drained = threading.Event(), threading.Event(), threading.Event()
     original = h.stores[0].publish_verified
 
@@ -200,7 +200,7 @@ async def test_cancelled_publication_drains_before_disjoint_api_can_claim(owners
     async def claim_from_peer():
         token = h.selected.set(h.stores[1])
         try:
-            return await builds.claim_build()
+            return await builds.claim_build(str(uuid4()), 1)
         finally:
             h.selected.reset(token)
 
@@ -230,3 +230,75 @@ async def test_api_mutex_namespace_cannot_be_adopted_as_a_worker_role(ownership)
     with pytest.raises(ValueError, match="build-api namespace"):
         async with sql_mutex(ownership.factory, "export-maintenance"):
             pytest.fail("API mutex adopted export role")
+
+
+@pytest.mark.asyncio
+async def test_recovery_on_disjoint_api_waits_for_original_claim_sql_commit(ownership, monkeypatch):
+    h = ownership
+    job_id = await h.enqueue()
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = builds._inputs
+
+    async def delayed(*args):
+        entered.set()
+        await release.wait()
+        return await original(*args)
+
+    monkeypatch.setattr(builds, "_inputs", delayed)
+    channel = str(uuid4())
+    claiming = asyncio.create_task(builds.claim_build(channel, 1))
+
+    async def recover_on_peer():
+        token = h.selected.set(h.stores[1])
+        try:
+            return await builds.claim_build(channel, 1, recover=True)
+        finally:
+            h.selected.reset(token)
+
+    recovery = None
+    try:
+        await asyncio.wait_for(entered.wait(), 3)
+        recovery = asyncio.create_task(recover_on_peer())
+        await asyncio.sleep(0.05)
+        assert not recovery.done()
+        release.set()
+        accepted, recovered = await asyncio.gather(claiming, recovery)
+        assert accepted["id"] == job_id
+        assert recovered == {
+            "channel": channel,
+            "sequence": 1,
+            "protocol": "recipe",
+            "claim": {"id": job_id, "lease": accepted["lease"]},
+        }
+    finally:
+        release.set()
+        await asyncio.gather(claiming, *([recovery] if recovery else []), return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_claim_transaction_cannot_leave_receipt_or_unknown_attempt(ownership, monkeypatch):
+    h = ownership
+    job_id = await h.enqueue()
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def paused(*args):
+        entered.set()
+        await release.wait()
+
+    monkeypatch.setattr(builds, "_inputs", paused)
+    channel = str(uuid4())
+    claiming = asyncio.create_task(builds.claim_build(channel, 1))
+    try:
+        await asyncio.wait_for(entered.wait(), 3)
+        claiming.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await claiming
+        recovered = await builds.claim_build(channel, 1, recover=True)
+        assert recovered["claim"] is None
+        assert await builds.claim_build(channel, 1) is None
+        async with h.factory() as session:
+            job = await session.get(PalimpsestHubBuild, job_id)
+            assert job.status == "queued" and job.lease_owner is None
+    finally:
+        release.set()
+        await asyncio.gather(claiming, return_exceptions=True)

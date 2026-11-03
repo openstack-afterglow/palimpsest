@@ -81,6 +81,66 @@ def test_workflow_selects_environment_runner_from_authoritative_mode(tmp_path, m
     assert result["cases"] == []
 
 
+@pytest.mark.parametrize("station_status", ["success", "partial"])
+def test_workflow_reuses_hourly_context_without_standalone_probes(tmp_path, monkeypatch, station_status):
+    from palimpsest_local import benchmark_openstack, benchmark_scenarios, benchmark_workflow, environment_benchmark
+
+    config = _config(tmp_path)
+    del config["environment"]
+    context = {
+        "measurement_root": str(tmp_path / "station"),
+        "station_id": "station-one",
+        "project_id": "project-one",
+        "data_volume_id": "data-one",
+    }
+    config["environment_context"] = context
+    reference = {"attempt_id": "original-hour", "finished_unix_seconds": 1234}
+    environment = {"status": station_status, "contextual_only": True, "disk": {"status": "success"}}
+    observed = []
+
+    def cached(request):
+        observed.append(request)
+        return environment, {"status": station_status, "sample_reference": reference}
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("hourly workflow cannot launch standalone environment probes")
+
+    def command(argv, output, label, timeout):
+        if label.endswith("-proof"):
+            (output / (label + ".stdout")).write_text(
+                json.dumps({"status": "success", "method": label.removesuffix("-proof"), "job_id": config["job_id"]})
+            )
+        return {"elapsed_seconds": 1.0}
+
+    monkeypatch.setattr(benchmark_scenarios, "_environment_context", cached)
+    monkeypatch.setattr(environment_benchmark, "run_environment", forbidden)
+    monkeypatch.setattr(benchmark_openstack, "run_openstack_environment", forbidden)
+    monkeypatch.setattr(benchmark_workflow, "_run", command)
+    result = run_workflow(config, tmp_path / "evidence", environment_runner=forbidden)
+    assert observed == [{"environment_context": context, "project_id": "project-one"}]
+    assert result["status"] == "success"
+    assert result["environment"] == environment
+    assert result["environment_reference"] == reference
+    assert len(result["cases"]) == len(METHODS)
+    assert any(issue.get("category") == "station-context-partial" for issue in result["issues"]) == (
+        station_status == "partial"
+    )
+
+
+def test_workflow_rejects_mixed_hourly_and_standalone_calibration_before_effects(tmp_path):
+    config = _config(tmp_path)
+    config["environment_context"] = {
+        "measurement_root": str(tmp_path / "station"),
+        "station_id": "station-one",
+        "project_id": "project-one",
+        "data_volume_id": "data-one",
+    }
+    output = tmp_path / "evidence"
+    with pytest.raises(ArtifactValidationError, match="never both"):
+        run_workflow(config, output)
+    assert not output.exists()
+
+
 def test_failed_case_is_not_a_timing_and_next_command_is_not_started(tmp_path):
     config = _config(tmp_path)
     next_target = tmp_path / "next"

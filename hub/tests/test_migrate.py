@@ -7,30 +7,17 @@ import pytest
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from palimpsest_hub.image_models import PalimpsestHubBuildContext, PalimpsestHubImageJob
+from palimpsest_hub.instance_models import PalimpsestHubInstance
 from palimpsest_hub.migrate import MigrationError, migrate
 from palimpsest_hub.models import (
     Base,
     PalimpsestHubBuild,
     PalimpsestImageExport,
     PalimpsestImageExportDelegation,
+    PalimpsestWorkerClaim,
     PalimpsestWorkerLease,
-)
-
-_TABLES = (
-    "palimpsest_hub_layers",
-    "palimpsest_hub_layer_access",
-    "palimpsest_hub_uploads",
-    "palimpsest_image_exports",
-    "palimpsest_image_export_delegations",
-    "palimpsest_hub_builds",
-    "palimpsest_package_namespaces",
-    "palimpsest_packages",
-    "palimpsest_package_keys",
-    "palimpsest_package_versions",
-    "palimpsest_package_blob_references",
-    "palimpsest_package_tags",
-    "palimpsest_package_uploads",
-    "palimpsest_package_caches",
+    RuntimeBlobReference,
 )
 
 
@@ -38,50 +25,70 @@ async def create_database(url: str, *, with_rows: bool) -> None:
     engine = create_async_engine(url)
     try:
         async with engine.begin() as connection:
-            for index, table in enumerate(_TABLES, start=1):
-                await connection.execute(text(f"CREATE TABLE {table} (id TEXT PRIMARY KEY, value TEXT NOT NULL)"))
-                if with_rows:
-                    await connection.execute(
-                        text(f"INSERT INTO {table} (id, value) VALUES (:id, :value)"),
-                        {"id": str(index), "value": table},
+            await connection.run_sync(Base.metadata.create_all)
+            if with_rows:
+                await connection.execute(
+                    Base.metadata.tables["palimpsest_hub_layers"]
+                    .insert()
+                    .values(
+                        id=1,
+                        blob_digest="sha256:" + "a" * 64,
+                        size_bytes=4096,
+                        media_type="application/vnd.afterglow.palimpsest.layer.squashfs.v1",
+                        config_digest="sha256:" + "b" * 64,
+                        name="legacy-layer",
+                        kind="squashfs",
+                        config_json={"instance_mode": "oci-layer"},
+                        project_id="c" * 32,
+                        is_published=False,
                     )
+                )
     finally:
         await engine.dispose()
 
 
 @pytest.mark.asyncio
-async def test_migrate_copies_each_hub_table(tmp_path: Path):
-    source_url = f"sqlite+aiosqlite:///{tmp_path / 'source.sqlite'}"
-    destination_url = f"sqlite+aiosqlite:///{tmp_path / 'destination.sqlite'}"
-    await create_database(source_url, with_rows=True)
-    await create_database(destination_url, with_rows=False)
-
-    copied = await migrate(source_url, destination_url)
-
-    assert copied == {table: 1 for table in _TABLES}
-    destination = create_async_engine(destination_url)
-    try:
-        async with destination.connect() as connection:
-            for table in _TABLES:
-                assert (await connection.scalar(text(f"SELECT value FROM {table}"))) == table
-    finally:
-        await destination.dispose()
-
-
-@pytest.mark.asyncio
-async def test_migrate_accepts_legacy_source_without_build_table(tmp_path: Path):
+async def test_migrate_preserves_legacy_layer_without_fabricating_a_published_image(tmp_path: Path):
     source_url = f"sqlite+aiosqlite:///{tmp_path / 'old.sqlite'}"
     destination_url = f"sqlite+aiosqlite:///{tmp_path / 'new.sqlite'}"
     engine = create_async_engine(source_url)
     try:
         async with engine.begin() as connection:
-            for table in ("palimpsest_hub_layers", "palimpsest_hub_uploads", "palimpsest_image_exports"):
-                await connection.execute(text(f"CREATE TABLE {table} (id TEXT PRIMARY KEY, value TEXT NOT NULL)"))
+            legacy = [
+                Base.metadata.tables[name]
+                for name in ("palimpsest_hub_layers", "palimpsest_hub_uploads", "palimpsest_image_exports")
+            ]
+            await connection.run_sync(lambda sync: Base.metadata.create_all(sync, tables=legacy))
+            await connection.execute(
+                legacy[0]
+                .insert()
+                .values(
+                    id=1,
+                    blob_digest="sha256:" + "a" * 64,
+                    size_bytes=4096,
+                    media_type="application/vnd.afterglow.palimpsest.layer.squashfs.v1",
+                    config_digest="sha256:" + "b" * 64,
+                    name="legacy-layer",
+                    kind="squashfs",
+                    config_json={"instance_mode": "oci-layer"},
+                    project_id="c" * 32,
+                    is_published=False,
+                )
+            )
     finally:
         await engine.dispose()
     await create_database(destination_url, with_rows=False)
     copied = await migrate(source_url, destination_url)
-    assert copied == {table: 0 for table in _TABLES}
+    assert copied["palimpsest_hub_layers"] == 1
+    destination = create_async_engine(destination_url)
+    try:
+        async with destination.connect() as connection:
+            layer = (await connection.execute(text("SELECT blob_digest, config_json FROM palimpsest_hub_layers"))).one()
+            assert layer.blob_digest == "sha256:" + "a" * 64
+            assert await connection.scalar(text("SELECT count(*) FROM palimpsest_hub_published_images")) == 0
+            assert await connection.scalar(text("SELECT count(*) FROM palimpsest_hub_layer_nodes")) == 0
+    finally:
+        await destination.dispose()
 
 
 @pytest.mark.asyncio
@@ -269,3 +276,426 @@ async def test_migration_preserves_build_receipt_and_deadline_but_retires_sql_ex
     finally:
         await source.dispose()
         await destination.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("include_receipts", [False, True])
+async def test_migration_preserves_claim_cursors_or_accepts_old_schema(tmp_path, include_receipts):
+    source_url = f"sqlite+aiosqlite:///{tmp_path / 'claim-source.sqlite'}"
+    destination_url = f"sqlite+aiosqlite:///{tmp_path / 'claim-destination.sqlite'}"
+    source, destination = create_async_engine(source_url), create_async_engine(destination_url)
+    receipts = PalimpsestWorkerClaim.__table__
+    try:
+        async with source.begin() as connection:
+            tables = [table for table in Base.metadata.sorted_tables if include_receipts or table != receipts]
+            await connection.run_sync(lambda sync: Base.metadata.create_all(sync, tables=tables))
+            if include_receipts:
+                await connection.execute(
+                    receipts.insert(),
+                    [
+                        {
+                            "channel": "00000000-0000-4000-8000-000000000001",
+                            "protocol": "image",
+                            "sequence": 81,
+                            "result_json": None,
+                        },
+                        {
+                            "channel": "00000000-0000-4000-8000-000000000001",
+                            "protocol": "recipe",
+                            "sequence": 82,
+                            "result_json": {
+                                "id": "00000000-0000-4000-8000-000000000002",
+                                "lease": "00000000-0000-4000-8000-000000000003",
+                            },
+                        },
+                    ],
+                )
+        async with destination.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        copied = await migrate(source_url, destination_url)
+        assert copied[receipts.name] == (2 if include_receipts else 0)
+        async with destination.connect() as connection:
+            after = list((await connection.execute(select(receipts).order_by(receipts.c.protocol))).mappings())
+        if include_receipts:
+            async with source.connect() as connection:
+                before = list((await connection.execute(select(receipts).order_by(receipts.c.protocol))).mappings())
+            assert after == before
+        else:
+            assert after == []
+    finally:
+        await source.dispose()
+        await destination.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("no_call", [False, True], ids=["legacy-server", "prepared-nova-no-call"])
+async def test_migrate_preserves_real_image_instance_and_runtime_reference_rows(tmp_path, no_call):
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    from palimpsest_hub.services.blob_references import runtime_blob_referenced
+
+    source_url = f"sqlite+aiosqlite:///{tmp_path / 'execution-source.sqlite'}"
+    destination_url = f"sqlite+aiosqlite:///{tmp_path / 'execution-destination.sqlite'}"
+    source = create_async_engine(source_url)
+    destination = create_async_engine(destination_url)
+    context = PalimpsestHubBuildContext.__table__
+    jobs = PalimpsestHubImageJob.__table__
+    instances = PalimpsestHubInstance.__table__
+    references = RuntimeBlobReference.__table__
+    now = datetime(2026, 10, 30, 1, 2, 3, 456789, tzinfo=UTC)
+    project = "a" * 32
+    digest = "sha256:" + "b" * 64
+    job_id = "00000000-0000-4000-8000-000000000001"
+    instance_id = "00000000-0000-4000-8000-000000000002"
+    prepared = {
+        "version": 1,
+        "phase": "nova_not_attempted",
+        "volume_create_attempted": True,
+        "server_create_attempted": False,
+        "terminal": True,
+    }
+    spec = {"layer_digests": [digest], "command": ["/bin/true"]}
+    if no_call:
+        spec["_boot_prepare"] = prepared
+    server_id = None if no_call else "00000000-0000-4000-8000-000000000005"
+    try:
+        for engine in (source, destination):
+            async with engine.begin() as connection:
+                await connection.run_sync(Base.metadata.create_all)
+        async with source.begin() as connection:
+            await connection.execute(
+                context.insert().values(
+                    project_id=project, digest=digest, size_bytes=1234, created_by="original-user", created_at=now
+                )
+            )
+            await connection.execute(
+                jobs.insert().values(
+                    id=job_id,
+                    project_id=project,
+                    created_by="original-user",
+                    request_id="00000000-0000-4000-8000-000000000003",
+                    kind="dockerfile",
+                    name="original-image",
+                    request_digest="sha256:" + "c" * 64,
+                    request_json={"context_digest": digest, "platform": "linux/amd64"},
+                    context_digest=digest,
+                    status="complete",
+                    staged_outputs=[{"digest": digest, "size_bytes": 1234}],
+                    output_digests=[digest],
+                    result_json={"layer_digests": [digest]},
+                    lease_owner="original-owner",
+                    lease_expires_at=now + timedelta(minutes=5),
+                    created_at=now,
+                    started_at=now,
+                    completed_at=now + timedelta(seconds=1),
+                )
+            )
+            await connection.execute(
+                instances.insert().values(
+                    id=instance_id,
+                    project_id=project,
+                    created_by="original-user",
+                    request_id="00000000-0000-4000-8000-000000000004",
+                    request_digest="sha256:" + "d" * 64,
+                    name="original-consumer",
+                    spec_json=spec,
+                    server_id=server_id,
+                    boot_volume_id="00000000-0000-4000-8000-000000000006",
+                    status="error",
+                    error_code="create_bootstrap_expired" if no_call else "bootstrap_expired",
+                    capability_hash=None,
+                    result_json=None if no_call else {"exit_code": 1},
+                    capability_expires_at=now + timedelta(minutes=10),
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            await connection.execute(
+                references.insert().values(
+                    resource_kind="instance", resource_id=instance_id, digest=digest, created_at=now
+                )
+            )
+
+        copied = await migrate(source_url, destination_url)
+        assert {table.name: copied[table.name] for table in (context, jobs, instances, references)} == {
+            context.name: 1,
+            jobs.name: 1,
+            instances.name: 1,
+            references.name: 1,
+        }
+        async with source.connect() as original, destination.connect() as migrated:
+            for table in (context, jobs, instances, references):
+                before = (await original.execute(select(table))).mappings().one()
+                after = (await migrated.execute(select(table))).mappings().one()
+                assert after == before
+            job = (await migrated.execute(select(jobs))).mappings().one()
+            instance = (await migrated.execute(select(instances))).mappings().one()
+            assert job["lease_expires_at"].microsecond == instance["capability_expires_at"].microsecond == 456789
+            assert job["output_digests"] == instance["spec_json"]["layer_digests"] == [digest]
+            assert instance["server_id"] == server_id and instance["capability_hash"] is None
+            assert instance["spec_json"] == spec
+            assert instance["result_json"] == (None if no_call else {"exit_code": 1})
+            assert instance["boot_volume_id"] == "00000000-0000-4000-8000-000000000006"
+        async with async_sessionmaker(destination)() as session:
+            assert await runtime_blob_referenced(session, digest)
+    finally:
+        await source.dispose()
+        await destination.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", [None, "orphan", "cycle"])
+@pytest.mark.parametrize("text_source,text_destination", [(False, False), (True, False), (False, True), (True, True)])
+async def test_published_graph_survives_migration_or_rejects_corrupt_parent_atomically(
+    tmp_path, monkeypatch, damage, text_source, text_destination
+):
+    import hashlib
+    from types import SimpleNamespace
+    from uuid import uuid4
+
+    from palimpsest_local.image_manifest import manifest_from_result
+    from sqlalchemy import Text
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    from palimpsest_hub.services import published_images
+    from palimpsest_hub.services.hub_store import LocalPathBlobStore
+
+    source_url = f"sqlite+aiosqlite:///{tmp_path / 'published-source.sqlite'}"
+    destination_url = f"sqlite+aiosqlite:///{tmp_path / 'published-destination.sqlite'}"
+    for url, use_text in ((source_url, text_source), (destination_url, text_destination)):
+        with monkeypatch.context() as schema:
+            if use_text:
+                # MariaDB reflects its JSON alias as LONGTEXT, not SQLAlchemy JSON.
+                schema.setattr(
+                    Base.metadata.tables["palimpsest_hub_image_memberships"].c.reuse_projects_json, "type", Text()
+                )
+            await create_database(url, with_rows=False)
+    source = create_async_engine(source_url)
+    destination = create_async_engine(destination_url)
+    factory = async_sessionmaker(source, expire_on_commit=False)
+    project = "c" * 32
+    actor = {"project_id": project, "user_id": "d" * 32}
+    monkeypatch.setattr(published_images, "get_settings", lambda: SimpleNamespace())
+    store = LocalPathBlobStore(tmp_path / "payloads")
+    descriptors = []
+    try:
+        async with factory() as session:
+            for index in range(3):
+                payload = b"hsqs-metadata-migration-" + bytes([index])
+                path = tmp_path / f"layer-{index}"
+                path.write_bytes(payload)
+                verified = store.inspect_file(path, max_bytes=4096)
+                store.publish_verified(path, verified)
+                descriptors.append({"digest": verified.blob_digest, "size_bytes": verified.size_bytes})
+                await session.execute(
+                    Base.metadata.tables["palimpsest_hub_publication_payloads"]
+                    .insert()
+                    .values(
+                        project_id=project,
+                        created_by=actor["user_id"],
+                        blob_digest=verified.blob_digest,
+                        size_bytes=verified.size_bytes,
+                    )
+                )
+            await session.commit()
+        images = []
+        for branch, indices in (("left", [0, 1]), ("right", [0, 2]), ("reused", [2, 1])):
+            manifest = manifest_from_result(
+                {
+                    "layers": [descriptors[index] for index in indices],
+                    "source": {},
+                    "runtime": {"entrypoint": ["/bin/sh"], "cmd": [], "env": [], "working_dir": "/", "user": "0"},
+                },
+                os_family="fixture-os",
+                os_version="1",
+                source_kind="local",
+                metadata={"branch": branch},
+            )
+            images.append(
+                await published_images.publish_image(
+                    factory,
+                    store,
+                    actor,
+                    str(uuid4()),
+                    branch,
+                    manifest,
+                )
+            )
+        if damage:
+            parent = (
+                "sha256:" + hashlib.sha256(b"missing-parent").hexdigest()
+                if damage == "orphan"
+                else images[0]["leaf_id"]
+            )
+            async with source.begin() as connection:
+                await connection.execute(
+                    text("UPDATE palimpsest_hub_layer_nodes SET parent_id=:parent WHERE id=:root"),
+                    {"parent": parent, "root": images[0]["nodes"][0]["id"]},
+                )
+            with pytest.raises(MigrationError):
+                await migrate(source_url, destination_url)
+            async with destination.connect() as connection:
+                assert await connection.scalar(text("SELECT count(*) FROM palimpsest_hub_layers")) == 0
+                assert await connection.scalar(text("SELECT count(*) FROM palimpsest_hub_published_images")) == 0
+        else:
+            await migrate(source_url, destination_url)
+            migrated = [
+                await published_images.resolve_image(
+                    async_sessionmaker(destination, expire_on_commit=False),
+                    image["id"],
+                    actor,
+                )
+                for image in images
+            ]
+            assert migrated[0]["nodes"][0]["id"] == migrated[1]["nodes"][0]["id"]
+            assert migrated[0]["nodes"][1]["parent_id"] == migrated[1]["nodes"][1]["parent_id"]
+            assert migrated[0]["nodes"][1]["id"] != migrated[2]["nodes"][1]["id"]
+            assert migrated[0]["nodes"][1]["digest"] == migrated[2]["nodes"][1]["digest"]
+            assert [image["manifest"]["metadata"]["branch"] for image in migrated] == ["left", "right", "reused"]
+    finally:
+        await source.dispose()
+        await destination.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dry_run", [False, True])
+@pytest.mark.parametrize("creator", [None, "", "   "], ids=["null-creator", "empty-creator", "blank-creator"])
+async def test_migrate_prepublication_schema_accepts_only_reviewed_exact_creator_mapping(tmp_path, dry_run, creator):
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    source_url = f"sqlite+aiosqlite:///{tmp_path / 'legacy-acl.sqlite'}"
+    destination_url = f"sqlite+aiosqlite:///{tmp_path / 'reviewed-acl.sqlite'}"
+    await create_database(source_url, with_rows=False)
+    await create_database(destination_url, with_rows=False)
+    source = create_async_engine(source_url)
+    destination = create_async_engine(destination_url)
+    project = "original-project"
+    digest = "sha256:" + "1" * 64
+    try:
+        async with source.begin() as connection:
+            await connection.execute(text("DROP TABLE palimpsest_hub_build_contexts"))
+            await connection.execute(
+                text("""
+                CREATE TABLE palimpsest_hub_build_contexts (
+                    project_id VARCHAR(64) NOT NULL, digest VARCHAR(71) NOT NULL,
+                    size_bytes BIGINT NOT NULL, created_by VARCHAR(128), created_at DATETIME NOT NULL,
+                    PRIMARY KEY (project_id, digest)
+                )
+            """)
+            )
+            await connection.execute(
+                text("""
+                INSERT INTO palimpsest_hub_build_contexts
+                (project_id, digest, size_bytes, created_by, created_at)
+                VALUES (:project, :digest, 321, :creator, '2026-11-02 01:02:03.123456')
+            """),
+                {"project": project, "digest": digest, "creator": creator},
+            )
+            # Same baseline image-job schema: no visibility column, nullable real creator.
+            await connection.execute(text("ALTER TABLE palimpsest_hub_image_jobs DROP COLUMN visibility"))
+            await connection.execute(
+                text("""
+                INSERT INTO palimpsest_hub_image_jobs
+                (id, project_id, created_by, request_id, kind, name, request_digest, request_json,
+                 status, staged_outputs, output_digests, created_at)
+                VALUES ('00000000-0000-4000-8000-000000000001', :project, NULL,
+                    '00000000-0000-4000-8000-000000000002', 'registry', 'old-receipt', :digest,
+                    '{}', 'complete', '[]', '[]', '2026-11-02 01:02:03.123456')
+            """),
+                {"project": project, "digest": digest},
+            )
+        with pytest.raises(MigrationError, match="reviewed exact-row mapping"):
+            await migrate(source_url, destination_url, dry_run=dry_run)
+        mapping = [
+            {
+                "table": "palimpsest_hub_build_contexts",
+                "key": {"project_id": project, "digest": digest},
+                "values": {"created_by": "evidence-proven-original-user"},
+            }
+        ]
+        copied = await migrate(source_url, destination_url, dry_run=dry_run, reviewed_mapping=mapping)
+        assert copied["palimpsest_hub_build_contexts"] == copied["palimpsest_hub_image_jobs"] == 1
+        async with async_sessionmaker(destination)() as session:
+            contexts = (await session.scalars(select(PalimpsestHubBuildContext))).all()
+            jobs = (await session.scalars(select(PalimpsestHubImageJob))).all()
+            if dry_run:
+                assert not contexts and not jobs
+            else:
+                assert len(contexts) == len(jobs) == 1
+                assert contexts[0].created_by == "evidence-proven-original-user"
+                assert contexts[0].created_at.microsecond == 123456
+                assert jobs[0].visibility == "internal" and jobs[0].created_by is None
+                assert jobs[0].request_json == {} and jobs[0].status == "complete"
+        async with destination.connect() as connection:
+            assert await connection.scalar(text("SELECT count(*) FROM palimpsest_hub_published_images")) == 0
+            assert await connection.scalar(text("SELECT count(*) FROM palimpsest_hub_layer_nodes")) == 0
+        async with source.connect() as connection:
+            assert await connection.scalar(text("SELECT created_by FROM palimpsest_hub_build_contexts")) == creator
+    finally:
+        await source.dispose()
+        await destination.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", ["partial-key", "wrong-row", "overwrite", "unknown-table", "duplicate"])
+async def test_reviewed_mapping_rejects_ambiguous_or_unused_facts_before_copy(tmp_path, damage):
+    source_url = f"sqlite+aiosqlite:///{tmp_path / 'mapping-source.sqlite'}"
+    destination_url = f"sqlite+aiosqlite:///{tmp_path / 'mapping-destination.sqlite'}"
+    await create_database(source_url, with_rows=True)
+    await create_database(destination_url, with_rows=False)
+    source = create_async_engine(source_url)
+    destination = create_async_engine(destination_url)
+    digest = "sha256:" + "3" * 64
+    source_creator = "" if damage == "duplicate" else "known-user"
+    try:
+        async with source.begin() as connection:
+            await connection.execute(
+                PalimpsestHubBuildContext.__table__.insert().values(
+                    project_id="project", digest=digest, size_bytes=10, created_by=source_creator
+                )
+            )
+        entry = {
+            "table": "palimpsest_hub_build_contexts",
+            "key": {"project_id": "project", "digest": digest, "created_by": source_creator},
+            "values": {"created_by": "different-user"},
+        }
+        if damage == "partial-key":
+            entry["key"].pop("created_by")
+        elif damage == "wrong-row":
+            entry["key"]["digest"] = "sha256:" + "4" * 64
+        elif damage == "unknown-table":
+            entry["table"] = "not-a-real-table"
+        mapping = [entry, entry] if damage == "duplicate" else [entry]
+        message = {
+            "partial-key": "complete exact source primary key",
+            "wrong-row": "match exactly one source row",
+            "overwrite": "cannot overwrite a known source fact",
+            "unknown-table": "unused or unknown-table",
+            "duplicate": "match exactly one source row",
+        }[damage]
+        with pytest.raises(MigrationError, match=message):
+            await migrate(source_url, destination_url, reviewed_mapping=mapping)
+        async with destination.connect() as connection:
+            assert await connection.scalar(text("SELECT count(*) FROM palimpsest_hub_layers")) == 0
+            assert await connection.scalar(text("SELECT count(*) FROM palimpsest_hub_build_contexts")) == 0
+    finally:
+        await source.dispose()
+        await destination.dispose()
+
+
+def test_migrate_cli_accepts_reviewed_mapping_path():
+    from palimpsest_hub.migrate import parse_args
+
+    args = parse_args(
+        [
+            "--source-url",
+            "sqlite+aiosqlite:///old.db",
+            "--destination-url",
+            "sqlite+aiosqlite:///new.db",
+            "--reviewed-mapping",
+            "/operator/reviewed-creators.json",
+            "--dry-run",
+        ]
+    )
+    assert args.reviewed_mapping == Path("/operator/reviewed-creators.json")
+    assert args.dry_run is True

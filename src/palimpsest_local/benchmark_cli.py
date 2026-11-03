@@ -27,6 +27,36 @@ def add_parser(commands) -> None:
     report.add_argument(
         "--output", required=True, type=Path, help="new directory for report.md, overview.html and issues.md"
     )
+    from .benchmark_station_cli import configure_parser
+
+    configure_parser(
+        modes.add_parser(
+            "station", help="one retained4CPU/8GiB station,500GiB data disk and hourly two-provider calibration"
+        )
+    )
+    scenario = modes.add_parser("scenario", help="reproducible API/SDK VM, ML and cluster scenarios")
+    actions = scenario.add_subparsers(dest="scenario_action", required=True)
+    actions.add_parser("list", help="show fixed workload profiles and required capabilities")
+    for action in ("plan", "run"):
+        command = actions.add_parser(
+            action, help="validate without effects" if action == "plan" else "execute once with durable evidence"
+        )
+        command.add_argument("--config", required=True, type=Path)
+        if action == "run":
+            command.add_argument("--output", required=True, type=Path)
+            command.add_argument(
+                "--auth-stdin",
+                action="store_true",
+                help="read private original-caller v3token/v3password JSON from stdin, never argv/environment/files",
+            )
+    for action in ("status", "report", "cleanup"):
+        command = actions.add_parser(
+            action,
+            help="inspect recorded state without replay" if action == "status" else action + " an existing owned run",
+        )
+        command.add_argument("--output", required=True, type=Path)
+        if action == "cleanup":
+            command.add_argument("--auth-stdin", action="store_true")
     for mode in ("init", "submit", "worker", "status"):
         command = modes.add_parser(mode, help="durable single-executor controller " + mode)
         command.add_argument(
@@ -49,6 +79,57 @@ def add_parser(commands) -> None:
 
 def dispatch(args) -> int:
     mode = args.benchmark_mode
+    if mode == "station":
+        from .benchmark_station_cli import dispatch as station_dispatch
+
+        return station_dispatch(args)
+    if mode == "scenario":
+        from .benchmark_scenarios import (
+            cleanup_scenario,
+            plan_scenario,
+            render_scenario_report,
+            run_scenario,
+            scenario_status,
+        )
+
+        action = args.scenario_action
+        if action == "list":
+            from .benchmark_scenario_workloads import PROFILES
+
+            result = PROFILES
+        elif action == "plan":
+            result = plan_scenario(load_config(args.config))
+        elif action == "run":
+            signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
+            if getattr(args, "auth_stdin", False):
+                from .benchmark_scenarios import connection_from_stdin
+
+                connection = connection_from_stdin()
+                try:
+                    result = run_scenario(load_config(args.config), args.output, connection=connection)
+                finally:
+                    connection.close()
+            else:
+                result = run_scenario(load_config(args.config), args.output)
+            result = scenario_status(args.output)
+        elif action == "cleanup":
+            if getattr(args, "auth_stdin", False):
+                from .benchmark_scenarios import connection_from_stdin
+
+                connection = connection_from_stdin()
+                try:
+                    result = cleanup_scenario(args.output, connection=connection)
+                finally:
+                    connection.close()
+            else:
+                result = cleanup_scenario(args.output)
+        else:
+            recorded = load_config(args.output / "result.json")
+            result = (
+                scenario_status(args.output) if action == "status" else render_scenario_report(recorded, args.output)
+            )
+        print(json.dumps(result, sort_keys=True, allow_nan=False))
+        return 1 if isinstance(result, dict) and result.get("status") == "failed" else 0
     if mode in {"local", "openstack", "workflow", "worker"}:
         signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
     if mode in {"init", "submit", "worker", "status"}:

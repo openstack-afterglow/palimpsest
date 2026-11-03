@@ -227,6 +227,19 @@ async def require_build_lease(request: Request, _: None = Depends(require_build_
     return lease
 
 
+async def require_claim_identity(request: Request, _: None = Depends(require_build_worker)) -> tuple[str, int]:
+    channel = request.headers.get("X-Palimpsest-Worker-Channel", "")
+    sequence = request.headers.get("X-Palimpsest-Claim-Sequence", "")
+    try:
+        if str(UUID(channel)) != channel or not sequence.isascii() or not sequence.isdecimal():
+            raise ValueError
+        if len(sequence) > 19 or not 1 <= int(sequence) <= 2**63 - 1 or str(int(sequence)) != sequence:
+            raise ValueError
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="canonical worker claim identity required") from exc
+    return channel, int(sequence)
+
+
 class BuildFailure(BaseModel):
     model_config = {"extra": "forbid"}
 
@@ -236,9 +249,18 @@ class BuildFailure(BaseModel):
 @router.post(
     "/build-worker/claim", status_code=202, dependencies=[Depends(require_build_worker)], operation_id="claim_hub_build"
 )
-async def claim_hub_build() -> Any:
-    claim = await build_service.claim_build()
+async def claim_hub_build(identity: tuple[str, int] = Depends(require_claim_identity)) -> Any:
+    claim = await build_service.claim_build(*identity)
     return claim if claim is not None else Response(status_code=204)
+
+
+@router.get("/build-worker/claim", operation_id="recover_hub_build_claim")
+async def recover_hub_build_claim(
+    response: Response, identity: tuple[str, int] = Depends(require_claim_identity)
+) -> dict:
+    """Settle this sequence, fencing an unseen POST; this is NOT a read-only probe."""
+    response.headers["Cache-Control"] = "no-store"
+    return await build_service.claim_build(*identity, recover=True)
 
 
 @router.get("/build-worker/builds/{build_id}/inputs/{digest}", operation_id="download_hub_build_input")

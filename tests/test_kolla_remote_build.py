@@ -248,18 +248,12 @@ def test_worker_only_lifecycle_never_templates_controller_credentials(tmp_path, 
         assert args["memory"]
         assert args["memory_swap"] == args["memory"], "Worker must not acquire unbounded swap"
         assert all(not name.startswith(("OS_", "DATABASE", "REDIS")) for name in args["env"])
-        assert set(args["env"]) == {
-            "PALIMPSEST_HUB_URL",
-            "PALIMPSEST_HUB_BUILD_WORKER_KEY_FILE",
-            "PALIMPSEST_HUB_BUILD_WORK_PATH",
-            "PALIMPSEST_HUB_BUILD_TIMEOUT_SECONDS",
-            "PALIMPSEST_HUB_MAX_BLOB_BYTES",
-        }
         assert args["env"]["PALIMPSEST_HUB_URL"] == "https://hub.example.test"
         assert args["env"]["PALIMPSEST_HUB_BUILD_WORKER_KEY_FILE"].startswith("/")
         assert args["env"]["PALIMPSEST_HUB_BUILD_WORK_PATH"].startswith("/")
         assert 60 <= int(args["env"]["PALIMPSEST_HUB_BUILD_TIMEOUT_SECONDS"]) <= 3600
         assert int(args["env"]["PALIMPSEST_HUB_MAX_BLOB_BYTES"]) > 0
+        assert int(args["env"]["PALIMPSEST_HUB_IMAGE_SCRATCH_BYTES"]) == 4 * 1024**3
         assert all(isinstance(value, str) for value in args["env"].values())
 
         mounts = str(args["volumes"])
@@ -347,6 +341,7 @@ def test_controller_and_remote_worker_render_separate_service_arguments(tmp_path
     }
     api = next(args for _, args in containers if args["name"] == "palimpsest_hub_api")
     assert api["env"]["PALIMPSEST_HUB_BUILD_WORKER_KEY"] == KEY
+    assert "PALIMPSEST_HUB_IMAGE_SCRATCH_BYTES" not in api["env"]
     worker = next(args for _, args in containers if args["name"] == "palimpsest_hub_build_worker")
     serialized = json.dumps(worker)
     assert KEY not in serialized, "Worker must receive a mounted keyfile, not a key env value"
@@ -392,3 +387,50 @@ def test_worker_secret_is_root_owned_and_hidden_from_diffs():
     assert defaults["enable_palimpsest_hub_build_worker"] in (False, "no")
     assert defaults["palimpsest_service_catalog"]["palimpsest-hub-build-worker"]["group"] == "palimpsest-build-worker"
     assert "palimpsest_services" not in defaults, "Do not reintroduce eagerly rendered secret-bearing service maps"
+
+
+@pytest.mark.parametrize("capacity", [0, 256 * 1024**2 - 1, 64 * 1024**3 + 1])
+def test_worker_rejects_unbounded_or_unsupported_image_scratch_before_docker(tmp_path, capacity):
+    records, transcript = _run_lifecycle(
+        tmp_path, ["deploy"], {"palimpsest_image_scratch_bytes": capacity}, expect_success=False
+    )
+    assert not _docker_records(records)
+    assert "finite context/scratch bounds" in transcript
+
+
+def test_worker_renders_explicit_small_bounded_scratch_override(tmp_path):
+    records, _ = _run_lifecycle(tmp_path, ["deploy"], {"palimpsest_image_scratch_bytes": 256 * 1024**2})
+    workers = [args for _, args in _docker_records(records) if args["name"] == "palimpsest_hub_build_worker"]
+    assert workers
+    assert all(int(args["env"]["PALIMPSEST_HUB_IMAGE_SCRATCH_BYTES"]) == 256 * 1024**2 for args in workers)
+
+
+def test_worker_reconfigure_keeps_identified_journal_on_its_original_volume(tmp_path):
+    volume = tmp_path / "retained-volume"
+    active = volume / "claim-cursor-retained"
+    active.mkdir(parents=True)
+    legacy = {"phase": "claim_pending", "protocol": "recipe"}
+    identified = {"phase": "idle", "channel": "62843e8e-a279-468c-950a-ea28f1ebdfcf", "sequence": 30261}
+    (volume / "worker.json").write_text(json.dumps(legacy))
+    (active / "worker.json").write_text(json.dumps(identified))
+    render_root = tmp_path / "render"
+    render_root.mkdir()
+    records, _ = _run_lifecycle(
+        render_root,
+        ["reconfigure"],
+        {
+            "palimpsest_build_worker_scratch_volume": "retained_claim_volume",
+            "palimpsest_build_worker_scratch_path": "/var/lib/palimpsest/build-worker",
+            "palimpsest_build_worker_work_path": "/var/lib/palimpsest/build-worker/claim-cursor-retained",
+        },
+    )
+    worker = next(
+        args
+        for _, args in _docker_records(records)
+        if args["name"] == "palimpsest_hub_build_worker" and args.get("state") == "started"
+    )
+    mount = next(item for item in worker["volumes"] if item.startswith("retained_claim_volume:"))
+    container_root = Path(mount.split(":")[1])
+    selected = volume / Path(worker["env"]["PALIMPSEST_HUB_BUILD_WORK_PATH"]).relative_to(container_root)
+    assert json.loads((selected / "worker.json").read_text()) == identified
+    assert json.loads((volume / "worker.json").read_text()) == legacy

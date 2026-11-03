@@ -24,6 +24,11 @@ from .state import atomic_write_json
 
 
 def _request(config: dict) -> tuple[str, dict]:
+    if config.get("schema") == "palimpsest.benchmark-scenario.v1":
+        from .benchmark_scenarios import validate_scenario
+
+        validate_scenario(config)
+        return "scenario", config
     if config.get("schema") == "palimpsest.benchmark-workflow.v1":
         validate_workflow(config)
         return "workflow", config
@@ -127,10 +132,28 @@ def work(root: Path, *, once: bool = False) -> int:
                     or st.st_size > 1024 * 1024
                 ):
                     raise ArtifactValidationError("unsafe benchmark queue entry")
-                config = load_config(path)
-                mode, payload = _request(config)
-                if path.stem != config["job_id"]:
-                    raise ArtifactValidationError("benchmark queue identity differs")
+                try:
+                    config = load_config(path)
+                    mode, payload = _request(config)
+                    if path.stem != config["job_id"]:
+                        raise ArtifactValidationError("benchmark queue identity differs")
+                except (ArtifactValidationError, ValueError, KeyError, TypeError) as error:
+                    record = {
+                        "job_id": path.stem,
+                        "phase": "failed-no-replay",
+                        "stage": "queued-admission",
+                        "category": type(error).__name__,
+                        "finished_unix_seconds": time.time(),
+                        "cloud_effects": 0,
+                    }
+                    fd = os.open(statepath, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                    with os.fdopen(fd, "w") as stream:
+                        json.dump(record, stream)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    if once:
+                        return 1
+                    break
                 evidence = root / "results" / path.stem
                 record = {
                     "job_id": path.stem,
@@ -158,7 +181,7 @@ def work(root: Path, *, once: bool = False) -> int:
                             sys.executable,
                             "-m",
                             "palimpsest_local.benchmark_cli",
-                            mode,
+                            *(["scenario", "run"] if mode == "scenario" else [mode]),
                             "--config",
                             str(input_path),
                             "--output",

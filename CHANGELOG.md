@@ -4,6 +4,98 @@ All notable changes to Palimpsest Local are documented here.
 
 ## [Unreleased]
 
+## [0.3.11] - 2026-11-03
+
+### Added
+
+- Add one canonical image publication engine for worker output and locally built
+  SDK pushes/extensions, authoritative Hub manifests and metadata discovery,
+  parent-aware single-parent logical layers, immutable payload references and
+  private/internal/public image membership with transitive reuse restrictions.
+- Add namespace-qualified Manila/CephFS publication and exact MDS-path plus OSD
+  pool/namespace read-only consumer credentials. Scope changes copy payloads;
+  same-scope reuse remains content-addressed. Path-only isolation and
+  cross-namespace hardlinks are explicitly rejected.
+- Add an opt-in native SDK lifecycle with fast durable HTTP202 admission,
+  fresh-original-caller background connections, project-scoped cumulative
+  CPU-image grants, exact cleanup and SQL/private-journal uncertainty fences.
+  Pair client/Hub `0.3.11` with an exact companion dependency. Local amd64
+  container and database qualification are distinct from production deployment,
+  actual namespace isolation and a new Nova warm-start proof.
+
+- Add an explicit experimental `cloud native` candidate: separate BIOS carrier/initramfs PID1, authenticated loopback mTLS bootstrap with per-run restricted SSH transport, CephFS-backed actual-root assembly, separately pinned NVIDIA driver injection, and grant-bound Cinder-before-Nova lifecycle/cleanup. The standalone probe uses original-image cudart/cuBLAS plus Driver API computation. Source preparation preserves predecessor bytes; this entry does not claim an executed native boot or GPU proof.
+- Add digest-pinned `cloud image-pull` on the Nova worker, with sequential layer conversion/publication/receipt commits, original OCI provenance, no-copy verified CephFS blob reuse, and durable no-replay intake identities. This does not implement or qualify native CephFS-root Nova GPU boot.
+- Add local-driven `palimpsest cloud env up|status|down`, `cloud dockerfile-build` and `cloud layer-run`: the CLI uses a `clouds.yaml` cloud through openstacksdk to provision a Manila CephFS layer share and a Nova build worker (read-write cephx identity), builds a Dockerfile there with pinned BuildKit, converts it into ordered SquashFS layers published write-once to CephFS, then boots fresh consumer VMs with a separate read-only cephx rule that loop-mount the layers read-only under an overlay and run a command. No Palimpsest code runs in consumers; created resources are recorded per environment and deleted only by recorded ID.
+- Add disabled-by-default API GPU profiles bound to original projects, exact qualified guest content, flavor/PCI aliases, driver and GPU count; use preinstalled NVIDIA vendor injection with preserved image identity and owned namespace cleanup. Actual GPU workload qualification remains blocked, not passed.
+- Add one-job/two-consumer API cold/warm measurements with continuous cold timing, existing ordered-layer warm reuse, fresh writable state and explicit HTTPS-transfer/cache limits. Keep a fixed offline hash-pinned derived TensorFlow recipe and bounded streaming context upload; no GPU timing or deployment qualification is claimed.
+- Add separately admitted two-node API k3s profiles, an external fixed offline-airgap build context, private expiring join capabilities and exact node/numerical-pod proofs. Cold/prepared pairs hold two live reservations and reuse one immutable image job; default CPU/GPU privilege is unchanged.
+- Add project-bound registry imports, bounded Dockerfile/context builds and public image-job APIs with durable request identities, fixed HTTPS worker leases and verified atomic layer publication.
+- Add original-human/project-bound instance create/list/detail/stop/delete APIs with provider-intent reconciliation, exact boot-volume checks, immutable ordered layer/runtime snapshots and bounded sealed guest results.
+- Add conditional layer metadata PATCH, retained physical-blob references, matching Hub client methods and dedicated image-worker container/Kolla policies. Current guests fetch payloads over HTTPS into read-only SquashFS lowers with private disk-backed upper/work; Manila-managed CephFS runtime access remains a separate target, not implemented by this change.
+- Add fixed PyTorch CPU/CUDA, NVIDIA CUDA, TensorFlow CPU/CUDA and rancher/k3s scenario programs with durable original-caller budgets, structured status/logs/reports and retained Hub instance/request identities, including uncertain provider creates. These source additions do not qualify new GPU or privileged-cluster execution.
+- Add a separately budgeted private iperf3 peer/bastion helper with console-pinned SSH, exact-owned SG/FIP and forward-only cleanup. Bounded private-stdin authentication keeps original-caller credentials out of argv, environment and evidence files.
+- Preserve the Korean visual guide and four interactive diagram artifacts byte-for-byte from the 2026-10-29 working-tree snapshot. README illustrations explain the external-control/Hub-metadata/Manila-managed-CephFS target, explicitly separate from current HTTPS bootstrap and historical Cinder prototypes; illustrations are not deployment or runtime evidence.
+
+### Fixed
+- Exclude non-distributed Finder `.DS_Store` metadata from deterministic worker
+  source archives after actual Linux container qualification found editable and
+  installed package fingerprints differed despite identical distributed code.
+  Preserve the code-byte/grant pin instead of weakening the integrity check.
+- Upgrade existing image-job visibility as historical project-wide `internal`
+  before creating dependent tables. Preserve proven context creators in the
+  creator-aware primary key; reject unknown creators before DDL, and quarantine
+  legacy jobs lacking creator/OS declarations before worker effects. Schema
+  cutover requires all writers stopped and a restorable paired SQL/CAS backup.
+- Make copied public Hub source readable in all three runtime images without
+  relying on root DAC capabilities; private configuration permissions are unchanged.
+- Preserve inherited reuse ceilings through MariaDB's reflected JSON/LONGTEXT
+  representation, binding decoded policy lists for the destination type. Reject
+  blank or oversized UTF-8 OS declarations before image-worker admission.
+- Declare the real OpenStack SDK used by provider-recovery contract tests in the
+  developer extra, leaving dependency-free base installs and CI safety policy intact.
+- Remove unnecessary reverse DNS from the fixed numeric bootstrap listener and
+  synchronize descendant readiness before process-boundary assertions; production
+  allocation and worker deadlines are unchanged.
+- Keep the persistent build-worker mount separate from its selected journal
+  subdirectory so canonical reconfiguration cannot orphan an identified claim.
+
+- Consolidate the remaining local worktree features and port final allocation-expiry/no-send recovery without reverting prepared-root or paired-budget ownership. Preserve original staged work and historical evidence outside retired checkouts; no remote merge or release is implied.
+- Fix imported cloud result registration, deletion replay, SSH isolation, bounded retained output and native tunnel/key-cleanup prerequisites. Controlled SIGTERM uses owned cleanup; experimental actual-root/GPU acceptance remains unqualified.
+- Preserve sanitized, private, no-clobber Nova console evidence before failed experimental native-run cleanup; retain positive ACTIVE/enrollment timestamps and failure phase across revocation. Bound SDK connect/read timeouts through the actual session and restore transport settings even on cancellation. Diagnostic failure does not prevent cleanup, refund attempts or satisfy the CPU/GPU gate. This evidence-retention repair does not identify or qualify the failed native boot.
+- Preserve fixed-operation/type/errno serial context for experimental PID1 failures without exposing exception messages, file paths, arbitrary class names or credentials. Keep labels compatible with the existing console sanitizer and preserve HOLD/result/gate semantics. This diagnostic-only candidate does not establish the cause or repair of the observed native boot failure.
+- Add exact-approved recovery for cleaned native failures without resetting their outcomes or spent ledgers: bind predecessor preparation/run/history digests, recheck provider absence and stopped bootstrap service, and preserve preparation assets in separate source generations with unchanged kernel bundle/DNS. Reserve cleanup time inside the allocation and reject recovered over-budget CPU results as GPU prerequisites. Local verification does not qualify the undiagnosed native boot.
+- Preserve private redacted carrier-builder stdout/stderr tails before failed pre-Nova cleanup, without interpreting an SSH exit status as remote-actor completion. Keep interrupted transports TERM-only and fail-closed source-identity checks intact; concurrent package-update evidence is not a guest-boot result or a refunded allocation.
+- Give one-pass Glance carrier PUTs deadline-bound scalar socket waits without changing metadata defaults or shared sessions. Prevent hidden SDK mutation replay on connection/status failures, reauthentication and redirects through the original-caller factory; reject mutation3xx and retain only safe upload cause/progress fields. Observe existing deletion intents rather than resending, bind Cinder origin to its durable image intent, and refuse recovery with unreaped upload clients. Strict no-replay retains paid-resource HOLDs for separately authorized manual disposition; it is not an automatic cleanup guarantee.
+- Recover prepared roots through original-project scoped Cinder inventory without the provider-rejected `project_id` query. Treat create responses as partial: bind a returned UUID only after an exact detail read verifies original owner, intent, size, image and no attachment; retain unknown POST outcomes without retries or Nova allocation.
+- Prepare each official Hub instance root as one durable exact-project image-backed Cinder volume before Nova. Initial create is Cinder-only; GET never mutates providers, and explicit request/volume-bound advance dispatches the first volume-source Nova attempt or one deferred exact-owned volume deletion. Preserve original bootstrap expiry, private no-call/uncertain history, strict tri-state server-attempt certificates, mutex fences across COMMIT, bounded lost-response recovery and actual404-only cleanup without changing cloud wait settings or persisting raw credentials. Existing server-backed rows remain lifecycle-only; source/client cutover is not deployment or GPU acceptance evidence.
+- Bound Hub asyncmy handshake/response reads with `DATABASE_READ_TIMEOUT` (default 30 seconds, valid 1–120) in API, export worker and offline bootstrap. Keep TCP connect/pool limits and readiness single-flight/closed-transport pre-ping semantics unchanged; do not pass MySQL-only connection arguments to SQLite.
+- Retain published CAS bytes and resumable staging after an unknown final COMMIT outcome in legacy uploads/bundles, image contexts/outputs and native package/cache publication; do not mistake a fresh nonlocking absence read for rollback proof or overwrite a late completion through exception compensation. Preserve known precommit cleanup and propagate errors without blind mutation retries.
+- Select a fixed fingerprint-bound 900-second service-image pack profile after an observed large-image packer timeout, keeping canonical callers at 120 seconds and preserving the original outer job deadline. Require profile/key agreement through request wire v3 without arbitrary timeout payloads, lease extension or failed-job replay.
+- Preserve allowlisted OCI intake/packer/store error codes and validated resource/I/O errno through the strict materializer subprocess response and private executor summary. Migrate both ends to response wire v4 without exposing exception messages, paths or credentials or changing successful artifact, timeout or quota semantics.
+- Resume image output publication from lock-serialized private receipts and exact result intents without re-executing builds, extending leases or replaying unknown mutations blindly. Preserve per-digest journal progress and private failure categories/status; wait for bulk CAS publication responses until the original absolute lease instead of a ten-second post-upload idle timeout. Reuse existing JSON columns, keeping pending image runtime private and public completion semantics unchanged.
+- Require overlayfs snapshots on the image job's quota-bound ext4 scratch after a real copy-up/whiteout probe, avoiding native parent-directory copies without increasing deadlines or enabling fallback. Preserve actual failed probe return codes and bounded stderr through normal job disposal; uncertain mount cleanup remains fail-closed.
+- Keep the image executor's BuildKit socket in its private `/run` tmpfs, independent of persistent job-path length. Retain only the latest image-worker failure in an atomic owner-only, bounded local artifact after exact executor cleanup, preserving trailing executor/BuildKit stderr outside mounted scratch and job deletion with fixed stage/category/errno diagnostics; public errors, database schema and journal recovery authority are unchanged.
+- Settle lost worker claim responses through a durable channel/sequence cursor under the job-selection SQL mutex. Fence delayed original requests, retain exact-lease no-reexecution semantics, preserve legacy unidentified journals, and require explicit additive-schema bootstrap before coordinated API/worker cutover.
+- Recheck expiry immediately after durable submission writes and after context hashing, before external effects. Bound slow/trickling dependency downloads by an owned-process absolute deadline, and release only definite no-call live occupancy without refunding cumulative reservations.
+- Bind CUDA compilation to the validated device capability and reject execution mismatches using the kernel-written `__CUDA_ARCH__`, not echoed host compiler defines. Enforce cluster source expiry/pinned qualification, identity-safe child cleanup, streaming output limits, atomic simultaneous capacity and per-pair deadlines.
+- Validate private flavor eligibility through the original caller's default available-flavor listing instead of requiring administrative whole-tenant ACL enumeration. Keep exact GPU profile/PCI/content checks and a fresh visibility fence before allocation.
+- Reject cyclic build-context symlinks on Python 3.13 as well as older supported interpreters while retaining valid dangling internal links.
+- Enforce a fully preallocated per-image workspace and packed-output budget with independent journal headroom; keep registry/tool temporary files in owned scratch and require exact cgroup/loop cleanup before publication.
+- Require separate current download and write authority before instance payload capabilities; permit only verified failed-create cleanup and retain capacity while a bound boot volume survives. Distinct definite no-create errors can be explicitly cleaned without treating an uncertain provider response as absence.
+- Bound guest result delivery by actual serialized JSON bytes, including escaped control output, while preserving identical-result retries and no workload replay.
+- Serialize Kolla's writable-disk GiB limit as a string; bound workload argv/results before allocation, keep CPU threading identical across comparison methods and require completed cluster probe computation before readiness. Preserve uncertain resource dispositions and cumulative auxiliary-resource budgets rather than replay effects.
+- Fence retained-station hourly/disk/create/repair/cleanup operations through one canonical station-wide lock, independent of checkpoint output paths. Retain failed attempts and per-output receipts; busy resident sampling returns a future wake-up without retry bursts.
+- Bind external Lima removal to safe owned native configuration and protected-state identity; prove descriptor-pinned directory deletion even across rename. Revalidate libvirt native backend/lifecycle metadata and inactive TPM retention before effects, through existing `host_vm_control.py`; default root/topology retention, independent named disks and console authority are unchanged.
+- Reuse the hardened private-stdin HTTPS/ambient-configuration boundary in the live Hub acceptance script. Persist exact consumer deletion identities before API effects and observe uncertain/deleting outcomes without issuing DELETE again; release budget only after original server/boot absence.
+- Recheck allocation expiry/deadline before image-job requests and the retained station's separate data-volume request. Explicitly settle only synchronously certified pre-request station admission failures; missing or late effect receipts remain uncertain.
+- Recover a completed disk checkpoint's latest pointer over an older result without repeating its probe, synthesizing a new timestamp or regressing a newer valid success.
+
+### Changed
+
+- Follow the owner's 2026-10-29 same-location measurement policy: reuse one retained 4-vCPU/8-GiB OpenStack station with a dedicated 500-GiB disk, pairing provider download/upload samples every 30–60 minutes during active experiments (default 60). Preserve individual provider values and equal-weight means; missing directions remain N/A. Workloads reference timestamped context instead of creating calibration VMs or running Internet probes per experiment. Historical matrices, failures and spent grants remain historical.
+- Keep ordinary notebook development/checks and specifically approved operator administration permitted; only long benchmarks require a resident host. Current API/SDK-reference and standalone-calibration modes remain explicit, with no silent CPU fallback or automatic GPU driver installation. Publication, actual Kolla deployment and quarantined-worker disposition remain separate recorded actions.
+
+
 ## [0.3.10] - 2026-10-28
 
 ### Added

@@ -240,10 +240,16 @@ class _ConnectedHub(HubClient):
         blob_response = method == "GET" and re.fullmatch(r"(?:/v1)?/layers/sha256:[0-9a-f]{64}/blob", path) is not None
         return _BoundedResponse(response, deadline=deadline, max_bytes=16 * 1024**3 if blob_response else _MAX_JSON)
 
-    def _json_request(self, method, path, payload=None, *, query=None):
+    def _json_request(self, method, path, payload=None, *, query=None, headers=None, before_send=None):
         body = json.dumps(payload, allow_nan=False).encode() if payload is not None else None
         with self._open(
-            method, path, query=query, body=body, content_type="application/json" if body else None
+            method,
+            path,
+            query=query,
+            body=body,
+            content_type="application/json" if body else None,
+            headers=headers,
+            before_send=before_send,
         ) as response:
             return _read_json(response)
 

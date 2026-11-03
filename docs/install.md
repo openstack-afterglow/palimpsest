@@ -6,11 +6,11 @@ initial configuration, upgrades, and administrator-owned Linux deployment.
 Released installations use pinned published bytes; trusted local installation below uses the actual checkout's bytes.
 
 Palimpsest Local requires Python 3.11 or newer; Hub requires Python 3.12+.
-This release source prepares0.3.10 on published0.3.9
-(`5c0fef0604ca631bef40ed505a0d02d742ccba9a`). Root/Hub metadata, module versions,
+This release source prepares0.3.11 on the published0.3.10 lineage.
+SDK publication and native execution remain separately qualified. Root/Hub metadata, module versions,
 generated locks and Kolla image defaults move together. After formal publication,
 install exact client bytes with
-`uv tool install --python 3.11 palimpsest-client==0.3.10`, or install a trusted
+`uv tool install --python 3.11 palimpsest-client==0.3.11`, or install a trusted
 local checkout with `uv tool install --force --python 3.11 .`.
 A root wheel upgrade neither deploys Hub nor qualifies actual build/run behavior.
 Git/outbound GitHub HTTPS is needed only for VCS installation.
@@ -20,6 +20,71 @@ Git/outbound GitHub HTTPS is needed only for VCS installation.
 Historical DMS Lab deployment receipts preserve private listen port `18021`, internal VIP port `8021` and public `https://palimpsest.dmslab.re.kr`; later0.3.7 receipts record the shared-CAS three-controller layout. Preserve actual current operator overrides rather than infer placement from old single-controller records or role defaults. Package pinning and image selection do not restart services. Verify public readiness and authenticated build/consumer behavior after a separately authorized Kolla rollout.
 
 Package references require a separate trusted `palimpsest_package_public_origin`; it was empty in the inspected runtime. For the Afterglow key-gateway deployment, use the approved `https://cloud.dmslab.re.kr` origin rather than inferring it from Hub Host or the internal transport. Verify nonempty exact protected IDs, current requester service leaves and original-token `/v1/projects/current` through Afterglow. Do not use admin/service credentials for package acceptance, grant ordinary users automatically, or claim health 200 proves authenticated reads/writes.
+
+### Unreleased GPU and fixed k3s runtime profiles
+
+These candidate contracts are not enabled by installing the client wheel alone.
+`palimpsest_instance_gpu_profiles` and `palimpsest_instance_cluster_profiles`
+default to empty. Profiles require exact original project IDs and a separately
+content-pinned guest image in `palimpsest_instance_base_images`; preserve existing
+operator values rather than copying a historical image/flavor into production.
+
+GPU entries pin image/flavor/PCI aliases, actual driver version and device count.
+The guest base must already contain working NVIDIA driver and vendor CLI/library
+1.18+. CUDA `base`/`runtime`/`devel` container tags describe application CUDA/cuDNN
+components, not proof that this guest injection runtime or a compatible kernel
+driver is installed. The tested CUDA12.6 devel image supplied nvcc12.6.85 and no
+`nvidia-container-cli`. Do not install drivers/toolkits during measured workload
+bootstrap; use a separately approved base-creation worker and immutable result.
+
+Cluster entries pin image, permitted CPU flavor IDs and original projects. Only
+the fixed two-node `cluster_profile` grants the whole-VM root/writable-cgroup
+exception; normal CPU/GPU policy remains unchanged. Runtime inputs require the
+fixed offline k3s image recipe and hash-pinned airgap archive. `cluster_server_id`
+selects the same original user's unexpired server and exact retained stack, not an
+arbitrary join URL/token or remote shell. See [precise execution/proof boundaries](benchmarks.md#fixed-api-k3s-qualification).
+
+The prepared-root instance API requires a coordinated reviewed API/client source
+cutover; installing a client wheel alone does not deploy it. Initial instance
+creation allocates only one exact-project image-backed Cinder root and returns
+while it is preparing. Pure GET observes `provider_phase=volume_ready` without
+starting a VM. Explicit `POST /v1/instances/{id}/advance` with
+`{"operation":"create-server","request_id":"<original UUID>","boot_volume_id":"<bound UUID>"}`
+is the only first-Nova path. Nova attaches that existing volume, not an image
+source. Preserve the original bootstrap expiration and all current Nova/Cinder/
+GPU-host settings; this repair does not increase provider wait limits.
+
+Deploy source-compatible callers together: record each explicit advancement
+intent before sending once, then use GET-only settlement after an unknown reply.
+Do not assume an older client which only creates and polls GET will start Nova.
+Prepared-volume-only DELETE records cleanup intent without deleting Cinder;
+when GET exposes `delete_volume_ready`, advance with `operation="delete-volume"`
+and the same original request/boot identity. Unknown provider deletion remains
+GET-only until actual404. `server_create_attempted=false` is a versioned no-call
+certificate; null legacy/unknown state is never evidence that no server exists.
+Existing server-backed DELETE may still remove Nova. This change adds private
+versioned state to the existing instance spec JSON and uses `boot_volume_id`;
+no new database column or raw-token persistence is required. Preserve existing
+server-backed rows and uncertain journals rather than replaying old creates.
+See the [instance state and ownership contract](../ARCHITECTURE.md#instance-effects-guest-boundary-and-result-semantics).
+
+For the fixed k3s context, set explicit matching API/worker
+`palimpsest_max_context_bytes` and `palimpsest_max_context_expanded_bytes` to at
+least256MiB; keep worker RUN network `none`. Larger TensorFlow contexts require
+their own explicit bounds and physically reserved scratch. Increasing a logical
+limit does not create disk capacity. Never prune shared caches or resize/reformat
+existing disks to hide insufficient capacity.
+
+Operator storage administration uses a separate project-scoped application
+credential, not workload auth or repeated global-admin password attempts. In the
+current bounded worker preparation, the required private file onwireguardserver
+is `/home/pieroot/.config/palimpsest/worker-storage-clouds.yaml`, ownerpieroot,
+parent0700/file0600, cloud `palimpsest-worker-storage`, `v3applicationcredential`,
+verified public Keystone `/v3` andRegionOne. The token's actual project must match
+the exact approved worker project before Cinder or attachment effects. Do not put
+secrets in chat, persist caller tokens, change IAM, reset administrator passwords,
+or fall back to a different identity after authentication fails.
+
 
 ### Hub liveness and readiness (0.3.6)
 
@@ -178,13 +243,14 @@ do not authorize another rollout or native qualification.
    restore. Preserve unknown scratch/loops/jobs/Trusts; never replay them or
    delete volumes to force a clean start.
 4. **Apply reviewed schema offline.** Run the new pinned API image's
-   `palimpsest-hub-bootstrap` with approved private database/config inputs while
-   every writer remains stopped. Current bootstrap creates missing tables
-   (including `palimpsest_worker_leases`) and adds nullable build
-   `lease_expires_at` when absent; there is no migration ledger, ownership
-   backfill or legacy guest adoption. Empty-database smoke is not compatibility
-   proof for the actual existing schema. `reconfigure.yml` does **not** bootstrap;
-   `deploy`/`upgrade` do, but neither orchestrates the all-writer stop/backup.
+   `palimpsest-hub-bootstrap` with private database/config inputs while every
+   writer remains stopped.0.3.11 upgrades pre-publication image tables before
+   dependent FKs: historical jobs receive `visibility=internal`, and build
+   contexts use `(project_id,digest,created_by)` only when every original creator
+   is proven. Unknown creators stop before DDL; no owner/OS/catalog image is
+   invented. MariaDB DDL commits implicitly: recovery is paired SQL/CAS restore,
+   not transaction rollback or a blind bootstrap replay. `reconfigure` does not
+   bootstrap; `deploy`/`upgrade` do, but neither drains all old writers for you.
    Migration into a separate empty initialized database is a distinct operation;
    it copies durable rows, not blob bytes or transient maintenance leases.
 5. **Use the existing image-mode lifecycle.** After the approved operator wheel
@@ -197,6 +263,34 @@ do not authorize another rollout or native qualification.
    kolla-ansible reconfigure -i /etc/kolla/multinode --tags palimpsest \
      --limit dms-controller1 --skip-tags haproxy
    ```
+   A single-controller limit still needs facts for every inventory host used by
+   HA Sentinel address rendering. Do not override
+   `kolla_ansible_delegate_facts_hosts` with an empty list when the selected role
+   resolves cross-controller `kolla_address` values. Retain standard fact
+   delegation, or explicitly scope it to the exact reviewed Sentinel controller
+   hosts; for the three-controller placement above:
+
+   ```sh
+   -e '{"kolla_ansible_delegate_facts_hosts":["dms-controller1","dms-controller2","dms-controller3"]}'
+   ```
+
+   This changes read-only setup delegation, not the single-controller apply
+   limit. Verify the installed gather-facts play and unchanged Sentinel assertion
+   in the **same** Ansible process; separately preloading facts into a render
+   harness does not prove a limited reconfigure has them. Never disable Sentinel
+   coherence checks or change network interfaces to hide missing host facts.
+
+   A canonical reconfigure is not by itself a no-force-stop guarantee. The
+   Palimpsest role uses `community.docker.docker_container`; when replacing a
+   running image with no explicit stop timeout, its stop request permits Docker's
+   finite default grace and subsequent SIGKILL. If the approved operation forbids
+   forced running-process termination, first use a separately reviewed,
+   exact-container ordinary stop with indefinite grace, verify its normal exit
+   and prevent automatic restart, then let canonical Kolla perform replacement
+   and start. Retain healthy peer APIs and immutable before/stopped/after records;
+   an ambiguous stop is HOLD, never a second signal or forced removal. Changing
+   the module's stop timeout may also persist a different container setting and
+   is not an implicit permission to change the reviewed target configuration.
 
    Between pull and reconfigure, complete the offline schema gate above.
    The deployed aggregate does not target `palimpsest-build-worker`; use the
@@ -632,6 +726,7 @@ enable_palimpsest_hub_build_worker: "yes"
 palimpsest_build_worker_hub_origin: "https://palimpsest.dmslab.re.kr"
 palimpsest_build_worker_scratch_volume: palimpsest_build_worker_scratch
 palimpsest_build_worker_scratch_path: /var/lib/palimpsest/build-worker
+palimpsest_build_worker_work_path: "{{ palimpsest_build_worker_scratch_path }}"
 palimpsest_build_worker_timeout_seconds: 3600
 palimpsest_build_worker_max_blob_bytes: 107374182400
 palimpsest_build_worker_cpus: 2
@@ -639,6 +734,14 @@ palimpsest_build_worker_memory: 6g
 palimpsest_build_worker_pids_limit: 512
 palimpsest_build_worker_etc_hosts: {}
 ```
+
+`palimpsest_build_worker_scratch_path` is the persistent volume's container mount;
+`palimpsest_build_worker_work_path` selects the actual private journal directory
+inside it and defaults to that mount. Preserve an already qualified subdirectory
+explicitly, together with the original volume and mount. Before any worker apply,
+compare the fully rendered volume/mount/`PALIMPSEST_HUB_BUILD_WORK_PATH` tuple to
+the actual container; neither a fresh volume nor a legacy parent journal is a
+replacement for the current identified cursor. Never clear uncertainty to deploy.
 
 `palimpsest_build_worker_etc_hosts` optionally maps the exact origin hostname
 to an operator-verified reachable IP **inside the worker container only** when
@@ -730,20 +833,36 @@ stopping the Hub API to avoid an uncertain claim.
 
 Keep scratch private and persistent across restarts. Its `worker.lock` flock
 and `worker.json` journal are recovery authority; do not remove either merely
-to unblock polling. Operator disposition depends on the recorded phase:
+to unblock polling. The current source retains an `idle` checkpoint containing
+the worker's private channel and monotonic claim sequence; an idle journal is
+not an uncertain job and must not be deleted to reset that sequence. Operator
+disposition and automatic settlement depend on the recorded phase:
 
-- `claim_pending`: a lost claim response means the API may have assigned a
-  lease the worker never learned. The worker halts permanently for operator
-  disposition; inspect server state/deadline and retained journal without
-  replaying the claim or deleting uncertainty. Expiry is terminal, not requeue.
+- Identified `claim_pending`: the API durably binds the channel, protocol and
+  sequence to an empty outcome or an exact job/lease under the claim SQL mutex.
+  Authenticated claim recovery settles that identity; it never blindly retries
+  the original claim POST. Recovery also fences an unseen request so a delayed
+  original POST cannot assign a new job afterward. This recovery endpoint can
+  write the claim cursor and is **not a read-only diagnostic**. A recovered job
+  retains the no-reexecution rule and is settled through its exact lease.
+- Legacy `claim_pending` without durable request identity remains fail-closed:
+  preserve its journal and establish an explicitly authorized disposition.
+  Counts of current nonterminal rows or unexpired leases alone cannot prove
+  that no claim occurred; compare attempt/lease/status fields against the
+  pre-worker baseline. Never clear a journal merely to resume polling.
 - `claimed` / `executing`: restart never re-executes a recorded job. Preserve
   the tree while the cleanup helper verifies exact process groups and loops;
   a parent-death fence and `builder.pid` / `helper-UUID.pid` records bind
   PID/start ticks/boot ID. Stale records matching the current helper PID are
   previous lifetimes, not authority to kill that helper.
-- `output_pending` / `fail_pending`: a lost mutation response is settled by
-  **status only**, `GET /v1/build-worker/builds/{id}` for the exact lease
-  (including terminal status), not automatic output/failure replay.
+- Recipe `output_pending` and all `fail_pending` records settle through exact-
+  lease status, not blind mutation replay. Image `output_pending` additionally
+  uses a private authoritative publication receipt: bind the complete descriptor,
+  rehash retained packed spans, skip exact committed digest/size stages and send
+  only absent exact idempotent stages. Completion requires that same bound result
+  and unchanged lease deadline. This never re-executes a build or extends an
+  expired attempt. Deploy all API replicas before the compatible worker; pending
+  descriptors stay hidden from public image-job results until completion.
 - `terminal`: cleanup still must be established before deleting the job or
   claiming another. `preflight <worker_pid> <scratch_root>` and
   `cleanup <job_dir> <worker_pid>` are executor modes, not a license for broad
@@ -751,9 +870,12 @@ to unblock polling. Operator disposition depends on the recorded phase:
   journal and inspect exact owned processes/mounts/loops; never detach unknown
   loops, kill PID-only matches or erase the tree to manufacture recovery.
 
-These recovery contracts are source-reviewed; the 0.3.5 production receipt
-records `claim_pending` disposition and resumed idle polling, not native build
-or recipe execution/restart/cleanup qualification.
+The identified-claim protocol requires the additive `palimpsest_worker_claims`
+table and coordinated API/worker deployment. Bootstrap it only through an
+explicit reviewed deployment after paired SQL/CAS backup and isolated restore;
+preserve existing tables and legacy journals. Historical 0.3.5 recovery used
+operator disposition, not this protocol, and is not current live qualification.
+Record current-source tests, deployment and native workload proof separately.
 
 ### Hub API and worker logs
 
@@ -769,6 +891,19 @@ or exception text. Hub disables Uvicorn's raw-target access logger at startup,
 including when launched through the direct `uvicorn palimpsest_hub.main:app`
 command. Do not enable third-party HTTP/SQL trace logging or an independent
 server access logger that emits raw targets in production.
+
+For image-build failures the worker retains one private owner-only
+`last-image-failure.json` beside `worker.json`, after exact executor cleanup and
+before deleting the disposable job tree. It contains the last64KiB from each
+executor/BuildKit stream as base64 plus fixed category/errno metadata; final JSON
+is limited to266240bytes. Treat these raw tool tails as potentially sensitive:
+inspect only through approved operator access, never copy them into public API
+errors, ordinary logs or reports. A later failure atomically replaces this one
+artifact. It is not journal/claim authority; do not delete an uncertain journal
+or adopt diagnostic staging to resume work. Executor stderr survives normal
+failed-child finalization, not an arbitrary worker SIGKILL before the tail is
+persisted. BuildKit uses a short socket in the existing per-executor private
+`/run` tmpfs so persistent job path length cannot exceed its Unix-socket limit.
 
 On a reused asyncmy connection whose uvloop TCP transport was already closed,
 Hub marks the failed pool pre-ping as a disconnect and obtains a fresh connection
@@ -983,6 +1118,8 @@ The required settings are:
 | `PALIMPSEST_HUB_PACKAGE_FORBIDDEN_PROJECT_IDS` | JSON array of exact protected project IDs, for example `'["<project-id>"]'`. A comma-separated list does not parse. Empty policy disables ordinary member/key authority with 503; independently verified human system management supersedes these mixed protected-owner exclusions. |
 | `PALIMPSEST_HUB_PACKAGE_FORBIDDEN_USER_IDS` | JSON array of exact protected administrator/service principal IDs, for example `'["<user-id>"]'`. Empty policy disables ordinary member/key authority with 503. Human system management independently excludes actual validator/trustee IDs and service/delegated authentication. |
 
+Human administration and admin-issued bounded key use freshly read the native user's home-domain ID and selected project's domain ID, verify each exact domain resource and require explicit boolean enabled=true. Disabled native requester/project/home/target domains deny with 403; missing/malformed/unavailable metadata is 503. The reader additionally needs complete native domain get/list, configured-domain filtered user lookup, user-group membership and raw user/group exact-system assignments, alongside existing subject/role/graph reads. Configure `OS_USER_DOMAIN_NAME`/`OS_USERNAME` to one existing native trustee domain/user; missing, ambiguous or partial lookup fails closed. Original token or saved key-provenance domain names never skip configured-service ID exclusion after a domain rename. These are read-only prerequisites, not permission to change IAM or fall back to service-password authentication.
+
 Optional settings and defaults:
 
 | Environment setting | Default / constraint |
@@ -990,6 +1127,7 @@ Optional settings and defaults:
 | `DATABASE_POOL_SIZE` | `10`, valid 1–100 |
 | `DATABASE_MAX_OVERFLOW` | `20`, valid 0–100 |
 | `DATABASE_CONNECT_TIMEOUT` | `10` seconds, valid 1–120 |
+| `DATABASE_READ_TIMEOUT` | `30` seconds, valid 1–120; asyncmy handshake/response read limit, separate from TCP connection and pool checkout timeouts; applies to API, export worker and offline bootstrap |
 | `DATABASE_POOL_TIMEOUT` | `30` seconds, valid 1–120 |
 | `DATABASE_UNHEALTHY_SECONDS` | `30` seconds, valid 1–3600 |
 | `PALIMPSEST_HUB_MAX_BLOB_BYTES` | `107374182400` bytes (100 GiB), minimum 1 |
@@ -1006,6 +1144,14 @@ Optional settings and defaults:
 | `OS_REGION_NAME` | `RegionOne` |
 | `OS_INTERFACE` | `internal` |
 | `SSL_VERIFY` | `true` |
+
+`DATABASE_READ_TIMEOUT` limits each asyncmy wait for incoming protocol data,
+including handshake/pre-ping/query responses; it is not an overall SQL transaction
+deadline and does not bound a peer that continually supplies partial data. It
+does not introduce retries. A response timeout after a mutation or COMMIT leaves
+an uncertain outcome: preserve the original durable claim/publication receipt
+and use its existing authoritative settlement, never assume rollback or replay.
+The separate HTTPS-only build worker does not consume this database setting.
 
 ### Remote build worker settings
 
@@ -1024,20 +1170,20 @@ Optional settings and defaults:
 
 The `OS_USERNAME`/`OS_PASSWORD` service identity remains separate from the read-only validator. The validator authenticates itself with `system_scope="all"` and validates the **presented subject token** through Keystone's token-read API; it never exchanges that token for a new default-project token and never falls back to service/admin credentials. `X-Project-Id`, if supplied, is only an exact assertion against the original scope, not a re-scope request. Downstream caller-scoped OpenStack requests reuse the validated original token and catalog. A missing reader identity/policy response fails closed (503), invalid/expired tokens fail 401, and scope assertions fail 403.
 
-Operator-owned Keystone policy must let this reader call token validation (`tokens.validate`), `users.get`, `projects.get` and `role_assignments.list`, including fresh direct system grants as well as effective project assignments. On every native package-key use, enabled user/project, current membership and current service authority are checked, not cached token membership. Native owners need current `member` or `reader` in the original project and remain forbidden by `admin`, `manager` or `service` assignments, protected IDs or validator identity. Direct system-grant lookup also attenuates existing native keys immediately when the owner is promoted. Read-only members cannot delegate writes; empty protected sets fail closed, and admin authority is not a native upload workaround. Deferred Glance exports retain this native owner policy.
+Operator-owned Keystone policy must let this reader call token validation (`tokens.validate`), `users.get`, `projects.get`, native domain/group reads and complete role-assignment collections. Every native package-key use freshly checks enabled owner/project, current authority and declared key ceilings. Ordinary member keys retain protected-owner and elevated `admin`/`manager`/`service` exclusions; independently issued human-admin keys retain explicit issuer provenance and fresh system-authority checks. A later owner promotion never upgrades an ordinary key. Missing/incomplete metadata fails closed; package keys cannot gain system management, key administration or OpenStack execution authority.
 
-The separate system-administrator gate uses `role_assignments.list(user=SUBJECT, system="all", include_names=True)` without effective expansion. Qualify that exact direct query with the dedicated reader and confirm immediate revocation; a project-oriented effective listing can omit a valid direct system-all admin assignment. Project-token admin/service grades are not substitutes for this system check. This does not change the fresh effective membership query used for ordinary package owners, and does not grant package keys builder/GC authority.
+The separate human system-administrator gate resolves complete raw exact-`system:all` user and current-group grants through the trusted unique-global role-ID implication graph; project-oriented effective expansion may omit these grants and is not evidence of their absence. Qualify raw user/group reads and immediate revocation with the dedicated reader. Tenant administrative/service grades never substitute for native system authority. Original `X-Project-Id` asserts caller scope; separate `X-Target-Project-Id` selects a verified logical management target without exchanging/re-scoping the original token. See [current credential contracts](project-package-registry.md#3-identity-and-authorization).
 
-For **legacy image/layer upload**, the 2026-10-14 owner-approved source policy
-treats a system administrator as an ordinary current-project user: both
-current original-project membership and current `palimpsest-publish_editor`
-are required. Publish authority derives only from ordinary direct/group/
-inherited assignment roots, excluding builtin `admin`/`manager` roots and
-Keystone implied copies tagged `links.prior_role`. Admin privilege alone never
-grants publication. Service identities, protected users/projects and validator
-identity remain denied. `/v1/me` projects this upload check for admins;
-delete/build remain system-admin. This does not relax native keys/owner policy
-or claim that live 0.3.3 has the candidate policy.
+**Historical legacy-publication policy (2026-10-14, before 0.3.10):** that
+candidate treated a system administrator as an ordinary project publisher,
+requiring current original-project membership and publication authority from
+nonadministrative assignment roots. Preserve its dated qualification records;
+do not apply that older rule as the current human-system management contract.
+Current 0.3.10 additionally admits independently revalidated human system
+administrators for policy-authorized target-bound publication without fabricated
+target membership or service leaves. Original requester audit, native domain
+enablement, delegated/service-identity vetoes and bounded key ceilings remain;
+deferred Glance Trust-export admission retains its separate stricter boundary.
 
 Keystone user/project IDs are exact bounded ASCII identifiers (up to 64 characters), including federated 64-hex user IDs. Do not parse them as UUIDs, case-fold or strip them. UUID formatting applies only to Hub-generated key/upload IDs. Protected sets and namespace binding values must preserve exact identity bytes. For a conventional project UUID, the conditional operator configuration is:
 
@@ -1430,3 +1576,117 @@ See [platform compatibility](compatibility.md), [Linux storage and
 logging](linux-storage-logging.md), [registry intake](registry-intake.md),
 [Docker/OCI registry profiles](registries.md), [BuildKit workflow](buildkit-block-workflow.md),
 and the [command workflows](cli/workflows.md) for operational details.
+
+## SDK image/native integration: operator prerequisites
+
+The `0.3.11` Hub distribution declares the exact matching client dependency.
+Checkout resolution uses `hub`'s explicit parent-path source; installed release
+bytes must match the same immutable tag and reviewed image digests. Paired wheel
+or local container checks do not establish production upgrade or native readiness.
+The canonical Docker builder includes API native helpers, SSH/OpenSSL and
+`ceph-common`; issuer provisioning and backend isolation remain operator gates.
+
+New catalog, user-owned staging, membership/visibility and native-intent tables
+are part of the0.3.11 schema. The reviewed offline bootstrap upgrades legacy
+image-job visibility as `internal` and known context creators; other populated
+ACL tables with missing owner/reuse facts require explicit reviewed mapping or
+quarantine. `create_all` alone is not an upgrade and historical jobs are not
+invented catalog images. Drain writers and prove paired SQL/CAS recovery first.
+
+All new execution profiles and namespace mounts default to inactive/unset.
+Manila publication requires the coherent settings
+`PALIMPSEST_HUB_PUBLICATION_MANILA_SHARE_ID`, `_EXPORT`, `_ROOT`, `_FS_NAME`
+and `_DATA_POOL` (the latter four share the same `PALIMPSEST_HUB_PUBLICATION_MANILA`
+prefix). The root must be the exact pre-mounted CephFS export, not a descendant
+or an ordinary directory. Kernel mount ID/device, export and explicit
+`fs`/`mds_namespace` selection are checked. Private staging remains outside it.
+Absence or mismatch never falls back to local storage for native execution.
+
+The publisher needs layout-setting permission (`p`) inside the approved share
+and write permission for its selected pool/namespaces. An ordinary Manila RW
+credential must not be assumed sufficient. New scope directories receive layout
+before payload creation; existing incompatible scope/file layouts are rejected,
+not migrated or rewritten automatically.
+
+Each `PALIMPSEST_HUB_NATIVE_PROFILES` entry binds:
+
+- exact original project/user, existing environment and private state root;
+- private original `grant_path`, share/base export and publication root;
+- optional exact `manifest_digest` (omit/null only for the explicit project-image
+  CPU grant, not an implicit wildcard);
+- `ceph_fs_name`, `ceph_data_pool`, dedicated `ceph_issuer_client`,
+  `ceph_conf_file` and `ceph_keyring_file`.
+
+Issuer files must be bounded, owned, private, no-follow regular files outside the
+exported payload tree. The manager rejects `client.admin`, bootstrap/default
+service identities and ambient credential fallback. Operator provisioning of the
+issuer's finite auth-command authority is separate from use of that authority:
+API startup never installs keys, expands caps, rotates a cluster key or prepares
+a native worker. Per-run keys allow only the selected MDS path and OSD namespace;
+global `tag cephfs data=...` consumer caps are not used.
+
+Kolla exposes `palimpsest_publication_manila_host_path` for the already-mounted
+publisher share and `palimpsest_native_operator_host_path` for private journals,
+approved grants and issuer files. The latter is mounted at
+`palimpsest_native_operator_container_path`; profile paths must use container
+locations and remain outside the exported root. These mounts must be deliberately
+pre-provisioned with the API UID/permissions; the role does not create a share or
+issuer principal. Native source/service preparation is an explicit operator
+operation. `cloud native prepare` may omit its tag only with the project-scoped
+CPU preparation grant. The original exact-image local proof path is separate.
+
+Before enabling this path, qualify: actual scope directory/file layouts,
+cross-scope path **and raw RADOS** read denial, provider-side write denial,
+actual-root identity and workload output, then exact VM/boot/port/carrier-image
+absence and Ceph auth absence. Auth removal alone does not establish immediate
+session eviction. Finish and clean each test consumer before the next; no old
+spent grant, retained VM or historical success provides a new allowance.
+
+The Kolla/container path, dedicated issuer setup, new cloud resources and native
+proof still require explicit final-source/resource approval. Current local
+source/package checks are not deployment or live multi-tenant isolation proof.
+
+Namespace-qualified **new** consumer keys do not revoke existing broad keys.
+Before activation, the operator must qualify the filesystem/data pool against
+other untrusted clients that may still have filesystem-wide data-tag or
+pool-wide read caps. If such clients exist, use an independently qualified
+dedicated backend/filesystem or obtain a separately approved owner migration;
+do not change foreign keys as a side effect of this feature. Cluster/service
+administrators and the trusted publisher/issuer remain outside consumer isolation.
+No current-cloud capability census or dedicated-backend qualification is implied
+by the local source tests.
+
+### Operator handoff for the observed backend
+
+Approved read-only observations found Ceph19.2.3/Squid, filesystem `manila`,
+data pool `manila_data` and existing worker/share resources still present. The
+existing root and original layer use the share's `fsvolumens_…` namespace, not
+the new visibility scopes. Its mount does not expose an explicit filesystem
+selection; the candidate intentionally refuses to infer the default. The exact
+worker key cannot read even its own auth record (exit13). These observations
+do not qualify layout-setting or auth-issuer authority.
+
+Before a live test, the operator must provide, without posting key material in
+chat or the repository:
+
+1. The approved backend/share identity and a pre-mounted root with an explicit
+   kernel-visible filesystem selection, plus a statement/evidence that other
+   untrusted clients cannot read its new namespaces with broader pool/tag caps.
+2. A publisher identity permitted to set the empty scope-directory layout and
+   write the intended pool/namespaces. Do not repurpose the retained worker rule
+   or rewrite existing layer layouts as an implicit migration.
+3. A dedicated issuer identity with reviewed auth-command authority, and private
+   minimal Ceph config/keyring paths owned by the executing API UID. Ordinary
+   global `ceph.conf` permissions or renaming an admin key are not qualification.
+4. The private profile/state/artifact preparation and separately approved
+   source-package, allocation/cleanup expiry and cumulative CPU/resource limits.
+   No new GPU allowance is requested by this feature.
+
+A run's key reads its selected **security scope** (personal, project, or public),
+not just one image within that scope. Do not treat it as confidentiality between
+mutually untrusted workloads sharing that audience. Neither that scope model nor
+auth-record deletion provides attestation or immediate eviction of a live client.
+
+The operator selected preparation outside this assistant's current read-only
+window. Until it is supplied and the exact deployment/test resources are
+approved, keep profiles inactive and report native warm-start acceptance pending.

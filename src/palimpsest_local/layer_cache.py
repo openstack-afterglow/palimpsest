@@ -13,8 +13,9 @@ import json
 import os
 import re
 import stat
+import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Any
@@ -23,10 +24,10 @@ from . import registry_intake
 from .errors import ArtifactValidationError
 from .oci_converter import DEFAULT_LAYER_CONVERSION_LIMITS, LAYER_INTAKE_POLICY_ID
 from .oci_image import OCIImageRef, resolve_image, strict_json_object
-from .oci_materializer import materialize_image_hard
+from .oci_materializer import OCIHardWorkerError, materialize_image_hard
 from .oci_packer import (
-    DEFAULT_SQUASHFS_PACK_POLICY,
     SQUASHFS_PACK_POLICY_ID,
+    SquashFSPackProfile,
     discover_squashfs_toolchain,
 )
 from .oci_provenance import Descriptor, Platform
@@ -38,7 +39,7 @@ from .oci_source import (
     SourceCAS,
     SourceSnapshot,
 )
-from .oci_store import DerivedLayerOccurrence, DerivedSquashFSKey, OCIStore
+from .oci_store import DerivedLayerOccurrence, DerivedSquashFSKey, MaterializationResult, OCIStore
 from .state import StatePaths
 
 SCHEMA = "palimpsest.layer-cache.v1"
@@ -605,8 +606,32 @@ class LayerCache:
             return self._view(catalog, root)
 
     def materialize(
-        self, root_digest: str, *, packer_path: Path = Path("/usr/bin/mksquashfs"), timeout_seconds: float = 300.0
+        self,
+        root_digest: str,
+        *,
+        packer_path: Path = Path("/usr/bin/mksquashfs"),
+        timeout_seconds: float = 300.0,
+        pack_profile: SquashFSPackProfile = SquashFSPackProfile.CANONICAL,
+        on_layer: Callable[[int, Path, dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
+        """Commit each derived layer before synchronously notifying its consumer.
+
+        Callbacks run under the cache lock and original deadline; they must not
+        reenter this cache. A failure retains the committed prefix, not image
+        success. The callback receipt is the canonical DerivedLayerReceipt.
+        """
+        if not isinstance(pack_profile, SquashFSPackProfile):
+            raise LayerCacheError("layer cache pack profile is invalid")
+        if on_layer is not None and not callable(on_layer):
+            raise LayerCacheError("layer cache layer callback is invalid")
+        if (
+            not isinstance(timeout_seconds, (int, float))
+            or isinstance(timeout_seconds, bool)
+            or not 0 < float(timeout_seconds) < float("inf")
+        ):
+            raise LayerCacheError("layer cache deadline is invalid")
+        deadline = time.monotonic() + float(timeout_seconds)
+        policy = pack_profile.policy
         with self._locked() as (fd, _fresh):
             catalog = self._load(fd)
             snapshot = self._verified(catalog, _digest(root_digest))
@@ -626,24 +651,29 @@ class LayerCache:
                         raise LayerCacheError("layer cache packer changed while identifying it")
                 finally:
                     os.close(packer_fd)
-            toolchain = discover_squashfs_toolchain(packer_path, expected_packer_sha256=digest.hexdigest())
-            receipt = materialize_image_hard(
-                snapshot,
-                source_cas_root=self.roots.oci_source_cas,
-                roots=self.roots,
-                store=self._store,
-                packer_path=packer_path,
-                toolchain=toolchain,
-                timeout_seconds=timeout_seconds,
+            toolchain = discover_squashfs_toolchain(
+                packer_path, expected_packer_sha256=digest.hexdigest(), policy=policy
             )
-            for ordinal, result in enumerate(receipt.results):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise OCIHardWorkerError("oci-worker-timeout", "layer cache materialization deadline expired")
+            committed_results: list[MaterializationResult] = []
+
+            def commit_layer(result: MaterializationResult) -> None:
+                if time.monotonic() >= deadline:
+                    raise OCIHardWorkerError("oci-worker-timeout", "layer cache materialization deadline expired")
+                if not isinstance(result, MaterializationResult):
+                    raise LayerCacheError("materialization returned an invalid layer result")
+                ordinal = len(committed_results)
+                if ordinal >= len(snapshot.layers):
+                    raise LayerCacheError("materialization returned an unexpected layer occurrence")
                 occurrence = DerivedLayerOccurrence.from_image(snapshot, ordinal)
                 key = DerivedSquashFSKey.for_occurrence(
                     occurrence,
                     intake_policy_id=LAYER_INTAKE_POLICY_ID,
                     intake_policy_fingerprint=DEFAULT_LAYER_CONVERSION_LIMITS.fingerprint,
                     pack_policy_id=SQUASHFS_PACK_POLICY_ID,
-                    pack_policy_fingerprint=DEFAULT_SQUASHFS_PACK_POLICY.fingerprint,
+                    pack_policy_fingerprint=policy.fingerprint,
                     toolchain=toolchain,
                 )
                 value = {
@@ -654,10 +684,39 @@ class LayerCache:
                     "image_digest": result.receipt.image_digest,
                     "image_size": result.receipt.image_size,
                 }
-                if result.receipt.key_digest != key.digest or catalog["derived"].get(key.digest, value) != value:
+                if (
+                    result.receipt.key_digest != key.digest
+                    or result.receipt.ordinal != ordinal
+                    or result.receipt.store_id != self._store.identity
+                    or result.receipt.source_snapshot_binding_digest != snapshot.binding_digest
+                    or result.receipt.source_image_digest != snapshot.image.digest
+                    or catalog["derived"].get(key.digest, value) != value
+                ):
                     raise LayerCacheError("materialization contradicts the retained recipe catalog")
                 catalog["derived"][key.digest] = value
-            self._save(fd, catalog)
+                self._save(fd, catalog)
+                committed_results.append(result)
+                if time.monotonic() >= deadline:
+                    raise OCIHardWorkerError("oci-worker-timeout", "layer cache materialization deadline expired")
+                if on_layer is not None:
+                    blob_path = self.roots.store / "blobs" / "sha256" / result.receipt.image_digest.split(":")[1]
+                    on_layer(ordinal, blob_path, result.receipt.to_dict())
+                if time.monotonic() >= deadline:
+                    raise OCIHardWorkerError("oci-worker-timeout", "layer cache materialization deadline expired")
+
+            receipt = materialize_image_hard(
+                snapshot,
+                source_cas_root=self.roots.oci_source_cas,
+                roots=self.roots,
+                store=self._store,
+                packer_path=packer_path,
+                toolchain=toolchain,
+                timeout_seconds=remaining,
+                pack_profile=pack_profile,
+                on_layer=commit_layer,
+            )
+            if len(committed_results) != len(snapshot.layers) or tuple(committed_results) != receipt.results:
+                raise LayerCacheError("image materialization results contradict the committed layer sequence")
             return {
                 **self._view(catalog, root_digest),
                 "receipt": receipt.to_dict(),

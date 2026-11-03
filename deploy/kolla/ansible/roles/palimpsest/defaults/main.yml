@@ -1,7 +1,7 @@
 ---
 # Palimpsest kolla role defaults
 
-palimpsest_image_tag: "0.3.10"
+palimpsest_image_tag: "0.3.11"
 palimpsest_image_namespace: "ghcr.io/openstack-afterglow"
 palimpsest_api_image: "{{ palimpsest_image_namespace }}/palimpsest-hub-api"
 palimpsest_worker_image: "{{ palimpsest_image_namespace }}/palimpsest-hub-worker"
@@ -28,11 +28,48 @@ palimpsest_build_worker_key_path: "{{ palimpsest_config_dir }}/build-worker.key"
 palimpsest_build_worker_container_key_path: /run/palimpsest/build-worker.key
 palimpsest_build_worker_scratch_volume: palimpsest_build_worker_scratch
 palimpsest_build_worker_scratch_path: /var/lib/palimpsest/build-worker
+# Keep the persistent mount independent from an already-qualified journal subdirectory.
+palimpsest_build_worker_work_path: "{{ palimpsest_build_worker_scratch_path }}"
 palimpsest_build_worker_memory: 6g
 palimpsest_build_worker_cpus: 2
 palimpsest_build_worker_pids_limit: 512
 palimpsest_build_worker_timeout_seconds: 3600
 palimpsest_build_worker_max_blob_bytes: 107374182400
+# Image import/build inputs are bounded separately from retained result blobs.
+palimpsest_registry_hosts: ["docker.io", "registry-1.docker.io", "ghcr.io", "quay.io"]
+palimpsest_image_run_network: "none"
+# The worker's own delegated cgroup namespace; never a host-global writable mount.
+palimpsest_image_cgroup_root: "/sys/fs/cgroup"
+# Per-image physical reservation: 3/4 ext4 scratch, up to 1/4 packed output.
+# Additional 8MiB setup reserve is released for independent journal headroom.
+palimpsest_image_scratch_bytes: 4294967296
+palimpsest_max_context_bytes: 16777216
+palimpsest_max_context_expanded_bytes: 268435456
+palimpsest_max_context_members: 10000
+palimpsest_instance_bootstrap_ttl_seconds: 3600
+palimpsest_max_instances_per_project: 16
+palimpsest_instance_max_boot_gib: 256
+palimpsest_instance_max_writable_gib: 64
+# Independently qualified unannotated Glance images, keyed by UUID and SHA hash.
+palimpsest_instance_base_images: {}
+# Explicit runtime opt-in, bound to qualified base content and an exact GPU flavor.
+# Empty until the operator qualifies driver/Container Toolkit and PCI assignment.
+palimpsest_instance_gpu_profiles: {}
+# Separately admitted whole-VM cluster privilege; normal CPU/GPU paths stay unchanged.
+palimpsest_instance_cluster_profiles: {}
+palimpsest_instance_ca_certificates: []
+# Explicit publisher mount and scoped native profiles; namespace isolation is required.
+# Empty values never mount a share, prepare a worker or allocate an instance.
+palimpsest_publication_manila_share_id: ""
+palimpsest_publication_manila_export: ""
+palimpsest_publication_manila_root: ""
+palimpsest_publication_manila_fs_name: ""
+palimpsest_publication_manila_data_pool: ""
+# These mounts must already exist. Kolla does not create a share or issuer key.
+palimpsest_publication_manila_host_path: ""
+palimpsest_native_operator_host_path: ""
+palimpsest_native_operator_container_path: "/var/lib/palimpsest/native-operator"
+palimpsest_native_profiles: {}
 # Optional exact hostname -> IP pins for the worker container only, e.g. when
 # the service network's DNS lacks the public Hub name. TLS still verifies the
 # certificate for the configured origin hostname.
@@ -151,11 +188,16 @@ palimpsest_hub_api_service:
   network_mode: host
   command: ["uvicorn", "palimpsest_hub.main:app", "--host", "{{ palimpsest_api_listen_address }}", "--port", "{{ palimpsest_api_listen_port | string }}", "--proxy-headers", "--no-access-log"]
   restart_policy: unless-stopped
-  volumes:
-    - "{{ palimpsest_config_dir }}/palimpsest.conf:/app/palimpsest.conf:ro"
-    - "{{ palimpsest_config_dir }}/policy:/etc/palimpsest:ro"
-    - "{{ palimpsest_hub_shared_path if palimpsest_hub_storage_mode == 'shared' else palimpsest_hub_volume }}:{{ palimpsest_hub_path }}"
-    - "kolla_logs:/var/log/kolla/"
+  volumes: >-
+    {{ [
+      palimpsest_config_dir ~ '/palimpsest.conf:/app/palimpsest.conf:ro',
+      palimpsest_config_dir ~ '/policy:/etc/palimpsest:ro',
+      (palimpsest_hub_shared_path if palimpsest_hub_storage_mode == 'shared' else palimpsest_hub_volume) ~ ':' ~ palimpsest_hub_path,
+      'kolla_logs:/var/log/kolla/'
+    ] + ([palimpsest_publication_manila_host_path ~ ':' ~ palimpsest_publication_manila_root ~ ':rw']
+         if palimpsest_publication_manila_root | length > 0 else [])
+      + ([palimpsest_native_operator_host_path ~ ':' ~ palimpsest_native_operator_container_path ~ ':rw']
+         if palimpsest_native_profiles | length > 0 else []) }}
   environment:
     PALIMPSEST_CONFIG: "/etc/palimpsest/palimpsest.conf"
     PALIMPSEST_HUB_BUILD_WORKER_KEY: "{{ palimpsest_build_worker_key if (enable_palimpsest_hub_build_worker | bool) else '' }}"
@@ -178,6 +220,26 @@ palimpsest_hub_api_service:
     PALIMPSEST_HUB_MAX_BLOB_BYTES: "{{ palimpsest_hub_max_blob_bytes | string }}"
     PALIMPSEST_HUB_MAX_BUNDLE_EXPANDED_BYTES: "{{ palimpsest_hub_max_bundle_expanded_bytes | string }}"
     PALIMPSEST_HUB_MAX_BLOCKING_OPERATIONS: "{{ palimpsest_hub_max_blocking_operations | string }}"
+    PALIMPSEST_HUB_REGISTRY_HOSTS: "{{ palimpsest_registry_hosts | to_json }}"
+    PALIMPSEST_HUB_IMAGE_RUN_NETWORK: "{{ palimpsest_image_run_network }}"
+    PALIMPSEST_HUB_IMAGE_CGROUP_ROOT: "{{ palimpsest_image_cgroup_root }}"
+    PALIMPSEST_HUB_MAX_CONTEXT_BYTES: "{{ palimpsest_max_context_bytes | string }}"
+    PALIMPSEST_HUB_MAX_CONTEXT_EXPANDED_BYTES: "{{ palimpsest_max_context_expanded_bytes | string }}"
+    PALIMPSEST_HUB_MAX_CONTEXT_MEMBERS: "{{ palimpsest_max_context_members | string }}"
+    PALIMPSEST_HUB_INSTANCE_BOOTSTRAP_TTL_SECONDS: "{{ palimpsest_instance_bootstrap_ttl_seconds | string }}"
+    PALIMPSEST_HUB_MAX_INSTANCES_PER_PROJECT: "{{ palimpsest_max_instances_per_project | string }}"
+    PALIMPSEST_HUB_INSTANCE_MAX_BOOT_GIB: "{{ palimpsest_instance_max_boot_gib | string }}"
+    PALIMPSEST_HUB_INSTANCE_MAX_WRITABLE_GIB: "{{ palimpsest_instance_max_writable_gib | string }}"
+    PALIMPSEST_HUB_INSTANCE_BASE_IMAGES: "{{ palimpsest_instance_base_images | to_json }}"
+    PALIMPSEST_HUB_INSTANCE_GPU_PROFILES: "{{ palimpsest_instance_gpu_profiles | to_json }}"
+    PALIMPSEST_HUB_INSTANCE_CLUSTER_PROFILES: "{{ palimpsest_instance_cluster_profiles | to_json }}"
+    PALIMPSEST_HUB_INSTANCE_CA_CERTIFICATES: "{{ palimpsest_instance_ca_certificates | to_json }}"
+    PALIMPSEST_HUB_PUBLICATION_MANILA_SHARE_ID: "{{ palimpsest_publication_manila_share_id }}"
+    PALIMPSEST_HUB_PUBLICATION_MANILA_EXPORT: "{{ palimpsest_publication_manila_export }}"
+    PALIMPSEST_HUB_PUBLICATION_MANILA_ROOT: "{{ palimpsest_publication_manila_root }}"
+    PALIMPSEST_HUB_PUBLICATION_MANILA_FS_NAME: "{{ palimpsest_publication_manila_fs_name }}"
+    PALIMPSEST_HUB_PUBLICATION_MANILA_DATA_POOL: "{{ palimpsest_publication_manila_data_pool }}"
+    PALIMPSEST_HUB_NATIVE_PROFILES: "{{ palimpsest_native_profiles | to_json }}"
     OS_AUTH_URL: "{{ palimpsest_keystone_auth_url }}"
     OS_USERNAME: "{{ palimpsest_keystone_user }}"
     OS_PROJECT_NAME: "{{ palimpsest_service_project_name }}"
@@ -216,9 +278,16 @@ palimpsest_hub_build_worker_service:
   environment:
     PALIMPSEST_HUB_URL: "{{ palimpsest_build_worker_hub_origin }}"
     PALIMPSEST_HUB_BUILD_WORKER_KEY_FILE: "{{ palimpsest_build_worker_container_key_path }}"
-    PALIMPSEST_HUB_BUILD_WORK_PATH: "{{ palimpsest_build_worker_scratch_path }}"
+    PALIMPSEST_HUB_BUILD_WORK_PATH: "{{ palimpsest_build_worker_work_path }}"
     PALIMPSEST_HUB_BUILD_TIMEOUT_SECONDS: "{{ palimpsest_build_worker_timeout_seconds | string }}"
     PALIMPSEST_HUB_MAX_BLOB_BYTES: "{{ palimpsest_build_worker_max_blob_bytes | string }}"
+    PALIMPSEST_HUB_REGISTRY_HOSTS: "{{ palimpsest_registry_hosts | to_json }}"
+    PALIMPSEST_HUB_IMAGE_RUN_NETWORK: "{{ palimpsest_image_run_network }}"
+    PALIMPSEST_HUB_IMAGE_CGROUP_ROOT: "{{ palimpsest_image_cgroup_root }}"
+    PALIMPSEST_HUB_IMAGE_SCRATCH_BYTES: "{{ palimpsest_image_scratch_bytes | string }}"
+    PALIMPSEST_HUB_MAX_CONTEXT_BYTES: "{{ palimpsest_max_context_bytes | string }}"
+    PALIMPSEST_HUB_MAX_CONTEXT_EXPANDED_BYTES: "{{ palimpsest_max_context_expanded_bytes | string }}"
+    PALIMPSEST_HUB_MAX_CONTEXT_MEMBERS: "{{ palimpsest_max_context_members | string }}"
 
 palimpsest_hub_worker_service:
   container_name: palimpsest_hub_worker

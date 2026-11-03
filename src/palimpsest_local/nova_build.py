@@ -14,6 +14,7 @@ import os
 import re
 import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -335,6 +336,10 @@ def _field(resource: Any, name: str, default=None):
     return resource.get(name, default) if isinstance(resource, dict) else getattr(resource, name, default)
 
 
+class NovaCreateAborted(ArtifactValidationError):
+    """A denied pre-request guard with a durably verified no-call receipt."""
+
+
 class NovaController:
     """Durable exact-owned Nova lifecycle for operator jobs, with retained data volumes."""
 
@@ -361,6 +366,25 @@ class NovaController:
             )
         if result.get("project_id") != self.project_id or result.get("job_id") != job_id:
             _fail("receipt ownership mismatch")
+        if result.get("phase") == "aborted-before-request":
+            descriptor = result.get("descriptor")
+            if (
+                result.get("schema") != "palimpsest.nova-job.v1"
+                or result.get("request_started") is not False
+                or "server_id" in result
+                or not isinstance(descriptor, dict)
+                or result.get("spec_digest") != spec_digest(descriptor)
+            ):
+                _fail("invalid aborted-before-request receipt")
+            # Re-establish durability before treating even a recovered marker as
+            # no-call proof (an earlier atomic replacement may have lost fsync).
+            with _directory(self.receipts) as fd:
+                proof_fd = os.open(self._path(job_id).name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd)
+                try:
+                    os.fsync(proof_fd)
+                finally:
+                    os.close(proof_fd)
+                os.fsync(fd)
         return result
 
     def _save(self, record: dict):
@@ -392,6 +416,7 @@ class NovaController:
         boot_volume_type: str | None = None,
         data_volumes: list[dict] | None = None,
         require_gpu: bool = True,
+        before_create: Callable[[str], None] | None = None,
     ) -> dict:
         self._scope()
         for label, value in (
@@ -504,6 +529,19 @@ class NovaController:
             "request_monotonic_seconds": time.monotonic(),
             "request_unix_seconds": time.time(),
         }
+        request = {
+            "name": name,
+            "flavor_id": flavor_id,
+            "networks": [{"uuid": network_id}],
+            "security_groups": [{"name": identity} for identity in security_group_ids],
+            "user_data": base64.b64encode(user_data.encode()).decode(),
+            "block_device_mapping_v2": mapping,
+            "metadata": {
+                "palimpsest_job": job_id,
+                "palimpsest_spec": record["spec_digest"],
+                "palimpsest_purpose": "nova-layer-workflow",
+            },
+        }
         # Exclusive durable intent is the create fence, including across CLI
         # processes. An uncertain accepted request is never automatically replayed.
         with _directory(self.receipts) as receipt_fd:
@@ -516,25 +554,26 @@ class NovaController:
                 stream.flush()
                 os.fsync(stream.fileno())
             os.fsync(receipt_fd)
-        server = self.connection.compute.create_server(
-            name=name,
-            flavor_id=flavor_id,
-            networks=[{"uuid": network_id}],
-            security_groups=[{"name": identity} for identity in security_group_ids],
-            user_data=base64.b64encode(user_data.encode()).decode(),
-            block_device_mapping_v2=mapping,
-            metadata={
-                "palimpsest_job": job_id,
-                "palimpsest_spec": record["spec_digest"],
-                "palimpsest_purpose": "nova-layer-workflow",
-            },
-        )
+        if before_create is not None:
+            try:
+                before_create(record["spec_digest"])
+            except Exception as exc:
+                # Only this branch knows the request has not started. Never
+                # translate an exception from create_server into a no-call.
+                record.update(phase="aborted-before-request", request_started=False)
+                self._save(record)
+                if self._read(job_id) != record:
+                    _fail("aborted-before-request receipt changed before verification")
+                raise NovaCreateAborted(str(exc)) from exc
+        server = self.connection.compute.create_server(**request)
         record.update(server_id=_field(server, "id"), phase="created")
         self._save(record)
         return record
 
     def inspect(self, job_id: str) -> dict:
         record = self._read(job_id)
+        if record.get("phase") == "aborted-before-request":
+            return {**record, "uncertain_create": False}
         if "server_id" not in record:
             return {**record, "uncertain_create": True}
         server = self._owned(record)

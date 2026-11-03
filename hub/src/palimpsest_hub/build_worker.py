@@ -1,10 +1,10 @@
 """HTTPS-only, single-execution Hub worker.
 
-The private local journal is a write-ahead fence, not a retry queue. A lost
-claim response permanently stops claiming until an operator establishes its
-safe disposition. Lost output/failure responses are settled only by status
-reads. Restart never executes a recorded job again. Executor cleanup must
-succeed before uploading, deleting a job tree, or claiming another job.
+The private local journal is a write-ahead fence, not a retry queue. Identified
+claim loss is settled by an authenticated SQL-fenced GET, never another POST.
+Legacy unidentified claim loss requires operator disposition. Lost output/failure
+responses are settled only by status reads. Restart never executes a recorded job
+again. Executor cleanup must succeed before disposal or another claim.
 
 Configuration comes from BuildWorkerSettings; only the key *path* is configured.
 The executor CLI owns Linux/tool/mount preflight and exact resource cleanup.
@@ -63,6 +63,22 @@ class BuildFailed(RuntimeError):
 
 class BuildTimeout(BuildFailed):
     pass
+
+
+def _safe_error_class(exc: Exception) -> str:
+    # Fixed labels only: even a custom exception class name is untrusted data.
+    for kind in (
+        BuildTimeout,
+        TimeoutError,
+        ssl.SSLError,
+        http.client.HTTPException,
+        OSError,
+        WorkerHalted,
+        ValueError,
+    ):
+        if isinstance(exc, kind):
+            return kind.__name__
+    return "Exception"
 
 
 def _seal_worker_memory() -> None:
@@ -146,8 +162,18 @@ class HttpsTransport:
         self.context = ssl.create_default_context()
 
     @contextmanager
-    def request(self, method: str, path: str, *, lease: str | None = None, body=None, headers=None, deadline=None):
-        if not path.startswith("/v1/build-worker/") or any(c in path for c in "\r\n?#"):
+    def request(
+        self,
+        method: str,
+        path: str,
+        *,
+        lease: str | None = None,
+        body=None,
+        headers=None,
+        deadline=None,
+        wait_for_response=False,
+    ):
+        if not path.startswith(("/v1/build-worker/", "/v1/image-worker/")) or any(c in path for c in "\r\n?#"):
             raise WorkerHalted("invalid worker route")
         connection = http.client.HTTPSConnection(self.host, self.port, timeout=10, context=self.context)
         end = deadline if deadline is not None else time.monotonic() + 30
@@ -181,6 +207,15 @@ class HttpsTransport:
                 expire()
                 raise BuildTimeout("HTTP request deadline exceeded")
             connection.request(method, path, body=body, headers=fields)
+            if wait_for_response or (
+                deadline is not None
+                and path.startswith("/v1/image-worker/")
+                and (method == "PUT" or (method == "POST" and path.endswith("/complete")))
+            ):
+                # The server still hashes/publishes a multi-GiB body AFTER the
+                # last byte is sent. Keep connect/send idle bounds, but wait
+                # for that receipt only until this unchanged absolute lease.
+                connection.sock.settimeout(max(0.001, end - time.monotonic()))
             response = connection.getresponse()
             try:
                 # Never consume or follow a Location, including same-origin redirects.
@@ -313,6 +348,7 @@ class Journal:
             raise WorkerHalted("worker scratch must be an owner-only directory")
         self.root = root
         self.path = root / "worker.json"
+        self.cursor = None
         self.lock_fd = _open_private(root / "worker.lock", os.O_CREAT | os.O_RDWR)
         try:
             fcntl.flock(self.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -324,10 +360,11 @@ class Journal:
         os.close(self.lock_fd)
 
     def load(self) -> dict | None:
+        self._diagnostics()
         try:
             fd = _open_private(self.path)
         except FileNotFoundError:
-            if any(p.name != "worker.lock" for p in self.root.iterdir()):
+            if any(p.name not in {"worker.lock", "last-image-failure.json"} for p in self.root.iterdir()):
                 raise WorkerHalted("unjournaled worker scratch retained")
             return None
         with os.fdopen(fd, "rb") as stream:
@@ -337,6 +374,7 @@ class Journal:
         try:
             value = json.loads(raw)
             if not isinstance(value, dict) or value.get("phase") not in {
+                "idle",
                 "claim_pending",
                 "claimed",
                 "executing",
@@ -345,13 +383,48 @@ class Journal:
                 "terminal",
             }:
                 raise ValueError("invalid journal phase")
-            if value["phase"] != "claim_pending":
+            if value.get("protocol", "recipe") not in {"recipe", "image"}:
+                raise ValueError("invalid journal protocol")
+            if "channel" in value or "sequence" in value or value["phase"] == "idle":
+                _uuid(value["channel"])
+                if type(value["sequence"]) is not int or not 1 <= value["sequence"] <= 2**63 - 1:
+                    raise ValueError("invalid claim sequence")
+            if value["phase"] not in {"claim_pending", "idle"}:
                 _uuid(value["id"])
                 _uuid(value["lease"])
         except (ValueError, TypeError, KeyError) as exc:
             raise WorkerHalted("invalid worker journal") from exc
         self._discard_uncommitted()
+        self.cursor = {key: value[key] for key in ("channel", "sequence")} if "channel" in value else None
+        if value["phase"] == "idle":
+            if any(
+                p.name not in {"worker.lock", "worker.json", "last-image-failure.json"} for p in self.root.iterdir()
+            ):
+                raise WorkerHalted("unjournaled worker scratch retained")
+            return None
         return value
+
+    def _diagnostics(self):
+        # These two fixed files confer no job/recovery authority. A crash before
+        # replace leaves only bounded uncommitted evidence, safe to discard.
+        from .image_executor import FAILURE_FILE, FAILURE_LIMIT
+
+        for name in (FAILURE_FILE, FAILURE_FILE + ".new"):
+            path = self.root / name
+            try:
+                fd = _open_private(path)
+            except FileNotFoundError:
+                continue
+            try:
+                info = os.fstat(fd)
+                current = path.lstat()
+                if info.st_size > FAILURE_LIMIT or (info.st_dev, info.st_ino) != (current.st_dev, current.st_ino):
+                    raise WorkerHalted("unsafe image failure evidence retained")
+                if name.endswith(".new"):
+                    path.unlink()
+                    self._sync()
+            finally:
+                os.close(fd)
 
     def _discard_uncommitted(self):
         """Under flock, only the validated durable journal authorizes recovery.
@@ -393,10 +466,29 @@ class Journal:
             os.fsync(stream.fileno())
         os.replace(temporary, self.path)
         self._sync()
+        self.cursor = {key: value[key] for key in ("channel", "sequence")} if "channel" in value else None
 
     def clear(self):
+        if self.cursor is not None:
+            self.save({"phase": "idle", **self.cursor})
+            return
         self.path.unlink()
         self._sync()
+
+    def begin_claim(self, protocol: str) -> dict:
+        if self.load() is not None:
+            raise WorkerHalted("unsettled worker journal")
+        cursor = self.cursor or {"channel": str(uuid.uuid4()), "sequence": 0}
+        if cursor["sequence"] >= 2**63 - 1:
+            raise WorkerHalted("worker claim sequence exhausted")
+        record = {
+            "phase": "claim_pending",
+            "protocol": protocol,
+            "channel": cursor["channel"],
+            "sequence": cursor["sequence"] + 1,
+        }
+        self.save(record)
+        return record
 
     def job_dir(self, record: dict) -> Path:
         return self.root / ("job-" + _uuid(record["id"]))
@@ -424,10 +516,19 @@ def _terminate(child: subprocess.Popen):
     raise WorkerHalted("executor process group could not be verified stopped")
 
 
-def run_executor(arguments: list[str], timeout: float, stop: threading.Event | None = None, log: Path | None = None):
+def run_executor(
+    arguments: list[str],
+    timeout: float,
+    stop: threading.Event | None = None,
+    log: Path | None = None,
+    *,
+    module: str = "palimpsest_local.hub_builder",
+):
     """Bound both output pipes and wall time without communicate() accumulation."""
+    if module not in {"palimpsest_local.hub_builder", "palimpsest_local.hub_image_builder"}:
+        raise WorkerHalted("invalid executor module")
     child = subprocess.Popen(
-        [sys.executable, "-I", "-m", "palimpsest_local.hub_builder", *arguments],
+        [sys.executable, "-I", "-m", module, *arguments],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -438,6 +539,7 @@ def run_executor(arguments: list[str], timeout: float, stop: threading.Event | N
     )
     output = bytearray()
     errors = 0
+    error_tail = bytearray()
     end = time.monotonic() + timeout
     try:
         with selectors.DefaultSelector() as selector:
@@ -459,13 +561,22 @@ def run_executor(arguments: list[str], timeout: float, stop: threading.Event | N
                                 raise BuildFailed("executor output exceeded limit")
                             output.extend(chunk)
                         else:
-                            errors += len(chunk)
-                            if errors > LOG_LIMIT:
-                                raise BuildFailed("executor log exceeded limit")
-                            if log_fd is not None:
-                                os.write(log_fd, chunk)
+                            if module == "palimpsest_local.hub_image_builder":
+                                error_tail.extend(chunk)
+                                del error_tail[:-LOG_LIMIT]
+                            else:
+                                errors += len(chunk)
+                                if errors > LOG_LIMIT:
+                                    raise BuildFailed("executor log exceeded limit")
+                                if log_fd is not None:
+                                    os.write(log_fd, chunk)
             finally:
                 if log_fd is not None:
+                    if module == "palimpsest_local.hub_image_builder":
+                        with os.fdopen(os.dup(log_fd), "wb") as stream:
+                            stream.write(error_tail)
+                            stream.flush()
+                            os.fsync(stream.fileno())
                     os.close(log_fd)
         if child.returncode == 124:
             raise BuildTimeout("executor deadline exceeded")
@@ -512,7 +623,8 @@ class BuildWorker:
 
     @staticmethod
     def _route(record, suffix=""):
-        return "/v1/build-worker/builds/" + _uuid(record["id"]) + suffix
+        prefix = "/v1/image-worker/jobs/" if record.get("protocol") == "image" else "/v1/build-worker/builds/"
+        return prefix + _uuid(record["id"]) + suffix
 
     def _status(self, record) -> dict:
         with self.transport.request("GET", self._route(record), lease=_uuid(record["lease"])) as response:
@@ -523,6 +635,10 @@ class BuildWorker:
             raise WorkerHalted("build disposition remains uncertain")
         if result["status"] == "complete" and record.get("output") is not None:
             output = record["output"]
+            if record.get("protocol") == "image":
+                if result.get("result") != output:
+                    raise WorkerHalted("image output disposition conflicts")
+                return result
             if (
                 result.get("output_digest") != output["digest"]
                 or result.get("output_size_bytes") != output["size_bytes"]
@@ -543,7 +659,11 @@ class BuildWorker:
         if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
             raise WorkerHalted("recorded executor tree is unsafe")
         try:
-            run_executor(["cleanup", str(directory), str(os.getpid())], 30)
+            arguments = ["cleanup", str(directory), str(os.getpid())]
+            if record.get("protocol") == "image":
+                run_executor(arguments, 60, module="palimpsest_local.hub_image_builder")
+            else:
+                run_executor(arguments, 30)
         except Exception as exc:
             raise WorkerHalted("executor cleanup could not be verified") from exc
 
@@ -580,21 +700,80 @@ class BuildWorker:
             self._status(record)
         self._dispose(record)
 
+    @staticmethod
+    def _claim_route(protocol):
+        return "/v1/image-worker/claim" if protocol == "image" else "/v1/build-worker/claim"
+
+    @staticmethod
+    def _claim_headers(record):
+        return {
+            "X-Palimpsest-Worker-Channel": _uuid(record["channel"]),
+            "X-Palimpsest-Claim-Sequence": str(record["sequence"]),
+        }
+
+    def _recover_claim(self, record):
+        if "channel" not in record:
+            raise WorkerHalted("claim outcome uncertain; operator disposition required")
+        try:
+            with self.transport.request(
+                "GET", self._claim_route(record.get("protocol", "recipe")), headers=self._claim_headers(record)
+            ) as response:
+                if response.status != 200:
+                    raise WorkerHalted("claim settlement unavailable")
+                result = _json_response(response)
+            if type(result.get("sequence")) is not int or any(
+                result.get(key) != record.get(key) for key in ("channel", "sequence", "protocol")
+            ):
+                raise WorkerHalted("claim settlement identity mismatch")
+            if "claim" not in result:
+                raise WorkerHalted("claim settlement missing outcome")
+            if result["claim"] is None:
+                self.journal.clear()
+                return None
+            identity = {
+                **record,
+                "phase": "claimed",
+                "id": _uuid(result["claim"]["id"]),
+                "lease": _uuid(result["claim"]["lease"]),
+            }
+            self.journal.save(identity)
+            return identity
+        except Exception as exc:
+            logger.warning(
+                "Worker claim settlement unavailable protocol=%s channel=%s sequence=%s cause=%s",
+                record["protocol"],
+                record["channel"],
+                record["sequence"],
+                _safe_error_class(exc),
+            )
+            raise WorkerHalted("claim outcome uncertain; journal retained") from exc
+
     def reconcile(self):
         record = self.journal.load()
         if record is None:
             return
         if record.get("phase") == "claim_pending":
-            raise WorkerHalted("claim outcome uncertain; operator disposition required")
+            record = self._recover_claim(record)
+            if record is None:
+                return
         if record.get("phase") not in {"claimed", "executing", "output_pending", "fail_pending", "terminal"}:
             raise WorkerHalted("invalid worker journal phase")
         _uuid(record["id"])
         _uuid(record["lease"])
         self._cleanup(record)
+        if record["phase"] == "output_pending" and record.get("protocol") == "image":
+            from .image_executor import upload
+
+            upload(self, record, record["output"], None)
+            return
         if record["phase"] in {"output_pending", "fail_pending", "terminal"}:
             self._status(record)
             self._dispose(record)
         else:
+            if record.get("protocol") == "image":
+                from .image_executor import retain_failure
+
+                retain_failure(self, record)
             self._fail(record, "build_failed")
 
     def _download(self, record, descriptor, target: Path, deadline: float):
@@ -710,51 +889,93 @@ class BuildWorker:
         self.reconcile()
         if self.stop.is_set():
             return False
-        self.journal.save({"phase": "claim_pending"})
+        from palimpsest_hub import image_executor
+
         record = None
+        pending = None
         try:
-            with self.transport.request("POST", "/v1/build-worker/claim") as response:
-                if response.status == 204:
-                    self.journal.clear()
-                    return False
-                if response.status != 202:
-                    raise WorkerHalted("claim outcome uncertain")
-                value = _json_response(response)
-                identity = {"phase": "claimed", "id": _uuid(value["id"]), "lease": _uuid(value["lease"])}
-                self.journal.save(identity)
-                record = identity
-                claim = validate_claim(
-                    value,
-                    self.settings.palimpsest_hub_max_blob_bytes,
-                    self.settings.palimpsest_hub_build_timeout_seconds,
-                )
+            for candidate in ("image", "recipe"):
+                pending = self.journal.begin_claim(candidate)
+                route = self._claim_route(candidate)
+                with self.transport.request("POST", route, headers=self._claim_headers(pending)) as response:
+                    if response.status == 204:
+                        self.journal.clear()
+                        continue
+                    if response.status != 202:
+                        raise WorkerHalted("claim outcome uncertain")
+                    value = _json_response(response)
+                    identity = {
+                        **pending,
+                        "phase": "claimed",
+                        "protocol": candidate,
+                        "id": _uuid(value["id"]),
+                        "lease": _uuid(value["lease"]),
+                    }
+                    self.journal.save(identity)
+                    record = identity
+                    if candidate == "image":
+                        claim = image_executor.validate_claim(value, self.settings)
+                    else:
+                        claim = validate_claim(
+                            value,
+                            self.settings.palimpsest_hub_max_blob_bytes,
+                            self.settings.palimpsest_hub_build_timeout_seconds,
+                        )
+                    break
+            else:
+                return False
         except Exception as exc:
             if record is None:
-                raise WorkerHalted("claim outcome uncertain; journal retained") from exc
+                if pending is None:
+                    raise WorkerHalted("claim outcome uncertain; journal retained") from exc
+                logger.warning(
+                    "Worker claim response uncertain protocol=%s channel=%s sequence=%s cause=%s",
+                    pending["protocol"],
+                    pending["channel"],
+                    pending["sequence"],
+                    _safe_error_class(exc),
+                )
+                self.reconcile()
+                return True
             # The exact lease is durable: invalid descriptors fail this attempt,
             # rather than poisoning the worker as an unidentified claim.
             self._cleanup(record)
+            if record.get("protocol") == "image":
+                image_executor.retain_failure(self, record, exc)
             self._fail(record, "build_failed")
             return True
         deadline = time.monotonic() + claim["timeout_seconds"]
         try:
-            result = self._build(claim, record, deadline)
-        except WorkerHalted:
+            result = (
+                image_executor.build(self, claim, record, deadline)
+                if record.get("protocol") == "image"
+                else self._build(claim, record, deadline)
+            )
+        except WorkerHalted as exc:
             self._cleanup(record)
+            if record.get("protocol") == "image":
+                image_executor.retain_failure(self, record, exc)
             raise
         except Exception as exc:
             self._cleanup(record)
+            if record.get("protocol") == "image":
+                image_executor.retain_failure(self, record, exc)
             self._fail(record, "build_timeout" if isinstance(exc, BuildTimeout) else "build_failed")
         else:
             self._cleanup(record)
             try:
-                self._upload(record, result, deadline)
+                if record.get("protocol") == "image":
+                    image_executor.upload(self, record, result, deadline)
+                else:
+                    self._upload(record, result, deadline)
             except WorkerHalted:
                 raise
             except Exception as exc:
                 # Upload intent means only status settlement remains safe.
                 if record["phase"] == "output_pending":
                     raise WorkerHalted("output disposition uncertain; journal retained")
+                if record.get("protocol") == "image":
+                    image_executor.retain_failure(self, record, exc)
                 self._fail(record, "build_timeout" if isinstance(exc, BuildTimeout) else "build_failed")
         return True
 
@@ -792,6 +1013,18 @@ async def main() -> None:
             raise WorkerHalted("executor preflight failed") from exc
         worker = BuildWorker(settings, transport, journal, stop)
         await _drain_blocking(stop, worker.reconcile)
+        try:
+            await _drain_blocking(
+                stop,
+                lambda: run_executor(
+                    ["preflight", str(os.getpid()), str(journal.root), settings.palimpsest_hub_image_cgroup_root],
+                    30,
+                    stop,
+                    module="palimpsest_local.hub_image_builder",
+                ),
+            )
+        except Exception as exc:
+            raise WorkerHalted("image executor preflight failed") from exc
         while not stop.is_set():
             processed = await _drain_blocking(stop, worker.process_one)
             if not processed:
@@ -806,11 +1039,18 @@ async def main() -> None:
 def run() -> None:
     try:
         asyncio.run(main())
-    except Exception:
+    except Exception as exc:
         # Never send exception chains, recipes, paths, or credentials to logs.
-        logger.error("Build worker halted; retained state requires safe disposition")
+        logger.error(
+            "Build worker halted; retained state requires safe disposition cause=%s",
+            _safe_error_class(exc.__cause__ or exc),
+        )
         raise SystemExit(1) from None
 
 
 if __name__ == "__main__":
-    run()
+    # Image adapters import the canonical worker module. Run that same module's
+    # loop so timeout/HOLD exception classes are identical under both entrypoints.
+    from palimpsest_hub.build_worker import run as worker_main
+
+    worker_main()

@@ -49,12 +49,16 @@ def test_invalid_digest(config, value):
 def simple_ancestors(monkeypatch, target, *, mode=0o711, acl=b"user::rwx\ngroup::--x\nother::--x\n\n"):
     original = os.fstat
     inode = target.stat().st_ino
+    simulated_ctimes = {}
 
     def metadata(fd):
         info = original(fd)
         values = {key: getattr(info, key) for key in ("st_dev", "st_ino", "st_mode", "st_uid", "st_gid", "st_ctime_ns")}
         if info.st_ino != inode:
             values["st_mode"] = stat.S_IFDIR | 0o755
+            # Simulated shared ancestors must not inherit unrelated /tmp churn.
+            # The target retains real ctime so actual mutation tests stay meaningful.
+            values["st_ctime_ns"] = simulated_ctimes.setdefault(info.st_ino, info.st_ctime_ns)
         elif mode is not None:
             values["st_mode"] = stat.S_IFDIR | mode
         return SimpleNamespace(**values)

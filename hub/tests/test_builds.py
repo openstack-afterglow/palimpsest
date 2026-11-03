@@ -125,8 +125,16 @@ async def enqueue(h, base, *, name="private-output", layers=(), headers=None):
     )
 
 
+def claim_headers(channel=None, sequence=1):
+    return {
+        **WORKER,
+        "X-Palimpsest-Worker-Channel": channel or str(uuid4()),
+        "X-Palimpsest-Claim-Sequence": str(sequence),
+    }
+
+
 async def claim(h):
-    response = await h.client.post("/v1/build-worker/claim", headers=WORKER)
+    response = await h.client.post("/v1/build-worker/claim", headers=claim_headers())
     assert response.status_code == 202, response.text
     return response.json()
 
@@ -188,7 +196,7 @@ async def test_streamed_claim_download_publication_and_lost_response_settlement(
     assert admitted["base"] == job["base"] and admitted["input_bytes"] == len(base_bytes)
     headers = attempt_headers(job)
     prefix = attempt_path(job)
-    assert (await h.client.post("/v1/build-worker/claim", headers=WORKER)).status_code == 204
+    assert (await h.client.post("/v1/build-worker/claim", headers=claim_headers())).status_code == 204
     for target in (base, unrelated):
         assert (await h.client.get(prefix + f"/inputs/{target}", headers=WORKER)).status_code == 409
     assert (await h.client.get(prefix + f"/inputs/{unrelated}", headers=headers)).status_code == 404
@@ -277,7 +285,9 @@ async def test_global_claim_deadline_nonce_and_terminal_failure_boundaries(remot
     first = await enqueue(h, first_base)
     second = await enqueue(h, second_base, headers=FOREIGN)
     assert first.status_code == second.status_code == 202
-    responses = await asyncio.gather(*[h.client.post("/v1/build-worker/claim", headers=WORKER) for _ in range(6)])
+    responses = await asyncio.gather(
+        *[h.client.post("/v1/build-worker/claim", headers=claim_headers()) for _ in range(6)]
+    )
     assert sorted(response.status_code for response in responses) == [202, 204, 204, 204, 204, 204]
     old = next(response.json() for response in responses if response.status_code == 202)
     assert old["id"] == first.json()["id"]
@@ -312,7 +322,7 @@ async def test_global_claim_deadline_nonce_and_terminal_failure_boundaries(remot
         attempt_path(new) + "/fail", headers=attempt_headers(new), json={"error_code": "build_failed"}
     )
     assert again.json() == failed.json()
-    assert (await h.client.post("/v1/build-worker/claim", headers=WORKER)).status_code == 204
+    assert (await h.client.post("/v1/build-worker/claim", headers=claim_headers())).status_code == 204
     assert (await output(h, new, b"hsqsfailed-output")).status_code == 409
     async with h.factory() as session:
         rows = (await session.scalars(select(PalimpsestHubBuild))).all()
@@ -328,7 +338,7 @@ async def test_claim_and_download_recheck_visibility_chain_and_bytes(remote_hub)
         source = await session.scalar(select(PalimpsestHubLayer).where(PalimpsestHubLayer.blob_digest == base))
         source.project_id = "beta"
         await session.commit()
-    assert (await h.client.post("/v1/build-worker/claim", headers=WORKER)).status_code == 204
+    assert (await h.client.post("/v1/build-worker/claim", headers=claim_headers())).status_code == 204
     async with h.factory() as session:
         row = await session.get(PalimpsestHubBuild, queued.json()["id"])
         assert row.status == "error" and row.lease_owner is None
@@ -456,7 +466,7 @@ async def test_worker_key_admission_is_disabled_when_unconfigured(remote_hub):
     base = await upload_base(h)
     h.settings.palimpsest_hub_build_worker_key = SecretStr("")
     assert (await enqueue(h, base)).status_code == 503
-    assert (await h.client.post("/v1/build-worker/claim", headers=WORKER)).status_code == 401
+    assert (await h.client.post("/v1/build-worker/claim", headers=claim_headers())).status_code == 401
     # No configured worker credential is equivalent to a tenant or admin credential.
     assert (await h.client.get("/v1/builds", headers=WORKER)).status_code == 403
 
@@ -541,12 +551,12 @@ async def test_aggregate_worker_input_limit_is_enforced_before_admission_and_cla
     h.settings.palimpsest_hub_max_blob_bytes = limit
     refused = await enqueue(h, base, name="oversize-inputs", layers=[parent])
     assert refused.status_code == 422 and "total build inputs" in refused.text
-    assert (await h.client.post("/v1/build-worker/claim", headers=WORKER)).status_code == 204
+    assert (await h.client.post("/v1/build-worker/claim", headers=claim_headers())).status_code == 204
     h.settings.palimpsest_hub_max_blob_bytes = 1024 * 1024
     accepted = await enqueue(h, base, name="changed-limits", layers=[parent])
     assert accepted.status_code == 202
     h.settings.palimpsest_hub_max_blob_bytes = limit
-    assert (await h.client.post("/v1/build-worker/claim", headers=WORKER)).status_code == 204
+    assert (await h.client.post("/v1/build-worker/claim", headers=claim_headers())).status_code == 204
     async with h.factory() as session:
         row = await session.get(PalimpsestHubBuild, accepted.json()["id"])
         assert row.status == "error" and row.error_code == "build_failed" and row.lease_owner is None
@@ -586,7 +596,7 @@ async def test_https_build_architecture_rechecked_at_admission_claim_input_and_p
         row = await session.scalar(select(PalimpsestHubLayer).where(PalimpsestHubLayer.blob_digest == parent))
         row.arch = "aarch64"
         await session.commit()
-    assert (await h.client.post("/v1/build-worker/claim", headers=WORKER)).status_code == 204
+    assert (await h.client.post("/v1/build-worker/claim", headers=claim_headers())).status_code == 204
     async with h.factory() as session:
         row = await session.scalar(select(PalimpsestHubLayer).where(PalimpsestHubLayer.blob_digest == parent))
         row.arch = "x86_64"
@@ -609,3 +619,67 @@ async def test_https_build_architecture_rechecked_at_admission_claim_input_and_p
             is None
         )
         assert (await session.get(PalimpsestHubBuild, job["id"])).status != "complete"
+
+
+@pytest.mark.asyncio
+async def test_claim_receipt_recovers_lost_202_without_renewing_or_selecting_again(remote_hub):
+    h = remote_hub
+    base = await upload_base(h)
+    first, second = await enqueue(h, base), await enqueue(h, base, name="second")
+    channel = str(uuid4())
+    headers = claim_headers(channel)
+    accepted = await h.client.post("/v1/build-worker/claim", headers=headers)
+    assert accepted.status_code == 202 and accepted.json()["id"] == first.json()["id"]
+    job = accepted.json()
+    h.settings.palimpsest_hub_build_timeout_seconds = 3600
+    recovered = await h.client.get("/v1/build-worker/claim", headers=headers)
+    assert recovered.status_code == 200 and recovered.headers["Cache-Control"] == "no-store"
+    assert recovered.json() == {
+        "channel": channel,
+        "sequence": 1,
+        "protocol": "recipe",
+        "claim": {"id": job["id"], "lease": job["lease"]},
+    }
+    repeated = await h.client.post("/v1/build-worker/claim", headers=headers)
+    assert repeated.json() == job  # Includes the original immutable deadline.
+    async with h.factory() as session:
+        assert (await session.get(PalimpsestHubBuild, second.json()["id"])).status == "queued"
+    await h.client.post(attempt_path(job) + "/fail", headers=attempt_headers(job), json={"error_code": "build_failed"})
+    newer = await h.client.post("/v1/build-worker/claim", headers=claim_headers(channel, 2))
+    assert newer.status_code == 202 and newer.json()["id"] == second.json()["id"]
+    for method in (h.client.get, h.client.post):
+        assert (await method("/v1/build-worker/claim", headers=headers)).status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_empty_receipt_and_recovery_before_delayed_post_never_claim_new_work(remote_hub):
+    h = remote_hub
+    base = await upload_base(h)
+    channel = str(uuid4())
+    first = claim_headers(channel)
+    assert (await h.client.post("/v1/build-worker/claim", headers=first)).status_code == 204
+    queued = await enqueue(h, base)
+    recovered = await h.client.get("/v1/build-worker/claim", headers=first)
+    assert recovered.json()["claim"] is None
+    assert (await h.client.post("/v1/build-worker/claim", headers=first)).status_code == 204
+    unseen = claim_headers(channel, 2)
+    assert (await h.client.get("/v1/build-worker/claim", headers=unseen)).json()["claim"] is None
+    assert (await h.client.post("/v1/build-worker/claim", headers=unseen)).status_code == 204
+    next_claim = await h.client.post("/v1/build-worker/claim", headers=claim_headers(channel, 3))
+    assert next_claim.status_code == 202 and next_claim.json()["id"] == queued.json()["id"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["GET", "POST"])
+@pytest.mark.parametrize(
+    "identity",
+    [
+        {},
+        {"X-Palimpsest-Worker-Channel": "invalid", "X-Palimpsest-Claim-Sequence": "1"},
+        {"X-Palimpsest-Worker-Channel": str(uuid4()), "X-Palimpsest-Claim-Sequence": "0"},
+        {"X-Palimpsest-Worker-Channel": str(uuid4()), "X-Palimpsest-Claim-Sequence": str(2**63)},
+    ],
+)
+async def test_claim_identity_is_required_even_with_worker_key(remote_hub, method, identity):
+    response = await remote_hub.client.request(method, "/v1/build-worker/claim", headers={**WORKER, **identity})
+    assert response.status_code == 422
