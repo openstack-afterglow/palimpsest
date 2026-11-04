@@ -11,6 +11,6 @@
 
 ## 3. Final source qualification
 
-- [ ] 3.1 Run final relevant authorization, migration, Kolla and release workflow checks with immutable receipts.
-- [ ] 3.2 Run separate actual native HTTP runtime smoke against synthetic Keystone and temporary SQL/CAS; preserve deployment limitations.
-- [ ] 3.3 Review and stamp the final source architecture; hand off exact files, role matrix and evidence to the publishing/deployment owner.
+- [x] 3.1 Run final relevant authorization, migration, Kolla and release workflow checks with immutable receipts.
+- [ ] 3.2 Run separate actual native HTTP runtime smoke against synthetic Keystone and temporary SQL/CAS; preserve deployment limitations. (Partial: in-process uvicorn registered-router suite passed; built-image/container smoke and restore requalification pending.)
+- [x] 3.3 Review and stamp the final source architecture; hand off exact files, role matrix and evidence to the publishing/deployment owner.
