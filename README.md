@@ -19,31 +19,31 @@ are not deployed-service acceptance; see the [control-plane boundaries](ARCHITEC
 - **macOS Apple Silicon:** supported default runtime through Lima 2.1+ and VZ (`lima-vz`); QEMU/libvirt Hypervisor.framework (`libvirt-hvf`) and Lima krunkit Vulkan GPU (`lima-krunkit`) are experimental.
 - **Linux:** supported libvirt/KVM runtime for conventional cloud-image VMs on `x86_64` and `aarch64`; the OCI-root runtime is narrower and supports Linux `x86_64`/`amd64` KVM only.
 - **Declarative projects:** a strict `palimpsest.yml` workflow reconciles multiple VM services with dependencies, environment, typed cloud-init, persistent block volumes, networks, and Lima TCP forwarding.
-- **Release source:** 0.3.11 adds Hub-authoritative SDK image publication/query/extension, parent-aware logical layers, immutable visibility-scoped payloads and an opt-in Manila/CephFS native lane. It preserves the released HTTPS worker, HA/readiness and catalog/instance paths. New native profiles remain inactive until storage/issuer qualification; source, publication and actual deployment have separate evidence in the [latest handoff](docs/development-handoff.md).
+- **Release source:** 0.3.12 adds Hub-authoritative SDK image publication/query/extension, parent-aware logical layers, immutable visibility-scoped payloads and an opt-in Manila/CephFS native lane. It preserves the released HTTPS worker, HA/readiness and catalog/instance paths. New native profiles remain inactive until storage/issuer qualification; source, publication and actual deployment have separate evidence in the [latest handoff](docs/development-handoff.md).
 
 ## Install from PyPI
 
 Requires Python 3.11 or newer. Prefer an isolated uv tool, or a pip virtual environment:
 
 ```sh
-uv tool install --python 3.11 "palimpsest-client==0.3.11"
+uv tool install --python 3.11 "palimpsest-client==0.3.12"
 palimpsest --version
 
 # Alternative: pip, without modifying the system Python.
 python3.11 -m venv .venv
-.venv/bin/python -m pip install "palimpsest-client==0.3.11"
+.venv/bin/python -m pip install "palimpsest-client==0.3.12"
 .venv/bin/palimpsest --version
 ```
 
 If uv's tool directory is not on `PATH`, run `uv tool update-shell` explicitly
 and open a new terminal. One-off use: `uvx --python 3.11 --from
-palimpsest-client==0.3.11 palimpsest --version`.
+palimpsest-client==0.3.12 palimpsest --version`.
 
 Root client installation and Hub service deployment are separate. API, export
 worker and build-worker images must match the reviewed release; updating the
 root wheel alone does not update running Kolla containers.
 
-The commands above select version0.3.11 after its formal publication. Check the
+The commands above select version0.3.12 after its formal publication. Check the
 [release handoff](docs/development-handoff.md) for actual PyPI/image receipts and
 the deployment-server package/lock selection. Older release and production
 receipts remain historical and do not establish the currently running version.

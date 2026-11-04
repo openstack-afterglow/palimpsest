@@ -88,6 +88,17 @@ def store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> LocalPathBlobStore
     return LocalPathBlobStore(tmp_path / "hub")
 
 
+@pytest.fixture(autouse=True)
+def storage_contract_writer(monkeypatch: pytest.MonkeyPatch):
+    """Tokenless synthetic storage actors; original-subject revalidation is covered in test_auth/test_image_jobs."""
+    from palimpsest_hub.services import image_jobs
+
+    async def unchanged(token_info):
+        return token_info
+
+    monkeypatch.setattr(image_jobs, "fresh_writer", unchanged)
+
+
 def _put_blob(store: LocalPathBlobStore, payload: bytes) -> str:
     session_id = "a" * 32
     store.start_upload(session_id)
@@ -1710,6 +1721,61 @@ async def test_private_blob_can_be_registered_by_another_project(
 
 
 @pytest.mark.asyncio
+async def test_member_delete_preserves_other_project_identical_layer(store, monkeypatch):
+    from palimpsest_hub.api.hub import delete_hub_layer
+
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    monkeypatch.setattr("palimpsest_hub.api.hub.get_session_factory", lambda: factory)
+    monkeypatch.setattr("palimpsest_hub.api.hub.get_blob_store", lambda: store)
+    try:
+        payload = b"shared identical layer bytes"
+        digest = _put_blob(store, payload)
+        config = {
+            "name": "shared",
+            "kind": "squashfs",
+            "blob_digest": digest,
+            "arch": None,
+            "parent_digest": None,
+            "chain_id": None,
+            "disk_format": None,
+            "os_variant": None,
+            "base_image_digest": None,
+        }
+        async with factory() as session:
+            session.add(
+                PalimpsestHubLayer(
+                    blob_digest=digest,
+                    blob_md5=None,
+                    size_bytes=len(payload),
+                    media_type=MEDIA_TYPE_LAYER_SQUASHFS,
+                    config_digest=compute_config_digest(config),
+                    name="shared",
+                    kind="squashfs",
+                    config_json=config,
+                    project_id="project-a",
+                    is_published=False,
+                    created_by="user-a",
+                )
+            )
+            session.add(PalimpsestHubLayerAccess(blob_digest=digest, project_id="project-b", created_by="user-b"))
+            await session.commit()
+        owner = {"project_id": "project-a", "user_id": "user-a", "package_actions": {"packages:delete"}}
+        with pytest.raises(HTTPException) as retained:
+            await delete_hub_layer(digest, owner)
+        assert retained.value.status_code == 409
+        async with factory() as session:
+            assert await session.get(PalimpsestHubLayerAccess, (digest, "project-b")) is not None
+            assert (
+                await session.execute(select(PalimpsestHubLayer).where(PalimpsestHubLayer.blob_digest == digest))
+            ).scalar_one_or_none() is not None
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_unscoped_upload_session_is_not_claimable_by_project():
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     async with engine.begin() as connection:
@@ -2073,11 +2139,11 @@ async def test_me_http_success_and_auth_errors_are_not_cacheable(monkeypatch):
             {"inventory": False, "download": True, "upload": False, "delete": False, "build": False},
         ),
         (False, set(), {"inventory": False, "download": False, "upload": False, "delete": False, "build": False}),
-        (True, set(), {"inventory": False, "download": False, "upload": False, "delete": True, "build": True}),
+        (True, set(), {"inventory": False, "download": False, "upload": False, "delete": False, "build": False}),
         (
             True,
             {"palimpsest-publish_editor"},
-            {"inventory": False, "download": False, "upload": True, "delete": True, "build": True},
+            {"inventory": False, "download": False, "upload": True, "delete": False, "build": False},
         ),
     ],
 )
@@ -2095,6 +2161,41 @@ async def test_me_capabilities_do_not_infer_extra_authority(monkeypatch, system_
     identity = {"user_id": "member", "project_id": "alpha", "roles": ["admin"], "is_system_admin": system_admin}
     context = await hub_api.get_hub_identity(identity)
     assert context["capabilities"] == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", ["reader", "member", "manager", "admin"])
+async def test_me_projects_standard_management_actions_not_system_flag(monkeypatch, tmp_path, role):
+    from palimpsest_hub import policy as native_policy
+
+    policy_file = tmp_path / "policy.yaml"
+    policy_file.write_text("{}\n")
+    policy_settings = SimpleNamespace(
+        oslo_policy_policy_file=str(policy_file),
+        oslo_policy_policy_dirs=(),
+    )
+    monkeypatch.setattr(native_policy, "get_settings", lambda: policy_settings)
+    actions = native_policy.allowed_actions([role], "alpha")
+
+    async def current_member(token_info):
+        return {
+            **token_info,
+            "package_capabilities": native_policy.capabilities_for(actions),
+            "package_actions": actions,
+            "is_package_system_admin": False,
+        }
+
+    monkeypatch.setattr(hub_api, "get_package_manager_info", current_member)
+    identity = {"user_id": "project-human", "project_id": "alpha", "roles": [role], "is_system_admin": False}
+    value = await hub_api.get_hub_identity(identity)
+    assert value["is_system_admin"] is False
+    assert value["capabilities"] == {
+        "inventory": True,
+        "download": True,
+        "upload": role != "reader",
+        "delete": role != "reader",
+        "build": role != "reader",
+    }
 
 
 @pytest.mark.asyncio
@@ -2904,7 +3005,13 @@ async def test_explicit_admin_native_upload_publish_read_bundle_delete_uses_targ
         "is_package_system_admin": True,
         "target_project_id": "selected-project",
         "target_project_name": "Selected Project",
-        "package_actions": {"packages:inventory", "packages:read", "packages:write", "system:manage"},
+        "package_actions": {
+            "packages:inventory",
+            "packages:read",
+            "packages:write",
+            "packages:delete",
+            "system:manage",
+        },
     }
     original = dict(admin)
 
@@ -2915,7 +3022,6 @@ async def test_explicit_admin_native_upload_publish_read_bundle_delete_uses_targ
         return info
 
     app.dependency_overrides[hub_api.get_package_manager_info] = identity
-    app.dependency_overrides[hub_api.require_admin] = identity
     monkeypatch.setattr(hub_api, "revalidate_package_admin", recheck)
     hidden = _put_blob(store, b"foreign private bytes")
     public = _put_blob(store, b"foreign published bytes")
@@ -3030,7 +3136,13 @@ async def test_me_preserves_original_identity_and_reports_explicit_admin_target(
             **token_info,
             "is_package_system_admin": True,
             "target_project_name": "Selected",
-            "package_actions": {"system:manage"},
+            "package_actions": {
+                "packages:inventory",
+                "packages:read",
+                "packages:write",
+                "packages:delete",
+                "system:manage",
+            },
             "package_capabilities": {
                 "palimpsest-inventory_reader",
                 "palimpsest-download_user",

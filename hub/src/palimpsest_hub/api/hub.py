@@ -43,7 +43,6 @@ from palimpsest_hub.auth import (
     get_package_manager_info,
     get_package_member_info,
     package_target_project_id,
-    require_admin,
     require_token,
     revalidate_package_admin,
     validate_package_owner,
@@ -464,10 +463,10 @@ async def _legacy_writer(token_info: dict = Depends(get_package_manager_info)) -
 
 
 async def _export_writer(token_info: dict = Depends(get_package_member_info)) -> dict:
-    """Trust exports retain their separately qualified non-administrative owner policy."""
+    """Export through the caller's project roles without an administrative credential fallback."""
     if token_info.get("is_system_admin") or {
         str(role).casefold() for role in (*token_info.get("roles", ()), *token_info.get("current_roles", ()))
-    } & {"admin", "manager", "service"}:
+    } & {"service"}:
         raise HTTPException(
             status_code=403, detail="Administrative or service identities cannot authorize image exports"
         )
@@ -483,6 +482,12 @@ async def _legacy_inventory(token_info: dict = Depends(get_package_manager_info)
 async def _legacy_download(token_info: dict = Depends(get_package_manager_info)) -> dict:
     if "packages:read" not in token_info.get("package_actions", ()):
         raise HTTPException(status_code=403, detail="Palimpsest download authority required")
+    return token_info
+
+
+async def _project_delete(token_info: dict = Depends(get_package_manager_info)) -> dict:
+    if "packages:delete" not in token_info.get("package_actions", ()):
+        raise HTTPException(status_code=403, detail="Project package deletion authority required")
     return token_info
 
 
@@ -518,8 +523,8 @@ async def get_hub_identity(token_info: dict = Depends(require_token)) -> dict[st
             "inventory": "palimpsest-inventory_reader" in capabilities,
             "download": "palimpsest-download_user" in capabilities,
             "upload": "palimpsest-publish_editor" in capabilities,
-            "delete": is_system_admin and "system:manage" in target_info.get("package_actions", ()),
-            "build": is_system_admin and "system:manage" in target_info.get("package_actions", ()),
+            "delete": "packages:delete" in target_info.get("package_actions", ()),
+            "build": "packages:write" in target_info.get("package_actions", ()),
         },
     }
 
@@ -1714,6 +1719,10 @@ async def _finalize_upload_locked(
                     await _legacy_writer(token_info)
                     if meta.is_published and "system:manage" not in token_info["package_actions"]:
                         raise HTTPException(status_code=403, detail="System publication policy denied")
+                else:
+                    from palimpsest_hub.services.image_jobs import fresh_writer
+
+                    await fresh_writer(token_info)
                 commit_started = True
                 await session.commit()
         except BaseException:
@@ -2041,6 +2050,10 @@ async def import_bundle(file: UploadFile, token_info: dict = Depends(_legacy_wri
                         if token_info.get("is_package_system_admin"):
                             token_info = await revalidate_package_admin(token_info)
                             await _legacy_writer(token_info)
+                        else:
+                            from palimpsest_hub.services.image_jobs import fresh_writer
+
+                            await fresh_writer(token_info)
                         commit_started = True
                         await session.commit()
                 except BaseException:
@@ -2059,8 +2072,8 @@ async def import_bundle(file: UploadFile, token_info: dict = Depends(_legacy_wri
 
 
 @router.delete("/layers/{digest}", status_code=204, operation_id="delete_hub_layer")
-async def delete_hub_layer(digest: str, token_info: dict = Depends(require_admin)) -> None:
-    """관리자 전용. 자식이 있으면 거부하고 blob 정리는 지연 GC에 맡긴다."""
+async def delete_hub_layer(digest: str, token_info: dict = Depends(_project_delete)) -> None:
+    """Delete an exact project-owned layer; shared catalog publication stays system-only."""
     normalized = normalize_digest(digest)
     if normalized is None:
         raise HTTPException(status_code=422, detail="digest 는 sha256:<64hex> 형식이어야 합니다")
@@ -2078,6 +2091,23 @@ async def delete_hub_layer(digest: str, token_info: dict = Depends(require_admin
         ).scalar_one_or_none()
         if row is None:
             raise HTTPException(status_code=404, detail="레이어를 찾을 수 없습니다")
+        if row.is_published and (
+            not token_info.get("is_package_system_admin")
+            or "system:manage" not in token_info.get("package_actions", ())
+        ):
+            raise HTTPException(status_code=403, detail="Shared catalog deletion requires system authority")
+        foreign_access = (
+            await session.execute(
+                select(PalimpsestHubLayerAccess.project_id)
+                .where(
+                    PalimpsestHubLayerAccess.blob_digest == normalized,
+                    ~exact_identity(PalimpsestHubLayerAccess.project_id, row.project_id),
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if foreign_access is not None:
+            raise HTTPException(status_code=409, detail="Layer is retained by another project")
         child = (
             await session.execute(
                 select(PalimpsestHubLayer.id).where(PalimpsestHubLayer.parent_digest == normalized).limit(1)
@@ -2090,8 +2120,17 @@ async def delete_hub_layer(digest: str, token_info: dict = Depends(require_admin
         if await runtime_blob_referenced(session, normalized):
             raise HTTPException(status_code=409, detail="Layer is retained by an image job or instance")
         if token_info.get("is_package_system_admin"):
-            token_info = await revalidate_package_admin(token_info)
-            if "system:manage" not in token_info["package_actions"]:
-                raise HTTPException(status_code=403, detail="System management policy denied")
+            current = await revalidate_package_admin(token_info)
+        else:
+            original = await asyncio.to_thread(validate_token, token_info["token"], token_info["project_id"])
+            current = await get_package_member_info(token_info=original)
+        if (current["user_id"], package_target_project_id(current)) != (
+            token_info["user_id"],
+            _required_project_id(token_info),
+        ):
+            raise HTTPException(status_code=403, detail="Original package subject or target changed")
+        await _project_delete(current)
+        if row.is_published and "system:manage" not in current.get("package_actions", ()):
+            raise HTTPException(status_code=403, detail="Shared catalog deletion requires system authority")
         await session.delete(row)
         await session.commit()

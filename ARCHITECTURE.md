@@ -1,5 +1,27 @@
 # Palimpsest Architecture
 
+## Standard project authority and full-dev 0.3.12 candidate — 2026-11-04 (UTC)
+
+This isolated candidate starts at remote dev `6e4dff7ac0493426f12d34f5e143bab52b3566d7`, not the dirty primary checkout or goal-m1 worktree. It includes the already merged SDK/publication/native lifecycle source, as explicitly selected by the owner, plus the complete standard-project authority delta. Version0.3.11 remains a reserved unpublished source milestone; no old tag is moved. Source preparation, artifact publication and actual deployment are separate.
+
+| Original/current native authority | Project-visible reads | Owned project writes/delete/build | Keys | Global catalog / machine callbacks |
+| --- | --- | --- | --- | --- |
+| reader | nonsecret visible metadata/content | denied | no issue/list/revoke | denied |
+| member / manager / project admin | allowed | allowed within native ownership | own subset issue/list/revoke | denied |
+| custom/group/domain path to a core role | exact native implied ceiling | exact native implied ceiling | same ceiling | no project-to-system uplift |
+| legacy Palimpsest names alone | no default grant | denied | denied | denied |
+| bounded issued package key | stored scope ∩ current owner | only stored package/cache actions; no metadata deletion | never administers keys | denied |
+| reduced original project credential | no human-route actions advertised | existing human routes deny | no uplift | denied |
+| verified original human system administrator | explicit logical target path | policy-controlled administrative path | new deliberate bounded keys only | independently verified native system scope; machine callbacks still separate |
+
+Fresh exact native role-ID implication traversal retains domain intermediates but never emits a domain-local builtin spelling as a global role. Original-token/current-owner decisions and stored key ceilings intersect; YAML can narrow but cannot elevate a reader. Personal metadata no longer substitutes for core authority. Native `openid` human recognition preserves all reduced-token/service/protected-principal vetoes. Project publish/cache/delete/build finalization revalidates the original subject. Published global layers and catalog management remain system-only, and private user/project/namespace visibility is unchanged.
+
+The inherited SDK schema bootstrap upgrades proven build-context creators into `(project_id,digest,created_by)`, assigns old image jobs `visibility=internal` and creates publication/native-intent tables. It must run offline before new FKs, not through live `create_all`. Unknown creators fail before DDL; no historical image catalog/OS/creator is fabricated. MariaDB DDL implicitly commits. Existing worker claim/lease rows and private journals are not reset. Stop the dedicated HTTPS worker while old API status is still available, then every controller writer; preserve exact database default charset/collation in restore fixtures, paired SQL/CAS bytes, numeric ownership and old pins. Rollback needs all-writer stop and paired old SQL/CAS plus exact old images/config, never old workers over new state.
+
+Independent review fixes: layer DELETE returns 409 under the existing blob lock when another project's access row references the same digest, so a member delete cannot cascade-remove another project's grant. Root Release and Hub image workflows share `scripts/check_release_version.py` before any artifact/image publication. A null package key is labelled `original human token`. Legacy upload/bundle finalization and SDK publication revalidate the original writer immediately before commit; tokenless internal callers are unchanged. Both policy modules validate the native parsed check graph, including `NotCheck.rule`, on every evaluation; missing/cyclic references and absent configured policy directories fail closed with 503.
+
+Numeric release tags and historical v tags share exact normalized client/Hub version checks and the existing trusted-ref/native/publisher gates. No external-native/GPU or deployment qualification follows from synthetic HTTP or portable tests. Final local evidence is recorded in the current handoff; parent-owned actual schema/CAS restore and rollout evidence remains separate.
+
 ## SDK image authority and namespace-native integration — 2026-11-03
 
 **`0.3.11` release source; publication, deployed state and native qualification have separate receipts.**
@@ -2447,9 +2469,9 @@ provider provisioning. Fresh multi-instance evidence is recorded separately.
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "4cff3945c4291f60420cd90833a173dbc68a6154ccd40f7cf9f372a67fe4adda",
-  "reviewed_at": "2026-11-03T11:17:20Z",
-  "summary": "CI64166hostedportablefailuresreviewedallshards,notblindlyrerun. RealSDKrecoverytestdependencydeclaredindevwithsamecloudrange; base[]/packageversions/CIpolicyunchanged, locksmetadataonly. Cleanpy3.12devNativeCloud232passed. ControlledrealchildresolverstallprovedHTTPServer.getfqdnblockingdependency; fixednumericbootstrapbindavoidsDNS,noTLS/grant/listenchanges; originalmacCItimeoutcauseunconfirmed. Ready-descendantregisterhandoffpreservesactual0.2sdeadlineandrealprocesscleanup, no startup-schedulingassumption; mTLS/CLIidle+dripTERM/noResolver+childsmoke65passed. Completeportable9669/228passedin627.72s. NewKollaJournal-subdirselectionregressionfailedbeforethenall30remote-rendercasespassedafterseparatemount/workpathvar. Installedrolelacksoldcapability; exact57abvolume/parentmount/qualifiedsubdirpinnedinoperator99withprivatebackups,allotherconfigs/images/servicesunchanged. Activeknownrecipe58848/SQL58846image58847cachednone; legacyrootand1afunboundmarkersretained;noGETsettlement/schema/serviceactions. Newclientpackagee51e8125...; nativeprofiles/issuerremainunset. Source-isolatedonly,primaryauthsliceuntouched. FinalrendereddockercomparisonrequiredafterqualifiedroleinstallbeforeKolla."
+  "source_sha256": "54cf22cadf949df61992310713e3bb3c8860f53a6a6b7cda46cdb1777c2f35f8",
+  "reviewed_at": "2026-11-04T05:20:30Z",
+  "summary": "0.3.12 standard project authority on dev 6e4dff7: core role ceilings, exact native implication, reduced empty preview, NotCheck-aware policy graph validated on every native reload, cross-project delete 409, original pre-target subject revalidated before final commits, shared numeric release version gate"
 }
 ```
 <!-- architecture-review:end -->

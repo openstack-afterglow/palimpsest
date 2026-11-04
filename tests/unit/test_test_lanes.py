@@ -612,7 +612,7 @@ def test_ci_no_job_targets_a_non_hosted_runner():
         "pull_request": {"branches": ["main", "dev"]},
     }
     # Release runs only on version tag pushes.
-    assert _load_workflow(_WORKFLOWS / "release.yml")[True] == {"push": {"tags": ["v*"]}}
+    assert _load_workflow(_WORKFLOWS / "release.yml")[True] == {"push": {"tags": ["[0-9]*", "v*"]}}
 
 
 # Workflows allowed to use a privileged trigger, by file name. `pull_request_target` runs with

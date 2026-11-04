@@ -1,5 +1,13 @@
 # Fast feedback without dropping coverage
 
+## Standard authority 0.3.12 qualification boundary — 2026-11-04 (UTC)
+
+The isolated release candidate is latest remote dev6e4dff7 plus the standard-core role migration, exact-ID domain implication preservation, truthful reduced-credential capability preview and numeric-release compatibility. Primary/SDK/goal-m1 dirty worktrees are not verification inputs. Targeted coverage includes the full native role matrix, original/current/key intersections, private/global/machine boundaries, domain builtin lookalikes, revoked originals, reader nonsecret downloads and original-human writer management. Registered-app standalone native HTTP uses real SDK requests against synthetic loopback Keystone with fresh SQL/CAS; it is not a live cloud or guest proof.
+
+Run final Hub checks from the Hub environment and root Kolla/release/native-helper contracts from the root environment. Retain interpreter and exact-source digests. Relevant Hub modules are `test_auth`, `test_catalog_auth`, `test_builds`, `test_packages`, `test_hub_api`, `test_export_delegation`, `test_image_jobs`, `test_instances`, `test_database_pool` and `test_migrate`. The parent owns full current-source CI, actual MariaDB10.11 restored-production rehearsal, paired CAS restore and canonical deployment; test fixtures alone cannot establish those outcomes.
+
+Do not silently import the new goal-m1 intake/sandbox/BuildKit source while fixing roles. Do not conflate existing0.3.11 reserved source receipts, new0.3.12 local results, source-overlay container checks, built-image identities, publication, operational rollout and optional native runtime acceptance. Each actual result belongs in the dated handoff with its own receipt.
+
 ## Local worktree consolidation — 2026-11-02
 
 Use separate client and Hub environments. Select `host-runtime`, CLI/source/cache

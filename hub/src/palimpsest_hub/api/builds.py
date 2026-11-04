@@ -1,7 +1,8 @@
-"""Project-bound, administrator-only requests for isolated Palimpsestfile builds."""
+"""Project-bound requests for isolated Palimpsestfile builds and machine-only callbacks."""
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import uuid
@@ -15,11 +16,18 @@ from sqlalchemy import func, select
 
 from palimpsest_hub.api.hub import (
     _factory_or_503,
+    _legacy_inventory,
+    _legacy_writer,
     _load_visible,
     _store_or_503,
     _validate_arch_dependencies,
 )
-from palimpsest_hub.auth import package_target_project_id, require_admin, revalidate_package_admin
+from palimpsest_hub.auth import (
+    get_package_member_info,
+    package_target_project_id,
+    revalidate_package_admin,
+    validate_token,
+)
 from palimpsest_hub.config import get_settings
 from palimpsest_hub.models import PalimpsestHubBuild, exact_identity
 from palimpsest_hub.rate_limit import limiter
@@ -107,7 +115,7 @@ def serialize_build(row: PalimpsestHubBuild) -> dict[str, Any]:
 async def create_hub_build(
     request: Request,
     req: BuildRequest,
-    token_info: dict = Depends(require_admin),
+    token_info: dict = Depends(_legacy_writer),
 ) -> dict[str, Any]:
     """Persist a job only after checking every source against the selected Hub target."""
     settings = get_settings()
@@ -174,9 +182,13 @@ async def create_hub_build(
             created_at=datetime.now(UTC),
         )
         if token_info.get("is_package_system_admin"):
-            token_info = await revalidate_package_admin(token_info)
-            if "system:manage" not in token_info["package_actions"]:
-                raise HTTPException(status_code=403, detail="System management policy denied")
+            current = await revalidate_package_admin(token_info)
+        else:
+            original = await asyncio.to_thread(validate_token, token_info["token"], token_info["project_id"])
+            current = await get_package_member_info(token_info=original)
+        if (current["user_id"], package_target_project_id(current)) != (token_info["user_id"], project_id):
+            raise HTTPException(status_code=403, detail="Original build subject or target changed")
+        await _legacy_writer(current)
         session.add(row)
         await session.commit()
         return serialize_build(row)
@@ -184,7 +196,7 @@ async def create_hub_build(
 
 @router.get("/builds", response_model=list[BuildResponse], operation_id="list_hub_builds")
 async def list_hub_builds(
-    limit: int = Query(50, ge=1, le=100), token_info: dict = Depends(require_admin)
+    limit: int = Query(50, ge=1, le=100), token_info: dict = Depends(_legacy_inventory)
 ) -> list[dict[str, Any]]:
     factory = _factory_or_503()
     async with factory() as session:
@@ -204,7 +216,7 @@ async def list_hub_builds(
 
 
 @router.get("/builds/{build_id}", response_model=BuildResponse, operation_id="get_hub_build")
-async def get_hub_build(build_id: UUID, token_info: dict = Depends(require_admin)) -> dict[str, Any]:
+async def get_hub_build(build_id: UUID, token_info: dict = Depends(_legacy_inventory)) -> dict[str, Any]:
     factory = _factory_or_503()
     async with factory() as session:
         row = await session.get(PalimpsestHubBuild, str(build_id))

@@ -148,7 +148,7 @@ class Actor:
     credential: str | None = field(default=None, repr=False)
     capabilities: frozenset[str] = frozenset()
     admin_context: dict | None = field(default=None, repr=False, compare=False)
-    personal_token: str | None = field(default=None, repr=False, compare=False)
+    member_token: str | None = field(default=None, repr=False, compare=False)
 
 
 async def namespace_row(session, namespace):
@@ -264,7 +264,7 @@ async def member_actor(namespace, member):
         actions=tuple(sorted(actions)),
         capabilities=capabilities_for(actions),
         admin_context=member if member.get("is_package_system_admin") else None,
-        personal_token=member["token"] if member.get("personal_project_owner") is True else None,
+        member_token=member.get("token") if not member.get("is_package_system_admin") else None,
     )
 
 
@@ -462,18 +462,16 @@ async def fresh_actor(actor, namespace, package, action, *, session=None, lock=F
         current = await member_actor(namespace, context)
         if (current.project_id, current.user_id) != (actor.project_id, actor.user_id):
             raise RegistryError(403, "PROJECT_SCOPE_MISMATCH", "administrative target or requester changed")
-    elif actor.personal_token is not None and action == "packages:delete":
-        original = await asyncio.to_thread(validate_token, actor.personal_token, actor.project_id)
+    elif actor.member_token is not None:
+        original = await asyncio.to_thread(validate_token, actor.member_token, actor.project_id)
         if (original["project_id"], original["user_id"]) != (actor.project_id, actor.user_id):
-            raise RegistryError(403, "PROJECT_SCOPE_MISMATCH", "personal requester or original project changed")
+            raise RegistryError(403, "PROJECT_SCOPE_MISMATCH", "requester or original project changed")
         context = await get_package_member_info(token_info=original)
-        if context.get("personal_project_owner") is not True:
-            raise RegistryError(403, "ACTION_DENIED", "current native personal owner required")
         current = await member_actor(namespace, context)
     elif actor.key_id is not None:
         current = await authenticate_key(actor.credential, session=session, lock=lock)
     else:
-        raise RegistryError(401, "AUTH_REQUIRED", "package key or human system administrator required")
+        raise RegistryError(401, "AUTH_REQUIRED", "original member token or scoped package key required")
     authorize(current, namespace, package, action)
     return current
 
@@ -1252,8 +1250,8 @@ async def version(actor, namespace, package, *, digest=None, tag=None, action="p
 
 async def delete_package(actor, namespace, package):
     """Delete target-owned metadata only; shared CAS remains reference-aware GC's job."""
-    if (actor.admin_context is None and actor.personal_token is None) or actor.key_id is not None:
-        raise RegistryError(403, "ACTION_DENIED", "human system administrator or native personal owner required")
+    if (actor.admin_context is None and actor.member_token is None) or actor.key_id is not None:
+        raise RegistryError(403, "ACTION_DENIED", "original member token or human system administrator required")
     authorize(actor, namespace, package, "packages:delete")
     blob_store = store()
     package_lock = actor.project_id + "/" + package

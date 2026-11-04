@@ -4,7 +4,28 @@ All notable changes to Palimpsest Local are documented here.
 
 ## [Unreleased]
 
-## [0.3.11] - 2026-11-03
+## [0.3.12] - release candidate, 2026-11-04 (UTC)
+
+### 한국어
+
+- 버전: client/Hub/Kolla0.3.12. 준비일:2026-11-04 (UTC). 정식 게시·운영 배포는 아직 수행하지 않았으며 각각 실제 완료 시각과 timezone을 별도로 기록한다.
+- 변경·수정: 전용 Palimpsest 역할 없이 현재 native manager/member/project-admin이 자기 프로젝트 리소스를 관리하고 reader는 허용된 비밀 아닌 조회/다운로드를 수행한다. 정확한 custom/group/domain implication, 원본 token과 현재 소유자 교집합, 발급 key 범위·private/global 경계를 보존한다. 유효한 제한 credential은 실행할 수 없는 human 관리 기능을 capability로 광고하지 않는다.
+- 보안 수정: 동일 digest를 다른 프로젝트가 별도로 업로드한 경우 member의 layer 삭제가 그 프로젝트 접근권을 cascade로 지우지 않도록 409로 거부한다. 업로드/번들/SDK publication은 lock·복사 뒤 commit 직전에 원본 subject(관리자는 target 재작성 전 원본 token scope)를 다시 검증한다. `not rule:missing`·부정된 순환·없는 policy 디렉터리는 503으로 실패한다. GHCR image tag도 root release와 같은 tag/version 일치 검사를 통과해야 한다. key 없는 version 출처 표시는 `original human token`이다.
+- 전환 절차(필수): 새 ingress를 막고 원래 API가 살아 있을 때 전용 build worker를 정지·정산한 뒤 모든 API/export/upload/GC writer를 멈춘다. 같은 무-writer 구간에서 SQL+CAS+설정을 함께 백업하고 격리 복원을 증명한다(DB 기본 charset/collation 포함). 새 API image의 `palimpsest-hub-bootstrap`을 writer가 멈춘 상태로 한 번 실행한다. MariaDB DDL은 암묵 commit이므로 rollback은 transaction 취소가 아니라 writer 정지 후 짝지은 이전 SQL/CAS·설정과 정확한 이전 image 복원이다. 이전 worker를 새 상태 위에서 다시 실행하지 않는다.
+- 최신 dev 전체 전환: 아래 미게시0.3.11 source의 SDK 이미지 publication/visibility/논리 layer/Manila 선택 경로와 기존57ab180 이후 repair를 포함한다. 별도 goal-m1 미커밋 변경은 포함하지 않는다. 기존 context PK·job visibility 변경, stopped-writer SQL/CAS backup/restore, API/export/build-worker 동시 cohort 전환이 필요하다. 옵트인 native/Ceph/GPU 실기 성공을 뜻하지 않는다.
+- 폐기·제거: service-role-only 기본 허용과 personal metadata만으로 얻는 권한 fallback을 제거한다. 기존 Keystone 역할/할당은 삭제하지 않으며 실제 core implication은 계속 권한이다. 새로운 데이터/API 제거는 없음.
+
+### English
+
+- Version: client/Hub/Kolla0.3.12. Prepared:2026-11-04 (UTC). Formal publication and operational deployment have not occurred; record their actual dates/times/timezones separately.
+- Changes/fixes: native manager/member/project-admin manage owned project resources without Palimpsest roles; reader performs authorized nonsecret reads/downloads. Preserve exact custom/group/domain implications, original/current-owner intersection, issued-key scope and private/global boundaries. Valid reduced credentials no longer advertise human actions they cannot execute.
+- Security fixes: a member layer DELETE returns 409 instead of cascade-removing another project's separately uploaded grant for the same digest. Upload/bundle/SDK publication revalidates the original subject immediately before commit, after locks and copies (administrators use the original token scope before the logical-target rewrite). `not rule:missing`, negated cycles and absent configured policy directories fail with 503. GHCR image tags pass the same tag/version identity gate as the root release. Keyless version provenance is labelled `original human token`.
+- Required cutover runbook: close new ingress, stop and settle the dedicated build worker while the old API is still available, then stop every API/export/upload/GC writer. Capture SQL+CAS+configuration from one no-writers interval and prove an isolated restore, including the database default charset/collation. Run the new API image's `palimpsest-hub-bootstrap` once while writers remain stopped. MariaDB DDL commits implicitly, so rollback is not a transaction undo: stop all writers and restore the paired old SQL/CAS/configuration plus the exact old images. Never run old workers over new state.
+- Full latest-dev transition includes the unpublished0.3.11 SDK publication/visibility/logical-layer/optional Manila source below and repairs after deployed57ab180, but excludes separate uncommitted goal-m1 work. Existing context primary-key/job-visibility changes require stopped writers, paired SQL/CAS backup/restore and coordinated API/export/build-worker cohorts. Optional native/Ceph/GPU execution is not qualified by this source release.
+- Deprecated/removed: service-role-only default authorization and personal-metadata-only authority fallback are removed. Existing Keystone roles/assignments are not deleted; genuine core implications remain authoritative. Other data/API removals:None.
+
+
+## [0.3.11] - reserved/unpublished source, 2026-11-03 (UTC); included in 0.3.12
 
 ### Added
 
