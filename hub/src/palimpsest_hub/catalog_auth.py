@@ -12,11 +12,17 @@ from keystoneauth1 import access as ks_access
 from keystoneauth1 import exceptions as ks_auth_exceptions
 from keystoneclient import exceptions as ks_exceptions
 
-from palimpsest_hub.auth import _assignment_user, _get_reader_ks_client, _role_metadata, _value, keystone_token_header
+from palimpsest_hub.auth import (
+    _assignment_user,
+    _get_reader_ks_client,
+    _role_metadata,
+    _value,
+    keystone_token_header,
+)
 from palimpsest_hub.catalog_policy import global_admin_actions
 from palimpsest_hub.config import get_settings, validate_keystone_id
 
-_HUMAN_AUTH_METHODS = frozenset({"password", "token", "totp", "oidc", "saml2", "mapped"})
+_HUMAN_AUTH_METHODS = frozenset({"password", "token", "totp", "openid", "oidc", "saml2", "mapped"})
 _REDUCED_TOKEN_MARKERS = frozenset(
     {
         "OS-TRUST:trust",
@@ -62,12 +68,12 @@ def _role_directory(client):
     edges = {role_id: set() for role_id in by_id}
     for inference in inferences["role_inferences"]:
         prior = inference["prior_role"]["id"]
-        prior_role = referenced_role(prior)
+        referenced_role(prior)
+        edges.setdefault(prior, set())
         for implied in inference["implies"]:
-            implied_role = referenced_role(implied["id"])
-            # Domain/custom aliases never assert global builtin capabilities through inference.
-            if prior_role.get("domain_id") is None and implied_role.get("domain_id") is None:
-                edges[prior].add(implied["id"])
+            referenced_role(implied["id"])
+            edges.setdefault(implied["id"], set())
+            edges[prior].add(implied["id"])
     return by_id, global_names, edges
 
 
@@ -82,12 +88,12 @@ def _effective_role_names(role_ids, directory):
             return
         role = by_id[role_id]
         name = role["name"]
-        if role.get("domain_id") is not None:
-            return
-        if global_names.get(name.casefold()) != [role_id]:
-            raise ValueError("Role is not a unique global binding")
+        if role.get("domain_id") is None:
+            if global_names.get(name.casefold()) != [role_id]:
+                raise ValueError("Role is not a unique global binding")
+            names.add(name)
+        # Follow exact native implications, not domain-local builtin lookalikes.
         visiting.add(role_id)
-        names.add(name)
         for implied in edges[role_id]:
             visit(implied)
         visiting.remove(role_id)

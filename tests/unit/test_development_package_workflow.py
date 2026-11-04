@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import shlex
 import subprocess
+import sys
 from itertools import product
 from pathlib import Path
 
@@ -12,6 +14,56 @@ from test_test_lanes import _github_condition
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github" / "workflows" / "development-package.yml"
 ALLOWED_BRANCHES = ["main", "dev", "codex/oci-root-phase1"]
+
+
+def test_numeric_and_historical_release_tags_match_both_distribution_versions(tmp_path) -> None:
+    workflow = yaml.safe_load((ROOT / ".github/workflows/release.yml").read_text())
+    command = next(
+        step["run"]
+        for step in workflow["jobs"]["verify"]["steps"]
+        if step.get("name") == "Validate immutable release version"
+    )
+    command = command.replace("python ", shlex.quote(sys.executable) + " ", 1)
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts/check_release_version.py").write_bytes(
+        (ROOT / "scripts/check_release_version.py").read_bytes()
+    )
+    (tmp_path / "hub").mkdir()
+    for file in ("pyproject.toml", "hub/pyproject.toml"):
+        (tmp_path / file).write_text('[project]\nversion = "0.3.12"\n')
+    for tag, accepted in (
+        ("0.3.12", True),
+        ("v0.3.12", True),
+        ("0.3.11", False),
+        ("release-0.3.12", False),
+        ("0.3.12..evil", False),
+        ("00.3.12", False),
+        ("0.3", False),
+    ):
+        result = subprocess.run(
+            ["bash", "-c", command], cwd=tmp_path, env={"PATH": "/usr/bin:/bin", "RELEASE_TAG": tag}
+        )
+        assert (result.returncode == 0) is accepted
+    image_workflow = yaml.safe_load((ROOT / ".github/workflows/hub-docker.yml").read_text())
+    assert image_workflow[True]["push"]["tags"] == ["[0-9]*", "v*"]
+    image_gate = next(
+        step
+        for step in image_workflow["jobs"]["test"]["steps"]
+        if step.get("name") == "Validate immutable release version"
+    )
+    assert image_gate["if"] == "startsWith(github.ref, 'refs/tags/')"
+    assert image_gate["run"] == next(
+        step["run"] for step in workflow["jobs"]["verify"]["steps"] if step.get("name") == image_gate["name"]
+    )
+    assert image_workflow["jobs"]["build-and-push"]["needs"] == "test"
+    (tmp_path / "hub/pyproject.toml").write_text('[project]\nversion = "0.3.11"\n')
+    mismatched_hub = subprocess.run(
+        ["bash", "-c", command], cwd=tmp_path, env={"PATH": "/usr/bin:/bin", "RELEASE_TAG": "0.3.12"}
+    )
+    assert mismatched_hub.returncode != 0
+    for image in ("api", "worker", "build-worker"):
+        metadata = next(step for step in image_workflow["jobs"]["build-and-push"]["steps"] if step.get("id") == image)
+        assert "type=semver,pattern={{version}}" in metadata["with"]["tags"]
 
 
 def _run_steps(job: dict) -> list[str]:
@@ -77,7 +129,7 @@ def test_publish_job_verifies_checksums_before_the_non_destructive_helper() -> N
 
 def test_formal_release_permissions_and_publication_gate() -> None:
     workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8"))
-    assert workflow[True] == {"push": {"tags": ["v*"]}}
+    assert workflow[True] == {"push": {"tags": ["[0-9]*", "v*"]}}
     assert workflow["permissions"] == {"contents": "read"}
 
     def effective_permissions(job: dict) -> dict:
@@ -97,6 +149,7 @@ def test_formal_release_permissions_and_publication_gate() -> None:
     trusted_context = ("openstack-afterglow/palimpsest", "push", "refs/tags/v1.2.3")
     contexts = [
         trusted_context,
+        ("openstack-afterglow/palimpsest", "push", "refs/tags/0.3.12"),
         ("some-fork/palimpsest", "push", "refs/tags/v1.2.3"),
         ("", "push", "refs/tags/v1.2.3"),
         ("openstack-afterglow/palimpsest", "pull_request", "refs/tags/v1.2.3"),
@@ -125,7 +178,7 @@ def test_formal_release_permissions_and_publication_gate() -> None:
             "needs.kvm-proof.result": native_result,
         }
         expected = (
-            context == trusted_context
+            context in (trusted_context, ("openstack-afterglow/palimpsest", "push", "refs/tags/0.3.12"))
             and not cancelled
             and verify_result == "success"
             and (enabled, native_result) in {("true", "success"), ("false", "skipped")}

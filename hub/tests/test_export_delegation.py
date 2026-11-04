@@ -45,13 +45,33 @@ VALIDATOR = "c" * 32
 ORIGINAL = "original-requester-token"
 IMAGE_ID = "11111111-2222-4333-8444-555555555555"
 SOURCE = b"synthetic image bytes"
-EDGES = {"member": ["reader"], "palimpsest-publish_editor": ["palimpsest-inventory_reader"]}
+EDGES = {
+    "admin": ["manager"],
+    "manager": ["member"],
+    "member": ["reader"],
+    "project_owner": ["project_admin"],
+    "project_admin": ["admin"],
+    "project_manager": ["manager"],
+    "project_member": ["member"],
+    "project_reader": ["reader"],
+}
 ROLE_NAMES = {
     "admin",
     "manager",
     "service",
     "member",
     "reader",
+    "project_owner",
+    "project_admin",
+    "project_manager",
+    "project_member",
+    "project_reader",
+    "palimpsest_reader",
+    "palimpsest_user",
+    "palimpsest_editor",
+    "palimpsest_admin",
+    "palimpsest-keys_editor",
+    "palimpsest-keys_admin",
     "palimpsest-publish_editor",
     "palimpsest-inventory_reader",
     "palimpsest-download_user",
@@ -100,7 +120,7 @@ def _effective(names):
 @pytest.fixture
 def keystone(monkeypatch: pytest.MonkeyPatch):
     state = {
-        "project_roles": ["member", "palimpsest-publish_editor"],
+        "project_roles": ["member"],
         "user_enabled": True,
         "trusts": {},
         "auth": [],
@@ -329,11 +349,23 @@ def keystone(monkeypatch: pytest.MonkeyPatch):
             elif parsed.path == f"/v3/users/{USER}/groups":
                 self.send_json(200, {"groups": [], "links": {"next": None}})
             elif parsed.path == f"/v3/users/{USER}":
-                self.send_json(200, {"user": {"id": USER, "name": "requester", "enabled": state["user_enabled"]}})
+                self.send_json(
+                    200,
+                    {
+                        "user": {
+                            "id": USER,
+                            "name": "requester",
+                            "enabled": state["user_enabled"],
+                            "domain_id": "default",
+                        }
+                    },
+                )
             elif parsed.path == f"/v3/projects/{PROJECT}":
                 self.send_json(
                     200, {"project": {"id": PROJECT, "name": "tenant", "enabled": True, "domain_id": "default"}}
                 )
+            elif parsed.path == "/v3/domains/default":
+                self.send_json(200, {"domain": {"id": "default", "name": "Default", "enabled": True}})
             elif parsed.path == "/v3/role_assignments":
                 query = parse_qs(parsed.query)
                 assignments = (
@@ -518,7 +550,7 @@ async def test_revoked_expired_or_swapped_scope_fails_before_glance_without_fall
     if change == "role_removed":
         h.identity["project_roles"] = []
     elif change == "publish_removed":
-        h.identity["project_roles"] = ["member"]
+        h.identity["project_roles"] = ["reader"]
     elif change == "user_disabled":
         h.identity["user_enabled"] = False
     elif change == "trust_revoked":
@@ -718,6 +750,41 @@ async def test_delegated_role_must_be_currently_possessed(hub, monkeypatch):
         EDGES.update(saved)
     assert h.identity["trust_creates"] == []
     assert await _rows(h) == ([], [])
+
+
+@pytest.mark.parametrize(
+    "role", ["member", "manager", "admin", "project_member", "project_manager", "project_admin", "project_owner"]
+)
+async def test_standard_native_project_writer_can_admit_bounded_export(hub, role):
+    hub.identity["project_roles"] = [role]
+    await _admit(hub)
+    [created] = hub.identity["trust_creates"]
+    assert [item["name"] for item in created["trust"]["roles"]] == ["member"]
+    assert created["token"] == ORIGINAL
+    _assert_no_tenant_service_password(hub.identity)
+
+
+@pytest.mark.parametrize(
+    "role",
+    [
+        "reader",
+        "project_reader",
+        "palimpsest_reader",
+        "palimpsest_user",
+        "palimpsest_editor",
+        "palimpsest_admin",
+        "palimpsest-inventory_reader",
+        "palimpsest-download_user",
+        "palimpsest-publish_editor",
+        "palimpsest-keys_editor",
+        "palimpsest-keys_admin",
+    ],
+)
+async def test_reader_and_legacy_only_roles_cannot_admit_export_or_create_trust(hub, role):
+    hub.identity["project_roles"] = [role]
+    await _admit(hub, expected=403)
+    assert hub.identity["trust_creates"] == []
+    assert await _rows(hub) == ([], [])
 
 
 async def test_trust_wider_than_requested_is_deleted_and_refused(hub):

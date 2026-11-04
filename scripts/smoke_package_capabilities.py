@@ -19,7 +19,8 @@ image's canonical ``palimpsest-hub-bootstrap`` probe outcome. This remains
 isolated HTTP acceptance, not canonical full-lifespan or deployment proof.
 
 Identity is a synthetic Keystone HTTP directory (``keystone-serve``) with
-unique global role IDs, zero service implication edges and live assignments. The
+unique global role IDs, native implication edges and live assignments. Legacy
+service grades/leaves start as unprivileged fixtures with no implication edges. The
 Hub authenticates its read-only validator with its real keystoneauth/
 keystoneclient stack; driver tokens are minted only on a separate control port.
 Redis is a real container, blobs and SQLite live in retained named volumes.
@@ -63,8 +64,27 @@ LABEL = "org.palimpsest.smoke"
 LABEL_VALUE = "scoped-package-capabilities"
 PUBLIC_ORIGIN = "https://packages.smoke.invalid"
 
-# Native member hierarchy is independent; service grades have no implication edges.
-ROLE_EDGES = (("admin", "member"), ("member", "reader"))
+# Canonical project aliases are resolved only through the native role graph.
+ROLE_EDGES = (
+    ("admin", "manager"),
+    ("manager", "member"),
+    ("member", "reader"),
+    ("project_admin", "admin"),
+    ("project_manager", "manager"),
+    ("project_member", "member"),
+    ("project_reader", "reader"),
+)
+LEGACY_ROLES = (
+    "palimpsest_admin",
+    "palimpsest_editor",
+    "palimpsest_user",
+    "palimpsest_reader",
+    "palimpsest-inventory_reader",
+    "palimpsest-download_user",
+    "palimpsest-publish_editor",
+    "palimpsest-keys_editor",
+    "palimpsest-keys_admin",
+)
 ROLE_NAMES = sorted(
     {
         "admin",
@@ -73,16 +93,10 @@ ROLE_NAMES = sorted(
         "member",
         "reader",
         "project_admin",
+        "project_manager",
         "project_member",
-        "palimpsest_admin",
-        "palimpsest_editor",
-        "palimpsest_user",
-        "palimpsest_reader",
-        "palimpsest-inventory_reader",
-        "palimpsest-download_user",
-        "palimpsest-publish_editor",
-        "palimpsest-keys_editor",
-        "palimpsest-keys_admin",
+        "project_reader",
+        *LEGACY_ROLES,
     }
 )
 ALL_ACTIONS = ["packages:inventory", "packages:read", "packages:write", "cache:read", "cache:write"]
@@ -1436,16 +1450,18 @@ class Smoke:
             "protected": {"id": secrets.token_hex(16), "project": project_a},
             "service_member": {"id": secrets.token_hex(16), "project": service_project},
             "foreign": {"id": secrets.token_hex(16), "project": project_b},
+            **{role: {"id": secrets.token_hex(16), "project": project_a} for role in LEGACY_ROLES},
         }
         assignments = {
-            "owner": ["palimpsest_admin"],
-            "inventory": ["palimpsest_reader"],
-            "writer": ["palimpsest-publish_editor", "palimpsest-keys_editor"],
-            "tenant_admin": ["member", "admin"],
+            "owner": ["member"],
+            "inventory": ["reader"],
+            "writer": ["project_member"],
+            "tenant_admin": ["admin"],
             "system_admin": ["member"],
-            "protected": ["palimpsest_admin"],
-            "service_member": ["palimpsest_admin"],
-            "foreign": ["palimpsest_admin"],
+            "protected": ["member"],
+            "service_member": ["member"],
+            "foreign": ["member"],
+            **{role: [role] for role in LEGACY_ROLES},
         }
         validator = {"id": secrets.token_hex(16), "name": "palimpsest-smoke-validator", "password": validator_password}
         seed = {
@@ -1692,6 +1708,72 @@ class Smoke:
             expect=403,
             auth={**owner, "X-Project-Id": self.users["foreign"]["project"]},
         )
+        for role in LEGACY_ROLES:
+            legacy_token = self.mint(role)
+            self.http(
+                f"legacy-only {role} has no default project access",
+                role,
+                "GET",
+                "/v1/projects/current",
+                expect=403,
+                auth=legacy_token,
+            )
+            self.http(
+                f"legacy-only {role} cannot list packages",
+                role,
+                "GET",
+                base + "/packages",
+                expect=403,
+                auth=legacy_token,
+            )
+            self.http(
+                f"legacy-only {role} cannot publish",
+                role,
+                "POST",
+                "/v1/uploads",
+                expect=403,
+                auth=legacy_token,
+                json_body={},
+            )
+            self.http(
+                f"legacy-only {role} cannot issue keys",
+                role,
+                "POST",
+                base + "/keys",
+                expect=403,
+                auth=legacy_token,
+                json_body={"name": "legacy-denied", "scope": {"packages": ["smoke/app"]}, "actions": ["packages:read"]},
+            )
+            self.assignment(True, role, "member")
+            self.http(
+                f"legacy token {role} cannot inherit a later member grant",
+                role,
+                "GET",
+                base + "/packages",
+                expect=403,
+                auth=legacy_token,
+            )
+            self.assignment(False, role, "member")
+        # Existing roles remain intact: a legitimate native inference can grant core authority.
+        self.control("edge", prior="palimpsest_editor", implied="member", present=True)
+        inferred_member = self.mint("palimpsest_editor")
+        self.http(
+            "native graph inference from retained role grants member access",
+            "palimpsest_editor",
+            "GET",
+            base + "/packages",
+            expect=200,
+            auth=inferred_member,
+        )
+        self.control("edge", prior="palimpsest_editor", implied="member", present=False)
+        self.http(
+            "removed native inference attenuates retained token",
+            "palimpsest_editor",
+            "GET",
+            base + "/packages",
+            expect=403,
+            auth=inferred_member,
+        )
         for label, token in (
             ("system_admin", system_admin),
             ("protected", protected),
@@ -1774,7 +1856,7 @@ class Smoke:
         writer_secret, _ = issue(
             "writer", writer, "write-no-read", ["packages:inventory", "packages:write"], ["smoke/writer", "smoke/app"]
         )
-        issue("writer", writer, "undelegated-read", ["packages:read"], ["smoke/writer"], expect=403)
+        issue("writer", writer, "member-read", ["packages:read"], ["smoke/writer"])
         issue("inventory", inventory, "no-key-authority", ["packages:inventory"], ["smoke/app"], expect=403)
         sub, writer_key = bearer(sub_secret), bearer(writer_secret)
         self.http(
@@ -1927,9 +2009,28 @@ class Smoke:
             validate=self.bytes_equal(archive),
         )
 
-        # Inventory denies downloads.
+        # Standard reader can browse and download, but cannot mutate or issue keys.
         self.http(
-            "inventory role lists packages",
+            "reader cannot start native upload",
+            "inventory",
+            "POST",
+            base + "/uploads",
+            expect=403,
+            auth=inventory,
+            params=app,
+            json_body=body(pending_archive, pending_root, "reader-denied"),
+        )
+        self.http(
+            "reader cannot start legacy upload",
+            "inventory",
+            "POST",
+            "/v1/uploads",
+            expect=403,
+            auth=inventory,
+            json_body={},
+        )
+        self.http(
+            "reader role lists packages",
             "inventory",
             "GET",
             base + "/packages",
@@ -1938,35 +2039,38 @@ class Smoke:
             validate=lambda r: {"names": [i["name"] for i in r.json()["items"]]},
         )
         self.http(
-            "inventory role reads version metadata", "inventory", "GET", version, expect=200, auth=inventory, params=app
+            "reader role reads version metadata", "inventory", "GET", version, expect=200, auth=inventory, params=app
         )
         self.http(
-            "inventory role cannot download archive",
+            "reader role downloads archive",
             "inventory",
             "GET",
             version + "/download",
-            expect=403,
+            expect=200,
             auth=inventory,
             params=app,
+            validate=self.bytes_equal(archive),
         )
         self.http(
-            "inventory role cannot range-download archive",
+            "reader role range-downloads archive",
             "inventory",
             "GET",
             version + "/download",
-            expect=403,
+            expect=206,
             auth=inventory,
             params=app,
             headers={"Range": "bytes=0-9"},
+            validate=self.bytes_equal(archive[:10]),
         )
         self.http(
-            "inventory role cannot download blob",
+            "reader role downloads blob",
             "inventory",
             "GET",
             f"{version}/blobs/{layer}",
-            expect=403,
+            expect=200,
             auth=inventory,
             params=app,
+            validate=self.bytes_equal(blobs[layer]),
         )
         self.http(
             "inventory-subset key lists packages",
@@ -2091,7 +2195,12 @@ class Smoke:
         revocable = bearer(revoke_secret)
         self.http("revocable key authenticates", "key:revocable", "GET", "/v1/auth/me", expect=200, auth=revocable)
         self.http(
-            "non-key-admin cannot revoke", "writer", "DELETE", f"{base}/keys/{revoke_id}", expect=403, auth=writer
+            "member cannot revoke another user's key",
+            "writer",
+            "DELETE",
+            f"{base}/keys/{revoke_id}",
+            expect=404,
+            auth=writer,
         )
         self.http("owner revokes own key", "owner", "DELETE", f"{base}/keys/{revoke_id}", expect=204, auth=owner)
         self.http("revoked key is rejected", "key:revocable", "GET", "/v1/auth/me", expect=401, auth=revocable)
@@ -2185,22 +2294,24 @@ class Smoke:
             validate=self.bytes_equal(legacy),
         )
         self.resume("legacy layer blob", "owner", layer_path + "/blob", auth=owner, original=legacy)
-        self.http("inventory role sees legacy layer", "inventory", "GET", layer_path, expect=200, auth=inventory)
+        self.http("reader role sees legacy layer", "inventory", "GET", layer_path, expect=200, auth=inventory)
         self.http(
-            "inventory role cannot download legacy blob",
+            "reader role downloads legacy blob",
             "inventory",
             "GET",
             layer_path + "/blob",
-            expect=403,
+            expect=200,
             auth=inventory,
+            validate=self.bytes_equal(legacy),
         )
         self.http(
-            "write-no-read role cannot download legacy blob",
+            "member role downloads project-visible legacy blob",
             "writer",
             "GET",
             layer_path + "/blob",
-            expect=403,
+            expect=200,
             auth=writer,
+            validate=self.bytes_equal(legacy),
         )
         self.http("foreign project cannot see legacy layer", "foreign", "GET", layer_path, expect=404, auth=foreign)
         self.http(
@@ -2309,15 +2420,16 @@ class Smoke:
                 validate=self.bytes_equal(export_bytes),
             )
             self.resume("ticket export download", "ticket:owner", url, auth={}, original=export_bytes)
-        self.http("inventory role reads existing export", "inventory", "GET", export_path, expect=200, auth=inventory)
-        ticket("inventory", inventory, expect=403)
+        self.http("reader role reads existing export", "inventory", "GET", export_path, expect=200, auth=inventory)
+        ticket("inventory", inventory)
         self.http(
-            "inventory role cannot download export blob",
+            "reader role downloads export blob",
             "inventory",
             "GET",
             export_path + "/blob",
-            expect=403,
+            expect=200,
             auth=inventory,
+            validate=self.bytes_equal(export_bytes),
         )
         ticket("foreign", foreign, expect=404)
         self.http("foreign project cannot read export", "foreign", "GET", export_path, expect=404, auth=foreign)
@@ -2326,21 +2438,42 @@ class Smoke:
             "missing export ticket is 404 for download authority", "owner", "POST", missing, expect=404, auth=owner
         )
         self.http(
-            "authorization precedes missing export lookup", "inventory", "POST", missing, expect=403, auth=inventory
+            "missing export is 404 for reader download authority",
+            "inventory",
+            "POST",
+            missing,
+            expect=404,
+            auth=inventory,
         )
 
-        # Global builder/GC: only verified system admin passes the auth boundary.
+        # Project builds use native read/write roles; worker execution stays unconfigured.
         build = {"name": "smoke-build", "recipe": "RUN true", "base_digest": legacy_digest}
-        self.http("service-admin tenant cannot list builds", "owner", "GET", "/v1/builds", expect=403, auth=owner)
+        self.http("member lists project builds", "owner", "GET", "/v1/builds", expect=200, auth=owner)
+        self.http("reader lists project builds", "inventory", "GET", "/v1/builds", expect=200, auth=inventory)
         self.http(
-            "service-admin tenant cannot build", "owner", "POST", "/v1/builds", expect=403, auth=owner, json_body=build
-        )
-        self.http(
-            "tenant Keystone admin cannot build",
-            "tenant_admin",
+            "reader cannot create project build",
+            "inventory",
             "POST",
             "/v1/builds",
             expect=403,
+            auth=inventory,
+            json_body=build,
+        )
+        self.http(
+            "member passes project build auth; worker unconfigured",
+            "owner",
+            "POST",
+            "/v1/builds",
+            expect=503,
+            auth=owner,
+            json_body=build,
+        )
+        self.http(
+            "tenant admin passes project build auth; worker unconfigured",
+            "tenant_admin",
+            "POST",
+            "/v1/builds",
+            expect=503,
             auth=tenant_admin,
             json_body=build,
         )
@@ -2364,11 +2497,11 @@ class Smoke:
             json_body=build,
         )
         gc_path = f"/v1/layers/{sha256_digest(gc_payload)}"
-        self.http("service-admin tenant cannot GC layer", "owner", "DELETE", gc_path, expect=403, auth=owner)
-        self.http("inventory role cannot GC layer", "inventory", "DELETE", gc_path, expect=403, auth=inventory)
+        self.http("reader role cannot GC layer", "inventory", "DELETE", gc_path, expect=403, auth=inventory)
         self.http("package key cannot GC layer", "key:full", "DELETE", gc_path, expect=401, auth=full)
+        self.http("foreign member cannot delete project layer", "foreign", "DELETE", gc_path, expect=404, auth=foreign)
         self.http(
-            "system admin GCs proof-owned layer", "system_admin", "DELETE", gc_path, expect=204, auth=system_admin
+            "member deletes its own project-visible proof layer", "owner", "DELETE", gc_path, expect=204, auth=owner
         )
         self.http("GC'd proof layer is gone", "owner", "GET", gc_path, expect=404, auth=owner)
         self.http("retained legacy layer survives GC", "owner", "GET", layer_path, expect=200, auth=owner)
@@ -2441,10 +2574,17 @@ class Smoke:
                 body=pending_archive,
             )
         pre_ticket = ticket("owner (pre-downgrade)", owner)
-        self.assignment(False, "owner", "palimpsest_admin")
-        self.assignment(True, "owner", "palimpsest_reader")
+        self.assignment(False, "owner", "member")
+        self.assignment(True, "owner", "reader")
         if pre_ticket:
-            self.http("downgrade: issued ticket no longer redeems", "ticket:owner", "GET", pre_ticket, expect=403)
+            self.http(
+                "reader downgrade: issued download ticket still redeems",
+                "ticket:owner",
+                "GET",
+                pre_ticket,
+                expect=200,
+                validate=self.bytes_equal(export_bytes),
+            )
         if pending:
             self.http(
                 "downgrade: pending upload cannot finalize",
@@ -2457,23 +2597,25 @@ class Smoke:
                 json_body={},
             )
         self.http(
-            "downgrade: key cannot download",
+            "reader downgrade: key keeps archive download",
             "key:full",
             "GET",
             version + "/download",
-            expect=403,
+            expect=200,
             auth=full,
             params=app,
+            validate=self.bytes_equal(archive),
         )
         self.http(
-            "downgrade: key cannot range-download blob",
+            "reader downgrade: key keeps range-download blob",
             "key:full",
             "GET",
             f"{version}/blobs/{layer}",
-            expect=403,
+            expect=206,
             auth=full,
             params=app,
             headers={"Range": "bytes=0-9"},
+            validate=self.bytes_equal(blobs[layer][:10]),
         )
         self.http("downgrade: key keeps inventory", "key:full", "GET", base + "/packages", expect=200, auth=full)
         self.http(
@@ -2494,12 +2636,13 @@ class Smoke:
             auth=owner,
         )
         self.http(
-            "downgrade: retained token cannot download legacy blob",
+            "reader downgrade: retained token keeps legacy download",
             "owner",
             "GET",
             layer_path + "/blob",
-            expect=403,
+            expect=200,
             auth=owner,
+            validate=self.bytes_equal(legacy),
         )
         self.http(
             "downgrade: retained token keeps legacy inventory",
@@ -2510,7 +2653,7 @@ class Smoke:
             auth=owner,
             params={"digest": legacy_digest},
         )
-        ticket("owner (downgraded)", owner, expect=403)
+        ticket("owner (reader downgrade)", owner)
         self.http(
             "downgrade: retained token cannot legacy-write",
             "owner",
@@ -2520,8 +2663,36 @@ class Smoke:
             auth=owner,
             json_body={},
         )
-        self.assignment(False, "owner", "palimpsest_reader")
+        self.assignment(False, "owner", "reader")
         self.assignment(True, "owner", "palimpsest_admin")
+        self.http(
+            "legacy-only downgrade: retained token loses download",
+            "owner",
+            "GET",
+            layer_path + "/blob",
+            expect=403,
+            auth=owner,
+        )
+        self.http(
+            "legacy-only downgrade: key loses download",
+            "key:full",
+            "GET",
+            version + "/download",
+            expect=403,
+            auth=full,
+            params=app,
+        )
+        self.http(
+            "legacy-only downgrade: key loses inventory",
+            "key:full",
+            "GET",
+            base + "/packages",
+            expect=403,
+            auth=full,
+        )
+        ticket("owner (legacy-only downgrade)", owner, expect=403)
+        self.assignment(False, "owner", "palimpsest_admin")
+        self.assignment(True, "owner", "member")
         self.http(
             "restored assignment: key downloads again",
             "key:full",
@@ -2553,7 +2724,7 @@ class Smoke:
                 params=app,
             )
 
-        # Operator YAML, not Keystone service-edge removal, attenuates actual operations.
+        # Operator YAML independently attenuates actual operations.
         self.set_policy({"packages:write": "!"})
         self.http(
             "policy deny: key cannot start upload",
@@ -2614,59 +2785,58 @@ class Smoke:
         self.set_policy(
             {
                 "packages:inventory": "!",
-                "packages:write": "role:palimpsest_reader",
-                "keys:issue": "role:palimpsest_reader",
+                "packages:write": "role:reader",
+                "keys:issue": "role:reader",
             }
         )
         self.http(
-            "policy grant: reader writer without inventory",
+            "policy override cannot grant reader write or key authority",
             "inventory",
             "GET",
             "/v1/policy/capabilities",
             expect=200,
             auth=inventory,
             validate=lambda r: ensure(
-                "packages:write" in r.json()["actions"] and "packages:inventory" not in r.json()["actions"],
-                "grant mismatch",
+                not {"packages:write", "keys:issue", "packages:inventory"} & set(r.json()["actions"]),
+                "native reader ceiling was bypassed",
                 r.json(),
             ),
         )
-        granted_secret, _ = issue("inventory", inventory, "yaml-reader", ["packages:write"], ["smoke/app"])
-        granted = {"Authorization": "Bearer " + granted_secret}
-        started = self.http(
-            "policy grant: reader key starts upload",
-            "key:yaml-reader",
-            "POST",
-            base + "/uploads",
-            expect=201,
-            auth=granted,
-            params=app,
-            json_body=body(pending_archive, pending_root, "v3"),
-        )
-        if started.status == 201:
-            self.http(
-                "policy grant: reader key aborts own upload",
-                "key:yaml-reader",
-                "DELETE",
-                base + "/uploads/" + started.json()["upload_id"],
-                expect=204,
-                auth=granted,
-                params=app,
-            )
-        self.set_policy({})
+        issue("inventory", inventory, "yaml-reader-denied", ["packages:write"], ["smoke/app"], expect=403)
         self.http(
-            "policy restored: current reader loses issued write",
-            "key:yaml-reader",
+            "policy override cannot let reader start upload",
+            "inventory",
             "POST",
             base + "/uploads",
             expect=403,
-            auth=granted,
+            auth=inventory,
             params=app,
             json_body=body(pending_archive, pending_root, "v3"),
         )
+        self.set_policy({"packages:inventory": "@", "packages:read": "@", "packages:write": "@", "keys:issue": "@"})
+        legacy_token = self.mint("palimpsest_admin")
+        self.http(
+            "permissive operator policy cannot uplift legacy-only role",
+            "palimpsest_admin",
+            "GET",
+            base + "/packages",
+            expect=403,
+            auth=legacy_token,
+        )
+        self.http(
+            "permissive operator policy cannot uplift reader write",
+            "inventory",
+            "POST",
+            base + "/uploads",
+            expect=403,
+            auth=inventory,
+            params=app,
+            json_body=body(pending_archive, pending_root, "v3"),
+        )
+        self.set_policy({})
 
         # Current role directory integrity: ambiguous IDs and dangling metadata fail closed (503).
-        self.control("duplicate_role", name="palimpsest_admin", present=True)
+        self.control("duplicate_role", name="member", present=True)
         self.http(
             "ambiguous global role name fails closed (key)", "key:full", "GET", "/v1/auth/me", expect=503, auth=full
         )
@@ -2678,8 +2848,8 @@ class Smoke:
             expect=503,
             auth=owner,
         )
-        self.control("duplicate_role", name="palimpsest_admin", present=False)
-        self.control("dangling_edge", prior="palimpsest_reader", present=True)
+        self.control("duplicate_role", name="member", present=False)
+        self.control("dangling_edge", prior="reader", present=True)
         self.http(
             "dangling inference role metadata 404 fails closed 503",
             "key:full",
@@ -2688,7 +2858,7 @@ class Smoke:
             expect=503,
             auth=full,
         )
-        self.control("dangling_edge", prior="palimpsest_reader", present=False)
+        self.control("dangling_edge", prior="reader", present=False)
         self.http("directory repaired: key authenticates", "key:full", "GET", "/v1/auth/me", expect=200, auth=full)
 
         self.persistence(

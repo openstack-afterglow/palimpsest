@@ -735,6 +735,7 @@ async def publish_image(
     visibility="private",
     base_image_id=None,
     base_manifest_digest=None,
+    authority=None,
 ):
     from palimpsest_hub.api.hub import _locked_blobs
     from palimpsest_hub.services.worker_leases import sql_mutex
@@ -768,12 +769,27 @@ async def publish_image(
             require_staged=True,
             inherited_policies=inherited_policies,
         )
+        if authority is not None:
+            # Revalidate the original, pre-target-rewrite subject after locks and copies.
+            from palimpsest_hub.services.image_jobs import fresh_writer
+
+            await fresh_writer(authority)
         await session.commit()
         return await image_value(session, row, actor=actor)
 
 
 async def extend_image(
-    factory, store, actor, request_id, name, base_image_id, layers, *, visibility="private", metadata=None
+    factory,
+    store,
+    actor,
+    request_id,
+    name,
+    base_image_id,
+    layers,
+    *,
+    visibility="private",
+    metadata=None,
+    authority=None,
 ):
     base = await resolve_image(factory, base_image_id, actor)
     full = base["manifest"]
@@ -806,4 +822,5 @@ async def extend_image(
         visibility=visibility,
         base_image_id=base_image_id,
         base_manifest_digest=base["manifest_digest"],
+        authority=authority,
     )

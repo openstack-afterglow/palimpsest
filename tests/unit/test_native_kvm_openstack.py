@@ -37,7 +37,15 @@ CI_USER_ID = "ci-provisioner-user-1"
 FOREIGN_USER_ID = "other-operator-user-2"
 COMMIT_SHA = "cf541223cd2a43fa4125652554ce18b8dffa83d1"
 PUBLIC_EGRESS_IP = "1.1.1.1"  # Valid public address; the fake cloud never opens network connections.
+
+
 VM_PORT_IP = "117.16.137.88"
+
+
+@pytest.mark.parametrize("tag", ["0.3.12", "v0.3.12"])
+def test_native_reference_accepts_numeric_and_historical_release_tags(tag):
+    assert helper._TAG_REF_RE.fullmatch("refs/tags/" + tag)
+
 
 _RAW_ED25519_HOST_KEY = b"\x00\x00\x00\x0bssh-ed25519\x00\x00\x00 " + (b"\x42" * 32)
 HOST_KEY_B64 = base64.b64encode(_RAW_ED25519_HOST_KEY).decode("ascii")
@@ -635,7 +643,7 @@ class FakeRemoteHarness:
         ({"event": "workflow_run"}, "unapproved workflow event"),
         ({"ref": "refs/pull/12/merge"}, "unapproved ref"),
         ({"ref": "refs/heads/feature"}, "unapproved ref"),
-        ({"ref": "refs/tags/0.2.4"}, "unapproved ref"),
+        ({"ref": "refs/tags/0.2"}, "unapproved ref"),
         ({"ref": "refs/tags/v0.2.4..evil"}, "unapproved ref"),
         ({"sha": "not-a-sha"}, "40-character hexadecimal"),
         ({"project_id": ADMIN_PROJECT_ID}, "refusing to use admin or candidate Hub project"),

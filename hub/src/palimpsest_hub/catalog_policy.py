@@ -71,6 +71,38 @@ class _StrictEnforcer(policy.Enforcer):
         finally:
             _parser.LOG = original
 
+    def load_rules(self, force_reload=False):
+        # enforce() reloads on every authorize(); validate each reloaded graph.
+        super().load_rules(force_reload)
+        _validate_native_rule_graph(self)
+
+
+def _validate_native_rule_graph(engine) -> None:
+    """Walk native parsed checks including negation singular child."""
+    from oslo_policy import _checks as _native_checks
+
+    complete: set[str] = set()
+
+    def visit_rule(name: str, active: frozenset[str]) -> None:
+        if name not in engine.rules or name in active:
+            raise ValueError("Undefined or cyclic native policy reference")
+        if name in complete:
+            return
+        visit_check(engine.rules[name], active | {name})
+        complete.add(name)
+
+    def visit_check(check, active: frozenset[str]) -> None:
+        if isinstance(check, _native_checks.RuleCheck):
+            visit_rule(check.match, active)
+        elif isinstance(check, _native_checks.NotCheck):
+            visit_check(check.rule, active)
+        else:
+            for child in getattr(check, "rules", ()):
+                visit_check(child, active)
+
+    for _name in engine.rules:
+        visit_rule(_name, frozenset())
+
 
 @lru_cache(maxsize=8)
 def _enforcer(policy_file: str, policy_dirs: tuple[str, ...]):
@@ -107,9 +139,13 @@ def _evaluate_actions(actions, target, creds):
                 and not Path(settings.oslo_policy_policy_file).is_file()
             ):
                 raise ValueError("Configured policy file is unavailable")
+            for _directory in tuple(settings.oslo_policy_policy_dirs or ()):
+                if not Path(_directory).is_dir():
+                    raise ValueError("Configured policy directory is unavailable")
             engine = get_enforcer()
             engine.load_rules()
             engine.check_rules(raise_on_violation=True)
+            _validate_native_rule_graph(engine)
             return frozenset(action for action in actions if engine.authorize(action, target, creds))
         except Exception:
             # Never retain partially loaded rules or a cached malformed file after failure.

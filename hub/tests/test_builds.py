@@ -12,24 +12,26 @@ from uuid import uuid4
 import httpx
 import pytest
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Request
 from pydantic import SecretStr, ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from palimpsest_hub import policy as native_policy
 from palimpsest_hub.api import builds, hub
-from palimpsest_hub.auth import require_admin
 from palimpsest_hub.build_worker import validate_claim
 from palimpsest_hub.config import BuildWorkerSettings, Settings
 from palimpsest_hub.models import Base, PalimpsestHubBuild, PalimpsestHubLayer
+from palimpsest_hub.policy import allowed_actions
 from palimpsest_hub.rate_limit import limiter
 from palimpsest_hub.services import builds as service
 from palimpsest_hub.services.hub_store import MEDIA_TYPE_LAYER_SQUASHFS, LocalPathBlobStore
 
 KEY = "worker-key-only-for-disposable-test-1234567890"
 WORKER = {"X-Palimpsest-Build-Worker-Key": KEY}
+MEMBER = {"X-Role": "member"}
 ADMIN = {"X-Role": "admin"}
-FOREIGN = {"X-Role": "admin", "X-Project-Id": "beta"}
+FOREIGN = {"X-Role": "member", "X-Project-Id": "beta"}
 
 
 def digest(payload: bytes) -> str:
@@ -54,6 +56,13 @@ async def remote_hub(tmp_path, monkeypatch):
         palimpsest_hub_build_timeout_seconds=60,
         palimpsest_hub_max_blob_bytes=1024 * 1024,
     )
+    policy_file = tmp_path / "policy.yaml"
+    policy_file.write_text("{}\n")
+    policy_settings = SimpleNamespace(
+        oslo_policy_policy_file=str(policy_file),
+        oslo_policy_policy_dirs=(),
+    )
+    monkeypatch.setattr(native_policy, "get_settings", lambda: policy_settings)
     monkeypatch.setattr(hub, "get_session_factory", lambda: factory)
     monkeypatch.setattr(hub, "get_blob_store", lambda: store)
     for module in (hub, builds, service):
@@ -64,22 +73,44 @@ async def remote_hub(tmp_path, monkeypatch):
     app.include_router(hub.router, prefix="/v1")
     app.include_router(builds.router, prefix="/v1")
 
-    async def identity(request: Request):
+    def current_identity(role, project):
         return {
-            "project_id": request.headers.get("X-Project-Id", "alpha"),
+            "project_id": project,
             "user_id": "creator",
             "is_system_admin": False,
+            "roles": [role],
+            "token": role + ":" + project,
+            "package_actions": allowed_actions([role], project),
         }
 
-    async def admin(request: Request):
-        if request.headers.get("X-Role") != "admin":
-            raise HTTPException(status_code=403, detail="admin required")
-        return await identity(request)
+    async def identity(request: Request):
+        role = request.headers.get(
+            "X-Role", "service" if "X-Palimpsest-Build-Worker-Key" in request.headers else "member"
+        )
+        return current_identity(role, request.headers.get("X-Project-Id", "alpha"))
 
-    # Only tenant identity is replaced. Worker header authentication is real.
-    app.dependency_overrides[require_admin] = admin
-    for dependency in (hub._legacy_writer, hub._legacy_inventory, hub._legacy_download):
-        app.dependency_overrides[dependency] = identity
+    async def writer(request: Request):
+        actor = await identity(request)
+        return await hub._legacy_writer(actor)
+
+    async def reader(request: Request):
+        actor = await identity(request)
+        return await hub._legacy_inventory(actor)
+
+    async def recheck(token_info):
+        return current_identity(token_info["roles"][0], token_info["project_id"])
+
+    from palimpsest_hub.services import image_jobs as image_job_service
+
+    for module in (builds, image_job_service):
+        monkeypatch.setattr(
+            module, "validate_token", lambda token, project: current_identity(token.split(":")[0], project)
+        )
+        monkeypatch.setattr(module, "get_package_member_info", recheck)
+    # Only tenant identity is replaced. Native action gates and worker header authentication are real.
+    app.dependency_overrides[hub._legacy_writer] = writer
+    app.dependency_overrides[hub._legacy_inventory] = reader
+    app.dependency_overrides[hub._legacy_download] = reader
     listener = socket.socket()
     listener.bind(("127.0.0.1", 0))
     server = uvicorn.Server(uvicorn.Config(app, log_level="error", lifespan="off"))
@@ -120,7 +151,7 @@ async def enqueue(h, base, *, name="private-output", layers=(), headers=None):
     recipe = f"FROM {base}\n" + "".join(f"LAYER {layer}\n" for layer in layers) + "RUN echo ready"
     return await h.client.post(
         "/v1/builds",
-        headers=headers or ADMIN,
+        headers=headers or MEMBER,
         json={"name": name, "base_digest": base, "layer_digests": list(layers), "recipe": recipe},
     )
 
@@ -683,3 +714,19 @@ async def test_empty_receipt_and_recovery_before_delayed_post_never_claim_new_wo
 async def test_claim_identity_is_required_even_with_worker_key(remote_hub, method, identity):
     response = await remote_hub.client.request(method, "/v1/build-worker/claim", headers={**WORKER, **identity})
     assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_standard_member_build_and_reader_status_keep_worker_boundary(remote_hub):
+    h = remote_hub
+    base = await upload_base(h)
+    reader = {"X-Role": "reader"}
+    assert (await enqueue(h, base, headers=reader)).status_code == 403
+    queued = await enqueue(h, base, headers=MEMBER)
+    assert queued.status_code == 202
+    path = "/v1/builds/" + queued.json()["id"]
+    assert (await h.client.get("/v1/builds", headers=reader)).status_code == 200
+    assert (await h.client.get(path, headers=reader)).status_code == 200
+    assert (await h.client.get(path, headers={**reader, "X-Project-Id": "beta"})).status_code == 404
+    assert (await enqueue(h, base, headers={"X-Role": "palimpsest_admin"})).status_code == 403
+    assert (await h.client.post("/v1/build-worker/claim", headers=MEMBER)).status_code == 401

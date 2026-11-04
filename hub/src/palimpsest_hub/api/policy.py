@@ -11,6 +11,10 @@ router = APIRouter(tags=["policy"])
 
 @router.get("/policy/capabilities")
 async def capabilities(token_info: dict = Depends(require_token)):
+    # Reduced subjects cannot execute the human-only resource routes. Validate
+    # their original token normally, but never advertise broader owner authority.
+    if token_info.get("is_delegated"):
+        return {"service": "palimpsest", "capabilities": [], "actions": []}
     if token_info.get("is_system_admin"):
         member = await asyncio.to_thread(_package_admin_context, token_info)
     else:

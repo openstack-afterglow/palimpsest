@@ -41,14 +41,7 @@ MANIFEST = "application/vnd.oci.image.manifest.v1+json"
 CONFIG = "application/vnd.oci.image.config.v1+json"
 LAYER = "application/vnd.oci.image.layer.v1.tar"
 
-SERVICE_ADMIN_ROLES = [
-    "member",
-    "palimpsest-inventory_reader",
-    "palimpsest-download_user",
-    "palimpsest-publish_editor",
-    "palimpsest-keys_editor",
-    "palimpsest-keys_admin",
-]
+PROJECT_MEMBER_ROLES = ["member"]
 
 
 def digest(payload):
@@ -167,31 +160,31 @@ async def hub(tmp_path, monkeypatch):
             "user_id": "f" * 64,
             "project_id": "Project-A",
             "project_name": "Renamable project",
-            "roles": SERVICE_ADMIN_ROLES.copy(),
+            "roles": PROJECT_MEMBER_ROLES.copy(),
         },
         "two": {
             "user_id": "OtherMember",
             "project_id": "Project-A",
             "project_name": "Renamable project",
-            "roles": SERVICE_ADMIN_ROLES.copy(),
+            "roles": PROJECT_MEMBER_ROLES.copy(),
         },
         "foreign": {
             "user_id": "ForeignMember",
             "project_id": "Project-B",
             "project_name": "Renamable project",
-            "roles": SERVICE_ADMIN_ROLES.copy(),
+            "roles": PROJECT_MEMBER_ROLES.copy(),
         },
         "admin": {
             "user_id": "AdminRole",
             "project_id": "Project-A",
             "project_name": "Renamable project",
-            "roles": ["admin", *SERVICE_ADMIN_ROLES],
+            "roles": ["admin"],
         },
         "protected": {
             "user_id": "ProtectedUser",
             "project_id": "Project-A",
             "project_name": "Renamable project",
-            "roles": SERVICE_ADMIN_ROLES.copy(),
+            "roles": PROJECT_MEMBER_ROLES.copy(),
         },
         "operator": {
             "user_id": "SystemOperator",
@@ -214,6 +207,8 @@ async def hub(tmp_path, monkeypatch):
 
     async def original_member(token_info):
         registry.require_policy(token_info)
+        if token_info["user_id"] in disabled:
+            raise registry.RegistryError(403, "PACKAGE_SCOPE_DENIED", "membership removed")
         actions = native_policy.allowed_actions(token_info["roles"], token_info["project_id"], token_info["user_id"])
         return {
             **token_info,
@@ -248,12 +243,6 @@ async def hub(tmp_path, monkeypatch):
     async def manager_dependency(request: Request):
         return await original_manager(await original_token(request))
 
-    async def system_admin_dependency(request: Request):
-        value = await original_token(request)
-        if value["user_id"] in disabled or not value.get("is_system_admin"):
-            raise HTTPException(status_code=403, detail="Current system administrator required")
-        return await original_manager(value)
-
     def owner(user_id, project_id):
         if user_id in disabled:
             raise registry.RegistryError(403, "PACKAGE_SCOPE_DENIED", "membership removed")
@@ -266,6 +255,22 @@ async def hub(tmp_path, monkeypatch):
                     "package_capabilities": native_policy.capabilities_for(actions),
                 }
         raise registry.RegistryError(403, "PACKAGE_SCOPE_DENIED", "membership removed")
+
+    def validated_token(token, project_id):
+        value = people[token]
+        if value["user_id"] in disabled or value["project_id"] != project_id:
+            raise registry.RegistryError(403, "PROJECT_SCOPE_MISMATCH", "original authority removed")
+        return {**value, "token": token}
+
+    monkeypatch.setattr(registry, "validate_token", validated_token)
+    monkeypatch.setattr(registry, "get_package_member_info", original_member)
+    monkeypatch.setattr(legacy, "validate_token", validated_token)
+    monkeypatch.setattr(legacy, "get_package_member_info", original_member)
+    from palimpsest_hub.services import image_jobs as image_job_service
+
+    monkeypatch.setattr(image_job_service, "validate_token", validated_token)
+    monkeypatch.setattr(image_job_service, "get_package_member_info", original_member)
+    monkeypatch.setattr(image_job_service, "revalidate_package_admin", original_manager)
 
     monkeypatch.setattr(registry, "get_session_factory", lambda: factory)
     monkeypatch.setattr(registry, "get_blob_store", lambda: blob_store)
@@ -287,7 +292,6 @@ async def hub(tmp_path, monkeypatch):
     app.dependency_overrides[get_package_member_info] = member_dependency
     app.dependency_overrides[get_package_manager_info] = manager_dependency
     app.dependency_overrides[require_token] = token_dependency
-    app.dependency_overrides[legacy.require_admin] = system_admin_dependency
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://fixture") as client:
         yield SimpleNamespace(
             client=client, store=blob_store, factory=factory, settings=settings, people=people, disabled=disabled
@@ -468,7 +472,7 @@ async def test_scope_project_and_owner_key_sessions_are_exact(hub):
         await hub.client.post(
             f"/v1/projects/{namespace}/uploads", params={"package": "test"}, headers={"X-Auth-Token": "one"}, json=body
         )
-    ).status_code == 401
+    ).status_code == 201
     assert (await hub.client.get("/v1/auth/me", headers={**first, "X-Project-Id": "project-a"})).status_code == 403
     assert (await hub.client.get("/v1/auth/me", headers={**first, "X-Auth-Token": "one"})).status_code == 401
     async with hub.factory() as session:
@@ -494,7 +498,7 @@ async def test_authority_removed_during_transfer_prevents_publication(hub, chang
     elif change == "membership":
         hub.disabled.add(hub.people["one"]["user_id"])
     elif change == "role":
-        hub.people["one"]["roles"] = ["reader", "palimpsest-inventory_reader"]
+        hub.people["one"]["roles"] = ["reader"]
         assert (await hub.client.get("/v1/auth/me", headers=credential)).status_code == 200
     else:
         async with hub.factory() as session:
@@ -859,7 +863,7 @@ async def test_service_admin_key_control_stays_owner_only(hub):
     ).status_code == 404
     assert (await hub.client.get(key_path, headers={"X-Auth-Token": "two"})).json()["items"] == []
     assert (await hub.client.get(key_path, headers=credential)).status_code == 401
-    hub.people["one"]["roles"] = ["reader", "palimpsest-inventory_reader"]
+    hub.people["one"]["roles"] = ["reader"]
     assert (await hub.client.get(key_path, headers={"X-Auth-Token": "one"})).status_code == 403
     assert (
         await hub.client.delete(key_path + "/" + issued["key"]["key_id"], headers={"X-Auth-Token": "one"})
@@ -989,7 +993,7 @@ async def test_legacy_http_idempotent_registration_preserves_descriptor_and_proj
 
 
 @pytest.mark.asyncio
-async def test_legacy_http_admin_delete_is_child_protected(hub):
+async def test_legacy_http_member_delete_is_child_and_project_protected(hub):
     parent = await legacy_publish(hub, b"parent layer", {"name": "parent", "kind": "squashfs"})
     child = await legacy_publish(
         hub,
@@ -1002,12 +1006,16 @@ async def test_legacy_http_admin_delete_is_child_protected(hub):
     )
     parent_path = "/v1/layers/" + parent["blob_digest"]
     for person in ("one", "admin"):
-        assert (await hub.client.delete(parent_path, headers={"X-Auth-Token": person})).status_code == 403
+        assert (await hub.client.delete(parent_path, headers={"X-Auth-Token": person})).status_code == 409
+    assert (await hub.client.delete(parent_path, headers={"X-Auth-Token": "foreign"})).status_code == 404
+    hub.people["two"]["roles"] = ["reader"]
+    assert (await hub.client.delete(parent_path, headers={"X-Auth-Token": "two"})).status_code == 403
     operator = {"X-Auth-Token": "operator"}
     assert (await hub.client.delete(parent_path, headers=operator)).status_code == 409
     assert (await hub.client.get(parent_path, headers=operator)).status_code == 200
-    assert (await hub.client.delete("/v1/layers/" + child["blob_digest"], headers=operator)).status_code == 204
-    assert (await hub.client.delete(parent_path, headers=operator)).status_code == 204
+    member = {"X-Auth-Token": "one"}
+    assert (await hub.client.delete("/v1/layers/" + child["blob_digest"], headers=member)).status_code == 204
+    assert (await hub.client.delete(parent_path, headers=member)).status_code == 204
     assert (await hub.client.get(parent_path, headers=operator)).status_code == 404
 
 
@@ -1102,7 +1110,7 @@ async def test_native_keys_are_not_legacy_or_member_credentials(hub):
     path = f"/v1/projects/{namespace}/uploads"
     assert (
         await hub.client.post(path, params={"package": "test"}, headers={"X-Auth-Token": "one"}, json=body)
-    ).status_code == 401
+    ).status_code == 201
     mixed = {**credential, "X-Auth-Token": "one"}
     assert (await hub.client.post(path, params={"package": "test"}, headers=mixed, json=body)).status_code == 401
 
@@ -1170,12 +1178,12 @@ async def test_package_key_cannot_select_admin_target_or_delete_package(hub):
 
 
 @pytest.mark.asyncio
-async def test_cache_only_keys_preserve_independent_leaves_scope_and_current_owner(hub):
+async def test_cache_only_keys_preserve_action_scope_and_current_standard_owner(hub):
     """ASGI/SQL/CAS proof, not a live identity or CLI transport qualification."""
     namespace, _, writer = await key(hub, actions=["cache:write"])
     _, _, other_writer = await key(hub, person="two", actions=["cache:write"])
     _, _, reader = await key(hub, person="two", actions=["cache:read"])
-    hub.people["one"]["roles"] = ["member", "palimpsest-publish_editor"]
+    hub.people["one"]["roles"] = ["member"]
     binding = {
         "project_id": "Project-A",
         "namespace": namespace,
@@ -1199,7 +1207,7 @@ async def test_cache_only_keys_preserve_independent_leaves_scope_and_current_own
     assert (await hub.client.get(archive_path, params=params, headers=writer)).status_code == 403
     assert (await hub.client.post(base + "/uploads", params=params, headers=reader, json=body)).status_code == 403
     # Cache read is independent of package inventory and download delegation.
-    hub.people["two"]["roles"] = ["member", "palimpsest-download_user"]
+    hub.people["two"]["roles"] = ["reader"]
     resolved = await hub.client.get(base + "/resolve", params={**params, **partition}, headers=reader)
     assert resolved.status_code == 200 and resolved.json()["resolution"] == "exact"
     downloaded = await hub.client.get(archive_path, params=params, headers=reader)
@@ -1220,7 +1228,7 @@ async def test_cache_only_keys_preserve_independent_leaves_scope_and_current_own
         "archive_size_bytes": len(pending_archive),
     }
     pending, _ = await staged(hub, namespace, writer, pending_archive, pending_body, resource="cache")
-    hub.people["one"]["roles"] = ["member", "palimpsest-download_user"]
+    hub.people["one"]["roles"] = ["reader"]
     assert (await hub.client.put(pending, params=params, headers=writer, json={})).status_code == 403
     assert (
         await hub.client.patch(
@@ -1231,10 +1239,105 @@ async def test_cache_only_keys_preserve_independent_leaves_scope_and_current_own
         )
     ).status_code == 403
     assert not hub.store.exists(digest(pending_archive))
-    hub.people["two"]["roles"] = ["reader", "palimpsest-inventory_reader"]
+    hub.disabled.add(hub.people["two"]["user_id"])
     assert (await hub.client.get(archive_path, params=params, headers=reader)).status_code == 403
+    hub.disabled.clear()
     inventory = await hub.client.get(f"/v1/projects/{namespace}/packages", headers={"X-Auth-Token": "two"})
     assert inventory.status_code == 200 and inventory.json()["items"] == []
     async with hub.factory() as session:
         assert await session.scalar(select(func.count()).select_from(PackageCache)) == 1
         assert await session.scalar(select(func.count()).select_from(RegistryPackage)) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", ["member", "manager", "admin"])
+async def test_standard_project_roles_manage_packages_without_service_roles(hub, role):
+    hub.people["one"]["roles"] = [role]
+    namespace, issued, key_headers = await key(hub)
+    member = {"X-Auth-Token": "one"}
+    archive, body, _ = image_archive(role.encode())
+    result, _, _ = await publish(hub, namespace, member, archive, body)
+    assert result.status_code == 201
+    assert result.json()["pushed_key_id"] is None
+    base = f"/v1/projects/{namespace}"
+    assert (await hub.client.get(base + "/packages", headers=member)).status_code == 200
+    assert (await hub.client.get(base + "/keys", headers=member)).status_code == 200
+    assert (await hub.client.delete(base + "/keys/" + issued["key"]["key_id"], headers=member)).status_code == 204
+    assert (await hub.client.get("/v1/auth/me", headers=key_headers)).status_code == 401
+    assert (
+        await hub.client.delete(base + "/package", params={"package": "test"}, headers={"X-Auth-Token": "foreign"})
+    ).status_code == 403
+    # Project-visible packages are managed by project members, not only their creator.
+    assert (
+        await hub.client.delete(base + "/package", params={"package": "test"}, headers={"X-Auth-Token": "two"})
+    ).status_code == 204
+    assert (await hub.client.get(base + "/package", params={"package": "test"}, headers=member)).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_standard_reader_queries_and_downloads_but_cannot_manage(hub):
+    namespace, _, credential = await key(hub)
+    archive, body, _ = image_archive()
+    assert (await publish(hub, namespace, credential, archive, body))[0].status_code == 201
+    hub.people["two"]["roles"] = ["reader"]
+    reader = {"X-Auth-Token": "two"}
+    base = f"/v1/projects/{namespace}"
+    params = {"package": "test"}
+    assert (await hub.client.get(base + "/packages", headers=reader)).status_code == 200
+    assert (await hub.client.get(base + "/versions", params=params, headers=reader)).status_code == 200
+    download = await hub.client.get(
+        base + "/versions/" + body["root_digest"] + "/download", params=params, headers=reader
+    )
+    assert download.status_code == 200 and download.content == archive
+    assert (await hub.client.post(base + "/uploads", params=params, headers=reader, json=body)).status_code == 403
+    assert (await hub.client.delete(base + "/package", params=params, headers=reader)).status_code == 403
+    assert (await hub.client.put("/v1/projects/Project-A/namespace", headers=reader, json={})).status_code == 403
+    assert (
+        await hub.client.post(
+            base + "/keys",
+            headers=reader,
+            json={
+                "name": "denied",
+                "scope": {"packages": ["test"]},
+                "actions": ["packages:read"],
+                "expires_in_days": 1,
+            },
+        )
+    ).status_code == 403
+    assert (await hub.client.get(base + "/keys", headers=reader)).status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_member_delete_rechecks_current_authority_before_commit(hub, monkeypatch):
+    namespace, _, credential = await key(hub)
+    archive, body, _ = image_archive()
+    assert (await publish(hub, namespace, credential, archive, body))[0].status_code == 201
+    original = registry.fresh_actor
+    calls = 0
+
+    async def revoke_at_commit(actor, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            hub.disabled.add(actor.user_id)
+        return await original(actor, *args, **kwargs)
+
+    monkeypatch.setattr(registry, "fresh_actor", revoke_at_commit)
+    base = f"/v1/projects/{namespace}"
+    deleted = await hub.client.delete(base + "/package", params={"package": "test"}, headers={"X-Auth-Token": "one"})
+    assert deleted.status_code == 403 and calls == 2
+    hub.disabled.clear()
+    assert (
+        await hub.client.get(base + "/package", params={"package": "test"}, headers={"X-Auth-Token": "two"})
+    ).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_project_member_cannot_delete_shared_catalog_layer(hub):
+    published = await legacy_publish(
+        hub, b"system catalog bytes", {"name": "shared", "kind": "squashfs", "is_published": True}, person="operator"
+    )
+    path = "/v1/layers/" + published["blob_digest"]
+    assert (await hub.client.delete(path, headers={"X-Auth-Token": "one"})).status_code == 403
+    assert (await hub.client.get(path, headers={"X-Auth-Token": "one"})).status_code == 200
+    assert (await hub.client.delete(path, headers={"X-Auth-Token": "operator"})).status_code == 204

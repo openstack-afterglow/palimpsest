@@ -173,6 +173,7 @@ async def publish(request: Request, actor: dict = Depends(_legacy_writer)):
         payload.name,
         manifest,
         visibility=payload.visibility,
+        authority=actor,
     )
 
 
@@ -208,6 +209,7 @@ async def extension(request: Request, actor: dict = Depends(_legacy_writer)):
         [layer.model_dump(exclude_none=True, exclude={"id", "parent_id"}) for layer in payload.layers],
         visibility=payload.visibility,
         metadata=payload.metadata,
+        authority=actor,
     )
 
 

@@ -24,6 +24,7 @@ from palimpsest_hub.auth import (
     validate_token,
 )
 from palimpsest_hub.config import default_project_namespace, get_settings
+from palimpsest_hub.policy import ACTIONS
 
 
 @pytest.fixture(autouse=True)
@@ -131,15 +132,18 @@ ORIGINAL_SUBJECT = "original-project-subject"
 
 # Synthetic Keystone owns these initial links; tests mutate them to prove revocation.
 SERVICE_EDGES = {
+    "admin": ["manager"],
+    "manager": ["member"],
+    "member": ["reader"],
+    "project_owner": ["project_admin"],
+    "project_admin": ["admin"],
+    "project_manager": ["manager"],
+    "project_member": ["member"],
+    "project_reader": ["reader"],
     "palimpsest_admin": ["palimpsest_editor", "palimpsest-keys_admin"],
     "palimpsest_editor": ["palimpsest_user", "palimpsest-publish_editor", "palimpsest-keys_editor"],
     "palimpsest_user": ["palimpsest_reader", "palimpsest-download_user"],
     "palimpsest_reader": ["palimpsest-inventory_reader"],
-    "palimpsest-download_user": ["palimpsest_reader"],
-    "palimpsest-publish_editor": ["palimpsest_reader"],
-    "palimpsest-keys_editor": ["palimpsest_reader"],
-    "palimpsest-keys_admin": ["palimpsest_reader"],
-    "member": ["reader"],
 }
 
 
@@ -175,8 +179,8 @@ def keystone_http(monkeypatch: pytest.MonkeyPatch):
         "users_next": False,
         "extra_users": [],
         "validator_roles": ["reader"],
-        "token_roles": ["member", "palimpsest_admin"],
-        "project_roles": ["member", "palimpsest_admin"],
+        "token_roles": ["member"],
+        "project_roles": ["member"],
         "other_roles": [],
         "system_roles": [],
         "groups": [],
@@ -281,6 +285,9 @@ def keystone_http(monkeypatch: pytest.MonkeyPatch):
             collection = path.path
             if collection == "/v3/role_assignments" and "effective" in parse_qs(path.query):
                 collection += "?effective"
+            elif collection == "/v3/role_assignments" and parse_qs(path.query).get("scope.project.id"):
+                collection += "?raw-project"
+                state["raw_project_reads"] = state.get("raw_project_reads", 0) + 1
             if status == 200 and collection in state["collection_metadata"]:
                 body = dict(body)
                 body.pop("links", None)
@@ -622,10 +629,10 @@ def test_disabled_owner_or_project_cannot_authorize_key(keystone_http, field):
 
 
 def test_admin_assignment_elsewhere_never_changes_current_project_ceiling(keystone_http):
-    keystone_http["project_roles"] = ["palimpsest_reader"]
+    keystone_http["project_roles"] = ["reader"]
     keystone_http["other_roles"] = ["admin"]
     owner = validate_package_owner(FEDERATED_OWNER, PROJECT_A)
-    assert owner["package_actions"] == {"packages:inventory"}
+    assert owner["package_actions"] == {"packages:inventory", "packages:read", "cache:read"}
     assert "admin" not in owner["roles"]
 
 
@@ -682,48 +689,19 @@ def test_opaque_project_namespace_is_stable_and_case_sensitive():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "role,expected",
-    [
-        ("palimpsest_reader", {"palimpsest-inventory_reader"}),
-        ("palimpsest_user", {"palimpsest-inventory_reader", "palimpsest-download_user"}),
-        (
-            "palimpsest_editor",
-            {
-                "palimpsest-inventory_reader",
-                "palimpsest-download_user",
-                "palimpsest-publish_editor",
-                "palimpsest-keys_editor",
-            },
-        ),
-        (
-            "palimpsest_admin",
-            {
-                "palimpsest-inventory_reader",
-                "palimpsest-download_user",
-                "palimpsest-publish_editor",
-                "palimpsest-keys_editor",
-                "palimpsest-keys_admin",
-            },
-        ),
-        *[
-            (leaf, {leaf, "palimpsest-inventory_reader"})
-            for leaf in (
-                "palimpsest-inventory_reader",
-                "palimpsest-download_user",
-                "palimpsest-publish_editor",
-                "palimpsest-keys_editor",
-                "palimpsest-keys_admin",
-            )
-        ],
-    ],
-)
-async def test_grade_and_exact_leaf_defaults_need_no_service_edges_or_member(keystone_http, role, expected):
+@pytest.mark.parametrize("role", ["reader", "member", "manager", "admin"])
+async def test_standard_native_role_defaults_need_no_implication_edges(keystone_http, role):
+    from palimpsest_hub.policy import ACTIONS, SYSTEM_ACTIONS
+
     keystone_http["edges"] = {}
     keystone_http["token_roles"] = keystone_http["project_roles"] = [role]
     original = validate_token(ORIGINAL_SUBJECT)
     member = await get_package_member_info(original)
-    assert member["package_capabilities"] == expected
+    expected = (
+        {"packages:inventory", "packages:read", "cache:read"} if role == "reader" else set(ACTIONS) - SYSTEM_ACTIONS
+    )
+    assert member["package_actions"] == expected
+    assert member["can_write"] is (role != "reader")
     assert member["token"] == ORIGINAL_SUBJECT and member["user_id"] == FEDERATED_OWNER
     assert member["auth_ref"] is original["auth_ref"]
 
@@ -732,16 +710,20 @@ async def test_grade_and_exact_leaf_defaults_need_no_service_edges_or_member(key
 @pytest.mark.parametrize(
     "roles",
     [
-        ["member"],
-        ["reader"],
-        ["member", "project_admin"],
-        ["member", "project_owner"],
-        ["manager"],
+        ["palimpsest_reader"],
+        ["palimpsest_user"],
+        ["palimpsest_editor"],
+        ["palimpsest_admin"],
+        ["palimpsest-inventory_reader"],
+        ["palimpsest-download_user"],
+        ["palimpsest-publish_editor"],
+        ["palimpsest-keys_editor"],
+        ["palimpsest-keys_admin"],
         ["waygate_admin"],
-        ["service", "palimpsest_admin"],
+        ["service", "member"],
     ],
 )
-async def test_unentitled_or_machine_service_roles_cannot_authorize(keystone_http, roles):
+async def test_legacy_only_or_machine_service_roles_cannot_authorize(keystone_http, roles):
     keystone_http["token_roles"] = keystone_http["project_roles"] = roles
     with pytest.raises(HTTPException) as raised:
         await get_package_member_info(validate_token(ORIGINAL_SUBJECT))
@@ -749,35 +731,53 @@ async def test_unentitled_or_machine_service_roles_cannot_authorize(keystone_htt
 
 
 @pytest.mark.asyncio
-async def test_removed_service_edges_do_not_revoke_locally_evaluated_grade(keystone_http):
-    keystone_http["token_roles"] = keystone_http["project_roles"] = ["palimpsest_editor"]
+@pytest.mark.parametrize(
+    "role,can_write",
+    [
+        ("project_reader", False),
+        ("project_member", True),
+        ("project_manager", True),
+        ("project_admin", True),
+        ("project_owner", True),
+    ],
+)
+async def test_canonical_project_roles_require_current_native_implication(keystone_http, role, can_write):
+    keystone_http["token_roles"] = keystone_http["project_roles"] = [role]
     original = validate_token(ORIGINAL_SUBJECT)
-    keystone_http["edges"] = {}
-    assert (await get_package_member_info(original))["can_write"]
-    assert "palimpsest-publish_editor" not in validate_package_owner(FEDERATED_OWNER, PROJECT_A)["roles"]
+    assert (await get_package_member_info(original))["can_write"] is can_write
+    keystone_http["edges"][role] = []
+    with pytest.raises(HTTPException) as raised:
+        await get_package_member_info(original)
+    assert raised.value.status_code == 403
 
 
 @pytest.mark.asyncio
-async def test_current_assignment_and_token_authority_intersect(keystone_http):
-    keystone_http["token_roles"] = ["reader", "palimpsest_reader"]
+async def test_current_assignment_and_issued_token_authority_intersect(keystone_http):
+    reads = {"packages:inventory", "packages:read", "cache:read"}
+    keystone_http["token_roles"] = ["reader"]
     original = validate_token(ORIGINAL_SUBJECT)
-    assert (await get_package_member_info(original))["package_capabilities"] == {"palimpsest-inventory_reader"}
-    keystone_http["token_roles"] = ["member", "palimpsest_admin"]
+    assert (await get_package_member_info(original))["package_actions"] == reads
+    keystone_http["token_roles"] = ["member"]
     original = validate_token(ORIGINAL_SUBJECT)
-    keystone_http["project_roles"] = ["reader", "palimpsest_reader"]
-    assert (await get_package_member_info(original))["package_capabilities"] == {"palimpsest-inventory_reader"}
+    keystone_http["project_roles"] = ["reader"]
+    assert (await get_package_member_info(original))["package_actions"] == reads
+    keystone_http["project_roles"] = []
+    with pytest.raises(HTTPException) as raised:
+        await get_package_member_info(original)
+    assert raised.value.status_code == 403
 
 
 @pytest.mark.parametrize("change", ["domain", "duplicate", "unknown", "cycle", "unavailable", "truncated"])
 def test_role_directory_cannot_be_replaced_by_name_claims(keystone_http, change):
     if change == "domain":
-        next(role for role in keystone_http["directory"] if role["name"] == "palimpsest_admin")["domain_id"] = "tenant"
+        next(role for role in keystone_http["directory"] if role["name"] == "member")["domain_id"] = "tenant"
+        keystone_http["edges"]["member"] = []
     elif change == "duplicate":
-        keystone_http["directory"].append({"id": "alias", "name": "palimpsest_admin", "domain_id": None})
+        keystone_http["directory"].append({"id": "alias", "name": "member", "domain_id": None})
     elif change == "unknown":
-        keystone_http["edges"]["palimpsest_admin"].append("missing")
+        keystone_http["edges"]["member"].append("missing")
     elif change == "cycle":
-        keystone_http["edges"]["palimpsest_reader"].append("palimpsest_admin")
+        keystone_http["edges"]["reader"] = ["member"]
     elif change == "truncated":
         keystone_http["directory_truncated"] = True
     else:
@@ -788,7 +788,7 @@ def test_role_directory_cannot_be_replaced_by_name_claims(keystone_http, change)
 
 
 def test_project_admin_implication_never_establishes_system_authority(keystone_http):
-    keystone_http["edges"]["palimpsest_admin"].append("admin")
+    keystone_http["token_roles"] = keystone_http["project_roles"] = ["project_admin"]
     owner = validate_package_owner(FEDERATED_OWNER, PROJECT_A)
     assert owner["can_write"] is True
     assert validate_token(ORIGINAL_SUBJECT)["is_system_admin"] is False
@@ -912,18 +912,24 @@ async def test_global_catalog_targetless_policy_still_requires_native_human_syst
 @pytest.mark.parametrize(
     "role,inventory,download,publish,issue,revoke",
     [
-        ("palimpsest_reader", True, False, False, False, False),
-        ("palimpsest_user", True, True, False, False, False),
-        ("palimpsest_editor", True, True, True, True, False),
-        ("palimpsest_admin", True, True, True, True, True),
-        ("palimpsest-inventory_reader", True, False, False, False, False),
-        ("palimpsest-download_user", True, True, False, False, False),
-        ("palimpsest-publish_editor", True, False, True, False, False),
-        ("palimpsest-keys_editor", True, False, False, True, False),
-        ("palimpsest-keys_admin", True, False, False, False, True),
+        ("reader", True, True, False, False, False),
+        ("member", True, True, True, True, True),
+        ("manager", True, True, True, True, True),
+        ("admin", True, True, True, True, True),
+        ("palimpsest_reader", False, False, False, False, False),
+        ("palimpsest_user", False, False, False, False, False),
+        ("palimpsest_editor", False, False, False, False, False),
+        ("palimpsest_admin", False, False, False, False, False),
+        ("palimpsest-inventory_reader", False, False, False, False, False),
+        ("palimpsest-download_user", False, False, False, False, False),
+        ("palimpsest-publish_editor", False, False, False, False, False),
+        ("palimpsest-keys_editor", False, False, False, False, False),
+        ("palimpsest-keys_admin", False, False, False, False, False),
     ],
 )
-async def test_native_http_service_matrix(native_http, role, inventory, download, publish, issue, revoke):
+async def test_native_http_standard_role_and_legacy_denial_matrix(
+    native_http, role, inventory, download, publish, issue, revoke
+):
     from test_packages import image_archive
     from test_packages import publish as publish_package
 
@@ -983,14 +989,21 @@ async def test_native_http_service_matrix(native_http, role, inventory, download
     created = await h.client.post(base + "/keys", headers=token, json=subset)
     assert created.status_code == (201 if issue and inventory else 403)
     rejected = await h.client.post(base + "/keys", headers=token, json={**key_request, "actions": ["vm:launch"]})
-    assert rejected.status_code == 422
+    assert rejected.status_code == (422 if inventory else 403)
     revoked = await h.client.delete(base + "/keys/" + issued.json()["key"]["key_id"], headers=token)
+    listed_keys = await h.client.get(base + "/keys", headers=token)
+    assert listed_keys.status_code == (200 if issue else 403), listed_keys.text
+    builds = await h.client.get("/v1/builds", headers=token)
+    assert builds.status_code == (200 if inventory else 403), builds.text
     assert revoked.status_code == (204 if revoke else 403)
-    # A service admin is not the verified system admin; a package key is not a VM credential.
-    build = {"name": "forbidden", "recipe": "FROM fixture", "base_digest": body["root_digest"]}
-    assert (await h.client.post("/v1/builds", headers=token, json=build)).status_code == 403
+    # A project administrator is not a verified system administrator; keys are not VM credentials.
+    build = {"name": "project-build", "recipe": "FROM fixture"}
+    created_build = await h.client.post("/v1/builds", headers=token, json=build)
+    assert created_build.status_code == (422 if publish else 403), created_build.text
     assert (await h.client.post("/v1/builds", headers=credential, json=build)).status_code == 401
-    assert (await h.client.delete("/v1/layers/" + body["root_digest"], headers=token)).status_code == 403
+    assert (await h.client.delete("/v1/layers/" + body["root_digest"], headers=token)).status_code == (
+        404 if publish else 403
+    )
     assert not any(event.get("methods") == ["token"] for event in h.identity["requests"])
 
 
@@ -1004,21 +1017,15 @@ async def test_native_http_key_graph_downgrade_and_namespace_denial(native_http)
     base = f"/v1/projects/{namespace}"
     assert (await h.client.put(f"/v1/projects/{PROJECT_A}/namespace", headers=token, json={})).status_code == 201
     request = {"name": "narrow writer", "scope": {"packages": ["test"]}, "actions": ["packages:write"]}
-    h.identity["project_roles"] = h.identity["token_roles"] = [
-        "member",
-        "palimpsest-publish_editor",
-        "palimpsest-keys_editor",
-    ]
+    h.identity["project_roles"] = h.identity["token_roles"] = ["member"]
     issued = await h.client.post(base + "/keys", headers=token, json=request)
     assert issued.status_code == 201
-    # Publish-only is not forced to request download and cannot delegate it.
-    assert (
-        await h.client.post(base + "/keys", headers=token, json={**request, "actions": ["packages:read"]})
-    ).status_code == 403
+    # The key retains its issued write-only action ceiling despite the member's broader authority.
     credential = {"Authorization": "Bearer " + issued.json()["secret"]}
+    assert (await h.client.get(base + "/packages", headers=credential)).status_code == 403
     archive, body, _ = image_archive()
     path, _ = await staged(h, namespace, credential, archive, body)
-    h.identity["project_roles"] = ["member", "palimpsest_user"]
+    h.identity["project_roles"] = ["reader"]
     assert (await h.client.put(path, headers=credential, params={"package": "test"}, json={})).status_code == 403
     assert (
         await h.client.patch(
@@ -1031,22 +1038,20 @@ async def test_native_http_key_graph_downgrade_and_namespace_denial(native_http)
     assert (await h.client.post(base + "/keys", headers=token, json=request)).status_code == 403
     assert (await h.client.get("/v1/projects/foreign/packages", headers=credential)).status_code == 403
     assert (await h.client.get(base + "/packages", headers={**token, "X-Project-Id": PROJECT_B})).status_code == 403
-    h.identity["project_roles"] = h.identity["token_roles"] = ["member", "palimpsest_admin"]
-    h.identity["project_roles"] = ["palimpsest_reader"]
+    h.identity["project_roles"] = h.identity["token_roles"] = ["member"]
+    h.identity["project_roles"] = ["reader"]
     assert (await h.client.put(path, headers=credential, params={"package": "test"}, json={})).status_code == 403
     h.identity["directory_unavailable"] = True
     assert (await h.client.get("/v1/auth/me", headers=credential)).status_code == 503
 
 
 @pytest.mark.asyncio
-async def test_fine_grained_inventory_default_is_local_not_inferred(keystone_http):
+async def test_internal_capability_labels_are_not_native_role_entitlements(keystone_http):
     keystone_http["project_roles"] = keystone_http["token_roles"] = ["palimpsest-publish_editor"]
     keystone_http["edges"] = {}
-    original = validate_token(ORIGINAL_SUBJECT)
-    assert (await get_package_member_info(original))["package_capabilities"] == {
-        "palimpsest-publish_editor",
-        "palimpsest-inventory_reader",
-    }
+    with pytest.raises(HTTPException) as raised:
+        await get_package_member_info(validate_token(ORIGINAL_SUBJECT))
+    assert raised.value.status_code == 403
 
 
 def test_unrelated_domain_role_inferences_do_not_disable_global_package_authority(keystone_http):
@@ -1102,9 +1107,9 @@ async def test_me_http_exposes_only_immutable_scope_and_fresh_capabilities(ident
         "user_id": FEDERATED_OWNER,
         "project_id": PROJECT_A,
         "project_name": "selected-project",
-        "roles": ["member", "palimpsest_admin"],
+        "roles": ["member"],
         "is_system_admin": False,
-        "capabilities": {"inventory": True, "download": True, "upload": True, "delete": False, "build": False},
+        "capabilities": {"inventory": True, "download": True, "upload": True, "delete": True, "build": True},
     }
     assert response.json() == expected
     assert all(
@@ -1119,13 +1124,13 @@ async def test_me_http_exposes_only_immutable_scope_and_fresh_capabilities(ident
         )
     )
     # The original token remains valid and unchanged after current authority is reduced.
-    keystone_http["project_roles"] = ["reader", "palimpsest_reader"]
+    keystone_http["project_roles"] = ["reader"]
     reduced = await identity_http.get("/v1/me", headers=headers)
-    expected["capabilities"].update(download=False, upload=False)
+    expected["capabilities"].update(upload=False, delete=False, build=False)
     assert reduced.status_code == 200 and reduced.json() == expected
     keystone_http["project_roles"] = []
     removed = await identity_http.get("/v1/me", headers=headers)
-    expected["capabilities"]["inventory"] = False
+    expected["capabilities"].update(inventory=False, download=False)
     assert removed.status_code == 200 and removed.json() == expected
     assert not any(event.get("methods") == ["token"] for event in keystone_http["requests"])
 
@@ -1134,23 +1139,24 @@ async def test_me_http_exposes_only_immutable_scope_and_fresh_capabilities(ident
 @pytest.mark.parametrize(
     "roles,expected",
     [
-        (["member", "palimpsest-inventory_reader"], (True, False, False)),
-        (["member", "palimpsest-download_user"], (True, True, False)),
-        (["member", "palimpsest-publish_editor"], (True, False, True)),
-        (["reader", "palimpsest-inventory_reader"], (True, False, False)),
-        (["reader", "palimpsest-download_user"], (True, True, False)),
-        (["member"], (False, False, False)),
-        (["admin", "member", "palimpsest_admin"], (True, True, True)),
+        (["reader"], (True, True, False)),
+        (["member"], (True, True, True)),
+        (["manager"], (True, True, True)),
+        (["admin"], (True, True, True)),
+        (["palimpsest-inventory_reader"], (False, False, False)),
+        (["palimpsest-download_user"], (False, False, False)),
+        (["palimpsest-publish_editor"], (False, False, False)),
+        (["palimpsest_admin"], (False, False, False)),
     ],
 )
-async def test_me_http_matches_exact_legacy_leaf_policies(identity_http, keystone_http, roles, expected):
+async def test_me_http_matches_standard_roles_not_legacy_labels(identity_http, keystone_http, roles, expected):
     keystone_http["token_roles"] = roles
     keystone_http["project_roles"] = roles
     response = await identity_http.get("/v1/me", headers={"X-Auth-Token": ORIGINAL_SUBJECT})
     assert response.status_code == 200
     assert response.json()["roles"] == roles
     assert response.json()["capabilities"] == dict(
-        zip(("inventory", "download", "upload", "delete", "build"), (*expected, False, False), strict=True)
+        zip(("inventory", "download", "upload", "delete", "build"), (*expected, expected[2], expected[2]), strict=True)
     )
 
 
@@ -1213,13 +1219,13 @@ async def test_me_http_missing_protection_policy_is_unavailable_not_denied(ident
 
 @pytest.mark.asyncio
 async def test_me_http_other_project_admin_keeps_current_project_ceiling(identity_http, keystone_http):
-    keystone_http["project_roles"] = ["palimpsest_reader"]
+    keystone_http["project_roles"] = ["reader"]
     keystone_http["other_roles"] = ["admin"]
     response = await identity_http.get("/v1/me", headers={"X-Auth-Token": ORIGINAL_SUBJECT})
     assert response.status_code == 200 and response.json()["is_system_admin"] is False
     assert response.json()["capabilities"] == {
         "inventory": True,
-        "download": False,
+        "download": True,
         "upload": False,
         "delete": False,
         "build": False,
@@ -1432,7 +1438,10 @@ async def test_native_http_admin_upload_status_abort_and_target_isolation(native
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("scope", ["project", "system", "unscoped"])
-@pytest.mark.parametrize("methods", [["password"], ["password", "totp"], ["oidc"], ["token"], ["password", "token"]])
+@pytest.mark.parametrize(
+    "methods",
+    [["password"], ["password", "totp"], ["oidc"], ["openid"], ["openid", "token"], ["token"], ["password", "token"]],
+)
 async def test_native_http_human_admin_original_scopes_and_bounded_key_management(native_http, scope, methods):
     from test_packages import image_archive
     from test_packages import publish as publish_package
@@ -2003,7 +2012,7 @@ async def test_native_http_member_key_service_veto_requires_complete_effective_a
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("methods", [["token"], ["password", "token"]])
+@pytest.mark.parametrize("methods", [["token"], ["password", "token"], ["openid", "token"]])
 @pytest.mark.parametrize(
     "marker",
     [
@@ -2099,10 +2108,10 @@ async def test_native_policy_http_reload_controls_key_ceiling_without_inventory_
     assert issued.status_code == 201
     key = {"Authorization": "Bearer " + issued.json()["secret"]}
     path = tmp_path / "policy.yaml"
-    path.write_text("{}\n")
+    path.write_text(json.dumps({"packages:write": "!", "cache:write": "!"}))
     monkeypatch.setenv("OSLO_POLICY_POLICY_FILE", str(path))
     get_settings.cache_clear()
-    h.identity["token_roles"] = h.identity["project_roles"] = ["palimpsest_reader"]
+    h.identity["token_roles"] = h.identity["project_roles"] = ["member"]
     archive, body, _ = image_archive()
     assert (
         await h.client.post(base + "/uploads", headers=key, params={"package": "test"}, json=body)
@@ -2110,10 +2119,10 @@ async def test_native_policy_http_reload_controls_key_ceiling_without_inventory_
     path.write_text(
         json.dumps(
             {
-                "packages:inventory": "!",
-                "packages:write": "role:palimpsest_reader",
-                "cache:write": "role:palimpsest_reader",
-                "keys:issue": "role:palimpsest_reader",
+                **dict.fromkeys(ACTIONS, "!"),
+                "packages:write": "role:member",
+                "cache:write": "role:member",
+                "keys:issue": "role:member",
             }
         )
     )
@@ -2137,14 +2146,14 @@ async def test_native_policy_http_reload_controls_key_ceiling_without_inventory_
     assert (await h.client.get("/v1/projects/foreign/packages", headers=key)).status_code == 403
     assert (
         await h.client.post("/v1/builds", headers=token, json={"name": "denied", "recipe": "FROM fixture"})
-    ).status_code == 403
+    ).status_code == 422
     assert (await h.client.delete("/v1/layers/" + body["root_digest"], headers=token)).status_code == 403
     path.write_text(
         json.dumps(
             {
-                "packages:inventory": "!",
-                "packages:read": "role:palimpsest_reader",
-                "keys:issue": "role:palimpsest_reader",
+                **dict.fromkeys(ACTIONS, "!"),
+                "packages:read": "role:member",
+                "keys:issue": "role:member",
             }
         )
     )
@@ -2155,7 +2164,7 @@ async def test_native_policy_http_reload_controls_key_ceiling_without_inventory_
     assert (await h.client.get(version_path, headers=read_key, params={"package": "test"})).status_code == 403
     downloaded = await h.client.get(version_path + "/download", headers=read_key, params={"package": "test"})
     assert downloaded.status_code == 200 and downloaded.content == archive
-    path.write_text(json.dumps({"packages:write": "!", "cache:write": "role:palimpsest_reader"}))
+    path.write_text(json.dumps({**dict.fromkeys(ACTIONS, "!"), "cache:write": "role:member"}))
     assert (
         await h.client.post(base + "/uploads", headers=key, params={"package": "test"}, json=body)
     ).status_code == 403
@@ -2171,7 +2180,6 @@ async def test_native_policy_http_reload_controls_key_ceiling_without_inventory_
     assert (
         await h.client.post(base + "/cache/uploads", headers=key, params={"package": "test"}, json=cache_body)
     ).status_code == 201
-    from palimpsest_hub.policy import ACTIONS
 
     path.write_text(json.dumps(dict.fromkeys(ACTIONS, "!")))
     empty = await h.client.get("/v1/policy/capabilities", headers=token)
@@ -2224,7 +2232,7 @@ async def test_native_policy_allow_all_does_not_bypass_identity_or_system(native
     token = {"X-Auth-Token": ORIGINAL_SUBJECT}
     ordinary = await h.client.get("/v1/policy/capabilities", headers=token)
     assert ordinary.status_code == 200 and "system:manage" not in ordinary.json()["actions"]
-    assert (await h.client.get("/v1/builds", headers=token)).status_code == 403
+    assert (await h.client.get("/v1/builds", headers=token)).status_code == 200
     assert (
         await h.client.get("/v1/policy/capabilities", headers={**token, "X-Target-Project-Id": PROJECT_B})
     ).status_code == 403
@@ -2232,14 +2240,16 @@ async def test_native_policy_allow_all_does_not_bypass_identity_or_system(native
     h.identity["project_roles"] = ["admin"]
     project_admin = await h.client.get("/v1/policy/capabilities", headers=token)
     assert project_admin.status_code == 200 and "system:manage" not in project_admin.json()["actions"]
-    assert (await h.client.get("/v1/builds", headers=token)).status_code == 403
+    assert (await h.client.get("/v1/builds", headers=token)).status_code == 200
     h.identity["project_roles"] = []
     assert (await h.client.get("/v1/policy/capabilities", headers=token)).status_code == 403
-    h.identity["project_roles"] = ["palimpsest_admin"]
+    h.identity["project_roles"] = ["member"]
     h.identity["token_markers"] = {"application_credential": {"id": "restricted"}}
-    assert (await h.client.get("/v1/policy/capabilities", headers=token)).status_code == 403
+    reduced = await h.client.get("/v1/policy/capabilities", headers=token)
+    assert reduced.status_code == 200 and reduced.json()["actions"] == reduced.json()["capabilities"] == []
+    assert (await h.client.get("/v1/builds", headers=token)).status_code == 403
     h.identity["token_markers"] = {}
-    h.identity["token_roles"] = h.identity["project_roles"] = ["palimpsest_admin"]
+    h.identity["token_roles"] = h.identity["project_roles"] = ["member"]
     h.identity["user_enabled"] = False
     assert (await h.client.get("/v1/policy/capabilities", headers=token)).status_code == 403
 
@@ -2248,13 +2258,13 @@ async def test_native_policy_allow_all_does_not_bypass_identity_or_system(native
 async def test_native_policy_toml_bridge_directory_reload_and_env_precedence(native_http, tmp_path, monkeypatch):
     h = native_http
     h.identity["edges"] = {}
-    h.identity["project_roles"] = h.identity["token_roles"] = ["palimpsest_reader"]
+    h.identity["project_roles"] = h.identity["token_roles"] = ["member"]
     policy_file = tmp_path / "policy.yaml"
     policy_file.write_text("{}\n")
     policy_dir = tmp_path / "policy.d"
     policy_dir.mkdir()
     override = policy_dir / "reader.yaml"
-    override.write_text('"packages:write": "role:palimpsest_reader"\n')
+    override.write_text('"packages:write": "role:member"\n')
     config = tmp_path / "palimpsest.conf"
     config.write_text(
         "[oslo_policy]\npolicy_file = "
@@ -2272,7 +2282,7 @@ async def test_native_policy_toml_bridge_directory_reload_and_env_precedence(nat
     override.write_text('"packages:write": "!"\n')
     assert "packages:write" not in (await h.client.get("/v1/policy/capabilities", headers=token)).json()["actions"]
     other = tmp_path / "env-policy.yaml"
-    other.write_text('"packages:inventory": "!"\n')
+    other.write_text(json.dumps(dict.fromkeys(ACTIONS, "!")))
     monkeypatch.setenv("OSLO_POLICY_POLICY_FILE", str(other))
     monkeypatch.setenv("OSLO_POLICY_POLICY_DIRS", "[]")
     get_settings.cache_clear()
@@ -2288,8 +2298,9 @@ async def test_native_policy_casefold_global_collision_denies_before_authority(n
         {"id": "role-custom_policy_writer", "name": "custom_policy_writer", "domain_id": None}
     )
     h.identity["token_roles"] = h.identity["project_roles"] = ["custom_policy_writer"]
+    h.identity["edges"]["custom_policy_writer"] = ["member"]
     policy_file = tmp_path / "policy.yaml"
-    policy_file.write_text('"packages:write": "role:custom_policy_writer"\n')
+    policy_file.write_text(json.dumps({**dict.fromkeys(ACTIONS, "!"), "packages:write": "role:custom_policy_writer"}))
     monkeypatch.setenv("OSLO_POLICY_POLICY_FILE", str(policy_file))
     get_settings.cache_clear()
     headers = {"X-Auth-Token": ORIGINAL_SUBJECT}
@@ -2338,7 +2349,7 @@ async def test_native_policy_explicit_string_checks_keep_oslo_semantics(
 ):
     h = native_http
     h.identity["edges"] = {}
-    h.identity["project_roles"] = h.identity["token_roles"] = ["palimpsest_reader"]
+    h.identity["project_roles"] = h.identity["token_roles"] = ["member"]
     policy_file = tmp_path / "policy.yaml"
     policy_file.write_text(json.dumps({"packages:write": expression}))
     monkeypatch.setenv("OSLO_POLICY_POLICY_FILE", str(policy_file))
@@ -2350,9 +2361,7 @@ async def test_native_policy_explicit_string_checks_keep_oslo_semantics(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("directory", [False, True])
-@pytest.mark.parametrize(
-    "expression", ["not malformed", "role:palimpsest_reader or malformed", "not (role:palimpsest_reader or)"]
-)
+@pytest.mark.parametrize("expression", ["not malformed", "role:member or malformed", "not (role:member or)"])
 async def test_native_policy_parse_errors_cannot_become_allow_under_boolean_checks(
     native_http, tmp_path, monkeypatch, directory, expression
 ):
@@ -2360,7 +2369,7 @@ async def test_native_policy_parse_errors_cannot_become_allow_under_boolean_chec
 
     h = native_http
     h.identity["edges"] = {}
-    h.identity["project_roles"] = h.identity["token_roles"] = ["palimpsest_reader"]
+    h.identity["project_roles"] = h.identity["token_roles"] = ["member"]
     main = tmp_path / "policy.yaml"
     main.write_text("{}\n")
     policy_dir = tmp_path / "policy.d"
@@ -2375,7 +2384,7 @@ async def test_native_policy_parse_errors_cannot_become_allow_under_boolean_chec
     assert (await h.client.get("/v1/policy/capabilities", headers=headers)).status_code == 503
     assert (await h.client.post("/v1/uploads", headers=headers, json={})).status_code == 503
     assert _parser.LOG is logger
-    rules.write_text(json.dumps({"packages:write": "role:palimpsest_reader"}))
+    rules.write_text(json.dumps({"packages:write": "role:member"}))
     recovered = await h.client.get("/v1/policy/capabilities", headers=headers)
     assert recovered.status_code == 200 and "packages:write" in recovered.json()["actions"]
     started = await h.client.post("/v1/uploads", headers=headers, json={})
@@ -2405,9 +2414,9 @@ async def test_native_policy_http_cache_only_archive_roundtrip_and_current_issue
     )
     assert issued.status_code == 201
     key = {"Authorization": "Bearer " + issued.json()["secret"]}
-    h.identity["token_roles"] = h.identity["project_roles"] = ["palimpsest_reader"]
+    h.identity["token_roles"] = h.identity["project_roles"] = ["member"]
     policy_file = tmp_path / "cache-policy.yaml"
-    policy_file.write_text(json.dumps({"packages:inventory": "!", "cache:read": "@", "cache:write": "@"}))
+    policy_file.write_text(json.dumps({**dict.fromkeys(ACTIONS, "!"), "cache:read": "@", "cache:write": "@"}))
     monkeypatch.setenv("OSLO_POLICY_POLICY_FILE", str(policy_file))
     get_settings.cache_clear()
     projection = await h.client.get("/v1/policy/capabilities", headers=token)
@@ -2456,6 +2465,12 @@ def test_packaged_policy_sample_exactly_matches_registered_defaults():
 
     sample = files("palimpsest_hub").joinpath("policy.yaml.sample").read_text()
     assert yaml.safe_load(sample) == {rule.name: rule.check_str for rule in list_rules()}
+    defaults = {rule.name: rule.check_str for rule in list_rules()}
+    reads = {"packages:inventory", "packages:read", "cache:read"}
+    writes = set(defaults) - reads - {"system:manage"}
+    assert {defaults[name] for name in reads} == {"role:reader or role:member or role:manager or role:admin"}
+    assert {defaults[name] for name in writes} == {"role:member or role:manager or role:admin"}
+    assert defaults["system:manage"] == "role:admin"
 
 
 def _configure_personal_identity(state):
@@ -2475,13 +2490,13 @@ async def test_native_personal_member_gets_only_project_actions_and_policy_deny_
     token = {"X-Auth-Token": ORIGINAL_SUBJECT}
     h.identity["token_roles"] = h.identity["project_roles"] = ["member"]
     ordinary = await h.client.get("/v1/policy/capabilities", headers=token)
-    assert ordinary.status_code == 200 and ordinary.json()["actions"] == []
+    assert ordinary.status_code == 200 and set(ordinary.json()["actions"]) == set(ACTIONS) - SYSTEM_ACTIONS
     _configure_personal_identity(h.identity)
     projection = await h.client.get("/v1/policy/capabilities", headers=token)
     assert projection.status_code == 200, projection.text
     assert set(projection.json()["actions"]) == set(ACTIONS) - SYSTEM_ACTIONS
     owner = validate_package_owner(FEDERATED_OWNER, PROJECT_A)
-    assert owner["personal_project_owner"] is True and set(owner["roles"]) <= {"member", "reader"}
+    assert owner["package_actions"] == set(ACTIONS) - SYSTEM_ACTIONS
     policy_file = tmp_path / "personal-policy.yaml"
     policy_file.write_text(json.dumps({"packages:write": "!", "system:manage": "@", "packages:delete": "!"}))
     monkeypatch.setenv("OSLO_POLICY_POLICY_FILE", str(policy_file))
@@ -2493,61 +2508,31 @@ async def test_native_personal_member_gets_only_project_actions_and_policy_deny_
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "change",
-    [
-        "missing_marker",
-        "foreign_marker",
-        "malformed_marker",
-        "wrong_domain",
-        "conflicting_kind",
-        "disabled_home",
-        "disabled_domain",
-        "disabled_user",
-        "disabled_project",
-        "member_removed",
-        "foreign_raw",
-        "group_raw",
-        "inherited_raw",
-        "group_effective",
-        "delegated",
-    ],
+    "change", ["disabled_home", "disabled_domain", "disabled_user", "disabled_project", "member_removed", "delegated"]
 )
-async def test_native_personal_identity_provenance_and_original_credential_fail_closed(keystone_http, change):
+async def test_native_personal_identity_has_no_disabled_or_delegated_bypass(keystone_http, change):
     state = keystone_http
     _configure_personal_identity(state)
-    if change in {"missing_marker", "foreign_marker", "malformed_marker"}:
-        state["project_extras"] = {
-            "afterglow_personal_user_id": {
-                "missing_marker": None,
-                "foreign_marker": "another-user",
-                "malformed_marker": [FEDERATED_OWNER],
-            }[change]
-        }
-    elif change == "wrong_domain":
-        state["domains"]["personal"]["name"] = "personal"
-    elif change == "conflicting_kind":
-        state["domains"]["personal"]["afterglow_domain_kind"] = "organization"
-    elif change in {"disabled_home", "disabled_domain"}:
+    if change in {"disabled_home", "disabled_domain"}:
         state["domains"]["default" if change == "disabled_home" else "personal"]["enabled"] = False
     elif change in {"disabled_user", "disabled_project"}:
         state["user_enabled" if change == "disabled_user" else "project_enabled"] = False
     elif change == "member_removed":
         state["project_roles"] = []
-    elif change == "delegated":
-        state["token_markers"] = {"application_credential": {"id": "reduced"}}
     else:
-        row = {
-            "user": {"id": FEDERATED_OWNER},
-            "scope": {"project": {"id": PROJECT_A}},
-            "role": {"id": "role-member", "name": "member"},
-        }
-        if change == "foreign_raw":
-            row["user"]["id"] = "another-user"
-        elif change in {"group_raw", "group_effective"}:
-            row["links"] = {"membership": "https://identity/groups/foreign/users/owner"}
-        else:
-            row["scope"]["OS-INHERIT:inherited_to"] = "projects"
-        state["extra_effective_assignments" if change == "group_effective" else "raw_project_assignments"] = [row]
+        state["token_markers"] = {"application_credential": {"id": "reduced"}}
+    with pytest.raises(HTTPException) as error:
+        await get_package_member_info(validate_token(ORIGINAL_SUBJECT))
+    assert error.value.status_code == 403
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("marker", [None, "foreign-owner", [FEDERATED_OWNER]])
+async def test_personal_owner_marker_does_not_replace_standard_role_authority(keystone_http, marker):
+    _configure_personal_identity(keystone_http)
+    keystone_http["project_extras"] = {"afterglow_personal_user_id": marker}
+    assert (await get_package_member_info(validate_token(ORIGINAL_SUBJECT)))["can_write"]
+    keystone_http["project_roles"] = keystone_http["token_roles"] = ["palimpsest_admin"]
     with pytest.raises(HTTPException) as error:
         await get_package_member_info(validate_token(ORIGINAL_SUBJECT))
     assert error.value.status_code == 403
@@ -2602,7 +2587,7 @@ async def test_native_personal_package_key_keeps_action_package_and_system_ceili
     assert (await h.client.get("/v1/projects/foreign/packages", headers=key)).status_code == 403
     assert (await h.client.post(base + "/keys", headers=key, json=request)).status_code == 401
     assert (await h.client.delete(base + "/package", headers=key, params={"package": "test"})).status_code == 403
-    assert (await h.client.get("/v1/builds", headers=token)).status_code == 403
+    assert (await h.client.get("/v1/builds", headers=token)).status_code == 200
     narrow = await h.client.post(base + "/keys", headers=token, json={**request, "actions": ["packages:read"]})
     assert narrow.status_code == 201
     narrow_key = {"Authorization": "Bearer " + narrow.json()["secret"]}
@@ -2612,13 +2597,13 @@ async def test_native_personal_package_key_keeps_action_package_and_system_ceili
     next_archive, next_body, _ = image_archive(b"pending personal publication")
     next_body["expected_tag_digest"] = body["root_digest"]
     upload, _ = await staged(h, namespace, key, next_archive, next_body)
-    h.identity["project_extras"]["afterglow_personal_user_id"] = "foreign-owner"
+    h.identity["project_roles"] = []
     assert (await h.client.put(upload, headers=key, params={"package": "test"}, json={})).status_code == 403
     assert (await h.client.get("/v1/auth/me", headers=key)).status_code == 403
     assert (
         await h.client.get(base + "/cache/archives/" + digest(cache), params={"package": "test"}, headers=key)
     ).status_code == 403
-    h.identity["project_extras"]["afterglow_personal_user_id"] = FEDERATED_OWNER
+    h.identity["project_roles"] = ["member"]
     assert (await h.client.delete(base + "/keys/" + issued.json()["key"]["key_id"], headers=token)).status_code == 204
     assert (await h.client.get("/v1/auth/me", headers=key)).status_code == 401
 
@@ -2700,11 +2685,8 @@ async def test_native_personal_metadata_delete_preserves_cas_other_refs_and_hard
     path.write_text(json.dumps({"packages:delete": "@"}))
     monkeypatch.setenv("OSLO_POLICY_POLICY_FILE", str(path))
     get_settings.cache_clear()
-    for role in ("member", "palimpsest_admin"):
-        h.identity["project_extras"] = {}
-        h.identity["token_roles"] = h.identity["project_roles"] = [role]
-        assert (await h.client.delete(base + "/package", headers=token, params={"package": "test"})).status_code == 403
-    _configure_personal_identity(h.identity)
+    h.identity["project_extras"] = {}
+    h.identity["token_roles"] = h.identity["project_roles"] = ["member"]
     h.identity["token_markers"] = {"application_credential": {"id": "reduced"}}
     assert (await h.client.delete(base + "/package", headers=token, params={"package": "test"})).status_code == 403
     h.identity["token_markers"] = {}
@@ -2718,12 +2700,12 @@ async def test_native_personal_metadata_delete_preserves_cas_other_refs_and_hard
     assert (await h.client.get(version + "/download", headers=key, params={"package": "other"})).status_code == 200
     for digest, expected in blobs.items():
         assert h.store.blob_path(digest).read_bytes() == expected
-    assert (await h.client.get("/v1/builds", headers=token)).status_code == 403
-    assert (await h.client.delete("/v1/layers/" + body["root_digest"], headers=token)).status_code == 403
+    assert (await h.client.get("/v1/builds", headers=token)).status_code == 200
+    assert (await h.client.delete("/v1/layers/" + body["root_digest"], headers=token)).status_code == 404
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("revocation", ["owner", "token", "provenance", "policy"])
+@pytest.mark.parametrize("revocation", ["membership", "token", "delegation", "policy"])
 async def test_native_personal_metadata_delete_revalidates_before_commit_and_rolls_back(
     native_http, tmp_path, monkeypatch, revocation
 ):
@@ -2742,18 +2724,12 @@ async def test_native_personal_metadata_delete_revalidates_before_commit_and_rol
         result = await original_member(token_info=token_info)
         observations.append(result)
         if len(observations) == 1:
-            if revocation == "owner":
-                h.identity["project_extras"]["afterglow_personal_user_id"] = "foreign"
+            if revocation == "membership":
+                h.identity["project_roles"] = ["reader"]
             elif revocation == "token":
                 h.identity["subject_revoked"] = True
-            elif revocation == "provenance":
-                h.identity["raw_project_assignments"] = [
-                    {
-                        "group": {"id": "foreign"},
-                        "role": {"id": "role-member", "name": "member"},
-                        "scope": {"project": {"id": PROJECT_A}},
-                    }
-                ]
+            elif revocation == "delegation":
+                h.identity["token_markers"] = {"application_credential": {"id": "reduced"}}
             else:
                 policy_file.write_text(json.dumps({"packages:delete": "!"}))
         return result
@@ -2764,7 +2740,7 @@ async def test_native_personal_metadata_delete_revalidates_before_commit_and_rol
     assert observations
     _configure_personal_identity(h.identity)
     h.identity["subject_revoked"] = False
-    h.identity.pop("raw_project_assignments", None)
+    h.identity["token_markers"] = {}
     policy_file.write_text("{}")
     version = base + "/versions/" + body["root_digest"]
     for package in ("test", "other"):
@@ -2774,11 +2750,11 @@ async def test_native_personal_metadata_delete_revalidates_before_commit_and_rol
 
 
 @pytest.mark.parametrize("kind", [None, False, "organization", ["personal"]])
-def test_native_personal_explicit_invalid_domain_kind_is_not_absence(keystone_http, kind):
+def test_native_personal_invalid_domain_kind_never_changes_member_ceiling(keystone_http, kind):
     _configure_personal_identity(keystone_http)
     keystone_http["domains"]["personal"]["afterglow_domain_kind"] = kind
     owner = validate_package_owner(FEDERATED_OWNER, PROJECT_A, allow_empty=True)
-    assert not owner["personal_project_owner"] and not owner["package_actions"]
+    assert owner["can_write"] and "system:manage" not in owner["package_actions"]
 
 
 @pytest.mark.asyncio
@@ -2791,8 +2767,8 @@ async def test_me_rechecks_membership_for_a_retained_token(keystone_http):
         "inventory": True,
         "download": True,
         "upload": True,
-        "delete": False,
-        "build": False,
+        "delete": True,
+        "build": True,
     }
     keystone_http["project_roles"] = []
     revoked = await get_hub_identity(original)
@@ -2847,7 +2823,7 @@ async def test_native_key_and_finalize_recheck_direct_system_promotion(native_ht
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("operation", ["build", "delete"])
-async def test_native_http_system_policy_withdrawal_at_final_mutation_boundary(
+async def test_native_http_project_action_withdrawal_at_final_mutation_boundary(
     native_http, tmp_path, monkeypatch, operation
 ):
     from sqlalchemy import select
@@ -2886,9 +2862,10 @@ async def test_native_http_system_policy_withdrawal_at_final_mutation_boundary(
     module = builds if operation == "build" else hub_api
     revalidate = module.revalidate_package_admin
     observed = []
+    required_action = "packages:write" if operation == "build" else "packages:delete"
 
     async def withdraw_before_final_validation(context):
-        policy_file.write_text(json.dumps({"system:manage": "!"}))
+        policy_file.write_text(json.dumps({required_action: "!"}))
         current = await revalidate(context)
         observed.append(current)
         return current
@@ -2908,7 +2885,7 @@ async def test_native_http_system_policy_withdrawal_at_final_mutation_boundary(
         response = await h.client.delete("/v1/layers/" + digest, headers=headers)
     assert response.status_code == 403, response.text
     assert observed and all(current["is_package_system_admin"] for current in observed)
-    assert all("system:manage" not in current["package_actions"] for current in observed)
+    assert all(required_action not in current["package_actions"] for current in observed)
     async with h.factory() as session:
         assert (await session.scalars(select(PalimpsestHubBuild))).all() == []
         layer = await session.scalar(select(PalimpsestHubLayer).where(PalimpsestHubLayer.blob_digest == digest))
@@ -3035,3 +3012,223 @@ async def test_native_http_admin_publication_revalidates_after_cas_and_compensat
             assert not h.store.exists(digest)
     if upload_id:
         assert h.store.upload_path(upload_id).read_bytes() == payload
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("methods", [["openid"], ["openid", "token"]])
+async def test_openid_human_member_keeps_original_project_management(keystone_http, methods):
+    keystone_http["token_methods"] = methods
+    member = await get_package_member_info(validate_token(ORIGINAL_SUBJECT))
+    assert member["can_write"]
+    assert {"packages:delete", "keys:issue", "keys:list", "keys:revoke"} <= member["package_actions"]
+    assert "system:manage" not in member["package_actions"]
+    assert not any(event.get("methods") == ["token"] for event in keystone_http["requests"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("methods", [["openid"], ["openid", "token"]])
+@pytest.mark.parametrize(
+    "marker",
+    ["OS-TRUST:trust", "application_credential", "OS-OAUTH1", "OS-OAUTH2", "oauth1", "oauth2", "bind", "access_rules"],
+)
+async def test_openid_reduced_credentials_never_gain_project_management(keystone_http, methods, marker):
+    keystone_http["token_methods"] = methods
+    keystone_http["token_markers"] = {marker: {}}
+    with pytest.raises(HTTPException) as error:
+        await get_package_member_info(validate_token(ORIGINAL_SUBJECT))
+    assert error.value.status_code == 403
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", ["reader", "palimpsest_admin", "palimpsest-publish_editor"])
+async def test_policy_allow_cannot_uplift_native_role_ceiling(native_http, tmp_path, monkeypatch, role):
+    h = native_http
+    h.identity["token_roles"] = h.identity["project_roles"] = [role]
+    path = tmp_path / "no-uplift.yaml"
+    path.write_text(json.dumps(dict.fromkeys(ACTIONS, "@")))
+    monkeypatch.setenv("OSLO_POLICY_POLICY_FILE", str(path))
+    get_settings.cache_clear()
+    token = {"X-Auth-Token": ORIGINAL_SUBJECT}
+    projection = await h.client.get("/v1/policy/capabilities", headers=token)
+    expected = {"packages:inventory", "packages:read", "cache:read"} if role == "reader" else set()
+    assert projection.status_code == 200 and set(projection.json()["actions"]) == expected
+    assert (await h.client.post("/v1/uploads", headers=token, json={})).status_code == 403
+    assert (await h.client.get("/v1/admin/catalog/layers", headers=token)).status_code == 403
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "check",
+    ["not rule:missing", "role:member and not (rule:missing or role:reader)", "not rule:cycle"],
+)
+async def test_negated_missing_or_cyclic_policy_fails_closed(native_http, tmp_path, monkeypatch, check):
+    h = native_http
+    path = tmp_path / "negated-bad-policy.yaml"
+    document = dict.fromkeys(ACTIONS, "role:member")
+    document["packages:read"] = check
+    if check == "not rule:cycle":
+        document["cycle"] = "not rule:cycle"
+    path.write_text(json.dumps(document))
+    monkeypatch.setenv("OSLO_POLICY_POLICY_FILE", str(path))
+    get_settings.cache_clear()
+    response = await h.client.get(
+        "/v1/policy/capabilities", headers={"X-Auth-Token": ORIGINAL_SUBJECT, "X-Project-Id": PROJECT_A}
+    )
+    assert response.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_missing_policy_directory_fails_closed(native_http, tmp_path, monkeypatch):
+    h = native_http
+    monkeypatch.setenv("OSLO_POLICY_POLICY_DIRS", str(tmp_path / "absent-policy.d"))
+    get_settings.cache_clear()
+    response = await h.client.get(
+        "/v1/policy/capabilities", headers={"X-Auth-Token": ORIGINAL_SUBJECT, "X-Project-Id": PROJECT_A}
+    )
+    assert response.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_revalidated_writer_denies_revoked_member_before_commit(native_http):
+    from palimpsest_hub.auth import get_package_member_info, validate_token
+    from palimpsest_hub.services.image_jobs import fresh_writer as _revalidate_writer
+
+    h = native_http
+    token_info = await get_package_member_info(validate_token(ORIGINAL_SUBJECT))
+    assert (await _revalidate_writer(token_info))["can_write"] is True
+    h.identity["project_roles"] = []
+    with pytest.raises(HTTPException) as revoked:
+        await _revalidate_writer(token_info)
+    assert revoked.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_policy_replaced_between_check_and_authorize_fails_closed(native_http, tmp_path, monkeypatch):
+    import os
+    import time
+
+    from palimpsest_hub import policy as native_policy
+
+    h = native_http
+    path = tmp_path / "swapped-policy.yaml"
+    path.write_text("{}\n")
+    monkeypatch.setenv("OSLO_POLICY_POLICY_FILE", str(path))
+    get_settings.cache_clear()
+    original = native_policy._StrictEnforcer.check_rules
+
+    def check_then_replace(self, *args, **kwargs):
+        result = original(self, *args, **kwargs)
+        path.write_text(json.dumps({"packages:read": "not rule:missing"}))
+        later = time.time() + 5
+        os.utime(path, (later, later))
+        return result
+
+    monkeypatch.setattr(native_policy._StrictEnforcer, "check_rules", check_then_replace)
+    response = await h.client.get(
+        "/v1/policy/capabilities", headers={"X-Auth-Token": ORIGINAL_SUBJECT, "X-Project-Id": PROJECT_A}
+    )
+    assert response.status_code == 503
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", ["palimpsest_admin", "palimpsest-publish_editor"])
+async def test_native_implication_not_local_service_grade_mapping_controls_core_authority(keystone_http, role):
+    keystone_http["token_roles"] = keystone_http["project_roles"] = [role]
+    keystone_http["edges"][role] = ["member", "admin"]
+    member = await get_package_member_info(validate_token(ORIGINAL_SUBJECT))
+    assert member["can_write"] and "packages:delete" in member["package_actions"]
+    assert "system:manage" not in member["package_actions"]
+    keystone_http["system_roles"] = [role]
+    assert validate_token(ORIGINAL_SUBJECT)["is_system_admin"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scope", ["home", "project"])
+@pytest.mark.parametrize("enabled,expected", [(False, 403), (None, 503)])
+async def test_standard_project_members_require_enabled_native_domains(keystone_http, scope, enabled, expected):
+    state = keystone_http
+    state["project_domain_id"] = "project-scope"
+    state["domains"]["project-scope"] = {"id": "project-scope", "name": "Project Scope", "enabled": True}
+    state["domains"]["default" if scope == "home" else "project-scope"]["enabled"] = enabled
+    assert not state.get("project_extras", {}).get("afterglow_personal_user_id")
+    with pytest.raises(HTTPException) as error:
+        await get_package_member_info(validate_token(ORIGINAL_SUBJECT))
+    assert error.value.status_code == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "metadata", [{"truncated": True, "links": {"next": None}}, {"truncated": False, "links": {"next": "next-page"}}]
+)
+async def test_core_personal_member_ignores_irrelevant_raw_project_provenance(keystone_http, metadata):
+    from palimpsest_hub.auth import _get_reader_ks_client
+
+    state = keystone_http
+    _configure_personal_identity(state)
+    state["collection_metadata"]["/v3/role_assignments?raw-project"] = metadata
+    # Confirm the irrelevant raw project listing really is partial at the HTTP
+    # boundary; required effective core/current authority remains complete.
+    payload = _get_reader_ks_client().get("/role_assignments?scope.project.id=" + PROJECT_A)[1]
+    assert payload["truncated"] is True or payload["links"]["next"] == "next-page"
+    assert state["raw_project_reads"] == 1
+    state["raw_project_reads"] = 0
+    member = await get_package_member_info(validate_token(ORIGINAL_SUBJECT))
+    assert member["can_write"] and "packages:delete" in member["package_actions"]
+    assert state["raw_project_reads"] == 0
+    # Removing an obsolete dependency must not mask a real authority outage.
+    state["effective_all_truncated"] = True
+    with pytest.raises(HTTPException) as unavailable:
+        await get_package_member_info(validate_token(ORIGINAL_SUBJECT))
+    assert unavailable.value.status_code == 503
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", ["reader", "member", "manager"])
+async def test_native_domain_implication_controls_project_actions_without_name_aliasing(native_http, role):
+    h = native_http
+    h.identity["directory"].extend(
+        [
+            {"id": "role-domain-parent", "name": "domain-parent", "domain_id": "tenant"},
+            {"id": "role-domain-child", "name": "domain-child", "domain_id": "tenant"},
+        ]
+    )
+    h.identity["edges"]["domain-parent"] = ["domain-child"]
+    h.identity["edges"]["domain-child"] = [role]
+    h.identity["token_roles"] = h.identity["project_roles"] = ["domain-parent"]
+    headers = {"X-Auth-Token": ORIGINAL_SUBJECT, "X-Project-Id": PROJECT_A}
+    response = await h.client.get("/v1/policy/capabilities", headers=headers)
+    assert response.status_code == 200
+    assert ("packages:write" in response.json()["actions"]) is (role != "reader")
+    assert "system:manage" not in response.json()["actions"]
+    h.identity["edges"]["domain-child"] = []
+    withdrawn = await h.client.get("/v1/policy/capabilities", headers=headers)
+    assert withdrawn.status_code == 403
+
+
+@pytest.mark.parametrize("module_name", ["palimpsest_hub.auth", "palimpsest_hub.catalog_auth"])
+def test_domain_builtin_spelling_does_not_replace_canonical_global_role(keystone_http, module_name):
+    from importlib import import_module
+
+    module = import_module(module_name)
+    keystone_http["directory"].append({"id": "role-domain-shadow", "name": "admin", "domain_id": "tenant"})
+    keystone_http["edges"]["domain-shadow"] = []
+    directory = module._role_directory(module._get_reader_ks_client())
+    assert module._effective_role_names(["role-domain-shadow"], directory) == set()
+    keystone_http["edges"]["domain-shadow"] = ["member"]
+    directory = module._role_directory(module._get_reader_ks_client())
+    assert module._effective_role_names(["role-domain-shadow"], directory) == {"member", "reader"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("marker", ["application_credential", "OS-TRUST:trust", "OS-OAUTH2", "access_rules", "bind"])
+async def test_reduced_original_token_preview_never_advertises_human_mutations(native_http, marker):
+    h = native_http
+    h.identity["token_methods"] = ["token"]
+    h.identity["token_markers"] = {marker: {"id": "synthetic-reduced"}}
+    headers = {"X-Auth-Token": ORIGINAL_SUBJECT, "X-Project-Id": PROJECT_A}
+    response = await h.client.get("/v1/policy/capabilities", headers=headers)
+    assert response.status_code == 200
+    assert response.json() == {"service": "palimpsest", "capabilities": [], "actions": []}
+    assert (await h.client.get("/v1/layers", headers=headers)).status_code == 403
+    h.identity["subject_revoked"] = True
+    assert (await h.client.get("/v1/policy/capabilities", headers=headers)).status_code == 401
