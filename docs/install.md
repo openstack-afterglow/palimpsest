@@ -1,16 +1,29 @@
 # Detailed installation and configuration guide
 
+## 0.3.12 full-dev transition gate — 2026-11-04 (UTC)
+
+This candidate includes merged origin/dev6e4dff7 SDK/publication source, not merely an authority patch over deployed57ab180. The earlier0.3.11 slot is reserved/unpublished; use new immutable numeric0.3.12 after exact-SHA CI and publication. All three API/export cohorts and the separate HTTPS build-worker cohort must run the same reviewed release. Updating the operator wheel/default tag is not a rollout.
+
+1. Record actual old/new manifests, private settings, override precedence, SQL database default charset/collation and all CAS mount identities. The current read-only operator receipt reports20tables, one proven context,8image jobs(2complete/6error),6builds(5complete/1error),2worker claims and8leases. These are timestamped observations, not a standing no-writer certificate. Preserve every original row/private journal.
+2. Close new ingress; stop/drain the dedicated build worker while the old API remains available for exact uncertain-claim status. Retain unknown scratch/loops/leases and do not reset/replay a claim. Then stop all API/export/upload/GC writers on all three controllers and drain already-started effects. The dedicated worker is outside the controller inventory limit and must be explicitly included through its packaged playbook.
+3. During one no-writers interval capture encrypted/restricted SQL+CAS+private configuration and exact old pins. Preserve SQL database charset/collation as well as per-table DDL: the current database is utf8mb3/utf8mb3_general_ci. Restore to an isolated same-engine database and independent CAS with exact numeric ownership. A hot SQL backup or copied CAS alone is a rehearsal, not a consistent recovery point.
+4. Run the new immutable API image's `palimpsest-hub-bootstrap` once against the stopped database using its private config. It upgrades context PK to `(project_id,digest,created_by)` and creator NOT NULL only for proven creators, adds historical image-job `visibility=internal`, then creates dependent publication/native tables. Unknown creators, unexpected indexes/FKs/triggers or incompatible ACL schemas fail closed; never fabricate creator/OS/visibility facts or blindly rerun partial MariaDB DDL. Existing worker-claims/leases stay unchanged. `reconfigure` does not bootstrap.
+5. Use canonical image-mode Kolla pull/reconfigure for the exact controller set with `--tags palimpsest --skip-tags haproxy` and normal Sentinel fact delegation. Use the packaged `palimpsest-build-worker.yml` separately with `kolla_action=pull` then `reconfigure`; preserve its mounted scratch/journal/key. No Keystone provisioning, global HAProxy edit, new Ceph issuer or native-profile activation is implied.
+6. Before ingress reopen, require exact new image revisions/versions, public/direct ready, original manager/member provider-backed management, reader nonsecret reads, policy projection, key/private/global denials, original download bytes and cross-replica state. Retain inherited native/Ceph/GPU qualification limits. Rollback requires stopping every new writer, restoring the paired old SQL/CAS/config and old exact images; do not restart old workers over new publication state or erase claim history.
+
+The existing `palimpsest_source_version` is deliberately not self-pinned to an uncommitted candidate. Image mode uses reviewed immutable image refs. Source mode requires an explicitly reviewed published full SHA and a clean separate checkout. Numeric protected-environment tag rules must be verified remotely if native qualification is enabled; an explicitly skipped native lane is not a native proof.
+
 This guide covers end-user installation from PyPI or a GitHub VCS URL,
 package selection, supported host/runtime combinations, external dependencies,
 initial configuration, upgrades, and administrator-owned Linux deployment.
 Released installations use pinned published bytes; trusted local installation below uses the actual checkout's bytes.
 
 Palimpsest Local requires Python 3.11 or newer; Hub requires Python 3.12+.
-This release source prepares0.3.11 on the published0.3.10 lineage.
+This release source prepares0.3.12 on the published0.3.10 lineage.
 SDK publication and native execution remain separately qualified. Root/Hub metadata, module versions,
 generated locks and Kolla image defaults move together. After formal publication,
 install exact client bytes with
-`uv tool install --python 3.11 palimpsest-client==0.3.11`, or install a trusted
+`uv tool install --python 3.11 palimpsest-client==0.3.12`, or install a trusted
 local checkout with `uv tool install --force --python 3.11 .`.
 A root wheel upgrade neither deploys Hub nor qualifies actual build/run behavior.
 Git/outbound GitHub HTTPS is needed only for VCS installation.
@@ -244,7 +257,7 @@ do not authorize another rollout or native qualification.
    delete volumes to force a clean start.
 4. **Apply reviewed schema offline.** Run the new pinned API image's
    `palimpsest-hub-bootstrap` with private database/config inputs while every
-   writer remains stopped.0.3.11 upgrades pre-publication image tables before
+   writer remains stopped.0.3.12 upgrades pre-publication image tables before
    dependent FKs: historical jobs receive `visibility=internal`, and build
    contexts use `(project_id,digest,created_by)` only when every original creator
    is proven. Unknown creators stop before DDL; no owner/OS/catalog image is
@@ -1579,7 +1592,7 @@ and the [command workflows](cli/workflows.md) for operational details.
 
 ## SDK image/native integration: operator prerequisites
 
-The `0.3.11` Hub distribution declares the exact matching client dependency.
+The `0.3.12` Hub distribution declares the exact matching client dependency.
 Checkout resolution uses `hub`'s explicit parent-path source; installed release
 bytes must match the same immutable tag and reviewed image digests. Paired wheel
 or local container checks do not establish production upgrade or native readiness.
@@ -1587,7 +1600,7 @@ The canonical Docker builder includes API native helpers, SSH/OpenSSL and
 `ceph-common`; issuer provisioning and backend isolation remain operator gates.
 
 New catalog, user-owned staging, membership/visibility and native-intent tables
-are part of the0.3.11 schema. The reviewed offline bootstrap upgrades legacy
+are part of the0.3.12 schema. The reviewed offline bootstrap upgrades legacy
 image-job visibility as `internal` and known context creators; other populated
 ACL tables with missing owner/reuse facts require explicit reviewed mapping or
 quarantine. `create_all` alone is not an upgrade and historical jobs are not
