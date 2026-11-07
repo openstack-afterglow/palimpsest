@@ -4,7 +4,7 @@ All notable changes to Palimpsest Local are documented here.
 
 ## [Unreleased]
 
-## [0.3.13] - release candidate, 2026-11-08 (UTC)
+## [0.3.13] - 2026-11-08 (UTC; published to PyPI/GHCR and deployed to the three DMS Lab controllers)
 
 Supersedes the 0.3.12 release candidate below: this version keeps 0.3.12's SDK publication and
 native lifecycle work and replaces its standard-role authority implementation with the

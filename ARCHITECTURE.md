@@ -3976,8 +3976,8 @@ separate state root, a second Apple Silicon device, and commit/release/deploy
 approvals.
 
 2026-11-08 release integration (0.3.13 candidate). The reviewed local line (dev
-7962b18 + M1 + M2, commit `f54a0d1`, which is also the lineage that production
-runs from approved source `1afca68`) was reconciled with the published 0.3.12
+7962b18 + M1 + M2, commit `f54a0d1`, whose ancestry includes both `57ab180` and
+`1afca68`; production was running `57ab180` when 0.3.13 was deployed) was reconciled with the published 0.3.12
 release (`4905228`, never deployed to production) by applying only the 0.3.12
 delta on top of the local tree (merge base set to `6e4dff7`): numeric `X.Y.Z` tag
 triggers in `release.yml`/`hub-docker.yml`, `scripts/check_release_version.py`,
@@ -3996,8 +3996,8 @@ that CI never sees).
 {
   "schema_version": 1,
   "source_sha256": "b5bfbaa2e719a8b09a115279cabec0bcfa7aed8c47d4c2d7fe2fff48a029ab66",
-  "reviewed_at": "2026-11-07T17:59:03Z",
-  "summary": "Reviewed the 0.3.13 candidate: local dev line (native thirteen-action role cutover, M1 Lima VZ arm64 native root, M2 Hub image quotas/keys/anonymous public reads/OCI source closure/client published push-pull-status) reconciled with the published 0.3.12 release infrastructure (numeric tag gates); an independent comparison against 0.3.12 added pre-commit subject revalidation and policy rule-graph validation. Independent security, merge-integrity, architecture and release-gap reviews on 2026-11-08 found no open P0/P1/P2 after fixes; verification is test-passed and hosted-CI based, not live-verified. The stamp is computed from the committed tree and covers source review only, not publication or deployment."
+  "reviewed_at": "2026-11-07T19:00:16Z",
+  "summary": "Reviewed the 0.3.13 line (local dev, native thirteen-action role cutover, M1 Lima VZ arm64 native root, M2 Hub image quotas/keys/anonymous public reads/OCI source closure/client published push-pull-status) reconciled with the published 0.3.12 release infrastructure; independent security, merge-integrity, architecture and release-gap reviews found no open P0/P1/P2 after fixes. Verification is test-passed and hosted-CI based; the 0.3.13 release was published and deployed to the three controllers with read-only live verification recorded in the handoff. The stamp is computed from the committed tree and covers source review only."
 }
 ```
 <!-- architecture-review:end -->
