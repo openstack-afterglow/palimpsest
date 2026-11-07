@@ -3976,8 +3976,8 @@ separate state root, a second Apple Silicon device, and commit/release/deploy
 approvals.
 
 2026-11-08 release integration (0.3.13 candidate). The reviewed local line (dev
-7962b18 + M1 + M2, commit `f54a0d1`, which is also the lineage that production
-runs from approved source `1afca68`) was reconciled with the published 0.3.12
+7962b18 + M1 + M2, commit `f54a0d1`, whose ancestry includes both `57ab180` and
+`1afca68`; production was running `57ab180` when 0.3.13 was deployed) was reconciled with the published 0.3.12
 release (`4905228`, never deployed to production) by applying only the 0.3.12
 delta on top of the local tree (merge base set to `6e4dff7`): numeric `X.Y.Z` tag
 triggers in `release.yml`/`hub-docker.yml`, `scripts/check_release_version.py`,
