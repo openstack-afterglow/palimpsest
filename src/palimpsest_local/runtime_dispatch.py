@@ -10,13 +10,14 @@ import secrets
 import threading
 import time
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
+from dataclasses import field as dataclass_field
 from types import MappingProxyType
 from typing import Any
 
 from . import cloud_runtime, kvm, lima, log_stream, platforms, state
-from .errors import StateError
+from .errors import ArtifactValidationError, RuntimeBusyError, StateError
 from .oci_network import OCI_NETWORK_GUEST_ADDRESS
 from .oci_run_request import LocalOCIRunRequest
 from .refs import RunSpec, VolumeAttachment
@@ -637,29 +638,55 @@ def _run_bound_request(request: ResolvedRunRequest, resolved_roots: StatePaths) 
         raise StateError("created run ledger has invalid result fields") from None
 
 
-def resolve_existing_run(name: str, *, roots: StatePaths | None = None) -> ExistingRunRecord:
+def resolve_existing_run(
+    name: str,
+    *,
+    roots: StatePaths | None = None,
+    _observation_budget: state.RunObservationWaitBudget | None = None,
+) -> ExistingRunRecord:
     """Resolve a run exclusively from its validated durable owner and state ledgers."""
     resolved_roots = roots or state.resolve_roots()
-    return state.read_run_dispatch_record(resolved_roots, name)
+    if _observation_budget is None:
+        return state.read_run_dispatch_record(resolved_roots, name)
+    return state.read_run_dispatch_record(resolved_roots, name, observation_budget=_observation_budget)
 
 
 def preflight_existing_record(
     record: ExistingRunRecord,
     operation: RuntimeOperation,
     *,
+    roots: StatePaths | None = None,
     host: platforms.HostPlatform | None = None,
     now_ns: int | None = None,
+    _observation_budget: state.RunObservationWaitBudget | None = None,
 ) -> PreflightReport:
     """Issue one authenticated operation report bound to an exact run record."""
 
     if not isinstance(record, ExistingRunRecord) or not isinstance(operation, RuntimeOperation):
         raise TypeError("existing run preflight requires a record and operation")
     profile = platforms.capability_profile(record.dispatch_key, operation)
+    native_host_config = None
+    if record.dispatch_key == DispatchKey(RuntimeKind.OCI_ROOT, RuntimeBackend.LIMA_VZ) and any(
+        requirement.capability_id.startswith("tool.") for requirement in profile.requirements
+    ):
+        if (
+            operation in {RuntimeOperation.RECONCILE, RuntimeOperation.EXEC, RuntimeOperation.SHELL}
+            and _observation_budget is None
+        ):
+            _observation_budget = state.RunObservationWaitBudget()
+        native_host_config = _native_vz_adapter().host_config_for_run(
+            roots or state.resolve_roots(),
+            record.name,
+            expected_record=record,
+            _observation_budget=_observation_budget,
+        )
     report = platforms.evaluate_capability_profile(
         profile,
         subject_digest=existing_record_subject_digest(record),
         host=host,
         now_ns=now_ns,
+        native_host_config=native_host_config,
+        _observation_budget=_observation_budget,
     )
     if not report.successful:
         failed = next(item for item in report.checks if not item.passed)
@@ -700,6 +727,17 @@ def require_existing_preflight(
 
 def _adapter_for(record: ExistingRunRecord, operation: RuntimeOperation) -> Any:
     if record.dispatch_key.runtime_kind is RuntimeKind.OCI_ROOT:
+        if record.dispatch_key.backend is RuntimeBackend.LIMA_VZ:
+            if operation in {
+                RuntimeOperation.START,
+                RuntimeOperation.STOP,
+                RuntimeOperation.RM,
+                RuntimeOperation.RECONCILE,
+                RuntimeOperation.EXEC,
+                RuntimeOperation.SHELL,
+            }:
+                return _native_vz_adapter()
+            raise RuntimeCapabilityError(operation, record.dispatch_key)
         if operation is RuntimeOperation.EXEC:
             from . import oci_exec_session
 
@@ -719,6 +757,12 @@ def _oci_adapter() -> Any:
     return oci_run_adapter
 
 
+def _native_vz_adapter() -> Any:
+    from . import vz_native_runtime
+
+    return vz_native_runtime
+
+
 def run_local_oci(request: LocalOCIRunRequest, *, roots: StatePaths) -> Any:
     """Enter the distinct typed local-image launcher, with its own host preflight."""
     if not isinstance(request, LocalOCIRunRequest) or not isinstance(roots, StatePaths):
@@ -727,12 +771,13 @@ def run_local_oci(request: LocalOCIRunRequest, *, roots: StatePaths) -> Any:
         from . import experimental_oci_vm
 
         return experimental_oci_vm.run(roots, request)
+    adapter = _native_vz_adapter() if request.backend == platforms.BACKEND_LIMA else _oci_adapter()
     platforms.capability_profile(
         request.dispatch_key,
         RuntimeOperation.RUN,
         network=request.network.mode if request.network.enabled else None,
     )
-    result = _oci_adapter().run_local_oci(roots, request)
+    result = adapter.run_local_oci(roots, request)
     if (
         not isinstance(result.record, ExistingRunRecord)
         or result.record.name != request.name
@@ -743,8 +788,13 @@ def run_local_oci(request: LocalOCIRunRequest, *, roots: StatePaths) -> Any:
     return result
 
 
-def _revalidate_bound_record(record: ExistingRunRecord, roots: StatePaths) -> None:
-    current = state.read_run_dispatch_record(roots, record.name)
+def _revalidate_bound_record(
+    record: ExistingRunRecord,
+    roots: StatePaths,
+    *,
+    _observation_budget: state.RunObservationWaitBudget | None = None,
+) -> None:
+    current = resolve_existing_run(record.name, roots=roots, _observation_budget=_observation_budget)
     if current != record:
         raise StateError("run ledger changed during dispatch")
 
@@ -753,10 +803,12 @@ def _preflight_existing_adapter(
     record: ExistingRunRecord,
     operation: RuntimeOperation,
     roots: StatePaths,
+    *,
+    _observation_budget: state.RunObservationWaitBudget | None = None,
 ) -> Any:
-    report = preflight_existing_record(record, operation)
+    report = preflight_existing_record(record, operation, roots=roots, _observation_budget=_observation_budget)
     adapter = _adapter_for(record, operation)
-    _revalidate_bound_record(record, roots)
+    _revalidate_bound_record(record, roots, _observation_budget=_observation_budget)
     require_existing_preflight(record, operation, report)
     return adapter
 
@@ -904,6 +956,8 @@ def _dispatch_lifecycle(
         if operation is RuntimeOperation.RM and volumes:
             raise StateError("OCI-root rm --volumes is unavailable; root retention follows the owned run policy")
         adapter = _preflight_existing_adapter(record, operation, resolved_roots)
+        if operation is RuntimeOperation.START and record.dispatch_key.backend is RuntimeBackend.LIMA_VZ:
+            return adapter.start_oci_run(resolved_roots, name, expected_record=record)
         if operation is RuntimeOperation.STOP:
             return adapter.stop_oci_run(resolved_roots, name, expected_record=record)
         if operation is RuntimeOperation.RM:
@@ -1035,14 +1089,19 @@ def exec(
     expected_identity: ExpectedRunIdentity | None = None,
     completion_record: str | None = None,
     timeout_ms: int | None = None,
+    _observation_budget: state.RunObservationWaitBudget | None = None,
 ) -> ProcessSession:
     request = ExecRequest.from_argv(argv, timeout_ms=timeout_ms)
     resolved_roots = roots or state.resolve_roots()
-    record = resolve_existing_run(name, roots=resolved_roots)
+    if _observation_budget is None:
+        _observation_budget = state.RunObservationWaitBudget()
+    record = resolve_existing_run(name, roots=resolved_roots, _observation_budget=_observation_budget)
     _require_expected_identity(record, expected_identity)
     if request.timeout_ms is not None and record.dispatch_key.runtime_kind is not RuntimeKind.OCI_ROOT:
         raise StateError("exec --timeout requires the OCI-root runtime")
     if completion_record is not None:
+        if record.dispatch_key.backend is RuntimeBackend.LIMA_VZ:
+            raise StateError("native VZ exec does not emit KVM monitor completion records; omit --completion-record")
         from .oci_exec_control import validate_exec_request
         from .oci_exec_record import OCIExecRecordWriter
         from .oci_exec_session import OCIExecRecordingError, effective_exec_timeout_ms
@@ -1081,6 +1140,22 @@ def exec(
             except BaseException:
                 pass
             raise
+    if record.dispatch_key == DispatchKey(RuntimeKind.OCI_ROOT, RuntimeBackend.LIMA_VZ):
+        adapter = _preflight_existing_adapter(
+            record,
+            RuntimeOperation.EXEC,
+            resolved_roots,
+            _observation_budget=_observation_budget,
+        )
+        return _require_process_session(
+            adapter.exec_session(
+                name,
+                request,
+                roots=resolved_roots,
+                _expected_record=record,
+                _observation_budget=_observation_budget,
+            )
+        )
     adapter = _preflight_existing_adapter(record, RuntimeOperation.EXEC, resolved_roots)
     return _require_process_session(
         adapter.exec_session(
@@ -1097,10 +1172,22 @@ def shell(
     *,
     roots: StatePaths | None = None,
     expected_identity: ExpectedRunIdentity | None = None,
+    _observation_budget: state.RunObservationWaitBudget | None = None,
 ) -> ProcessSession:
     resolved_roots = roots or state.resolve_roots()
-    record = resolve_existing_run(name, roots=resolved_roots)
+    if _observation_budget is None:
+        _observation_budget = state.RunObservationWaitBudget()
+    record = resolve_existing_run(name, roots=resolved_roots, _observation_budget=_observation_budget)
     _require_expected_identity(record, expected_identity)
+    if record.dispatch_key == DispatchKey(RuntimeKind.OCI_ROOT, RuntimeBackend.LIMA_VZ):
+        adapter = _preflight_existing_adapter(
+            record, RuntimeOperation.SHELL, resolved_roots, _observation_budget=_observation_budget
+        )
+        return _require_process_session(
+            adapter.shell_session(
+                name, roots=resolved_roots, _expected_record=record, _observation_budget=_observation_budget
+            )
+        )
     adapter = _preflight_existing_adapter(record, RuntimeOperation.SHELL, resolved_roots)
     return _require_process_session(
         adapter.shell_session(
@@ -1220,10 +1307,37 @@ def logs(
     expected_identity: ExpectedRunIdentity | None = None,
 ) -> LogStream:
     resolved_roots = roots or state.resolve_roots()
-    record = resolve_existing_run(name, roots=resolved_roots)
+    budget = state.RunObservationWaitBudget()
+    # Legacy boot consoles must remain readable while their lifecycle holds the
+    # run lock. This hint only selects that legacy reader, which independently
+    # pins and revalidates the full immutable record before exposing any bytes.
+    # Native authority always comes from a fresh locked read below.
+    try:
+        hint = resolve_existing_run(name, roots=resolved_roots)
+    except StateError:
+        if not state.run_entry_present_or_ambiguous(resolved_roots, name):
+            raise
+        hint = None
+    if hint is not None and hint.dispatch_key != DispatchKey(RuntimeKind.OCI_ROOT, RuntimeBackend.LIMA_VZ):
+        record = hint
+    else:
+        record = resolve_existing_run(name, roots=resolved_roots, _observation_budget=budget)
+        if hint is not None and record != hint:
+            raise StateError("run ledger changed during log routing")
     _require_expected_identity(record, expected_identity)
     platforms.capability_profile(record.dispatch_key, RuntimeOperation.LOGS)
     mode = LogMode.FOLLOW if follow else LogMode.SNAPSHOT
+    if record.dispatch_key == DispatchKey(RuntimeKind.OCI_ROOT, RuntimeBackend.LIMA_VZ):
+        adapter = _native_vz_adapter()
+        return log_stream.open_retained_console_stream(
+            resolved_roots,
+            record,
+            mode,
+            refresh=lambda observation_budget: adapter.refresh_logs(
+                resolved_roots, name, expected_record=record, _observation_budget=observation_budget
+            ),
+            observation_budget=budget,
+        )
     return log_stream.open_retained_console_stream(resolved_roots, record, mode)
 
 
@@ -1304,11 +1418,31 @@ def _inspect_ports(raw_ports: Any) -> tuple[InspectPort, ...]:
     )
 
 
+def _native_vz_plan(snapshot: state.RunLedgerSnapshot) -> dict[str, Any] | None:
+    if snapshot.record.dispatch_key != DispatchKey(RuntimeKind.OCI_ROOT, RuntimeBackend.LIMA_VZ):
+        return None
+    native = snapshot.state.get("vz_native")
+    if native is None:
+        return None
+    if isinstance(native, Mapping) and "plan" not in native:
+        if native.get("schema") != "palimpsest.vz-native-run.v1" or "plan_sha256" in native:
+            raise StateError("native VZ pre-plan binding is invalid")
+        return None
+    try:
+        plan = _native_vz_adapter().read_vz_plan(snapshot)
+    except (ArtifactValidationError, KeyError, TypeError, ValueError) as error:
+        raise StateError("native VZ committed plan is invalid") from error
+    if plan.get("mode") not in ("dev", "prod") or plan.get("restart") not in ("no", "unless-stopped"):
+        raise StateError("native VZ committed plan policy is invalid")
+    return plan
+
+
 def _project_summary(snapshot: state.RunLedgerSnapshot, *, stale: bool) -> RunSummary:
     """Build a deeply immutable public projection without host paths or raw ledger data."""
 
     raw = snapshot.state
     plan = _committed_oci_domain_plan(snapshot)
+    _native_vz_plan(snapshot)
     base = raw.get("base")
     if base is not None and not isinstance(base, Mapping):
         raise StateError("run ledger contains an invalid public base")
@@ -1416,6 +1550,30 @@ def _project_inspect(snapshot: state.RunLedgerSnapshot) -> InspectRecord:
                     for port in plan.network.published_ports
                 ),
                 guest_ip=guest_address,
+            )
+        native_plan = _native_vz_plan(snapshot)
+        if native_plan is not None:
+            observed = raw.get("vz_status", {})
+            if not isinstance(observed, Mapping):
+                raise StateError("native VZ workload observation is invalid")
+            main = observed.get("main", {})
+            if not isinstance(main, Mapping):
+                raise StateError("native VZ workload observation is invalid")
+            detail = OCIRootInspectDetail(
+                memory_mib=_optional_integer(raw, "memory_mib"),
+                vcpus=_optional_integer(raw, "vcpus"),
+                network=_optional_string(raw, "network"),
+                ports=_inspect_ports(raw.get("ports", ())),
+                guest_ip=_optional_string(raw, "guest_ip"),
+                mode=native_plan["mode"],
+                restart=native_plan["restart"],
+                main_state=_optional_string(main, "state"),
+                main_pid=_optional_integer(main, "pid"),
+                main_exit_code=_optional_integer(main, "exit_code"),
+                main_exit_signal=_optional_integer(main, "exit_signal"),
+                main_oom_kill_count=_optional_integer(main, "oom_kill_count"),
+                user_session_count=_optional_integer(observed, "user_session_count"),
+                user_sessions_known=observed.get("user_sessions_known"),
             )
         return InspectRecord(schema_version=1, record=snapshot.record, lifecycle=lifecycle, detail=detail)
     base = raw.get("base")
@@ -1559,10 +1717,360 @@ def ps(*, roots: StatePaths | None = None) -> RunAggregationResult:
     )
 
 
-def reconcile(*, roots: StatePaths | None = None) -> RunAggregationResult:
-    """Live-reconcile each valid run through its exact durable dispatch record."""
+@dataclass(frozen=True, slots=True)
+class _ReadObservationResult:
+    aggregation: RunAggregationResult
+    snapshots: tuple[state.RunLedgerSnapshot, ...]
+
+
+@dataclass(slots=True)
+class _ReadObservationFlight:
+    owner: int
+    done: threading.Event = dataclass_field(default_factory=threading.Event)
+    result: _ReadObservationResult | None = None
+    discovery: RunAggregationResult | None = None
+    failed: bool = False
+
+
+_READ_OBSERVATION_LOCK = threading.Lock()
+_READ_OBSERVATION_FLIGHTS: dict[tuple[Any, ...], _ReadObservationFlight] = {}
+_NATIVE_READ_KEY = DispatchKey(RuntimeKind.OCI_ROOT, RuntimeBackend.LIMA_VZ)
+
+
+def _unobserved_reconciliation(
+    roots: StatePaths,
+    names: tuple[str, ...],
+    code: str,
+    discovery: RunAggregationResult | None,
+) -> RunAggregationResult:
+    """Keep discoverable stale rows without another provider observation."""
+    try:
+        snapshots, snapshot_errors = state.enumerate_run_snapshots(
+            roots, observation_budget=state.RunObservationWaitBudget(0)
+        )
+    except StateError:
+        if discovery is not None:
+            return _unobserved_aggregation(discovery, names)
+        snapshots, snapshot_errors = (), ()
+    return _unobserved_projection(snapshots, snapshot_errors, names, code)
+
+
+def _unobserved_projection(
+    snapshots: tuple[state.RunLedgerSnapshot, ...],
+    snapshot_errors: tuple[RunAggregationError, ...],
+    names: tuple[str, ...],
+    code: str,
+) -> RunAggregationResult:
+    summaries: list[RunSummary] = []
+    errors = [replace(error, operation=RuntimeOperation.RECONCILE) for error in snapshot_errors]
+    for snapshot in snapshots:
+        summary, error = _project_or_error(snapshot, operation=RuntimeOperation.RECONCILE, stale=True)
+        if summary is not None:
+            summaries.append(summary)
+        if error is not None:
+            errors.append(error)
+    for name in sorted(set(names) | {snapshot.record.name for snapshot in snapshots}):
+        errors.append(
+            _aggregation_error(
+                operation=RuntimeOperation.RECONCILE,
+                name=name,
+                code=code,
+                message="run observation is unavailable",
+            )
+        )
+    return RunAggregationResult(tuple(sorted(summaries, key=lambda item: item.name)), _sorted_unique_errors(errors))
+
+
+def _failed_join_reconciliation(
+    roots: StatePaths,
+    budget: state.RunObservationWaitBudget,
+    binding: state._RunObservationBinding,
+    code: str,
+    observer: Callable[[state.RunLedgerSnapshot], None] | None,
+    discovery: RunAggregationResult | None,
+) -> RunAggregationResult:
+    """Native failure is stale discovery; legacy providers remain independent."""
+    try:
+        snapshots, errors = state.enumerate_run_snapshots(roots, observation_budget=budget)
+    except StateError:
+        if discovery is not None:
+            return _unobserved_aggregation(discovery, binding.names)
+        return _unobserved_projection((), (), binding.names, code)
+    legacy = tuple(item for item in snapshots if item.record.dispatch_key != _NATIVE_READ_KEY)
+    publish: list[state.RunLedgerSnapshot] = []
+    independent = _reconcile_snapshots(roots, budget, legacy, errors, publish.append)
+    if observer is not None:
+        for snapshot in publish:
+            observer(snapshot)
+    return _native_stale_with_independent_legacy(independent, snapshots, binding.names, code)
+
+
+def _native_stale_with_independent_legacy(
+    independent: RunAggregationResult,
+    snapshots: tuple[state.RunLedgerSnapshot, ...],
+    names: tuple[str, ...],
+    code: str,
+) -> RunAggregationResult:
+    legacy_names = {item.record.name for item in snapshots if item.record.dispatch_key != _NATIVE_READ_KEY}
+    native = tuple(item for item in snapshots if item.record.dispatch_key == _NATIVE_READ_KEY)
+    stale = _unobserved_projection(native, (), tuple(name for name in names if name not in legacy_names), code)
+    return RunAggregationResult(
+        tuple(sorted(independent.summaries + stale.summaries, key=lambda item: item.name)),
+        _sorted_unique_errors(list(independent.errors + stale.errors)),
+    )
+
+
+def _require_current_shared_snapshot(
+    current: state.RunLedgerSnapshot,
+    observed: state.RunLedgerSnapshot,
+) -> None:
+    if current.record != observed.record:
+        raise StateError("run identity changed after shared observation")
+    if current.state == observed.state:
+        return
+    if current.state.get("status") == "removed":
+        raise StateError("run was removed after shared observation")
+    observation_fields = {"status", "lifecycle_revision", "vz_status", "vz_logs"}
+    current_stable = {key: value for key, value in current.state.items() if key not in observation_fields}
+    observed_stable = {key: value for key, value in observed.state.items() if key not in observation_fields}
+    if current_stable != observed_stable:
+        raise StateError("run authority changed after shared observation")
+    raise RuntimeBusyError("shared run observation was superseded")
+
+
+def _unobserved_aggregation(
+    aggregation: RunAggregationResult,
+    names: tuple[str, ...],
+) -> RunAggregationResult:
+    errors = list(aggregation.errors)
+    for name in sorted(set(names) | {item.record.name for item in aggregation.summaries}):
+        errors.append(
+            _aggregation_error(
+                operation=RuntimeOperation.RECONCILE,
+                name=name,
+                code="runtime-failure",
+                message="shared run observation is unavailable",
+            )
+        )
+    return RunAggregationResult(
+        tuple(replace(summary, stale=True) for summary in aggregation.summaries),
+        _sorted_unique_errors(errors),
+    )
+
+
+def _validate_shared_native_snapshot(
+    roots: StatePaths,
+    snapshot: state.RunLedgerSnapshot,
+    budget: state.RunObservationWaitBudget,
+    binding: state._RunObservationBinding,
+) -> None:
+    adapter = _native_vz_adapter()
+    # Configuration/tool identities and custody are freshly checked, not
+    # capability reports or provider observations borrowed from the leader.
+    config = None
+    if snapshot.state["status"] != "removed":
+        config = adapter.host_config_for_run(
+            roots, snapshot.record.name, expected_record=snapshot.record, _observation_budget=budget
+        )
+    with state.locked_existing_run(
+        roots,
+        snapshot.record.name,
+        expected=snapshot.record,
+        observation_budget=budget,
+    ) as authority:
+        _require_current_shared_snapshot(authority.snapshot, snapshot)
+        binding.verify()
+        if config is not None:
+            with adapter._custody(
+                config, lock_timeout=state.RUN_OBSERVATION_TIMEOUT_SECONDS, observation_budget=budget
+            ):
+                authority.verify_binding()
+                binding.verify()
+        else:
+            authority.verify_binding()
+
+
+def _joined_observation(
+    roots: StatePaths,
+    budget: state.RunObservationWaitBudget,
+    binding: state._RunObservationBinding,
+    shared: _ReadObservationResult,
+    observer: Callable[[state.RunLedgerSnapshot], None] | None,
+) -> RunAggregationResult:
+    try:
+        binding.verify()
+    except StateError:
+        return _failed_join_reconciliation(roots, budget, binding, "runtime-failure", observer, shared.aggregation)
+    try:
+        snapshots, errors = state.enumerate_run_snapshots(roots, observation_budget=budget)
+    except StateError:
+        return _unobserved_aggregation(shared.aggregation, binding.names)
+    # Only native read observations are shared. Legacy/KVM adapters retain
+    # independent reconciliation, including their existing failure behavior.
+    native_names = {
+        item.record.name for item in shared.aggregation.summaries if item.record.dispatch_key == _NATIVE_READ_KEY
+    } | {
+        error.name
+        for error in shared.aggregation.errors
+        if error.dispatch_key == _NATIVE_READ_KEY and error.name is not None
+    }
+    legacy = tuple(
+        item
+        for item in snapshots
+        if item.record.dispatch_key != _NATIVE_READ_KEY and item.record.name not in native_names
+    )
+    legacy_publish: list[state.RunLedgerSnapshot] = []
+    publish: list[state.RunLedgerSnapshot] = []
+    result = _reconcile_snapshots(roots, budget, legacy, errors, legacy_publish.append)
+    summaries = list(result.summaries)
+    combined_errors = list(result.errors)
+    busy_names = {error.name for error in errors if error.code == "runtime-busy"}
+    fresh = {item.record.name: item for item in shared.snapshots if item.record.dispatch_key == _NATIVE_READ_KEY}
+    for snapshot in snapshots:
+        if snapshot.record.dispatch_key != _NATIVE_READ_KEY and snapshot.record.name not in native_names:
+            continue
+        name = snapshot.record.name
+        observed = fresh.get(name)
+        stale = True
+        failure = None
+        if name not in busy_names and observed is not None:
+            try:
+                _require_current_shared_snapshot(snapshot, observed)
+                _validate_shared_native_snapshot(roots, observed, budget, binding)
+                stale = False
+            except RuntimeBusyError:
+                failure = "runtime-busy"
+            except (OSError, StateError, TypeError, ValueError):
+                failure = "invalid-ledger"
+            except Exception:
+                failure = "runtime-failure"
+        summary, error = _project_or_error(snapshot, operation=RuntimeOperation.RECONCILE, stale=stale)
+        if summary is not None:
+            summaries.append(summary)
+        if error is not None:
+            combined_errors.append(error)
+        if failure is not None:
+            combined_errors.append(
+                _aggregation_error(
+                    operation=RuntimeOperation.RECONCILE,
+                    record=snapshot.record,
+                    code=failure,
+                    message="shared run observation is no longer current",
+                )
+            )
+        elif observed is None or not stale:
+            combined_errors.extend(error for error in shared.aggregation.errors if error.name == name)
+        if not stale:
+            publish.append(observed)
+    try:
+        binding.verify()
+    except StateError:
+        if observer is not None:
+            for snapshot in legacy_publish:
+                observer(snapshot)
+        return _native_stale_with_independent_legacy(result, snapshots, binding.names, "runtime-failure")
+    if observer is not None:
+        for snapshot in legacy_publish + publish:
+            observer(snapshot)
+    return RunAggregationResult(
+        tuple(sorted(summaries, key=lambda item: item.name)), _sorted_unique_errors(combined_errors)
+    )
+
+
+def reconcile(
+    *,
+    _observation_budget: state.RunObservationWaitBudget | None = None,
+    roots: StatePaths | None = None,
+    _snapshot_observer: Callable[[state.RunLedgerSnapshot], None] | None = None,
+) -> RunAggregationResult:
+    """Share only an ongoing selected-root read, never a completed observation."""
     resolved_roots = roots or state.resolve_roots()
-    snapshots, snapshot_errors = state.enumerate_run_snapshots(resolved_roots)
+    budget = _observation_budget if _observation_budget is not None else state.RunObservationWaitBudget()
+    with state._pinned_run_observation_binding(resolved_roots) as binding:
+        if binding is None or not binding.names:
+            return _reconcile_producer(resolved_roots, budget, _snapshot_observer)
+        key = binding.key
+        flight: _ReadObservationFlight | None = None
+        leader = False
+        snapshots: list[state.RunLedgerSnapshot] = []
+        try:
+            with _READ_OBSERVATION_LOCK:
+                flight = _READ_OBSERVATION_FLIGHTS.get(key)
+                leader = flight is None
+                if leader:
+                    flight = _ReadObservationFlight(threading.get_ident())
+                    _READ_OBSERVATION_FLIGHTS[key] = flight
+            assert flight is not None
+            if not leader:
+                if flight.owner == threading.get_ident():
+                    return _unobserved_reconciliation(resolved_roots, binding.names, "runtime-busy", flight.discovery)
+                started = time.monotonic()
+                try:
+                    completed = flight.done.wait(budget.remaining_seconds)
+                finally:
+                    budget.charge_wait(started)
+                if not completed:
+                    return _failed_join_reconciliation(
+                        resolved_roots, budget, binding, "runtime-busy", _snapshot_observer, flight.discovery
+                    )
+                if flight.failed:
+                    return _failed_join_reconciliation(
+                        resolved_roots, budget, binding, "runtime-failure", _snapshot_observer, flight.discovery
+                    )
+                assert flight.result is not None
+                return _joined_observation(resolved_roots, budget, binding, flight.result, _snapshot_observer)
+            aggregation = _produce_read_observation(resolved_roots, budget, flight, snapshots.append)
+            binding.verify_roots()
+            flight.result = _ReadObservationResult(aggregation, tuple(snapshots))
+        except BaseException:
+            if leader and flight is not None:
+                flight.failed = True
+            raise
+        finally:
+            if leader and flight is not None:
+                with _READ_OBSERVATION_LOCK:
+                    if _READ_OBSERVATION_FLIGHTS.get(key) is flight:
+                        del _READ_OBSERVATION_FLIGHTS[key]
+                flight.done.set()
+        # No coordinator/run/custody lock or live entry surrounds user callbacks.
+        # A reentrant observer therefore starts a new independent observation.
+        if _snapshot_observer is not None:
+            for snapshot in snapshots:
+                _snapshot_observer(snapshot)
+        return aggregation
+
+
+def _produce_read_observation(
+    roots: StatePaths,
+    budget: state.RunObservationWaitBudget,
+    flight: _ReadObservationFlight,
+    observer: Callable[[state.RunLedgerSnapshot], None],
+) -> RunAggregationResult:
+    snapshots, errors = state.enumerate_run_snapshots(roots, observation_budget=budget)
+    # Only stale discovery can survive a failed join/read. This comes from the
+    # producer's existing enumeration, never an extra metadata/provider read.
+    flight.discovery = _unobserved_projection(snapshots, errors, (), "runtime-busy")
+    aggregation = _reconcile_snapshots(roots, budget, snapshots, errors, observer)
+    flight.discovery = aggregation
+    return aggregation
+
+
+def _reconcile_producer(
+    roots: StatePaths,
+    budget: state.RunObservationWaitBudget,
+    observer: Callable[[state.RunLedgerSnapshot], None] | None,
+) -> RunAggregationResult:
+    snapshots, snapshot_errors = state.enumerate_run_snapshots(roots, observation_budget=budget)
+    return _reconcile_snapshots(roots, budget, snapshots, snapshot_errors, observer)
+
+
+def _reconcile_snapshots(
+    resolved_roots: StatePaths,
+    _observation_budget: state.RunObservationWaitBudget,
+    snapshots: tuple[state.RunLedgerSnapshot, ...],
+    snapshot_errors: tuple[RunAggregationError, ...],
+    _snapshot_observer: Callable[[state.RunLedgerSnapshot], None] | None,
+) -> RunAggregationResult:
     summaries: list[RunSummary] = []
     errors = [
         RunAggregationError(
@@ -1575,15 +2083,49 @@ def reconcile(*, roots: StatePaths | None = None) -> RunAggregationResult:
         )
         for error in snapshot_errors
     ]
+    busy_names = {error.name for error in snapshot_errors if error.code == "runtime-busy"}
     for snapshot in snapshots:
         record = snapshot.record
         try:
-            adapter = _preflight_existing_adapter(record, RuntimeOperation.RECONCILE, resolved_roots)
+            if record.name in busy_names:
+                summary, projection_error = _project_or_error(
+                    snapshot, operation=RuntimeOperation.RECONCILE, stale=True
+                )
+                if summary is not None:
+                    summaries.append(summary)
+                if projection_error is not None:
+                    errors.append(projection_error)
+                continue
+            native = record.dispatch_key == DispatchKey(RuntimeKind.OCI_ROOT, RuntimeBackend.LIMA_VZ)
+            if native and snapshot.state.get("status") == "removed":
+                # This is durable history, not a fresh provider-absence claim.
+                # Removed history must not compete for live provider custody.
+                summary = _project_summary(snapshot, stale=False)
+                if _snapshot_observer is not None:
+                    _snapshot_observer(snapshot)
+                summaries.append(summary)
+                continue
+            if native:
+                adapter = _preflight_existing_adapter(
+                    record,
+                    RuntimeOperation.RECONCILE,
+                    resolved_roots,
+                    _observation_budget=_observation_budget,
+                )
+            else:
+                adapter = _preflight_existing_adapter(record, RuntimeOperation.RECONCILE, resolved_roots)
             if adapter is cloud_runtime:
                 adapter_result = cloud_runtime.reconcile_run(
                     record.name,
                     roots=resolved_roots,
                     _expected_record=record,
+                )
+            elif native:
+                adapter_result = adapter.refresh_run(
+                    resolved_roots,
+                    record.name,
+                    expected_record=record,
+                    _observation_budget=_observation_budget,
                 )
             else:
                 adapter_result = lima.reconcile_run(
@@ -1591,15 +2133,21 @@ def reconcile(*, roots: StatePaths | None = None) -> RunAggregationResult:
                     roots=resolved_roots,
                     _expected_record=record,
                 )
-            refreshed = state.read_run_ledger_snapshot(resolved_roots, record.name)
-            if refreshed.record != record:
-                raise StateError("run ledger changed during reconciliation")
-            projected = refreshed
-            if record.state_schema_version == 1:
-                observed_state = adapter_result.get("state") if isinstance(adapter_result, Mapping) else None
-                if not isinstance(observed_state, Mapping):
-                    raise StateError("runtime reconciliation returned no observed state")
-                projected = state.snapshot_from_runtime_observation(record, observed_state)
+            if record.dispatch_key == DispatchKey(RuntimeKind.OCI_ROOT, RuntimeBackend.LIMA_VZ):
+                # refresh_run returns the state written through its locked authority.
+                # A second unlocked ledger read can collide with the next poll's
+                # atomic status write despite unchanged ownership and provider state.
+                projected = state.snapshot_from_runtime_observation(record, adapter_result)
+            else:
+                refreshed = state.read_run_ledger_snapshot(resolved_roots, record.name)
+                if refreshed.record != record:
+                    raise StateError("run ledger changed during reconciliation")
+                projected = refreshed
+                if record.state_schema_version == 1:
+                    observed_state = adapter_result.get("state") if isinstance(adapter_result, Mapping) else None
+                    if not isinstance(observed_state, Mapping):
+                        raise StateError("runtime reconciliation returned no observed state")
+                    projected = state.snapshot_from_runtime_observation(record, observed_state)
             summary, error = _project_or_error(
                 projected,
                 operation=RuntimeOperation.RECONCILE,
@@ -1607,6 +2155,8 @@ def reconcile(*, roots: StatePaths | None = None) -> RunAggregationResult:
             )
             if summary is None or error is not None:
                 raise StateError("invalid reconciled run ledger")
+            if _snapshot_observer is not None:
+                _snapshot_observer(projected)
             summaries.append(summary)
             adapter_warnings = adapter_result.get("warnings") if isinstance(adapter_result, Mapping) else None
             if isinstance(adapter_warnings, (list, tuple)) and adapter_warnings:
@@ -1618,6 +2168,20 @@ def reconcile(*, roots: StatePaths | None = None) -> RunAggregationResult:
                         message="runtime status changed during reconciliation",
                     )
                 )
+        except RuntimeBusyError:
+            summary, projection_error = _project_or_error(snapshot, operation=RuntimeOperation.RECONCILE, stale=True)
+            if summary is not None:
+                summaries.append(summary)
+            if projection_error is not None:
+                errors.append(projection_error)
+            errors.append(
+                _aggregation_error(
+                    operation=RuntimeOperation.RECONCILE,
+                    record=record,
+                    code="runtime-busy",
+                    message="run observation is busy",
+                )
+            )
         except (RuntimeCapabilityError, RuntimePreflightError):
             summary, projection_error = _project_or_error(
                 snapshot,

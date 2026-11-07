@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import errno
 import hashlib
 import io
@@ -9,6 +10,7 @@ import json
 import os
 import signal
 import struct
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -24,6 +26,8 @@ import pytest
 import palimpsest_local.oci_materializer as materializer
 import palimpsest_local.oci_materializer_worker as worker
 import palimpsest_local.oci_store as oci_store
+import palimpsest_local.vz_worker as vz_worker
+from palimpsest_local.errors import ArtifactValidationError
 from palimpsest_local.oci_converter import DEFAULT_LAYER_CONVERSION_LIMITS, LAYER_INTAKE_POLICY_ID
 from palimpsest_local.oci_image import OCIImageRef
 from palimpsest_local.oci_materializer import OCIHardWorkerError
@@ -42,19 +46,21 @@ from palimpsest_local.oci_packer import (
 )
 from palimpsest_local.oci_provenance import (
     OCI_IMAGE_CONFIG_MEDIA_TYPE,
+    OCI_IMAGE_INDEX_MEDIA_TYPE,
     OCI_IMAGE_MANIFEST_MEDIA_TYPE,
     OCI_LAYER_MEDIA_TYPE,
     Descriptor,
     Platform,
     ProvenanceSource,
 )
-from palimpsest_local.oci_source import LocalLayoutSource, SourceCAS
+from palimpsest_local.oci_source import LocalLayoutSource, SnapshottedOCIArchive, SnapshottedOCIImage, SourceCAS
 from palimpsest_local.oci_store import (
     DerivedLayerOccurrence,
     DerivedLayerReceipt,
     DerivedSquashFSKey,
     MaterializationResult,
     OCIStore,
+    parent_chain_digest,
 )
 from palimpsest_local.oci_worker_protocol import (
     MAX_OCI_WORKER_MESSAGE_BYTES,
@@ -85,6 +91,7 @@ def _request() -> OCIWorkerRequest:
     toolchain = VerifiedSquashFSToolchain(identity, Path("/usr/bin/mksquashfs"), ())
     key = DerivedSquashFSKey.for_occurrence(
         occurrence,
+        parent_chain_digest=_digest("0"),
         intake_policy_id=LAYER_INTAKE_POLICY_ID,
         intake_policy_fingerprint=DEFAULT_LAYER_CONVERSION_LIMITS.fingerprint,
         pack_policy_id=SQUASHFS_PACK_POLICY_ID,
@@ -134,14 +141,25 @@ def _result(request: OCIWorkerRequest) -> MaterializationResult:
     )
 
 
-def _materialization_fixture(tmp_path: Path) -> SimpleNamespace:
-    layer_stream = io.BytesIO()
-    member = tarfile.TarInfo("value")
-    member.mode = 0o644
-    member.size = len(b"fixture")
-    with tarfile.open(fileobj=layer_stream, mode="w", format=tarfile.PAX_FORMAT) as archive:
-        archive.addfile(member, io.BytesIO(b"fixture"))
-    layer_payload = layer_stream.getvalue()
+def _materialization_fixture(
+    tmp_path: Path,
+    *,
+    architecture: str = "amd64",
+    acquisition: bool = False,
+    indexed: bool = False,
+    repeated: bool = False,
+    process_config: dict | None = None,
+) -> SimpleNamespace:
+    def tar_payload(name: str, content: bytes) -> bytes:
+        layer_stream = io.BytesIO()
+        member = tarfile.TarInfo(name)
+        member.mode = 0o644
+        member.size = len(content)
+        with tarfile.open(fileobj=layer_stream, mode="w", format=tarfile.PAX_FORMAT) as archive:
+            archive.addfile(member, io.BytesIO(content))
+        return layer_stream.getvalue()
+
+    layer_payload = tar_payload("value", b"fixture")
 
     layout = tmp_path / "layout"
     blobs = layout / "blobs" / "sha256"
@@ -158,11 +176,16 @@ def _materialization_fixture(tmp_path: Path) -> SimpleNamespace:
         return descriptor
 
     layer = add_blob(layer_payload, OCI_LAYER_MEDIA_TYPE)
+    layers = [layer]
+    if repeated:
+        upper = add_blob(tar_payload("upper", b"second layer"), OCI_LAYER_MEDIA_TYPE)
+        layers = [layer, upper, layer]
     config_payload = json.dumps(
         {
-            "architecture": "amd64",
+            "architecture": architecture,
             "os": "linux",
-            "rootfs": {"type": "layers", "diff_ids": [layer.digest]},
+            "rootfs": {"type": "layers", "diff_ids": [item.digest for item in layers]},
+            **({"config": process_config} if process_config is not None else {}),
         },
         separators=(",", ":"),
     ).encode()
@@ -172,13 +195,26 @@ def _materialization_fixture(tmp_path: Path) -> SimpleNamespace:
             "schemaVersion": 2,
             "mediaType": OCI_IMAGE_MANIFEST_MEDIA_TYPE,
             "config": config.to_dict(),
-            "layers": [layer.to_dict()],
+            "layers": [item.to_dict() for item in layers],
         },
         separators=(",", ":"),
     ).encode()
     manifest = add_blob(manifest_payload, OCI_IMAGE_MANIFEST_MEDIA_TYPE)
+    root = manifest
+    if indexed:
+        root = add_blob(
+            json.dumps(
+                {
+                    "schemaVersion": 2,
+                    "mediaType": OCI_IMAGE_INDEX_MEDIA_TYPE,
+                    "manifests": [{**manifest.to_dict(), "platform": {"os": "linux", "architecture": architecture}}],
+                },
+                separators=(",", ":"),
+            ).encode(),
+            OCI_IMAGE_INDEX_MEDIA_TYPE,
+        )
     (layout / "index.json").write_text(
-        json.dumps({"schemaVersion": 2, "manifests": [manifest.to_dict()]}, separators=(",", ":")),
+        json.dumps({"schemaVersion": 2, "manifests": [root.to_dict()]}, separators=(",", ":")),
         encoding="utf-8",
     )
 
@@ -189,7 +225,11 @@ def _materialization_fixture(tmp_path: Path) -> SimpleNamespace:
         repository="team/app",
         requested_reference="registry.example.com/team/app:latest",
     )
-    image = LocalLayoutSource.parse(f"oci-layout://{layout}@{manifest.digest}").snapshot(reference, cas)
+    source = LocalLayoutSource.parse(f"oci-layout://{layout}@{root.digest}")
+    if acquisition:
+        image = source.snapshot_acquisition(reference, cas, platform=f"linux/{architecture}")
+    else:
+        image = source.snapshot(reference, cas)
     roots = init_resolved_roots(StatePaths(tmp_path / "config", tmp_path / "state"))
     store = OCIStore(roots)
     packer = (tmp_path / "mksquashfs").resolve()
@@ -201,6 +241,8 @@ def _materialization_fixture(tmp_path: Path) -> SimpleNamespace:
     return SimpleNamespace(
         cas=cas,
         image=image,
+        source=source,
+        reference=reference,
         packer=packer,
         roots=roots,
         source_cas_root=source_cas_root,
@@ -210,11 +252,15 @@ def _materialization_fixture(tmp_path: Path) -> SimpleNamespace:
 
 
 def _fixture_worker_request(
-    fixture: SimpleNamespace, pack_profile: SquashFSPackProfile = SquashFSPackProfile.CANONICAL
+    fixture: SimpleNamespace,
+    pack_profile: SquashFSPackProfile = SquashFSPackProfile.CANONICAL,
+    *,
+    ordinal: int = 0,
 ) -> OCIWorkerRequest:
-    occurrence = DerivedLayerOccurrence.from_image(fixture.image, 0)
+    occurrence = DerivedLayerOccurrence.from_image(fixture.image, ordinal)
     key = DerivedSquashFSKey.for_occurrence(
         occurrence,
+        parent_chain_digest=parent_chain_digest(fixture.image, ordinal),
         intake_policy_id=LAYER_INTAKE_POLICY_ID,
         intake_policy_fingerprint=DEFAULT_LAYER_CONVERSION_LIMITS.fingerprint,
         pack_policy_id=SQUASHFS_PACK_POLICY_ID,
@@ -268,6 +314,338 @@ def _minimal_squashfs() -> bytes:
     return superblock + payload + b"\0" * (image_size - bytes_used)
 
 
+@pytest.mark.parametrize("indexed", [False, True])
+def test_acquisition_amd64_reconstructs_native_identical_graph_binding_and_wire(tmp_path, indexed):
+    fixture = _materialization_fixture(tmp_path, acquisition=True, indexed=indexed, repeated=True)
+    acquisition = fixture.image
+    request = _fixture_worker_request(fixture, ordinal=2)
+    native = fixture.source.snapshot(fixture.reference, fixture.cas)
+    fixture.image = native
+    native_request = replace(_fixture_worker_request(fixture, ordinal=2), nonce=request.nonce)
+
+    assert isinstance(acquisition, SnapshottedOCIArchive)
+    assert isinstance(native, SnapshottedOCIImage)
+    assert acquisition.image.canonical_bytes() == native.image.canonical_bytes()
+    assert acquisition.image.source.to_dict() == native.image.source.to_dict()
+    assert acquisition.image.digest == native.image.digest
+    assert acquisition.to_dict() == native.to_dict()
+    assert request.to_json_bytes() == native_request.to_json_bytes()
+    reconstructed = worker._reconstruct_image(request, fixture.cas)
+    assert isinstance(reconstructed, SnapshottedOCIImage)
+    assert reconstructed.to_dict() == acquisition.to_dict()
+
+
+@pytest.mark.parametrize("indexed", [False, True])
+def test_arm_worker_reconstructs_complete_original_graph_and_stages_every_occurrence(tmp_path, indexed):
+    fixture = _materialization_fixture(
+        tmp_path,
+        architecture="arm64",
+        acquisition=True,
+        indexed=indexed,
+        repeated=True,
+        process_config={"Env": ["LANG=C"], "User": "123:456", "WorkingDir": "/work"},
+    )
+    reconstructed = []
+    staged_payloads = []
+    for ordinal in range(3):
+        request = _fixture_worker_request(fixture, ordinal=ordinal)
+        request = OCIWorkerRequest.from_json_bytes(request.to_json_bytes())
+        snapshot = worker._reconstruct_image(request, fixture.cas)
+        assert isinstance(snapshot, SnapshottedOCIArchive)
+        assert snapshot.to_dict() == fixture.image.to_dict()
+        assert snapshot.image.platform == Platform("linux", "arm64")
+        assert snapshot.image.config.process == fixture.image.image.config.process
+        assert snapshot.image.config.process.argv == ()
+        assert DerivedLayerOccurrence.from_image(snapshot, ordinal) == request.occurrence
+        with fixture.cas.lease_layer(snapshot, ordinal) as source, worker.stage_layer(source) as staged:
+            assert staged.receipt.ordinal == ordinal
+            assert staged.receipt.diff_id == snapshot.image.layers[ordinal].diff_id
+            name = "upper" if ordinal == 1 else "value"
+            entry = next(entry for entry in staged.changeset.entries if entry.path == name)
+            with staged.lease_regular_payload(entry.payload) as payload:
+                staged_payloads.append(payload.read(4096))
+        reconstructed.append(snapshot)
+    assert staged_payloads == [b"fixture", b"second layer", b"fixture"]
+    assert reconstructed[0].layers[0] == reconstructed[0].layers[2]
+    assert fixture.image.root.descriptor == (
+        fixture.image.image.index_descriptor or fixture.image.image.manifest_descriptor
+    )
+
+
+@pytest.mark.parametrize(
+    "tampering",
+    [
+        "platform",
+        "root",
+        "manifest",
+        "config",
+        "reference",
+        "cas",
+        "image",
+        "binding",
+        "ordinal",
+        "layer",
+        "diffid",
+        "parent",
+    ],
+)
+def test_arm_cold_worker_rejects_changed_authority_before_staging_or_publication(tmp_path, monkeypatch, tampering):
+    fixture = _materialization_fixture(tmp_path, architecture="arm64", acquisition=True, indexed=True, repeated=True)
+    request = _fixture_worker_request(fixture)
+    if tampering == "platform":
+        request = replace(request, source=replace(request.source, platform=Platform("linux", "amd64")))
+    elif tampering == "root":
+        request = replace(request, source=replace(request.source, index_descriptor=None))
+    elif tampering == "manifest":
+        request = replace(
+            request,
+            source=replace(
+                request.source,
+                manifest_descriptor=replace(request.source.manifest_descriptor, digest=_digest("1")),
+            ),
+        )
+    elif tampering == "config":
+        request = replace(
+            request,
+            source=replace(
+                request.source,
+                config_descriptor=replace(request.source.config_descriptor, digest=_digest("1")),
+            ),
+        )
+    elif tampering == "reference":
+        request = replace(
+            request,
+            source=replace(request.source, requested_reference="registry.example.com/team/app:other"),
+        )
+    elif tampering == "cas":
+        request = replace(request, expected_source_cas_id="source-cas-v1:" + "0" * 64)
+    elif tampering in {"image", "binding", "ordinal", "layer", "diffid"}:
+        fields = {
+            "image": {"source_image_digest": _digest("1")},
+            "binding": {"source_snapshot_binding_digest": _digest("1")},
+            "ordinal": {"ordinal": 3},
+            "layer": {"compressed_digest": _digest("1")},
+            "diffid": {"diff_id": _digest("1")},
+        }[tampering]
+        occurrence = replace(request.occurrence, **fields)
+        key = DerivedSquashFSKey.for_occurrence(
+            occurrence,
+            parent_chain_digest=request.key.parent_chain_digest,
+            intake_policy_id=LAYER_INTAKE_POLICY_ID,
+            intake_policy_fingerprint=DEFAULT_LAYER_CONVERSION_LIMITS.fingerprint,
+            pack_policy_id=SQUASHFS_PACK_POLICY_ID,
+            pack_policy_fingerprint=request.pack_profile.policy.fingerprint,
+            toolchain=fixture.toolchain,
+        )
+        request = replace(request, occurrence=occurrence, key=key, key_digest=key.digest)
+    elif tampering == "parent":
+        key = replace(request.key, parent_chain_digest=_digest("1"))
+        request = replace(request, key=key, key_digest=key.digest)
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("changed cold-worker authority reached layer staging or publication")
+
+    monkeypatch.setattr(worker, "discover_squashfs_toolchain", lambda *args, **kwargs: fixture.toolchain)
+    monkeypatch.setattr(worker, "stage_layer", unexpected)
+    monkeypatch.setattr(oci_store.ArtifactStore, "publish_squashfs", unexpected)
+    with pytest.raises(ArtifactValidationError):
+        worker._materialize(OCIWorkerRequest.from_json_bytes(request.to_json_bytes()))
+
+
+@pytest.mark.parametrize("tampering", ["none", "source", "binding", "parent", "missing-source"])
+def test_warm_worker_authenticates_source_graph_and_parent_context_before_cache(
+    tmp_path, monkeypatch, tampering
+) -> None:
+    from test_oci_store import _receipts
+
+    fixture = _materialization_fixture(tmp_path, acquisition=True, repeated=True)
+    request = _fixture_worker_request(fixture, ordinal=2)
+    image = _minimal_squashfs()
+
+    @contextmanager
+    def produce():
+        intake, packed = _receipts(request.occurrence, image)
+        identity = fixture.toolchain.identity
+        packed = replace(
+            packed,
+            packer_version=identity.version,
+            packer_sha256=identity.executable_digest.removeprefix("sha256:"),
+            toolchain_fingerprint=identity.fingerprint,
+            toolchain_dependency_digests=identity.dependency_digests,
+        )
+        leased = LeasedSquashFS(io.BytesIO(image), packed)
+        try:
+            yield intake, leased
+        finally:
+            failure = leased._close()
+            if failure is not None:
+                raise failure
+
+    # A real persisted derived record exists before the worker is called.
+    if tampering == "parent":
+        key = replace(request.key, parent_chain_digest=_digest("1"))
+        request = replace(request, key=key, key_digest=key.digest)
+    fixture.store.materialize(request.occurrence, request.key, produce)
+    if tampering == "source":
+        request = replace(
+            request,
+            source=replace(
+                request.source,
+                config_descriptor=replace(request.source.config_descriptor, digest=_digest("1")),
+            ),
+        )
+    elif tampering == "binding":
+        request = replace(request, occurrence=replace(request.occurrence, source_snapshot_binding_digest=_digest("1")))
+    elif tampering == "missing-source":
+        manifest_hex = fixture.image.manifest.descriptor.digest.removeprefix("sha256:")
+        path = fixture.source_cas_root / "blobs" / "sha256" / manifest_hex
+        path.unlink()
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("warm worker attempted staging or publication")
+
+    monkeypatch.setattr(worker, "discover_squashfs_toolchain", lambda *args, **kwargs: fixture.toolchain)
+    monkeypatch.setattr(worker, "stage_layer", unexpected)
+    monkeypatch.setattr(oci_store.ArtifactStore, "publish_squashfs", unexpected)
+    if tampering == "none":
+        result = worker._materialize(request)
+        assert result.cache_result == "warm_hit"
+    else:
+        with pytest.raises(ArtifactValidationError):
+            worker._materialize(request)
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="spoofing sys.platform makes SourceCAS issue Linux openat2 syscall numbers, killing the interpreter on Darwin",
+)
+@pytest.mark.parametrize("architecture", ["amd64", "arm64"])
+def test_acquisition_hard_layer_request_binds_exact_graph_and_occurrence(tmp_path, monkeypatch, architecture):
+    fixture = _materialization_fixture(
+        tmp_path, architecture=architecture, acquisition=True, indexed=True, repeated=True
+    )
+    observed = []
+
+    def exchange(request, **kwargs):
+        snapshot = worker._reconstruct_image(OCIWorkerRequest.from_json_bytes(request.to_json_bytes()), fixture.cas)
+        with (
+            fixture.cas.lease_layer(snapshot, request.occurrence.ordinal) as source,
+            worker.stage_layer(source) as staged,
+        ):
+            assert staged.receipt.diff_id == fixture.image.image.layers[2].diff_id
+            entry = next(entry for entry in staged.changeset.entries if entry.path == "value")
+            with staged.lease_regular_payload(entry.payload) as payload:
+                assert payload.read(4096) == b"fixture"
+        observed.append(request)
+        response = OCIWorkerResponse(request.nonce, request.digest, "succeeded", _result(request), None)
+        return response.to_json_bytes(), 0, SimpleNamespace(poll=lambda: 0)
+
+    monkeypatch.setattr(materializer.sys, "platform", "linux")
+    monkeypatch.setattr(materializer, "_spawn_and_exchange", exchange)
+    result = materializer.materialize_layer_hard(
+        fixture.image,
+        2,
+        source_cas_root=fixture.source_cas_root,
+        roots=fixture.roots,
+        store=fixture.store,
+        packer_path=fixture.packer,
+        toolchain=fixture.toolchain,
+    )
+    assert len(observed) == 1
+    assert observed[0].source.platform == Platform("linux", architecture)
+    assert observed[0].occurrence == DerivedLayerOccurrence.from_image(fixture.image, 2)
+    assert result.receipt.source_snapshot_binding_digest == fixture.image.binding_digest
+    assert result.receipt.ordinal == 2
+
+
+def test_arm_image_materialization_uses_real_cold_store_and_ordered_occurrence_receipts(tmp_path, monkeypatch):
+    fixture = _materialization_fixture(
+        tmp_path,
+        architecture="arm64",
+        acquisition=True,
+        indexed=True,
+        repeated=True,
+        process_config={"Env": ["VALUE=original"], "WorkingDir": "/work", "User": "123:456"},
+    )
+    scratch = tmp_path / "worker-scratch"
+    scratch.mkdir(mode=0o700)
+    monkeypatch.chdir(scratch)
+    packed_ordinals = []
+
+    @contextmanager
+    def packed_fixture(staged, **kwargs):
+        # Only the external packer is substituted. CAS reconstruction, layer
+        # intake, recipe validation, artifact publication and receipts are real.
+        packed_ordinals.append(staged.receipt.ordinal)
+        image = _minimal_squashfs()
+        identity = fixture.toolchain.identity
+        receipt = PackedSquashFSReceipt(
+            policy_id=SQUASHFS_PACK_POLICY_ID,
+            policy_fingerprint=kwargs["policy"].fingerprint,
+            source_ordinal=staged.receipt.ordinal,
+            source_diff_id=staged.receipt.diff_id,
+            normalized_tar_digest=_digest("8"),
+            normalized_tar_size=staged.receipt.uncompressed_size,
+            entries=staged.receipt.members,
+            packer_version=identity.version,
+            packer_sha256=identity.executable_digest.removeprefix("sha256:"),
+            image_digest=f"sha256:{hashlib.sha256(image).hexdigest()}",
+            image_size=len(image),
+            structural_verifier=SQUASHFS_STRUCTURAL_VERIFIER_ID,
+            toolchain_fingerprint=identity.fingerprint,
+            toolchain_dependency_digests=identity.dependency_digests,
+        )
+        with tempfile.TemporaryFile(mode="w+b") as stream:
+            stream.write(image)
+            stream.seek(0)
+            packed = LeasedSquashFS(stream, receipt)
+            try:
+                yield packed
+            finally:
+                packed._close()
+
+    def materialize(selected, ordinal, **kwargs):
+        assert selected is fixture.image
+        return worker._materialize(_fixture_worker_request(fixture, ordinal=ordinal))
+
+    monkeypatch.setattr(worker, "discover_squashfs_toolchain", lambda *args, **kwargs: fixture.toolchain)
+    monkeypatch.setattr(worker, "pack_staged_squashfs", packed_fixture)
+    monkeypatch.setattr(materializer, "materialize_layer_hard", materialize)
+    callbacks = []
+    receipt = materializer.materialize_image_hard(
+        fixture.image,
+        source_cas_root=fixture.source_cas_root,
+        roots=fixture.roots,
+        store=fixture.store,
+        packer_path=fixture.packer,
+        toolchain=fixture.toolchain,
+        on_layer=lambda result: callbacks.append(result.receipt.ordinal),
+    )
+    assert packed_ordinals == [0, 1, 2]
+    assert callbacks == [0, 1, 2]
+    assert [result.cache_result for result in receipt.results] == ["cold_miss", "cold_miss", "cold_miss"]
+    assert receipt.platform_os == "linux"
+    assert receipt.platform_architecture == "arm64"
+    assert receipt.root_descriptor == fixture.image.root.descriptor
+    assert receipt.config_descriptor == fixture.image.config.descriptor
+    assert receipt.layer_descriptors == tuple(item.descriptor for item in fixture.image.layers)
+    assert receipt.layer_diff_ids == fixture.image.image.config.diff_ids
+    assert receipt.process == fixture.image.image.config.process
+    assert not receipt.process.bootable
+    assert receipt.process.cwd == "/work"
+    assert receipt.process.user.to_dict() == {"user": "123", "group": "456"}
+    assert ("VALUE", "original") in receipt.process.environment
+    assert receipt.results[0].receipt.key_digest != receipt.results[2].receipt.key_digest
+    assert receipt.results[0].receipt.occurrence_digest != receipt.results[2].receipt.occurrence_digest
+    fixture.store.validate_receipt_occurrences(
+        tuple(result.receipt for result in receipt.results),
+        tuple(DerivedLayerOccurrence.from_image(fixture.image, ordinal) for ordinal in range(3)),
+    )
+    for unsupported in (("windows", "arm64"), ("linux", "riscv64")):
+        with pytest.raises(OCIHardWorkerError, match="platform is unsupported"):
+            replace(receipt, platform_os=unsupported[0], platform_architecture=unsupported[1])
+
+
 def test_request_and_success_response_round_trip_as_canonical_json() -> None:
     request = _request()
     response = OCIWorkerResponse(request.nonce, request.digest, "succeeded", _result(request), None)
@@ -308,10 +686,44 @@ def test_request_rejects_unknown_fields_and_digest_or_path_tampering() -> None:
     bad_digest["key"]["digest"] = _digest("9")
     bad_path = request.to_dict()
     bad_path["roots"]["state"] = "/var/lib/../tmp"
+    bad_context = request.to_dict()
+    bad_context["key"]["value"]["parent_chain_digest"] = _digest("9")
 
-    for value in (unknown, bad_digest, bad_path):
+    for value in (unknown, bad_digest, bad_path, bad_context):
         with pytest.raises(OCIWorkerProtocolError):
             OCIWorkerRequest.from_dict(value)
+
+
+def test_request_rejects_parentless_legacy_recipe_even_with_matching_digest() -> None:
+    value = _request().to_dict()
+    legacy = dict(value["key"]["value"])
+    legacy["domain"] = "palimpsest.oci-derived-recipe.v1"
+    del legacy["parent_chain_digest"]
+    parsed = DerivedSquashFSKey.from_dict(legacy)
+    value["key"] = {"digest": parsed.digest, "value": legacy}
+    with pytest.raises(OCIWorkerProtocolError, match="key"):
+        OCIWorkerRequest.from_dict(value)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("intake_policy_id", "historical-intake"),
+        ("intake_policy_fingerprint", _digest("1")),
+        ("normalization_contract_id", "palimpsest.oci-changeset-normalization.v2"),
+        ("tar_emission_contract_id", "historical-emission"),
+        ("packer_contract_id", "historical-packer"),
+        ("structural_verifier", "palimpsest.squashfs-superblock.v2"),
+    ],
+)
+def test_worker_request_rejects_unsupported_semantic_contract_even_with_matching_digest(field, value) -> None:
+    request = _request()
+    key = replace(request.key, **{field: value})
+    wire = request.to_dict()
+    wire["key"] = {"digest": key.digest, "value": key.to_dict()}
+    assert DerivedSquashFSKey.from_dict(key.to_dict()) == key
+    with pytest.raises(OCIWorkerProtocolError, match="contracts"):
+        OCIWorkerRequest.from_dict(wire)
 
 
 def test_fixed_pack_profiles_preserve_default_and_separate_recipe_authority():
@@ -1700,6 +2112,35 @@ def test_worker_failure_code_rejects_foreign_class_unknown_code_and_cycles():
     assert worker._failure_code(wrapper, "intake") is None
 
 
+@pytest.mark.parametrize(
+    "code",
+    [
+        "oci-prefix-layer-limit",
+        "oci-prefix-timeout",
+        "oci-prefix-limit",
+        "oci-stage-context",
+        "oci-changeset-entry-limit",
+        "oci-changeset-metadata-limit",
+    ],
+)
+def test_prefix_intake_failures_remain_typed_across_worker_protocol(code) -> None:
+    failure = worker.LayerIntakeError(code, "private context")
+    assert worker._category(failure) == "intake"
+    request = _request()
+    response = OCIWorkerResponse(
+        request.nonce,
+        request.digest,
+        "failed",
+        None,
+        "intake",
+        failure_code=worker._failure_code(failure, "intake"),
+    )
+    parsed = OCIWorkerResponse.from_json_bytes(response.to_json_bytes())
+    assert parsed.failure_code == code
+    assert parsed.error_category == "intake"
+    assert b"private context" not in response.to_json_bytes()
+
+
 @pytest.mark.parametrize("number", [True, {}, [], 0, errno.EINVAL, errno.EAGAIN, errno.ENOMEM])
 def test_response_rejects_unallowlisted_io_errno(number):
     request = _request()
@@ -1760,7 +2201,7 @@ def test_real_pack_tar_emission_intake_failure_reports_observed_packing_operatio
     # Darwin would execute Linux openat2 syscall numbers in the pytest process.
     monkeypatch.setattr(oci_packer, "sys", SimpleNamespace(platform="linux"))
     monkeypatch.setattr(worker, "discover_squashfs_toolchain", lambda *args, **kwargs: fixture.toolchain)
-    monkeypatch.setattr(oci_packer, "_discover_dependency_paths", lambda _path: ())
+    monkeypatch.setattr(oci_packer, "_discover_dependency_paths", lambda _path, **_kwargs: ())
     monkeypatch.setattr(oci_packer, "_packer_version", lambda *args: fixture.toolchain.identity.version)
     observed = []
 
@@ -1879,7 +2320,7 @@ def test_child_real_pack_boundary_selects_fixed_policy_with_slow_clock_fixture(t
         return fixture.toolchain
 
     monkeypatch.setattr(worker, "discover_squashfs_toolchain", discover)
-    monkeypatch.setattr(oci_packer, "_discover_dependency_paths", lambda _path: ())
+    monkeypatch.setattr(oci_packer, "_discover_dependency_paths", lambda _path, **_kwargs: ())
     monkeypatch.setattr(oci_packer, "_packer_version", lambda *args: fixture.toolchain.identity.version)
     image = _minimal_squashfs()
     waits = []
@@ -1968,3 +2409,263 @@ def test_worker_spawn_and_pipe_startup_do_not_reset_remaining_deadline(tmp_path,
     )
     assert (output, code, actual) == (b"", 0, process)
     assert waits == [5]
+
+
+@pytest.mark.parametrize(
+    ("boundary", "expected_phase"),
+    [("source-entry", "source"), ("stage-entry", "staging"), ("source-exit", None), ("stage-exit", None)],
+)
+def test_prefix_resource_entry_and_cleanup_keep_observed_operation_phase(
+    tmp_path, monkeypatch, boundary, expected_phase
+) -> None:
+    fixture = _materialization_fixture(tmp_path, acquisition=True, repeated=True)
+    request = _fixture_worker_request(fixture, ordinal=2)
+    scratch = tmp_path / "worker-scratch"
+    scratch.mkdir(mode=0o700)
+    monkeypatch.chdir(scratch)
+    original_lease = worker.SourceCAS.lease_layer
+    original_stage = worker.stage_layer
+    opened = []
+    staged_layers = []
+
+    @contextmanager
+    def lease(cas, snapshot, ordinal):
+        if ordinal == 0 and boundary == "source-entry":
+            raise MemoryError("private prefix entry")
+        with original_lease(cas, snapshot, ordinal) as source:
+            opened.append(source._file_fd)
+            yield source
+        if ordinal == 0 and boundary == "source-exit":
+            raise MemoryError("private prefix teardown")
+
+    @contextmanager
+    def stage(source, **kwargs):
+        with original_stage(source, **kwargs) as staged:
+            staged_layers.append(staged)
+            if source._ordinal == 0 and boundary == "stage-entry":
+                raise MemoryError("private prefix staging")
+            yield staged
+        if source._ordinal == 0 and boundary == "stage-exit":
+            raise MemoryError("private prefix teardown")
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("failed prefix reached packer or publication")
+
+    monkeypatch.setattr(worker, "discover_squashfs_toolchain", lambda *args, **kwargs: fixture.toolchain)
+    monkeypatch.setattr(worker.SourceCAS, "lease_layer", lease)
+    monkeypatch.setattr(worker, "stage_layer", stage)
+    monkeypatch.setattr(worker, "pack_staged_squashfs", forbidden)
+    monkeypatch.setattr(oci_store.ArtifactStore, "publish_squashfs", forbidden)
+    with pytest.raises(worker._WorkerResourceError) as raised:
+        worker._materialize(request)
+    assert worker._category(raised.value) == "resource"
+    assert worker._operation_stage(raised.value) == expected_phase
+    for fd in opened:
+        with pytest.raises(OSError):
+            os.fstat(fd)
+    assert all(staged._spool.closed for staged in staged_layers)
+    assert not list((fixture.roots.oci_derived_store / "keys").iterdir())
+
+
+def test_cumulative_prefix_deadline_interrupts_second_real_stage_before_local_timeout(tmp_path, monkeypatch):
+    from functools import partial
+
+    from palimpsest_local.oci_source import LeasedSourceLayer
+
+    fixture = _materialization_fixture(tmp_path, acquisition=True, repeated=True)
+    request = _fixture_worker_request(fixture, ordinal=2)
+    scratch = tmp_path / "worker-scratch"
+    scratch.mkdir(mode=0o700)
+    monkeypatch.chdir(scratch)
+    clock = SimpleNamespace(now=0.0)
+    timer = SimpleNamespace(monotonic=lambda: clock.now)
+    original_lease = worker.SourceCAS.lease_layer
+    original_chunks = LeasedSourceLayer.chunks
+    streamed = []
+    exhausted = []
+
+    @contextmanager
+    def lease(cas, snapshot, ordinal):
+        with original_lease(cas, snapshot, ordinal) as source:
+            if ordinal == 1:
+                clock.now = 200.0
+            yield source
+
+    def chunks(source, *args, **kwargs):
+        for chunk in original_chunks(source, *args, **kwargs):
+            streamed.append(source._ordinal)
+            if source._ordinal == 1:
+                clock.now = 301.0
+            yield chunk
+        exhausted.append(source._ordinal)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("expired cumulative prefix reached packer or publication")
+
+    monkeypatch.setattr(worker, "time", timer)
+    monkeypatch.setattr(worker, "stage_layer", partial(worker.stage_layer, clock=timer.monotonic))
+    monkeypatch.setattr(worker, "discover_squashfs_toolchain", lambda *args, **kwargs: fixture.toolchain)
+    monkeypatch.setattr(worker.SourceCAS, "lease_layer", lease)
+    monkeypatch.setattr(LeasedSourceLayer, "chunks", chunks)
+    monkeypatch.setattr(worker, "pack_staged_squashfs", forbidden)
+    monkeypatch.setattr(oci_store.ArtifactStore, "publish_squashfs", forbidden)
+    with pytest.raises(worker.LayerIntakeError) as raised:
+        worker._materialize(request)
+    assert raised.value.code == "oci-prefix-timeout"
+    assert worker._operation_stage(raised.value) == "staging"
+    assert 0 in streamed and 1 in streamed and 2 not in streamed
+    assert exhausted == [0]
+    assert not list((fixture.roots.oci_derived_store / "keys").iterdir())
+
+
+@contextmanager
+def _vz_transport_child(code):
+    process = subprocess.Popen(
+        [sys.executable, "-I", "-B", "-c", code],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        yield process, vz_worker._Transport(process, time.monotonic() + 10)
+    finally:
+        process.wait(timeout=10)
+        for stream in (process.stdin, process.stdout, process.stderr):
+            stream.close()
+
+
+def test_vz_real_early_exit_drains_stderr_even_when_stdout_eof_is_selected_first(monkeypatch):
+    original_selector = vz_worker.selectors.DefaultSelector
+
+    class StdoutFirstSelector(original_selector):
+        def select(self, timeout=None):
+            return sorted(super().select(timeout), key=lambda event: event[0].data != "stdout")
+
+    monkeypatch.setattr(vz_worker.selectors, "DefaultSelector", StdoutFirstSelector)
+    with _vz_transport_child("import os; os.write(2,b'RuntimeError: unsafe bytecode cache\\n'); os._exit(23)") as (
+        process,
+        transport,
+    ):
+        process.wait(timeout=10)
+        with pytest.raises(vz_worker.VZWorkerHold) as raised:
+            transport.receive()
+        diagnostics = json.loads(json.dumps(raised.value.private_diagnostics()))
+        assert diagnostics["returncode"] == 23
+        assert base64.b64decode(diagnostics["stderr_tail_base64"]) == b"RuntimeError: unsafe bytecode cache\n"
+        assert diagnostics["stderr_eof"] is True
+        assert diagnostics["stderr_truncated"] is False
+        assert "unsafe bytecode cache" not in str(raised.value)
+        assert "unsafe bytecode cache" not in repr(raised.value)
+
+
+def test_vz_real_child_private_stderr_tail_is_bounded_without_loosening_total_cap():
+    size = 3 * vz_worker.MAX_PRIVATE_STDERR
+    secret = b"private fatal detail\n"
+    with _vz_transport_child(f"import os; os.write(2,b'x'*{size}+{secret!r}); os._exit(29)") as (_, transport):
+        with pytest.raises(vz_worker.VZWorkerHold) as raised:
+            transport.receive()
+        diagnostics = raised.value.private_diagnostics()
+        tail = base64.b64decode(diagnostics["stderr_tail_base64"])
+        assert len(tail) == vz_worker.MAX_PRIVATE_STDERR
+        assert tail.endswith(secret)
+        assert diagnostics["stderr_bytes_observed"] == size + len(secret)
+        assert diagnostics["stderr_truncated"] is True
+        assert secret.decode().strip() not in str(raised.value)
+    with _vz_transport_child(f"import os; os.write(2,b'x'*{vz_worker.MAX_JSON + 1}); os._exit(31)") as (_, transport):
+        with pytest.raises(vz_worker.VZWorkerHold) as raised:
+            transport.receive()
+        diagnostics = raised.value.private_diagnostics()
+        assert diagnostics["stderr_bytes_observed"] > vz_worker.MAX_JSON
+        assert len(base64.b64decode(diagnostics["stderr_tail_base64"])) == vz_worker.MAX_PRIVATE_STDERR
+
+
+@pytest.mark.parametrize("operation", ["receive", "finish"])
+def test_vz_real_child_frame_and_exit_errors_expose_private_evidence(operation):
+    code = "import os,struct; os.write(2,b'private child failure'); "
+    if operation == "receive":
+        code += f"os.write(1,struct.pack('>I',{vz_worker.MAX_JSON + 1})); "
+    code += "os._exit(37)"
+    with _vz_transport_child(code) as (process, transport):
+        process.wait(timeout=10)
+        with pytest.raises(vz_worker.VZWorkerHold) as raised:
+            getattr(transport, operation)()
+        diagnostics = raised.value.private_diagnostics()
+        assert diagnostics["returncode"] == 37
+        assert base64.b64decode(diagnostics["stderr_tail_base64"]) == b"private child failure"
+        assert "private child failure" not in str(raised.value)
+
+
+def test_vz_transaction_preserves_marker_and_private_child_failure_without_retry(tmp_path, monkeypatch):
+    custody = tmp_path / "custody"
+    custody.mkdir(mode=0o700)
+    home = tmp_path / "lima"
+    config_path = tmp_path / "worker.json"
+    record = {
+        "name": "owned-worker",
+        "status": "Running",
+        "arch": "aarch64",
+        "vmType": "vz",
+        "dir": str(home / "owned-worker"),
+    }
+    selected = vz_worker.VZWorker(
+        {
+            "custody_root": str(custody),
+            "lima_home": str(home),
+            "instance": {"name": "owned-worker", "arch": "aarch64", "vm_type": "vz"},
+            "guest": {
+                "python": "/pinned/python",
+                "python_sha256": _digest("a"),
+                "package_root": "/pinned/source",
+                "package_fingerprint": _digest("b"),
+            },
+        },
+        config_path,
+        (),
+    )
+    children = []
+    retained = []
+
+    def spawn(self, arguments):
+        if not children:
+            code = f"import os; os.write(1,{json.dumps(record).encode()!r})"
+        else:
+            code = "import os; os.write(2,b'RuntimeError: unsafe bytecode cache\\n'); os._exit(41)"
+        process = subprocess.Popen(
+            [sys.executable, "-I", "-B", "-c", code],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        children.append(process)
+        process.wait(timeout=10)
+        return process
+
+    monkeypatch.setattr(vz_worker.VZWorker, "_spawn", spawn)
+    monkeypatch.setattr(vz_worker.VZWorker, "_check_instance", lambda self: None)
+    monkeypatch.setattr(vz_worker, "_HELD", retained)
+    monkeypatch.setattr(vz_worker, "retain_preparation_custody", lambda *resources: None)
+    try:
+        with pytest.raises(vz_worker.VZWorkerHold) as raised:
+            with selected.transaction("prepare-test"):
+                pytest.fail("dead worker reached the operation body")
+        diagnostics = raised.value.private_diagnostics()
+        assert diagnostics["returncode"] == 41
+        assert base64.b64decode(diagnostics["stderr_tail_base64"]) == b"RuntimeError: unsafe bytecode cache\n"
+        assert (custody / "active.json").is_file()
+        assert len(retained) == 1
+        assert len(children) == 2
+        assert "unsafe bytecode cache" not in str(raised.value)
+        with pytest.raises(BlockingIOError):
+            with selected.transaction("prepare-test"):
+                pytest.fail("retained request was replayed")
+        assert len(children) == 2
+    finally:
+        for process in children:
+            process.wait(timeout=10)
+            for stream in (process.stdin, process.stdout, process.stderr):
+                stream.close()
+        for _, rootfd, lockfd in retained:
+            os.close(lockfd)
+            os.close(rootfd)

@@ -276,7 +276,9 @@ async def instance_hub(tmp_path, monkeypatch):
             "user_id": request.headers.get("X-User", USER),
             "token": "fixture-original-human-token",
             "package_actions": set(
-                request.headers.get("X-Actions", "packages:write,packages:inventory,packages:read").split(",")
+                request.headers.get(
+                    "X-Actions", "packages:write,packages:inventory,packages:read,packages:manage"
+                ).split(",")
             ),
             "is_system_admin": False,
         }
@@ -289,13 +291,24 @@ async def instance_hub(tmp_path, monkeypatch):
         await hub._legacy_writer(actor)
         return actor
 
+    async def controller(request: Request):
+        return await hub._instance_controller(await actor(request))
+
+    async def control(actor, conn, row):
+        service.request_project(actor, conn)
+        service.require_instance_control(actor, row)
+        return actor
+
     app.dependency_overrides[hub._legacy_writer] = actor
     app.dependency_overrides[hub._legacy_inventory] = actor
+    app.dependency_overrides[hub._instance_controller] = controller
+    app.dependency_overrides[instances.get_package_manager_info] = actor
     app.dependency_overrides[get_os_conn] = conn
     monkeypatch.setattr(instances, "_factory_or_503", lambda: factory)
     monkeypatch.setattr(instances, "_store_or_503", lambda: store)
     monkeypatch.setattr(instances, "get_settings", lambda: settings)
     monkeypatch.setattr(service, "fresh_writer", fresh)
+    monkeypatch.setattr(service, "fresh_instance_controller", control)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="https://hub.example.test") as client:
         yield SimpleNamespace(
             client=client, provider=provider, factory=factory, store=store, settings=settings, clock=clock
@@ -1054,9 +1067,9 @@ async def test_definite_preallocation_failure_retains_reason_and_can_release_quo
     assert (await create_and_advance(h, json=request_body())).status_code == 429
     assert (await h.client.delete(path, headers={"X-Actions": "packages:read"})).status_code == 403
     assert (await create_and_advance(h, json=request_body())).status_code == 429
-    # Restored write authority can discard only the proven unallocated intent;
+    # Restored manager authority can discard only the proven unallocated intent;
     # read authority is deliberately not required for lifecycle cleanup.
-    deleted = await h.client.delete(path, headers={"X-Actions": "packages:write"})
+    deleted = await h.client.delete(path, headers={"X-Actions": "packages:write,packages:manage"})
     assert deleted.status_code == 202 and deleted.json()["status"] == "deleted"
     assert deleted.json()["error_code"] == reason
     assert (await h.client.get(path)).json()["error_code"] == reason
@@ -3457,7 +3470,7 @@ async def assert_expired_nova_root_cleanup(h, item, body, monkeypatch):
     assert (await advance_instance(h, item)).status_code == 409
     assert (await h.client.post("/v1/instances", json=request_body())).status_code == 429
     assert (await h.client.delete(path, headers={"X-Actions": "packages:read"})).status_code == 403
-    deleting = await h.client.delete(path, headers={"X-Actions": "packages:write"})
+    deleting = await h.client.delete(path, headers={"X-Actions": "packages:write,packages:manage"})
     assert deleting.status_code == 202 and deleting.json()["status"] == "deleting"
     assert h.provider.volume_deletes == []
     ready = await h.client.get(path)
@@ -3751,7 +3764,7 @@ async def native_hub(instance_hub, tmp_path, monkeypatch):
         return {"token": token, "project_id": project, "user_id": USER}
 
     async def fresh_manager(token_info):
-        return {**token_info, "package_actions": ["packages:write", "packages:read"]}
+        return {**token_info, "package_actions": ["packages:write", "packages:read", "packages:manage"]}
 
     async def fresh_connection(token_info):
         assert token_info["token"] == h.provider._afterglow_token
@@ -4897,3 +4910,405 @@ async def test_worker_published_payload_remains_consumable_without_private_resul
     fresh = await h.client.post("/v1/instances", json={**request, "request_id": str(uuid4())}, headers=headers)
     assert fresh.status_code == 404
     assert len(h.provider.creates) == len(h.provider.volume_creates) == 1
+
+
+async def test_withdrawn_self_cleanup_action_cannot_stop_delete_or_dispose_volume(instance_hub):
+    h = instance_hub
+    member = {"X-Actions": "packages:write,packages:inventory,packages:read"}
+    created = await create_and_advance(h, json=request_body(), headers=member)
+    assert created.status_code == 202
+    item = created.json()
+    path = "/v1/instances/" + item["id"]
+    assert (await h.client.post(path + "/stop", headers=member)).status_code == 403
+    assert (await h.client.delete(path, headers=member)).status_code == 403
+    # Even the alternate advance route must require manager authority for disposal.
+    disposal = await advance_instance(h, item, operation="delete-volume", headers=member)
+    assert disposal.status_code == 403
+    assert h.provider.stops == h.provider.deletes == h.provider.volume_deletes == []
+    assert (await h.client.post(path + "/stop")).status_code == 202
+    assert (await h.client.delete(path)).status_code == 202
+
+
+async def test_native_member_without_self_cleanup_action_cannot_delete_retained_consumer(native_hub):
+    n = native_hub
+    member = {"X-Actions": "packages:write,packages:inventory,packages:read"}
+    created = await n.h.client.post("/v1/native-instances", headers=member, json=n.body)
+    assert created.status_code == 202
+    path = "/v1/native-instances/" + created.json()["id"]
+    calls = list(n.calls)
+    assert (await n.h.client.delete(path, headers=member)).status_code == 403
+    assert n.calls == calls
+
+
+async def test_native_delete_background_withdrawn_cleanup_action_holds_without_effect(native_hub, monkeypatch):
+    from palimpsest_hub import auth
+
+    n = native_hub
+    item = (await n.h.client.post("/v1/native-instances", json=n.body)).json()
+    calls = list(n.calls)
+
+    async def current_member(token_info):
+        return {**token_info, "package_actions": {"packages:write", "packages:read"}}
+
+    monkeypatch.setattr(auth, "get_package_manager_info", current_member)
+    path = "/v1/native-instances/" + item["id"]
+    accepted = await n.h.client.delete(path)
+    assert accepted.status_code == 202
+    assert (await n.h.client.get(path)).json()["status"] == "held"
+    assert n.calls == calls
+
+
+@pytest.mark.parametrize("fence", ["missing", "revoked"])
+def test_native_effect_authentication_requires_current_action_fence(monkeypatch, fence):
+    from palimpsest_local.cloud_env import CloudEnvError
+
+    from palimpsest_hub.services import native_instances as native
+
+    env = object.__new__(native._CallerEnvironment)
+    env.actor = {"token": "original", "project_id": PROJECT}
+    env.caller, env.sql_held = object(), False
+    env.profile = {"project_id": PROJECT, "user_id": USER}
+    env.state = {"project_id": PROJECT, "user_id": USER}
+    observed = []
+
+    def checkpoint(state):
+        observed.append(state)
+
+    if fence == "revoked":
+
+        def deny():
+            raise CloudEnvError("current manager action revoked")
+
+        checkpoint.authorize_actor = deny
+    env.checkpoint = checkpoint
+    monkeypatch.setattr(native, "_scope", lambda *args: None)
+    monkeypatch.setattr(native, "validate_token", lambda *args: {"project_id": PROJECT, "user_id": USER})
+    with pytest.raises(CloudEnvError, match="action"):
+        env._authenticate("original")
+    assert observed == []
+
+
+@pytest.mark.parametrize("mismatch", [None, "request", "volume", "ownership"])
+async def test_project_manager_disposes_other_creators_recorded_prepared_root(instance_hub, mismatch):
+    h = instance_hub
+    creator = {"X-Actions": "packages:write,packages:inventory,packages:read"}
+    accepted = await h.client.post("/v1/instances", headers=creator, json=request_body())
+    assert accepted.status_code == 202
+    item = accepted.json()
+    identity, volume_id = item["id"], item["boot_volume_id"]
+    path = "/v1/instances/" + identity
+    original_markers = dict(h.provider.volumes_by_id[volume_id]["metadata"])
+    h.provider._afterglow_user_id = OTHER
+    manager = {"X-User": OTHER, "X-Actions": "packages:write,packages:manage,packages:inventory"}
+    # Creation stays creator-bound even when the other caller is a manager.
+    assert (await advance_instance(h, item, headers=manager)).status_code == 403
+    deleting = await h.client.delete(path, headers=manager)
+    assert deleting.status_code == 202 and deleting.json()["status"] == "deleting"
+    assert h.provider.volume_deletes == h.provider.creates == []
+    if mismatch == "request":
+        item = {**item, "request_id": str(uuid4())}
+    elif mismatch == "volume":
+        item = {**item, "boot_volume_id": str(uuid4())}
+    elif mismatch == "ownership":
+        h.provider.volumes_by_id[volume_id]["project_id"] = OTHER
+    disposed = await advance_instance(h, item, operation="delete-volume", headers=manager)
+    assert disposed.status_code == (409 if mismatch else 202), disposed.text
+    assert h.provider.volume_deletes == ([] if mismatch else [volume_id])
+    assert h.provider.creates == h.provider.deletes == []
+    if mismatch is None:
+        observed = await h.client.get(path, headers=manager)
+        assert observed.status_code == 200 and observed.json()["status"] == "deleted"
+    async with h.factory() as session:
+        row = await session.get(PalimpsestHubInstance, identity)
+        assert row.created_by == USER and row.project_id == PROJECT and row.boot_volume_id == volume_id
+        assert row.status == ("deleting" if mismatch else "deleted")
+    if mismatch:
+        assert h.provider.volumes_by_id[volume_id]["metadata"] == original_markers
+
+
+async def test_member_creator_cleans_private_instance_without_widening_other_manager_reach(instance_hub):
+    h = instance_hub
+    member = {"X-Actions": "packages:write,packages:inventory,packages:read,packages:manage_own"}
+    created = await create_and_advance(h, json=request_body(), headers=member)
+    assert created.status_code == 202
+    item = created.json()
+    path = "/v1/instances/" + item["id"]
+    async with h.factory() as session:
+        row = await session.get(PalimpsestHubInstance, item["id"])
+        row.spec_json = {**row.spec_json, "published_visibility": "private"}
+        await session.commit()
+    h.provider._afterglow_user_id = OTHER
+    for actions in ("packages:manage_own", "packages:manage"):
+        other = {"X-User": OTHER, "X-Actions": actions}
+        assert (await h.client.post(path + "/stop", headers=other)).status_code == 404
+        assert (await h.client.delete(path, headers=other)).status_code == 404
+    assert h.provider.stops == h.provider.deletes == []
+    h.provider._afterglow_user_id = USER
+    assert (await h.client.post(path + "/stop", headers=member)).status_code == 202
+    assert (await h.client.delete(path, headers=member)).status_code == 202
+    assert h.provider.stops == h.provider.deletes == [item["server_id"]]
+    assert h.provider.volumes_by_id == {}
+
+
+@pytest.mark.parametrize("write_allowed", [True, False])
+async def test_member_creator_disposes_only_own_exact_prepared_boot_root(instance_hub, write_allowed):
+    h = instance_hub
+    member = {"X-Actions": "packages:write,packages:inventory,packages:read,packages:manage_own"}
+    accepted = await h.client.post("/v1/instances", json=request_body(), headers=member)
+    assert accepted.status_code == 202
+    item = accepted.json()
+    path = "/v1/instances/" + item["id"]
+    if not write_allowed:
+        member = {"X-Actions": "packages:inventory,packages:read,packages:manage_own"}
+        assert (await advance_instance(h, item, headers=member)).status_code == 403
+    h.provider._afterglow_user_id = OTHER
+    other = {**member, "X-User": OTHER}
+    assert (await h.client.delete(path, headers=other)).status_code == 403
+    assert (await advance_instance(h, item, operation="delete-volume", headers=other)).status_code == 403
+    h.provider._afterglow_user_id = USER
+    assert (await h.client.delete(path, headers=member)).status_code == 202
+    assert h.provider.volume_deletes == []
+    disposed = await advance_instance(h, item, operation="delete-volume", headers=member)
+    assert disposed.status_code == 202
+    assert h.provider.volume_deletes == [item["boot_volume_id"]]
+    assert (await h.client.get(path, headers=member)).json()["status"] == "deleted"
+    async with h.factory() as session:
+        row = await session.get(PalimpsestHubInstance, item["id"])
+        assert row.created_by == USER and row.project_id == PROJECT
+
+
+@pytest.mark.parametrize("operation", ["stop", "delete"])
+async def test_creator_cleanup_action_withdrawal_before_effect_never_mutates_provider(
+    instance_hub, monkeypatch, operation
+):
+    h = instance_hub
+    member = {"X-Actions": "packages:write,packages:inventory,packages:read,packages:manage_own"}
+    item = (await create_and_advance(h, json=request_body(), headers=member)).json()
+    path = "/v1/instances/" + item["id"]
+    original = service.fresh_instance_controller
+    checks = 0
+
+    async def withdraw(actor, conn, row):
+        nonlocal checks
+        checks += 1
+        if checks == 2:
+            actor = {**actor, "package_actions": set(actor["package_actions"]) - {"packages:manage_own"}}
+        return await original(actor, conn, row)
+
+    monkeypatch.setattr(service, "fresh_instance_controller", withdraw)
+    response = await (
+        h.client.post(path + "/stop", headers=member) if operation == "stop" else h.client.delete(path, headers=member)
+    )
+    assert response.status_code == 403 and checks == 2
+    assert h.provider.stops == h.provider.deletes == h.provider.volume_deletes == []
+
+
+async def test_native_profile_bound_member_can_delete_own_retained_consumer(native_hub, monkeypatch):
+    from palimpsest_hub import auth
+
+    n = native_hub
+    actions = {"packages:write", "packages:read", "packages:inventory", "packages:manage_own"}
+
+    async def current_member(token_info):
+        return {**token_info, "package_actions": actions}
+
+    monkeypatch.setattr(auth, "get_package_manager_info", current_member)
+    member = {"X-Actions": ",".join(sorted(actions))}
+    accepted = await n.h.client.post("/v1/native-instances", json=n.body, headers=member)
+    assert accepted.status_code == 202
+    path = "/v1/native-instances/" + accepted.json()["id"]
+    calls = list(n.calls)
+    n.h.provider._afterglow_user_id = OTHER
+    assert (await n.h.client.delete(path, headers={**member, "X-User": OTHER})).status_code == 404
+    assert n.calls == calls
+    n.h.provider._afterglow_user_id = USER
+    assert (await n.h.client.delete(path, headers=member)).status_code == 202
+    assert (await n.h.client.get(path, headers=member)).json()["status"] == "deleted"
+    assert len(n.calls) == len(calls) + 1 and n.calls[-1][1] is True
+
+
+async def test_native_self_cleanup_fresh_effect_callback_cannot_reuse_withdrawn_action(native_hub, monkeypatch):
+    from palimpsest_hub import auth
+
+    n = native_hub
+    actions = {"packages:write", "packages:read", "packages:manage_own"}
+
+    async def current_member(token_info):
+        return {**token_info, "package_actions": actions}
+
+    monkeypatch.setattr(auth, "get_package_manager_info", current_member)
+    member = {"X-Actions": ",".join(sorted(actions))}
+    accepted = await n.h.client.post("/v1/native-instances", json=n.body, headers=member)
+    assert accepted.status_code == 202
+    path = "/v1/native-instances/" + accepted.json()["id"]
+    calls = list(n.calls)
+    original = service.fresh_instance_controller
+    withdrawn = False
+
+    async def authority(actor, conn, row):
+        if withdrawn:
+            actor = {**actor, "package_actions": set(actor["package_actions"]) - {"packages:manage_own"}}
+        return await original(actor, conn, row)
+
+    def driver(profile, actor, conn, checkpoint, *args):
+        nonlocal withdrawn
+        withdrawn = True
+        checkpoint.authorize_actor()
+        raise AssertionError("withdrawn self cleanup cannot reach a provider effect")
+
+    monkeypatch.setattr(service, "fresh_instance_controller", authority)
+    monkeypatch.setattr(n.service, "_execute", driver)
+    assert (await n.h.client.delete(path, headers=member)).status_code == 202
+    assert (await n.h.client.get(path, headers=member)).json()["status"] == "held"
+    assert n.calls == calls
+
+
+@pytest.mark.parametrize("operation,observation", [("stop", "server"), ("delete", "server"), ("delete", "volume")])
+async def test_creator_cleanup_rechecks_revocation_during_final_provider_observation(
+    instance_hub, monkeypatch, operation, observation
+):
+    h = instance_hub
+    member = {"X-Actions": "packages:write,packages:inventory,packages:read,packages:manage_own"}
+    item = (await create_and_advance(h, json=request_body(), headers=member)).json()
+    path = "/v1/instances/" + item["id"]
+    original_authority = service.fresh_instance_controller
+    original_observe = h.provider.get_server if observation == "server" else h.provider.get_volume
+    state = {"reads": 0, "revoked": False, "denied": False}
+
+    def observe(identity):
+        result = original_observe(identity)
+        state["reads"] += 1
+        # One observation binds the durable intent; the next is in the final
+        # effect section, after its first fresh authority check.
+        if state["reads"] == 2:
+            state["revoked"] = True
+        return result
+
+    async def authority(actor, conn, row):
+        if state["revoked"]:
+            state["denied"] = True
+            actor = {**actor, "package_actions": set(actor["package_actions"]) - {"packages:manage_own"}}
+        return await original_authority(actor, conn, row)
+
+    monkeypatch.setattr(h.provider, "get_server" if observation == "server" else "get_volume", observe)
+    monkeypatch.setattr(service, "fresh_instance_controller", authority)
+    response = await (
+        h.client.post(path + "/stop", headers=member) if operation == "stop" else h.client.delete(path, headers=member)
+    )
+    assert response.status_code == 403
+    assert state["reads"] == 2 and state["revoked"] and state["denied"]
+    assert h.provider.stops == h.provider.deletes == h.provider.volume_deletes == []
+    assert item["server_id"] in h.provider.servers_by_id
+    assert item["boot_volume_id"] in h.provider.volumes_by_id
+
+
+async def _published_job_image(h, monkeypatch, *, platform, stored_arch):
+    """A worker-published image whose single payload row was first labelled ``stored_arch``."""
+    from palimpsest_local.image_manifest import manifest_from_result, normalize_manifest
+
+    from palimpsest_hub.image_models import PalimpsestHubImageJob, PalimpsestHubPublicationPayload
+    from palimpsest_hub.services import published_images
+
+    payload = b"hsqs-platform-" + platform.encode()
+    digest = "sha256:" + hashlib.sha256(payload).hexdigest()
+    source = h.store.root / ("platform-output-" + platform.replace("/", "-"))
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_bytes(payload)
+    h.store.publish_verified(source, h.store.inspect_file(source, max_bytes=len(payload)))
+    runtime = {"entrypoint": ["/bin/sh"], "cmd": [], "env": [], "working_dir": "/", "user": "0"}
+    manifest = manifest_from_result(
+        {"layers": [{"digest": digest, "size_bytes": len(payload)}], "runtime": runtime, "source": {}},
+        os_family="fixture-os",
+        os_version="1",
+        source_kind="local",
+    )
+    if platform != manifest["platform"]:
+        manifest = normalize_manifest(
+            {**manifest, "platform": platform, "layers": [{"digest": digest, "size_bytes": len(payload)}]}
+        )
+    monkeypatch.setattr(published_images, "get_settings", lambda: SimpleNamespace())
+    job_id, job_request = str(uuid4()), str(uuid4())
+    async with h.factory() as session:
+        session.add(
+            PalimpsestHubLayer(
+                blob_digest=digest,
+                size_bytes=len(payload),
+                media_type=MEDIA_TYPE_LAYER_SQUASHFS,
+                arch=stored_arch,
+                config_digest="sha256:" + "0" * 64,
+                name="first-registrant",
+                kind="image-payload",
+                config_json={"instance_mode": "oci-layer"},
+            )
+        )
+        session.add(
+            PalimpsestHubPublicationPayload(
+                project_id=PROJECT, created_by=USER, blob_digest=digest, size_bytes=len(payload)
+            )
+        )
+        await session.commit()
+        await published_images.register_image(
+            session,
+            h.store,
+            {"project_id": PROJECT, "user_id": USER},
+            job_request,
+            "platform-image",
+            manifest,
+            image_id=job_id,
+            require_staged=True,
+        )
+        session.add(
+            PalimpsestHubImageJob(
+                id=job_id,
+                project_id=PROJECT,
+                created_by=USER,
+                request_id=job_request,
+                name="platform-image",
+                kind="dockerfile",
+                request_digest=digest,
+                request_json={},
+                status="complete",
+                output_digests=[digest],
+                result_json={"layers": manifest["layers"], "source": {}, "runtime": runtime, "manifest": manifest},
+            )
+        )
+        await session.commit()
+    return job_id
+
+
+async def test_amd64_image_is_not_rejected_for_a_payload_first_labelled_aarch64(instance_hub, monkeypatch):
+    h = instance_hub
+    job_id = await _published_job_image(h, monkeypatch, platform="linux/amd64", stored_arch="aarch64")
+    request = request_body(command=[])
+    request.update(layer_digests=[], image_job_id=job_id)
+    response = await create_and_advance(h, json=request)
+    assert response.status_code == 202, response.text
+    assert response.json()["mode"] == "oci-chroot"
+
+
+def _arm64_manifest_supported():
+    from palimpsest_local.image_manifest import manifest_from_result, normalize_manifest
+
+    layers = [{"digest": "sha256:" + "1" * 64, "size_bytes": 1}]
+    runtime = {"entrypoint": [], "cmd": [], "env": [], "working_dir": "/", "user": "0"}
+    manifest = manifest_from_result(
+        {"layers": layers, "runtime": runtime, "source": {}}, os_family="x", os_version="1", source_kind="local"
+    )
+    try:
+        normalize_manifest({**manifest, "platform": "linux/arm64", "layers": layers})
+    except ValueError:
+        return False
+    return True
+
+
+@pytest.mark.skipif(not _arm64_manifest_supported(), reason="manifest normalization does not accept linux/arm64")
+async def test_amd64_instance_path_still_refuses_arm64_images(instance_hub, monkeypatch):
+    h = instance_hub
+    # Even if the shared payload row says x86_64, the sealed image's platform decides.
+    job_id = await _published_job_image(h, monkeypatch, platform="linux/arm64", stored_arch="x86_64")
+    request = request_body(command=[])
+    request.update(layer_digests=[], image_job_id=job_id)
+    response = await create_and_advance(h, json=request)
+    assert response.status_code == 422
+    assert response.json()["detail"] == "Instance inputs must be x86_64 SquashFS runtime layers"
+    assert h.provider.creates == h.provider.volume_creates == []

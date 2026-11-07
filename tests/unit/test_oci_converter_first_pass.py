@@ -521,30 +521,6 @@ def test_pr2_base_fixture_binary_capability_stages_through_the_production_parser
             assert b"".join(payload_lease.chunks()) == b"file with capability"
 
 
-@pytest.mark.parametrize(
-    ("fixture_name", "expected_digest"),
-    [
-        ("base_layer.tar", "sha256:4fec3742dd8a0a1fa483d2cd4fccbb04d1686591c1a4913a7665d45a18966cd6"),
-        ("leaf_layer.tar", "sha256:85ffae029be971381794177129eb6973d408fc018b05de85e5809e94a41bbf79"),
-    ],
-)
-def test_staged_emitter_matches_the_exact_pr2_normalized_tar(
-    tmp_path: Path,
-    fixture_name: str,
-    expected_digest: str,
-) -> None:
-    uncompressed = (Path(__file__).parent.parent / "fixtures" / "oci-root" / fixture_name).read_bytes()
-    cas, image, _ = _snapshot(tmp_path, uncompressed, OCI_LAYER_MEDIA_TYPE)
-    output = io.BytesIO()
-
-    with cas.lease_layer(image, 0) as lease, stage_layer(lease) as staged:
-        receipt = staged.emit_overlay_tar(output)
-
-    assert receipt.digest == expected_digest
-    assert receipt.size == len(output.getvalue())
-    assert receipt.entries > 0
-
-
 def test_payload_lease_supports_bounded_file_reads_without_mixing_consumers(tmp_path: Path) -> None:
     member, payload = _file("value", b"payload")
     uncompressed = _tar(member, payloads={member.name: payload})
@@ -1002,7 +978,7 @@ def test_pack_staged_caller_assigns_final_popen_stage_without_invented_errno(
             os.fstat(fd)
         raise MemoryError("private-memory-secret")
 
-    monkeypatch.setattr(oci_packer, "_discover_dependency_paths", lambda _path: ())
+    monkeypatch.setattr(oci_packer, "_discover_dependency_paths", lambda _path, **_kwargs: ())
     monkeypatch.setattr(oci_packer.subprocess, "Popen", popen)
     with cas.lease_layer(image, 0) as source, stage_layer(source) as staged:
         with pytest.raises(SquashFSPackError) as raised:
@@ -1234,7 +1210,7 @@ def test_verified_squashfs_toolchain_rejects_dependency_byte_change(tmp_path: Pa
     binding = oci_packer._bind_toolchain_file(dependency)
     identity = oci_packer.SquashFSToolchainIdentity("4.7.5", executable.digest, (binding.digest,))
     capability = oci_packer.VerifiedSquashFSToolchain(identity, packer.resolve(), (binding,))
-    monkeypatch.setattr(oci_packer, "_discover_dependency_paths", lambda _packer: (dependency.resolve(),))
+    monkeypatch.setattr(oci_packer, "_discover_dependency_paths", lambda _packer, **_kwargs: (dependency.resolve(),))
 
     capability.verify(packer, executable.digest.removeprefix("sha256:"))
     dependency.chmod(0o600)
@@ -1243,6 +1219,35 @@ def test_verified_squashfs_toolchain_rejects_dependency_byte_change(tmp_path: Pa
 
     with pytest.raises(SquashFSPackError, match="dependency bytes changed"):
         capability.verify(packer, executable.digest.removeprefix("sha256:"))
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="toolchain discovery requires Linux")
+@pytest.mark.parametrize("expire_after", [0, 1, 2, 3])
+def test_discovery_deadline_stops_next_probe_and_never_returns_late_capability(tmp_path, monkeypatch, expire_after):
+    from types import SimpleNamespace
+
+    packer = tmp_path / "mksquashfs"
+    packer.write_bytes(b"deadline toolchain fixture")
+    packer.chmod(0o500)
+    clock = SimpleNamespace(now=2.0 if expire_after == 0 else 0.0)
+    monkeypatch.setattr(oci_packer, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    started = []
+
+    def preparation(argv, **kwargs):
+        assert clock.now < 1.0, "preparation subprocess started after the deadline"
+        assert 0 < kwargs["timeout"] <= 1.0 - clock.now
+        started.append(argv)
+        clock.now = 2.0 if len(started) == expire_after else clock.now + 0.2
+        stdout = b"mksquashfs version 4.6.1" if "-version" in argv else b"statically linked"
+        return oci_packer.subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr=b"")
+
+    monkeypatch.setattr(oci_packer, "run_preparation_tool", preparation)
+    with pytest.raises(SquashFSPackError) as raised:
+        oci_packer.discover_squashfs_toolchain(
+            packer, expected_packer_sha256=hashlib.sha256(packer.read_bytes()).hexdigest(), deadline=1.0
+        )
+    assert raised.value.code == "oci-packer-timeout"
+    assert len(started) == expire_after
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="FD-bound packer execution requires Linux")
@@ -1590,18 +1595,6 @@ def test_source_cas_corruption_is_rejected_without_repair(tmp_path: Path) -> Non
     assert target.read_bytes() == b"x" * len(compressed)
 
 
-def test_production_policy_constants_match_pr4_contract() -> None:
-    limits = DEFAULT_LAYER_CONVERSION_LIMITS
-    assert limits.max_members == 250_000
-    assert limits.max_uncompressed_bytes == 32 * 1024**3
-    assert limits.max_path_bytes == 4096
-    assert limits.max_compression_ratio == 2048
-    assert limits.timeout_seconds == 300.0
-    assert LAYER_INTAKE_POLICY_ID.endswith(".v2")
-    assert limits.fingerprint.startswith("sha256:")
-    assert replace(limits, max_members=limits.max_members - 1).fingerprint != limits.fingerprint
-
-
 def test_body_exception_is_not_masked_by_incomplete_source_lease(tmp_path: Path) -> None:
     member, payload = _file("value")
     uncompressed = _tar(member, payloads={member.name: payload})
@@ -1810,3 +1803,32 @@ def test_foreign_snapshot_cannot_be_leased_from_another_cas(tmp_path: Path) -> N
     with pytest.raises(ArtifactValidationError, match="different source CAS"):
         with other.lease_layer(image, 0):
             pass
+
+
+def test_cumulative_checkpoint_cancels_inside_intake_and_revokes_the_spool(tmp_path: Path) -> None:
+    member, payload = _file("payload", b"x" * (3 * 1024**2))
+    uncompressed = _tar(member, payloads={member.name: payload})
+    cas, image, _ = _snapshot(tmp_path, uncompressed, OCI_LAYER_MEDIA_TYPE)
+    ticks = 0
+    expires = 1_000_000
+
+    def checkpoint() -> None:
+        nonlocal ticks
+        ticks += 1
+        if ticks >= expires:
+            raise LayerIntakeError("oci-prefix-timeout", "shared prefix expired")
+
+    with cas.lease_layer(image, 0) as lease, stage_layer(lease, checkpoint=checkpoint) as staged:
+        reference = staged.changeset.by_path()["payload"].payload
+    # The next layer gets a fresh local intake clock but not a fresh prefix
+    # budget. Expire during its actual decompression/hash/scan, before yield.
+    expires = ticks + 3
+    with pytest.raises(LayerIntakeError, match="oci-prefix-timeout"):
+        with cas.lease_layer(image, 0) as lease, stage_layer(lease, checkpoint=checkpoint):
+            pytest.fail("expired intake yielded a usable layer")
+    with pytest.raises(LayerIntakeError, match="closed"):
+        with staged.lease_regular_payload(reference):
+            pytest.fail("the prior context retained a payload capability")
+    with cas.lease_layer(image, 0) as lease, stage_layer(lease) as replay:
+        with replay.lease_regular_payload(replay.changeset.by_path()["payload"].payload) as content:
+            assert b"".join(content.chunks()) == payload

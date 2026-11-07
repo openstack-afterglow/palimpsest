@@ -51,8 +51,7 @@ def request_project(actor, conn):
     return project
 
 
-async def fresh_writer(actor, conn):
-    from palimpsest_hub.api.hub import _legacy_writer
+async def _fresh_subject(actor, conn):
     from palimpsest_hub.auth import (
         get_package_member_info,
         revalidate_package_admin,
@@ -66,10 +65,33 @@ async def fresh_writer(actor, conn):
         if original.get("user_id") != actor.get("user_id") or original.get("project_id") != actor.get("project_id"):
             raise HTTPException(403, "Instance original subject or scope changed")
         current = await get_package_member_info(token_info=original)
-    await _legacy_writer(current)
     if current["user_id"] != actor["user_id"] or package_target_project_id(current) != package_target_project_id(actor):
         raise HTTPException(403, "Instance authority changed")
     request_project(current, conn)
+    return current
+
+
+async def fresh_writer(actor, conn):
+    from palimpsest_hub.api.hub import _legacy_writer
+
+    current = await _fresh_subject(actor, conn)
+    return await _legacy_writer(current)
+
+
+def require_instance_control(actor, row):
+    if package_target_project_id(actor) != row.project_id:
+        raise HTTPException(403, "Instance management requires the exact project")
+    actions = actor.get("package_actions", ())
+    if "packages:manage" in actions:
+        return
+    if "packages:manage_own" in actions and actor.get("user_id") == row.created_by:
+        return
+    raise HTTPException(403, "Instance management or exact creator cleanup authority required")
+
+
+async def fresh_instance_controller(actor, conn, row):
+    current = await _fresh_subject(actor, conn)
+    require_instance_control(current, row)
     return current
 
 
@@ -352,13 +374,19 @@ async def snapshot(session, req, actor, store):
     layers = []
     base_digest = None
     modes = set()
+    if published is not None:
+        from palimpsest_hub.services.published_images import PLATFORM_ARCH
+
+        # A sealed image's declared platform decides; the arch label on a shared payload row
+        # only records whoever first registered identical bytes.
+        published_arch = PLATFORM_ARCH.get(published["manifest"]["platform"])
     for digest in digests:
         layer = await _runtime_layer(session, digest, actor, published)
         config = layer.config_json or {}
         if (
             layer.kind not in ("squashfs", "image-payload")
             or layer.media_type != MEDIA_TYPE_LAYER_SQUASHFS
-            or layer.arch != "x86_64"
+            or (published_arch if published is not None else layer.arch) != "x86_64"
         ):
             raise HTTPException(422, "Instance inputs must be x86_64 SquashFS runtime layers")
         if layer.size_bytes <= 0 or not store.exists(digest):
@@ -1162,11 +1190,11 @@ async def dispose_prepared_volume(session, row, actor, conn, *, allow_delete=Fal
         row.error_code = "provider_boot_volume_pending"
         await session.commit()
         return
-    if not allow_delete or actor is None or "packages:write" not in actor.get("package_actions", ()):
+    if not allow_delete or actor is None:
         row.error_code = "provider_boot_volume_pending"
         await session.commit()
         return
-    await fresh_writer(actor, conn)  # Fresh writer after the slow ownership read.
+    await fresh_instance_controller(actor, conn, row)  # Fresh ownership/action fence after the slow read.
     preparation_update(row, delete_phase="uncertain")
     row.error_code = "provider_volume_delete_uncertain"
     await session.commit()
@@ -1184,7 +1212,7 @@ async def dispose_prepared_volume(session, row, actor, conn, *, allow_delete=Fal
         await session.commit()
         return
     try:
-        await fresh_writer(actor, conn)
+        await fresh_instance_controller(actor, conn, row)
     except HTTPException:
         preparation_update(row, delete_phase="not_attempted")
         await session.commit()
@@ -1296,10 +1324,10 @@ async def advance(factory, actor, conn, instance_id, request, settings):
         state = preparation(row)
         if state is None:
             raise HTTPException(409, "Legacy instances cannot advance provider creation")
-        if actor.get("user_id") != row.created_by:
-            raise HTTPException(403, "Only the original instance subject can advance its accepted intent")
-        await fresh_writer(actor, conn)
         if request["operation"] == "create-server":
+            if actor.get("user_id") != row.created_by:
+                raise HTTPException(403, "Only the original instance subject can advance its accepted intent")
+            await fresh_writer(actor, conn)
             if (
                 row.status != "booting"
                 or state.get("terminal")
@@ -1309,6 +1337,7 @@ async def advance(factory, actor, conn, instance_id, request, settings):
                 raise HTTPException(409, "Instance has no unattempted ready server creation intent")
             await advance_prepared_boot(session, row, actor, conn, settings, allocate=True, launch=True)
         else:
+            await fresh_instance_controller(actor, conn, row)
             if row.status != "deleting":
                 raise HTTPException(409, "Volume disposal requires the original explicit deletion intent")
             attempted = server_create_attempted(row)
@@ -1336,11 +1365,11 @@ async def action(factory, actor, conn, instance_id, operation):
     project = request_project(actor, conn)
     async with sql_mutex(factory, "build-api:instance:" + instance_id) as session:
         row = await owned(session, instance_id, project, actor["user_id"])
+        await fresh_instance_controller(actor, conn, row)
         if row.status == "deleted":
             return projection(row)
         if row.status == "deleting" and operation == "stop":
             raise HTTPException(409, "Cannot stop an instance with a pending deletion")
-        await fresh_writer(actor, conn)
         if create_not_attempted(row):
             if operation != "delete":
                 raise HTTPException(409, "Instance create was never attempted")
@@ -1399,7 +1428,7 @@ async def action(factory, actor, conn, instance_id, operation):
             if operation == "stop" and row.status != "stopping":
                 return projection(row)
             try:
-                await fresh_writer(actor, conn)
+                await fresh_instance_controller(actor, conn, row)
                 current = await run_blocking(exact_server, conn, row)
                 if current is not None:
                     if operation == "delete":
@@ -1408,8 +1437,10 @@ async def action(factory, actor, conn, instance_id, operation):
                             raise HTTPException(
                                 409, "Boot volume appeared after deletion intent; retry to bind it durably"
                             )
+                        await fresh_instance_controller(actor, conn, row)
                         await run_blocking(conn.compute.delete_server, value(current, "id"), ignore_missing=False)
                     elif str(value(current, "status", "")).upper() != "SHUTOFF":
+                        await fresh_instance_controller(actor, conn, row)
                         await run_blocking(conn.compute.stop_server, value(current, "id"))
             except HTTPException:
                 raise

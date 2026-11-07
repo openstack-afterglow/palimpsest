@@ -24,14 +24,1794 @@ files_modified:
 [ARCHITECTURE.md](../ARCHITECTURE.md), 실행 경계는 [testing.md](testing.md),
 세부 결과는 아래 링크된 문서와 source다.
 
-## Standard authority 0.3.12 release preparation — 2026-11-04 (UTC)
+## Reader/member/manager priority cutover — 2026-11-06, source264 in progress
 
-- Worktree:`/Users/pieroot/code/palimpsest-release-0312-20261104`, local dev, baseline latest remote `6e4dff7ac0493426f12d34f5e143bab52b3566d7`. Primary dev7962b18 with84unstaged/28untracked paths and no staged files, SDK-release ba52ae4 and goal-m1 6e4dff7 plus its own WIP remain untouched. Do not push an older deployed-base branch over current dev or move a tag.
-- Owner explicitly selected full latest-dev transition after schema/CAS risks were explained. Candidate0.3.12 skips reserved/unpublished0.3.11 and includes all already merged SDK/publication/native lifecycle source, not only auth. The independent goal-m1 dirty implementation is excluded.
-- Core member/manager/project-admin now manage exact-project resources; reader reads nonsecret visible resources. Dedicated service grades alone and personal-metadata-only fallback grant nothing. Exact native custom/group/domain implication paths remain authoritative. Original/current-owner and issued-key ceilings intersect; key/private/global/human/service/worker boundaries stay separate. Reduced original credentials have empty executable human-route preview, not a fabricated writer grant.
-- Local commits `92ee9add4f12861726d52a51e6d3eb3c7c45e49a` (authority fixes) and `20ad4899f36af3f8a111ecfc64b3c36261390b78` (0.3.12 release preparation) sit on `dev` 6e4dff7. Final local evidence: full Hub suite 1736 passed/7 skipped/0 failed; root ruff/format clean and release/native-helper/lane/Kolla contracts 247 passed; `openspec validate --strict` valid; architecture working/staged `54cf22ca…`/607 files. Product digest (219 `hub/src`+`src` files, canonical path→sha256 map) `951f9b08277ebc8426b1907fb903eb15157bf48a9262ccf089e0a2e4727eaa64`. Local-only arm64 API image `sha256:fd12fc0cddefdfb446619998045772b6cca87263ed81275972c6bbf943ccabfd` reports 0.3.12 for both modules and distributions; it is not a published artifact. Runtime smoke is the in-process uvicorn registered-router suite against synthetic loopback Keystone with the real SDK and fresh SQL/CAS; no Docker-composed or built-image authenticated smoke was run. Restore qualification of the final digest/image is still pending. Direct push to protected `dev` is rejected by repository rules; publication proceeds through a PR. No tag, release, IAM change or deployment yet. Formal bilingual release communication must state version, actual publication/deployment dates with timezone, changes/fixes and deprecated/removed features (None/없음 where empty).
-- Current parent-provided native receipts report deployed image revision57ab180 across controller APIs/export workers; SQL20tables with one known context/8imagejobs/6builds/2workerclaims/8leases and shared CAS. These observations do not attest no concurrent writers or provide a recoverable backup. Preserve all records/journals; dedicated build-worker cohort must drain while the old API can settle status.
-- The latest-dev bootstrap changes context ownership keys and historical job visibility before new publication FKs. Unknown creators fail before DDL. MariaDB recovery requires stopped writers plus paired SQL/CAS/config and exact old pins. Restore fixtures must preserve DATABASE default charset/collation, not only table encodings; current production is utf8mb3/utf8mb3_general_ci. Parent-owned native restore/publication/rollout evidence is distinct from local source checks below.
+Owner explicitly added this alongside the continuing local M1 Goal: existing
+OpenStack reader handles reads, member creation/edit, manager management/removal,
+with upper tiers including lower. Previous2026-11-03 source granted member all
+project management; it does not satisfy this new three-tier instruction.
+Primary dev7962b18 started with0staged/85unstaged/28untracked; unrelated WIP stays.
+
+Initial eleven-action source/operator cutover was independently reviewed.
+Policy review found no privilege bypass but two stale tests, corrected by parent.
+Route review found shared-layer foreign-grant/base-reference deletion and
+member-created private/native/prepared-root cleanup deadends. Source now guards
+foreign grants and all parent/base consumers, preserves creator for creation but
+allows authorized disposal of recorded roots, and corrects manager deletion copy.
+These fixes are source-defined and not yet runtime qualified.
+
+OWNER THEN EXPLICITLY SELECTED both exceptions274:
+- member may stop/delete only its own VM, exclusive boot volume and native
+  consumer; other private creators stay hidden/protected. This is not an owner
+  exception for package/layer/export deletion.
+- reader/member may revoke its own API key using the original Keystone token;
+  issuance stays manager-only, other owners stay forbidden, package keys do not
+  gain any management/revocation scope.
+
+RoleHub263/RoleOps263 completed thirteen actions and exact-owner/effect fences,
+including final Nova observations before authority recheck, publication-independent
+prepared-root disposal and profile-bound retained native cleanup. Both fresh
+independent source re-reviews report no open P1/P2 findings. Scope is source,
+not executed role regressions or live provider proof. Earlier demoted-owner
+revocation inability is resolved by the approved self-revoke exception.
+Current native role-ID implications, original-token/current-owner intersection,
+domains/principals, visibility, key attenuation and system authority remain.
+
+Parent incremented primary client/Hub/lock/default image metadata to unpublished
+candidate0.3.12. Source0.3.11 M1 SDK154 is separate. Changed Python Ruff and both
+Hub JS syntax checks passed; offline root/Hub lock checks passed37/79packages.
+Public candidate archive40578e95517e2180a5015e9b191300cd74991100a9e4e32b4285992de99e81ca/
+6782225bytes/724paths is frozen283; no private proof helpers or credentials.
+
+Executed role verification (receipts `Role-linux-lane-summary292.json` and
+builds/imagejobs/kolla293): after the host harness failures, approval284 and a
+fully requalified cold custody guard, the frozen public 0.3.12 source ran on
+existing builder `sg-b212fed8-b01` (PrivateNetwork, MemoryMax2G, CPUQuota200%,
+TasksMax128, readonly source, scratch writes, synthetic Keystone). One stale
+member-delete expectation was corrected; auth481/catalog41/packages68/export+
+upload65/instances+hub_api538/builds31/image_jobs125/kolla39 = 1388 passed. The
+sparse 8GiB tar node was deselected (64MiB file cap) and is not claimed. No new
+VM, install, real IAM/Nova/GPU, release or deploy; creates stay 14/28. Original
+n11 and its source remain preserved. Commit/tag/publication remain unapproved.
+Kolla 39 passed is not the full contract suite: the HEAD test
+`test_nonroot_hub_policy_config_is_readable_without_exposing_secret_toml` is absent
+from the working tree (unattributed; `volumes` became a Jinja string in
+pre-existing WIP defaults), so that contract is UNTESTED. Follow-up316 ran the
+whole changed benchmark_scenarios file:212 passed5.39s, bringing this synthetic
+source verification to1600 unique tests. Dependency317 compared the actual
+Python3.12.3 hub-venv with frozen hub/uv.lock:58 names match,19 have duplicate
+system/venv metadata,57 extras, and client/Hub are source imports rather than
+installed0.3.12 distributions. This is NOT a qualified locked release environment.
+`Role-source291-dependency-and-receipt-correction317.json` also corrects the
+wrapper's stale archive-SHA field: source291 is eb336c0e…, not snapshot283.
+Independent non-pytest registered `palimpsest_hub.main:app` Uvicorn/SQLite/CAS
+smoke331 passed28 checks with synthetic Keystone and real Keystone client:
+exact three-tier action sets, reader write denial, member publication/tag edit/
+byte readback, manager committed deletion/key issue, reader own-key revoke/
+foreign-key404 and current-owner demotion. Lifespan is explicitly off; this is
+not production startup, live IAM, provider or deployment. Initial328 expected403
+for foreign-key invisibility but source correctly returned404; only the harness
+expectation changed. Source hash correction applies to this wrapper result too.
+The earlier default unit `Result=success` after interruption is not a test result.
+
+Canonical local Goal is primary spec.md:33/108, nextM1-27. Isolated source remains
+/Users/pieroot/code/palimpsest-goal-m1-20261103; immutable SDK154 bytes unchanged.
+Browser acceptance295 and full M1-20 default/override312 passed. M1-22 actual
+dev proof322 reconnected272.648s after PTY close, kept the remaining of two PTYs
+alive315.560s after the other closed, then final0/known sessions plus no guest
+requests produced provider Stopped324.773s after final close. Earlier natural
+stop319→public start320→same-upper marker/newboot321 was observed. Prod n11
+actual PTY close and0/known sessions remained physicalRunning/mainExited7 after
+331.614s without guest requests329. No idle timeout was changed.
+M1-26 rebuilt changed C source to new image/consumers sum131, while original n11
+before297 and after325 retained original manifest/source/binary/sum31 and its
+private markers; first3 lower payloads reused and last2 changed326.
+M1-23 real commandless image37ca0bd5… has unchanged five layer descriptors:
+prod attempt18 refused before VM/canonical run333; dev attempt19 n14 main
+absent/PID0/null exit still performed actual TCC/file work via root PTY and
+image-UID1000 structured exec336. Root-private marker read denied1000 was a
+harness permission expectation, not a product failure or weakened permissions.
+All completed n11/n12/n13/n14 consumers and exclusive disks/root records/actor
+state plus each exact group+five leases were normally removed and proved absent
+330/309/323/337; shared receipts and original artifacts retained. The earlier
+builder-only Running inventory is historical, not the current live inventory.
+Creates21/50 are nonrefundable; public2019517440bytes remain reserved.
+The fixed expiry2026-11-07T00:02:06.117604Z has PASSED. Original monotonic
+322513.6925030362 is unchanged; a smaller current monotonic reading is not
+renewed authority. No new create/build/install/measurement under this grant.
+Attempt15 operator venv-Python symlink failed O_NOFOLLOW before guest staging.
+Exact settlement303 preceded removal of only its unchanged stopped host journal;
+canonical same-hash /usr/bin/python3.12 worker304 succeeded in separate attempt16.
+The0×0 PTY harness313 and missed reconnect window319 remain failures/not passes.
+Packer attempt20 failed BEFORE any VM permit: stock1.15.1 panicwrap creates an
+outer supervisor and inner core with the same canonical binary/full argv.
+Actual controller32581→outer57883→inner57885→builder57891→wrapper57927 and
+inner file/shell peers were observed380. The frozen three-role helper correctly
+HOLDed; no plan/spawn/exec-intent/QMP or actual QEMU VM existed. Request was
+Packer start+2.126812s, not the later44s parent observation. Packer naturally
+exited1 after reported10m3s SSH timeout; all six process births were absent382.
+The metadata-only settlement retained the images first; parent then rehashed
+exact disk/vars and their directory inode before removing only those outputs383.
+Original cloud image/code/seed/source/shared inputs remain. Owned caffeinate was
+normally SIGTERM-stopped after its exact retained Popen identity check; no
+VM/SSH/QEMU signal or request was sent. Fresh full cold/provider inventory has
+only b01 and zero QEMU, physical34553700352/free409882824704bytes at383.
+New q381 helper1769a6fa… models `[wrapper,plugin,core,supervisor]` and six
+processes without a wrap-cookie bypass. CPU383/391 HOLDed on unrelatedPID7573
+metadataEPERM; its actual FD inventory proved inheritedfd3–5 including pipes4–5.
+Full natural absence/freshguard392 closed that CPU case without relabeling PASS.
+The helper now marks fd>2 CLOEXEC before exec, including version-only probes.
+CPU397/399 PASS-CPU-ONLY used that exact sha-checked helper function, samePID/
+argv Python self-exec, post-exec only0–2/devnull, actual six-role OS metadata,
+outer exit1/all four peers absent while the collector remained ppid1/ownPGID,
+reader EOF while that collector was still alive, then natural73 after75seconds
+and fresh complete process/provider absence. It created no VM or HVF proof.
+Exactq381 profile network/signal387 and exactseed actualUbuntu blkid388 passed.
+Cap50 amendment400 records the user's explicit note “누적 50회까지 올려” over
+the suggested30. It changes ONLY the cumulative attempt ceiling; renewal244's
+original28 receipt and fixed UTC/monotonic deadlines remain immutable.
+The q381 cold adapter now binds supervisor index3 and validates the amendment
+plus unchanged other bounds; actual complete empty-registry guard402 passed.
+Parent401/launch401 review found a transient-observer StateError gap; bounded
+same-exception observation was corrected before attempt21. Exact validate404
+passed without a VM; cap50/cold-adapter review reported no open P1/P2.
+Attempt21 subsequently reached actual QEMU/HVF with an exact process/listener
+witness. This does NOT establish successful qualification, bake or rebake.
+Receipt414 recorded guest boot stalled before SSH and a changed resident SSH
+mux identity that HOLDed the full cold guard; no pin fabrication/socket repair.
+At fresh415 (2026-11-07T01:22Z), Packer had naturally exited1 after10m3s SSH
+timeout. Supervisor/core/builder/file/shell births were absent and both retained
+pipe readers reached EOF. Exact QEMU PID66495/birth1794004387480672000 remained
+ppid1/ownPGID66495; read-only QMP reported running and bounded serial read8 was
+empty. Actual PID listeners were only127.0.0.1:51220 and127.0.0.1:5905.
+Only that QEMU matched the campaign path in the current OS argv scan; this is
+not fresh Lima provider inventory or a successful complete custody guard.
+Builder status is therefore not freshly provider-verified. No VM signal/control,
+socket repair, uncertain replay or live disk removal occurred.
+The synchronous systemd-run timer in bootcmd versus Before=sysinit cloud-init
+ordering is a source-backed deadlock hypothesis, NOT target journal/timer proof.
+Guest SSH and expiry-timer activation were not proved; normal poweroff/absence
+and disk/socket cleanup remain blocked. Preserve exact process and attachments.
+Receipt `M1-27-q381-expired-live-custody-and-no-new-effects415.json` records
+current helper381 d0a5fbe6…/parent401 ffc2ff51…/launch401 04bcd160…/
+cold282 4e63874c… hashes, captures, process observations and authority expiry.
+Owner then explicitly selected one exact-q381 ACPI normal-poweroff request and
+a NEW24h grant416. Fixed bounds:2026-11-08T01:34:18.689437Z and same-kernel
+monotonic389311.159806125; either expiry stops new effects. Carry forward
+21spent/50cap,2019517440reserved bytes and all original resource/exclusion bounds.
+Old244/cap400 receipts remain unchanged. Owner/cold-source migration to416 is
+still pending and must not be bypassed. Cleanup remains a prerequisite.
+At01:35:57Z exact q381 PID/birth/argv/socket and retained parent lock were checked;
+an exclusive durable no-replay intent preceded ONE QMP system_powerdown request.
+QMP returned success plus POWERDOWN event416; this is not shutdown proof.
+Bounded60s/31observations417 still found exact QEMU alive; QMP running, serial9
+empty. No replay, other control, VM signal, socket repair or live disk removal.
+Owner then separately authorized exact q381 QMP quit ONE time418, not a general
+force fallback. At02:00:32Z identity/socket/retained lock were rechecked and
+durable no-replay intent preceded that sole request. QMP returned success and
+SHUTDOWN{guest:false,reason:host-qmp-quit}; do NOT report normal guest shutdown.
+Exact6births and creator-unlinked QMP socket were absent419; no campaign-path
+process remained in OS scan (not a fresh Lima provider inventory).
+Final diskSHA3ec3b638…/varsSHA428b94f8… were pinned with stable metadata and no
+open output handles. Both files were unlinked once. Post-unlink directory full
+metadata comparison420 HOLDed because APFS nlink changed4→2; no file replay.
+Fresh same-device/inode/uid/mode and empty-directory verification preceded only
+rmdir421. Exclusive output dir/disk/vars and QMP socket are absent; original
+code/seed hashes still match. Failed q381 is NOT no-force qualification/bake.
+Owner now records q381 Removed/cleanup421 and effective renewal416. Retained
+Popen/EOF handles remain historical; prospective registry retired and exact
+parent lock released (file preserved)422 only after those absence witnesses.
+Next: new cold422/q424 helper+seed/template/parent/launch sources under416,
+independent review, current provider/normal builder resume/offline+expiry proof,
+new bootstrap and all clocks/capacity/resource gates BEFORE attempt22.
+No new VM or spend since21; no commit/tag/release/deploy/cloud/GPU/IAM/
+second-device or future-force authority added.
+Successor preparation update: actual reviewed cold416 fullguard430 PASSED,
+provider b01 Stopped, QEMU0, creates21. Parent/launch review found a P1 stale381
+dispatch literal at launch424:120; corrected to424 before any spend and synthetic
+actual-AST dispatch/lineage regression428 rejects old381, accepts424. Review
+then closed P1/P2 on that parent/cold snapshot; this is not real permit/VM proof.
+Guest review found timer dependencies still deferred arming until sysinit.
+Candidate user-data now keeps --no-block and disables DefaultDependencies on
+BOTH exact transient timer/service. Stalls before bootcmd/PID1 remain HOLD.
+Prepared429 ISO/source stage remain unchanged; new cidata432.iso and seed432
+have exact all3 archive-extracted input bytes. Helper/HCL bind only432; Linux
+blkid/systemd component checks and live guest behavior have NOT run.
+Before ordinary b01 resume, parent identified old cold422's fixed b01 SSH
+PID78941 would reject the legitimate new dependency. Added prospective-only
+retained actual-start-Popen/Stopped-preflight/birth-window/socket/argv witness
+and defined normal-resume431 with bounded pipe/waiter custody and no replay/
+signals/repair. This new narrow transition is awaiting focused independent
+review BEFORE execution; b01 has not been started. No new VM since21.
+Execution update437–440: focused reviews closed P1/P2 on normalresume431,
+prospective-builder cold422 and final offline436/component435 sources. Exact
+source hashes and AC/open-lid witnesses were retained437. New cold422 was
+loaded only with all prospective registries empty; ordinary b01 start431
+returned0 in8.050393s, and actual post-resume fullguard observed singleton
+Running/4CPU/8GiB/30GiB. New mux62613 birth1794019841681207000 was prospectively
+bound to the retained owned start Popen; no cold adoption/repair.
+The following one-shot policy436 limactl-shell request exceeded90s. Retained
+limactl63108 and childSSH63111 remain live with ZERO buffered stdout/stderr438.
+Do NOT replay436 or claim nft/expiry installed; exact guest effects/completion
+are UNKNOWN. Hostagent62404 and mux62613 stay alive; host log shows guest-agent
+time sync, which is not policy/program completion proof. Host socket topology439
+shows mux TCP127.0.0.1:55795→55777 and held SSH Unix mux-channel connection.
+No new guest connection/control, signal, socket repair or force was issued.
+Owner records last-confirmed Running/new55777 and pending438, preserving old244
+policy/expiry as historical only. A transient owner JSON comma error was
+immediately corrected before any further operation; current JSON parses.
+Proposal440 pins exact b01 directory/hostagent/mux and requests ONE separately
+approved fresh non-mux READ-ONLY SSH diagnostic to inspect exact intent/nft/
+expiry/root436 process/SSH tuples. No policy change, command replay, signal,
+master control, socket repair, VM lifecycle or allocation is included.
+Full Goal remains33/108 and HOLD; attempt22, component435, exact Linux ISO432
+probe and no-force/bake/rebake comparison have not run. Spent21/50 unchanged.
+Owner approved one separate read-only non-mux SSH diagnostic441. It returned0
+without guest writes/replay/signals. Actual guest intent exists, nft output-drop
+table has4rules and drop counter11504packets/864019bytes, and expiry416 timer is
+active/waiting for fixed2026-11-08 01:34:17UTC442. No source-hash-matching original
+root436 process remains. This verifies CURRENT protection state, not original
+script exit/negative-probe output or boot-window RX. conntrack_tcp_loose=1;
+the stalled old channel's cause remains unknown.
+Correction 2026-11-07 (receipts 458 v2, 459, 460): the q424 guest journal
+bytes (system.journal, user-1000.journal, syslog, kern.log, wtmp, root.raw) were
+DELETED at cleanup459. Only SHA-256 hashes and excerpts quoted in tool output
+remain; this is irreversible and violated the bounded-evidence rule. Journal
+timestamps are rsyslog ingest times (ordering only), not benchmark values; the
+"no SIGKILL/failure" claim is only a plaintext match, not re-verifiable. The
+verdict proves the guest expiry-timer fallback ran systemd poweroff. It does NOT
+prove the designed Packer shutdown_command path with host QEMU exit observation.
+q424 closure binding now in cold422 (pinned 458 v2 and 459 digests, exact Removed
+row, birth-matched absence, output/QMP absence) and verified by a CPU check
+against the real owner; a live birth correctly HOLDs. Independent review of that
+binding is still PENDING. Offline .deb closure460 is complete; 9 of 11 match the
+guest baseline, linux-libc-dev upgrades 147→149, tcc is new. Fresh full guard in
+the new kernel has NOT run. Spent 22/50. Next bake seed must not keep a 15-minute
+expiry shorter than provisioning plus shutdown_timeout; a timer-killed bake is FAILED.
+Independent review of the q424 closure binding found two P2s, both valid and fixed:
+(1) birth matching used read_process, which raises StateError for foreign-UID PID
+reuse and would HOLD falsely; it now compares (pid, birth) against the same-UID
+list_processes set; (2) closing q424 dropped the attempt-counter floor, so a
+refunded owner.json (21) would pass; the closure now requires 22<=spent<=50.
+CPU checks: real owner passes; PID reuse with another birth passes; live recorded
+birth, counter 21 and counter 51 each HOLD. cold422 bytes changed, so any later
+bootstrap must re-pin the new cold422 hash. P3 notes (unused return value,
+authority dir inode not rechecked, stale module docstring) remain open.
+Original host limactl63108/SSH63111/mux62613 still live with retained pipes.
+Do not replay436, infer its return0, or open another diagnostic under441.
+Proposal443 requests ONLY one standard SSH multiplex-control `-O exit` for
+exact62613/birth1794019841681207000 and its ownedsocket, after rechecking identity.
+This is a proposed graceful HOST transport closure, not VM/guest poweroff,
+signal, manual socket unlink/repair or firewall change. Not yet approved.
+Keep HOLD until actual transport EOF/absence/disposition plus current fullguard.
+
+
+
+Preparation377 acquired11 actual official ARM64 debs, total7221720bytes:
+official OCI-derived archive keys373→gpgv InRelease374→signed by-hash indexes375
+→exact debSHA256377. Real APT install/solver and comparison have NOT run.
+
+## Goal 체크리스트 G0 재개 포인터 — 2026-11-03
+
+진행 상태의 정본은 [spec.md의 Goal 실행 체크리스트](../spec.md#goal-실행-체크리스트)다. 이전 SDK 작업 목록이나 과거 native/GPU 성공을 새 Goal의 완료로 이전하지 않는다. 전체 G0→M1→M2→M3→M4→M5.1~M5.5→FINAL 범위는 유지한다.
+
+- G0-01~G0-07과 M1-01~03을 증거로 체크했다. M1-01/02는 독립 리뷰된 설계뿐이며 M1-03의 종합 receipt는 `M1-03-verification.json`이다. 현재 M1-04는 source 조사 후 구현 계획 단계이고 이후 항목은 미완료다. 사용자가 `G0-07-M1-budget-v1`, `Sol 계획 + 독립 리뷰`를 선택했고 승인은2026-11-04T12:19:27Z에 만료된다. 정확한 예산·제외는 정본 spec과 `G0-07-approval.json`을 따른다.
+- M1 작업트리는 `/Users/pieroot/code/palimpsest-goal-m1-20261103`, branch `goal/m1-vz-arm64-20261103`, base `6e4dff7ac0493426f12d34f5e143bab52b3566d7`다. 혼합 동시 WIP인 주 트리·기존 SDK release 트리와 분리했고 새 commit/tag·배포·서비스 교체는 없다.
+- M1-03은 exact upstream policy, cached/retained/Docker admission, mandatory BuildKit fence, 기존 SSH pipe의 current-policy challenge와 실제 최종 publication commit/HOLD를 구현했다. 독립 source 차단은 모두 닫혔다. 최종 source07 archive는 `e9f1cadf…`; 제품·Hub 테스트 bytes는 source06과 동일하고 remote-artifact fixture만 달라졌다.
+- root 영향1301pass/2skip, Hub1670pass/2skip와 별도 sparse node1pass를 기록했다. 최초 Hub sparse 실패는64MiB sandbox file cap이 원인이며 같은 노드가9GiB logical 한도에서8192physical bytes로 통과했다. 최종 CLI, 실제 arm64 BuildKit prior-stage 이름/번호 COPY→정확한 OCI 파일, real pipe의 revocation/HOLD/prefix 보존, loopback Uvicorn/SQLite의 admission/revocation/idempotence가 통과했다. HTTP 신원은 명시적 synthetic이다. Future-stage COPY는 실제 BuildKit0.34.1 자체 문법 거부였으며 정책 거부와 구분해 보존했다.
+- 실제 격리 트리 working architecture guard가 `12b3a2aa…/609files`로 통과했다. 최종4개 portable lane은7350pass/22skip/142warnings,380.66s,exit0이며 durable receipt로 보존했다. 앞선 지연 출력은 registry에서 조회되지 않아 성공으로 세지 않았고 소유 unit 부재 확인 뒤 이 최종 실행을 수행했다. 증거는 본 기기 `~/.local/share/palimpsest-proofs/spec-goal-20261103/M1-03-*.json`에 있다.
+- 전용 `sg3-b212fed8`의 새 builder1개만 현재 필요한 test/build 플랫폼으로 유지한다: 생성1/12,4CPU/8GiB/30GiB, private HOME/LIMA_HOME/state/keys.16:32UTC 관측 physical5670512KiB, guest quota238165207bytes, 비환불 download예약1690264576bytes다. 리뷰어의 무단 공개 metadata조회1회·바이트미계측은 사고 receipt로 별도 공개했다. 기존 사용자 VM/캐시·Desktop·클라우드/GPU/Ceph/IAM는 미변경이다. 실제 VZ user `/`·SSH·supervisor·ordered-chain runtime과 container build/Kolla 배포는 여전히 미검증; M1-04 source 조사는 선행 완료가 아니다.
+
+## Standard project-role source handoff — 2026-11-03
+
+Native Hub source now maps current core member/manager/admin to project resource
+management and reader-or-above to visible queries/downloads. Defaults no longer
+grant service-grade/leaf or personal-owner-only authority; operator policy cannot
+uplift the core ceiling. Existing native effective role graph, issued subject/key
+ceilings, private-user/project ownership, protected/service identities, machine
+callbacks and system catalogs stay separate. Ordinary humans can publish/delete
+project package metadata; package keys still cannot delete or administer keys.
+Project builds use write/inventory action gates; published shared layers remain
+system-managed. Both token validators recognize human native openid federation
+without weakening reduced-credential vetoes.
+
+Tracking: `openspec/changes/unify-standard-project-roles`; contracts and commands:
+`docs/testing.md` standard-role section. No checks, formatting, architecture stamp,
+commit/release, deployment or IAM/config/DB effects were performed in this slice.
+Preserve the existing independent dirty source and release/deployment receipts;
+none of those historical outcomes verify these changed authorization bytes.
+
+## Source264 reviewed; changed-source build prepared for live comparison
+
+Process-local in-flight-only native reconciliation and independent5s metrics
+sampling are source-complete. Core reviewer closed timeout/legacy, producer
+failure/cancellation, superseded status/log observations, directory changes,
+safe failed-discovery rows and interrupt-after-registration findings. Client
+review closed sampling lifecycle and captured-metrics mutation ordering; manual
+refresh now visibly disables while another action runs. No TTL/authorization
+cache, pause-for-console or increased15s sample bound. Three descriptors pin the
+root; current full record/state/config/custody/HOLD still gate fresh publication.
+Concurrent membership change can still report native runtime-failure; legacy
+results remain independent. Reviews are source-only.
+
+Final264:694 focused passed19.24s; expanded19-file1861 passed94.11s
+(`artifact://9921`); scoped Ruff, JS syntax and4run-form cases passed. Initial
+expanded1857pass/3fail was an omitted production helper in the JS consumer
+harness; fixed by including actual helper and a real deferred-promise ordering
+case. Ruff's new imported field/local-variable shadow was fixed by aliasing the
+import only. Standard immutable154 capture/build/install/live test are NEXT,
+not yet executed. Installed153 and its failed single-tab evidence remain intact.
+
+Prepared260 six-file variant actually built through installedSDK153 public CLI
+on private Buildx/owned BuildKit263. Manifest e81b5280fd6483bc959155af8f4909c4071
+b571724f0124c278f6461c3226483, archive33591808bytes. Actual OCI config digest
+097c0091… binds arm64/Linux, User1000:1000, image literalENV, workdir, nonempty
+Entrypoint with emptyfixedarg and literal metacharacter CMD paths264. Docker RUN
+compiled changed C and compared sum131 expectations. N11/original sum31 image is
+preserved; no new VM/old-v-new runtime comparison yet, so M1-20/26 remain open.
+
+First build261 refused before output because sanitized native env lacked private
+Buildx routing. Corrected known route, not product fallback. Builder's old SSH
+pin refused after authorized244 reboot. Current owned VM-directory, LimaHA/
+VZPID78786, exact hostagent argv, loopback64081 listener and new seed
+iid1793923514 were correlated; derived public/wire key SHA256:SC1R/FaNB5c0TUq+
+aqr6Psl4Ql65DCTyuvm4jL5Ylzo qualified a NEW boot-scoped private strict pin263.
+Old hb148 pin unchanged; no keyscan/global trust downgrade. Exact cloud-init key
+rotation mechanism remains inference, not attestation. No guest private key left
+the guest. New SSH forwarding uses retained stdin/guest read, so EOF settled it
+exit0 with no signal. Private Buildx entry removed, BuildKit inactive/dead/
+MainPID0. Original host-forward socket inode is inert DarwinECONNREFUSED61
+and retained; no manual socket repair/unlink264.
+
+Functional build's402.24s is start-to-parent-observation UPPER BOUND including
+controller scheduling, not a cold/performance sample. Packer CPU-only sandbox
+261 denied SIGKILL with EPERM in parent and descendant sender while disposable
+children exited normally; no plugin/QEMU VM executed. This does not establish
+Packer compatibility or prevent a hypothetical QMP quit; actual no-force trial
+still requires source/custody qualification before launch.
+
+User added a parallel PRIMARY-tree reader/member/manager authorization cutover.
+RoleHub263 andRoleOps263 own primary Hub/API/tests and operator/docs respectively;
+never mix that moving primary source into immutable local source154. Primary dev
+7962b18 baseline85unstaged/28untracked/0staged preserved. No IAM/resource action
+or publication authorized by that code request. WholeGoal29/108 remains active.
+
+## SDK153 is installed; single-tab live acceptance failed —249–259
+
+Guard a2a1e27dd009dfa01175c873699c7b1b250440575fa33fdb295f699410e9faea/
+634files passed before capture153. Immutable archive cbe1121ce0cd8c10a1f9aab6
+340489149ae3045a9c5ef96b6eb2d80f195b9039/7114913bytes/746paths, frozen
+ROOT/inputs/source-host153 and guestsource153 are preserved. Standard offline/
+private-network package249 built and actually installed/imported bothentrypoints
+in owned guest. Transferred wheel8f6f693675c19628750b0bc6a7014ba8120122d1d2
+fefaf9893b3e42837d42c6/1616079bytes; sdist68e3bfb8…/7140525bytes; standard
+SHA256SUMS verified. Exact173packagefiles/165Pythonmodules matched frozen source
+before actual fresh sdk-host153 import, no extra/link/bytecode shadows. Actual
+CPython3.11.15 prefix and both cli:main versions qualified250. Host/guest package
+fingerprint sha256:9de795733cb9cf42558187373e84f37b24d5236993e5d506e8ce0414799be237.
+
+Attempt13 was spent on an input error: controller worker153.json mode0400 failed
+the unchanged exact0600 worker contract before provider/run reservation. Fresh
+252 proved onlybuilder/no canonicaln11. No resource cleanup/replay was performed.
+Old invalid file is retained; fresh worker153-owned253.json0600 has same verified
+bytes/fingerprint and actual loader acceptance. Separately reserved attempt14
+actually launched n11 run2568d375-dc6a-4c2a-9723-0b1ded53a698,
+providerplm-2568d375dc6a, directory16777231/238010026,
+upper08e7176a-8480-4f6d-8b63-eb3ea0d079f7 with profile246.
+
+Public SDK153 ps shows physicalRunning while inspect retains mainExited7/PID0.
+Actual one-second guest command succeeded in2.837s host time; a two-second
+command expired124 in3.914s, with no late marker254. Boot32b2462b… and actual
+root/proc1=29:2 remain. Actual serial dashboard metrics/logs available; concurrent
+logs+metrics both available; staggered4 yielded one honest busy255. Do NOT call
+that sufficient concurrency acceptance.
+
+One visible Chrome/privateprofile256, normal5sautopoll, Resources open showed
+12memorypoints but2CPU/network/diskrates and repeated waiting/reset. First
+console execution failedbusy; a later explicit user-style request printed actual
+guestmarker/C-verification but does NOT cure first-attempt failure. Screenshots/
+surface257 and all failures are retained. Source153 SINGLE-TAB ACCEPTANCE FAILED,
+not complete under a renamederror. Own browser/server closed normally258, exit0;
+token redacted, no VM action. N11 remains the necessary current reproducer and
+original-source comparison control, not a finished accumulated consumer.
+
+Measured unmodified SDK153 operations258: vms2.464s, metrics4.795s, logs2.793s.
+The client finishes inventory, then logs/metrics, then delays5s; a nominal cycle
+is about12.26s before contention while rate pairs reject gaps>15s. Exact rejected
+pair timestamps were not yet captured, so that per-sample cause remains inference.
+ScoutMetricsCadence259 confirms scheduling/guards, not actual sample rejection.
+Parent changed working app.js to independent5s metrics cadence with one joinable
+in-flight promise, hidden VM log polling only on Logs, and preserved identity/
+boot/counter/15s guards. CoalesceReadFlight259 owns in-flight-only root
+reconciliation sharing, with waiter root/run/generation revalidation and no TTL/
+cached authorization. Source154 is moving/unreviewed/unbuilt; never edit or
+relabel installed153. Repeat exact single-tab Resources2min+firstconsole after
+immutable154. No pause/threshold increase/automatic command retry as acceptance.
+
+Current creates14/28 spent, public reserved1881105408bytes, same fixed244 expiry.
+Only ownedbuilder+n11 Running. Recent GUI free325.8GiB is near the300GiB guard;
+recheck before new work and preserve other users' files. Packer plugin/template
+247 passed preparation only, no QEMU VM/bake/benchmark. ROOT/inputs/m120-changed248
+is the scenario directory. Six files/3036bytes are now prepared260: changed C
+sum100→expected131, explicit Entrypoint prefix including emptyarg, literal
+metacharacter paths, imageENV/User1000:1000/workdir. Original frozen C matches
+after exactly one expected sum replacement. No build/compile/VM validation yet.
+
+## Renewal244, completed prod lifecycle, and unactivated reader successor —244–248
+
+Canonical `/Users/pieroot/code/palimpsest/spec.md`:29/108 checked, nextM1-20.
+M1-19 andM1-21 now have actual completion246. M1-20 nonempty Entrypoint/CMD,
+M1-22 full dev reconnect/five-minute grace, M1-23 commandless dev/prod, M1-26
+source-change, M1-27 build-inclusive Packer and M1-28 gate remain incomplete.
+The entire108-item Goal is still active, not reduced to M1 or this source repair.
+
+User explicitly selected cumulative28 creates/fixed24h plus only the official
+private QEMU1.1.8 plugin/no-force qualification exception. Receipt
+`G0-07-M1-renewal244.json` fixes expiry2026-11-07T00:02:06.117604Z; counters
+are preserved,12spent/28, public reservations1881105408bytes/8GiB. Other CPU,
+RAM, logical/physical disk, free-space, running/resident limits are unchanged.
+No global tools/Tart/LaunchAgent/daemon changes, cloud/GPU/IAM/publication,
+VM/SSH/QEMU force, unknown replay or foreign cleanup was authorized.
+
+Fresh244 observed old builder andn09 Stopped after prior expiry. Builder alone
+normally resumed244. Its reboot had lost in-memory deny/timer policy; the first
+atomic nft syntax attempt failed without applying, corrected deny-only244 and
+expiry244 timer succeeded, and actual drop-counter growth was observed. Apt
+boot journals and total nonloopback RX68613bytes bound the initial window;
+do not call that public wire attribution. Old1GiB pool/prior280129960 usage was
+not reset. Old native104 was never rewritten or used to restart expiredn09.
+Normal n09 rm once244 and full exclusive/6lease/export absence/shared preservation
+closed it. No stopped old-profile control remains.
+
+New immutable native profile246 shares verified assets103/carrier/tools but
+uses the renewed fixed deadline. Actual reviewed installed SDK152/worker50325356
+launched n10 run3176537b-6e39-4741-ba41-909bdae7e331/providerplm-3176537b6e39,
+upper5232f472-de1a-47c4-90ad-d08ab4cd6b88. Restart flag omitted; canonical actual
+plan is prod/unless-stopped. Bounded main-only256MiB/no-swap allocator had an
+absolute512MiB touch ceiling, with PID1/user sessions outside that cgroup.
+335 authenticated status observations captured main normal7, selfABRT134/6,
+OOM137/9; memory.events oom1/oom_kill2/group1. Same boot483c155e… and upper
+counter persisted through7launches, later gaps2.03/3.85/8/16.16/31.90s.
+Do not claim a measured60s plateau, two independent OOMs, or transient states
+all polled by public CLI. Public ps/inspect/logs confirmed final main/session
+state and output. Normal stop produced143/signal15/fence true; physicalStopped/
+PID0 remained after437s. One normal rm plus final complete provider/exclusive
+disk/root/6lease/export/actor absence and five lower/three source archive
+preservation closed246. Only the necessary builder remains, no refund.
+
+Current successor code is NOT captured/installed/live-qualified. Reviews244–248
+closed the shared WAIT-only budget, strict live ownership reads, fresh snapshot
+projection, removed-home exemption, literal legacy log routing hint, no-init
+fallback, independent guest timer/fixed40s host actor, try-once create/source
+name locks and typed run/namespace busy. Already-pinned followers can skip only
+unadmitted pure mutex observations, never unknown HOLD/provider/integrity errors.
+Busy grants no aliases/transport/lifecycle. Named strict degraded first-read
+fallback remains narrower than shared RuntimeBusyError. Registry initialization
+flock and existing provider limits are unchanged. Source247 had1792pass92.52s;
+source248 focused1079pass21.74s and final19-file1823pass93.56s. Both independent
+final source reviews close findings, with scoped lint/format passed. Updated
+architecture/README/VZ contract/CLI usage/testing/changelog separate busy, HOLD,
+wait-only budget and full guest timer. Stamp, immutableSDK153 and actual cohort/
+browser are still pending. The earlier600s fake-clock hang,
+invalid fractional test expiry and missing console-mock budget parameters are
+retained failures, not masked production successes. Fake forwarding-timer/
+wording pins were removed in favor of real subprocess/side-effect controls.
+
+Official plugin ZIP31750b51…/14687991bytes was verified and installed only under
+ROOT/packer-plugins; actual `packer plugins installed` and configuration
+validation247 passed. ROOT/p/q247 has isolated public-key NoCloud/static-no-route
+seed, owned64MiB code+vars copies, loopback SSH/VNC, private QMP/serial/PCAP input
+and explicit guest shutdown; build must use `-on-error=abort`, never `-force`.
+No Packer VM/bake/benchmark occurred. Its filter-dump schema is observed through
+QEMU help only, not live capture. Future failure custody, strict loopback/process
+identity, pcap completeness and normal guest shutdown must qualify first; QMP
+quit is not graceful. NativeVZ versusQEMU/HVF/kernel/userspace differences and
+all bake/rebake/setup/acquisition/transfer/storage/failure costs stay explicit.
+SDK153 guest scratch `m113-installed153` and validated/rebased owned public
+dependency cache are ready248; no source153 archive or install exists yet.
+
+## Current-prefix dual CLI complete; prod/no partial proof; scope decision —233–243
+
+Both actual SDK152 aliases rebuilt unchanged fixture234 from one current private
+prefix/state, same manifest4f0d99…. Private client/SSH/socket/BuildKit transport
+normally settled235. Actual current palimpsest run225 and plm run236, dualexec/
+ps/inspect/logs238 complete M1-13; whole Goal27/108, nextM1-19.
+
+n09 genuine prod/no main runs UID/GID1000 with explicit literal CMD override,
+image cwd/PATH, and original compiled C expected output. Run3847a30d-fd0c-4214-
+bcdc-7a1b7fafd0ae/providerplm-3847a30dfd0c, directory16777231/237535589,
+upperc28bc133-50c6-4f6c-b197-456d3e6c0038. Main PID153, user sessions0.
+The controlled flag caused the MAIN itself to emit exit marker and exit7, not an
+SSH child. First inspect240 was durable stale metadata; correct live ps then
+inspect241 recorded mainexited/pid0/code7/signal0. Another live bookend242 after
+132s preserved exit7/one start and one exit marker while providerRunning, proving
+bounded prod/no behavior only. 406s no-user-client interval had same boot/work,
+but its first main-health inspect was durable, so do not claim a fresh continuous
+PID-health measurement. Normal stop242 leaves n09 only as necessary pending
+reader-cohort control; no active consumer during approval/review wait.
+
+Creates11/12 spent, public reservations1846502400bytes/8GiB, original effective
+expiryUTCNov5 22:05:10 unchanged. New proposal243 is NOT approval: cumulative28
+and24h renewal, same2running/3resident/4CPU/8GiB/32GiB/100GiB/free300GiB/8GiB;
+exact official private QEMU plugin1.1.8 zip31750b51… only, existing tools/HVF,
+strict no-force/abort qualification and normal owned cleanup, no globals/cloud/
+GPU/publication. Native-only20 alternative keeps Packer blocked, not removed.
+Source239 confirms upstream default/error cleanup can Process.Kill QEMU; abort
+skips halted/cancelled step cleanup but plugin teardown/pipe custody is not
+qualified. Explicit guest shutdown and owned abort/custody proof precede any
+bake; QMPquit is not graceful. No plugin downloaded/installed/VM/benchmark yet.
+The scouts' expired-date statement was corrected: local KSTNov6 at03:05 equals
+UTCNov5 18:05 and is BEFORE22:05 expiry. Always compare actual UTC epoch.
+
+Ongoing source192 now addresses live name-lock reads, shared WAIT-only allowance
+instead of charging normal provider work, native admission and preserved removed
+logs. These newest bytes are NOT the previously reviewed/tested/captured152;
+no hot reload/source relabel. Parent awaits source handoff then independent
+review/checks/immutableSDK and actual cohort. Pending prod/unless-stopped,
+restart/backoff/OOM/no-command/source-change/Packer remain unqualified.
+
+## SDK152 actual residual-read failures; paired uppers verified and removed —211–232
+
+Reviewed152 guard92f672c3…/634files, archive5f644fce…/746paths, wheel2fa5aa48…,
+privateSDK152 and host/guest worker50325356… are pinned211–214. Existing
+assets103/profile104 unchanged. Actual retained n07 start215 succeeded.
+Phased/staggered cohort216 improved live status but one metrics transport
+refusal remained;219 also observed a logs identity refusal. Diagnostic wrappers
+only logged/rethrew original boundaries;3-wave222 saw no failure, so do not
+invent a raw cause for216. No passing-cohort substitution:152 is not concurrency
+acceptance. Remaining live-reader/run-lock and session-admission correction is
+in progress192, preserving offline metadata no-init and all identity/ctime
+guards. Quiet215 hit its deliberate550s bounded loop exit63; recorded223, not
+relabeled clean release. All diagnostic dashboards reaped normally.
+
+Independent functional case225–227 then used current installed palimpsest run
+on the real second build label, with default dev/no and no source-share flag.
+n08 run29652ffb-353c-4c71-afe9-2f761344f3b3/providerplm-29652ffb353c,
+directory16777231/237528737, upper6cf505f6-b04b-4f3c-80bf-5d2666a261c8.
+Same five lower digests as n07/upper78c6c8d0…. B has no A markers; its actual
+source edit339560…→a087e0…/TCC compile/write affects only B, original lower
+source stays339560… and writes fail EROFS. Fresh BStopped preceded Astart;
+A retains original source and its four work/GUI markers, with no B binary/
+report/marker. This is sequential real-VM upper independence, not a concurrent
+race or hostile-root proof. M1-25 is checked.
+
+Both exact consumers normally stopped/removed once231. Final232 proves provider
+and exclusive disk/root-record absence, both group+five-member lease authorities
+retired/missing, no export refs or payload projection, full five shared SquashFS
+bytes/structure and both built archives/original OCI/source fixture preserved.
+Native namespace has only lock. Only necessary builder Running; creates10/12,
+public reservation1779393536bytes, expiry remains UTCNov5 22:05:10. No force,
+native signal, manual endpoint/marker removal or uncertain replay. Typed witness
+scripts initially used nonexistent receipt/store verifier attributes; corrected
+to actual image_digest and ArtifactStore.verify_squashfs, with no resource replay.
+
+Whole Goal26/108, nextM1-13. Both aliases' builds/exec/status and each actual run
+are proven across151→152; parent will strengthen same-current-prefix build proof
+before checking M1-13. No finished consumer retained. Packer exact official QEMU
+plugin1.1.8 Darwin ARM zip31750b51… and existingQEMU11.1.3/firmware are only
+read-only prerequisites206; no plugin install or live HVF/Packer build. Two
+remaining creates cannot finish the full pending lifecycle/comparison matrix;
+prepare exact extra-budget/plugin scope before that boundary, never refund.
+
+## Installed SDK151 actual builds, source share, catalog and dashboard owner —162–203
+
+User explicitly approved campaign-private reviewed SDK installation loops162,
+not general host tools/plugins. Installed151 at ROOT/sdk-host151 offline/no-deps/
+copy; all173 package members and165 Python modules matched frozen sources.
+Existing interpreter/tools/global environments remained unchanged.
+
+Real host plm build167 and palimpsest build171 used the same frozen fixture and
+selected worker-state45 through private remote Buildx/owned BuildKit. Both output
+manifest4f0d99c28bdf1a37973ce34cda3f1c249418ab4567f62b2be08c125cd8edbb4e;
+archive hashes differ, matching labels separately recorded. Actual build-record
+times202194/201591ms include two100.6s metadata resolutions; APT was cached and
+compile/COPY actually ran on first. These are warm functional builds, not cold
+benchmarks. Both remote client entries/SSH forwards/own sockets/guest units were
+normally settled168/172. Caller-created journal override was missing its required
+preprovisioned directory; fixed only that owned config directory after both builds,
+preserving warnings. No product suppression or global logging change.
+
+Worker151 pins actual source151 package fingerprintf7f25843… independently equal
+on host/guest170, with unchanged assets103/profile104. Clock correction: local
+KSTNov6 does not mean UTCNov5 22:05 deadline expired; actual epoch was checked.
+Attempt8 CLI174 rejected share=CWD before dispatch; actual provider/run absence175
+and pure parser176 established no effects. Count8 remains spent. Corrected
+strict-child-share current project/intent9 launched n07 normally177:
+run4320e45b-5c19-4dd6-91e8-efc5aa8f5b1c, providerplm-4320e45b5c19,
+directory16777231/237297853, upper78c6c8d0-069f-445b-ae5b-edb556f3cc45.
+
+Both installed aliases exec/status work179/180; plm run uses the actual first
+build label, not hand-joined provenance. Real root/PID1=29:2, five readonly
+lowers004→000, embedded source equals explicit fixture share, virtiofs ro and
+write EROFS, original C stdout41/report15. M1-08 is checked. Fresh installed
+catalog181 is equal complete/rev6 across processes with2builds/7runs/2images;
+actual SQL203 joins two labels/builds×five source/derived/run ordinals correctly.
+M1-12 checked after independent schema review192. Null cloud-image base is
+appropriate for complete OCI-root; output labels are not native registry tags
+and exact-manifest join alone is not unique invocation provenance.
+
+Actual browser/native dashboard metrics186 succeeded. Drawer-close200 completed
+the original gated command after close; normal app SIGINT201 waited6.258s for a
+six-second native command/cleanup, exit0, marker present and no ACK warning.
+Browser relay was disconnected; existing Chrome with new campaign-private
+profile/cache was used, no browser installation/default-user profile. One stale
+browser session was reported to tool QA. Native GUI lifecycle remains purposely
+cloud-only/disabled; do not expand that policy just to enable its button.
+
+Still open: normal concurrent dashboard reads199 caused native unavailable/
+stale identity under healthy provider and a real active quiet user session.
+Source192 is correcting read-only custody contention and separate snapshot
+replacement races; no check/activation claim yet. GUI194 failed because the guest
+had actually naturally stopped; it did not start the requested command. Original
+quiet196 accidentally put --timeout after name (REMAINDER executable125/errno2);
+corrected bounded session198 was explicitly released/drained0 in202, no signal.
+
+Normal native stop202 returned0; fresh provider203 Stopped/zero PIDs. Only builder
+Running, necessary stopped n07 isolation control retained; native custody dir has
+only lock, no HOLD/session/actor. Both build forwards, dashboard and quiet CLI
+reaped0. Creates9/12, downloads reserved1779393536bytes/8GiB, expiry unchanged.
+Whole Goal25/108, nextM1-13; next consumer must finish upper/default-share and
+second-alias run proof, then remove both exact comparative consumers normally.
+Packer plugin/hypervisor prerequisites165 and extra case budget are unresolved;
+SDK approval is not plugin/Tart/other host installation approval.
+
+## Source151 frozen; offline wheel verified; host install awaits scope —159–161
+
+Reviewed working guard2cdc2e0e68d5923e1583f59694336c06de6af57f4a4f514e42da73f9e94a8638
+is634files; immutable archivee02701644c7eef8fc9f63a555455e5dd8485f2d1a778575d3d82c8b27ce150c9
+contains746paths/7078161bytes, frozen as host source-host151 and guest source-151.
+Normal package script ran offline in the existing owned guest's private-network
+sandbox: sdist→wheel, isolated venv install/import/stage1 asset and both installed
+entrypoints' version/help all succeeded159. Transient unit is absent/inactive/
+dead/MainPID0. No host SDK install or new native consumer occurred.
+
+Transferred public wheel SHA256bf203328b0c56acf0708b47169537f257670989919d2caf6630271b9893c213b
+is1610070bytes. All173 package members and all165 expected Python modules match
+frozen151 bytes; both entrypoints target cli:main. Sdist18d9a291…/7102496bytes
+and checksums retained160. Old owned14.34MB uv-cache links included both runtime
+/tmp and actual absolute paths; two read-only validation failures preceded a
+validated clone/rebase of only the new scratch links158. No download or global
+cache mutation. Artifact transfer's initial stat equality incorrectly included
+atime; stable ownership/inode/mode/link/size/mtime/ctime was checked before transfer.
+
+Proposal161 requests this exact private SDK and independently reviewed successor
+SDKs only, new campaign-local sdk-host<snapshot> prefixes/private caches, offline/
+no-deps and no live-prefix switching. Renewal74 explicitly excludes host package
+installation, so no implied approval. Existing VM/create/disk/expiry limits and
+all global-system/Docker Desktop/LaunchAgent/cloud/GPU/publication exclusions stay.
+Fresh provider161 lists only needed builder Running; cumulative creates7/12.
+Canonical whole Goal remains23/108, not complete. Await that bounded decision
+before installed-host M1-13; no new-source native/dashboard success is claimed.
+
+## Reviewed liveness and retained dashboard exec ready for capture —143–156
+
+The observed139 defect is source-fixed: physical VM `status` is independent of
+canonical main `runtime_status`. Fresh pinned reconcile remains authoritative
+without ambient Lima tools/home; supplementary aliases require same home
+device/inode/full identity, cannot upgrade pinned stopped state or borrow access.
+Same-home ambiguity and canonical HOLD/stale/invalid authority remain denied.
+
+Real child-process counterexample154 exposed native exit0 followed by missing
+completion-property failure and a leaked registry entry. The direct-return
+proposal was withdrawn:155b is not the final fix. Both native and KVM now retain
+non-daemon drain/cleanup and foreground detach through registry shutdown.
+Canonical dispatch explicitly exempts native from nonexistent mailbox ACKs,
+while default KVM missing/throwing ACK observation counts unconfirmed and always
+releases the completed entry. Independent reviewers146 closed production findings;
+requested Access native0/KVM1 accounting controls are added. Final nine-file
+host/UI/ACK lane1178 passed76.92s, Ruff check and six format checks pass.
+Live NativeProcessSession/provider/dashboard smoke remains pending a new case.
+
+Prerequisites qualified without installing host packages: Packer1.15.1;
+existing Docker-app Buildx0.38.1 via campaign-private plugin config; existing
+guest BuildKit0.34.1. Real strict-pinned host SSH Unix forward plus remote Buildx
+inspect149 reached that owned builder. Client entry, own forward/socket and
+transient guest unit fully settled150. No Docker Desktop, new VM, image build,
+Packer benchmark or public download. Offline guest uv dependency cache is16MiB;
+normal sdist→wheel package script can run there with no host Hatchling.
+
+Next: stamp reviewed source, unique151 snapshot, build/hash-verify its wheel in
+the approved owned guest, then request only the still-excluded host-private SDK
+installation scope with exact wheel/source/path. Do not silently install from
+general autonomy. Same-root installed dual-alias build/run/exec/status, explicit
+RO source share and independent uppers remain unqualified. Renewal74/counter7/12
+and only necessary builder remain unchanged. gbrain CLI is absent; no sync/upload.
+
+## Source134 live lifecycle closed; n06 fully removed —134–143
+
+Reviewed guardf9e5334a…/634files, immutable host archiveb327141f…/746files was
+captured once as134. No builder source/worker transfer. Exact public stop134
+settled the original stop-incomplete by observation only. Same-case actual cold
+stop/start135 changed boot b47544d3…→e330f021…, with intervening provider Stopped/
+PID/actor/socket/upper checks and five file hashes/four installed-package records
+unchanged. Natural dev idle was actually observed Running→Stopped; canonical
+exited remained unchanged until the real public CLI start138 succeeded directly,
+without the old explicit-stop workaround. Boot7e98e075… and all data persisted.
+
+Final normal stop/RM140 then full proof142 confirms provider/exclusive root record
+and disk/projection/HOLD/actor absence, group+five member lease authorities absent,
+all export run references gone, all five shared SquashFS payloads fully verified,
+original33.59MB OCI digest183910…/full stamp and source snapshot6f2b… unchanged.
+The verification script initially compared qualification05a4… with snapshot6f2b…;
+corrected the digest domains using the retained result, with no resource replay.
+Owner n06 is Removed, attempts7/12 remain spent; only necessary offline builder
+Running, campaign fence rechecked143. No force/signal/manual cleanup or publication.
+
+Current remaining observed defect139: managed native main exits while its VZ
+platform is still Running, but the VM detail view leaves status exited and metrics
+returns unavailable/stopped. Canonical retained-main logs work and the observed
+provider's generic logs are correctly denied/identity. This liveness distinction
+is being fixed before another case; do not retain the finished n06 for it.
+
+Actual catalog source134 refresh/fresh-process read137 now agrees exactly:
+complete/revision2/six runs including the canonical pre-provider n01 failure, no
+invented plan/image for it. Builds/tags in that selected host state remain empty.
+Historical guest builds31/34 are not host state45 provenance.
+
+Next prep: real host-installed dual CLI and same-root build-label resolver, real
+host Buildx connection to the owned guest Unix socket, explicit RO source share
+and same-lower independent uppers. No host install authorization was inferred
+from the excluded host-package scope. Local tools found143: uv, Docker, existing
+Packer path; primary dev Python has no Hatchling/pip/build. Tool usability/pins
+and offline wheelhouse remain to qualify, not permission to use a shared cache
+or Docker Desktop. Packer build-inclusive comparison still not executed.
+
+## Reviewed source ready for immutable host cutover —133
+
+All assigned production findings are closed: Native stop/start re-review131,
+generic host lifecycle/access132, and pure discovery/source/network binding132.
+The last P3 vacuous deletion assertion now seeds one real content-store cloud
+image and checks its exact digest is eligible before and protected after each
+invalid source link. The final approved trusted host lane passed903 tests/15.72s;
+lint and ten scoped formatting checks pass. Initial902pass/1fail was an invalid
+new accepted-plan fixture (missing v2 UUID/name), repaired in both positive and
+malformed controls without changing production. Receipts133 preserve both runs.
+
+No guest test sandbox, builder SSH, VM operation, force, replay or manual HOLD
+mutation was needed. Do not create a builder-test dependency through the held
+namespace: these are trusted repository unit tests in the already-approved host
+lane. `M1-native-custody-source-final-closure133.json` pins changed-file hashes.
+Only after the matching working guard and immutable HOST-ONLY successor capture
+may the exact public n06 stop call select its observation-only settlement path.
+No failed-start scope or signal. Revalidate any necessary same-case stop/start
+with actual guest boot IDs/provider Stopped/PID absence, then normal RM and full
+shared/source preservation. Source100 remains the runtime-qualified version until
+that happens. Builder/counter7/12/renewal74 and whole Goal23/108 are unchanged.
+
+Recorded limits remain: native network detail currently uses a KVM-only helper
+and reports unavailable; plan discovery is not full runtime/payload authority.
+M1-08 explicit share, M1-12 same-root build/tag/run, M1-13 installed dual entrypoints,
+cross-VM isolation and the Packer build-inclusive comparison remain unqualified.
+
+## Independent-review blockers; no successor activation —127–130
+
+651 affected native/dispatch/inventory tests passed7.48s and Ruff check passed
+before the final review corrections. Review127 then found unknown stop journals
+could be discarded on start; final resource reload could ignore a newly live
+provider/actor/upper; and known occupied-port admission could create a false
+start HOLD. Parent corrected the source and added journal-preservation,
+final-reload-race and real-bound-socket tests; these revisions are not yet checked
+or activated. Runtime-dispatch whole-file formatting has unrelated older VZ hunks;
+do not silently restyle them or claim that full-file format check passed.
+
+Another review found malformed non-null planless bindings could appear complete,
+and native Lima provider rows could be misclassified as generic cloud-image VMs,
+exposing force-delete through host/dashboard control. Source owners are fixing
+these boundaries and tests. No exploit/delete was executed. Missing metadata is
+not resource absence; suspicious native providers must not gain generic control.
+
+Do not activate/stamp this successor or settle n06 until revised checks and
+independent re-review close blockers. Actual n06 remains Stopped/HOLD, counter7,
+no RM/stop replay/signal/manual marker mutation. Source100 remains the only
+runtime-qualified source. Completion124's stale n01 “honest partial” gap is
+withdrawn by correction129 as well as diagnosis correction125. Actual success
+proofs are unchanged. Native admission `run_local_oci` full AST remains identical
+to exercised100, separately recorded130; the whole native file is not identical.
+Next same-case successor lifecycle proof should explicitly collect boot IDs and
+provider Stopped/PID absence, not label old118 stdout as those observations.
+
+## N06 actual VZ root/access/persistence; orderly cleanup HOLD —105–125
+
+Canonical primary `spec.md` now checks23/108, adding M1-04/15/16/17/18/24;
+whole Goal and M1/GATE remain open. Source100 frozen archive3cf6d4a7…/guardc90a…
+/package3f939968… with real platform142ed75e…/assets103c2756163…/profile104
+1179ac2f… produced actual native ARM VZ root29:2=PID1 root, ordered readonly5lowers,
+dedicated upper/work and real CLI exec/console/directSSH. Original embedded C
+stdout41/report15, image OS digest and source hashes were observed, not inferred
+from catalog or a VM listing. Console114's cwd mistake/overclaim is explicitly
+withdrawn by115; successful fail-fast console115 and directSSH116 are the evidence.
+
+Actual source comment/recompile, three work markers and real offline dpkg package
+installation survived a successful public Running→stop→start118. Before/after
+five SHA256s and four installed package records match. No RAM/process resume claim.
+Component102 independently proved plmctl1000/real sudo0/wrong key rejection and
+normal inetd reaping; ephemeral keys were removed after process/mount absence103.
+Current182 qualifier/platform tests passed1.23s, with qualification-node bytes
+matched to frozen100. Completion maps: `M1-04-*-119/124`, root-access-boundary124,
+`M1-24-n06-source-package-persistence-summary124.json`, all in the common proof root.
+
+**Current exact retained consumer, not removed:** n06 name`sg-b212fed8-n06`,
+run`166584d3-c98d-4795-8fbf-f066294fa512`, provider`plm-166584d3c98d`,
+directory16777231/236295383, upper`4f0fa194-419f-43b6-8a35-1eb771dda551`.
+Cleanup public stop120 returned unknown-provider-state after accepted quiescence/
+poweroff. Ledger failed/stop-incomplete; receipt121 preserves it. Read-only
+limactl list122 shows exact Stopped/no hostagent or driver PIDs. No RM attempt,
+new signal/force/manual marker unlink/replayed stop. Source-backed lifecycle fix
+and independent review are in progress; settle only through canonical exact
+observation authority, then ordinary RM/upper+lease+ref+actor absence/shared
+preservation. Do not bypass namespace HOLD to reach builder or start another case.
+
+Another actual gap: natural five-minute dev idle stop left canonical exited,
+and public start109 rejected it. Explicit stop+start111 worked, but is not a fix
+or proof of natural-idle resume. Keep M1-22 open.
+
+Fresh catalog119 has the n06 image/source/five ordered links, zero builds/tags.
+Diagnosis124's “valid warning/no defect” statement is withdrawn by correction125:
+canonical unprepared missing/null VZ plan was wrongly rejected by durable
+projection. Correct discovery only; absent metadata cannot prove no resources
+because the reservation failure writer can replace an earlier payload. The n01
+specific no-provider fact comes from proof48. Malformed-present plans/HOLD remain
+guarded. Do not fake same-root build/run linkage to historical builds31/34.
+
+Owner counter7/12/public1712284672bytes, expiry renewal74 at2026-11-05T22:05:10Z.
+Only necessary offline builder Running plus stopped held n06; no refund, commit,
+release, cloud/device operation or Packer execution. Next incomplete M1-08 needs
+actual explicit source mount; M1-12/13 need same-root real build/tag/run discovery
+and installed dual CLI paths after cleanup. Parent retains the live Eval kernel;
+do not re-run full executor/fence setup or re-capture source100.
+
+## N05 normal deletion live-verified / source100 staged —101
+
+Frozen host100 archive3cf6d4a7…/guardc90a4544…/package3f939968… used original
+profile94/assets94 to settle the already-returned stop by observation only.
+Ordinary canonical RM1 returned removed/instance-root-and-topology-purged. Fresh
+proof101 verifies provider/exclusive upper/projection/ref/HOLD/actor absence,
+lease-group/all5members retired, full5shared payloads and original OCI unchanged,
+only necessary builder Running. No replayed Lima stop, signal, force or manual
+endpoint unlink. Owner n05 row is Removed; creates6/12 are not refunded.
+
+The original archive100 was subsequently staged unchanged into new guest source100
+and private interpreter100; do not re-run capture under100. Guest package matches
+3f939968… and cache absence/tools were directly checked. Actual pinned-option
+probe101 rejects-E and ACCEPTS-s; omit-s only as redundant for password-disabled
+qualifiedbuild, never describe it as demonstrated incompatible.
+
+Canonical primary spec checkpoint is refreshed;17/108 remains, Packer benchmark
+criteria M1-27 only defined/not executed. Next use reviewed private fixture97
+with explicit seventh SYS_PTRACE cap to exercise actual jail/inetd/forced Lima/
+sudo and wrong-key rejection before next VM admission. A component FAIL after
+known children exit is not HOLD; uncertain live state remains retained.
+New immutable assets/profile and next actual VZ root/SSH proof are still needed.
+
+## N05 ordinary-stop HOLD / reviewed normal sockets and SSH profile —97/98/99
+
+Source94 archive5e73e955…/guardbe54f8e2…/packagefbfc452d… with immutable assets
+80efbdd9… and hostedce1f7f… passed exact preflight. N05 attempt6 was reserved and
+fsynced before one invocation in retained kernel with no tool deadline. Run
+55420f89-eddf-45b2-93df-0a8b5e6053d7/providerplm-55420f89eddf,
+directory16777231/236239258, upper88b8a832-649b-40aa-9894-65107057386a.
+Boot passed the prior readonly mount issue but Dropbear inetd rejects -E.
+No usable root/SSH/handoff or checklist increment.
+
+Normal stop returned; original actor10313/birth1793866210134134000 is absent and
+provider authoritative Stopped/PIDs0. Canonical stop remains returned/HOLD due
+only default_ep.sock/default_fd.sock, not a live VM actor. Both are501/0755/
+single-link and refuse STREAM+DGRAM withECONNREFUSED61; lsof has no open files.
+Do not infer their absence from the directory tool: it omitted special entries.
+Pinned Lima2.2.1 vm_darwin.go178-210 + usernet/config.go20-40 map this to the
+instance-local in-process default gvisor, not a shared daemon. No signal,
+manual socket unlink or provider stop replay was used.
+
+New reviewed source permits only complete read-only returned-stop settlement
+with honest current-after-normal-stop endpoint pins, original lifetime stamps,
+full authority and stronger-absence/reappearance fencing. Then ordinary RM once
+must prove provider/root/ref/lease/HOLD absence before any next consumer. Old
+forced ha/vz cleanup policy is unchanged. Builder SSH remains blocked by native
+namespace HOLD: do not bypass the renewal fence or fake a settled marker.
+
+Pinned Dropbear7ecd073d…/506576bytes was compiled with password/PAM/plugin/syslog
+off. C drops unsupported/redundant-E/-s; both asset paths pin exact actual bytes.
+117focused cases/0.26s and Ruff pass. Initial3test type mismatches are preserved,
+not production relaxations. A valid self-consistent real bundle with only a
+Dropbear-comment byte changed is accepted by frozen94 and rejected by the new
+public loader; original still reopens and temporary forgery is absent.
+Independent lifecycle/security and SSH/profile reviews report no blockers.
+
+Private live SSH component97 sources are written but not executed. Parent adopted
+only SYS_PTRACE in addition to the six scoped root-unit caps, preserving actual
+PID1/GID/SUID/procfs guards; no ptrace attach or sysctl. Driver now distinguishes
+client/command success from normal inetd exit code and reports deterministic FAIL
+only after both planned connections, ECHILD and normal namespace-controller exit.
+Timeout/unknown actor retains custody. Component success is not VZ acceptance.
+
+User additionally requested Packer-like golden-image comparison INCLUDING image
+build time. Primary spec.md M1-27 now covers cold/reuse/source-change, UTC/monotonic
+stage and total time, true readiness, source/cache/artifact/storage evidence and
+amortized reuse, with no new resource grant.17/108 checked; Packer not run.
+
+Next: stamp the reviewed source and freeze HOST-ONLY locally while HOLD blocks
+guest staging. Use that exact new host package with original profile94/assets94
+for observation-only stop settlement then ordinary n05 RM; never re-run Lima
+stop or use an old force grant. Verify exact absence/shared preservation and
+update owner before any builder/next-VM action. Then stage matching new source,
+run real SSH component and build new immutable assets/profile for next pre-reserved
+case. Renewal74 expires22:05:10UTC Nov5, creates6/12 and public reserved1712284672
+bytes. No counter/custody/quota reset, commit, release or deployment.
+
+## N04 exact failure/cleanup and readonly-FD repair —90/91/92
+
+
+Advancement93/94: the complete206-case protocol file passed on actual Linux
+in3.04s, distinct from preserved Darwin SIGSYS. Final five new cases passed in
+0.27s after test-only formatting/JSON evidence assertions and removal of wording/
+copy pins. Runtime bytes unchanged. Production sysfs readonly caller passed a
+separate actual namespace smoke94. Namespace91/92 fixtures were removed with
+process/mount/no-follow proofs. Staged source93 imported with explicit -I -B and
+cache absence; retained custody/fence identity was not reset. It precedes final
+test formatting, so freeze a new final generation rather than relabel its digest.
+
+Canonical Goal state remains the primary `spec.md`:17/108, first incomplete
+M1-04 and native M1-15/16 still open. User approved n04 and then instructed
+autonomous create/fix/remove iteration; continue within renewal74 rather than
+requesting routine confirmation. Original VM/CPU/RAM/storage/download limits
+and22:05:10UTC Nov5 expiry remain. Actual creates are5/12, reserved public bytes
+1708090368. N04 accounting was corrected after its actual attempt, not a claimed
+pre-effect reservation; no failures/expired grants/counters were refunded.
+
+N04 run da36f8cc-dc60-4717-849d-658c0b9c7066/provider plm-da36f8ccdc60, upper
+6592ccef-3f01-4ab9-b890-0eec77ae07d6 reached kernel/native init. Serial identified
+`mount(NULL,/proc/self/fd/3,NULL,0x1027,NULL)` EINVAL22 during readonly identity
+injection. The pre-bind FD still refers to the covered mount/inode. New production
+code hardens a detached open_tree clone with mount_setattr before move_mount
+attachment directly to the pinned target. Preserve source restrictions and
+covered-target provenance; no fallback/writable window/ABI change. Writable binds
+and explicit private-jail self-remount remain separate.
+
+Normal stop and single TERM89 left the same actor alive. The n04-specific approved
+single KILL/stale cleanup settled; ordinary canonical RM returned removed. A
+post-return logging `.status` AttributeError was separately corrected from the
+actual LifecycleResult/terminal ledger; RM was never repeated. Fresh receipt90
+proves exact provider/exclusive-root/projection/ref/HOLD/actor absence and six
+retired lease authorities; all five shared payloads and original OCI requalified.
+Only necessary offline builder remains. No root/SSH success or check increment.
+
+Worker's earlier fatal stderr said unsafe bytecode cache: staging's root `-I`
+import ignored PYTHONDONTWRITEBYTECODE. Private helper now explicitly uses `-B`;
+do not reload the whole executor/reset retained custody to apply its definition.
+New bounded private diagnostics retain64KiB stderr/observed exit status while
+keeping public messages,1MiB total cap and no-force/HOLD invariants unchanged.
+Earlier repeated requests/manual marker clears lacked complete same-time custody
+evidence and remain unvalidated history, not justified by the eventual boot.
+Fresh observation91 held both original locks, checked full process identities
+with pinned Lima baseline/query ancestry and found no worker/staging/cache.
+
+Production C af1c4eba… compiled and passed actual Linux6.8 namespace proof92:
+legacy errno22, fixed readonly FD/file/directory mounts, EROFS30, inherited noexec/
+nosuid/nodev, writable source/alias, symlink rejection, provenance/FD closure and
+separate jail flags. Initial fixture91 overwrite-via-exclusive-create failure
+is preserved. Five new real-child cases pass; broader Darwin protocol file
+terminated140/SIGSYS after21dots and is not green. Independent mount and private
+diagnostic source reviewers found no blockers; compiler/namespace proof is not
+VZ root/SSH qualification or VZ commit exclusion (still unsupported).
+
+Next: remove only exact finished namespace fixtures, freeze/review the next source,
+stage with explicit no-bytecode and verify cache absence, rebuild immutable assets
+offline and bind matching host/worker profiles. Before next single native case,
+durably reserve its create count and exact source/resources. Use a retained
+no-force controller with no enclosing tool deadline; do not repeat held requests,
+manually unlink custody or extrapolate n04-only force scope. Verify actual usable
+root/SSH then ordinary cleanup; uncertain cleanup/new scope/expiry remains HOLD.
+
+## Renewed offline builder / next native diagnosis readiness — source81/82/83
+
+`m1-renewal-fence81.py` installs an explicit successor into retained controls
+without clearing outstanding custody. It preserves original grant/owner timestamps
+and cumulative4/12creates/1708090368reserved bytes, verifies effective renewal74
+until22:05:10UTC Nov5, original builder directory16777231/229431161 and isolation,
+tool bytes, free>=300GiB/owned<=100GiB, retired n03 run authority and current slots.
+Shared projection key paths may be freshly published for a new accounted owner;
+old run refs/leases never may. Fence smoke recorded416820887552host free bytes
+and21663732physical KiB before resume; this is not a guest/network attestation.
+
+Builder resumed normally (no create) and has active transient expiry81 at
+Nov6 07:05:10KST = Nov5 22:05:10UTC. Public nft quota was absent after boot; none
+was reset/recreated/refunded. A separate owned offline81 table accepts only
+lo/SSH/DHCP, drops other traffic. A reserved-address probe failed and actual
+owned output-drop packets rose536→539. Startup traffic before enforcement is
+unmeasured, not claimed as zero. Guest kernel6.8.0-147, musl-gcc/modules present;
+root filesystem had11555504128available bytes. No public package download needed.
+
+Source81 archive0091e058…/746public files and private Python prefix81 were staged.
+Platform C source5be7534e… compiled; immutable assets81 manifest282ad0a5… with
+Imagece788325…/59079048bytes and initramfsfdb9a374…/9193618bytes built offline,
+transferred over own SSH control and strictly reopened on host. Original44 kept.
+The child-namespace diagnostic used all5preserved lower images and own32MiB ext4,
+and passed OverlayFS plus proc/sys/dev/platform/root moves. First unit81 exited126
+before execution because root lacked DAC_OVERRIDE to traverse private UID501
+scratch; corrected unit82 passed. Builder root/PID1 binding and modprobe/ptrace
+unchanged; own loop references0 and exact fixtures removed. Reproduction C is
+embedded in bounded evidence82, standalone throwaway source/binary removed.
+This neither identifies n03's failure nor proves VZ root. Full init_main also
+mounts later control/cgroup/boot state; the older overlay-vs-move list was not
+exhaustive. `M1-16-mount-diagnosis-amendment83.json` preserves that correction.
+
+Worker82 reuses empty old custody rather than bypassing it, rechecks actual guest
+tool hashes and package2a4b8fd6… matching frozen host80. Host readiness82 binds
+new assets81/renewal deadline. Proposed exact next case `sg-b212fed8-n04` would
+spend attempt5,2CPU/2GiB,3.5GiBprimary+4GiBupper+64MiBCIDATA reservation, dev/no
+restart/no overrides/no source mounts, original archive18391052… and selected
+manifest74ba65eb…. Read-only preflight passed; no VM yet. See next-case proposal83.
+Because known early-failure Lima cleanup can hang, seek explicit conditional
+failed-start signal/force cleanup terms for the chosen next-case scope before
+admission; consumed n03-only grant79 does not extend to it.
+
+## Source80 forced-cleanup readiness under exact owner amendment79
+
+Owner selected only this instance's bounded forced cleanup for60minutes from
+04:01:19.850114UTC Nov5, not-after05:01:19.850114. `G0-07-n03-forced-cleanup79.json`
+binds original n03/PID24719/birth/argv, directory dev16777231/ino235197794,
+exclusive upper5dfe2658… and exact stale metadata/ordinary conditional cleanup.
+No repeat signal, broad kill/prune, arbitrary unlock, foreign/shared/builder
+mutation or new VM budget is permitted. All historical failures stay recorded.
+
+Source80 replaces the private signal boolean with explicit STOP-only enum scope,
+keeps SIGTERM sent history and independently fences a single forced termination.
+Original endpoint pins are captured/compared before delivery and required again
+after real actor/active-endpoint absence. No-follow stale cleanup rechecks full
+authority, a fresh complete process inventory, visible/retained/original directory
+identity, leaf pin and final wall/monotonic expiry at every unlink; canonical
+state persists intent/progress and retains HOLD on uncertainty. Only original
+PID files/socket are eligible, never an adopted endpoint. Strict absence then
+provider/root/layer guards still gate ordinary RM and final reference release.
+
+Independent endpoint review closed3P2 findings (directory FD binding, late
+related actor and slow-read expiry), with actual source-observation fixtures.
+Lifecycle source review found no blocker. A first fixture run374pass/1fail
+injected replacement before the intended pin boundary; repaired fixture and
+final375tests/1.71s pass did not weaken product behavior.
+Actual owned-child component80 reproduced ignored SIGTERM, delivered one SIGKILL,
+reaped/proved absence and durably reconciled only original stale metadata while
+preserving keep.txt/rejecting replay; all fixtures removed. Non-VM authorities
+are declared synthetic. `M1-16-forced-recovery-source-review80.json` and
+`M1-16-forced-recovery-owned-component80.json` do not claim actual n03 recovery.
+
+**Actual source80 settlement:** exactly one SIGKILL settled04:26:23.786073UTC;
+canonical ordinary RM settled04:29:44.620266, with no normal-stop/SIGTERM replay
+or forced provider delete. Fresh proof80 observes original PID absent, provider
+directory/exclusive upper/canonical root record/lower payload+chain/run reference/
+resource HOLD/active journal absent, lease set and all5members retired. Namespace
+has no actor/session/HOLD journals; only the required builder remains Stopped.
+All5shared SquashFS payloads passed full readback again and original OCI OS/source
+requalification returned the unchanged binding. Failures stay stop=attempted,
+term=sent; forced termination and delete are settled, ledger removed/HOLD null.
+The canonical stale reconciler removed only original ha.sock; PID files were
+already absent when that stage observed them. No attribution beyond that is made.
+`M1-16-n03-final-absence-and-preservation80.json` is the final cleanup authority.
+Bounded original boot/agent logs were privately preserved before destruction.
+
+Owner history was reconciled only after proof: original grant/expiry/IDs retained,
+effective renewal74 linked separately, n03 marked removed, builder observed
+Stopped, creates still4/12 and public reservation1708090368bytes. Backup
+`M1-owner-before-reconciliation81.private.json` preserves the earlier owner record.
+No next consumer or builder resume has yet occurred. Prepare successor control
+fence/timer/offline worker assets under renewal74 without resetting guest pool.
+
+## Actual n03 single-SIGTERM78 failed to settle — no further signal
+
+Owner approved the same exact action for60minutes from response receipt.
+`G0-07-n03-single-sigterm78.json` binds03:48:46.505589–04:48:46.505589UTC Nov5,
+immutable source-host77, original PID/birth/executable/argv and unchanged guards.
+Canonical single SIGTERM ran03:49:13–03:49:32; delivery recorded `sent`, but the
+same actor remained after15seconds. Original normalstop stays attempted,
+termination stays sent, canonical status failed/launch-incomplete HOLD.
+Provider reports n03 Running/PID24719 and builder Stopped. No delete phase,
+second signal, force, state rewrite, manual unlock or new consumer occurred.
+Receipts `M1-16-n03-sigterm-{intent,result}78.json` and
+`M1-16-n03-post-sigterm-hold78.json` are authoritative; one-shot78 is spent
+even while its clock remains live. Do not repeat it.
+
+Read-only native sample78 (1second/10ms) succeeded but lacks Go symbols and
+cannot prove the blocked goroutine. Pinned Lima2.2.1 upstream source intercepts
+SIGINT/SIGTERM and consumes the signal channel only after synchronous SSH
+setup. VZ readiness closes its notification only after a goroutine whose error
+send can block on an unbuffered channel. An early poweroff/absent usernet endpoint
+can therefore explain setup/signals waiting on each other, but exact live Go
+location and binary-to-source equivalence remain unproved. This is a hypothesis,
+not a repaired guest/hostagent. See `M1-16-n03-shutdown-source-diagnosis78.json`.
+No host Go compiler was present; none was installed.
+
+Public upstream source/tree reads add a conservative1MiB retrospective budget
+reservation (not wire measurement or a pre-effect reservation claim), total
+1708090368bytes against8GiB. Creates stay4/12 without refund. Further force or
+stale-owned-metadata reconciliation is outside the consumed single-SIGTERM
+approval and needs an explicit new owner decision before effects.
+
+## Source77 one-shot recovery ready; response76 arrived after cleanup expiry
+
+Owner selected “정확한 hostagent에 SIGTERM 1회 허용”, but the offered fixed
+not-after23:05:10UTC Nov4 was already past when the response arrived03:10:25UTC
+Nov5. `G0-07-n03-single-sigterm76.json` and its `-expired.json` record that fact;
+no n03 signal, delete, repin or deadline extension occurred.
+
+Source77 adds a default-off STOP-only single-SIGTERM scope and canonical durable
+termination intent/sent/settled phases. Normal-stop failed history stays intact.
+Original actor/attempt/full resource authority and concrete shutdown/endpoint
+absence remain necessary; partial signals or failed writes never permit replay.
+Active cleanup STOP cannot fall through to an ordinary/unheld or different run.
+Independent lifecycle and security reviewers found no blocking defect in this
+exact invocation; scope is not a universal START/RM sandbox and Darwin numeric-PID
+signaling is not race-free against same-UID concurrent PID reuse.
+
+357 affected tests passed in1.23s. Actual owned-child component77 delivered
+SIGTERM once (exit-15), reaped/proved absence, persisted canonical JSON and
+refused replay, with explicitly synthetic non-VM resource authorities. No n03
+or native-root/SSH success is implied. Fixtures were removed. Before an actual
+action, request a fresh one-shot window relative to the approval response and
+recheck the original exact actor/network/root/input guards. Preserve cumulative
+4/12creates and1707041792reserved input bytes; no new consumer before cleanup.
+
+## M1 renewal74 / source75 — approved continuation, process observation repaired
+
+User replied “승인 할게 이어서 해”. `G0-07-M1-renewal74.json` records the
+same M1 isolated local limits for24hours from conservative22:05:10UTC Nov4,
+not-after22:05:10UTC Nov5. Four creates and1707041792reserved download bytes
+remain spent; no quota reset or cloud/GPU/publication permission is inferred.
+Exact n03 normal-stop/conditional-RM uses original policy72 and a narrower
+not-after23:05:10UTC Nov4; no force, extra signal, replay, repin or adoption.
+
+Renewed full carrier admission passed but concrete same-UID enumeration failed
+before effects on PID1081's proc_pidpath ENOENT. Original PID24719 remained exact;
+builder remained Stopped, n03 remained HOLD, no new consumer was admitted.
+Do not stop the unrelated process or equate its path failure with absence.
+
+Source75 retains an explicit unknown executable in inventory only. Strict exact
+actor reads reject it; all metadata/complete argv stability and the unchanged
+transitive parent/PGID/instance/directory custody predicate remain required.
+An owned compiled child's unlink reproduced the old failure; the repaired
+inventory retained the live child and exact reads refused it, then EOF/exit0
+and ESRCH proved natural absence. Independent source audit found no bypass;
+related-unknown actor regressions were added before operational readiness.
+Receipts `M1-16-n03-stop-preflight74.json`,
+`M1-16-darwin-unlinked-executable74.json`,
+`M1-16-darwin-inventory-smoke75.json`. Actual n03 EINVAL remains unidentified:
+the existing diagnostic64 bundle must identify its failed mount before a fix.
+Do not claim native root/SSH success or advance checks from these components.
+
+**Actual stop75 outcome:** repaired full readiness passed, then one canonical
+normal stop ran22:16:57–22:20:12UTC and returned nonzero through the existing
+`VZNativeHold`; no fallback/replay/extra signal was attempted. The original
+PID24719 remains exact and provider Running; canonical status failed,
+hold launch-incomplete, cleanup.stop attempted, no delete phase. The stop CLI
+child exited and no retained control child remains. Builder is still Stopped.
+Do not infer that the generic error establishes why normal stop failed.
+Receipts `M1-16-n03-stop-{preflight,intent,result}75.json` and
+`M1-16-n03-post-stop-hold75.json` bind source75 and unchanged cumulative budgets.
+338 affected observer/Lima/runtime/assets tests passed in1.24s; scoped Ruff lint
+passed and final formatting preserved all three changed Python ASTs.
+No root/SSH acceptance or checkbox changed. No new consumer can proceed until
+an explicitly revised cleanup action settles exact actor/provider/root custody.
+
+## Successor66 / source69 recovery — no operational effect, carrier still blocks
+
+Owner explicitly selected n03 normal-stop/conditional-delete and90min CPU
+continuation. Immutable `G0-07-n03-reconciliation-and-M1-continuation66.json`
+uses conservative pre-ask anchor12:18:04UTC: cleanup not-after13:18:04, CPU
+not-after13:48:04. Original expiry12:19:27 and cumulative4/12/public reservation
+1707041792B are preserved, not reset. Existing builder is now Stopped from its
+original timer; parent deliberately did not resume it or reset guest quota.
+No next consumer until exact n03 full actor/provider/root/export/lease absence.
+
+New `darwin_process.py` uses inspected27.2SDK ABI/libproc/sysctl, stable identity
+double-reads, real same-UID enumeration and ESRCH-only absence. No child process,
+signal or fake observer performs qualification. Actual self/PID24719/owned-child
+natural lifecycle and13security-boundary regressions passed; argv is repr-redacted
+and unrelated argv/environment is not retained in evidence. Canonical recovery
+binds original failed-start provenance, exact actor+network pins+phase deadline,
+full retained input/root/lease/export authority, no related actor/autostart/named
+network effect, exact upper lock and durable no-replay stop/delete phases.
+No timeout TERM/SIGKILL fallback; unknown lstat errors remain HOLD. Source-only
+independent reviews closed their findings. Final affected host tests472passed.
+
+Actual readonly frozen68 qualification FAILED before any stop on carrier full
+stamp. Receipt68: original/current SHA identical; dev/inode/UID/fullmode/nlink/
+size/mtime identical; ctime1793793268925360295→1793793458998959797. Fresh
+independent actor/network/root observation69 passed, but is NOT full readiness.
+No original pin/state/HOLD was repinned, and no stop/signal/delete occurred.
+Real cloned/qemu components and canonical Python reserve/write/_hold/failure
+unwind component70 did not change carrier ctime. Writer remains unidentified;
+timing does not prove benign APFS or Python unwind. Disposable fixtures removed.
+
+Receipts `M1-16-darwin-process-{observer-smoke66,owned-lifecycle67}.json`,
+`M1-16-failed-start-recovery67-{source.json,diff}`,
+`M1-16-n03-failed-start-carrier-continuity68.json`,
+`M1-16-n03-independent-custody-and-absence-guards69.json`,
+`M1-16-carrier-python-failure-unwind-component70.json`,
+`M1-16-carrier-python-unwind-fixture-cleanup70.json`. Later formatting/new
+conclusive-absence fixes supersede67source hash; parent records current guard.
+Need separately explicit n03 historical-ctime policy for each permitted
+operation; approval66 and prior case49 do not authorize a silent exception.
+
+
+## Current n03 early-boot HOLD — source63 runtime / source64 diagnostics
+
+Case49's approved source63 normal RM completed with fresh provider/root/export/
+all lease/HOLD absence and five shared layers/original OCI preserved. A fresh
+original-grant attempt4 then used source63/worker package `2d27c2d8…`, canonical
+`sg-b212fed8-n03`, UUID `be637448-0c08-4bd3-961e-28f3e71d141c`,
+provider `plm-be6374480c08`, directory dev16777231/ino235197794. Upper
+`5dfe2658-5368-438c-98d5-3221b7d318cf`,2CPU/2GiB,3.5GiB primary+4GiB upper.
+Carrier/new-create boot-input admission passed. Actual kernel/init, ext4 with
+that UUID and five SquashFS loop mounts were observed, then mount errno22 and
+normal poweroff0.25s. Overlay warning precedes mount completion, so the failed
+call/root cause is unresolved. No actual `/`/SUID/SSH/handoff or main result.
+
+The provider still reports Running because exact hostagent/driver PID24719
+remains: UID501, PPID1, birth2026-11-04T20:54:38+09, pinned limactl hostagent
+argv/pidfile/socket/instance all match. Upper in_use_by symlink targets only
+this exact instance. Canonical state failed/launch-incomplete with ready boot
+copies and recorded start_attempt; it is NOT eligible for prestart reconciliation.
+No stop, PID signal, delete, force or replay has been attempted. No next consumer.
+
+Readonly review: normal stop sends SIGINT but may stall before SSH setup; direct
+TERM is not a cure. Delete can SIGKILL live actor PIDs and removes in_use_by
+without checking owner. Both normal CLI operations also reconcile networks.
+Actual private config declares user-v2/shared/bridged/host and global varRun;
+parent freshly found configured socket_vmnet executable, three global daemon
+pidfiles and private _networks absent, without sudo/effects. These facts are
+not a future authorization or same-UID race-proof guarantee.
+
+Source64 C `5be7534e3a4aa8c58a897bf5c3452df6f9650de272353a4807612f8d1ed32fce`
+adds only failure-time mount context, preserves errno, logs no options/data.
+Independent source review passed. Static musl compile and actual UID501/no-caps
+missing-target mount produced context errno2 plus existing fatal errno2/exit125.
+No init_main/root_transition/global modprobe sysctl was invoked. Probe files
+removed; no new asset bundle/VM. Existing n03 uses old immutable asset44/C44.
+Receipts `M1-16-native-n03-{create-intent,launch,failure-location,
+start-provider-diagnostic,actor-custody-readonly}63.json`,
+`M1-16-native-n03-network-noaction-inspection65.json`,
+`M1-16-mount-failure-diagnostic-component64.json` and
+`M1-16-mount-diagnostic-probe-cleanup64.json`.
+Native config expired12:04:27UTC; original G0/builder expiry12:19:27UTC remains.
+No implicit extension/refund; attempts4/12, original download reservation unchanged.
+Need exact n03 graceful-stop/conditional-delete reconciliation approval and a
+separate CPU continuation window before any expired operation/new consumer.
+
+
+## Exact native49 deletion reconciliation — owner-approved source62
+
+Owner explicitly selected `삭제 전용 정리 승인`, recorded in
+`G0-07-native49-delete-reconciliation-approval62.json`, for only the never-started
+`plm-fada6f5f7bba`/run `sg-b212fed8-n02` and exclusive root `656c0206…`.
+Original expiry/budgets, no-force/no-replay, unrelated resources/builder/original
+OCI/shared data preservation remain unchanged. This does not approve boot,
+adoption, pin replacement, host installation, publication or deployment.
+
+Frozen62 archive `b78eaa7d…`, native `915dc80c…`, separates destruction-only
+historical carrier ctime from runtime continuity under the complete original
+failed-prestart gate. Only marker launch-incomplete with ledger launch-incomplete
+or retained-authority-changed qualifies. Digest/other seven stamp fields and
+full current-read stability remain mandatory; original pin is not rewritten.
+All remaining authorities and pre-delete root-exclusivity/absence-before-release/
+HOLD-last checks remain. Independent source review reports no findings.
+Actual canonical read-only checks reject20 altered carrier/start/access/partial-
+delete cases; four malformed-marker fixtures and a real metadata race while
+hashing also reject. Qualified current49 cleanup authority passes without any
+provider delete/start or original pin/marker mutation. Receipts:
+`M1-16-native49-approved-reconciliation-boundaries62.json` and
+`M1-16-reconciliation-current-read-and-marker62.json`.
+**Observed source63 settlement:** formatted native is AST-identical to reviewed62;
+`runtime_dispatch.rm` returned failed→removed with no fallback/error. Fresh
+provider list/directory, exclusive named upper and canonical root record, lower
+projection, lease intent/all five members and exact HOLD are absent. Namespace
+contains only lock. Builder remains Running; original OCI archive hash and all
+five shared SquashFS hashes/structures35491840B were freshly verified unchanged.
+Carrier's original recorded pin remains unchanged. No force, replay, GC or
+attempt refund. Receipts `M1-16-native49-approved-rm63-{intent,result,
+fresh-absence,authority-release,shared-preservation}.json`. Working reviewed
+guard `fb1a598755396cd775e5b559fb7bc959c2a652d3bf70631e8d925f23d028a2ba`/632 passed.
+This closes only approved cleanup; native boot/root/access remains0. Any next
+consumer uses a fresh nonrefundable attempt within the original grant.
+
+
+## Goal M1 current resume — source61, 2026-11-04
+
+Canonical roadmap is the primary worktree's `spec.md`,17/108 checked.
+Implementation remains in isolated `goal/m1-vz-arm64-20261103`, base
+`6e4dff7ac0493426f12d34f5e143bab52b3566d7`, uncommitted. M1-15 was reopened
+after real Lima `ValidateTemplateArgs` disproved the root/UID0 bootstrap design.
+Current real plmctl1000/private SUID/control/user-role separation and ABI2 are
+source-reviewed; actual guest authentication and privilege boundary remain open.
+Astra is unavailable; independent reviews are not operational approval.
+
+Completed component evidence under
+`~/.local/share/palimpsest-proofs/spec-goal-20261103/`:
+
+- C44 `9ba522ec…`/JSON `6489b707…` compiled musl/staticARM with warnings-as-errors.
+  Actual C probes cover output disconnect143 versus old timeout124, independent
+  stdinEOF23, child reaping and seven JSON/UTF8/overflow/token-boundary cases.
+- Asset44 manifest `02fb7857…` assembled/strict-reopened on Linux and Darwin:
+  Image59079048B, initramfs9193529B, ten modules. Binding uses observed release
+  banners/module vermagic; no embedded kernel config or binary attestation.
+  C platform Apache2 SPDX and other per-file licenses are preserved separately.
+- Real worker45 prepared1GiB sparse ext4 with unique host key and replayed all
+  five original OCI layers from archive `18391052…` into host-verified canonical
+  receipts. Private trial raw removed after custody settled. No VM boot proof.
+- Frozen51 archive `ae1627f0…`, native SHA
+  `d1032c7879b451bba9541cadc03eec447c4018c483e068c26b43ff400184ba9f`.
+  Affected nine-node portable run751passed/15skipped/1warning in71.43s.
+  Actual filesystem/flock8cases passed; orphan actor admission was reproduced
+  before and rejected after the repair. Recovery/admission independent review
+  reports no remaining scoped P1/P2, with no reviewer effects.
+- Current native SHA `6b3df0560dc7193c5ba1b59a42fd25e46541df5d7ab9684c7b9645a935fbb81e`
+  adds reviewed pre-delete named-root exclusivity; real fixtures preserve and
+  reject foreign/unknown entries and the held real root was read-only verified
+  unused. Import organization/formatting preserves all six module ASTs; final
+  scoped lint/format passed using existing Ruff0.16.0.
+- Frozen61 archive `89b0b191…` repairs only missing portable asset-test lane
+  membership after source60's5classification failures. Actual manifest check,
+ 143doc/guard/lane tests and final single894passed/15skipped selection77.97s passed.
+  Source60 final package/asset loader/public failed-ledger inspect also passed.
+- Actual read-only dashboard overview/VM navigation in a new private HOME and
+  separate Chrome profile had0JSerrors. Normal PTY Ctrl-C exited0, listener absent;
+  no force or actual49/default-state access. Native console/SSH remains unproven.
+
+Live resource state: private runtime root
+`~/.local/share/palimpsest-goal/sg3-b212fed8/`; builder `sg-b212fed8-b01` retained
+Running. Attempt48 failed before any provider call on canonical secret-field
+policy; corrected metadata names and private pinned config references retain
+that guard. Attempt49 created `plm-fada6f5f7bba`, UUID
+`fada6f5f-7bba-4a1e-9ce9-40e488d8a167`, canonical run `sg-b212fed8-n02`,
+Stopped/never-started. Its exclusive root is
+`656c0206-411e-4e90-9f9a-0c1942ad1524`,4GiB; primary3.5GiB,2CPU/2GiB guest.
+Do not adopt/start it or create the next consumer before authoritative cleanup.
+
+Actual `limactl create` invokes `Prepare`, not merely `instance.Create`.
+Old code rejected the files this valid call had produced. Source51 now admits
+only outputs of the same new successful create, verifying exact boot hashes/
+modes/identities/raw size and pinned-carrier semantic comparison; it never
+recreates or repairs retained files. Exact primary mode600/644 is pinned; upper
+policy is unchanged. Raw provider configs are private file authorities rather
+than policy-forbidden embedded ledger dictionaries.
+
+Cleanup51 intent uses canonical `runtime_dispatch.rm` and exact expected run
+identity. An initial absent-symbol call failed before entry. Correct entry then
+stopped BEFORE provider delete at the carrier full-stamp gate: original SHA and
+all stamp fields except ctime still match. HOLD became
+`retained-authority-changed`; no deletion or authority release occurred. Small/
+4MiB clone, clone-unlink/fsync and full616MB carrier→clone→pinned qemu conversion
+experiments did not reproduce source drift. Their isolated files were removed
+after custody settlement; case49 is untouched. Cause remains unproven. Preserve
+the gate/HOLD, no blind replay or manually unlinked marker.
+
+Receipts: `M1-16-native49-canonical-rm51-{intent,result}.json`,
+`native49-carrier-authority-diagnosis51.json`,
+`resource-custody-policy51.json`, `orphan-actor-{before50,after51}.json`,
+`focused-native-tests51.json`, `apfs-clonefile-{ctime52,large53,unlink54}.json`,
+`carrier-full-image-component55.json` and `carrier-component55-cleanup.json`.
+Further receipts: `M1-16-prestart-root-custody56.json`,
+`native49-root-custody-readonly57.json`, `format-semantic-equivalence59.json`,
+`final-component-smoke60.json`, `ui-{private-browser,normal-shutdown}60.json`,
+`test-manifest-repair61.json` and `final-selection61.json`.
+Current approved cumulative attempts3/12, public download reservation1707041792B/
+8GiB; no refunds/extensions. Original expiry2026-11-04T12:19:27Z, native config
+fixed15minutes earlier. No host install, commit/push/release/deploy/cloud/GPU
+operations. Old source38 guard `f1793104…`/621 does not certify current bytes.
+Current reviewed working guard `218d43869175fe125542503506caf40608a5d324c9d60b494b0f972636b61e77`
+covers632files and passed after the lane repair. This records source review only;
+case49's original carrier stamp/HOLD is not relaxed or repinned.
+M1-04/08/12/13 native acceptance, M1-13 host-install approval, actual root/
+upper resume/SSH/console and UI-native qualification remain open.
+
+
+## Goal M1-15 platform design and component checkpoint
+
+Selected contract is the VZ spec's static POSIX-C ARM64 platform boundary,
+not a numeric x86 stage1 port. PID1/main/user sessions use the original ordered
+image root; a private control account/shell/key root provides platform
+dependencies without replacing image files/libraries. Main/CLI exec preserve
+canonical OCI context and workload-root account lookup, administrative
+SSH/console is explicitly owner-root, and neither may expose the control jail.
+
+Unique pre-start host-key/run binding, separate trusted control/user key hooks,
+private known-hosts, actual session lifetime and genuine bound-seed/current-IID
+readiness are required. No daemon `-c` override, class from client command, or
+blanket user `restrict`/PTY loss. Real DHCP/bootstrap TCP22 precedes strict
+authenticated vsock handoff/confirmed TCP22 closure before main. A reported P2
+showed stock musl Dropbear `-i` cannot receive raw vsock/Unix sockets because of
+numeric peer lookup. Corrected AC58 selects bounded per-connection AF_INET
+loopback connected pairs with opaque relay/EOF/backpressure, no permanent
+alternate port or fake SSH peer address. Final access/capture design audits
+source-closed with no remaining assigned P1/P2; no configured-reviewer/Astra or
+runtime signoff is implied.
+
+Ubuntu24 exact private injection targets/rooted symlink handling/generated
+placeholder capture treatment preserve user configuration/package data.
+Mandatory capture is copy-only, not broad `/etc`/`/root`/network/`/tmp` deletion.
+Account user upper, private siblings/RAM, assets/disks/copies separately, enforce
+existing envelope/peak growth and do not add raw-disk siblings twice. M3
+lower-identity/capture and later session/restart/access behavior remain unproven.
+
+Parent actual owned-builder evidence: BusyBox-static1.36.1 and Limaagent2.2.1
+ARM64/no interpreter/dynamic segment, required applets and ash features passed;
+kernel6.8.0-147 config has required virtiofs/OverlayFS/vsock modules. Initially
+compiler/Dropbear/qemu were absent. Downloaded/hashed35 official signed-index
+APT packages50.5MB then installed offline/PrivateNetwork with no upgrades,
+removals or service restarts; GCC13.3/musl1.2.4/qemu8.2.2 and clean dpkg audit
+observed. Host unchanged; dependency closure/hashes are retained.
+
+Primary Dropbear source GET403 was preserved, not bypassed with headers/cookies.
+Its upstream-listed public mirror supplied2386978bytes with exact primary
+tar SHA256 `e098034a843699200c8c977a991fff73159735bf795d5f72ef672c41a6b1ae81`.
+Offline UID501 musl build produced506576byte static ARM64 Dropbear2026.94,
+SHA256 `7ecd073d57f4fb68bcbbbab1f75ea4a1b4cd860318df9b3508d95f4515c0b866`;
+actual version passed. No first-party helper/initramfs, key generation, SSH
+service, relay, VZ root/boot/resume or new VM has been proven by that component.
+Local PGP/broader binary attestation is not claimed.
+
+Evidence prefixes in the common proof directory: `M1-15-existing-builder-*`,
+`static-elf-and-shell-component-proof`, `observed-kernel-feature-config`,
+`guest-toolchain-{install-plan,download,deb-manifest,install}`,
+`installed-toolchain-observation`, `ssh-{source-acquisition,
+source-official-mirror-acquisition}`, and `static-ssh-build.json`.
+Source research adds8MiB nonrefundable reservation, total1707041792bytes/8GiB;
+guest1GiB counter/expiry were not reset. Continue actual asset manifest/ARM
+platform and canonical VZ consumer implementation after recording this design.
+M1-04/08/12/13 native acceptance and host-install exclusion remain unchanged.
+
+## Goal M1-14 transport design checkpoint
+
+Selected contract is in the VZ spec and architecture: exact Lima2.2.1 effective
+read-only virtiofs configuration, explicit distinct host/guest paths and derived
+tag, allowlisted same-chain transport projection behind canonical store/ordered
+leases, custody through stopped resume and absence-proven cleanup. Reject plain
+mode and all unapproved shares, explicitly including Rosetta. Existing KVM
+QEMU-DAC receipts/guards remain unchanged, not reused as VZ authority.
+
+Upper design uses canonical run/root-volume ownership with Lima physical named
+disks; ordinary user data volume lifecycle stays independent. Preformat only a
+new authorized owned raw ext4 file before attachment, `format:false` from first
+start. Host directory/file inode/raw size/in-use binding combines with exactly
+one guest FS UUID plus prelaid run/root-plan/chain nonce. One-shot initialization
+and populated resume are distinct; uncertain state is not repaired/reformatted.
+Count every attached disk/image including carrier/upper/data/installer/cidata
+and physical preparation/copy/platform/export overhead, not per-attachment32GiB.
+
+Re-established official annotated tag `bd99f2bc…` → commit `27bc4c4b…`, inspected
+actual2.2.1 boot/share/default/schema/readiness source, and observed installed
+version2.2.1. Go build-info tooling was absent; no host install or binary source
+attestation was attempted. An8MiB nonrefundable source-investigation reservation
+raised the counter to1698653184bytes/8GiB; guest quota/expiry stayed unchanged.
+Actual `validate --fill` retained the read-only distinct paths, plain contrast
+removed mounts, and explicit `vmOpts.vz.rosetta` off resolved correctly.
+Five verified actual source31 derived payloads35491840bytes were copied to an
+owned host schema-input directory, not imported as host store/lease authority.
+Tag for that exact path is `lima-4f213fc473c0c7df`. Generic Ubuntu initrd metadata
+was inspected, not transferred or qualified as native-root initrd.
+
+Initial independent task design audits accepted the source36 draft, but a later
+P2 identified missing/recreated projection checks before resume: Lima's share
+constructor can auto-create a directory. Canonical M1-14 was reopened; source36
+completion remains historical. Snapshot8943 explicitly checks retained directory/
+completed publication/allowlist/file identity/hash/size/leases/runrefs before
+every create/first start/resume, retains custody and blocks unknown cleanup from
+resume. It also requires effective/persisted exact upper disk/formatfalse before
+first start/resume. Both final source-only review slices closed with no P1/P2.
+No runtime/code/test or VM effect was performed by the auditors. Parent performed
+configuration validation only;
+actual early mount/write denial, boot assets/platform access, attachment-to-guest
+identity, actual PID1 root and populated resume remain M1-15/16/17 gates.
+M1-04/08/12/13 remain unchecked until their real consumer acceptance. Continue
+M1-15 design and implementation; no host package/global state/cloud/GPU action.
+
+## Goal M1-13 installed command component — source34
+
+The current checkout installs `plm` and `palimpsest` through the same `cli.main`.
+The canonical package checker now actually runs both installed names; its former
+mock-command echo test was deleted instead of repinned. Source34 `b82231b4…`
+built sdist→wheel and performed private venv/tool installs offline. Retained
+private guest wheel SHA256 is
+`4f6d08167510f53a05dce7cf28b59e572b4e01690734a3f131ff5f13a2bf3efc`;
+both imports came from that installation's site-packages.
+
+Each real executable built the pinned Ubuntu/COPY/C-compile fixture to the same
+`74ba65eb…` manifest. Distinct build labels survived in one persisted two-build
+frame; both commands read identical metadata and identical empty status tables.
+BuildKit normally stopped inactive/dead/MainPID0. Focused contracts passed
+298/4skips in11.52s; Ruff check/format passed. No host package/PATH change,
+publication, new VM or actual native VZ run/exec occurred.
+
+`M1-13-{canonical-package,private-installed-prefix,installed-real-builds,
+installed-catalog-status,focused,style,buildkit-settlement}34.json` preserve the
+component evidence. M1-13 remains unchecked for real run/exec through both names;
+continue M1-14/15 transport/platform prerequisites, not a scaffold or fake runtime.
+The existing source version alone does not identify this unpublished candidate.
+
+## Goal M1-12 metadata component checkpoint — source31
+
+Primary `/Users/pieroot/code/palimpsest/spec.md` is the sole completion ledger;
+M1-12 remains unchecked until actual VZ run UUID/source linkage. Implementation
+is isolated in `goal/m1-vz-arm64-20261103`, base `6e4dff7…`, uncommitted and
+unpublished. Source31 archive SHA256 is
+`0d1b30c82842fa2755c61b3dbe052d055ade6d41316cffc4ffaa1870ecee1a10`
+(733 public paths). Earlier guard `475b0b10…/619` does not cover this new code.
+
+`local_catalog.py` supplies the selected-root SQLite engine; StatePaths owns
+paths and inventory reuses existing collectors/validators for CLI/web. The DB
+keeps verified source/reference/ordered occurrences, separate derived receipts,
+builds/known ancestry/provenance/labels, real tag/package aliases and UUID/revision
+run observations. It is not payload, execution, lease, deletion or Hub authority.
+Metadata refresh creates only the private catalog subtree in an existing state;
+missing state/config, runtime locks/quarantines and live backends are untouched.
+Malformed entries are isolated with incomplete warnings, all deletion previews
+disabled for incomplete frames; SQL/open errors remain visible. Legacy build
+response shapes remain unchanged; full-frame scope/warnings are in `store catalog`.
+
+Producer hooks follow existing durable commits and released guards. Late catalog
+failure preserves successful output/status and does not replay. Source-only
+registration never downgrades a verified complete graph; complete registration
+validates graph/binding/order/actual store receipts. Build context/Dockerfile
+hashes are existing pre-solve observations; record hashes are explicitly canonical
+semantic JSON, not raw file attestation. Root relocation preserves graph/reference
+facts, uses independent catalog IDs, invalidates derivations and requires verified
+destination CAS rebinding. No leases or global cross-authority atomicity transfer.
+Catchable fresh-init failures clean only owned newly created files; process death/
+power loss and rare pre-return create failures may leave unknown files requiring
+operator recovery, never automatic adoption of an existing empty DB.
+
+Verification preserved source29's6fail and source30's1fail/1198pass/11skip.
+The final failure was a normal `builds/outputs` directory misclassified as a
+malformed build, not integer overflow. Source31 passed1202/11skip in77.19s,
+including malformed metadata, huge finite integer, source-preserving relocation,
+readonly traversal, late committed-output failure and pre-solve provenance cases.
+Two disclosed independent read-only task audits source-closed assigned blockers;
+these are not configured-reviewer/Astra signoff or runtime proofs.
+
+Real source31 Buildx/BuildKit build of the pinned Ubuntu/COPY/C-compile fixture
+succeeded with default output namespace: build `bk-a0c3424ddcb5`, manifest
+`sha256:74ba65eb55664caaa3b3964f56ed96c03a2821c17c81b51591bdf4655d8d7b36`,
+archive `sha256:18391052313a30a32bba3100d380f47bb3c7783e7672547eb5e425ef49da6048`.
+It is a new build, not the historical `7f62247f…` artifact. All five new image
+occurrences cold-materialized; separate CLI processes preserved the exact graph/
+derived/build records and unchanged repeated persisted reads. Actual read-only
+web image/build detail and real log matched the CLI/provenance API; VM count0.
+The stale browser relay was not updated. Existing installed Chrome used a new
+private profile, then normal SIGTERM/process absence/profile cleanup. Lima's
+owned hostAgent automatically forwarded the loopback port; the unnecessary
+explicit SSH forward failed bind/exit255 and was not replayed. BuildKit/web both
+normally stopped inactive/dead/MainPID0. No new VM/cloud/GPU/publication action.
+
+Receipts in `~/.local/share/palimpsest-proofs/spec-goal-20261103/`:
+`M1-12-focused{29,30,31}.json`, `M1-12-real-build31.json`,
+`M1-12-new-build-chain31.json`, `M1-12-new-build-cli-restart31.json`,
+`M1-12-web-surface31.json`/screenshots, daemon/web/browser settlement receipts.
+Earlier read-only relocation diagnostics, namespace diagnosis, early async web
+read and postprocessing key mistakes remain recorded as failures, not product
+success. Final portable lanes/guard/resources are recorded below; continue the
+M1-13/14/15 prerequisites and actual VZ consumer to close M1-04/08/12.
+Approval expiry/counters remain fixed; do not treat this metadata checkpoint as
+VZ `/`, access, source-profile execution admission, M1 or whole Goal completion.
+
+Final M1-12 component source33 `a3e48cda…` passed all four affected portable
+lanes7855/20skips/142warnings in307.22s, with code32 runtime unchanged and only
+architecture evidence/stamp updated. Guard `7e54a87c…` covers621files. Source32
+actual config-selected keep-source relocation preserved original graph/reference/
+order, verified destination CAS bytes, invalidated derivations, assigned an
+independent catalog ID and refreshed a complete frame. The earlier environment-
+override rejection was not bypassed. `M1-12-component-verification33.json` links
+all proof and remains `canonical_complete=false` for pending actual VZ linkage.
+At01:28Z the sole required builder remained Running, physical15552004KiB and
+hostfree485222326272bytes, quota412546013/1GiB, original expiry timer active;
+web/BuildKit inactive/PID0, loops empty, isolated Chrome/profile absent.
+
+## Historical Goal M1-11 local catalog design checkpoint
+
+At source28 the existing local package had no SQLite usage. Source/caller review covered
+build finalization and its pre-success retained exports, tag/source/package
+records, SourceCAS/ordered materialization/derived receipts, pinned UUID run
+ledgers, ledger-only vs live inventory, independent deletion guards and raw-copy
+root relocation. Two disclosed independent read-only task reviews found no
+blocking contradiction in the new architecture/VZ catalog contract.
+
+Decision: one standard-library SQLite in selected `state/catalog-v1/`, through
+StatePaths and existing inventory APIs; persistent local discovery/read model,
+not payload/owner/runtime/lease/Hub authority. Preserve current JSON journals and
+CAS, unknown ancestry, repeated ordinals and partial producer commits. Reuse
+collectors with explicit incompleteness rather than copying their silent-skip
+behavior. Metadata refresh may write only this private subtree, never trigger
+`init_resolved_roots`, quarantine cleanup, config creation or live reconciliation.
+SQL transactions do not enclose existing mutation locks. Producer integration
+must be after guards and broad failure handlers so index failure cannot replay
+or relabel a successful build. Corrupt/unknown DBs fail visibly; root moves need
+quiescence/closed-copy/rebinding, not copied execution authority.
+
+Actual bounded SQLite3.45.1 design proof persisted the real five-layer ARM
+receipt to a separate readonly process, preserved ordered rows, allowed repeated
+bytes under another ordinal then rolled back, rejected duplicate ordinals and
+foreign links, and retained all original rows after rollback. The temporary DB
+was removed normally. `M1-11-sqlite-design-proof28.json` and
+`M1-11-sqlite-design-cleanup28.json` are engine/design evidence only.
+
+At that checkpoint M1-12 was unimplemented; the source31 component record above
+supersedes that implementation status, not the pending real VZ linkage. The
+SQLite3.45.1 probe is still only engine/design evidence. The docs-only M1-11
+checkpoint did not advance its `475b0b10…/619` source guard or grant any new
+VM/network/publication/cloud/device operation.
+
+## Goal M1 contextual fidelity checkpoint — source27
+
+Primary `spec.md` remains the sole completion ledger. M1-09/10 now have the
+required source/focused/actual-filesystem/docs/guard/lane evidence. Current source
+archive `f4f5cf45…` implements v3 lower-only normalization and effective parent/
+root metadata inheritance, shared with the OS reader. New recipe v2 binds
+ordered preceding descriptors/DiffIDs; historical records/leases are read-only,
+not write/reuse shims. Warm workers authenticate graph/prefix/current contracts.
+Cold replay retains no prior staged capabilities and shares one cooperative
+deadline. Cache reopen now opens existing source authority before graph reads.
+Unsupported CloudEnv root `.plmignore` fails before packing/upload.
+
+Actual source27:1178focused passed24.19s;3 privileged SquashFS/OverlayFS cases
+passed1.71s, including omitted parent/root attributes, ordinary user.overlay
+xattrs and same-leaf/different-parent cache isolation. Normal unmount left no
+loops. Original manifest `7f62247f…` five-layer cold/warm conversion and verified
+artifact readback passed; no flattening, original source/process unchanged, all
+new recipe keys, identical cold/warm receipts. Two disclosed independent task
+audits source-closed findings, not configured-reviewer/Astra signoff.
+
+Preserve source26's17failed/1161passed first run and27's missing-sudo wrapper
+failure; do not relabel them as passing. Source27's four affected portable lanes
+passed7746/20skipped/142warnings in306.51s. Docs-only source28 passed143 contract
+tests, lane-manifest validation and Ruff check/format for20 changed Python files;
+guard `475b0b10…`/619files passed. Candidate27→28 changes only six documentation
+files. Readonly per-candidate venvs pin parent/`-I` imports; shared `.pth` is not
+switched. Continue M1-11 through state/inventory, not a parallel metadata store.
+M1-04 native admission, M1-08 explicit host-source mount and VZ actual `/`/
+SSH remain absent. Existing approval/counters/expiry unchanged; no new VM,
+network download, source publication, native/cloud/GPU/deployment operation.
+Evidence is `~/.local/share/palimpsest-proofs/spec-goal-20261103/M1-10-*27*.json`.
+
+## Goal M1 ordered ARM conversion checkpoint — 2026-11-04
+
+M1-09 now has actual filesystem evidence, not VZ execution: existing SourceCAS/
+hard workers/OCIStore accept validated ARM acquisition snapshots and preserve
+original graph/process and ordered occurrence receipts; default native amd64
+identities and worker wirev3 stay unchanged. Explicit `oci materialize
+--platform linux/arm64` is Linux-hosted conversion only. Legacy KVM intent and
+persisted-root preparation reject ARM before lease/volume/run effects.
+
+Source20 `bb5e775b…` passed1164 focused and7642/20skipped/142warnings across the
+four impacted portable lanes. Source19's earlier7638pass predates the P2
+toolchain-discovery budget fix; the shared absolute deadline now covers all
+preparation probes and capability revalidation, with cooperative filesystem IO.
+Independent source reconstruction and legacy/CLI reviews closed their findings.
+
+Actual source17 cold conversion of original manifest `7f62247f…` emitted five
+separate SquashFS results, source17 and repaired20 warm calls reused identical
+per-layer receipts. Real verified-stream/unsquashfs inspection checked original
+base, source, stdout/report, ELF183, ownership/mode and OS symlink; swapped order
+failed. Retain initial sandbox64MiB spool rejection, wrong disposable cache
+labels and test-owned-cwd/root-entry fixture failures. Product gates were not
+weakened, cold work was not replayed/reset, and only signal0 was observed by
+the parent CLI audit hook. This is not global child-signal attestation.
+
+No M1-04 execution binding, M1-08 host-source opt-in mount, native VZ root/access
+or runtime lease exists yet. M1-10 v2 canonical reducer is implemented in
+source24: lower-only order-independent markers, deletion-dominated opacity,
+suppressed descendants, recreated-dir opacity, repeated-hardlink pending fix,
+and single-interpreter OS reader. Focused1057 and privileged 2-case
+SquashFS/OverlayFS proof passed. Four impacted lanes on source24 runtime are
+pending/settled separately. Open P1: upper child without explicit parent dir
+masks lower 123:456/0710 with synthetic 0:0/0755; parent-aware effective metadata
+and recipe binding are required before M1-09/10 can be checked. Do not reuse
+v1-derived receipts for new semantics and do not claim VZ execution.
+
+## Goal M1 local build checkpoint — 2026-11-04
+
+Primary `spec.md` remains canonical. M1-05 is checked from an actual unchanged
+five-input ARM fixture build: original Ubuntu child `19cad596…`, exact TCC install,
+libc6-dev, COPY, compilation and real BuildKit RUN produced stdout41/report15,
+source-identical image files and ELF machine183. Manifest `7f62247f…` retains
+the original first compressed descriptor and DiffID. This is not VZ-root proof.
+
+M1-06/07 source13 focused553 and six actual product Buildx0.30.1→BuildKit0.34.1
+cases passed: Dockerfile-only, external definition/full context, missing source,
+merged ignore, external-specific precedence and required-source exclusion.
+No source writeback occurred. Source12 before evidence preserves ignored-file
+inclusion and false failure after a legitimate empty cache export. Local cache
+now reports no export/null digest/zero bytes and preserves its pointer; native
+mandatory cache, missing and partial exports still fail. Two disclosed
+independent read-only task audits found no blockers; not Astra or an unavailable
+configured-reviewer signoff.
+
+Source13 archive `3f1203c3…`; source14 `9c5146b3…` formats the same implementation
+and strengthens an unchanged-context test. Working source guard `4d0d9207…/619`
+passed. The impacted source14 four-lane run settled7598passed/20skipped/
+1failed/142warnings in378.26s. Its sole failure was an unseeded isolated offline
+hatchling cache; after cloning/rebinding the already verified guest cache, that
+exact wheel-build/install node passed separately in0.37s. This is not one green
+uninterrupted full-lane run. M1-06/07 are checked with these boundaries recorded.
+Receipts: `~/.local/share/palimpsest-proofs/spec-goal-20261103/M1-05-*`,
+`M1-06-*`, `M1-06-07-*`, `M1-07-*`.
+
+The separate guest BuildKit daemon was normally stopped, inactive/dead/MainPID0.
+Finished host/guest case drivers were preserved in receipts then removed. The
+single owned builder, original OCI input, compiled output and needed caches
+remain for M1-09 within the original expiry/budgets. No new VM/create attempt,
+Docker Desktop, host service, cloud, GPU, Ceph/IAM or publication action occurred.
+M1-04 execution binding, M1-08 actual explicit host-source mounting and VZ
+platform/root/SSH/lifecycle remain incomplete; do not check them from build proof.
+
+## Goal M1 OS-source qualification checkpoint — 2026-11-03/04
+
+M1-04 is **not complete**. The reviewed component reads actual effective
+`os-release` from a pinned original OCI graph through SourceCAS leases and staged
+normalized changesets, selects exactly Ubuntu24.04/linux-arm64/lima-vz
+direct-linux source profile and exposes `oci qualify`. It never launches a VM,
+executes image bytes or admits runtime use. No existing native request,
+materializer, boot plan or Lima adapter consumes it yet; amd64/KVM native OCI and
+experimental QEMU carrier behavior were not widened. The first consumer will be
+the later ARM ordered-layer materialization/preparation item, which must
+revalidate the exact CAS graph/OS/profile and bind it to prepared lower/boot
+inputs before any run state or VM effects.
+
+- Source11 archive `077fe139…`; working architecture guard `2b83572d…/614files`.
+  Focused OS/source/normalizer/state/CLI selection passed778. Four portable lanes
+  passed7560/20skipped/142warnings. Source12 doc-only follow-up passed143 CLI/guard/lane tests
+  and manifest `list --check`; source12 changed only docs/spec files.
+- Official Ubuntu24.04 arm64 child `sha256:19cad596…`; original archive28948992
+  bytes SHA256 `f623dc22…`. Linux guest and sandboxed Darwin arm64 source CLI both
+  returned Ubuntu24.04 via `/etc/os-release`→`/usr/lib/os-release`. Derived
+  unsupported OS, dangling preferred link and wrong-architecture variants were refused.
+- Before/after smokes closed early carrier budget, runtime-quarantine preservation
+  and normalizer synthetic-ancestor preallocation findings. Earlier harness failures
+  (Skopeo `/var/tmp`, missing disposable CAS parent, invalid index fixture, stale
+  config-creation fixtures) are retained in receipts and were not product-gate relaxations.
+- Independent configured review identified two P2 defects; its followup returned429
+  and per-call model override was disabled. Disclosed alternative read-only audits
+  closed intake/state follow-up, and the reader/reducer reviewer closed their scoped
+  findings. This is not Astra/unavailable reviewer signoff.
+- Resources: owned builder `sg-b212fed8-b01` remains the one necessary platform;
+  create attempts1/12, public reservation1690264576bytes, guest quota280129960 used at
+  18:40UTC. Disposable proof programs were preserved then removed. Existing user VMs/caches,
+  Docker Desktop, cloud/GPU/Ceph/IAM and deployment resources were not changed.
+  Receipts: `~/.local/share/palimpsest-proofs/spec-goal-20261103/M1-04-*.json`.
+
+## Goal M1 source-policy checkpoint — 2026-11-03
+
+Canonical progress is the primary checkout's
+`/Users/pieroot/code/palimpsest/spec.md#goal-실행-체크리스트`, not this older
+SDK task list. Keep the complete G0→M1→M2→M3→M4→M5.1~5.5→FINAL scope.
+M1-01/02 are reviewed designs, not implemented native-root support.
+
+- Implementation: this isolated `goal/m1-vz-arm64-20261103` worktree, base
+  `6e4dff7ac0493426f12d34f5e143bab52b3566d7`, uncommitted. Preserve primary mixed
+  WIP and the old SDK release tree. No new tag/release/Kolla rollout occurred.
+- M1-03 implements exact operator source policy across intake/cache/build/run,
+  immutable job provenance and fresh actual-commit authority over existing pipes,
+  with HOLD/prefix preservation. Independent source findings are closed.
+- Final source07 archive SHA256
+  `e9f1cadf32833c647e2dc0f70755a5a6653a1f6793f8797e75434c7b810c4c32`;
+  working architecture source `12b3a2aa…/609files`. Final four portable lanes
+  passed7350/22skipped/142warnings in380.66s. Root focused1301/2skipped and Hub
+  1670/2skipped plus the separately passing sparse node have their precise
+  source/sandbox boundaries in [testing.md](testing.md#m1-03-source-policy-qualification--2026-11-03).
+- Real CLI, arm64 BuildKit exact local-stage OCI, publication-pipe revocation
+  and loopback Uvicorn/SQLite policy transitions passed. HTTP identity and
+  payload/storage fixtures are synthetic. Future-stage COPY was engine-rejected,
+  not policy-rejected. None proves actual VZ user `/`, SSH/supervisor, original
+  Ubuntu/CUDA execution, Keystone, Docker Desktop, container build/deployment or
+  Ceph/Nova/GPU. These remain separate Goal items.
+- Local receipts: `~/.local/share/palimpsest-proofs/spec-goal-20261103/M1-03-*.json`,
+  accessible on this host. Retain earlier test failures, exact review closures,
+  missing deferred-output incident and the reviewer's unauthorized public
+  metadata lookup/unknown byte count; do not turn reservations into measured total
+  network traffic.
+- Approved campaign `sg3-b212fed8` expires2026-11-04T12:19:27Z. One new necessary
+  builder4CPU/8GiB/30GiB remains; creation spent1/12, download reservation
+  1690264576bytes. Final resource receipt binds physical usage, quota, timer and
+  exact VM identity. Existing user paths/VMs/cache/Desktop/cloud resources remain
+  excluded. Next ordered work is M1-04; read-only OS/profile research is not
+  implementation or native proof. Sol develops with separate independent review;
+  no Astra route/signoff is available.
 
 ## Worktree consolidation — 2026-11-02
 
@@ -5982,16 +7762,44 @@ Exact selectors and caveats: [testing](testing.md#host-vm-removal-across-state-r
 - Final local closure: CLI reference is current; Kolla/assets/shared-storage/package checks passed81/1skip in121.35s using the existing venv's Ansible and uv on PATH. Initial invocations failed only on missing PATH tools and an obsolete source-text volume assertion; removed that implementation-only test instead of re-pinning it to the new rendered-volume expression. Actual Ansible/render/storage checks and wheel installation remain exercised. Final reviewed guard `917791effa5bc4830f41701aa3dbffeaba821038a0ccf7a8ac299473299447d1`/606files supersedes the prior3b228test snapshot; runtime worker archive remains `4e071d9eee238247dd711f2a5216e550b9a5ae89d54f3444586dad88b7e90a45`/6041600bytes. Final wheel pair was actually installed with no dependency changes and imported with Python `-I` outside the checkout; CLI reports0.3.11.dev0. `source-verification.json` records the exact boundary. No container build/deployment or live native result has been added.
 - Owner then separately approved local Docker Desktop-only linux/amd64 builds/import/CLI for three new tags, network/host-volume-free runtime only, no push/deployment/cloud/GPU. Local Unix socket and desktop-linux builder were verified explicitly; inactive/foreign builders were not modified. Initial917791ef image builds succeeded, but the first import smoke correctly stopped at worker-package SHA mismatch. Inventory proved all161 distributed file hashes identical; editable source alone contained Finder `.DS_Store`. Fixed `package_archive` to ignore that non-distributed metadata without deleting the user's file or relaxing code checks. CloudEnv166tests passed; new reviewed source `45c5d8ba165024d93ee9b7d156456efb6c824c622dc7fb1e915edb849119b9d1`/606files and worker archive`88b88e13fb5665978b09a4d39fae8c17e6b2213de47664fda2ff93a3cf6bf338`/6031360bytes supersede prior917/4e071. Owner explicitly approved the packaging-only ref amendment; new45c5d8ba tags are being qualified separately. Preserve old tags/evidence; no blanket image/container cleanup. Operator selected supplying the required publisher/issuer/mount prerequisites outside this session; live native acceptance remains blocked until provided and separately approved.
 
-## SDK0.3.11 formal release and Kolla continuation — 2026-11-03 (in progress)
+## M1-27 Packer vs native comparison — first real execution, 2026-11-07 (interim; M1-27 still unchecked)
 
-- Owner explicitly authorizes the recurring reviewed-source → patch increment → new immutable tag/release → canonical Kolla-Ansible deployment → actual API check loop without routine per-iteration confirmation. Existing private Ceph/IAM, paid native/GPU budgets and unrelated-resource protections remain separate. Latest public version at preflight is0.3.10; this source prepares0.3.11, not a moved old tag.
-- Fixed the actual Docker packaging discrepancy without relaxing the worker pin: editable-only Finder metadata is excluded, all161 distributed files matched; public Hub source is made readable without root DAC capabilities. All3linux/amd64 images executed import/CLI under networknone/no volumes/read-only root/capdropALL/512MiB/1CPU/64pids. Client/Hub are0.3.11; worker package is`b67244a769152ee1320a2721d66793339310c4d25bceda1b479eee6fe5770c87`/6031360bytes. Images remain local preflight artifacts, not deployment evidence.
-- Live read-only operator baseline reached `wireguard-dmslab`/wireguardserver with no active Kolla process. Operator still selects0.3.10 via a private local wheel source. Three API containers use imageID44416316…, three exports a5195089…, worker98383de3… usesc0068eb6…/restartcount1732 and old57ab scratch. Public ready returned200. Actual MariaDB10.11.19 has20tables, image jobs lackvisibility (2complete/6error), and unknown context creators=0. No production SQL/config/service mutation was made.
-- Added the required offline schema upgrade before FK creation: historical jobs becomeinternal, original known creators enter the contextPK, unknown creators block beforeDDL, and missing legacy job metadata is quarantined before effects; already-building missing facts complete409. Literal stable15table and pre-publication schemas passed real SQLite/HTTP cases; actual isolated MariaDB10.11.19 passed5cases and two full JSON/graph-copy cases, including unknown-ceiling rejection then exact reviewed mapping. ReflectedLONGTEXT failure was reproduced before repair. Four JSON/TEXT source/destination graph variants and UTF8/blank/NUL request boundaries have failing-before/passing-after proof. MariaDB fixtures exitednormally0 and only their disposable volumes were removed.
-- Root core-cli/host-runtime/build-registry initially had5749passed/95toolPATHfailures; all95passed after restoring the required toolPATH. Root sync temporarily pruned21cloud extras, which were restored at their exact original versions; only requested client metadata remains0.3.11. Final source-wide Ruff/format, CLI-reference and lane checks passed. Full Hub58source1612/7 passed before finalNUL guard; isolated complete final Hub passed1614/7 in357.99seconds.
-- Concurrent standard-project-role/auth/package-API/UI/test/doc edits then appeared in the primary checkout; those are another slice and are preserved. A shared-tree full run met new403/lint failures and is NOT a pass for that mixed tree. The accidental shared review stampeded71… must NOT be treated as approval of those foreign bytes. Release work is isolated at`/Users/pieroot/code/palimpsest-sdk-release-0311-20261103`, branch`release/sdk-manila-0.3.11-20261103`, base7962b18. Recovered all90owned public paths from the already-built complete source distributionSHA`d8fec7409f38c5c6a1c6218452100f6030c65fe56bde534d647ac3931e782fdb`; all58Hubruntime files matched the qualified58image, all161SDKfiles matched theb672wheel, and every unownedHubruntime file matchedHEAD. Overlaid only AST-proven finalOSguard/NULcases, FinderDockerexclude and owned architecture prose. The concurrent images fixture and role docs were not copied. Primary worktree/index remain untouched by recovery; isolated reviewed guard is`b4246065b8568290e1fa3496b94e958b8345813e6495a57796375f33f6adca15`/606files.
-- Independent schema/release reviewers closed bounded fixes; no Astra-specific orchestration/signoff is available. Existing six strict dev ruleset contexts and `PALIMPSEST_KVM_ENABLED=false` remain unchanged. Worker journal read-only projection currently shows stable48byteclaim_pending without usable ID/channel; startup/reconciliation is HOLD pending exact retained-state settlement. Do not hide this by clearing a journal or blindly starting a fresh volume. Operator publisher/issuer/mount and actual namespace/native warm proof remain pending, not implied by release/deployment authority.
-- PR38 was created and branch64166e153275d64320458b239f65734319b67145 pushed through the ordinary workflow. PR Hub/image gate41617434946 passed; Test41617435233 failed portable shards. Distinct failures were an undeclared realSDK test dependency (including secondary cleanup failures), two macOS CLI-start readiness timeouts and a descendant-PID startup race. Added the existing SDK range todev (base[]unchanged), with only root/Hub lockmetadata updates. Clean Python3.12dev-only NativeCloud232passed; no skip/fake404 workaround. Removed the loopback HTTPServer's unnecessary getfqdn dependency; controlled resolver stall proved that dependency, but the exact individual macOS CI timeout cause remains unconfirmed. Genuine mTLS/no-resolver/idle-and-dripTERM plus ready-descendant smoke passed65. Descendant tests retain the0.2second deadline case and confirm the real child installs TERM-ignore and publishes its PID before the boundary; non-deadline success uses a separate startup allowance. Fresh complete portable lane passed9669/228skip in627.72seconds; the later new state-continuity render case separately failed-before and passed-after with all30Kolla remote-build cases.
-- Correction to the initial worker custody observation: the48byte legacy root journal is NOT the configured active journal. Current effective work path is`/var/lib/palimpsest/build-worker/claim-cursor-20261030-02`, historical inode811391/device64769/root0700. Actual active journal is identified recipe sequence58848/channelhashd809a49a…/sha`dd04a766bf3bbf848b042c636cb23fc634120c62303ecc18621c84664610fdef`, no bound ID/output. Exact-channel SQL has recipe58846/image58847 cachednone; all6builds and8imagejobs are terminal, exports empty. No claim-recovery GET was issued: it is a mutating settlement. Current source's SQL-fenced recovery may settle that exact pending sequence only after the coordinated old-writer fence; unbound legacy parent and1af markers remain preserved and do not authorize bypass.
-- Installed repair-wheel role also lacked a distinct work-path variable, so relying on old99config would have selected either the wrong volume or legacy root. Added `palimpsest_build_worker_work_path` defaulting to the mount and a real Ansible rendering/state-selection regression. Before any service apply, backed up99/project/lock privately on operator under`/home/pieroot/.local/share/palimpsest-sdk-0311-64166e1-20261103`; no active Kolla process was observed. Pinned only exact existing57abvolume, parent mount and qualified cursor subdirectory in99; all other values/oldimagepins unchanged, owner1003/group1004/mode0640 retained and backup parent0700. This is config selection, NOT installation/restart/schema or claim settlement. Must install the qualified new role and compare the actual rendered tuple against Docker inspect before applying worker lifecycle.
-- Operator99contains none of the namespace publication/issuer/mount inputs and no native profiles. Those live prerequisites remain unavailable, not a reason to fabricate success or enable fallback. The bootstrap source repair changes the client worker-package digest to`e51e812528d86c743dd0b8926904cb54b3db08a20a0c5ff56115aceaf81cf6f4`/6031360bytes; b672is the prior qualified snapshot and grants must not silently follow this change.
+- **Scope/authority:** renewal416 only (UTC 2026-11-08T01:34:18.689437Z and monotonic 389311.159806125 either-expiry rule), create attempts 22→30 of 50 (Packer pb501/pc502/pc503/pb504/pc505 = 23–27, native n15/n16/n17 = 28–30), no force/signal/QMP control, no replay. All eight QEMU rows and all native runtime rows ended `Removed` with pinned cleanup/absence receipts; guard after each lane passed. No commit, push, publication, cloud, GPU, IAM or deployment.
+- **Reviewed sources (parent-computed disk hashes, not agent-reported):** fence500 `c971350f…`, bake500 `2861bf9d…`, gen500 `519f17f5…`, launch500 `467d28b2…`, consumer500 `f4a3e165…`, native503 `3058a2a7…` (native501 `56d524ec…` + a one-line fix, receipt 516), native owner glue504 `e37e7ab6…`/later `sha_glue` in receipt. Independent review rounds: native 3, fence 1 (P0 case-order fixed), launch/consumer 3, bake/generator 1 — final open P1/P2 none. A real first-execution defect (native501 line 942 UnboundLocalError) escaped three reviews and was caught before any effect; a parent CPU test also spawned `plm --help` and wrote 109 `.pyc` files into the qualified SDK tree, which the fence correctly HELD on; both are recorded (516, 504/505). Lesson: run a real linter/AST scan and an actual first call, never spawn the SDK interpreter in CPU tests, and hash files only after the last edit.
+- **Packer success path observed (first time):** bake Packer exit 0 with parent-observed QEMU (pid,birth) absence (`M1-27-pb501-bake-result500.json`); consumer clones of the golden boot, run the same workload over SSH (`count=3 sum=31`, changed `sum=131`), end by authenticated poweroff with direct QEMU exit observation; golden verdicts GOLDEN-CONFIRMED from guest journal text (string matches, not attestation). Bake Popen→exit 58.925 s (cold), 59.230 s (changed); consumer Popen→workload result 11.565/11.877/11.887 s (ssh_ready is an upper bound because the first SSH attempt always timed out at 10 s banner exchange).
+- **Native observed:** `plm build` 4.57 s cold (SDK total 3.712 s, cache none) / 1.63 s changed (SDK 0.819 s, cache local); consumers create→handoff 22.47/22.47/22.34 s (workload finished no later than create exit; upper bound); per-consumer host free delta about −2.68 GB vs Packer clone free-delta within host noise (+0.8/+4.3/−8.1 MB). b01 worker-mux argv length was 38 (the earlier 36 assumption failed) and was admitted only through the retained-Popen `_PROSPECTIVE_B01_WORKER_MUX` binding.
+- **Comparison caveats (full list in `M1-27-comparison-interim520.json`):** different hypervisors/boot paths; native build used an already-warm builder; native prepared phases are dominated by ~10 s custody guards; battery power throughout (86%→61%); n=1 per path; Packer upload was the whole `workload/` dir (7,226,400/7,226,405 bytes, not the 7,221,720 deb-only figure written in the interim receipt).
+- **Open for M1-27:** same-VM stop/start measurement for both lanes (spec line 444). New sources are being authored and independently reviewed: native restart505 (`plm stop`/`plm start` on an extra n18 consumer) and Packer table600 (pb506/pc507 with a guest-reboot tail; same QEMU process/disk/instance-id, firmware reset occurs). Then final comparison receipt, M1-27 check and M1-28 gate. Pending approvals: none new; attempts 31+ remain within the existing cap.
+- **Exact pins (supersede the abbreviated list above):** native503 `3058a2a799ea8d496e66092001e0b4cb81deb6369e962f0627a52511dd484327`; native owner glue504 `e37e7ab6367b9b5d3b5e162abf5653f3ea3c07b83c79e3c3d4dbf1fc11733e6f`; the "later sha_glue in receipt" wording above is void.
+
+## M1-27 closed and M1-28 GATE applied — 2026-11-07 (supersedes the "Open for M1-27" bullet above)
+
+- **Restart measurements done.** Native (n18, attempt 33): `plm stop` 4.703 s, `plm start` 8.057 s, same run/instance/lease set, new guest boot id, main re-ran (logs show two runs, exact output), all eleven checks true (`M1-27-native501-consumer-restart-m505-summary.json`). Packer (pb506 bake attempt 31, pc507 consumer attempt 32): same-QEMU-process guest reboot, request→SSH on new boot 41.9 s (upper bound; includes ~30 s old-guest shutdown), same pid/birth, new boot id, workload re-run exact, expiry timer re-armed (`M1-27-packer-restart-measurement525.json`). A QEMU relaunch from the same used disk was **not** measured; the Packer lane has no VM manager.
+- **Final comparison:** `M1-27-comparison-final527.json` (+ `…supplement528.json` clone timings, `M1-27-failure-and-retry-cost529.json`). n per path is stated in the receipt. Failures before the first Packer success (attempts 20–22, builder incident) are costed in 529 and not folded into the success-path composites.
+- **Review/fix chain for the restart sources:** Packer table600 + reboot tail (two independent reviews, no open P1/P2) and native restart505 (one review; one recovery-path P2 fixed by the author, verified by the parent by ruff/AST/reading, **no independent re-review**). Active pins: fence600 `a25c1b4b4438b0a6534677ec0a076e3399d185e04fbc879cff71e70cea3749df`, launch600 `ebcabd9279e1fa91de3b50769ab33554c6a4cdc7901701222c09e5257c08193a`, consumer600 `87e9b1f895789a6957bf111bcc7a1736c49cbe1a78b348f2018d9bc7fb2f5edd`, restart505 `2a04a650217410441dbc92e6be79e1bea34f544e91aaf610c6797bc2b8d09882`.
+- **GATE (M1-28) result, `M1-28-gate-application530.json`:** GATE-01..05 met at M1 scope with the caveats above. Isolated M1 tree: `scripts/check_architecture.py` exit 0, `source_sha256=1f9cf5e4ec7049e4d5205661a5d2193eb356829cfb34f5d245842d1e3fd343d7`, 634 files (read-only check; no stamp). Primary repo guard exits 1 (stale; mixed WIP, unrelated to this work, not stamped). Nothing committed, pushed, tagged, published or deployed.
+- **Resources:** attempts 33/50. Only builder `sg-b212fed8-b01` is Running (hostagent 62404, mux 76754) under renewal416, expiry UTC 2026-11-08T01:34:18.689437Z; all QEMU and native consumer rows are Removed; no leftover listeners, disks or hold files (direct inventory). Retained evidence/reuse inputs listed in the gate receipt.
+- **Scope of the M1 completion declaration:** L0, L1, R1 and the **local** half of S1. S1's OpenStack shelve/unshelve is an M4 claim and is not made here. Next: M2-01 (read-only review of Hub API/storage/DB/Kolla/key domains); live Hub, IAM, deployment, GPU or Ceph actions remain behind specific approval.
+
+## M2 implementation in the merge worktree — 2026-11-07/08 (independently reviewed; commit, push and release state: see "0.3.13 release integration" below)
+
+- **Where:** isolated worktree `/Users/pieroot/code/palimpsest-m2-merge-20261107` on base `7962b18`; committed as `f54a0d1` on 2026-11-08 (see the release section below for push/CI/deployment state). The first stamp (`source_sha256=81d91b88…`, 648 files, working tree) was superseded by a stamp computed from the committed tree. `scripts/generate_cli_reference.py --check` passes (reference current).
+- **Hub, what exists:** DB-authoritative quota (`palimpsest_hub_image_quota_policies` tier×visibility with nullable `max_images`/`max_chain_bytes`/`max_source_bytes`; `palimpsest_hub_image_quota_tiers` user|project→free|paid; seeds fill missing rows only) enforced inside `register_image` after the request_id replay lookup under the global image mutex; 403 `image_count_limit`, 413 `image_chain_size_limit`, 413 `image_source_size_limit`; image-job completion settles those as terminal job errors. Admin `/v1/admin/image-quota/{policies,tiers,usage,physical}` and `GET /v1/image-quota/me`; SQL-aggregated usage/physical report (digest once per storage namespace, logical vs physical bytes). `ppi_v1_` image keys (`images:read`, `images:publish`, publish ≠ read, hash-only, once-shown, ≤90 days, per-user active cap default 50, human-token management only, membership revalidated at use and before writes; `ppk_v1` keys have no image authority). Anonymous `public` list/get/blob with redacted projection, invalid credential → 401, per-client per-process rate limit. Optional `oci-root` source closure (`palimpsest_hub_image_source_blobs`, own-staged blobs, manifest commitment, OCI document coherence, served by image membership; staging no longer checks SquashFS magic, registration does). Manifest `platform` accepts `linux/arm64` for oci-root only; execution paths refuse arm64. `migrate.py` copies keys, quota and source-closure tables.
+- **Client, what exists:** `palimpsest published push|pull|status` (`hub_publish.py`), unreleased catalog schema v2 (`publications`, `pulled_images`, `pulled_layers`; round-1 DDL refused), request id persisted before the first network call, generation/terminal/replay semantics, `published` only after a matching Hub response, credential order `--image-key-file` (0600) > `PALIMPSEST_IMAGE_KEY` > `PALIMPSEST_TOKEN`, `--confirm-public`, `--no-source`, environment-exposure notice, pull with full OCI chain verification and rebuilt layout under `<state-root>/published/<id>/layout` (0700/0400) registered via `LocalLayoutSource` + `inventory.record_oci_source` (no VM) and a `plm run` hint, `store rm` blocking pulled digests, content-only manifest receipts (same digest from any state root).
+- **Paths:** Hub `hub/src/palimpsest_hub/services/{image_quota,image_keys,public_images,published_images,image_jobs,instances,native_instances}.py`, `api/{image_admin,image_keys,published_images}.py`, `image_key_models.py`, `image_models.py`, `config.py`, `database.py`, `main.py`, `migrate.py`; client `src/palimpsest_local/{hub_publish,local_catalog,hub,image_manifest,inventory,cli}.py`; Kolla `deploy/kolla/ansible/roles/palimpsest/defaults/main.yml` (`palimpsest_api_forwarded_allow_ips`, default `127.0.0.1`); tests `hub/tests/test_{image_quota,image_jobs_quota,image_source_closure,image_keys,public_images}.py`, `tests/unit/test_hub_publish.py`, Linux-only `skipif` in `tests/unit/test_oci_worker_protocol.py`; lanes in `scripts/test_lanes.py`; docs `ARCHITECTURE.md`, `CHANGELOG.md`, `docs/{testing,install,project-package-registry,vm-workflow}.md`, `docs/cli/{usage,reference}.md`.
+- **Verification (exact):** test-passed only. Hub lane and root per-file runs passed in a scrubbed macOS environment with synthetic Keystone and SQLite (`tests/unit/test_hub_publish.py`: 70 tests, stable over repeated runs); an isolated end-to-end harness (real Hub app under uvicorn on loopback, real client CLI, fake Keystone over HTTP, no dependency overrides) passed 77 checks on the final source (earlier revisions also passed twice); a separate Hub-level script exercised the seeded free chain caps with real byte counts (private 1073741824, internal 5368709120, public 10737418240: one byte under and exactly at the cap publish, one byte over returns 413 `image_chain_size_limit`) and passed 11 checks on the final source. Independent reviews: quota, access (security), Hub round 2 (security) and client rounds 1–6 (round 6: ready on correctness, no open P0/P1/P2); receipts 537 and 538 under the proofs directory. NOT verified: live Hub/Keystone/Afterglow OAuth, Kolla deployment and Kolla tests (`ansible-playbook` missing), MySQL/MariaDB, Manila/CephFS closure copying, Linux-only tests on this host, an actual `plm run` of a pulled image on a separate state root, a second Apple Silicon device. Evidence receipts are outside the repository.
+- **Owner decisions recorded:** count = unique name per scope; bytes = stored compressed sizes; GiB = 2^30; each distinct digest counted once per image; image keys are a separate kind from package keys; source closure option A (publish original OCI closure, runnable after pull); separate source-byte cap (seeded equal to the chain cap). Receipt 537 (2026-11-08): physical storage = Hub-known stored blob bytes per storage namespace (cloud-side Glance raw conversion/Cinder usage excluded by the owner); oci-root charges every manifest layer including original OCI base layers; paid-tier seeds kept as proposed (private 20/50 GiB, internal 50/50 GiB, public unlimited count/100 GiB source).
+- **Known consequences/open risks:** limits cap distinct names and per-image chain/source bytes, not total storage per scope or versions under one name; a scope already over a lowered limit can still add versions under existing names; downgrade never deletes. Publishing a closure exposes config environment values to every reader (anyone for `public`), unlike the public manifest projection. Staged-but-unregistered blobs have no aggregate quota or expiry (pre-existing). The Hub serves stored blobs without re-verification (clients verify). Quota SQL uses MySQL/MariaDB-sensitive `CAST AS BINARY` and JSON extraction, untested there. Rate limit is per process/node and keyed on uvicorn's resolved address: behind HAProxy without the HAProxy sources in `FORWARDED_ALLOW_IPS` all anonymous callers share one bucket per proxy; the role variable exists but no deployment sets it, and rate-limit/key-cap settings are not Kolla variables. In-place bootstrap does not add `max_source_bytes` to a dev DB that already has the never-shipped quota tables (offline `migrate.py` copy seeds it from the chain cap).
+- **Client replay redesign (receipt 538), review findings closed:** the round-3 P2 (publish-only key replaying another credential's row) was closed by a redesign instead of the original recipe, after rounds 4–5 showed that shared pending replay rows create other duplicates: unpublished generations are owned by the credential that began them (`publications.hub_credential`, the public `ppi_v1_` key id; NULL for non-key credentials); a credential that cannot read replays only rows its own key recorded; its own unresolved attempt is retried first with its own request id; a refused or uncertain replay never starts a generation and never reports "nothing changed"; a 404 replay starts a generation inheriting the stored Hub request id; a non-key credential that cannot read refuses. `FakeHub` now routes before recording (flake fixed), tracks per-(project,user) staging and applies the Hub's publish-only precheck; the staging sweep judges the newest mtime in each tree; the arm64 intake precheck limit is documented. The `publications` DDL changed in place under `user_version` 2 (unreleased; exact-DDL check refuses earlier drafts). The internal-image refusal was not kept (not decidable on first encounter). By-design duplicate-image situations are listed in `docs/cli/usage.md`. Remaining P3: an older valid own row plus a newer own attempt with a fresh request id after a mismatching Hub answer can register an extra image (broken Hub only).
+- **2026-11-08 independent reviews and corrections (receipt 539):** (1) whole-surface M2 security review (agent `M2WholeSecurityReview`): no P0/P1; P2 fixed (anonymous list pages capped at `ANONYMOUS_LIST_LIMIT = 20`, regression test); accepted P3 items are listed in ARCHITECTURE.md. (2) merge-integrity review (agent `MergeIntegrityReview`): no merge-induced code defect; four v0.3.11 release fixes that the hand merge had lost (and that the primary line lacked) were ported (`openstacksdk` in the dev extra and both lockfiles, `nova_bootstrap_service` `server_bind` override + test, Kolla `palimpsest_build_worker_work_path` + `docs/install.md` + test, OCI worker-protocol descendant-ready flake fix); P3 fixed: store listing/preview now blocks digests referenced by pulled Hub images (`deletion_blockers.published`, web UI list). The earlier merge receipt's statement "no merge-dropped tests found" was inaccurate for those tests; 14 hub auth/package tests that differ from M1 were removed deliberately by the primary's native-role cutover. Hub lane 1967 passed / 7 skipped, six Kolla files 125 passed / 1 skipped (with `ansible-playbook` from the venv on PATH; the earlier "ansible-playbook missing" failures were a PATH problem, not a missing tool). (3) architecture review (agent `ArchDocReview`): 12 blockers and 14 nits against ARCHITECTURE.md, all fixed; it also found a real source defect, fixed: `credential_free_subprocess_environment` now removes `PALIMPSEST_IMAGE_KEY` from Docker/Buildx/mksquashfs/helper child environments (test extended), and a pull whose local source registration fails now reports `runnable: false`, no run hint, `source_registration_error` and a message (test added). Code comments about the oci-root rule and paid seeds now cite owner decision 537.
+- **Final verification on this source (test-passed + isolated end-to-end, not live-verified):** `tests/unit/test_hub_publish.py` 72 passed; `test_local_catalog`, `test_inventory`, `test_cli_contract`, `test_registry`, `test_package_credentials`, `test_docker_hub`, `test_registry_intake`, `test_test_lanes`, `test_cli_reference`, `test_ui` passed (one process per file); Hub M2 files 21/6/36/27/23 passed; real-Hub harness 77/77 (source aggregate `63511eb2…`, unchanged during run) and GiB boundary script 11/11 after the last code edit; ruff check clean and ruff format clean on every Python file changed by M2/this review. Not verified: live Hub/Keystone/Afterglow OAuth, Kolla deployment on a real cloud, MySQL/MariaDB quota SQL, Manila/CephFS closure copy, Linux-only tests on this host, `plm run` of a pulled image, second Apple Silicon device.
+- **Not approval-gated (corrected):** independent review, architecture review/stamp and the guard are ordinary workflow steps and are done above. The owner's 2026-11-03 authorization (`openspec/specs/contributor-workflow/spec.md:14`) covers reviewed source → patch bump → new immutable tag → canonical Kolla-Ansible deploy → API verification without per-iteration confirmation. It does not waive the CI, ownership and data-preservation gates, Ceph/IAM credential provisioning, GPU/device reassignment, new paid native/VM campaigns or foreign-resource deletion.
+- **Remaining before the release loop can start (preconditions, not approvals):** commit scoping of this worktree against the primary line (the primary's own `spec.md`/`docs/development-handoff.md` sections written after the copy were reconciled only for `spec.md`; reconcile this handoff with the primary's "M2-01 closed…/M2 update" sections before commit); Linux hosted CI (29 `sys.platform`-spoofing test sites, `tests/kvm`, integration, e2e) and `ruff format --check` drift in the 19 inherited files (CI enforces it); MariaDB execution of the quota SQL; the Kolla target, inventory, rollback and API verification plan recorded before effects; operator decision on `palimpsest_api_forwarded_allow_ips` for the deployment. Still blocked by live access/devices: real Afterglow OAuth (M2-05/08), a new VM from a pulled layout (M2-15; SDK154 re-qualification, fence guard, native-effect grant; renewal416 expires 2026-11-08T01:34:18Z), second Apple Silicon device (M2-16).
+
+## 0.3.13 release integration — 2026-11-08 (committed and pushed on a release branch; CI in progress, not merged, tagged, published or deployed)
+
+- **Authorization (owner, 2026-11-08):** commit all progress, push a new version so CI/CD builds the images, then reconfigure only the palimpsest role on the Kolla-Ansible deploy server and continue verification. The 2026-11-03 standing authorization still excludes bypassing CI, Ceph/IAM provisioning, GPU/device reassignment, new paid native/VM campaigns and foreign-resource deletion.
+- **Refs:** `f54a0d1` (M1+M2 on `7962b18`, 231 files) → release infrastructure of published `0.3.12` (`4905228`) adopted → merge `9220353` (ancestry only; our tree is authoritative) → `3ce3b68` version `0.3.13` → stamp commit → release-gap fixes. Branch `release/0.3.13-m1-m2-20261108`, PR #40 into `dev`. Production runs the local lineage (approved source `1afca68`); published `0.3.12` was never deployed.
+- **Hosted CI, first run:** lint/manifests/package, guest stage-1, OCI filesystem proof, local OCI product build, Hub unit tests, Hub image build and Linux shards 1/3/4/5/6 passed. Linux shard 2 failed because `tests/unit/test_development_package_workflow.py` still pinned the pre-release tag trigger (release delta applied: numeric tags). macOS shard 1 failed in `test_darwin_process.py::test_real_process_birth_and_natural_exit_are_distinct` (venv interpreter re-executes the framework binary; the test now compares `realpath`). macOS shard 4 failed on the same workflow file as Linux.
+- **0.3.12 comparison (agent `Rel312GapReview`, independent):** gaps G2 (upload finalize and bundle import revalidate the original writer for every caller just before commit), G3 (SDK/image-key publication revalidates the original subject after locks and payload copies via a `recheck` callback) and G4 (both policy modules validate the parsed rule graph including negations on every reload, and a missing configured policy directory fails with 503) were ported with tests. G5 (following role-implication links through domain-scoped intermediate roles) is intentionally not ported: Keystone already expands implied roles and removes domain roles before Hub sees tokens, and the reviewed local role code deliberately never lets domain aliases assert global roles. Release tests that conflict with the thirteen-action design (manager tier for key issue/delete, reader own-key actions, 403 instead of an empty capability preview, system-admin delete bypass) were not ported. `docs/install.md` carries a 0.3.13 transition gate runbook.
+- **Production read-only baseline (2026-11-08):** three controllers each run `palimpsest_hub_api` and `palimpsest_hub_worker` (healthy); database has 20 tables (1 build context, 8 image jobs, 6 builds, 20 layers, 2 worker claims, 8 leases, 3 instances, 60 runtime blob refs), MariaDB 10.11.19, `utf8mb3`/`utf8mb3_general_ci`; operator `/etc/kolla/.venv` has `palimpsest-client` 0.3.10 from a private wheel, role data under `.venv/share/kolla-ansible/ansible/roles/palimpsest`. `reconfigure` does not run `palimpsest-hub-bootstrap`; the new schema needs the offline bootstrap with writers stopped and a paired backup first (runbook above).

@@ -15,8 +15,9 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -27,7 +28,15 @@ from .errors import ArtifactValidationError, UnsupportedPlatformError
 from .oci_changeset import EntryKind
 from .oci_converter import StagedLayer
 from .oci_tar_emitter import TarEmissionReceipt, normalized_xattr_bytes
-from .web_job_client import run_preparation_tool
+from .web_job_client import (
+    PreparationToolHold,
+    defer_preparation_termination,
+    defer_web_cancellation,
+    preparation_custody_held,
+    require_preparation_custody_owner,
+    retain_preparation_custody,
+    run_preparation_tool,
+)
 
 _IO_CHUNK = 1024 * 1024
 _SQUASHFS_SUPERBLOCK_SIZE = 96
@@ -192,11 +201,16 @@ class SquashFSPackExecution:
 
     scratch_root: Path | None = field(default=None, repr=False)
     inherit_process_group: bool = False
+    no_force: bool = False
 
     def __post_init__(self) -> None:
+        if type(self.no_force) is not bool:
+            raise SquashFSPackError("oci-pack-execution", "termination policy is invalid")
         if type(self.inherit_process_group) is not bool:
             raise SquashFSPackError("oci-pack-execution", "process-group policy is invalid")
-        if not self.inherit_process_group:
+        if self.no_force and self.inherit_process_group:
+            raise SquashFSPackError("oci-pack-execution", "no-force packing requires its own preparation group")
+        if not self.inherit_process_group and (not self.no_force or self.scratch_root is None):
             if self.scratch_root is not None:
                 raise SquashFSPackError("oci-pack-execution", "standalone packing cannot use supervisor scratch")
             return
@@ -262,7 +276,10 @@ class VerifiedSquashFSToolchain:
     _packer_path: Path = field(repr=False)
     _dependencies: tuple[_ToolchainFileBinding, ...] = field(repr=False)
 
-    def verify(self, packer_path: Path, expected_packer_sha256: str) -> None:
+    def verify(
+        self, packer_path: Path, expected_packer_sha256: str, *, deadline: float | None = None, no_force: bool = False
+    ) -> None:
+        _discovery_timeout(deadline, 30.0)
         expected = normalize_digest(f"sha256:{expected_packer_sha256}")
         try:
             selected = packer_path.resolve(strict=True)
@@ -273,12 +290,13 @@ class VerifiedSquashFSToolchain:
         executable = _bind_toolchain_file(selected)
         if executable.digest != expected:
             raise SquashFSPackError("oci-packer-toolchain", "selected packer bytes changed")
-        paths = _discover_dependency_paths(selected)
+        paths = _discover_dependency_paths(selected, deadline=deadline, no_force=no_force)
         if paths != tuple(binding.path for binding in self._dependencies):
             raise SquashFSPackError("oci-packer-toolchain", "selected packer dependencies changed")
         current = tuple(_bind_toolchain_file(path) for path in paths)
         if current != self._dependencies:
             raise SquashFSPackError("oci-packer-toolchain", "selected packer dependency bytes changed")
+        _discovery_timeout(deadline, 30.0)
 
 
 def _bind_toolchain_file(path: Path) -> _ToolchainFileBinding:
@@ -321,7 +339,19 @@ def _bind_toolchain_file(path: Path) -> _ToolchainFileBinding:
         _close_fd(fd)
 
 
-def _discover_dependency_paths(packer_path: Path) -> tuple[Path, ...]:
+def _discovery_timeout(deadline: float | None, maximum: float) -> float:
+    if deadline is None:
+        return maximum
+    remaining = deadline - time.monotonic()
+    if not 0 < remaining < float("inf"):
+        raise SquashFSPackError("oci-packer-timeout", "filesystem toolchain discovery deadline expired")
+    return min(maximum, remaining)
+
+
+def _discover_dependency_paths(
+    packer_path: Path, *, deadline: float | None = None, no_force: bool = False
+) -> tuple[Path, ...]:
+    _discovery_timeout(deadline, 30.0)
     inspector_path = next((path for path in (Path("/usr/bin/ldd"), Path("/bin/ldd")) if path.is_file()), None)
     if inspector_path is None:
         raise SquashFSPackError("oci-packer-toolchain", "dynamic dependency inspector is unavailable")
@@ -338,7 +368,8 @@ def _discover_dependency_paths(packer_path: Path) -> tuple[Path, ...]:
             check=False,
             capture_output=True,
             env=_fixed_env(),
-            timeout=30,
+            timeout=_discovery_timeout(deadline, 30.0),
+            **({"no_force": True} if no_force else {}),
         )
     except (OSError, MemoryError, subprocess.TimeoutExpired) as exc:
         if process_resource_failure(exc):
@@ -372,8 +403,13 @@ def discover_squashfs_toolchain(
     *,
     expected_packer_sha256: str,
     policy: SquashFSPackPolicy = DEFAULT_SQUASHFS_PACK_POLICY,
+    deadline: float | None = None,
+    no_force: bool = False,
 ) -> VerifiedSquashFSToolchain:
     """Discover and seal the real mksquashfs executable plus every linked file."""
+    if type(no_force) is not bool:
+        raise SquashFSPackError("oci-pack-execution", "termination policy is invalid")
+    _discovery_timeout(deadline, 30.0)
     if os.name != "posix" or not sys.platform.startswith("linux"):
         raise UnsupportedPlatformError("SquashFS toolchain discovery requires Linux")
     if re.fullmatch(r"[0-9a-f]{64}", expected_packer_sha256 or "") is None:
@@ -387,7 +423,8 @@ def discover_squashfs_toolchain(
             check=False,
             capture_output=True,
             env=_fixed_env(),
-            timeout=min(30.0, float(policy.packer_timeout_seconds)),
+            timeout=_discovery_timeout(deadline, min(30.0, float(policy.packer_timeout_seconds))),
+            **({"no_force": True} if no_force else {}),
         )
     except (OSError, MemoryError, subprocess.TimeoutExpired) as exc:
         if process_resource_failure(exc):
@@ -399,14 +436,17 @@ def discover_squashfs_toolchain(
     version_tuple = tuple(int(item or b"0") for item in match.groups())
     if version_tuple < (4, 6, 0):
         raise SquashFSPackError("oci-packer-version", "filesystem packer is older than 4.6.0")
-    dependencies = tuple(_bind_toolchain_file(path) for path in _discover_dependency_paths(executable.path))
+    dependencies = tuple(
+        _bind_toolchain_file(path)
+        for path in _discover_dependency_paths(executable.path, deadline=deadline, no_force=no_force)
+    )
     identity = SquashFSToolchainIdentity(
         ".".join(str(item) for item in version_tuple),
         executable.digest,
         tuple(sorted({binding.digest for binding in dependencies})),
     )
     capability = VerifiedSquashFSToolchain(identity, executable.path, dependencies)
-    capability.verify(packer_path, expected_packer_sha256)
+    capability.verify(packer_path, expected_packer_sha256, deadline=deadline, no_force=no_force)
     return capability
 
 
@@ -561,7 +601,38 @@ def _terminate_process(
     grace_seconds: float,
     *,
     owns_process_group: bool,
+    no_force: bool = False,
 ) -> None:
+    if no_force:
+        with defer_web_cancellation(), defer_preparation_termination():
+            try:
+                if owns_process_group:
+                    os.killpg(process.pid, signal.SIGTERM)
+                else:
+                    process.terminate()
+            except ProcessLookupError:
+                pass
+            except BaseException:
+                retain_preparation_custody(process)
+                raise PreparationToolHold("packer group cannot be signalled safely; custody retained") from None
+            try:
+                process.wait(timeout=grace_seconds)
+                if not owns_process_group:
+                    retain_preparation_custody(process)
+                    raise PreparationToolHold("shared packer group settlement is unknown; custody retained")
+                deadline = time.monotonic() + grace_seconds
+                while True:
+                    try:
+                        os.killpg(process.pid, 0)
+                    except ProcessLookupError:
+                        return
+                    if time.monotonic() >= deadline:
+                        break
+                    time.sleep(min(0.01, max(0, deadline - time.monotonic())))
+            except BaseException:
+                pass
+            retain_preparation_custody(process)
+            raise PreparationToolHold("packer process/group is unsettled; no force permitted")
     try:
         if owns_process_group:
             os.killpg(process.pid, signal.SIGTERM)
@@ -602,23 +673,26 @@ def _run_pinned(
     ):
         raise ValueError("invalid pinned packer resource failure stage")
     diagnostics: BinaryIO | None = None
+    held = False
+    process = None
     try:
         if capture_output:
             diagnostics = tempfile.TemporaryFile(mode="w+b")
         output_target: BinaryIO | int = diagnostics if diagnostics is not None else subprocess.DEVNULL
         try:
-            process = subprocess.Popen(
-                ["<verified-mksquashfs>", *arguments],
-                executable=_fd_path(executable_fd),
-                cwd=_fd_path(cwd_fd),
-                env=_fixed_env(),
-                stdin=stdin,
-                stdout=output_target,
-                stderr=output_target,
-                close_fds=True,
-                pass_fds=(executable_fd, cwd_fd),
-                start_new_session=not execution.inherit_process_group,
-            )
+            with defer_web_cancellation() if execution.no_force else nullcontext(), defer_preparation_termination():
+                process = subprocess.Popen(
+                    ["<verified-mksquashfs>", *arguments],
+                    executable=_fd_path(executable_fd),
+                    cwd=_fd_path(cwd_fd),
+                    env=_fixed_env(),
+                    stdin=stdin,
+                    stdout=output_target,
+                    stderr=output_target,
+                    close_fds=True,
+                    pass_fds=(executable_fd, cwd_fd),
+                    start_new_session=not execution.inherit_process_group,
+                )
         except (OSError, MemoryError) as exc:
             if process_resource_failure(exc):
                 if resource_failure_stage is None:
@@ -626,12 +700,34 @@ def _run_pinned(
                 raise _packer_resource_error(exc, resource_failure_stage) from None
             raise SquashFSPackError("oci-packer-spawn", "filesystem packer could not be started") from None
         try:
-            return_code = process.wait(timeout=timeout_seconds)
+            if execution.no_force:
+                deadline = time.monotonic() + timeout_seconds
+                while True:
+                    if diagnostics is not None and os.fstat(diagnostics.fileno()).st_size > 1024 * 1024:
+                        raise subprocess.SubprocessError("pinned packer diagnostics exceeded their bound")
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(process.args, timeout_seconds)
+                    try:
+                        return_code = process.wait(timeout=min(remaining, 0.05))
+                        break
+                    except subprocess.TimeoutExpired:
+                        continue
+            else:
+                return_code = process.wait(timeout=timeout_seconds)
+            if execution.no_force:
+                try:
+                    os.killpg(process.pid, 0)
+                except ProcessLookupError:
+                    pass
+                else:
+                    raise subprocess.SubprocessError("packer left a live descendant")
         except subprocess.TimeoutExpired:
             _terminate_process(
                 process,
                 grace_seconds,
                 owns_process_group=not execution.inherit_process_group,
+                no_force=execution.no_force,
             )
             raise SquashFSPackError("oci-packer-timeout", "filesystem packer exceeded its deadline") from None
         except BaseException as primary:
@@ -640,10 +736,13 @@ def _run_pinned(
                     process,
                     grace_seconds,
                     owns_process_group=not execution.inherit_process_group,
+                    no_force=execution.no_force,
                 )
             except BaseException as cleanup:
                 raise BaseExceptionGroup("filesystem packer interruption cleanup failed", [primary, cleanup]) from None
             raise
+        if execution.no_force and preparation_custody_held():
+            raise PreparationToolHold("packer cleanup retained custody")
         if diagnostics is None:
             return return_code, b""
         diagnostics.seek(0, os.SEEK_END)
@@ -652,8 +751,24 @@ def _run_pinned(
         diagnostic_tail = diagnostics.read(4096)
         return return_code, diagnostic_tail
     finally:
-        if diagnostics is not None:
-            diagnostics.close()
+        with defer_web_cancellation() if execution.no_force else nullcontext(), defer_preparation_termination():
+            if execution.no_force and process is not None and not preparation_custody_held():
+                try:
+                    try:
+                        os.killpg(process.pid, 0)
+                    except ProcessLookupError:
+                        group_live = False
+                    else:
+                        group_live = True
+                    if process.poll() is None or group_live:
+                        _terminate_process(process, grace_seconds, owns_process_group=True, no_force=True)
+                except BaseException:
+                    retain_preparation_custody(process)
+            if execution.no_force and preparation_custody_held():
+                held = True
+                retain_preparation_custody(process, diagnostics, cwd_fd, executable_fd, stdin)
+            if diagnostics is not None and not held:
+                diagnostics.close()
 
 
 def _packer_version(
@@ -913,15 +1028,20 @@ def pack_staged_squashfs(
         raise SquashFSPackError("oci-pack-input", "staged layer or pack policy is invalid")
     if re.fullmatch(r"[0-9a-f]{64}", expected_packer_sha256 or "") is None:
         raise SquashFSPackError("oci-packer-digest", "expected packer SHA-256 is invalid")
+    if execution.no_force:
+        require_preparation_custody_owner()
+    if execution.no_force and preparation_custody_held():
+        raise PreparationToolHold("previous packer preparation retains custody")
     if toolchain is None:
         toolchain = discover_squashfs_toolchain(
             packer_path,
             expected_packer_sha256=expected_packer_sha256,
             policy=policy,
+            no_force=execution.no_force,
         )
     elif not isinstance(toolchain, VerifiedSquashFSToolchain):
         raise SquashFSPackError("oci-packer-toolchain", "verified toolchain capability is invalid")
-    toolchain.verify(packer_path, expected_packer_sha256)
+    toolchain.verify(packer_path, expected_packer_sha256, no_force=execution.no_force)
 
     try:
         directory = Path(
@@ -954,14 +1074,14 @@ def pack_staged_squashfs(
         version = _packer_version(pinned_fd, directory_fd, policy, execution)
         if toolchain.identity.version != version or toolchain.identity.executable_digest != f"sha256:{pinned_digest}":
             raise SquashFSPackError("oci-packer-toolchain", "selected packer does not match its toolchain identity")
-        toolchain.verify(packer_path, expected_packer_sha256)
+        toolchain.verify(packer_path, expected_packer_sha256, no_force=execution.no_force)
         _verify_pinned_packer(pinned_fd, directory_fd, pinned_digest)
 
         try:
             normalized_tar = tempfile.TemporaryFile(mode="w+b")
         except OSError:
             raise SquashFSPackError("oci-pack-spool", "normalized tar spool could not be created") from None
-        with normalized_tar:
+        try:
             spool_stat = os.fstat(normalized_tar.fileno())
             if not stat.S_ISREG(spool_stat.st_mode) or spool_stat.st_uid != os.geteuid() or spool_stat.st_nlink != 0:
                 raise SquashFSPackError("oci-pack-spool", "normalized tar spool is unsafe")
@@ -991,10 +1111,16 @@ def pack_staged_squashfs(
                 execution=execution,
                 resource_failure_stage="packer-final-spawn",
             )
+        finally:
+            with defer_web_cancellation() if execution.no_force else nullcontext(), defer_preparation_termination():
+                if execution.no_force and preparation_custody_held():
+                    retain_preparation_custody(normalized_tar)
+                else:
+                    normalized_tar.close()
         if return_code != 0:
             raise SquashFSPackError("oci-packer-exit", "filesystem packer returned a nonzero status")
         _verify_pinned_packer(pinned_fd, directory_fd, pinned_digest)
-        toolchain.verify(packer_path, expected_packer_sha256)
+        toolchain.verify(packer_path, expected_packer_sha256, no_force=execution.no_force)
 
         flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
         try:
@@ -1085,32 +1211,41 @@ def pack_staged_squashfs(
         primary_error = exc
         raise
     finally:
-        cleanup_errors: list[BaseException] = []
-        if leased is not None:
-            close_error = leased._close()
-            if close_error is not None:
-                cleanup_errors.append(close_error)
-        if pinned_fd >= 0:
-            try:
-                os.close(pinned_fd)
-            except OSError:
-                cleanup_errors.append(SquashFSPackError("oci-pack-cleanup", "pinned packer close failed"))
-        if directory_fd >= 0:
-            cleanup_errors.extend(
-                _cleanup_private(
-                    directory,
-                    directory_fd,
-                    ("layer.squashfs", "verified-mksquashfs"),
+        with defer_web_cancellation() if execution.no_force else nullcontext(), defer_preparation_termination():
+            if execution.no_force and preparation_custody_held():
+                retain_preparation_custody(directory, directory_fd, pinned_fd, leased, image_file)
+                raise PreparationToolHold(
+                    "packer staging retained until exact process cleanup is reconciled"
+                ) from primary_error
+            cleanup_errors: list[BaseException] = []
+            if leased is not None:
+                close_error = leased._close()
+                if close_error is not None:
+                    cleanup_errors.append(close_error)
+            if pinned_fd >= 0:
+                try:
+                    os.close(pinned_fd)
+                except OSError:
+                    cleanup_errors.append(SquashFSPackError("oci-pack-cleanup", "pinned packer close failed"))
+            if directory_fd >= 0:
+                cleanup_errors.extend(
+                    _cleanup_private(
+                        directory,
+                        directory_fd,
+                        ("layer.squashfs", "verified-mksquashfs"),
+                    )
                 )
-            )
-        elif directory.exists():
-            try:
-                directory.rmdir()
-            except OSError:
-                cleanup_errors.append(SquashFSPackError("oci-pack-cleanup", "private directory removal failed"))
-        if cleanup_errors:
-            failures = ([primary_error] if primary_error is not None else []) + cleanup_errors
-            raise BaseExceptionGroup("staged SquashFS cleanup failed", failures)
+            elif directory.exists():
+                try:
+                    directory.rmdir()
+                except OSError:
+                    cleanup_errors.append(SquashFSPackError("oci-pack-cleanup", "private directory removal failed"))
+            if cleanup_errors:
+                if execution.no_force:
+                    retain_preparation_custody(directory)
+                    raise PreparationToolHold("packer cleanup failed; staging custody retained") from primary_error
+                failures = ([primary_error] if primary_error is not None else []) + cleanup_errors
+                raise BaseExceptionGroup("staged SquashFS cleanup failed", failures)
 
 
 __all__ = [

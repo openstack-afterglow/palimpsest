@@ -10,6 +10,7 @@ import time
 from datetime import UTC, datetime
 
 from . import build_worker as worker
+from .config import configured_image_source_policy
 
 
 def validate_claim(value: dict, settings) -> dict:
@@ -30,6 +31,21 @@ def validate_claim(value: dict, settings) -> dict:
     request = value["request"]
     if not isinstance(request, dict):
         raise ValueError("invalid image request")
+    from palimpsest_local.image_source_policy import image_source_policy_from_dict
+    from palimpsest_local.registry import RegistryError
+
+    try:
+        policy = image_source_policy_from_dict(value.get("source_policy"))
+        if (
+            not policy.rules
+            or policy.digest != value.get("source_policy_digest")
+            or policy != configured_image_source_policy(settings)
+            or "source_policy" in request
+            or "source_policy_digest" in request
+        ):
+            raise ValueError("image source policy binding changed")
+    except RegistryError:
+        raise ValueError("invalid image source policy") from None
     if value["kind"] == "registry":
         from palimpsest_local.hub_image_builder import normalize_reference
 
@@ -39,6 +55,12 @@ def validate_claim(value: dict, settings) -> dict:
             **request,
             "reference": normalize_reference(request["reference"], settings.palimpsest_hub_registry_hosts),
         }
+        from palimpsest_local.registry_intake import resolve_anonymous_reference
+
+        try:
+            policy.admit(resolve_anonymous_reference(request["reference"]))
+        except RegistryError:
+            raise ValueError("image source is not allowed by operator policy") from None
     else:
         text = request["dockerfile"]
         if not isinstance(text, str) or not 0 < len(text.encode()) <= worker.RECIPE_LIMIT:
@@ -79,7 +101,10 @@ def validate_claim(value: dict, settings) -> dict:
 def build(instance, claim: dict, record: dict, deadline: float) -> dict:
     directory = instance.journal.job_dir(record)
     directory.mkdir(mode=0o700)
-    manifest = {key: claim[key] for key in ("kind", "name", "platform", "request", "max_output_bytes")}
+    manifest = {
+        key: claim[key]
+        for key in ("kind", "name", "platform", "request", "max_output_bytes", "source_policy", "source_policy_digest")
+    }
     manifest["context"] = claim.get("context")
     settings = instance.settings
     manifest.update(
@@ -116,7 +141,11 @@ def build(instance, claim: dict, record: dict, deadline: float) -> dict:
         raw = stream.read(worker.JSON_LIMIT + 1)
     if len(raw) > worker.JSON_LIMIT:
         raise worker.BuildFailed("image result exceeds limit")
-    return validate_result(json.loads(raw), claim["max_output_bytes"])
+    result = validate_result(json.loads(raw), claim["max_output_bytes"])
+    metadata = result["manifest"]["source"].get("metadata", {})
+    if any(metadata.get(key) != claim[key] for key in ("source_policy", "source_policy_digest")):
+        raise ValueError("image result source policy binding changed")
+    return result
 
 
 FAILURE_FILE = "last-image-failure.json"
@@ -299,6 +328,27 @@ def upload(instance, record: dict, result: dict, deadline: float | None) -> None
             seen.add(item["digest"])
         return publication, time.monotonic() + remaining
 
+    def require_current_policy():
+        from palimpsest_local.image_source_policy import image_source_policy_from_dict
+        from palimpsest_local.registry import RegistryError
+
+        # Keep the saved result bound to its original authority. Status reads
+        # and terminal disposal remain available during staggered API rollouts,
+        # but the worker must independently fence every publication mutation.
+        metadata = result["manifest"]["source"].get("metadata", {})
+        if not isinstance(metadata, dict):
+            raise worker.WorkerHalted("invalid image publication source policy")
+        try:
+            policy = image_source_policy_from_dict(metadata.get("source_policy"))
+            if (
+                not policy.rules
+                or policy.digest != metadata.get("source_policy_digest")
+                or policy != configured_image_source_policy(instance.settings)
+            ):
+                raise ValueError("image source policy binding changed")
+        except (RegistryError, ValueError):
+            raise worker.WorkerHalted("image publication source policy changed") from None
+
     def pin(end):
         offset = 0
         reserve = worker._size(
@@ -354,6 +404,7 @@ def upload(instance, record: dict, result: dict, deadline: float | None) -> None
         if server_end is None:
             instance._dispose(record)
             return
+        require_current_policy()
         previous_deadline = progress.get("deadline")
         if previous_deadline is not None and previous_deadline != publication["deadline"]:
             raise worker.WorkerHalted("image publication deadline changed")
@@ -361,6 +412,7 @@ def upload(instance, record: dict, result: dict, deadline: float | None) -> None
         instance.journal.save(record)
         deadline = min(deadline, server_end)
         if publication["result_digest"] is None:
+            require_current_policy()
             operation, http_status = "intent", None
             progress["intent"] = "attempted"
             instance.journal.save(record)
@@ -391,6 +443,7 @@ def upload(instance, record: dict, result: dict, deadline: float | None) -> None
             if digest in present:
                 progress["outputs"][digest] = "confirmed"
                 continue
+            require_current_policy()
             operation, http_status = "stage", None
             progress["outputs"][digest] = "attempted"
             instance.journal.save(record)
@@ -431,6 +484,7 @@ def upload(instance, record: dict, result: dict, deadline: float | None) -> None
             or {item["digest"] for item in publication["staged_outputs"]} != present
         ):
             raise worker.WorkerHalted("image publication is not ready")
+        require_current_policy()
         operation, http_status = "complete", None
         progress["completion"] = "attempted"
         instance.journal.save(record)

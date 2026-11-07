@@ -23,9 +23,10 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from . import lima
-from .errors import ArtifactValidationError, LifecycleError
+from .errors import ArtifactValidationError, LifecycleError, PalimpsestError, RuntimeBusyError
 from .oci_network import OCI_NETWORK_MODE_NONE, OCI_NETWORK_MODES
 from .runtime_types import (
     CapabilityCheck,
@@ -41,6 +42,10 @@ from .runtime_types import (
     RuntimeOperation,
     RuntimePreflightError,
 )
+from .state import RUN_OBSERVATION_TIMEOUT_SECONDS, RunObservationWaitBudget
+
+if TYPE_CHECKING:
+    from .vz_native_runtime import VZHostConfig
 
 BACKEND_KVM = "kvm"
 BACKEND_LIMA = "lima-vz"
@@ -99,6 +104,53 @@ _LIMA_LIVE_OPERATIONS = frozenset(
 )
 
 
+@dataclass(frozen=True, slots=True)
+class NativeRootBootProfile:
+    """Reviewed source/boot-method identity, not a host or execution capability."""
+
+    profile_id: str
+    os_id: str
+    version_id: str
+    platform: str
+    backend: str
+    boot_method: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "profile_id": self.profile_id,
+            "os_id": self.os_id,
+            "version_id": self.version_id,
+            "platform": self.platform,
+            "backend": self.backend,
+            "boot_method": self.boot_method,
+        }
+
+
+_UBUNTU_2404_ARM64_VZ_PROFILE = NativeRootBootProfile(
+    profile_id="palimpsest.native-root.ubuntu-24.04.arm64.lima-vz.direct-linux.v1",
+    os_id="ubuntu",
+    version_id="24.04",
+    platform="linux/arm64",
+    backend=BACKEND_LIMA,
+    boot_method="direct-linux",
+)
+
+
+def select_native_root_boot_profile(
+    *, os_id: str, version_id: str, platform: str, backend: str
+) -> NativeRootBootProfile:
+    """Select only an exact reviewed identity; never probe or infer a fallback."""
+
+    profile = _UBUNTU_2404_ARM64_VZ_PROFILE
+    if (os_id, version_id, platform, backend) != (profile.os_id, profile.version_id, profile.platform, profile.backend):
+        raise ArtifactValidationError(
+            "unsupported native-root source profile: "
+            f"ID={os_id!r}, VERSION_ID={version_id!r}, platform={platform!r}, backend={backend!r}; "
+            "only ubuntu 24.04 / linux/arm64 / lima-vz has a reviewed direct-linux source profile"
+        )
+    return profile
+
+
 @dataclass(frozen=True)
 class HostPlatform:
     """The host operating system and normalized CPU architecture."""
@@ -151,7 +203,20 @@ def capability_profile(
     kind = dispatch_key.runtime_kind
     backend = dispatch_key.backend
     if kind is RuntimeKind.OCI_ROOT:
-        if operation is RuntimeOperation.RUN:
+        if backend is RuntimeBackend.LIMA_VZ:
+            if operation is RuntimeOperation.RUN:
+                identifiers = ("host.lima-vz", "tool.limactl")
+            elif operation in {RuntimeOperation.START, RuntimeOperation.RM}:
+                identifiers = ("host.lima-vz", "tool.limactl")
+            elif operation in {RuntimeOperation.EXEC, RuntimeOperation.SHELL, RuntimeOperation.STOP}:
+                identifiers = ("tool.ssh",)
+            elif operation is RuntimeOperation.RECONCILE:
+                identifiers = ("tool.limactl", "tool.ssh")
+            elif operation in _READ_ONLY_STATE_OPERATIONS:
+                identifiers = ()
+            else:
+                raise RuntimeCapabilityError(operation, dispatch_key)
+        elif operation is RuntimeOperation.RUN:
             identifiers = ("host.kvm-device", "tool.qemu-img", "tool.qemu-system", "python.libvirt")
         elif operation is RuntimeOperation.RM:
             identifiers = ("python.libvirt",)
@@ -199,7 +264,10 @@ def capability_profile(
     requirements = _requirements(*identifiers)
     if operation is RuntimeOperation.RUN and network is not None:
         if kind is RuntimeKind.OCI_ROOT:
-            if network != OCI_NETWORK_MODE_NONE:
+            if backend is RuntimeBackend.LIMA_VZ:
+                if network != OCI_NETWORK_MODE_NONE:
+                    requirements += (CapabilityRequirement("network.lima", network),)
+            elif network != OCI_NETWORK_MODE_NONE:
                 requirements += (CapabilityRequirement("network.oci-user-mode", network),)
         elif not (backend is RuntimeBackend.KVM and network == "none"):
             if backend.is_lima:
@@ -231,6 +299,9 @@ def _check_capability(
     dispatch_key: DispatchKey,
     host: HostPlatform,
     arch: str | None,
+    native_host_config: VZHostConfig | None = None,
+    operation: RuntimeOperation | None = None,
+    _observation_budget: RunObservationWaitBudget | None = None,
 ) -> CapabilityCheck:
     from . import kvm as _kvm  # deferred: platforms is imported by kvm.py
 
@@ -330,6 +401,40 @@ def _check_capability(
         return _passed(requirement, "installed")
     if identifier.startswith("tool."):
         tool = identifier.removeprefix("tool.")
+        if dispatch_key == DispatchKey(RuntimeKind.OCI_ROOT, RuntimeBackend.LIMA_VZ) and tool in {
+            "limactl",
+            "ssh",
+        }:
+            from .vz_native_runtime import (
+                VZHostConfig,
+                preflight_pinned_lima,
+            )
+
+            try:
+                if tool == "limactl":
+                    preflight_pinned_lima(
+                        native_host_config,
+                        allow_expired=True,
+                        custody_timeout=(
+                            RUN_OBSERVATION_TIMEOUT_SECONDS if operation is RuntimeOperation.RECONCILE else 0
+                        ),
+                        _observation_budget=(_observation_budget if operation is RuntimeOperation.RECONCILE else None),
+                    )
+                else:
+                    selected = VZHostConfig.from_environment() if native_host_config is None else native_host_config
+                    selected.verify(allow_expired=True)
+            except RuntimeBusyError:
+                # No probe was admitted; do not turn mutex contention into a
+                # failed capability report or issue an operation authorization.
+                raise
+            except (PalimpsestError, OSError):
+                return _failed(
+                    requirement,
+                    "native-pin-check-failed",
+                    CapabilityErrorCategory.CHECK_FAILED,
+                    "native VZ requires a valid PALIMPSEST_VZ_CONFIG and settled pinned-tool custody",
+                )
+            return _passed(requirement, "pinned-2.2.1" if tool == "limactl" else "pinned-executable")
         if tool == "qemu-system":
             try:
                 domain = resolve_domain_profile(
@@ -636,6 +741,8 @@ def evaluate_capability_profile(
     host: HostPlatform | None = None,
     now_ns: int | None = None,
     purpose: PreflightReportPurpose = PreflightReportPurpose.OPERATION,
+    native_host_config: VZHostConfig | None = None,
+    _observation_budget: RunObservationWaitBudget | None = None,
 ) -> PreflightReport:
     """Evaluate read-only probes and issue an authenticated capability report."""
 
@@ -648,7 +755,15 @@ def evaluate_capability_profile(
     if type(issued) is not int or issued < 0:
         raise ValueError("preflight clock returned an invalid value")
     checks = tuple(
-        _check_capability(requirement, dispatch_key=profile.dispatch_key, host=resolved_host, arch=arch)
+        _check_capability(
+            requirement,
+            dispatch_key=profile.dispatch_key,
+            host=resolved_host,
+            arch=arch,
+            native_host_config=native_host_config,
+            operation=profile.operation,
+            _observation_budget=_observation_budget,
+        )
         for requirement in profile.requirements
     )
     return _issue_capability_report(
@@ -816,8 +931,19 @@ def select_backend(
             if host.system != "Darwin" or host.machine not in {"aarch64", "x86_64"}:
                 raise ArtifactValidationError("experimental lima-qemu-oci execution requires a supported macOS host")
             return BACKEND_LIMA_QEMU_OCI
+        if requested == BACKEND_LIMA or (
+            requested == "auto" and host.system == "Darwin" and host.machine == "aarch64" and arch == "aarch64"
+        ):
+            if host.system != "Darwin" or host.machine != "aarch64" or arch != "aarch64":
+                raise ArtifactValidationError(
+                    "native OCI-root on lima-vz requires macOS on Apple Silicon and linux/arm64"
+                )
+            return BACKEND_LIMA
         if requested not in {"auto", BACKEND_KVM}:
-            raise ArtifactValidationError("native OCI-root supports only KVM; opt into --force-architecture on macOS")
+            raise ArtifactValidationError(
+                "native OCI-root supports only KVM and lima-vz; opt into --force-architecture on macOS "
+                "for the experimental Lima/QEMU container runtime"
+            )
         if host.system != "Linux" or host.machine != "x86_64" or arch != "x86_64":
             raise ArtifactValidationError(
                 "native OCI-root requires Linux x86_64/KVM and linux/amd64; "

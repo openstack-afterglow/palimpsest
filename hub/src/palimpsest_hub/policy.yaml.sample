@@ -1,11 +1,19 @@
 # Project-local rules. Scope, current identity, key attenuation and ownership are not overridable.
+# Existing native reader < member < manager tiers include all lower-tier actions.
 "packages:inventory": "role:reader or role:member or role:manager or role:admin"
 "packages:read": "role:reader or role:member or role:manager or role:admin"
 "packages:write": "role:member or role:manager or role:admin"
+"packages:delete": "role:manager or role:admin"
+"packages:manage": "role:manager or role:admin"
+# Self cleanup additionally requires exact original creator/project ownership.
+"packages:manage_own": "role:member or role:manager or role:admin"
 "cache:read": "role:reader or role:member or role:manager or role:admin"
 "cache:write": "role:member or role:manager or role:admin"
-"keys:issue": "role:member or role:manager or role:admin"
-"keys:list": "role:member or role:manager or role:admin"
-"keys:revoke": "role:member or role:manager or role:admin"
+"keys:issue": "role:manager or role:admin"
+"keys:list": "role:reader or role:member or role:manager or role:admin"
+"keys:revoke": "role:manager or role:admin"
+# Original Keystone token only; never another owner's key or bearer-key control.
+"keys:revoke_own": "role:reader or role:member or role:manager or role:admin"
+# A project admin/manager is not a system administrator. This check additionally
+# requires independently verified fresh human system:all admin authority.
 "system:manage": "role:admin"
-"packages:delete": "role:member or role:manager or role:admin"

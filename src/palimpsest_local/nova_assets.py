@@ -15,6 +15,7 @@ import os
 import re
 import stat
 import uuid
+from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -279,7 +280,7 @@ class AssetCatalog:
                 _fail("consumer references an absent asset/store binding")
         return data
 
-    def _save(self, fd: int, data: dict) -> None:
+    def _save(self, fd: int, data: dict, *, before_commit: Callable[[], None] | None = None) -> None:
         payload = _canonical(data)
         if len(payload) > _MAXIMUM:
             _fail("catalog exceeds its size bound")
@@ -290,6 +291,8 @@ class AssetCatalog:
                 stream.write(payload)
                 stream.flush()
                 os.fsync(stream.fileno())
+            if before_commit is not None:
+                before_commit()
             os.rename(temporary, "assets.json", src_dir_fd=fd, dst_dir_fd=fd)
             os.fsync(fd)
         finally:
@@ -299,7 +302,14 @@ class AssetCatalog:
                 pass
 
     def register(
-        self, *, arch: str, source: dict, layers: list[dict], blob_paths: list[Path], name: str | None = None
+        self,
+        *,
+        arch: str,
+        source: dict,
+        layers: list[dict],
+        blob_paths: list[Path],
+        name: str | None = None,
+        before_commit: Callable[[], None] | None = None,
     ) -> dict:
         """Register only fully verified successful outputs; no metadata-only success."""
         descriptor = _asset(self.project_id, arch, source, layers)
@@ -329,7 +339,7 @@ class AssetCatalog:
             catalog["assets"][identity] = record
             if name is not None:
                 catalog["names"][name] = identity
-            self._save(fd, catalog)
+            self._save(fd, catalog, before_commit=before_commit)
             return {"asset_id": identity, **record, "retention": "permanent"}
 
     def inspect(self, value: str | None = None, *, verify: bool = False) -> dict:

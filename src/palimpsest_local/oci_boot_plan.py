@@ -29,7 +29,7 @@ OCI_ROOT_LOWER_ROLE = "root-lower"
 
 @dataclass(frozen=True, slots=True)
 class OCIBootPlanIntent:
-    """Canonical intent to reserve one materialized OCI graph as VM lowers."""
+    """Canonical legacy Linux amd64 KVM intent for materialized OCI lowers."""
 
     run_id: str
     run_name: str
@@ -43,6 +43,8 @@ class OCIBootPlanIntent:
         ArtifactLeaseOwner(self.run_id, self.run_name, OCI_ROOT_LOWER_ROLE)
         if not isinstance(self.materialization, OCIImageMaterializationReceipt):
             raise OCIStoreError("oci-boot-plan", "boot-plan materialization is invalid")
+        if self.materialization.platform_os != "linux" or self.materialization.platform_architecture != "amd64":
+            raise OCIStoreError("oci-boot-plan", "legacy OCI KVM boot plans require exactly linux/amd64")
         try:
             self.materialization.process.require_bootable()
         except ArtifactValidationError:

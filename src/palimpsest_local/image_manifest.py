@@ -13,6 +13,10 @@ import re
 
 SCHEMA = "palimpsest.image-manifest.v1"
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
+# Publication compatibility, not execution admission. Every native/Hub execution
+# consumer separately pins its own platform (``NATIVE_EXECUTION_PLATFORM``).
+MODE_PLATFORMS = {"oci-root": ("linux/amd64", "linux/arm64"), "application": ("linux/amd64",)}
+NATIVE_EXECUTION_PLATFORM = "linux/amd64"
 
 
 def _digest(value):
@@ -54,6 +58,19 @@ def _hash(value):
     )
 
 
+def layer_identity(parent_id, digest: str, size_bytes: int, compatibility: dict) -> str:
+    """Logical node identity: exact parent, payload and image compatibility."""
+    return _hash(
+        {
+            "schema": "palimpsest.layer-node.v1",
+            "parent_id": parent_id,
+            "digest": digest,
+            "size_bytes": size_bytes,
+            **compatibility,
+        }
+    )
+
+
 def normalize_manifest(value: dict) -> dict:
     """Validate and copy a complete descriptor, deriving its single-parent chain."""
     keys = {
@@ -70,7 +87,8 @@ def normalize_manifest(value: dict) -> dict:
     }
     if not isinstance(value, dict) or set(value) - keys or value.get("schema") != SCHEMA:
         raise ValueError("unsupported image manifest schema or fields")
-    if value.get("mode") not in ("oci-root", "application") or value.get("platform") != "linux/amd64":
+    mode = value.get("mode")
+    if not isinstance(mode, str) or mode not in MODE_PLATFORMS or value.get("platform") not in MODE_PLATFORMS[mode]:
         raise ValueError("unsupported image execution compatibility")
     result = {key: value[key] for key in ("schema", "mode", "platform")}
     for key in ("os_family", "os_version"):
@@ -140,15 +158,7 @@ def normalize_manifest(value: dict) -> dict:
         if digest in sizes and sizes[digest] != size:
             raise ValueError("shared payload digest has contradictory sizes")
         sizes[digest] = size
-        identity = _hash(
-            {
-                "schema": "palimpsest.layer-node.v1",
-                "parent_id": parent,
-                "digest": digest,
-                "size_bytes": size,
-                **compatibility,
-            }
-        )
+        identity = layer_identity(parent, digest, size, compatibility)
         if ("id" in layer and layer["id"] != identity) or ("parent_id" in layer and layer["parent_id"] != parent):
             raise ValueError("logical layer identity contradicts its parent chain")
         item = {"id": identity, "parent_id": parent, "digest": digest, "size_bytes": size}
@@ -163,6 +173,45 @@ def normalize_manifest(value: dict) -> dict:
 
 def manifest_digest(manifest: dict) -> str:
     return _hash(normalize_manifest(manifest))
+
+
+def verify_public_manifest(value: dict) -> list[dict]:
+    """Recompute a public projection's ordered logical chain; return its layers.
+
+    The public projection omits private runtime values, so its full manifest
+    digest cannot be recomputed. Only compatibility, order, parent links, payload
+    digests and sizes are verifiable from it.
+    """
+    if not isinstance(value, dict) or value.get("schema") != SCHEMA or value.get("projection") != "public":
+        raise ValueError("unsupported public image manifest projection")
+    mode = value.get("mode")
+    if not isinstance(mode, str) or mode not in MODE_PLATFORMS or value.get("platform") not in MODE_PLATFORMS[mode]:
+        raise ValueError("unsupported image execution compatibility")
+    for key in ("os_family", "os_version"):
+        if not _text(value.get(key), 128).strip():
+            raise ValueError("explicit OS family and version are required")
+    base = value.get("base_image_digest")
+    if (mode == "application" and _digest(base) != base) or (mode == "oci-root" and base is not None):
+        raise ValueError("public manifest base image contradicts its mode")
+    layers = value.get("layers")
+    if not isinstance(layers, list) or not 1 <= len(layers) <= 128:
+        raise ValueError("image requires one to 128 ordered layers")
+    compatibility = {key: value[key] for key in ("mode", "platform", "os_family", "os_version", "base_image_digest")}
+    parent, sizes, result = None, {}, []
+    for layer in layers:
+        if not isinstance(layer, dict) or not {"id", "parent_id", "digest", "size_bytes"} <= set(layer):
+            raise ValueError("invalid logical layer descriptor")
+        digest, size = _digest(layer["digest"]), layer["size_bytes"]
+        if type(size) is not int or not 1 <= size <= 2**63 - 1:
+            raise ValueError("layer size must be a positive bounded integer")
+        if sizes.setdefault(digest, size) != size:
+            raise ValueError("shared payload digest has contradictory sizes")
+        identity = layer_identity(parent, digest, size, compatibility)
+        if layer["id"] != identity or layer["parent_id"] != parent:
+            raise ValueError("logical layer identity contradicts its parent chain")
+        result.append({"id": identity, "parent_id": parent, "digest": digest, "size_bytes": size})
+        parent = identity
+    return result
 
 
 def public_manifest(manifest: dict) -> dict:
@@ -262,7 +311,10 @@ def public_manifest(manifest: dict) -> dict:
 
 
 def native_image_projection(manifest: dict) -> dict:
+    """Native Nova execution input; only the qualified linux/amd64 native profile exists."""
     full = normalize_manifest(manifest)
+    if full["platform"] != NATIVE_EXECUTION_PLATFORM:
+        raise ValueError("native execution supports only linux/amd64 published images")
     return {
         "source": {"kind": "published", "manifest_digest": manifest_digest(full), "manifest": full},
         "runtime": full["runtime"],
@@ -282,6 +334,7 @@ def manifest_from_result(
     metadata: dict | None = None,
     mode: str = "oci-root",
     base_image_digest: str | None = None,
+    platform: str = "linux/amd64",
 ) -> dict:
     """Build a canonical descriptor from real materialized output or local artifacts.
 
@@ -294,7 +347,7 @@ def manifest_from_result(
         {
             "schema": SCHEMA,
             "mode": mode,
-            "platform": "linux/amd64",
+            "platform": platform,
             "os_family": os_family,
             "os_version": os_version,
             "base_image_digest": base_image_digest,

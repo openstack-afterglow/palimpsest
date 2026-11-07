@@ -32,8 +32,8 @@ from .oci_packer import (
 )
 from .oci_process import OCIProcessSpec
 from .oci_provenance import Descriptor, canonical_json_bytes
-from .oci_source import SnapshottedOCIImage
-from .oci_store import DerivedLayerOccurrence, DerivedSquashFSKey, MaterializationResult, OCIStore
+from .oci_source import SnapshottedOCIArchive, SnapshottedOCIImage
+from .oci_store import DerivedLayerOccurrence, DerivedSquashFSKey, MaterializationResult, OCIStore, parent_chain_digest
 from .oci_worker_limits import OCI_WORKER_NPROC_LIMIT
 from .oci_worker_protocol import (
     MAX_OCI_WORKER_MESSAGE_BYTES,
@@ -47,7 +47,14 @@ from .oci_worker_protocol import (
     validate_worker_operation_stage,
 )
 from .state import StatePaths
-from .web_job_client import defer_web_cancellation
+from .web_job_client import (
+    PreparationToolHold,
+    defer_preparation_termination,
+    defer_web_cancellation,
+    preparation_custody_held,
+    require_preparation_custody_owner,
+    retain_preparation_custody,
+)
 
 _WORKER_MODULE = "palimpsest_local.oci_materializer_worker"
 _SCRATCH_PREFIX = ".oci-materializer-worker-"
@@ -187,7 +194,7 @@ class OCIImageMaterializationReceipt:
             raise OCIHardWorkerError("oci-image-receipt", "image materialization metadata is invalid")
         if not isinstance(self.process, OCIProcessSpec):
             raise OCIHardWorkerError("oci-image-receipt", "image materialization process is invalid")
-        if self.platform_os != "linux" or self.platform_architecture != "amd64":
+        if self.platform_os != "linux" or self.platform_architecture not in ("amd64", "arm64"):
             raise OCIHardWorkerError("oci-image-receipt", "image materialization platform is unsupported")
         if (
             not isinstance(self.layer_descriptors, tuple)
@@ -294,10 +301,12 @@ def _wait_group_gone(process_group: int, timeout_seconds: float) -> bool:
     return True
 
 
-def _terminate_worker(process: subprocess.Popen[bytes], grace_seconds: float) -> bool:
+def _terminate_worker(process: subprocess.Popen[bytes], grace_seconds: float, *, no_force: bool = False) -> bool:
     _signal_group(process, signal.SIGTERM)
     leader_reaped = _wait_bounded(process, grace_seconds)
     group_gone = _wait_group_gone(process.pid, grace_seconds)
+    if no_force:
+        return leader_reaped and group_gone
     if not group_gone:
         _signal_group(process, signal.SIGKILL)
     if not leader_reaped:
@@ -307,7 +316,8 @@ def _terminate_worker(process: subprocess.Popen[bytes], grace_seconds: float) ->
     return leader_reaped and group_gone
 
 
-def _cleanup_scratch(scratch: Path, scratch_fd: int, expected_parent: Path) -> None:
+def _cleanup_scratch(scratch: Path, scratch_fd: int, expected_parent: Path, *, no_force: bool = False) -> None:
+    cleaned = False
     try:
         opened = os.fstat(scratch_fd)
         visible = os.stat(scratch, follow_symlinks=False)
@@ -320,15 +330,25 @@ def _cleanup_scratch(scratch: Path, scratch_fd: int, expected_parent: Path) -> N
             or opened.st_uid != os.geteuid()
             or stat.S_IMODE(opened.st_mode) != 0o700
         ):
+            if no_force:
+                raise PreparationToolHold("materializer scratch identity is unknown; custody retained")
             return
         shutil.rmtree(scratch)
+        cleaned = True
     except OSError:
+        if no_force:
+            raise PreparationToolHold("materializer scratch cleanup failed; custody retained") from None
         return
     finally:
-        try:
-            os.close(scratch_fd)
-        except OSError:
-            pass
+        if no_force and not cleaned:
+            retain_preparation_custody(scratch, scratch_fd)
+        else:
+            try:
+                os.close(scratch_fd)
+            except OSError:
+                if no_force:
+                    retain_preparation_custody(scratch, scratch_fd)
+                    raise PreparationToolHold("materializer scratch descriptor cleanup is unknown") from None
 
 
 def _background_reap(
@@ -376,6 +396,8 @@ def _spawn_and_exchange(
     command: tuple[str, ...] | None = None,
     register_worker: Callable[[subprocess.Popen[bytes]], None] | None = None,
 ) -> tuple[bytes, int, subprocess.Popen[bytes]]:
+    if request.no_force:
+        require_preparation_custody_owner()
     deadline = time.monotonic() + timeout_seconds
     request_bytes = request.to_json_bytes()
     output = bytearray()
@@ -383,6 +405,34 @@ def _spawn_and_exchange(
     threads: tuple[threading.Thread, ...] = ()
     start_attempts = 0
     selected_command = command or (sys.executable, "-I", "-m", _WORKER_MODULE)
+    if request.no_force and command is None:
+        package_root = os.fspath(Path(__file__).resolve().parent)
+        cache_prefix = f"/nonexistent-palimpsest-vz-{uuid.uuid4().hex}"
+        if os.path.lexists(cache_prefix):
+            raise OCIHardWorkerError("oci-worker-input", "isolated worker cache prefix already exists")
+        selected_command = (
+            sys.executable,
+            "-I",
+            "-S",
+            "-B",
+            "-X",
+            f"pycache_prefix={cache_prefix}",
+            "-c",
+            (
+                "import importlib.util,runpy,sys\n"
+                "root = sys.argv[1]\n"
+                "spec = importlib.util.spec_from_file_location("
+                "'palimpsest_local', root + '/__init__.py', submodule_search_locations=[root])\n"
+                "if spec is None or spec.loader is None:\n"
+                "    raise RuntimeError('selected materializer package cannot be loaded')\n"
+                "package = importlib.util.module_from_spec(spec)\n"
+                "sys.modules['palimpsest_local'] = package\n"
+                "spec.loader.exec_module(package)\n"
+                "runpy.run_module(sys.argv[2], run_name='__main__')\n"
+            ),
+            package_root,
+            _WORKER_MODULE,
+        )
     process = None
 
     def write_request() -> None:
@@ -419,7 +469,7 @@ def _spawn_and_exchange(
                 pass
 
     try:
-        with defer_web_cancellation():
+        with defer_web_cancellation(), defer_preparation_termination():
             try:
                 process = subprocess.Popen(
                     selected_command,
@@ -441,7 +491,7 @@ def _spawn_and_exchange(
         reader = threading.Thread(target=read_response, name="palimpsest-oci-worker-stdout", daemon=True)
         threads = (writer, reader)
         for thread in threads:
-            with defer_web_cancellation():
+            with defer_web_cancellation(), defer_preparation_termination():
                 start_attempts += 1
                 thread.start()
         remaining = deadline - time.monotonic()
@@ -461,7 +511,7 @@ def _spawn_and_exchange(
         reaped = False
         cleanup_failed = False
         try:
-            reaped = _terminate_worker(process, grace_seconds)
+            reaped = _terminate_worker(process, grace_seconds, no_force=request.no_force)
             if reaped:
                 for index, stream in enumerate((process.stdin, process.stdout)):
                     if index < start_attempts:
@@ -511,7 +561,7 @@ def _spawn_and_exchange(
 
 
 def materialize_layer_hard(
-    image: SnapshottedOCIImage,
+    image: SnapshottedOCIImage | SnapshottedOCIArchive,
     ordinal: int,
     *,
     source_cas_root: Path,
@@ -522,11 +572,18 @@ def materialize_layer_hard(
     timeout_seconds: float = 300.0,
     terminate_grace_seconds: float = 1.0,
     pack_profile: SquashFSPackProfile = SquashFSPackProfile.CANONICAL,
+    no_force: bool = False,
 ) -> MaterializationResult:
-    """Materialize one occurrence in an exec worker or return no success."""
+    """Materialize one validated filesystem occurrence, without granting boot authority."""
+    if type(no_force) is not bool:
+        raise OCIHardWorkerError("oci-worker-input", "termination policy is invalid")
+    if no_force:
+        require_preparation_custody_owner()
+    if no_force and preparation_custody_held():
+        raise PreparationToolHold("previous materializer preparation retains custody")
     if os.name != "posix" or not sys.platform.startswith("linux"):
         raise UnsupportedPlatformError("hard OCI materialization workers require Linux")
-    if not isinstance(image, SnapshottedOCIImage) or type(ordinal) is not int:
+    if not isinstance(image, (SnapshottedOCIImage, SnapshottedOCIArchive)) or type(ordinal) is not int:
         raise OCIHardWorkerError("oci-worker-input", "materializer image or ordinal is invalid")
     if not isinstance(roots, StatePaths) or not isinstance(store, OCIStore):
         raise OCIHardWorkerError("oci-worker-input", "materializer store authority is invalid")
@@ -542,6 +599,7 @@ def materialize_layer_hard(
     occurrence = DerivedLayerOccurrence.from_image(image, ordinal)
     key = DerivedSquashFSKey.for_occurrence(
         occurrence,
+        parent_chain_digest=parent_chain_digest(image, ordinal),
         intake_policy_id=LAYER_INTAKE_POLICY_ID,
         intake_policy_fingerprint=DEFAULT_LAYER_CONVERSION_LIMITS.fingerprint,
         pack_policy_id=SQUASHFS_PACK_POLICY_ID,
@@ -556,13 +614,14 @@ def materialize_layer_hard(
     deferred_cleanup = False
     worker_reaped = False
     failure = None
+    worker_cleanup_verified = False
 
     def register_worker(worker):
         nonlocal process
         process = worker
 
     try:
-        with defer_web_cancellation():
+        with defer_web_cancellation(), defer_preparation_termination():
             try:
                 scratch = Path(tempfile.mkdtemp(prefix=_SCRATCH_PREFIX, dir=scratch_parent))
                 os.chmod(scratch, 0o700)
@@ -589,6 +648,7 @@ def materialize_layer_hard(
             packer_sha256=toolchain.identity.executable_digest.removeprefix("sha256:"),
             cpu_limit_seconds=min(3600, max(1, math.ceil(remaining))),
             pack_profile=pack_profile,
+            no_force=no_force,
         )
         output, return_code, process = _spawn_and_exchange(
             request,
@@ -620,7 +680,7 @@ def materialize_layer_hard(
                 raise OCIHardWorkerError(
                     "oci-worker-protocol", "non-resource worker response carried resource failure details"
                 )
-            raise OCIHardWorkerError(
+            rejection = OCIHardWorkerError(
                 f"oci-worker-{response.error_category}",
                 (
                     _reported_worker_resource_detail(response)
@@ -633,6 +693,10 @@ def materialize_layer_hard(
                 io_errno=response.io_errno,
                 operation_stage=response.operation_stage,
             )
+            # The canonical worker emits a bound response only after nested
+            # preparation cleanup; unsettled children park without a response.
+            worker_cleanup_verified = True
+            raise rejection
         if response.result is None:
             raise OCIHardWorkerError("oci-worker-protocol", "materializer worker omitted its result")
         receipt = response.result.receipt
@@ -644,6 +708,7 @@ def materialize_layer_hard(
             or receipt.ordinal != occurrence.ordinal
         ):
             raise OCIHardWorkerError("oci-worker-protocol", "materializer worker receipt binding is invalid")
+        worker_cleanup_verified = True
         return response.result
     except BaseException as exc:
         failure = exc
@@ -654,33 +719,58 @@ def materialize_layer_hard(
         # Spawn registers directly into this owner before cancellation resumes.
         # Neither exception construction/delivery nor the except arm is an
         # ownership handoff; every exit goes through this final cleanup guard.
-        with defer_web_cancellation():
+        with defer_web_cancellation(), defer_preparation_termination():
+            if no_force and process is not None and failure is not None and not worker_cleanup_verified:
+                # Nested discovery/packer sessions may outlive an abruptly exited
+                # worker. Reaping its leader/group alone never grants scratch deletion.
+                try:
+                    if not worker_reaped:
+                        _terminate_worker(process, float(terminate_grace_seconds), no_force=True)
+                finally:
+                    retain_preparation_custody(process, scratch, scratch_fd)
+                raise PreparationToolHold(
+                    "failed worker retains scratch/FD custody; cleanup is not proven"
+                ) from failure
             if process is not None and not worker_reaped:
                 try:
                     if process.poll() is None or _group_exists(process.pid):
-                        worker_reaped = _terminate_worker(process, float(terminate_grace_seconds))
+                        worker_reaped = _terminate_worker(process, float(terminate_grace_seconds), no_force=no_force)
                     else:
                         worker_reaped = True
                 except BaseException:
                     worker_reaped = False
                 if not worker_reaped:
                     deferred_cleanup = True
-                    try:
-                        _background_reap(process, scratch, scratch_fd, scratch_parent)
-                    except BaseException:
-                        if failure is not None:
-                            failure.add_note(
-                                "worker reaper startup failed; cleanup is not confirmed; scratch requires proven termination"
-                            )
+                    if no_force:
+                        retain_preparation_custody(process, scratch, scratch_fd)
+                    else:
+                        try:
+                            _background_reap(process, scratch, scratch_fd, scratch_parent)
+                        except BaseException:
+                            if failure is not None:
+                                failure.add_note(
+                                    "worker reaper startup failed; cleanup is not confirmed; scratch requires proven termination"
+                                )
+                    if no_force:
+                        raise PreparationToolHold(
+                            "materializer worker/group retained; no next request permitted"
+                        ) from failure
             if not deferred_cleanup and scratch is not None:
                 if scratch_fd is not None:
-                    _cleanup_scratch(scratch, scratch_fd, scratch_parent)
+                    _cleanup_scratch(scratch, scratch_fd, scratch_parent, no_force=no_force)
                 else:
-                    shutil.rmtree(scratch, ignore_errors=True)
+                    if no_force:
+                        try:
+                            shutil.rmtree(scratch)
+                        except OSError:
+                            retain_preparation_custody(scratch)
+                            raise PreparationToolHold("materializer scratch cleanup is unknown") from None
+                    else:
+                        shutil.rmtree(scratch, ignore_errors=True)
 
 
 def materialize_image_hard(
-    image: SnapshottedOCIImage,
+    image: SnapshottedOCIImage | SnapshottedOCIArchive,
     *,
     source_cas_root: Path,
     roots: StatePaths,
@@ -691,14 +781,21 @@ def materialize_image_hard(
     terminate_grace_seconds: float = 1.0,
     pack_profile: SquashFSPackProfile = SquashFSPackProfile.CANONICAL,
     on_layer: Callable[[MaterializationResult], None] | None = None,
+    no_force: bool = False,
 ) -> OCIImageMaterializationReceipt:
     """Materialize every layer occurrence in order under one wall-clock deadline.
 
     Results are immutable cache entries, not runtime leases. The synchronous
     callback runs before the next occurrence and consumes the same deadline.
     Callback failures propagate; earlier cache entries remain available.
+    Acquisition snapshots are filesystem inputs, not native launch authority;
+    the original process is preserved even when it has no bootable command.
     """
-    if not isinstance(image, SnapshottedOCIImage):
+    if type(no_force) is not bool:
+        raise OCIHardWorkerError("oci-worker-input", "termination policy is invalid")
+    if no_force:
+        require_preparation_custody_owner()
+    if not isinstance(image, (SnapshottedOCIImage, SnapshottedOCIArchive)):
         raise OCIHardWorkerError("oci-worker-input", "materializer image is invalid")
     if not isinstance(pack_profile, SquashFSPackProfile):
         raise OCIHardWorkerError("oci-worker-input", "materializer pack profile is invalid")
@@ -724,6 +821,7 @@ def materialize_image_hard(
             timeout_seconds=remaining,
             terminate_grace_seconds=terminate_grace_seconds,
             pack_profile=pack_profile,
+            no_force=no_force,
         )
         if time.monotonic() - started > float(timeout_seconds):
             raise OCIHardWorkerError("oci-worker-timeout", "late image materialization success was discarded")

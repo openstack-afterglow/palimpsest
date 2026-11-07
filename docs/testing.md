@@ -1,12 +1,1088 @@
 # Fast feedback without dropping coverage
 
-## Standard authority 0.3.12 qualification boundary — 2026-11-04 (UTC)
+## M2 Hub image publication — 2026-11-07 merge worktree
 
-The isolated release candidate is latest remote dev6e4dff7 plus the standard-core role migration, exact-ID domain implication preservation, truthful reduced-credential capability preview and numeric-release compatibility. Primary/SDK/goal-m1 dirty worktrees are not verification inputs. Targeted coverage includes the full native role matrix, original/current/key intersections, private/global/machine boundaries, domain builtin lookalikes, revoked originals, reader nonsecret downloads and original-human writer management. Registered-app standalone native HTTP uses real SDK requests against synthetic loopback Keystone with fresh SQL/CAS; it is not a live cloud or guest proof.
+New test files and their lanes (classified in `scripts/test_lanes.py`):
 
-Run final Hub checks from the Hub environment and root Kolla/release/native-helper contracts from the root environment. Retain interpreter and exact-source digests. Relevant Hub modules are `test_auth`, `test_catalog_auth`, `test_builds`, `test_packages`, `test_hub_api`, `test_export_delegation`, `test_image_jobs`, `test_instances`, `test_database_pool` and `test_migrate`. The parent owns full current-source CI, actual MariaDB10.11 restored-production rehearsal, paired CAS restore and canonical deployment; test fixtures alone cannot establish those outcomes.
+| File | Lane | Covers |
+| --- | --- | --- |
+| `hub/tests/test_image_quota.py` | `hub` | seeds vs. DB authority, unique-name counts, distinct-digest chain/source bytes, policy/tier admin routes, `/v1/image-quota/me`, physical report, lowered limits |
+| `hub/tests/test_image_jobs_quota.py` | `hub` | worker completion settling quota refusals as terminal job errors |
+| `hub/tests/test_image_source_closure.py` | `hub` | closure shape, manifest commitment, own-staging, OCI document coherence, duplicate keys, closure blob serving |
+| `hub/tests/test_image_keys.py` | `hub` | `ppi_v1_` issue/list/revoke, action ceilings, active-key cap, membership revalidation, `ppk_v1` refusal |
+| `hub/tests/test_public_images.py` | `hub` | anonymous list/get/blob projection, invalid credential 401, per-client rate limit |
+| `tests/unit/test_hub_publish.py` | `build-registry` | `published push/pull/status`, credential order, request-id generations and replay, same manifest from two state roots, catalog v1→v2 upgrade, OCI layout rebuild/registration |
 
-Do not silently import the new goal-m1 intake/sandbox/BuildKit source while fixing roles. Do not conflate existing0.3.11 reserved source receipts, new0.3.12 local results, source-overlay container checks, built-image identities, publication, operational rollout and optional native runtime acceptance. Each actual result belongs in the dated handoff with its own receipt.
+```sh
+# Separate Hub environment
+cd hub
+uv run --frozen --extra dev pytest -q tests/test_image_quota.py tests/test_image_jobs_quota.py \
+  tests/test_image_source_closure.py tests/test_image_keys.py tests/test_public_images.py
+# Repository root
+uv run --frozen --extra dev pytest -q tests/unit/test_hub_publish.py
+```
+
+Recorded status: test-passed only. The Hub lane and root per-file runs passed in
+a scrubbed environment on macOS with synthetic Keystone and SQLite;
+`tests/unit/test_hub_publish.py` has 72 cases. An isolated end-to-end harness
+(real Hub app under uvicorn on loopback, real client CLI, fake Keystone over
+HTTP, no dependency overrides) passed 77 checks on the current source, and a
+separate Hub-level script checked the seeded free chain caps with real byte
+counts (1073741824 / 5368709120 / 10737418240 bytes: one byte under and exactly
+at the cap publish, one byte over returns 413) and passed 11 checks on the current
+source. Nothing here is live-verified: no live Hub/Keystone/Afterglow OAuth, Kolla
+deployment, MySQL/MariaDB, Manila/CephFS closure copy, Linux-only test on this
+host, actual `plm run` of a pulled image on a separate state root or second Apple
+Silicon device. `FakeHub` in `tests/unit/test_hub_publish.py` routes before
+recording (stray local traffic is ignored), tracks staging per (project, user) and
+applies the real Hub's publish-only staging precheck before the request-id
+lookup; publish-only-key replay, credential-owned attempts and the staging sweep
+have regression tests there.
+
+macOS caveats: tests that spoof `sys.platform` to Linux can make `SourceCAS`
+issue Linux `openat2` syscall numbers and kill the interpreter on Darwin.
+`tests/unit/test_oci_worker_protocol.py::test_acquisition_hard_layer_request_binds_exact_graph_and_occurrence`
+is therefore Linux-only (`skipif`). `hub/tests/test_image_quota.py` skips its
+arm64 cross-tenant case when the installed client cannot normalize `linux/arm64`.
+Root Kolla tests (`tests/test_kolla_*.py`) need a genuine `ansible-playbook` on
+`PATH`; a missing binary is an environment failure, not a role failure.
+
+## Thirteen-action role cutover — 2026-11-06 executed on existing builder
+
+User selected standard reader/member/manager privileges plus two exact-owner
+exceptions (member consumer cleanup, original-token reader/member key revocation).
+Independent policy and route reviews found no open P1/P2 findings.
+
+Darwin rejected every DATA/AS/RSS limit before pytest started, so no host run
+counts. After explicit approval284 and a fully requalified cold custody guard,
+the frozen public 0.3.12 snapshot (sha256 `40578e95…` then corrected `291`) ran on
+existing `sg-b212fed8-b01` under PrivateNetwork, MemoryMax2G, CPUQuota200%,
+TasksMax128, read-only source and scratch-only writes, with synthetic Keystone
+only (no real IAM/Nova/GPU, no new VM, no package install).
+
+First run exposed one real stale expectation: a retained member token must show
+artifact `delete` False; test corrected, production role logic unchanged. Final
+batches on corrected source: auth 481, catalog 41, packages 68, export+upload 65,
+instances+hub_api 538, builds 31, image_jobs 125 and root Kolla role/default
+contracts 39 — all passed (1388). `test_pax_export_size_over_eight_gib_scans_
+sparse_tar` was deselected: the approved 64MiB file cap rejects its sparse 8GiB
+tar (Errno27), unrelated to roles; it is NOT claimed passed. One whole-file auth
+run lost its output at the 1700s cell cap and is not counted. Receipts:
+`Role-linux-lane-summary292.json` plus builds/imagejobs/kolla293 results. Not
+covered: real Keystone/provider effects, deployment, release, external clients.
+
+Kolla caveat: 39 root tests passed, but this is not the full previously cited
+contract suite. `test_nonroot_hub_policy_config_is_readable_without_exposing_
+secret_toml` exists at HEAD yet is absent from the working tree. Its assertions
+iterate `volumes` as a list, but pre-existing uncommitted `defaults/main.yml`
+now renders `volumes` as a Jinja string, so the old test would fail unmodified.
+The deletion's author is unattributed (RoleOps263 owned this file; mixed user
+WIP also exists); nothing was restored. The non-root policy-readability contract
+is currently UNTESTED. Follow-up316 executed the whole changed
+`tests/unit/test_benchmark_scenarios.py`:212 passed5.39s, for1600 unique synthetic
+tests across the stated lanes. Dependency317 compared actual Python3.12.3
+hub-venv metadata with frozen `hub/uv.lock`:58 matching names,19 duplicate
+system/venv distributions,57 extras and two source-only local projects. This
+does not qualify a locked installed release. The wrapper's stale snapshot283
+SHA field is corrected additively in
+`Role-source291-dependency-and-receipt-correction317.json`: selected source291
+SHA is `eb336c0e22bee5d86ebfdedbbafe3b8161e35c7ff1801da22275911185a09654`.
+Independent non-pytest registered `main:app` Uvicorn/SQLite/CAS smoke331 then
+passed28 actual loopback HTTP checks: exact action sets, reader write denial,
+member publish/tag update/byte download, manager package deletion/key issue,
+reader own-key revoke/foreign-key404 and current-owner demotion. Auth dependencies
+were not overridden; Keystone protocol is synthetic, production lifespan off.
+Initial328 expected403 for foreign-key invisibility; actual source returns404,
+so only the throwaway harness changed. This is not live IAM, MySQL, provider,
+deployment or a qualified installed release. Receipt
+`Role-registered-HTTP-current-source-smoke331.json` records the correct291 SHA.
+
+## Historical standard-role source handoff — 2026-11-03
+
+This implementation slice ran no tests, builds, lint, formatting, architecture
+stamp or live operations. Existing results below are historical, not evidence
+for the new role ceiling/federation bytes. The integrating owner should run:
+
+Parent's initial full native Hub run reported31failed/1680passed/7skipped
+(`artifact://1251`); root Kolla reported49passed. The implementation follow-up
+addresses nine legacy-only invalid-body auth precedence assertions, two genuine
+disabled home/project-domain bypasses, two obsolete system-action withdrawal
+fixtures, seventeen policy-environment fixture failures and one incomplete admin
+capability fixture. Native domain checks are independent of personal provenance.
+Policy tests now use explicit temporary `{}` YAML with the real Enforcer rather
+than ambient required service settings. The project-action withdrawal tests retain
+their no-build-row, unchanged-owned-layer and exact-CAS-byte assertions.
+No follow-up checks were run by this slice; parent must rerun the affected/full Hub.
+
+Bounded follow-up also removes obsolete personal-provenance authorization
+plumbing rather than suppressing its errors. New
+`test_core_personal_member_ignores_irrelevant_raw_project_provenance` probes an
+actually partial raw project HTTP collection, proves standard core authorization
+does not read it, and still requires503 when effective current authority becomes
+partial. Source/tests remain unrun by this slice.
+
+```sh
+# Repository root: Kolla preservation/default/sample contracts
+uv run --frozen --extra dev pytest -q tests/test_kolla_role_contracts.py
+# Separate Hub environment
+cd hub
+uv run --frozen --extra dev pytest -q tests/test_auth.py tests/test_catalog_auth.py tests/test_packages.py tests/test_hub_api.py tests/test_builds.py tests/test_export_delegation.py tests/test_instances.py tests/test_upload_limits.py
+```
+
+Current selectors define reader metadata/content/own-key operations, member
+publication plus exact-owner cleanup, manager package/layer/export management,
+custom-only denial, permissive-policy non-uplift and original/current role
+intersections. Native implications and exact ownership retain foreign/
+global denial. `test_openid_*` and `test_catalog_openid_*` distinguish genuine
+native human federation from reduced credential markers in both validators.
+`test_standard_project_roles_publish_but_only_managers_manage`,
+`test_standard_reader_queries_and_downloads_but_cannot_manage`,
+`test_manager_delete_rechecks_current_authority_before_commit`,
+`test_project_manager_cannot_delete_shared_catalog_layer` and
+`test_standard_member_build_and_reader_status_keep_worker_boundary` exercise
+the migrated package/layer/build callers. Synthetic native HTTP smoke remains
+`scripts/smoke_package_capabilities.py`; it never authorizes a production IAM
+or deployment probe. Full Hub and scoped architecture checks/stamping belong
+to the integrating owner after concurrent WIP is coherent.
+
+## Current native observation and lifecycle evidence —244–264
+
+The current source separates named/namespace pure mutex busy from actor/resource
+HOLD, shares at most five seconds of actual contended waiting per pass, and
+cooperates with canonical run ownership for authoritative reads. This is not a
+five-second wall-clock RPC deadline. Native source/create run-name acquisition
+is try-once under custody; ordinary defaults and registry initialization remain
+unchanged. Guest timeout begins at guest execution, not host preparation.
+
+Source247 expanded19-file host lane:1792 passed92.52s (`artifact://9794`).
+Its first six-file integration had944passed/5failed: new source-acquisition
+fixtures used a fractional fixed expiry, and older console adapters lacked the
+new private observation-budget argument. Corrected those fixtures without
+weakening production expiry checks or terminal/identity policy.
+Source248 changed seven-node lane:1079 passed21.74s (`artifact://9804`).
+Its final19-file expanded lane passed1823/93.56s (`artifact://9808`).
+Both independent final source re-reviews report no findings. Scoped Ruff checks
+pass; unrelated whole-file runtime_dispatch formatting debt is not restyled.
+These are source/component results. Immutable SDK153 archivecbe1121c… and
+wheel8f6f6936… were actually built/installed249/250 with exact package-tree and
+host/guest fingerprint9de79573… verification. Real n11 CLI254 distinguishes
+physicalRunning from mainExited7 and verifies guest-only timeout. However its
+normal single visible-tab Resources/firstconsole scenario257 FAILED: own
+autopoll caused busy and continuous-rate gaps. Explicit later command success
+is not acceptance. Own browser/server normally closed258; VM remains needed.
+Source154 observation sharing/client cadence are moving, not yet qualified.
+
+Source264 final reconciliation/inventory694 passed19.24s, and the expanded
+19-file lane1861 passed94.11s (`artifact://9921`). Scoped Ruff and JS syntax
+passed. Four run-form consumer cases execute production handlers plus the real
+observation barrier, including inventory dropping an admitted metrics handle
+before that request settles. The first integrated run1857passed/3failed because
+the partial JS harness omitted that helper; corrected harness, no no-op mock.
+The new dataclass field import shadowed an old local collection variable and
+failed scoped Ruff; aliasing the imported helper fixed it without restyling old
+code. Both independent source reviews closed findings. These checks still do
+not establish immutable154 installation or successful single-tab live behavior.
+
+Controls exercise actual flock exclusion with simulated observation clocks,
+strict degraded metadata without grants, other-home/removed logs, named and
+shared-namespace follower continuation, final pinned-byte drain, cancellation
+and terminal HOLD/integrity failures. The follower's simulated second consumer
+holds real named/custody contexts, not a live public VM lifecycle operation.
+Real local status and guest subprocesses prove a one-second guest timer survives
+longer host work, still expires real longer guest work, submits once and releases
+markers/mutexes. Those are CPU component proofs, not a real guest/SSH claim.
+The earlier600s simulated-clock hang and positive floating remainder were fixed
+with a clamped absolute local contention deadline; the failed lane is retained.
+
+Actual installed SDK152/profile246 n10 supplied separate M1-19/21 proof:
+default prod/unless-stopped, main normal7/ABRT134signal6/main-only bounded OOM
+137signal9, same boot and upper through seven launches, observed increasing
+delays through about32s, and explicit-stop fence/physicalStopped after437s.
+OOM event1/group-kill1 killed2 counted tasks; it is not two independent OOM
+experiments. The 256MiB limit was an explicit main-cgroup experiment control,
+not a new product default or kernel/host fault guarantee. Normal rm and complete
+provider/upper/root/lease/export/actor absence plus shared-byte preservation246
+closed the case. n07/n08/n09 were already normally removed232/244.
+
+Whole Goal29/108, nextM1-20. Native read concurrency, full dev reconnect/grace,
+commandless modes and source-change cases remain pending. Approved244 allows
+28 cumulative attempts (14 spent, no refund) until its fixed expiry, with the
+same resource limits. Needed builder+n11 are Running. Attempt13's worker0400
+input refusal was proven pre-provider; fresh exact0600 loader253 preceded a
+separately reserved successful attempt14, not a replay/refund. The official
+private Packer plugin/template247 are preparation, not VM/bake/performance proof;
+cold/reuse/change comparison must include image manufacture.
+
+## Frozen151 offline distribution smoke —159–161
+
+Standard `scripts/build_package.py` actually built sdist then wheel with
+SOURCE_DATE_EPOCH1700000000, UV_OFFLINE and no Python downloads inside the
+approved owned guest/private-network sandbox. Fresh private venv imported the
+installed wheel and qualified its stage1 asset; uv tool install exposed both
+palimpsest/plm version0.3.11 and help successfully. Unit finished success and
+fresh show reports absent/inactive/dead/MainPID0. No host installation.
+
+Transferred wheel bf203328…/1610070bytes passed zip integrity and full173-member
+source-manifest comparison; every165 expected Python module is present. Source
+guard2cdc2e0e…/634files and immutable archivee0270164…/746paths are recorded160.
+Read-only cache-link and atime-comparison validation failures are preserved,
+corrected before cloning/transfer; no build replay, download or global mutation.
+Fresh provider161 lists only needed builder Running, attempts7/12 unchanged.
+This proves distribution/install/component behavior, not host-installed
+build/run/exec/status or live new-source native dashboard behavior.
+
+## Native liveness and retained completion-protocol checks —143–156
+
+Final nine-file darwin-process/runtime-dispatch/inventory/console/host-inventory/
+native-source/native-source-CLI/OCI-exec-session/UI lane:1178 passed76.92s.
+Ruff check and six affected-file format checks pass. Focused public native
+metrics/console plus KVM Access unknown-ACK control and full exec-session suite:
+101 passed2.70s. The prior1177 run passed77.52s before the last protocol-choice
+controls and native-only error-message correction.
+
+Real ordinary child counterexample154 returned exit0/output31 but raised on
+missing completion observation and retained one active owner. Final explicit
+protocol keeps non-daemon drain/cleanup, detach-only foreground close, admission/
+shutdown waiting, strict pre-factory Boolean validation and KVM unknown-ACK count.
+Stdin-gated children exercise timer/drawer close before actual completion.
+Missing native ACK is neither read nor fabricated. Direct-return155b was
+withdrawn because it would cancel foreground commands and strand daemon cleanup.
+Independent source reviews146 closed production findings; Access-level native0/
+KVM1 checks close the requested protocol-selection regression gap.
+
+These are actual child-process/component and host/API suite checks, not live
+new-source NativeProcessSession/custody settlement. Next VM smoke must exercise
+main-exited/platform-running metrics/console, mid-command drawer detach and
+dashboard SIGINT waiting, then stopped refusal and custody absence.
+
+Actual host Buildx remote inspect149 reached existing owned BuildKit0.34.1 using
+strict pinned SSH Unix forwarding and private client metadata. Settlement150
+removed its client entry, reaped own SSH, verified/unlinked only its inert owned
+host socket and proved the transient guest unit inactive/dead/MainPID0. This is
+transport qualification, not an image build or Packer benchmark.
+
+## Source134 actual lifecycle and complete cleanup —134–143
+
+Host-only frozen134/guardf9e5334a… settled the exact original ordinary-stop HOLD.
+No replayed guest/provider stop or signal. Actual cold stop/start135 has distinct
+kernel boot IDs and fresh provider Stopped/PID/actor/socket/upper evidence, plus
+identical five file hashes/four package records and all work markers. Read-only
+natural idle observer136 retained canonical exited; actual public CLI start138
+then succeeded without metadata-stop alignment and booted again with the same
+data. This closes the specific earlier idle-start failure, not full M1-22.
+
+Final normal stop and RM140, full absence/preservation142: only needed builder
+Running, no consumer/dedicated disk/root record/projection/actor/HOLD, group+five
+lease members and export refs absent; shared five payloads and original OCI bytes/
+full stamp/source snapshot revalidated. No create refund (7/12), force or manual
+cleanup. Original watcher completed176.96s normally; its accidental480s outer
+deadline never fired. Future native-custody observers must use timeout0 with an
+internal bounded observation loop, not risk an external owner kill.
+
+Real detail-read139 observed main logs available from the canonical console and
+generic observed-provider logs denied. Metrics returned unavailable/stopped
+despite the actual native platform being Running after main exit. That separate
+VM/main-state projection defect remains open, with no retained consumer. Fresh
+catalog137 is complete/rev2/six runs and identical after process restart; same-root
+actual build/tag/run proof remains absent. No Packer benchmark was run.
+
+## Final reviewed host lane —133
+
+903 tests passed15.72s across darwin-process, runtime-dispatch, inventory, console,
+host-inventory and both native-source suites. Native131/host-access132/metadata132
+source reviews have no remaining assigned findings. Exact content-store artifact
+deletion controls replace the old vacuous source-link assertion.
+
+Initial902pass/1fail exposed a bad new accepted-plan fixture: missing v2 identity
+caused refusal before plan validation and masked negative controls. Both fixture
+groups now write canonical v2 identity; production was not weakened. Lint passes,
+ten changed files format-check clean, unrelated older runtime-dispatch formatting
+hunks were intentionally untouched. No new native action has run on this source.
+The trusted repository host lane is already authorized; no builder SSH or new
+guest sandbox is a prerequisite while n06 holds the namespace.
+
+## Review corrections pending new verification —127–130
+
+The initial651pass/7.48s covered native/durable-dispatch/catalog suites, not the
+subsequent review fixes. New tests cover unknown/unfinished stop journals,
+contrary provider/actor/upper state appearing during the final resource reload,
+real loopback-port occupation before start admission and between admission and
+the first start intent. No native operation follows these source-only changes yet.
+
+Host-observation/control classification must not expose native VZ instances to
+generic force-delete, including untrusted native-looking identity. Planless
+bindings must distinguish canonical unprepared schema from malformed metadata.
+Those source/test slices are in progress. Do not count defined tests as passed.
+The old root/persistence proofs remain explicitly source100; successor proof must
+observe boot identity and actual stopped provider/actor state before reusing them.
+
+## Actual native-root/access and source/package persistence —105–125
+
+Source100/assets103/profile104 n06 passed actual ARM VZ OverlayFS root identity
+against PID1, ordered5readonly lower mounts, public CLI exec, CLI shell PTY and
+independent pinned OpenSSH PTY. Original compiled C stdout41/report15 and original
+embedded source/OS bytes were observed. Lower000 write failed EROFS. Console114's
+cwd/overclaim was withdrawn; only fail-fast console115 and SSH116 qualify.
+
+Actual source edit/recompile, all access-path work markers and real offline
+dpkg install persisted through public Running→stop→start118. Exact five file
+hashes and four installed package/version/status lines match; RAM/process
+continuity is not asserted. Source binding/actual OS proof119,182 current
+qualification tests/1.23s, boundary completion124 and persistence summary124
+record the exact limits. Real Linux component102 separately qualified private
+plmctl1000/privileged sudo0/wrong-key rejection and normal inetd child reaping;
+temporary key material was removed after proven absence103.
+
+Open, not green: natural dev idle→public start109 fails on stale exited metadata.
+Later ordinary cleanup stop120 reached unknown intermediate provider state,
+retaining stop-incomplete HOLD; exact Stopped/PIDs absent observed122. RM was not
+attempted. No force, signal, replay or manual marker mutation. Successor lifecycle
+edits/tests/review and actual canonical settlement/deletion are still required.
+
+Catalog119's missing build/tag linkage needs a same-selected-root real build/run.
+Correction125 retracts diagnosis124: missing/null unprepared native plan must be
+discoverable as failed, never resource-absence/lifecycle authority; malformed
+present bindings must still mark partial collection and protect deletion previews.
+New discovery boundary tests are defined but not yet run. Packer M1-27 is criteria
+only, including golden-image build time; no comparison result exists.
+
+## Actual ordinary n05 cleanup and unchanged source100 staging —101
+
+Source100 completed observation-only settlement of original normal stop and one
+ordinary canonical RM. Exact absence/shared preservation and original source
+requalification passed (`M1-16-n05-final-absence-and-preservation101.json`,
+`M1-16-n05-normal-cleanup-live-proof101.json`). No repeated provider stop, signal,
+force or manual endpoint unlink. This is live lifecycle proof, not boot/SSH proof.
+
+Original archive100 staged unchanged; actual guest package3f939968… matches host,
+no source cache, tools reverified. Option probe101: -E rejects, -s ACCEPTS, remaining
+inetd options accept. Removed-s is redundant under qualifiedpassword0, not proven
+unsupported. No next consumer yet; cumulative6/12 and public1712284672bytes stay.
+
+## Normal-stop default sockets and qualified SSH bytes —97/98/99
+
+N05 source94/packagefbfc452d…/asset80efbdd9… was pre-reserved as6/12 and admitted
+once. Its previous readonly mount failure was passed, but actual inetd repeatedly
+rejected `-E`. The original normal Lima stop returned and actor10313 disappeared;
+authoritative provider is Stopped/PIDs0. Only default_ep/default_fd sockets remain:
+UID501/single-link0755, STREAM+DGRAM eachECONNREFUSED61, targetedlsof no matches.
+The directory reader hid special entries; its apparent omission was not absence.
+Pinned upstream code identifies these as per-instance in-process default gvisor.
+No additional signal, manual endpoint unlink or stop replay occurred.
+
+117focused tests pass in0.26s across darwin-process/asset suites; Ruff check and
+format pass. Initial117pass/3fail was a new test's uniform StateError expectation:
+upper/inputs/UID correctly raised VZNativeHold; port remains StateError. Correct
+per-case classes without weakening production. Duplicate size/wording/overmocked
+wrapper checks were replaced with semantic exact-size valid-ELF qualification
+coverage and actual public-loader evidence.
+
+The actual qualified94 bundle reopens under the new verifier. A separate private
+copy changed only one Dropbear ELF-comment byte, preserved size/version/ELF
+structure and recomputed all component/archive/manifest receipts. Frozen94's
+public loader accepted it; the new public loader rejected it. This is a real
+before/after integration observation, not rejection due malformed unrelated
+kernel/config/recipe fixtures. No altered executable ran; all temporary forged
+files were removed and the original requalified.
+
+Independent lifecycle security and SSH/profile reviews found no production
+blockers. Source-only real jail/inetd/SUID fixture97 is prepared, not executed.
+Its owned unit must add SYS_PTRACE solely for genuine procfs credential checks,
+retain NoNewPrivileges=no/Yama≥1 and private network/PID namespaces, and perform
+no ptrace attachment or global sysctl change. Observe normal inetd termination
+separately from SSH/client status; deterministic assertion failures finish and
+reap both planned connections before reporting FAIL. Uncertain live state holds.
+
+Evidence: `M1-16-n05-{failure-diagnosis96,normal-stop-result96,
+post-normal-endpoints97,endpoint-inactivity97,post-stop-provider-readonly97,
+endpoint-source-diagnosis97}.json`, `M1-16-normal-ssh-source-checks98.json`,
+`M1-16-ssh-profile-real-bundle-smoke99.json` and fixture-cleanup99.
+Actual reviewed-code n05 deletion/root/SSH acceptance remains pending.
+
+## Verification advancement —93/94
+
+The complete protocol file passed206cases in3.04s on actual isolated Linux
+(`M1-16-linux-worker-protocol93.json`); the earlier Darwin SIGSYS remains distinct.
+Final new-case5tests passed on Darwin in0.27s after test-only formatting and
+removal of incidental wording/copy assertions; JSON-roundtripped diagnostic
+evidence is now checked semantically. Ruff check/format passed. Runtime C/worker
+bytes did not change. Separate actual sysfs readonly attachment using production
+C passed with all four restrictions (`M1-16-readonly-sysfs-component94.json`).
+Namespace91/92 fixtures were no-follow removed only after full process/mount
+absence (`M1-16-readonly-fixtures-final-cleanup92.json`).
+
+Source93 staged with an explicit `-I -B` root import; its package had no bytecode
+cache afterward. Only the corrected pin function definition was installed into
+the retained executor: no control list, renewal fence or quota reset. Source93
+contains the pre-formatting test snapshot; freeze the final reviewed tree under
+a new immutable generation before native admission.
+
+## Readonly FD mount and private worker diagnostics —90/91/92
+
+Actual n04 serial narrowed the failure to readonly remount through the original
+pre-bind FD: flags0x1027/EINVAL22. `readonly-fd-probe92.c` includes the production
+platform C and compiled statically with ARM musl, warnings-as-errors, then ran in
+an owned Linux6.8 private mount/network namespace. The legacy sequence reproduced
+EINVAL22; detached FD attachment passed readonly root-write EROFS30, inherited
+noexec/nosuid/nodev, unchanged writable source/alias, file/directory callers,
+source/target symlink rejection, original covered-inode provenance, descriptor
+closure and independent jail self-remount flags. Binary00170efd…; unit0/623ms.
+This does not establish authenticated VZ root/SSH or actual setuid execution.
+
+Fixture91 compiled but misused the production exclusive-create helper for a
+deliberate overwrite, exiting125/EEXIST. Its receipt and exact source remain;
+fixture92 corrects only that smoke helper, not the production implementation.
+The expected symlink-rejection child in passing92 exits125 and emits EINVAL.
+
+Five new real-child diagnostic cases passed on Darwin in0.69s (`-k vz_`).
+They cover stdout-first EOF, bounded private stderr/total-cap failure, bad
+frame/exit evidence and retained custody/marker/no-replay after transaction
+failure. Initial primary-source import-path collection failed; isolated
+PYTHONPATH corrected it. A broader file run terminated140/SIGSYS after21dots:
+not a green full lane, not suppressed or rerun unchanged.
+
+Fresh nonce-bound observation91 held host and guest worker locks simultaneously,
+required scratch to contain only its original lock, classified the two pinned
+systemd baseline processes plus query ancestry, and found no worker/preparation
+actor, unknown UID501 process or source bytecode cache. An initial overbroad
+UID501-zero assertion failed because Lima baseline/session processes also use
+that UID; its failed observation and separate classification remain recorded.
+This proves current settlement, not the safety of earlier manual marker clears.
+
+N04 normal stop and one SIGTERM failed to settle the original actor; the approved
+single SIGKILL/stale cleanup and ordinary canonical RM then returned removed.
+Receipt90 proves exact provider/root/projection/ref/HOLD/actor and all six lease
+authorities absent, five shared layers/original OCI unchanged. First RM logging
+accessed nonexistent `.status`; actual result/ledger corrected the report with
+no second RM.5/12creates remain spent; accounting was retrospective, not claimed
+as a pre-effect reservation. No usable native root/SSH or Goal check was added.
+
+Evidence under `~/.local/share/palimpsest-proofs/spec-goal-20261103/`:
+`M1-16-n04-final-absence-and-preservation90.json`,
+`M1-16-worker-fresh-settlement91.json`,
+`M1-16-readonly-fd-component{91,92}.json`,
+`M1-16-worker-checks90.json`, and
+`M1-16-readonly-worker-independent-review92.json`.
+
+## Renewed offline platform and negative root-move investigation —81/82/83
+
+Successor fence81 passed actual owner/tool/isolation/resource/retired-authority
+checks without clearing retained custody. The necessary builder resumed under
+renewal74 and a verified transient22:05:10UTC expiry. Its separate nft offline
+guard's actual output-drop counter increased for a reserved-address TCP probe.
+The old quota was not recreated or refunded; startup traffic was not wire-metered.
+Receipts builder-resume/offline-guard/offline-negative-probe/runtime-prerequisites81
+record observed behavior rather than claiming total transfer metering.
+
+Diagnostic C5be7534e… compiled, assets81 manifest282ad0a5… built offline and
+strictly reopened after own-control transfer. Worker82 reverified actual tools
+and package2a4b8fd6… matching frozen host80. Proposed n04 host preflight83 passed,
+but no new VM was created. Asset-builder CLI help now correctly states ABI2.
+
+The own child namespace mounted the actual5original SquashFS lowers and new32MiB
+ext4, then completed OverlayFS and every early MS_MOVE; final type0x794c7630.
+First unit81 never executed (126/DAC capability); corrected unit82 passed.
+Builder root/PID1 device+inode remained64769:2, modprobe path/ptrace unchanged,
+own loop refs0. Exact runtime fixtures were removed and bounded reproduction C
+archived in evidence82; only needed assets/platform remained.
+This is a negative reproduction, not proof of native VZ PID1, SSH, control jail
+or later cgroup/boot mounts. No mount behavior was changed speculatively.
+
+## Source80 exact forced-cleanup verification
+
+375 affected contracts passed in1.71s after repairing a fixture that exchanged
+the directory too early and hit safe ENOENT instead of the intended retained-FD
+boundary (initial374pass/1fail retained). Real filesystem/UNIX-socket fixtures
+cover original pins, inactive-only socket cleanup, metadata/directory replacement,
+complete observation of an empty exchanged directory, late unknown-executable
+related actors, final-read expiry and preserved nonendpoint files. Ancillary
+native authorities are explicit fixtures, not real VM proof.
+
+`M1-16-forced-recovery-owned-component80.json` runs a fresh owned C child with
+real PID files and an active UNIX socket. The child actually ignores SIGTERM;
+canonical code records its sent/unsettled phase, then separate SIGKILL records
+and delivers once, reaps/proves absence, validates original refused socket/PID
+pins and removes only those stale files through the actual no-follow reconciler.
+Durable ordinary-stop/term history survives; replay is refused and keep.txt
+survives. Non-VM immutable/root/network authority is synthetic and declared.
+The child and all fixture paths were removed. No n03 SIGKILL occurred in this
+component. Separate source-only endpoint/security and lifecycle reviews closed
+their concrete findings before operational admission.
+
+The later actual n03 action80 independently passed complete shutdown and ordinary
+removal: `M1-16-n03-final-absence-and-preservation80.json` records all exact
+provider/root/projection/reference/HOLD/actor absence, retired5member leases and
+full readback of all5shared payloads plus unchanged source qualification. Final
+formatted-source selection passed375in1.57s; lint/format/manifest/working source
+guard passed. This establishes this exact forced cleanup, not a repaired native
+root boot, SSH, a general safe-force capability or permission for another case.
+
+## Source77 one-shot termination verification
+
+357 affected observer/VZ-assets/Lima/runtime-dispatch tests passed in1.23s.
+They cover preserved attempted/returned normal-stop history, separately required
+signal scope, replay/delete/actor mismatch rejection, intent/sent/final write
+uncertainty, signal errors, deadline crossing in final identity/authority reads,
+unresolved endpoints/provider and active-scope ordinary-stop fallback rejection.
+The authority fixtures are synthetic; they are not VM qualification.
+
+`M1-16-sigterm-owned-component77.json` exercises the actual canonical termination
+function against an owned freshly compiled local child. Real libproc/argv,
+complete related-process classification and canonical atomic JSON persistence
+remain active; non-VM resource authorities are explicit fixture substitutes.
+The child exited by SIGTERM(-15), was reaped and independently absent; the
+durable marker preserved failed stop history and blocked another signal.
+All fixture paths were removed. This did not signal n03 or establish guest/root
+shutdown. Amendment76's fixed window expired before receipt, so a fresh exact
+action window remains required for actual n03 recovery.
+
+The later real operational attempt78 used the response-relative exact approval,
+not expired76. Canonical SIGTERM was delivered once, but exact PID24719 survived
+the15second settlement window; termination stays sent, failed normal-stop history
+and HOLD remain, no delete/new consumer. Final formatted source tests357passed
+in1.41s; that component pass does not supersede this real failed proof.
+The read-only native sample lacks Go symbols. Upstream2.2.1 signal/setup channel
+ordering supports a deadlock hypothesis, not a live stack attribution or fix.
+No second signal or forced cleanup was performed.
+
+## M1 renewed observation repair — source75
+
+`M1-16-n03-stop-preflight74.json` records the renewed exact cleanup qualification
+stopping before effects on an unrelated live process's unavailable vnode path.
+The owned-child reproduction in `M1-16-darwin-unlinked-executable74.json` confirmed
+that unlink can cause ENOENT while a compiled child remains live and observable
+through kernel metadata/argv. Copied system-binary fixtures exited under AMFI
+before readiness and are recorded as failed attempts, not proof.
+
+`M1-16-darwin-inventory-smoke75.json` observes the repaired actual inventory:
+the unlinked owned child remains present with an explicitly unknown executable;
+exact actor reads refuse that identity; stdin EOF produces exit0 and reaped
+ESRCH absence. No signal, VM operation, user process change or host installation
+was used. Metadata/argv failures, changed identity and other executable lookup
+errors remain blocking. Native custody regression coverage retains descendant,
+process-group and detached instance/directory actor rejection before and after
+stop. An owned unlink reproduction is not attribution of PID1081's real cause.
+
+The final affected selection (observer, VZ assets, Lima and runtime dispatch)
+passed338tests in1.24s. Source-only custody review found no new bypass; a redundant
+grandchild HOLD case was removed because the parent alone already caused HOLD.
+Actual repaired stop readiness then passed; one normal stop failed without
+settling PID24719. `M1-16-n03-post-stop-hold75.json` records retained HOLD and no
+delete/new consumer. This is a real failed operational proof, not a test pass.
+Final scoped formatting preserved all three Python ASTs; source75 receipt hashes
+identify the pre-format operational snapshot separately from the working tree.
+
+## Current M1 VZ component checkpoint — 2026-11-04
+
+ABI2 platform C44 compiled statically on ARM; actual C process/JSON probes passed.
+Asset44 assembled and strict-loaded on Linux/Darwin; worker45 prepared ext4 and
+replayed all five original layers into host canonical receipts. Case49 validated
+genuine nonroot Lima bootstrap through actual CLI create but never booted.
+It remains Stopped/HOLD: carrier SHA/identity/owner/mode/link count/size/mtime
+match and ctime differs. Small/full-image clone/conversion probes did not
+reproduce the drift. Do not call this a benign timestamp, clear HOLD or admit a
+new consumer. No actual `/`, SUID/SSH, populated resume or native-console proof.
+
+Source51 nine-node affected tests passed751/15skipped. Source60's extended
+selection recorded889passed/15skipped/5failed, all five failures caused by the
+new `test_vz_runtime_assets.py` missing explicit lane classification. Source61
+adds that portable file to existing `oci-guest`; actual `list --check` and the
+143 architecture/CLI-reference/lane contracts passed. The final single affected
+selection passed894/15skipped in77.97s. No native flags, special lane, hosted/native
+trust gate or test expectation was changed.
+
+Real filesystem/flock probes enforce resource-HOLD/actor/session boundaries.
+An orphan actor was admitted before and blocked after the repair. Separate real
+directory fixtures reject foreign `in_use_by`, unknown PID and directory entries
+before provider deletion without removing them; the exact held upper directory
+was read-only verified to contain only its canonical datadisk. This is not
+permission to delete through a mismatched carrier gate.
+
+Actual source60 dashboard smoke used credential-free private HOME/LIMA_HOME and
+an existing Chrome binary with a separate profile, relay off and loopback-only
+page access. Read-only overview/VM navigation rendered with zero JS errors;
+normal Ctrl-C exited0 and the listener was absent. Deliberately absent backend
+tools produced explicit unavailable observations. Real native console/SSH worker
+lifetimes remain unverified. Existing scoped Ruff0.16.0 lint/format passed;
+formatter changes preserve all six native-module ASTs.
+
+
+## M1-15 platform design and static component evidence
+
+The selected private platform/control-root versus actual PID1/image/user-root
+contract is design-only. Two disclosed task design reviews closed after
+correcting P2 raw-vsock-to-Dropbear incompatibility with an explicit per-connection
+AF_INET adapter. Trusted key classes, image-only execution accounts, PTY
+preservation, exact Ubuntu24 injection/capture map, bounds/peak accounting and
+uncertain shutdown/session HOLD remain required, not implemented behavior.
+
+### M1-15 bootstrap correction — 2026-11-04 (design only, no VM created)
+
+Upstream Lima v2.2.1 `pkg/cidata/template.go` `ValidateTemplateArgs` rejects
+`User == "root"` and `UID == 0` (reader-verified; no provider Create invoked).
+The earlier root/UID0 bootstrap conclusion is withdrawn; see
+`M1-15-provider-root0-design-invalidation.json`. The provider bootstrap identity
+MUST stay `plmctl`/`UID 1000` with `passwordlessSudo: true` for genuine sudo.
+
+Role separation: Lima control account `plmctl` is the cloud-init/SSH-session
+bootstrap identity only; privileged work goes through the platform `sudo`
+adapter to real root; PID1/init, supervisor loop, Dropbear SSH/console,
+control jail (`/platform/control`), guestagent, CIDATA handling and seed/plan
+mounts are root-owned platform components under `/platform`; the workload
+identity comes from the OCI image `User` and is preserved for main/user
+sessions, never replaced by `plmctl`.
+
+Platform owns boot/init/supervisor/SSH/console, control jail, guestagent,
+CIDATA/seed/plan, and upper/work setup; the user image owns the read-only
+lower chain plus OCI config (entrypoint/cmd/env/user/workdir). Host source is
+mounted only on explicit opt-in. Commit capture MUST exclude or regenerate
+machine-id, dbus machine-id, hostname, SSH host keys, injected
+authorized_keys/tokens, cloud-init/DHCP state, seed/plan, control/run state
+and the upper binding nonce; the source VM is never mutated for capture.
+Capacity counts CIDATA pre-effect, seed/plan and the 256 MiB control tmpfs
+under the existing carrier+root+CIDATA aggregate guard. No VM was created,
+stopped, or deleted by this design correction.
+
+Actual existing-builder probes: ARM64 BusyBox-static1.36.1 and Limaagent2.2.1
+had no interpreter/dynamic segment; required applets and real ash features
+passed. nft is dynamic and must not be silently mixed into image libraries.
+Observed kernel6.8.0-147 config includes virtiofs/OverlayFS/vsock modules;
+this is not a tested custom initrd/early mount.
+
+Actual guest-only package preparation simulated35new/0upgrade/0remove, downloaded
+50.5MB and hashed each .deb, then installed offline in PrivateNetwork. Installed
+GCC13.3/musl1.2.4/qemu8.2.2 ran and dpkg audit was empty; service restarts deferred.
+No host installation or VM creation. Primary SSH source GET403 is retained;
+the upstream-listed public mirror returned the exact `e098034a…` tarball.
+Offline UID501 static build produced ARM64 Dropbear2026.94,506576bytes,
+SHA256 `7ecd073d57f4fb68bcbbbab1f75ea4a1b4cd860318df9b3508d95f4515c0b866`;
+machine183/no interpreter/no dynamic segment and actual version passed.
+These are component facts, not authenticated SSH, relay/handoff, a first-party
+ARM init/supervisor, native VZ root, populated resume, capture or lifecycle proof.
+
+Receipts in `~/.local/share/palimpsest-proofs/spec-goal-20261103/` include
+`M1-15-static-elf-and-shell-component-proof.json`,
+`M1-15-observed-kernel-feature-config.json`,
+`M1-15-guest-toolchain-deb-manifest.json`,
+`M1-15-guest-toolchain-install.json`,
+`M1-15-installed-toolchain-observation.json`,
+`M1-15-ssh-source-acquisition.json` (403),
+`M1-15-ssh-source-official-mirror-acquisition.json`, and
+`M1-15-static-ssh-build.json`. Source checksums came from official HTTPS;
+local PGP verification or hostile-root/host attestation is not claimed.
+
+## M1-14 transport design/source/schema evidence
+
+Official Lima2.2.1 annotated tag `bd99f2bc…` resolves to commit `27bc4c4b…`.
+The parent inspected selected boot/share/default/schema/readiness source and
+observed installed version2.2.1. Actual `limactl validate --fill` retained
+distinct host and `/.palimpsest/lower-input` guest paths with `writable:false`;
+the computed source-defined tag was `lima-4f213fc473c0c7df`. A plain-mode contrast
+removed mounts, and explicit `vmOpts.vz.rosetta.enabled/binfmt:false` resolved.
+Five real verified source31 derived payloads totaling35491840bytes supplied the
+host schema inputs. Source and host-copy hashes matched, without rehoming their
+worker store/receipt/lease authority. No VM was created or booted.
+
+Two disclosed task design audits initially accepted source36, then a follow-up
+P2 reopened it because Lima auto-creates a missing share directory. The corrected
+snapshot8943 requires retained projection/publication/allowlist/identity/hash/
+lease/run-reference validation before every create/first start/resume, with
+unknown cleanup blocking resume, and effective/persisted upper formatfalse checks.
+Both final source-only review slices closed; no runtime checks were performed
+by reviewers. Source36 completion is retained as invalidated historical evidence.
+`M1-14-{installed-transport-schema-validation,
+resolved-transport-binding,explicit-rosetta-off-schema,
+real-readonly-input-copies}.json` in the common proof directory are deliberately
+configuration/source evidence, not early guest mount, RO write denial, native
+kernel/initrd, root/SSH, populated-upper resume or two-consumer isolation.
+These later gates must be exercised by the real native consumer.
+
+## M1-13 installed command component — source34
+
+Source34 archive `b82231b47bf15abf9968ad53b4b637eacc0044a5847733de60f5c7c385fe3ef1`
+built canonical sdist→wheel offline. The real package checker installed both
+`palimpsest` and `plm`; the old mocked-command echo test was deleted, not repinned.
+Wheel SHA256 `4f6d08167510f53a05dce7cf28b59e572b4e01690734a3f131ff5f13a2bf3efc`
+was installed into a retained private guest prefix. Both entrypoints loaded the
+same `cli.main` from installed site-packages, not the source tree.
+
+Both installed executables actually built the Ubuntu/COPY/C-compile fixture
+through bounded owned BuildKit, yielding the same `74ba65eb…` manifest. They
+read the same complete persisted two-build frame, preserved distinct output
+labels and returned identical empty status tables. BuildKit normally stopped
+inactive/dead/MainPID0. Packaging/CLI/reference/completion contracts passed
+298/4skips in11.52s; Ruff check/format passed both changed Python files.
+No installed native VZ run/exec was performed; M1-13 remains unchecked until
+that later consumer is ready. This candidate does not publish or replace0.3.11.
+
+Receipts: `M1-13-canonical-package34.json`,
+`M1-13-private-installed-prefix34.json`, `M1-13-installed-real-builds34.json`,
+`M1-13-installed-catalog-status34.json`, `M1-13-focused34.json`,
+`M1-13-style34.json` and `M1-13-buildkit-settlement34.json` in the common proof
+directory. Guest-only isolated installs do not modify host packages or PATH.
+
+## M1-12 selected-root catalog component — source31
+
+Source31 archive
+`0d1b30c82842fa2755c61b3dbe052d055ade6d41316cffc4ffaa1870ecee1a10`
+passed1202 focused cases/11skips in77.19s across catalog, inventory, CLI,
+BuildKit, retained sources/instances, UI and lane/reference contracts. Preserve
+source29's6fail/1100pass/11skip and source30's1fail/1198pass/11skip. The final
+failure was the valid `builds/outputs` transport directory incorrectly classified
+as a malformed ledger, not overflow: huge integer timings and valid archive facts
+already survived. Source31 validates/ignores the canonical directory while
+symlink/non-directory/unknown namespaces remain incomplete; no expectation repin.
+
+Behavioral cases cover private SQLite persistence/transactions, wrong/unknown DB
+and unsafe path rejection, shared-traversal parent aliases, catchable fresh-init
+cleanup, malformed-entry isolation and UTF-8/size boundaries, UUID/revision
+source fences, complete-source monotonicity, source-preserving relocation,
+pre-solve context/Dockerfile provenance and late metadata failures preserving
+committed producer outputs. These do not prove process-death first-publication
+atomicity or provide execution/deletion authority.
+
+Actual public CLI built the pinned Ubuntu/COPY/C-compile fixture with default
+output namespace: build `bk-a0c3424ddcb5`, manifest `74ba65eb…`, archive
+`18391052…`. Five original occurrences of that new image cold-materialized with
+exact typed receipts. Independent CLI processes read the same build/source/
+ordered derived facts, and repeated persisted reads did not refresh. The prior
+historical `7f62247f…` five-layer source29 warm catalog smoke is separate evidence.
+
+Actual read-only web images/build detail/log and authenticated provenance API
+matched the new CLI record. No VM or remote Hub/control action was invoked.
+The stale relay extension was not installed/updated; an existing Chrome used
+a new owned profile, then normal SIGTERM/process absence/profile removal.
+Owned Lima auto-forwarded loopback; explicit SSH forward failed bind/exit255
+and was not retried. The early async URL read and incorrect postprocess keys/
+uninitialized global-token request are retained harness failures, not product
+failures or passing requests. BuildKit/web stopped inactive/dead/MainPID0.
+
+Receipts: `~/.local/share/palimpsest-proofs/spec-goal-20261103/`
+`M1-12-focused{29,30,31}.json`, `M1-12-real-build31.json`,
+`M1-12-new-build-chain31.json`, `M1-12-new-build-cli-restart31.json`,
+`M1-12-web-surface31.json`, screenshots and normal settlement receipts.
+Per-candidate immutable venvs pin parent and worker imports. Actual VZ `/`,
+SSH/source-profile execution admission and real run UUID linkage remain open;
+the canonical Goal ledger must not check M1-12 from this component proof.
+
+Final guarded source33 `a3e48cda…` has the same runtime as source32; only the
+architecture evidence/stamp changed. The four affected portable lanes passed
+7855/20skips/142warnings in307.22s (7875selected), `M1-12-impacted-lanes33.json`.
+Working guard `7e54a87c…` covers621 source files. Source32's actual config-selected
+keep-source move preserved graph/reference/order, verified copied source bytes,
+invalidated derivations, assigned an independent catalog ID and refreshed a
+complete frame. The first move correctly refused an environment override;
+public selection after unsetting it met the existing contract. These receipts
+and current resources are linked by `M1-12-component-verification33.json`,
+whose `canonical_complete` remains false.
+
+## M1-10 contextual filesystem fidelity — source27
+
+Source27 archive `f4f5cf4548f4a9b4dbd8827cf4e088ed2f7c263dad699c15e320d0d1a8d9f636`
+passed1178 focused cases in24.19s. Source26's first1178-node run retained17
+failures/1161passes: a cache constructor used source authority before initialization,
+invalid parent digests escaped the wire-error taxonomy, and five new worker
+fixtures omitted the required private cwd. These were fixed without changing the
+ownership or semantic gates. Shared-stream exhaustion now proves cumulative
+deadline cancellation occurs inside intake, not only afterward.
+
+Actual privileged source27 proof passed3 cases in1.71s: two marker orders with
+canonical-store bytes equal to real kernel-mounted SquashFS/OverlayFS images,
+and same exact leaf under two different parent UIDs with separate cold/warm
+artifacts. The omitted directory inherited UID/GID123:456, mode02710, mtime and
+ordinary `user.overlay.application`; an omitted root inherited314:159/0751 and
+its xattr. Existing file/link/overwrite/delete/recreation checks and EROFS write
+denials on both lowers and the merged view passed. Normal cleanup left no loops.
+An earlier wrapper omitted `sudo` and failed before starting its transient unit;
+`M1-10-real-filesystem27.json` preserves that setup failure, `27b` the actual run.
+
+The original pinned ARM five-layer CLI passed new-recipe cold4.594s/warm1.478s
+conversion with matching occurrence receipts, unchanged graph/process and no
+flattening. All recipe keys changed from prior semantics; this fully headered
+fixture's payload hashes remained the same. Verified artifact streams plus real
+`unsquashfs` rechecked exact source/input/stdout/report, ARM ELF183, UID/mode and
+original OS symlink. Reversed occurrence order was refused. These lifecycle
+observations are not a performance threshold, VZ `/`, SSH or runtime admission.
+
+Two disclosed read-only task audits source-closed inherited metadata/barriers,
+ordinary-xattr preservation, prefix operation/deadline attribution, contextual
+cache authority, historical read-only compatibility, constructor order, wire
+errors and current worker contracts. Neither ran checks or supplies an
+unavailable configured-reviewer/Astra signature. Exact source27's four impacted
+portable lanes passed7746/20skipped/142warnings in306.51s (7766 selected nodes).
+Docs-only source28 has identical Python/config bytes, passed143 document/guard/
+lane tests, exact lane-manifest validation and Ruff check/format for20 affected
+Python files. Working architecture guard is `475b0b10…`/619files. The initial
+readonly-source Ruff cache failure is preserved; explicit `--no-cache` passed.
+
+Receipts: `~/.local/share/palimpsest-proofs/spec-goal-20261103/`
+`M1-10-focused26.json`, `M1-10-focused27.json`,
+`M1-10-real-filesystem27b.json`, `M1-10-loops27.json`,
+`M1-10-real-v3-cold-warm27.json`, `M1-10-real-v3-inspection27.json`.
+Candidate-specific readonly proof venvs pin parent and `-I` worker imports;
+no running invocation's shared `.pth` is changed.
+
+## M1-09 ordered ARM filesystem conversion — 2026-11-04
+
+Source20 archive `bb5e775b…` passed1164 focused converter/worker/store/legacy/
+CLI/document contracts and four impacted portable lanes7642/20skipped/142warnings
+in293.17s. Source19's earlier7638-pass run predates the repaired discovery
+deadline. Two independent read-only audits covered source reconstruction and
+legacy/CLI isolation; the latter's P2 deadline gap was fixed and source-closed.
+Version, dependency inspection and final capability verification share the
+ARM CLI's remaining absolute budget; hashing is cooperative, not hard-preemptive.
+
+Actual Linux ARM public CLI converted the pinned original five-layer fixture
+without a flattened root, then reused the same per-layer receipts. Actual cache
+labels were `cold_miss` and `warm_hit`; incorrect disposable string expectations
+were saved as failed wrappers, not repinned permanent tests or replayed cold
+work. The initial64MiB outer file limit was too small for the103279616byte
+original tar; its stage/spool failure was preserved before a512MiB assigned
+envelope was used. Product limits and grant counters did not change.
+
+Verified ArtifactStore streams and real `unsquashfs` checked all five outputs,
+exact source/input/stdout/report, ARM ELF183, numeric UID/GID/mode and original
+OS symlink. Swapped receipt order was refused. An expired discovery deadline
+spawned no process; real verified-tool discovery completed within its budget,
+and the current source20 CLI reused the exact original receipts. No runtime
+leases, VZ workload VM, actual OverlayFS `/` or SSH/access proof is claimed.
+Finished smoke drivers and inspection-only copies were removed after evidence.
+Receipts: `~/.local/share/palimpsest-proofs/spec-goal-20261103/M1-09-*.json`.
+
+Historical M1-10 before evidence: `M1-10-whiteout-before20.json` reproduces the
+v1 lower-only/recreation corruption; `M1-10-inherited-directory-before22.json`
+and its canonical companion reproduce omitted-directory ownership/mode loss.
+The later source27 evidence above supersedes these defects, not VZ execution.
+
+## M1-05 deterministic native-root build fixture — 2026-11-04
+
+`tests/fixtures/vz-native-root/` is a complete Dockerfile build context, not a
+generated receipt or a simulated launcher. Its first and only target is
+`linux/arm64`. The Dockerfile uses the original official
+`docker.io/library/ubuntu` Ubuntu 24.04 child manifest
+`sha256:19cad59657037cffa0ac9a48107019b768900ff1071140965827513ac866bd5e`
+directly, with no external syntax frontend, invented root ancestry, or cloud
+image fallback. The parent proof has already acquired this child; that does
+not establish that a particular BuildKit daemon has it cached. The literal
+`FROM` resolves through Docker Hub and can fetch this same child again; it
+does not automatically consume the separately acquired OCI layout. Account
+for any registry metadata/blob transfers in the approved network allowance.
+
+The real build must run Ubuntu APT, install
+`tcc=0.9.27+git20200814.62c30a4a-1` and `libc6-dev`, copy the C source and text
+inputs, compile an arm64 Linux executable, execute it, and compare both output
+files against independently authored expectations. An unavailable pinned TCC
+package is a build failure, not permission to silently select another version
+or compiler. The parent subsequently built this unchanged fixture through the
+real local product CLI, guest Buildx0.30.1 remote driver and BuildKit0.34.1:
+the exact stdout/report, retained source, ARM ELF machine183 and original base
+descriptor/DiffID passed. Source12 runtime/source11 guard and input hashes are
+pinned in `M1-05-verification.json`; this is not a VZ workload-root proof.
+
+### Exact input and image contract
+
+All fixture text uses LF line endings and a final LF. These expected bytes are
+specified from the three input integers and their arithmetic sum, not harvested
+from an execution:
+
+| Image path under `/opt/vz-native-root/` | Required contents |
+| --- | --- |
+| `input.txt` | `7\n11\n13\n` (8 bytes) |
+| `expected.stdout`, build-retained `stdout.txt` | `palimpsest-vz-native-root\ncount=3\nsum=31\n` (41 bytes) |
+| `expected.report`, build-retained `report.txt` | `count=3\nsum=31\n` (15 bytes) |
+| `probe.c`, `Dockerfile` | Exact source files copied from this build context, retained without a host source mount |
+| `probe` | Actual executable compiled from the retained C source by installed TCC |
+| `installed-packages.tsv` | Actual complete `dpkg-query -W` package inventory: package name, version, architecture, tab-separated, one installed-package record per line |
+
+The image's genuine `WORKDIR` is `/opt/vz-native-root`; its genuine `CMD` is
+`["./probe", "input.txt", "report.txt"]`. Running it must exit **0**, emit exactly
+the 41 stdout bytes above, emit no stderr, and rewrite `report.txt` with exactly
+the 15 bytes above. The build itself retains `stdout.txt` as well as that report.
+Source, input, expected files, compiler and development headers remain in the
+image for later native-root rerun/recompilation checks.
+
+The child digest pins only the original base. Ubuntu APT mirror state, unpinned
+dependency versions (including `libc6-dev`), package metadata, executable bytes,
+and final image bytes are **not reproducibility guarantees**. Retain the actual
+complete `installed-packages.tsv`, compiler version, base/config/layer/output
+digests, build logs, platform/ELF identity, stdout, stderr and exit status in
+each proof. Pinning TCC does not pin its dependency closure. There are no
+timestamps, UUIDs, random values or network-derived values in expected output.
+
+### Canonical build and negative/source-change proof
+
+Before invoking the build, the parent must inspect its selected owner-only
+`config.toml`: online Dockerfile admission requires an existing `image_sources`
+policy with `schema_version = 1`, `publisher_policy = "registry-namespace"`,
+and a rule allowing `registry = "docker.io"`, `namespace = "library"`,
+`repository = "ubuntu"`. Missing policy denies all images, including a
+digest-pinned one. Do not bypass admission or modify configuration implicitly
+to make this fixture pass.
+The admission failure is
+`upstream image source is not allowed by image_sources policy`; it is not an
+APT, source-copy, or compiler failure.
+
+With that policy and the existing approved ARM builder selected, from the
+repository root:
+
+```sh
+palimpsest build tests/fixtures/vz-native-root \
+  --frontend dockerfile \
+  -f tests/fixtures/vz-native-root/Dockerfile \
+  --tag vz-native-root:m1-05 \
+  --platform linux/arm64 \
+  --cache-mode local \
+  --registry docker \
+  --network default
+```
+
+This is a local OCI build, not image publication or an OCI-root VM launch.
+APT needs the already approved bounded public network allowance; do not select
+strict offline mode for this online package-install fixture. No runtime cloud
+base, runtime-pack fallback, new builder, or host-source mount is needed.
+Retain the product CLI's actual returned build/artifact paths. Run only in the
+parent's approved isolated guest; a source review does not prove this command
+or ARM context transfer works.
+
+For the missing-source negative, use a private copy of this entire context
+outside the checkout, omit only `probe.c`, and invoke the same product CLI with
+that copy as context and its Dockerfile as `-f`. Require a nonzero build result
+at `COPY`, with no successful new image receipt and no substitution from the
+checkout, another context or an old binary. Preserve the original fixture.
+
+For source-change evidence, use another private complete context copy and
+change only `long long sum = 0;` to `long long sum = 1;` in `probe.c`. With
+unchanged expectations, require the actual compile/run to produce sum32 and
+fail the byte comparison; accepting a cached sum31 result is a failure.
+Then independently change the two expected files' `sum=31` lines to `sum=32`
+and rebuild: require exit0, stdout
+`palimpsest-vz-native-root\ncount=3\nsum=32\n`, and report
+`count=3\nsum=32\n`. Retain distinct output identities and exact changed source
+bytes. Do not update expectations by copying actual program output.
+
+In the later authorized VM proof, inspect the retained source/input and image
+configuration, run the original CMD with its real workdir, then recompile
+`tcc -Wall -o probe-recompiled probe.c` inside that workdir and rerun
+`./probe-recompiled input.txt report-recompiled.txt`. Require the original
+expected stdout/report bytes and exit0 before a separately retained sum32
+source-edit/recompilation check. A build-stage run alone proves neither VZ
+native-root boot, SSH access, source-in-layer runtime visibility, nor M1-04's
+missing pre-effect native-root binding. No such runtime completion is claimed.
+
+### Local context/ignore proof checkpoint
+
+Source13 passed553 existing/focused BuildKit, CLI and build-asset consumer tests.
+Six real product CLI cases passed their expectations: Dockerfile-only success,
+external Dockerfile plus complete source context, absent required source failure,
+merged exclusion/reinclusion/ancestor/sibling rules, external filename-specific
+ignore precedence, and exclusion of a required COPY source causing failure.
+Source trees and original Dockerfiles stayed unchanged in all six cases.
+Receipts live in `~/.local/share/palimpsest-proofs/spec-goal-20261103/`:
+`M1-06-07-real-product-cases13.json`, `M1-06-07-focused13.json`.
+
+The before receipts preserve actual source12 inclusion of an ignored file and
+valid config-only OCI rejection after BuildKit's genuine empty cache export.
+The repair records optional cache absence truthfully, preserves the prior cache
+pointer and still rejects partial/missing exports and missing mandatory native
+cache. Source14 only formats source13 code and strengthens the external-ignore
+identity test. Independent read-only source audits found no blockers. Four
+impacted portable lanes settled7598passed/20skipped/1failed/142warnings in378.26s:
+the isolated offline UV cache lacked hatchling. After assigning a cloned copy
+of the previously verified cache, that exact wheel-build/install node passed
+separately in0.37s. This is not an uninterrupted green full-lane run. No pending
+check, Hub deployment, native VZ root/SSH or explicit host-source mount is counted.
+
+
+## M1-04 source qualification component — 2026-11-03
+
+M1-04 is **not complete**: the actual native-root launch/preparation consumer
+does not yet bind this qualification to its prepared root/boot inputs. Existing
+amd64 KVM and experimental carrier paths were not widened.
+
+Source11 archive SHA256:
+`077fe1392ed810d7a9999e6d02fdd9698d55f6d48c4b1036856a01f98850a540`.
+Focused OS/source/profile/CLI/normalizer/state selection passed
+**778 in4.30s**. Final `core-cli host-runtime build-registry oci-store` selection
+passed **7560/20skipped/142warnings in289.63s**. No full/native/guest-binary
+opt-in or full-Hub result is implied.
+
+Real source08 before/source11 after cases established:
+
+- A552960byte tar carrier accepted at131072byte budget now fails before staging/
+  CAS promotion; selected CAS prefix is empty in that rejected case.
+- An actual rejected source used to remove an eligible own runtime quarantine.
+  It now preserves the quarantine/marker and avoids run-name-lock cleanup.
+- With requested effective-entry cap4, a controlled deep path created82synthetic
+  directories before later rejection. Shared normalization now stops with5small
+  construction attempts and at most4retained table entries, including before
+  reader accounting. This is not a measured host-OOM or RSS guarantee.
+
+The official Ubuntu24.04 arm64 child
+`sha256:19cad59657037cffa0ac9a48107019b768900ff1071140965827513ac866bd5e`
+was anonymously fetched with pinned original descriptors/DiffIDs; original
+archive28948992bytes, SHA256
+`f623dc2288e90a1403a2af195a4c976656244cee6109700d66ebef35e299169f`.
+Actual source qualification in both the owned Linux guest and Darwin arm64 CLI
+followed `/etc/os-release` to `/usr/lib/os-release`, read Ubuntu24.04 and selected
+the reviewed direct-linux source profile, with `execution_admitted:false`.
+The Mac run used isolated Python and sandbox-exec; separate probes observed
+network-bind/outside-case-write denial and own-case-write success. No hard
+Mac RSS cap is claimed.
+
+Actual derived original-image variants with unsupported top-layer OS, dangling
+preferred OS link and wrong config architecture were refused. Original bytes
+remain unchanged; no image command ran. Earlier Skopeo `/var/tmp` and missing
+disposable CAS-parent setup failures were harness/prerequisite issues, corrected
+with supported `--tmpdir` and canonical initialization without refetching the
+mutable tag or overwriting the archive. Later invalid-index and stale
+config-creation fixtures were corrected without product admission relaxation.
+
+Reader/reducer source review and explicit alternative intake/state audits closed
+their scoped findings; the default review followup returned429 and per-call
+model override was disabled. No unavailable signoff or Astra participation is
+claimed. Exact receipts, actual guard and resource state are in the handoff.
+
+## M1-03 source-policy qualification — 2026-11-03
+
+Exact candidate source07 archive SHA256:
+`e9f1cadf32833c647e2dc0f70755a5a6653a1f6793f8797e75434c7b810c4c32`.
+The actual working architecture guard passed
+`12b3a2aac24b9d3a66faf1605a4ce1e662ca2b7b717f693aebd099c8c496c216/609files`.
+No commit, release or deployed-source claim is attached to this snapshot.
+
+- Final explicit portable selection
+  `python scripts/test_lanes.py run core-cli host-runtime build-registry oci-store`:
+  **7350passed/22skipped/142warnings in380.66s**, exit0.
+- Earlier focused root selection:1301passed/2skipped on source06. All product
+  runtime and Hub test bytes/modes are identical06→07; only the remote-artifact
+  receipt fixture changed and the final lane run covers it.
+- Full separate Hub environment:1670passed/2skipped plus one existing sparse-tar
+  node blocked by the64MiB sandbox file cap. That exact node then passed alone
+  under a9GiB logical file cap, allocating8192physical bytes. This is not a claim
+  that one uninterrupted full-Hub run was green.
+- Real final CLI admission/revocation, arm64 BuildKit0.34.1 COPY→OCI with exact
+  file/descriptor/DiffID verification, and loopback Uvicorn/SQLite admission,
+  policy-revocation and immutable-idempotent-receipt smoke passed. HTTP identity
+  and settings were explicitly synthetic/disposable.
+- Real child pipes and actual payload/receipt commit helpers passed stable and
+  revoke-after-copy-before-link cases. Revocation retained the earlier payload/
+  journal, withheld the next payload/image and produced durable HOLD. Payloads
+  and storage were synthetic/local, not production SSH or Ceph.
+
+Project tests ran in a new approved arm64 VZ builder with private paths, readonly
+source, private network namespace,2GiB RAM/no swap,128tasks,2CPU, bounded files and
+wall time. Offline UV/backend tools were prepared explicitly in that guest.
+The earlier four-lane run's missing-UV, `/tmp` mount-alias rename and source-policy
+fixture failures are retained; no runtime exception was suppressed or failing
+test narrowed. An earlier deferred final output became unavailable and was not
+counted; the successful final run writes its receipt durably.
+
+BuildKit itself rejected future-stage COPY; prior-stage name and ordinal copies
+with empty upstream rules produced the exact expected file. Allowed Ubuntu
+resolution reached the OS network denial; no Ubuntu/CUDA image was acquired.
+No full/native/guest-binary opt-in, Docker Desktop, actual VZ user root, Keystone,
+container build/Kolla deployment, Ceph/Nova/GPU or cross-device proof is implied.
+Bounded receipts and source reviews are linked from the latest handoff.
 
 ## Local worktree consolidation — 2026-11-02
 

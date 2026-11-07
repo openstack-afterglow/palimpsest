@@ -353,10 +353,17 @@ def dispatch(args) -> int:
                     stream.write(rendered)
             return 0
         if operation == "registry-worker":
+            from .image_source_policy import load_image_source_policy
             from .registry_worker import run_job
+            from .state import resolve_roots
 
             result = run_job(
-                _json(args.request), cache_root=args.cache_root, jobs_root=args.jobs_root, assets_root=args.assets_root
+                _json(args.request),
+                cache_root=args.cache_root,
+                jobs_root=args.jobs_root,
+                assets_root=args.assets_root,
+                source_policy=load_image_source_policy(resolve_roots()),
+                current_policy=lambda: load_image_source_policy(resolve_roots()),
             )
         elif operation == "build":
             result = run_nova_build(_json(args.config), name=args.name)

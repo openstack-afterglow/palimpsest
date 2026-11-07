@@ -154,6 +154,8 @@ class OCIRootPreparationTransaction:
         )
         if set(plan) != expected_fields:
             raise StateError("OCI-root preparation boot plan fields are invalid")
+        if plan.get("platform") != {"os": "linux", "architecture": "amd64"}:
+            raise StateError("legacy OCI-root preparation requires exactly linux/amd64")
         actual = _json_digest(plan, "OCI-root preparation boot plan is invalid")
         if actual != plan_digest:
             raise StateError("OCI-root preparation boot plan binding is invalid")

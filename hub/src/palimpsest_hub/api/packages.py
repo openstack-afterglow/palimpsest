@@ -65,7 +65,7 @@ async def read_actor(request: Request, namespace: str):
 
 async def package_writer(request: Request, namespace: str):
     actor = await read_actor(request, namespace)
-    registry.require_capability(actor.actions, "packages:write")
+    registry.require_action(actor.actions, "packages:write")
     return actor
 
 
@@ -224,7 +224,7 @@ async def start_upload(
 
 @router.get("/projects/{namespace}/uploads/{upload_id}")
 async def upload_status(
-    namespace: str, upload_id: str, package: str = Query(...), actor: registry.Actor = Depends(package_writer)
+    namespace: str, upload_id: str, package: str = Query(...), actor: registry.Actor = Depends(read_actor)
 ):
     return await registry.upload_status(actor, namespace, package, upload_id, "package")
 
@@ -257,7 +257,7 @@ async def finalize_upload(
 
 @router.delete("/projects/{namespace}/uploads/{upload_id}", status_code=204)
 async def abort_upload(
-    namespace: str, upload_id: str, package: str = Query(...), actor: registry.Actor = Depends(package_writer)
+    namespace: str, upload_id: str, package: str = Query(...), actor: registry.Actor = Depends(read_actor)
 ):
     await registry.abort_upload(actor, namespace, package, upload_id, "package")
     return Response(status_code=204)

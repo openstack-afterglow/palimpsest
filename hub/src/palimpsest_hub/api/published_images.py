@@ -9,21 +9,26 @@ from datetime import UTC, datetime, timedelta
 from typing import Literal
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Security
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
 
 from palimpsest_hub.api import hub
 from palimpsest_hub.api.hub import (
     _factory_or_503,
-    _legacy_inventory,
-    _legacy_writer,
     _locked_blob,
     _run_blocking,
     _store_or_503,
 )
 from palimpsest_hub.api.image_jobs import bounded_json, content_descriptor
-from palimpsest_hub.auth import package_target_project_id
+from palimpsest_hub.auth import (
+    credential_headers,
+    get_package_manager_info,
+    keystone_token_header,
+    original_token_info,
+    package_target_project_id,
+)
 from palimpsest_hub.config import get_settings
 from palimpsest_hub.image_models import (
     PalimpsestHubLayerNode,
@@ -31,12 +36,133 @@ from palimpsest_hub.image_models import (
     PalimpsestHubPublishedImage,
 )
 from palimpsest_hub.models import PalimpsestHubUpload, exact_identity
+from palimpsest_hub.services import image_keys, public_images
 from palimpsest_hub.services import published_images as service
 from palimpsest_hub.services.blob_references import retain_blob
 from palimpsest_hub.services.image_jobs import _receive, fresh_writer, now
 from palimpsest_hub.services.worker_leases import sql_mutex
 
 router = APIRouter()
+
+# Documentation-only declarations: credential selection below reads the raw headers.
+image_key_bearer = HTTPBearer(
+    auto_error=False, scheme_name="ImageKey", description="ppi_v1_ image API key (Authorization: Bearer)"
+)
+
+_HUMAN_DENIALS = {
+    "packages:inventory": "Palimpsest inventory authority required",
+    "packages:read": "Palimpsest download authority required",
+    "packages:write": "Palimpsest publish authority required",
+}
+
+
+def _bearer_credential(authorization: str) -> str:
+    """RFC 7235: the auth scheme is case-insensitive; only Bearer carries an image key."""
+    scheme, _, credential = authorization.partition(" ")
+    credential = credential.strip(" ")
+    if scheme.casefold() != "bearer" or not credential:
+        raise HTTPException(status_code=401, detail="image key bearer credential required")
+    return credential
+
+
+async def _image_actor(request: Request, *, human_action: str, key_action: str, anonymous: bool) -> dict:
+    """Select exactly one credential: image key, original Keystone token, or (reads only) none.
+
+    A present but invalid credential is always rejected; it is never treated as anonymous.
+    `ppk_v1` package keys and every other bearer format fail image-key decoding with 401.
+    """
+    authorization, token = credential_headers(request)
+    if authorization is not None:
+        if "x-target-project-id" in request.headers:
+            raise HTTPException(status_code=403, detail="image keys cannot select a logical target")
+        actor = await image_keys.authenticate(_bearer_credential(authorization))
+        assertion = request.headers.get("x-project-id")
+        if assertion is not None and assertion != actor["project_id"]:
+            raise HTTPException(status_code=403, detail="project assertion does not match image key")
+        if key_action not in actor["image_actions"]:
+            raise HTTPException(status_code=403, detail="image key action is not delegated")
+        return actor
+    if token is None:
+        if not anonymous:
+            raise HTTPException(status_code=401, detail="X-Auth-Token header or image key is required")
+        public_images.admit_anonymous(request)
+        return public_images.anonymous_actor()
+    member = await get_package_manager_info(token_info=await original_token_info(request))
+    if human_action not in member.get("package_actions", ()):
+        raise HTTPException(status_code=403, detail=_HUMAN_DENIALS[human_action])
+    return member
+
+
+_TokenScheme = Security(keystone_token_header)
+_KeyScheme = Security(image_key_bearer)
+
+
+async def image_inventory(
+    request: Request, _token: str | None = _TokenScheme, _key: HTTPAuthorizationCredentials | None = _KeyScheme
+) -> dict:
+    return await _image_actor(request, human_action="packages:inventory", key_action="images:read", anonymous=True)
+
+
+async def image_download(
+    request: Request, _token: str | None = _TokenScheme, _key: HTTPAuthorizationCredentials | None = _KeyScheme
+) -> dict:
+    return await _image_actor(request, human_action="packages:read", key_action="images:read", anonymous=True)
+
+
+async def image_graph_reader(
+    request: Request, _token: str | None = _TokenScheme, _key: HTTPAuthorizationCredentials | None = _KeyScheme
+) -> dict:
+    return await _image_actor(request, human_action="packages:inventory", key_action="images:read", anonymous=False)
+
+
+async def image_writer(
+    request: Request, _token: str | None = _TokenScheme, _key: HTTPAuthorizationCredentials | None = _KeyScheme
+) -> dict:
+    return await _image_actor(request, human_action="packages:write", key_action="images:publish", anonymous=False)
+
+
+def _publish_only_key(actor: dict) -> bool:
+    return actor.get("actor_type") == "image-key" and "images:read" not in actor["image_actions"]
+
+
+async def _fresh_writer(actor: dict) -> dict:
+    """Mutation-boundary recheck for the same credential kind that admitted the request."""
+    if actor.get("actor_type") == "image-key":
+        return await image_keys.fresh_actor(actor, "images:publish")
+    return await fresh_writer(actor)
+
+
+async def _require_own_staged_payloads(actor: dict, manifest: dict) -> None:
+    """A publish-only key cannot probe payloads it did not stage (no reuse of visible images)."""
+    digests = {item["digest"] for item in manifest["layers"]}
+    async with _factory_or_503()() as session:
+        staged = set(
+            (
+                await session.scalars(
+                    select(PalimpsestHubPublicationPayload.blob_digest).where(
+                        exact_identity(PalimpsestHubPublicationPayload.project_id, actor["project_id"]),
+                        exact_identity(PalimpsestHubPublicationPayload.created_by, actor["user_id"]),
+                        PalimpsestHubPublicationPayload.blob_digest.in_(digests),
+                    )
+                )
+            ).all()
+        )
+    if staged != digests:
+        raise HTTPException(status_code=404, detail="publication payload not found")
+
+
+def _readable(row, actor: dict) -> bool:
+    if public_images.is_anonymous(actor):
+        return public_images.anonymous_readable(row)
+    return service.image_readable(row, actor)
+
+
+class SourceClosureItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    role: Literal["root", "manifest", "config", "layer"]
+    digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    size_bytes: int = Field(gt=0, strict=True)
+    ordinal: int = Field(ge=0, strict=True)
 
 
 class PublicationRequest(BaseModel):
@@ -45,6 +171,7 @@ class PublicationRequest(BaseModel):
     name: str = Field(pattern=r"^[a-z0-9][a-z0-9.+-]{0,63}$")
     manifest: dict
     visibility: Literal["private", "internal", "public"] = "private"
+    source_closure: list[SourceClosureItem] | None = Field(default=None, min_length=1, max_length=300)
 
 
 class ExtensionLayer(BaseModel):
@@ -92,7 +219,7 @@ async def _upload_admission(factory, store, project, actor):
                 )
                 if active >= hub._MAX_ACTIVE_UPLOADS:
                     raise HTTPException(status_code=429, detail="project upload session limit reached")
-                await fresh_writer(actor)
+                await _fresh_writer(actor)
                 session.add(
                     PalimpsestHubUpload(
                         id=upload_id, received_bytes=0, project_id=project, created_by=actor.get("user_id")
@@ -119,7 +246,7 @@ async def _upload_admission(factory, store, project, actor):
 
 
 @router.put("/published-images/blobs/{digest}", operation_id="stage_published_image_payload")
-async def stage_payload(digest: str, request: Request, actor: dict = Depends(_legacy_writer)):
+async def stage_payload(digest: str, request: Request, actor: dict = Depends(image_writer)):
     digest, size = content_descriptor(request, get_settings().palimpsest_hub_max_blob_bytes, digest)
     if request.headers.get("Content-Type", "").split(";", 1)[0] != "application/octet-stream":
         raise HTTPException(status_code=415, detail="publication payload must be octet-stream")
@@ -129,11 +256,11 @@ async def stage_payload(digest: str, request: Request, actor: dict = Depends(_le
     # not permission to adopt another project's private payload.
     async with (
         _upload_admission(factory, store, project, actor),
-        _receive(store, request, digest, size, now() + timedelta(seconds=300)) as (path, verified),
+        _receive(store, request, digest, size, now() + timedelta(seconds=300), squashfs=False) as (path, verified),
         _locked_blob(store, digest),
-        sql_mutex(factory, "build-api:image:single-flight") as session,
+        sql_mutex(factory, service.IMAGE_MUTEX) as session,
     ):
-        await fresh_writer(actor)
+        await _fresh_writer(actor)
         await _run_blocking(store.publish_verified, path, verified)
         row = await session.get(
             PalimpsestHubPublicationPayload,
@@ -158,13 +285,15 @@ async def stage_payload(digest: str, request: Request, actor: dict = Depends(_le
 
 
 @router.post("/published-images", status_code=201, operation_id="publish_image")
-async def publish(request: Request, actor: dict = Depends(_legacy_writer)):
+async def publish(request: Request, actor: dict = Depends(image_writer)):
     payload = await bounded_json(request, PublicationRequest, 1024 * 1024)
     manifest = service.normalized(payload.manifest)
     if sum(item["size_bytes"] for item in manifest["layers"]) > get_settings().palimpsest_hub_max_blob_bytes:
         raise HTTPException(status_code=413, detail="image stack exceeds byte limit")
-    current = await fresh_writer(actor)
+    current = await _fresh_writer(actor)
     current = {**current, "project_id": package_target_project_id(current)}
+    if _publish_only_key(current):
+        await _require_own_staged_payloads(current, manifest)
     return await service.publish_image(
         _factory_or_503(),
         _store_or_503(),
@@ -173,31 +302,43 @@ async def publish(request: Request, actor: dict = Depends(_legacy_writer)):
         payload.name,
         manifest,
         visibility=payload.visibility,
-        authority=actor,
+        source_closure=(
+            [item.model_dump() for item in payload.source_closure] if payload.source_closure is not None else None
+        ),
+        recheck=lambda: _fresh_writer(actor),
     )
 
 
 @router.get("/published-images", operation_id="list_published_images")
 async def list_images(
-    limit: int = Query(100, ge=1, le=200), offset: int = Query(0, ge=0), actor: dict = Depends(_legacy_inventory)
+    limit: int = Query(100, ge=1, le=200), offset: int = Query(0, ge=0), actor: dict = Depends(image_inventory)
 ):
+    anonymous = public_images.is_anonymous(actor)
+    if anonymous:
+        limit = min(limit, public_images.ANONYMOUS_LIST_LIMIT)
+    predicate = public_images.anonymous_predicate() if anonymous else service.visible_images(actor)
     async with _factory_or_503()() as session:
         rows = (
             await session.scalars(
                 select(PalimpsestHubPublishedImage)
-                .where(service.visible_images(actor))
+                .where(predicate)
                 .order_by(PalimpsestHubPublishedImage.created_at, PalimpsestHubPublishedImage.id)
                 .limit(limit)
                 .offset(offset)
             )
         ).all()
+        if anonymous:
+            return {"items": [await public_images.anonymous_image_value(session, row) for row in rows]}
         return {"items": [await service.image_value(session, row, actor=actor) for row in rows]}
 
 
 @router.post("/published-images/extensions", status_code=201, operation_id="publish_image_extension")
-async def extension(request: Request, actor: dict = Depends(_legacy_writer)):
+async def extension(request: Request, actor: dict = Depends(image_writer)):
     payload = await bounded_json(request, ExtensionRequest, 1024 * 1024)
-    current = await fresh_writer(actor)
+    current = await _fresh_writer(actor)
+    if _publish_only_key(current):
+        # Extension reads the base image's full manifest and graph.
+        raise HTTPException(status_code=403, detail="image extension also requires images:read")
     current = {**current, "project_id": package_target_project_id(current)}
     return await service.extend_image(
         _factory_or_503(),
@@ -209,16 +350,19 @@ async def extension(request: Request, actor: dict = Depends(_legacy_writer)):
         [layer.model_dump(exclude_none=True, exclude={"id", "parent_id"}) for layer in payload.layers],
         visibility=payload.visibility,
         metadata=payload.metadata,
-        authority=actor,
+        recheck=lambda: _fresh_writer(actor),
     )
 
 
 @router.get("/published-images/{image_id}", operation_id="get_published_image")
-async def get_image(image_id: UUID, actor: dict = Depends(_legacy_inventory)):
+async def get_image(image_id: UUID, actor: dict = Depends(image_inventory)):
+    anonymous = public_images.is_anonymous(actor)
     async with _factory_or_503()() as session:
         row = await session.get(PalimpsestHubPublishedImage, str(image_id))
-        if row is None or not service.image_readable(row, actor):
+        if row is None or not _readable(row, actor):
             raise HTTPException(status_code=404, detail="published image not found")
+        if anonymous:
+            return await public_images.anonymous_image_value(session, row)
         return await service.image_value(session, row, actor=actor)
 
 
@@ -238,7 +382,10 @@ async def _node(session, node_id, actor, *, project_id=None, image_id=None):
 
 @router.get("/layer-nodes/{node_id}", operation_id="get_layer_node")
 async def get_node(
-    node_id: str, project_id: str | None = None, image_id: UUID | None = None, actor: dict = Depends(_legacy_inventory)
+    node_id: str,
+    project_id: str | None = None,
+    image_id: UUID | None = None,
+    actor: dict = Depends(image_graph_reader),
 ):
     async with _factory_or_503()() as session:
         return service.serialize_node(
@@ -253,7 +400,7 @@ async def children(
     offset: int = Query(0, ge=0),
     project_id: str | None = None,
     image_id: UUID | None = None,
-    actor: dict = Depends(_legacy_inventory),
+    actor: dict = Depends(image_graph_reader),
 ):
     image_id = str(image_id) if image_id else None
     async with _factory_or_503()() as session:
@@ -272,7 +419,10 @@ async def children(
 
 @router.get("/layer-nodes/{node_id}/ancestors", operation_id="get_layer_ancestors")
 async def ancestors(
-    node_id: str, project_id: str | None = None, image_id: UUID | None = None, actor: dict = Depends(_legacy_inventory)
+    node_id: str,
+    project_id: str | None = None,
+    image_id: UUID | None = None,
+    actor: dict = Depends(image_graph_reader),
 ):
     image_id = str(image_id) if image_id else None
     async with _factory_or_503()() as session:
@@ -288,24 +438,26 @@ async def ancestors(
 
 
 @router.get("/published-images/{image_id}/blobs/{digest}", operation_id="download_published_image_payload")
-async def image_blob(image_id: UUID, digest: str, request: Request, actor: dict = Depends(hub._legacy_download)):
+async def image_blob(image_id: UUID, digest: str, request: Request, actor: dict = Depends(image_download)):
     async with _factory_or_503()() as session:
         row = await session.get(PalimpsestHubPublishedImage, str(image_id))
-        if row is None or not service.image_readable(row, actor):
+        if row is None or not _readable(row, actor):
             raise HTTPException(status_code=404, detail="published image not found")
-        manifest = service.normalized(row.manifest_json)
-        item = next((item for item in manifest["layers"] if item["digest"] == digest), None)
-        if item is None:
+        roles, size = await service.image_blob_roles(session, row, digest)
+        if not roles:
             raise HTTPException(status_code=404, detail="publication payload not found")
         await service.image_value(session, row)
     store = _store_or_503()
     if not store.exists(digest):
         raise HTTPException(status_code=404, detail="publication payload not found")
-    return hub._blob_response(
+    payload = "payload" in roles
+    response = hub._blob_response(
         store=store,
         digest=digest,
-        total=item["size_bytes"],
-        media_type="application/vnd.palimpsest.layer.squashfs",
-        filename=digest[7:] + ".sqfs",
+        total=size,
+        media_type="application/vnd.palimpsest.layer.squashfs" if payload else "application/octet-stream",
+        filename=digest[7:] + (".sqfs" if payload else ""),
         range_header=request.headers.get("range"),
     )
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return response

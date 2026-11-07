@@ -1,31 +1,34 @@
 # Install Palimpsest
 
 Palimpsest requires Python 3.11 or newer. This source prepares
-[`palimpsest-client 0.3.12`](https://pypi.org/project/palimpsest-client/0.3.12/)
-for the 2026-11-04 (UTC) release candidate; publication and deployment are separate. After publication, install exact bytes in isolation:
+[`palimpsest-client 0.3.13`](https://pypi.org/project/palimpsest-client/0.3.13/)
+(2026-11-08 UTC release candidate; 0.3.12 was the previous candidate); publication and deployment are separate. After publication, install exact bytes in isolation:
 
 ```sh
-uv tool install --python 3.11 "palimpsest-client==0.3.12"
+uv tool install --python 3.11 "palimpsest-client==0.3.13"
 palimpsest --version
 
 # Or use pip, without changing system Python:
 python3.11 -m venv .venv
-.venv/bin/python -m pip install "palimpsest-client==0.3.12"
+.venv/bin/python -m pip install "palimpsest-client==0.3.13"
 .venv/bin/palimpsest --version
 ```
 
-Version0.3.12 adds SDK publication/visibility/layer graphs and opt-in native
+Version0.3.13 adds Hub image quotas/keys/anonymous public reads, `published push|pull|status` and the local Lima VZ arm64 OCI-root runtime on top of the 0.3.12 SDK publication/visibility/layer graphs and opt-in native
 integration while preserving the released local/runtime work. For a trusted checkout,
 run `uv tool install --force --python 3.11 .`, or `python -m pip install .`
 inside a virtual environment. Remote branch/PyPI installation does not include
 uncommitted edits. Do not infer source identity from the version alone.
+The updated trusted checkout installs both `palimpsest` and `plm` through the
+same CLI implementation; `plm store ls` is equivalent to `palimpsest store ls`.
+Older published bytes may lack the alias even if their version string matches.
 If uv's bin directory is not on `PATH`, explicitly run `uv tool update-shell`
 and open a new terminal. Hub is a separate distribution/deployment; a client
 upgrade does not publish or roll out Hub images.
 
 Publication, deployment-server package selection and actual running services are
 separate gates; use the [latest release/operator handoff](docs/development-handoff.md)
-for their exact receipts. Installing the0.3.12 client does not activate native
+for their exact receipts. Installing the0.3.13 client does not activate native
 profiles, provision Ceph credentials, or deploy the matching Hub containers.
 
 Historical release `v0.3.5` followed protected-dev PR #24 and merge
@@ -122,7 +125,7 @@ Repository tags also drive GHCR image tags for
 `ghcr.io/openstack-afterglow/palimpsest-hub-worker` and
 `ghcr.io/openstack-afterglow/palimpsest-hub-build-worker`; image tags follow the
 repository tag, not the independently versioned Hub wheel. The released Kolla
-role defaults to Hub image tag `0.3.12`; verify exact reviewed API/export/build-worker
+role defaults to Hub image tag `0.3.13`; verify exact reviewed API/export/build-worker
 digests and platform manifests before any future deployment.
 Root publication requires trusted tag artifact checks and protected PyPI
 publisher gates. Native policy permits only enabled/success or explicitly

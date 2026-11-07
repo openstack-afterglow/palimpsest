@@ -24,6 +24,18 @@ storage/access/measurement dependencies and the single currently needed shared
 build worker are separate infrastructure, not additional test consumers; preserve
 their recorded ownership/dependencies when reconciling cleanup. Never delete an
 unattributed VM or another user's resource merely because it appears nearby.
+Current API benchmark and fixed `scripts/smoke_hub_execution.py` qualification
+requires an original project token with `packages:write` and either
+`packages:manage` or `packages:manage_own`. Existing member self-cleanup authority
+is sufficient only for consumers created by that actual caller and their
+exclusive disposable boot volumes; never another private creator's resource.
+They read `GET /v1/policy/capabilities` before API work and again before consumer
+reservations/intents; malformed/unavailable authority or missing admission/
+cleanup action fails closed. Package keys cannot supply cleanup authority.
+This preflight grants no budget and does not freeze future authorization.
+Run one approved case, preserve evidence, delete its exact consumer/exclusive
+boot disk, and prove provider absence before the next case. Revoked cleanup
+authority is HOLD: no replacement, system/service fallback or uncertain replay.
 
 The existing native/scenario loops gate their own consumers, but their separate
 locks are not a project-wide GPU admission fence. Keep one operator/executor for

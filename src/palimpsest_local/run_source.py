@@ -9,8 +9,9 @@ import re
 import secrets
 import shutil
 import stat
+import time
 from collections.abc import Sequence
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,7 @@ from typing import Any
 from . import state
 from .digest import digest_hex, require_digest
 from .errors import PalimpsestError, StateError
+from .image_source_policy import admit_image_source
 from .oci_image import ACQUISITION_PLATFORMS
 from .oci_layout import MAX_JSON_BYTES, MEDIA_TYPE_LAYER_CONFIG, MEDIA_TYPE_MANIFEST, ContentStore
 from .package_reference import package_reference_path, read_package_reference
@@ -32,11 +34,13 @@ from .platforms import (
     capability_profile,
     detect_host,
     evaluate_capability_profile,
+    select_backend,
 )
 from .registry import (
     RegistryError,
     RegistryProfile,
     add_profile,
+    default_registry_config,
     docker_image_inspect_argv,
     load_registry_config,
     resolve_docker_config_dir,
@@ -46,6 +50,7 @@ from .registry import (
 from .registry_intake import (
     DEFAULT_TIMEOUT_SECONDS,
     MAX_ARCHIVE_BYTES,
+    AcquisitionDeadline,
     RegistryImageNotFoundError,
     RegistryIntakeError,
     RegistryPullReceipt,
@@ -55,6 +60,16 @@ from .registry_intake import (
 )
 from .runtime_types import RuntimePreflightError
 from .state import StatePaths, pinned_owner_directory, utc_now_iso, validate_tag
+from .web_job_client import (
+    PreparationToolHold,
+    defer_preparation_termination,
+    defer_web_cancellation,
+    no_force_preparation_termination,
+    park_preparation_custody,
+    preparation_custody_held,
+    require_preparation_custody_owner,
+    retain_preparation_custody,
+)
 
 _RUN_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 _BUILD_ID_RE = re.compile(r"^bk-[0-9a-f]{12}$")
@@ -78,15 +93,39 @@ def generate_run_name(image_ref: str, roots: StatePaths | None = None) -> str:
     raise StateError("cannot allocate a unique run name")
 
 
-def preflight_oci_capabilities(*, network: str | None = None, host: HostPlatform | None = None) -> None:
+def preflight_oci_capabilities(
+    *,
+    network: str | None = None,
+    host: HostPlatform | None = None,
+    platform: str = "linux/amd64",
+    backend: str = "auto",
+    no_force: bool = False,
+) -> None:
+    if type(no_force) is not bool:
+        raise StateError("source capability no-force policy must be boolean")
+    selected_host = host or detect_host()
+    if platform == "linux/amd64" and backend in {"auto", "kvm"}:
+        # Preserve the existing host-independent amd64 KVM intake/probe.
+        selected = "kvm"
+    else:
+        selected = select_backend(
+            platform.removeprefix("linux/"), host=selected_host, requested=backend, runtime_kind="oci-root"
+        )
+    if selected == "lima-vz" and no_force:
+        # The acquisition scope probes the pinned native tool once before its
+        # phase marker. Repeated discovery checks must not invoke PATH Lima.
+        from .vz_native_runtime import VZHostConfig
+
+        VZHostConfig.from_environment().verify()
+        return
     profile = capability_profile(
-        DispatchKey(RuntimeKind.OCI_ROOT, RuntimeBackend.KVM), RuntimeOperation.RUN, network=network
+        DispatchKey(RuntimeKind.OCI_ROOT, RuntimeBackend(selected)), RuntimeOperation.RUN, network=network
     )
     report = evaluate_capability_profile(
         profile,
         subject_digest="sha256:" + hashlib.sha256(f"early-oci:{profile.profile_id}:{network}".encode()).hexdigest(),
-        arch="x86_64",
-        host=host or detect_host(),
+        arch="aarch64" if platform == "linux/arm64" else "x86_64",
+        host=selected_host,
         purpose=PreflightReportPurpose.DISCOVERY,
     )
     if not report.successful:
@@ -97,6 +136,91 @@ def preflight_oci_capabilities(*, network: str | None = None, host: HostPlatform
             report=report,
             capability_id=failed.capability_id,
         )
+
+
+@contextmanager
+def _external_acquisition_scope(*, platform, backend, force_architecture, timeout_seconds, no_force, network=None):
+    native = False
+    if not force_architecture and (platform == "linux/arm64" or backend == "lima-vz"):
+        native = (
+            select_backend(platform.removeprefix("linux/"), requested=backend, runtime_kind="oci-root") == "lima-vz"
+        )
+    if native or no_force:
+        require_preparation_custody_owner()
+    if (native or no_force) and preparation_custody_held():
+        raise PreparationToolHold("previous source preparation retains custody; no next request permitted")
+    if not native:
+        with no_force_preparation_termination() if no_force else nullcontext():
+            yield no_force, timeout_seconds, None
+        return
+
+    from .vz_native_runtime import VZHostConfig, preflight_pinned_lima, source_acquisition_custody
+
+    config = VZHostConfig.from_environment()
+    config.verify()
+    expiry = config.value["expires_unix"]
+    remaining = float(timeout_seconds)
+    if expiry is not None:
+        remaining = min(remaining, expiry - time.time())
+    if not 0 < remaining <= 3600:
+        raise StateError("native VZ source acquisition deadline is invalid or expired")
+    deadline = AcquisitionDeadline(time.monotonic() + remaining, expiry)
+
+    with (
+        no_force_preparation_termination(checkpoint=deadline.checkpoint),
+        source_acquisition_custody(config) as custody,
+    ):
+        with pinned_owner_directory(custody) as directory:
+            marker = None
+            payload = state._json_bytes(
+                {
+                    "schema": "palimpsest.vz-source-acquisition.v1",
+                    "nonce": secrets.token_hex(16),
+                    "operation": "source-acquisition",
+                    "pid": os.getpid(),
+                    "config_digest": config.digest,
+                }
+            )
+            try:
+                preflight_pinned_lima(config, custody=custody, timeout_seconds=deadline.remaining(30), network=network)
+                with defer_web_cancellation(), defer_preparation_termination():
+                    marker = os.open(
+                        "active.json",
+                        os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                        0o600,
+                        dir_fd=directory,
+                    )
+                    view = memoryview(payload)
+                    while view:
+                        view = view[os.write(marker, view) :]
+                    os.fsync(marker)
+                    os.fsync(directory)
+                deadline.checkpoint()
+                yield True, deadline.remaining(remaining), deadline
+                deadline.checkpoint()
+            finally:
+                with defer_web_cancellation(), defer_preparation_termination():
+                    if preparation_custody_held():
+                        retain_preparation_custody(marker, directory, custody)
+                        park_preparation_custody()
+                    if marker is not None:
+                        try:
+                            opened = os.fstat(marker)
+                            visible = os.stat("active.json", dir_fd=directory, follow_symlinks=False)
+                            if (
+                                (opened.st_dev, opened.st_ino) != (visible.st_dev, visible.st_ino)
+                                or opened.st_uid != os.geteuid()
+                                or opened.st_nlink != 1
+                                or stat.S_IMODE(opened.st_mode) != 0o600
+                                or os.pread(marker, len(payload) + 1, 0) != payload
+                            ):
+                                raise PreparationToolHold("native acquisition custody marker changed")
+                            os.unlink("active.json", dir_fd=directory)
+                            os.fsync(directory)
+                            os.close(marker)
+                        except BaseException:
+                            retain_preparation_custody(marker, directory, custody)
+                            park_preparation_custody()
 
 
 @dataclass(frozen=True, slots=True)
@@ -234,7 +358,11 @@ def save_retained_source_record(roots: StatePaths, record: RetainedSourceRecord)
 
 
 def _archive_digest(
-    path: Path, expected: str | None = None, *, directory_fd: int | None = None
+    path: Path,
+    expected: str | None = None,
+    *,
+    directory_fd: int | None = None,
+    acquisition_deadline: AcquisitionDeadline | None = None,
 ) -> tuple[str, os.stat_result]:
     """Hash the bounded regular file pinned by this exact name/descriptor."""
     target = path.name if directory_fd is not None else path
@@ -243,6 +371,8 @@ def _archive_digest(
         return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
 
     try:
+        if acquisition_deadline is not None:
+            acquisition_deadline.checkpoint()
         before = os.stat(target, dir_fd=directory_fd, follow_symlinks=False)
         if (
             not stat.S_ISREG(before.st_mode)
@@ -258,6 +388,8 @@ def _archive_digest(
             digest = hashlib.sha256()
             remaining = opened.st_size
             while remaining:
+                if acquisition_deadline is not None:
+                    acquisition_deadline.checkpoint()
                 chunk = stream.read(min(1024 * 1024, remaining))
                 if not chunk:
                     raise StateError("local OCI archive changed during verification")
@@ -269,6 +401,8 @@ def _archive_digest(
                 or identity(os.stat(target, dir_fd=directory_fd, follow_symlinks=False)) != identity(opened)
             ):
                 raise StateError("local OCI archive changed during verification")
+        if acquisition_deadline is not None:
+            acquisition_deadline.checkpoint()
         value = "sha256:" + digest.hexdigest()
         if expected is not None and value != require_digest(expected):
             raise StateError("local OCI archive digest mismatch")
@@ -334,13 +468,15 @@ def find_retained_oci_source(
     return next(iter(matches.values()), None)
 
 
-def list_retained_oci_sources(roots: StatePaths) -> list[dict[str, Any]]:
+def _collect_retained_oci_sources(roots: StatePaths, warnings: set[str] | None) -> list[dict[str, Any]]:
     results: dict[tuple[str, str], dict[str, Any]] = {}
     with _source_directory(roots, "records") as directory:
         if directory is None:
             return []
         for filename in sorted(os.listdir(directory)):
             if re.fullmatch(r"[0-9a-f]{64}\.json", filename) is None:
+                if warnings is not None:
+                    warnings.add("Some retained OCI source records are malformed")
                 continue
             try:
                 record = _read_record(directory, filename)
@@ -358,7 +494,11 @@ def list_retained_oci_sources(roots: StatePaths) -> list[dict[str, Any]]:
                     availability = "missing"
                 except OSError:
                     availability = "unavailable"
+                    if warnings is not None:
+                        warnings.add("Some retained OCI source archives are unavailable")
             except (OSError, PalimpsestError):
+                if warnings is not None:
+                    warnings.add("Some retained OCI source metadata is unavailable or inconsistent")
                 continue
             key = (record.root_digest, record.archive_digest)
             if key in results:
@@ -386,6 +526,17 @@ def list_retained_oci_sources(roots: StatePaths) -> list[dict[str, Any]]:
                 "build_ids": [],
             }
     return list(results.values())
+
+
+def list_retained_oci_sources(roots: StatePaths, *, warnings: set[str] | None = None) -> list[dict[str, Any]]:
+    """Project retained sources, with optional explicit discovery incompleteness."""
+    try:
+        return _collect_retained_oci_sources(roots, warnings)
+    except (OSError, PalimpsestError):
+        if warnings is None:
+            raise
+        warnings.add("Retained OCI source metadata namespace is unavailable or inconsistent")
+        return []
 
 
 def find_buildkit_oci_source(
@@ -458,13 +609,22 @@ def find_package_reference_source(
 
 
 def _retain_archive(
-    roots: StatePaths, receipt: RegistryPullReceipt, reference: str, source_type: str
+    roots: StatePaths,
+    receipt: RegistryPullReceipt,
+    reference: str,
+    source_type: str,
+    *,
+    acquisition_deadline: AcquisitionDeadline | None = None,
 ) -> ResolvedRunSource:
-    archive_digest, before = _archive_digest(receipt.output)
+    archive_digest, before = _archive_digest(
+        receipt.output, **({"acquisition_deadline": acquisition_deadline} if acquisition_deadline is not None else {})
+    )
     filename = digest_hex(archive_digest) + ".oci.tar"
     final = roots.state.resolve() / "sources" / "blobs" / filename
     with _source_directory(roots, "blobs", create=True) as directory:
         try:
+            if acquisition_deadline is not None:
+                acquisition_deadline.checkpoint()
             os.link(receipt.output.name, filename, src_dir_fd=directory, dst_dir_fd=directory, follow_symlinks=False)
             linked = os.stat(filename, dir_fd=directory, follow_symlinks=False)
             if (linked.st_dev, linked.st_ino, linked.st_size, linked.st_mtime_ns) != (
@@ -476,7 +636,11 @@ def _retain_archive(
                 raise StateError("acquired OCI archive changed during retention")
             os.fsync(directory)
         except FileExistsError:
-            _archive_digest(final, archive_digest)
+            _archive_digest(
+                final,
+                archive_digest,
+                **({"acquisition_deadline": acquisition_deadline} if acquisition_deadline is not None else {}),
+            )
         os.unlink(receipt.output.name, dir_fd=directory)
         os.fsync(directory)
     record = RetainedSourceRecord(
@@ -492,6 +656,8 @@ def _retain_archive(
         utc_now_iso(),
         tuple(dict.fromkeys((reference, receipt.reference))),
     )
+    if acquisition_deadline is not None:
+        acquisition_deadline.checkpoint()
     save_retained_source_record(roots, record)
     return ResolvedRunSource("oci-root", final, record.root_digest, receipt, source_type)
 
@@ -517,8 +683,29 @@ def find_docker_daemon_source(
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     platform: str = "linux/amd64",
     force_architecture: bool = False,
+    backend: str = "auto",
+    no_force: bool = False,
+    acquisition_deadline: AcquisitionDeadline | None = None,
 ) -> ResolvedRunSource | None:
     """Export one unambiguous image, preserving acquisition platform and native policy."""
+    if type(no_force) is not bool:
+        raise StateError("source acquisition no-force policy must be boolean")
+    if any(_DIGEST_RE.fullmatch(reference) for reference in image_refs):
+        raise StateError("bare digests identify local artifacts; select a retained source or explicit archive path")
+    # A Docker-store hit is still upstream adoption, not an explicit local
+    # archive. Admit every candidate before contacting the daemon so a denial
+    # cannot become an image miss or authorize a different transport.
+    for image_ref in dict.fromkeys(image_refs):
+        canonical = resolve_image_reference(
+            image_ref,
+            default_registry_config(),
+            registry_alias=None if _has_explicit_registry(image_ref) else "docker",
+            environment={},
+        ).canonical
+        try:
+            admit_image_source(canonical, roots)
+        except PalimpsestError as exc:
+            raise RegistryIntakeError(str(exc)) from None
     if not image_refs or shutil.which("docker") is None:
         return None
     config_dir = docker_config_dir or resolve_docker_config_dir()
@@ -526,7 +713,10 @@ def find_docker_daemon_source(
     for image_ref in dict.fromkeys(image_refs):
         try:
             result = run_docker_command(
-                docker_image_inspect_argv(config_dir, [image_ref]), timeout_seconds=15, check=False
+                docker_image_inspect_argv(config_dir, [image_ref]),
+                timeout_seconds=acquisition_deadline.remaining(15) if acquisition_deadline is not None else 15,
+                check=False,
+                **({"no_force": True} if no_force else {}),
             )
         except PalimpsestError:
             raise RegistryIntakeError("cannot inspect the configured local Docker daemon") from None
@@ -558,8 +748,10 @@ def find_docker_daemon_source(
         return None
     image_ref = next(iter(matches.values()))
     if not force_architecture:
-        preflight_oci_capabilities()
-    state.init_resolved_roots(roots)
+        preflight_oci_capabilities(platform=platform, backend=backend, **({"no_force": True} if no_force else {}))
+    state.init_resolved_roots(
+        roots, **({"_run_lock_deadline": time.monotonic()} if acquisition_deadline is not None else {})
+    )
     with _source_directory(roots, "blobs", create=True):
         destination = (
             roots.state.resolve() / "sources" / "blobs" / (".docker-export-" + secrets.token_hex(12) + ".oci.tar")
@@ -571,8 +763,16 @@ def find_docker_daemon_source(
             docker_config_dir=config_dir,
             timeout_seconds=timeout_seconds,
             platform=platform,
+            **({"no_force": True} if no_force else {}),
+            **({"acquisition_deadline": acquisition_deadline} if acquisition_deadline is not None else {}),
         )
-        return _retain_archive(roots, receipt, image_ref, "docker-daemon")
+        return _retain_archive(
+            roots,
+            receipt,
+            image_ref,
+            "docker-daemon",
+            **({"acquisition_deadline": acquisition_deadline} if acquisition_deadline is not None else {}),
+        )
 
 
 def acquire_remote_oci_source(
@@ -584,7 +784,14 @@ def acquire_remote_oci_source(
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     platform: str = "linux/amd64",
     force_architecture: bool = False,
+    backend: str = "auto",
+    no_force: bool = False,
+    acquisition_deadline: AcquisitionDeadline | None = None,
 ) -> ResolvedRunSource:
+    if type(no_force) is not bool:
+        raise StateError("source acquisition no-force policy must be boolean")
+    if _DIGEST_RE.fullmatch(image_ref):
+        raise RegistryIntakeError("bare digests identify local artifacts and cannot select an upstream registry image")
     config = load_registry_config(roots)
     if registry_alias is not None or _has_explicit_registry(image_ref):
         if _has_explicit_registry(image_ref) and registry_alias is None:
@@ -612,8 +819,10 @@ def acquire_remote_oci_source(
             if config.registries[alias].protocol == "oci"
         ]
     if not force_architecture:
-        preflight_oci_capabilities()
-    state.init_resolved_roots(roots)
+        preflight_oci_capabilities(platform=platform, backend=backend, **({"no_force": True} if no_force else {}))
+    state.init_resolved_roots(
+        roots, **({"_run_lock_deadline": time.monotonic()} if acquisition_deadline is not None else {})
+    )
     with _source_directory(roots, "blobs", create=True):
         for profile in profiles:
             destination = (
@@ -628,10 +837,18 @@ def acquire_remote_oci_source(
                     docker_config_dir=docker_config_dir,
                     timeout_seconds=timeout_seconds,
                     platform=platform,
+                    **({"no_force": True} if no_force else {}),
+                    **({"acquisition_deadline": acquisition_deadline} if acquisition_deadline is not None else {}),
                 )
             except RegistryImageNotFoundError:
                 continue
-            return _retain_archive(roots, receipt, image_ref, "oci-registry")
+            return _retain_archive(
+                roots,
+                receipt,
+                image_ref,
+                "oci-registry",
+                **({"acquisition_deadline": acquisition_deadline} if acquisition_deadline is not None else {}),
+            )
     raise RegistryImageNotFoundError("image was not found in the selected OCI registry profiles")
 
 
@@ -694,7 +911,10 @@ def resolve_run_source(
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     platform: str = "linux/amd64",
     force_architecture: bool = False,
+    no_force: bool = False,
 ) -> ResolvedRunSource:
+    if type(no_force) is not bool:
+        raise StateError("source acquisition no-force policy must be boolean")
     path = Path(image_ref).expanduser()
     if path.is_file():
         kind = runtime_kind or ("oci-root" if image_ref.endswith((".oci.tar", ".oci")) else "cloud-image")
@@ -748,32 +968,55 @@ def resolve_run_source(
         return ResolvedRunSource("oci-root", archive, root, source_type="package-reference")
     retained = find_retained_oci_source(roots, image_ref, registry_alias=registry_alias)
     if retained is not None:
+        try:
+            admit_image_source(retained.canonical_reference, roots)
+        except PalimpsestError as exc:
+            raise RegistryIntakeError(str(exc)) from None
         return ResolvedRunSource(
             "oci-root", Path(retained.archive_path), retained.root_digest, source_type="retained-source"
         )
-    if runtime_kind is None and _DIGEST_RE.fullmatch(image_ref):
-        return ResolvedRunSource("cloud-image", image_ref, source_type="cloud-store")
-    if not force_architecture:
-        if backend not in {"auto", "kvm"}:
-            raise StateError("OCI-root run supports only the KVM backend")
-        preflight_oci_capabilities(network=network)
-    elif platform not in ACQUISITION_PLATFORMS:
+    if _DIGEST_RE.fullmatch(image_ref):
+        if runtime_kind is None:
+            return ResolvedRunSource("cloud-image", image_ref, source_type="cloud-store")
+        raise StateError("local OCI digest is not retained; select an explicit archive path")
+    if force_architecture and platform not in ACQUISITION_PLATFORMS:
         raise StateError("force-architecture requires platform linux/amd64 or linux/arm64")
-    candidates = _docker_candidates(roots, image_ref, registry_alias)
-    local = find_docker_daemon_source(
-        roots,
-        candidates,
-        timeout_seconds=timeout_seconds,
+    with _external_acquisition_scope(
         platform=platform,
+        backend=backend,
         force_architecture=force_architecture,
-    )
-    if local is not None:
-        return local
-    return acquire_remote_oci_source(
-        roots,
-        image_ref,
-        registry_alias=registry_alias,
         timeout_seconds=timeout_seconds,
-        platform=platform,
-        force_architecture=force_architecture,
-    )
+        no_force=no_force,
+        network=network,
+    ) as (selected_no_force, remaining, acquisition_deadline):
+        if not force_architecture:
+            preflight_oci_capabilities(
+                network=network,
+                platform=platform,
+                backend=backend,
+                **({"no_force": True} if selected_no_force else {}),
+            )
+        candidates = _docker_candidates(roots, image_ref, registry_alias)
+        local = find_docker_daemon_source(
+            roots,
+            candidates,
+            timeout_seconds=remaining,
+            platform=platform,
+            force_architecture=force_architecture,
+            backend=backend,
+            **({"no_force": True} if selected_no_force else {}),
+            **({"acquisition_deadline": acquisition_deadline} if acquisition_deadline is not None else {}),
+        )
+        if local is not None:
+            return local
+        return acquire_remote_oci_source(
+            roots,
+            image_ref,
+            registry_alias=registry_alias,
+            timeout_seconds=remaining,
+            platform=platform,
+            force_architecture=force_architecture,
+            backend=backend,
+            **({"no_force": True} if selected_no_force else {}),
+            **({"acquisition_deadline": acquisition_deadline} if acquisition_deadline is not None else {}),
+        )

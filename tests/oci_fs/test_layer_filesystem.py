@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import io
 import json
@@ -52,11 +53,6 @@ from palimpsest_local.oci_store import ArtifactLeaseOwner, OCIStore
 from palimpsest_local.state import StatePaths, init_resolved_roots
 
 FIXTURES_DIR = Path(__file__).parent.parent / "fixtures" / "oci-root"
-
-_TRANSLATED_FIXTURE_SHA256 = {
-    "base_layer.tar": "4fec3742dd8a0a1fa483d2cd4fccbb04d1686591c1a4913a7665d45a18966cd6",
-    "leaf_layer.tar": "85ffae029be971381794177129eb6973d408fc018b05de85e5809e94a41bbf79",
-}
 
 _MINIMAL_LAYER_LIMITS = replace(
     DEFAULT_LAYER_CONVERSION_LIMITS,
@@ -258,6 +254,192 @@ def _snapshot_fixtures(root: Path, payloads: tuple[bytes, ...]):
     return cas, image
 
 
+def _fidelity_fixtures(*, markers_last: bool, inherited_uid: int = 123) -> tuple[bytes, bytes, dict]:
+    """Extend the mounted probe's control fixture, not its filesystem reducer."""
+    timestamp = 1_700_000_000
+    receipt = json.loads((FIXTURES_DIR / "expected_receipt.json").read_text())
+    expected = receipt["entries"]
+
+    def member(
+        name: str,
+        *,
+        kind: bytes = tarfile.REGTYPE,
+        payload: bytes = b"",
+        mode: int = 0o640,
+        uid: int = 12345,
+        gid: int = 23456,
+        target: str = "",
+    ) -> tuple[tarfile.TarInfo, bytes]:
+        info = tarfile.TarInfo(f"fidelity/{name}" if name else "fidelity")
+        info.type = kind
+        info.mode, info.uid, info.gid, info.mtime = mode, uid, gid, timestamp
+        info.linkname = target
+        info.size = len(payload)
+        return info, payload
+
+    def directory(name: str, **metadata) -> tuple[tarfile.TarInfo, bytes]:
+        return member(name, kind=tarfile.DIRTYPE, mode=0o751, **metadata)
+
+    def visible(
+        name: str,
+        *,
+        kind: str = "file",
+        payload: bytes = b"",
+        mode: int = 0o640,
+        uid: int = 12345,
+        gid: int = 23456,
+        **extra,
+    ) -> None:
+        entry = {
+            "type": kind,
+            "mode": mode,
+            "uid": uid,
+            "gid": gid,
+            "mtime_ns": timestamp * 1_000_000_000,
+            "xattrs_b64": {},
+            **extra,
+        }
+        if kind == "file":
+            entry["sha256"] = hashlib.sha256(payload).hexdigest()
+        expected[f"fidelity/{name}" if name else "fidelity"] = entry
+
+    base = [
+        directory(""),
+        member("untouched", payload=b"retained lower content"),
+        member("overwrite", payload=b"obsolete lower content"),
+        member("removed", payload=b"deleted lower file"),
+        member("same-layer", payload=b"obsolete lower version"),
+        directory("removed-tree"),
+        member("removed-tree/stale", payload=b"deleted lower subtree"),
+    ]
+    base.extend(
+        (
+            member("inherited", kind=tarfile.DIRTYPE, mode=0o2710, uid=inherited_uid, gid=456),
+            member("inherited/existing", payload=b"retained inherited child"),
+        )
+    )
+    base[-2][0].pax_headers = {"SCHILY.xattr.user.overlay.application": "retained"}
+    root = tarfile.TarInfo(".")
+    root.type = tarfile.DIRTYPE
+    root.mode, root.uid, root.gid, root.mtime = 0o751, 314, 159, timestamp
+    root.pax_headers = {"SCHILY.xattr.user.root": "root-metadata"}
+    base.append((root, b""))
+    expected["."].update(mode=0o751, uid=314, gid=159)
+    for name in ("opaque", "recreated-explicit", "recreated-implied", "recreated-churn"):
+        base.extend(
+            (
+                directory(name),
+                member(f"{name}/stale", payload=b"must not reappear"),
+                directory(f"{name}/nested"),
+                member(f"{name}/nested/stale", payload=b"must not leak recursively"),
+            )
+        )
+    ordinary = [
+        directory(""),
+        member("overwrite", payload=b"upper replacement", mode=0o6750, uid=3456, gid=4567),
+        member("same-layer", payload=b"same-layer entry survives its whiteout"),
+        directory("opaque"),
+        member("opaque/current", payload=b"visible despite late opaque marker"),
+        directory("recreated-explicit", uid=3456, gid=4567),
+        member("recreated-explicit/current", payload=b"explicit recreation"),
+        member("recreated-implied/current", payload=b"implicit recreation"),
+        member("recreated-churn", payload=b"transient file"),
+        member("recreated-churn/current", payload=b"file to directory recreation"),
+        member("hardlink-target", payload=b"shared inode"),
+        member("hardlink-alias", kind=tarfile.LNKTYPE, target="fidelity/hardlink-target"),
+        member(
+            "symlink",
+            kind=tarfile.SYMTYPE,
+            mode=0o777,
+            uid=22222,
+            gid=33333,
+            target="hardlink-target",
+        ),
+        member("bound", payload=b"original occurrence"),
+        member("bound-alias", kind=tarfile.LNKTYPE, target="fidelity/bound"),
+        member("bound-peer", kind=tarfile.LNKTYPE, target="fidelity/bound"),
+        member("bound", payload=b"replacement occurrence", mode=0o600, uid=3456, gid=4567),
+        member("inherited/new", payload=b"new without parent header", uid=222, gid=333),
+    ]
+    markers = [
+        member(name, uid=0, gid=0)
+        for name in (
+            ".wh.removed",
+            ".wh.removed-tree",
+            ".wh.same-layer",
+            "opaque/.wh..wh..opq",
+            ".wh.recreated-explicit",
+            ".wh.recreated-implied",
+            ".wh.recreated-churn",
+        )
+    ]
+    visible("", kind="dir", mode=0o751)
+    visible("untouched", payload=b"retained lower content")
+    visible("overwrite", payload=b"upper replacement", mode=0o6750, uid=3456, gid=4567)
+    visible("same-layer", payload=b"same-layer entry survives its whiteout")
+    visible("opaque", kind="dir", mode=0o751)
+    visible("opaque/current", payload=b"visible despite late opaque marker")
+    visible("recreated-explicit", kind="dir", mode=0o751, uid=3456, gid=4567)
+    visible("recreated-explicit/current", payload=b"explicit recreation")
+    for name, payload in (
+        ("recreated-implied", b"implicit recreation"),
+        ("recreated-churn", b"file to directory recreation"),
+    ):
+        visible(name, kind="dir", mode=0o755, uid=0, gid=0)
+        visible(f"{name}/current", payload=payload)
+    visible(
+        "inherited",
+        kind="dir",
+        mode=0o2710,
+        uid=inherited_uid,
+        gid=456,
+        xattrs_b64={"user.overlay.application": "cmV0YWluZWQ="},
+    )
+    visible("inherited/existing", payload=b"retained inherited child")
+    visible("inherited/new", payload=b"new without parent header", uid=222, gid=333)
+    visible("hardlink-target", payload=b"shared inode", inode_group="fidelity-shared")
+    visible(
+        "hardlink-alias",
+        payload=b"shared inode",
+        inode_group="fidelity-shared",
+        link_target="fidelity/hardlink-target",
+    )
+    visible(
+        "symlink",
+        kind="symlink",
+        mode=0o777,
+        uid=22222,
+        gid=33333,
+        target="hardlink-target",
+    )
+    visible("bound", payload=b"replacement occurrence", mode=0o600, uid=3456, gid=4567)
+    visible("bound-alias", payload=b"original occurrence", inode_group="fidelity-original")
+    visible(
+        "bound-peer",
+        payload=b"original occurrence",
+        inode_group="fidelity-original",
+        link_target="fidelity/bound-alias",
+    )
+
+    def extend(fixture_name: str, additions: list[tuple[tarfile.TarInfo, bytes]]) -> bytes:
+        output = io.BytesIO()
+        with (
+            tarfile.open(FIXTURES_DIR / fixture_name, mode="r:") as source,
+            tarfile.open(fileobj=output, mode="w", format=tarfile.PAX_FORMAT) as destination,
+        ):
+            for info in source:
+                if fixture_name == "leaf_layer.tar" and info.name.rstrip("/") in {".", ""}:
+                    continue
+                with source.extractfile(info) if info.isreg() else io.BytesIO() as content:
+                    destination.addfile(info, content if info.isreg() else None)
+            for info, payload in additions:
+                destination.addfile(info, io.BytesIO(payload) if info.isreg() else None)
+        return output.getvalue()
+
+    leaf = ordinary + markers if markers_last else markers + ordinary
+    return extend("base_layer.tar", base), extend("leaf_layer.tar", leaf), receipt
+
+
 def test_non_linux_rejection_before_subprocess():
     """Verify non-Linux platform rejects OCI filesystem operations BEFORE any subprocess execution."""
     with patch("sys.platform", "darwin"):
@@ -443,13 +625,6 @@ def test_tar_translation_leaf_fixture_structure():
         assert idx_target < idx_link, "forward_link_2.txt target must be emitted before forward_link_1.txt hardlink"
 
 
-@pytest.mark.parametrize("fixture_name", sorted(_TRANSLATED_FIXTURE_SHA256))
-def test_translated_fixture_bytes_remain_exact(fixture_name: str):
-    translated = translate_oci_tar_to_overlay_tar((FIXTURES_DIR / fixture_name).read_bytes())
-
-    assert hashlib.sha256(translated).hexdigest() == _TRANSLATED_FIXTURE_SHA256[fixture_name]
-
-
 @pytest.mark.oci_fs
 def test_layer_filesystem_semantics(tmp_path: Path):
     """Prove the selected candidate on privileged Linux without fallback."""
@@ -480,20 +655,18 @@ def test_layer_filesystem_semantics(tmp_path: Path):
     assert evidence.fixture_digest.startswith("sha256:")
     assert len(evidence.base_image_sha256) == 64
     assert len(evidence.leaf_image_sha256) == 64
-    staged_base_digest, staged_base = _pack_staged_fixture(
+    staged_base_digest, _ = _pack_staged_fixture(
         tmp_path / "staged-base",
         base_tar,
         packer=Path(prerequisites.packer),
         packer_sha256=prerequisites.packer_sha256,
     )
-    staged_leaf_digest, staged_leaf = _pack_staged_fixture(
+    staged_leaf_digest, _ = _pack_staged_fixture(
         tmp_path / "staged-leaf",
         leaf_tar,
         packer=Path(prerequisites.packer),
         packer_sha256=prerequisites.packer_sha256,
     )
-    assert staged_base.normalized_tar_digest == f"sha256:{_TRANSLATED_FIXTURE_SHA256['base_layer.tar']}"
-    assert staged_leaf.normalized_tar_digest == f"sha256:{_TRANSLATED_FIXTURE_SHA256['leaf_layer.tar']}"
     assert staged_base_digest == evidence.base_image_sha256
     assert staged_leaf_digest == evidence.leaf_image_sha256
     evidence_dir = os.environ.get("PALIMPSEST_OCI_FS_EVIDENCE_DIR")
@@ -603,6 +776,131 @@ def test_hard_worker_materializes_all_ordered_image_occurrences_cold_then_warm(t
     assert [result.cache_result for result in warm.results] == ["warm_hit", "warm_hit"]
     assert [result.receipt for result in warm.results] == [result.receipt for result in cold.results]
     assert cold.source_snapshot_binding_digest == image.binding_digest
+
+
+@pytest.mark.oci_fs
+@pytest.mark.parametrize("markers_last", [False, True], ids=["markers-first", "markers-last"])
+def test_canonical_materialized_filesystem_fidelity(tmp_path: Path, markers_last: bool) -> None:
+    """Compare canonical leased images with a real kernel-mounted, exact-tree proof."""
+    if os.environ.get("PALIMPSEST_REQUIRE_OCI_FS") != "1":
+        pytest.skip("set PALIMPSEST_REQUIRE_OCI_FS=1 for the privileged canonical filesystem proof")
+    try:
+        prerequisites = preflight_oci_filesystem_probe(FilesystemCandidate.SQUASHFS)
+    except UnsupportedPlatformError as exc:
+        pytest.fail(f"canonical filesystem fidelity proof unavailable: {exc}")
+    base_tar, leaf_tar, expected = _fidelity_fixtures(markers_last=markers_last)
+    source_root = tmp_path / "source"
+    _cas, image = _snapshot_fixtures(source_root, (base_tar, leaf_tar))
+    roots = init_resolved_roots(StatePaths(tmp_path / "config", tmp_path / "state"))
+    store = OCIStore(roots)
+    packer = Path(prerequisites.packer)
+    toolchain = discover_squashfs_toolchain(packer, expected_packer_sha256=prerequisites.packer_sha256)
+    materialized = materialize_image_hard(
+        image,
+        source_cas_root=source_root / "cas",
+        roots=roots,
+        store=store,
+        packer_path=packer,
+        toolchain=toolchain,
+        timeout_seconds=120,
+    )
+    assert [result.receipt.ordinal for result in materialized.results] == [0, 1]
+    assert [result.cache_result for result in materialized.results] == ["cold_miss", "cold_miss"]
+    assert materialized.source_snapshot_binding_digest == image.binding_digest
+    leased_digests = []
+    owner = ArtifactLeaseOwner(str(uuid.uuid4()), "canonical-fidelity-proof", "root-layer")
+    for result in materialized.results:
+        digest = hashlib.sha256()
+        with store.acquire_lease(result.receipt, owner) as lease:
+            for chunk in lease.chunks():
+                digest.update(chunk)
+        assert result.receipt.image_digest == f"sha256:{digest.hexdigest()}"
+        leased_digests.append(digest.hexdigest())
+
+    denied: set[str] = set()
+
+    def verify_readonly_tree(mountpoint: Path, entries: dict) -> tuple[bool, str]:
+        # This hook observes the helper's actual mounts, then delegates to the
+        # unchanged exact-tree verifier rather than substituting a source tree.
+        for label, path in (
+            ("base", mountpoint.parent / "base-mnt" / "fidelity" / "untouched"),
+            ("leaf", mountpoint.parent / "leaf-mnt" / "fidelity" / "overwrite"),
+            ("merged", mountpoint / "fidelity" / "overwrite"),
+        ):
+            try:
+                with path.open("ab") as stream:
+                    stream.write(b"unexpected writable filesystem")
+            except OSError as exc:
+                assert exc.errno == errno.EROFS, (label, exc)
+            else:
+                # Use an ordinary Exception so the probe catches the failure
+                # and runs normal unmount cleanup before reporting it.
+                raise AssertionError(f"{label} unexpectedly accepted a filesystem write")
+            denied.add(label)
+        return _verify_merged_tree(mountpoint, entries)
+
+    # Reuse the existing private namespace, exact lower controls and normal-only
+    # unmount cleanup. Its mounted images must match the canonical store bytes.
+    with patch("palimpsest_local.oci_convert._verify_merged_tree", side_effect=verify_readonly_tree):
+        evidence = probe_oci_filesystem_candidate(FilesystemCandidate.SQUASHFS, base_tar, leaf_tar, expected)
+    assert denied == {"base", "leaf", "merged"}
+    assert [evidence.base_image_sha256, evidence.leaf_image_sha256] == leased_digests
+    assert evidence.candidate == FilesystemCandidate.SQUASHFS.value
+
+
+@pytest.mark.oci_fs
+def test_same_leaf_under_distinct_parent_metadata_has_isolated_cold_and_warm_artifacts(tmp_path: Path) -> None:
+    if os.environ.get("PALIMPSEST_REQUIRE_OCI_FS") != "1":
+        pytest.skip("set PALIMPSEST_REQUIRE_OCI_FS=1 for the canonical parent-context proof")
+    prerequisites = preflight_oci_filesystem_probe(FilesystemCandidate.SQUASHFS)
+    roots = init_resolved_roots(StatePaths(tmp_path / "config", tmp_path / "state"))
+    store = OCIStore(roots)
+    packer = Path(prerequisites.packer)
+    toolchain = discover_squashfs_toolchain(packer, expected_packer_sha256=prerequisites.packer_sha256)
+    leaf_receipts = []
+    leaf_bytes = []
+    for uid in (123, 789):
+        base, leaf, _expected = _fidelity_fixtures(markers_last=True, inherited_uid=uid)
+        leaf_bytes.append(leaf)
+        source_root = tmp_path / f"source-{uid}"
+        _cas, image = _snapshot_fixtures(source_root, (base, leaf))
+        arguments = dict(
+            source_cas_root=source_root / "cas",
+            roots=roots,
+            store=store,
+            packer_path=packer,
+            toolchain=toolchain,
+            timeout_seconds=120,
+        )
+        cold = materialize_layer_hard(image, 1, **arguments)
+        warm = materialize_layer_hard(image, 1, **arguments)
+        assert cold.cache_result == "cold_miss"
+        assert warm.cache_result == "warm_hit"
+        assert cold.receipt == warm.receipt
+        leaf_receipts.append(cold.receipt)
+        output = tmp_path / f"leaf-{uid}.squashfs"
+        with store.acquire_lease(
+            cold.receipt, ArtifactLeaseOwner(str(uuid.uuid4()), "parent-context-proof", "root-layer")
+        ) as lease:
+            with output.open("xb") as stream:
+                for chunk in lease.chunks():
+                    stream.write(chunk)
+        extracted = tmp_path / f"extracted-{uid}"
+        result = subprocess.run(
+            ["unsquashfs", "-processors", "1", "-no-progress", "-d", str(extracted), str(output)],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        directory = (extracted / "fidelity/inherited").stat()
+        assert (directory.st_uid, directory.st_gid, directory.st_mode & 0o7777) == (uid, 456, 0o2710)
+        assert directory.st_mtime_ns == 1_700_000_000_000_000_000
+        assert (extracted / "fidelity/inherited/new").read_bytes() == b"new without parent header"
+    assert leaf_bytes[0] == leaf_bytes[1]
+    assert leaf_receipts[0].key_digest != leaf_receipts[1].key_digest
+    assert leaf_receipts[0].image_digest != leaf_receipts[1].image_digest
 
 
 @pytest.mark.oci_fs

@@ -35,13 +35,14 @@ from palimpsest_hub.auth import (
     revalidate_package_admin,
     validate_token,
 )
-from palimpsest_hub.config import get_settings
+from palimpsest_hub.config import configured_image_source_policy, get_settings
 from palimpsest_hub.image_models import LEGACY_JOB_VISIBILITY, PalimpsestHubBuildContext, PalimpsestHubImageJob
 from palimpsest_hub.models import exact_identity
 from palimpsest_hub.services import claim_recovery
 from palimpsest_hub.services.blob_references import retain_blob
 from palimpsest_hub.services.digest import compute_config_digest
 from palimpsest_hub.services.hub_store import HubStoreError
+from palimpsest_hub.services.published_images import IMAGE_MUTEX
 from palimpsest_hub.services.worker_leases import sql_mutex
 
 
@@ -175,6 +176,105 @@ def normalize_registry_reference(value: str, hosts=None) -> str:
     )
 
 
+def admit_sources(kind, payload, policy, hosts):
+    """Early-check literal image inputs; BuildKit fences resolved dynamic inputs."""
+
+    from palimpsest_local.registry import RegistryError, default_registry_config, resolve_image_reference
+
+    if not policy.rules:
+        raise HTTPException(status_code=503, detail="image source policy is not configured")
+
+    def admit(reference):
+        canonical = normalize_registry_reference(reference, hosts)
+        try:
+            policy.admit(resolve_image_reference(canonical, default_registry_config(), environment={}))
+        except RegistryError:
+            raise HTTPException(status_code=422, detail="image source is not allowed by operator policy") from None
+        return canonical
+
+    if kind == "registry":
+        return {**payload, "reference": admit(payload["reference"])}
+    # This is deliberately not a Dockerfile interpreter. Literal FROM and
+    # external COPY/ADD --from inputs can fail before queue/context effects;
+    # ARG expansion, stage aliases and all actual resolutions are enforced by
+    # the exact BuildKit source-policy transport at solve time.
+    from palimpsest_local.buildkit import (
+        _FROM_RE,
+        _PARSER_DIRECTIVE_RE,
+        _copy_from_sources,
+        _instruction_leading_options,
+        _is_instruction,
+        _logical_dockerfile_text_lines,
+    )
+    from palimpsest_local.errors import ArtifactValidationError
+
+    lines = _logical_dockerfile_text_lines(payload["dockerfile"])
+    stages = {match[2].lower() for line in lines if (match := _FROM_RE.fullmatch(line)) is not None and match[2]}
+
+    def literal(source):
+        if "$" not in source and not source.isdecimal() and source.lower() not in stages:
+            admit(source)
+
+    for line in lines:
+        directive = _PARSER_DIRECTIVE_RE.fullmatch(line)
+        if directive:
+            if directive[1].lower() == "escape":
+                break  # Non-default parser semantics belong to the actual solve.
+            # The fixed built-in frontend uses cmdline= and does not resolve a
+            # syntax image. Do not impose permission for an unused header.
+            continue
+        match = _FROM_RE.fullmatch(line)
+        if match:
+            if match[1].lower() != "scratch":
+                literal(match[1])
+            continue
+        if "<<" in line:
+            break  # Do not mistake heredoc payload text for image instructions.
+        try:
+            if _is_instruction(line, "COPY") or _is_instruction(line, "ADD"):
+                for source in _copy_from_sources(line):
+                    literal(source)
+            if _is_instruction(line, "RUN"):
+                for option in _instruction_leading_options(line, "RUN"):
+                    if not option.lower().startswith("--mount="):
+                        continue
+                    for field in option.split("=", 1)[1].strip("\"'").split(","):
+                        key, separator, source = field.partition("=")
+                        if separator and key.strip().lower() == "from":
+                            literal(source.strip().strip("\"'"))
+        except ArtifactValidationError:
+            continue  # Ambiguous quoted flags are fenced by BuildKit, not guessed.
+    return payload
+
+
+def bound_source_policy(payload, settings):
+    """Verify persisted operator provenance without widening a queued request."""
+    from palimpsest_local.image_source_policy import image_source_policy_from_dict
+    from palimpsest_local.registry import RegistryError
+
+    try:
+        policy = image_source_policy_from_dict(payload.get("source_policy"))
+        if (
+            not policy.rules
+            or payload.get("source_policy_digest") != policy.digest
+            or policy != configured_image_source_policy(settings)
+        ):
+            raise ValueError("image source policy changed")
+    except (RegistryError, ValueError):
+        raise HTTPException(status_code=409, detail="image source policy binding changed") from None
+    return policy
+
+
+def require_result_policy(job, descriptor):
+    metadata = descriptor.get("manifest", {}).get("source", {}).get("metadata", {})
+    if (
+        metadata.get("source_policy") != job.request_json.get("source_policy")
+        or metadata.get("source_policy_digest") != job.request_json.get("source_policy_digest")
+        or job.request_json.get("source_policy") is None
+    ):
+        raise HTTPException(status_code=409, detail="image result source policy binding changed")
+
+
 async def fresh_writer(token_info):
     if token_info.get("is_package_system_admin"):
         current = await revalidate_package_admin(token_info)
@@ -200,14 +300,18 @@ async def admit(kind, payload, token_info):
     settings = get_settings()
     if not settings.palimpsest_hub_build_worker_key.get_secret_value():
         raise HTTPException(status_code=503, detail="isolated image worker is not configured")
+    if "source_policy" in payload or "source_policy_digest" in payload:
+        raise HTTPException(status_code=422, detail="image source policy is operator-controlled")
+    policy = configured_image_source_policy(settings)
+    if kind == "registry":
+        payload = {**payload, "reference": normalize_registry_reference(payload["reference"])}
     project = package_target_project_id(token_info)
     payload = {**payload, "visibility": payload.get("visibility", "private")}
     from palimpsest_hub.services.published_images import visibility_value
 
     visibility_value(payload["visibility"])
 
-    descriptor = {"kind": kind, **payload}
-    fingerprint = compute_config_digest(descriptor)
+    caller_descriptor = {"kind": kind, **payload}
     context_digest = payload.get("context_digest")
     store = _store_or_503()
     async with (
@@ -221,9 +325,22 @@ async def admit(kind, payload, token_info):
             )
         )
         if existing is not None:
-            if existing.created_by != token_info["user_id"] or existing.request_digest != fingerprint:
+            stored_descriptor = {"kind": existing.kind, **existing.request_json}
+            stored_caller_descriptor = {
+                key: value
+                for key, value in stored_descriptor.items()
+                if key not in ("source_policy", "source_policy_digest")
+            }
+            if (
+                existing.created_by != token_info["user_id"]
+                or existing.request_digest != compute_config_digest(stored_descriptor)
+                or stored_caller_descriptor != caller_descriptor
+            ):
                 raise HTTPException(status_code=409, detail="request_id is already bound to another descriptor")
             return existing
+        payload = admit_sources(kind, payload, policy, settings.palimpsest_hub_registry_hosts)
+        payload = {**payload, "source_policy": policy.to_dict(), "source_policy_digest": policy.digest}
+        fingerprint = compute_config_digest({"kind": kind, **payload})
         if context_digest:
             context = await session.get(
                 PalimpsestHubBuildContext,
@@ -357,7 +474,7 @@ def validate_context(path):
         raise HTTPException(status_code=422, detail="invalid or unsafe build context tar") from None
 
 
-async def receive(store, request, digest, size, deadline, *, context=False):
+async def receive(store, request, digest, size, deadline, *, context=False, squashfs=True):
     staging = uuid4().hex
     try:
         await _run_blocking(store.start_upload, staging)
@@ -380,7 +497,7 @@ async def receive(store, request, digest, size, deadline, *, context=False):
             raise HTTPException(status_code=422, detail="content digest mismatch")
         if context:
             await _run_blocking(validate_context, path)
-        else:
+        elif squashfs:
 
             def magic():
                 with path.open("rb") as handle:
@@ -439,7 +556,7 @@ async def upload_context(request, token_info, digest, size):
 
 @asynccontextmanager
 async def locked_jobs():
-    async with sql_mutex(_factory_or_503(), "build-api:image:single-flight") as session:
+    async with sql_mutex(_factory_or_503(), IMAGE_MUTEX) as session:
         yield session
 
 
@@ -464,6 +581,8 @@ async def owned(session, job_id, lease, *, live=False):
         await session.commit()
     if live and job.status != "building":
         raise HTTPException(status_code=409, detail="image attempt is not active")
+    if live:
+        bound_source_policy(job.request_json, get_settings())
     return job
 
 
@@ -513,8 +632,8 @@ async def claim(channel: str, sequence: int, *, recover: bool = False):
                     raise HTTPException(status_code=409)
                 if job.request_json.get("visibility", LEGACY_JOB_VISIBILITY) != job.visibility:
                     raise HTTPException(status_code=409)
-                if job.kind == "registry":
-                    normalize_registry_reference(job.request_json["reference"])
+                policy = bound_source_policy(job.request_json, settings)
+                admit_sources(job.kind, job.request_json, policy, settings.palimpsest_hub_registry_hosts)
                 context = await context_for(session, job)
                 if context and not _store_or_503().exists(context["digest"]):
                     raise HTTPException(status_code=409)
@@ -532,9 +651,11 @@ async def claim(channel: str, sequence: int, *, recover: bool = False):
                 "request": {
                     key: value
                     for key, value in job.request_json.items()
-                    if key not in ("request_id", "name", "platform")
+                    if key not in ("request_id", "name", "platform", "source_policy", "source_policy_digest")
                 },
                 "context": context,
+                "source_policy": policy.to_dict(),
+                "source_policy_digest": policy.digest,
                 "lease": job.lease_owner,
                 "deadline": deadline(job).isoformat(),
                 "timeout_seconds": max(1, math.ceil((deadline(job) - now()).total_seconds())),
@@ -568,6 +689,7 @@ async def publication_intent(job_id, lease, descriptor):
         locked_jobs() as session,
     ):
         job = await owned(session, job_id, lease)
+        require_result_policy(job, descriptor)
         if job.result_json is not None and job.result_json != descriptor:
             raise HTTPException(status_code=409, detail="image publication descriptor conflicts")
         if job.status != "complete":
@@ -699,6 +821,7 @@ async def complete(job_id, lease, descriptor):
                 raise HTTPException(status_code=409, detail="completed image descriptor conflicts")
             return job
         job = await owned(session, job_id, lease, live=True)
+        require_result_policy(job, descriptor)
         if job.result_json is not None and job.result_json != descriptor:
             raise HTTPException(status_code=409, detail="image publication descriptor conflicts")
         stages = {item["digest"]: item for item in job.staged_outputs}
@@ -706,6 +829,7 @@ async def complete(job_id, lease, descriptor):
             stages[item["digest"]]["size_bytes"] != item["size_bytes"] for item in layers
         ):
             raise HTTPException(status_code=409, detail="complete descriptor does not match staged outputs")
+        from palimpsest_hub.services.image_quota import QUOTA_ERROR_CODES
         from palimpsest_hub.services.published_images import normalized, register_image
 
         canonical = descriptor["manifest"]
@@ -722,16 +846,35 @@ async def complete(job_id, lease, descriptor):
             or any(canonical["source"].get(key) != value for key, value in descriptor["source"].items())
         ):
             raise HTTPException(status_code=409, detail="image manifest contradicts admitted output")
-        await register_image(
-            session,
-            store,
-            {"project_id": job.project_id, "user_id": job.created_by},
-            job.request_id,
-            job.name,
-            canonical,
-            image_id=job.id,
-            visibility=job.visibility,
-        )
+        try:
+            await register_image(
+                session,
+                store,
+                {"project_id": job.project_id, "user_id": job.created_by},
+                job.request_id,
+                job.name,
+                canonical,
+                image_id=job.id,
+                visibility=job.visibility,
+            )
+        except HTTPException as exc:
+            code = exc.detail.get("code") if isinstance(exc.detail, dict) else None
+            if code not in QUOTA_ERROR_CODES:
+                raise
+            quota_code = code
+            # Discard every pending registration; the output locks above stay held.
+            await session.rollback()
+        else:
+            quota_code = None
+        if quota_code is not None:
+            # A tenant quota is a definite job outcome. Answering with the terminal
+            # error receipt lets the worker settle instead of halting as uncertain.
+            async with locked_jobs() as fresh:
+                job = await owned(fresh, job_id, lease)
+                if job.status == "building":
+                    job.status, job.error_code, job.completed_at = "error", quota_code, now()
+                await fresh.commit()
+                return job
         # Disk verification and SQL flush must not extend the immutable execution lease.
         await session.flush()
         if now() >= deadline(job):

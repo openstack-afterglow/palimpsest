@@ -27,6 +27,7 @@ from .errors import ArtifactValidationError
 from .oci_changeset import (
     ChangesetMember,
     ChangesetValidationError,
+    EffectiveFilesystem,
     EntryKind,
     NormalizedChangeset,
     normalize_changeset,
@@ -75,6 +76,7 @@ class LayerConversionLimits:
 
     max_members: int = 250_000
     max_physical_headers: int = 1_000_000
+    max_normalized_entries: int = 500_000
     max_compressed_bytes: int = 32 * 1024**3
     max_uncompressed_bytes: int = 32 * 1024**3
     max_path_bytes: int = 4096
@@ -92,6 +94,7 @@ class LayerConversionLimits:
             self.max_members,
             self.max_physical_headers,
             self.max_compressed_bytes,
+            self.max_normalized_entries,
             self.max_uncompressed_bytes,
             self.max_path_bytes,
             self.max_regular_file_bytes,
@@ -120,6 +123,7 @@ class LayerConversionLimits:
                 "max_compression_ratio": self.max_compression_ratio,
                 "max_members": self.max_members,
                 "max_metadata_bytes_per_header": self.max_metadata_bytes_per_header,
+                "max_normalized_entries": self.max_normalized_entries,
                 "max_path_bytes": self.max_path_bytes,
                 "max_physical_headers": self.max_physical_headers,
                 "max_regular_file_bytes": self.max_regular_file_bytes,
@@ -202,13 +206,16 @@ class LayerIntakeReceipt:
 
 
 class _Deadline:
-    __slots__ = ("_clock", "_expires")
+    __slots__ = ("_clock", "_expires", "_checkpoint")
 
-    def __init__(self, clock: Callable[[], float], seconds: float):
+    def __init__(self, clock: Callable[[], float], seconds: float, checkpoint: Callable[[], None] | None = None):
         self._clock = clock
         self._expires = clock() + seconds
+        self._checkpoint = checkpoint
 
     def check(self) -> None:
+        if self._checkpoint is not None:
+            self._checkpoint()
         if self._clock() > self._expires:
             raise LayerIntakeError("oci-layer-timeout", "layer intake exceeded its cooperative deadline")
 
@@ -434,7 +441,12 @@ def _scan_tar(
                 for member in members
             )
             try:
-                normalized = normalize_changeset(common_members)
+                normalized = normalize_changeset(
+                    common_members,
+                    max_entries=limits.max_normalized_entries,
+                    max_metadata_bytes=limits.max_total_metadata_bytes,
+                    checkpoint=deadline.check,
+                )
             except ChangesetValidationError as exc:
                 raise LayerIntakeError(exc.code, str(exc).partition(": ")[2]) from None
             return (
@@ -752,6 +764,7 @@ class StagedLayer:
 
     __slots__ = (
         "_closed",
+        "_context_bound",
         "_generation",
         "_lock",
         "_members",
@@ -777,6 +790,7 @@ class StagedLayer:
     ) -> None:
         self._spool = spool
         self._closed = False
+        self._context_bound = False
         self._started = False
         self._owner_pid = os.getpid()
         self._owner_thread = threading.get_ident()
@@ -815,6 +829,17 @@ class StagedLayer:
     @property
     def changeset(self) -> NormalizedChangeset[RegularPayloadRef]:
         return self._normalized
+
+    def bind_parent_directories(self, filesystem: EffectiveFilesystem) -> None:
+        """Bind this layer once to the verified, ordered preceding filesystem."""
+        self._assert_owner()
+        if self._context_bound or self._started:
+            raise LayerIntakeError("oci-stage-context", "staged parent context is already bound or consumed")
+        try:
+            self._normalized = filesystem.apply(self._normalized, retain_payloads=False)
+        except ChangesetValidationError as exc:
+            raise LayerIntakeError(exc.code, str(exc).partition(": ")[2]) from None
+        self._context_bound = True
 
     def emit_overlay_tar(self, sink: BinaryIO, *, max_bytes: int | None = None) -> TarEmissionReceipt:
         """Stream the normalized OverlayFS tar through occurrence-bound leases."""
@@ -968,18 +993,21 @@ def stage_layer(
     *,
     limits: LayerConversionLimits = DEFAULT_LAYER_CONVERSION_LIMITS,
     clock: Callable[[], float] = time.monotonic,
+    checkpoint: Callable[[], None] | None = None,
 ) -> Iterator[StagedLayer]:
     """Decompress, DiffID-check and scan one occurrence-bound source lease."""
     if not isinstance(lease, LeasedSourceLayer):
         raise LayerIntakeError("oci-source-lease", "layer intake requires a leased source occurrence")
     if not isinstance(limits, LayerConversionLimits) or not callable(clock):
         raise LayerIntakeError("oci-limit-policy", "layer intake policy or clock is invalid")
+    if checkpoint is not None and not callable(checkpoint):
+        raise LayerIntakeError("oci-limit-policy", "layer intake checkpoint is invalid")
     if lease.compressed_size > limits.max_compressed_bytes:
         raise LayerIntakeError("oci-compressed-limit", "compressed layer exceeds its intake limit")
     if lease.media_type not in {OCI_LAYER_MEDIA_TYPE, OCI_LAYER_GZIP_MEDIA_TYPE, DOCKER_LAYER_GZIP_MEDIA_TYPE}:
         raise LayerIntakeError("oci-codec", "layer media type has no supported codec")
 
-    deadline = _Deadline(clock, float(limits.timeout_seconds))
+    deadline = _Deadline(clock, float(limits.timeout_seconds), checkpoint)
     try:
         spool = tempfile.TemporaryFile(mode="w+b")
     except OSError:

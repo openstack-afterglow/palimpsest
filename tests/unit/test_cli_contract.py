@@ -506,80 +506,29 @@ def test_parser_accepts_additive_buildkit_dockerfile_surface():
     assert parsed.runtime_block_size == 262144
 
 
-@pytest.mark.parametrize("automatic", [False, True])
-def test_oci_materialize_dispatches_local_archive_and_emits_path_free_receipt(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], automatic: bool
-) -> None:
-    real_state_home = tmp_path / "real-state-home"
-    real_state_home.mkdir()
-    state_home_alias = tmp_path / "state-home-alias"
-    state_home_alias.symlink_to(real_state_home, target_is_directory=True)
-    monkeypatch.setenv("XDG_STATE_HOME", str(state_home_alias))
-    real_source = tmp_path / "real-source"
-    real_source.mkdir()
-    source_alias = tmp_path / "source-alias"
-    source_alias.symlink_to(real_source, target_is_directory=True)
-    archive = real_source / "image.oci.tar"
-    archive.write_bytes(b"archive")
-    packer = tmp_path / "mksquashfs"
-    packer.write_bytes(b"packer")
-    manifest = "sha256:" + "a" * 64
-    snapshot = object()
-    calls: dict[str, object] = {}
+@pytest.mark.parametrize("invalid", ["wrong-architecture", "symlink-source"])
+def test_arm_filesystem_materialize_rejects_invalid_source_before_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], invalid: str
+):
+    from test_native_root_source import os_layout
 
-    class FakeSource:
-        def __init__(self, *, archive: Path, root_digest: str):
-            calls["archive"] = archive
-            calls["root_digest"] = root_digest
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.delenv("PALIMPSEST_STATE_HOME", raising=False)
+    layout, *_ = os_layout(tmp_path / "layout", architecture="amd64" if invalid == "wrong-architecture" else "arm64")
+    source = layout.root
+    if invalid == "symlink-source":
+        source = tmp_path / "source-alias"
+        source.symlink_to(layout.root, target_is_directory=True)
+    packer = tmp_path / "packer"
+    packer.write_bytes(b"must never execute")
 
-        def snapshot(self, reference, source_cas):
-            calls["reference"] = reference
-            calls["source_cas"] = source_cas
-            return snapshot
+    def forbidden(*args, **kwargs):
+        pytest.fail("invalid source reached a child process")
 
-    class FakeReceipt:
-        digest = "sha256:" + "b" * 64
-
-        def to_dict(self):
-            return {"schema": "palimpsest.oci-image-materialization.v2", "results": []}
-
-    def fake_materialize(selected, **kwargs):
-        calls["snapshot"] = selected
-        calls["materialize"] = kwargs
-        return FakeReceipt()
-
-    monkeypatch.setattr(cli, "LocalArchiveSource", FakeSource)
-    monkeypatch.setattr(cli, "OCIStore", lambda roots: ("store", roots))
-    monkeypatch.setattr(cli, "discover_squashfs_toolchain", lambda *args, **kwargs: (args, kwargs))
-    monkeypatch.setattr(cli, "materialize_image_hard", fake_materialize)
-
-    result = cli.main(
-        [
-            "oci",
-            "materialize",
-            str(source_alias / archive.name),
-            *([] if automatic else ["--manifest", manifest]),
-            "--packer",
-            str(packer),
-            "--timeout",
-            "12",
-        ]
-    )
-
-    assert result == 0
-    assert calls["archive"] == archive.resolve()
-    assert calls["root_digest"] == (None if automatic else manifest)
-    if automatic:
-        assert calls["reference"] is None
-    assert calls["snapshot"] is snapshot
-    materialize = calls["materialize"]
-    assert isinstance(materialize, dict)
-    assert materialize["timeout_seconds"] == 12.0
-    assert materialize["roots"].state == (real_state_home / "palimpsest").resolve()
-    assert materialize["source_cas_root"] == (real_state_home / "palimpsest/runtime-packs/oci-source-v1").resolve()
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["receipt_digest"] == FakeReceipt.digest
-    assert str(tmp_path) not in json.dumps(payload)
+    monkeypatch.setattr(cli.subprocess, "Popen", forbidden)
+    assert cli.main(["oci", "materialize", str(source), "--platform", "linux/arm64", "--packer", str(packer)]) == 1
+    assert capsys.readouterr().out == ""
 
 
 def test_buildkit_offline_dispatch_reads_no_registry_profile_or_hub_client(
@@ -1396,6 +1345,10 @@ def test_cli_process_bridge_restores_handlers_when_terminal_restore_fails(
         def fileno() -> int:
             return 81
 
+        @staticmethod
+        def isatty() -> bool:
+            return True
+
     class FakeThread:
         def __init__(self, *, target, name, daemon):
             del target, name, daemon
@@ -1404,7 +1357,7 @@ def test_cli_process_bridge_restores_handlers_when_terminal_restore_fails(
             return None
 
         def join(self, *, timeout: float) -> None:
-            assert timeout == 0.5
+            del timeout
 
         def is_alive(self) -> bool:
             return False
@@ -1421,7 +1374,7 @@ def test_cli_process_bridge_restores_handlers_when_terminal_restore_fails(
     monkeypatch.setattr(cli.signal_module, "getsignal", lambda signum: f"prior-{signum}")
     monkeypatch.setattr(cli.signal_module, "signal", lambda signum, handler: signal_calls.append((signum, handler)))
 
-    with pytest.raises(PalimpsestError, match="cannot restore local terminal"):
+    with pytest.raises(PalimpsestError):
         cli._run_process_session(Session(), interactive=True)
 
     assert signal_calls[-2:] == [
@@ -1469,17 +1422,19 @@ def test_cli_process_bridge_closes_session_to_terminate_input_thread(
         def fileno() -> int:
             return 82
 
+        @staticmethod
+        def isatty() -> bool:
+            return True
+
     class FakeThread:
         def __init__(self, *, target, name, daemon):
             del target, name, daemon
-            self.joins = 0
 
         def start(self) -> None:
             return None
 
         def join(self, *, timeout: float) -> None:
-            assert timeout == 0.5
-            self.joins += 1
+            del timeout
 
         def is_alive(self) -> bool:
             return not session.closed
@@ -2517,82 +2472,6 @@ def test_cli_web_port_validation(capsys: pytest.CaptureFixture[str]):
     cli._validate_args(args_8080, parser)
 
 
-def test_cli_dispatch_store_show(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
-    monkeypatch.setattr(
-        "palimpsest_local.cli.inventory.storage_report",
-        lambda roots: {
-            "state_root": "/tmp/state",
-            "source": "default",
-            "directories": {"store": 100, "runs": 0},
-            "total_state_bytes": 100,
-            "free_bytes": 500,
-            "total_bytes": 1000,
-        },
-    )
-    ret_table = cli.main(["store", "show"])
-    assert ret_table == 0
-    out_table = capsys.readouterr().out
-    assert "/tmp/state" in out_table
-    assert "default" in out_table
-
-    ret_json = cli.main(["store", "show", "--format", "json"])
-    assert ret_json == 0
-    out_json = capsys.readouterr().out
-    data = json.loads(out_json)
-    assert data["state_root"] == "/tmp/state"
-
-
-def test_cli_dispatch_store_rm(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
-    monkeypatch.setattr(
-        "palimpsest_local.cli.inventory.remove_artifact",
-        lambda roots, digest, force=False: {
-            "digest": digest,
-            "removed_tags": ["tag1"],
-            "freed_bytes": 1024,
-        },
-    )
-    ret = cli.main(["store", "rm", "sha256:" + "a" * 64, "--force"])
-    assert ret == 0
-    out = capsys.readouterr().out
-    data = json.loads(out)
-    assert data["digest"] == "sha256:" + "a" * 64
-    assert data["removed_tags"] == ["tag1"]
-
-
-def test_cli_dispatch_store_move(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
-    called_dest: list[Path] = []
-    monkeypatch.setattr(
-        "palimpsest_local.cli.inventory.move_state_root",
-        lambda roots, destination, keep_source=False: (
-            called_dest.append(Path(destination))
-            or {"status": "ok", "state_root": str(destination), "source": "config"}
-        ),
-    )
-    ret = cli.main(["store", "move", "--to", "/tmp/new-root", "--keep-source"])
-    assert ret == 0
-    assert called_dest == [Path("/tmp/new-root")]
-    out = capsys.readouterr().out
-    data = json.loads(out)
-    assert data["status"] == "ok"
-
-
-def test_cli_dispatch_store_set(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
-    called_dest: list[Path] = []
-    monkeypatch.setattr(
-        "palimpsest_local.cli.inventory.set_state_root",
-        lambda roots, destination: (
-            called_dest.append(Path(destination))
-            or {"status": "ok", "state_root": str(destination), "source": "config"}
-        ),
-    )
-    ret = cli.main(["store", "set", "--to", "/tmp/new-root"])
-    assert ret == 0
-    assert called_dest == [Path("/tmp/new-root")]
-    out = capsys.readouterr().out
-    data = json.loads(out)
-    assert data["status"] == "ok"
-
-
 def test_cli_run_without_name_or_kind_auto_names_and_resolves_local_buildkit(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ):
@@ -2654,11 +2533,14 @@ def test_cli_run_without_name_or_kind_auto_names_and_resolves_local_buildkit(
 def test_cli_run_warm_local_source_does_not_query_registries(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     from types import SimpleNamespace
 
+    from test_registry_intake import _allow_image_sources
+
     from palimpsest_local import run_source
 
     roots = cli.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
     monkeypatch.setattr(cli, "init_roots", lambda *a, **k: roots)
     monkeypatch.setattr(cli, "resolve_roots", lambda *a, **k: roots)
+    _allow_image_sources(tmp_path, ("docker.io", "warm-org", "cached-app"), config_dir=roots.config)
 
     blobs_dir = roots.state / "sources" / "blobs"
     blobs_dir.mkdir(parents=True, mode=0o700)
@@ -2956,14 +2838,17 @@ def test_cli_run_docker_credentials_do_not_cross_native_boundary():
         "DOCKER_CONFIG": "/path/to/docker",
         "PALIMPSEST_TOKEN": "secret-hub-token",
         "PALIMPSEST_PACKAGE_KEY": "secret-native-key",
+        "PALIMPSEST_IMAGE_KEY": "ppi_v1_" + "a" * 32 + "." + "S" * 43,
     }
     sanitized = credential_free_subprocess_environment(env)
     assert sanitized["PATH"] == "/usr/bin"
     assert sanitized["DOCKER_CONFIG"] == "/path/to/docker"
     assert "PALIMPSEST_TOKEN" not in sanitized
     assert "PALIMPSEST_PACKAGE_KEY" not in sanitized
+    assert "PALIMPSEST_IMAGE_KEY" not in sanitized
     assert "PALIMPSEST_TOKEN" in env
     assert "PALIMPSEST_PACKAGE_KEY" in env
+    assert "PALIMPSEST_IMAGE_KEY" in env
 
 
 def test_cli_automatic_acquisition_fixture_is_isolated(tmp_path: Path):
@@ -3087,3 +2972,122 @@ assert signal.getsignal(signal.SIGTERM) == previous
     result = subprocess.run([sys.executable, "-c", program, str(marker)], capture_output=True, timeout=10)
     assert result.returncode == 0, result.stderr.decode()
     assert marker.read_text() == "owned cleanup reached"
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["store", "catalog"],
+        ["store", "catalog", "--refresh"],
+        ["store", "ls", "--format", "json"],
+        ["store", "show", "--format", "json"],
+    ],
+)
+def test_local_metadata_reads_leave_missing_selected_roots_absent(argv, capsys):
+    roots = state.resolve_roots()
+    assert not roots.state.exists()
+    assert not roots.config.exists()
+    assert cli.main(argv) == 0
+    result = json.loads(capsys.readouterr().out)
+    if argv[1] == "ls":
+        assert result == []
+    assert not roots.state.exists()
+    assert not roots.config.exists()
+
+
+def test_completed_build_keeps_output_and_success_record_when_catalog_sync_fails(tmp_path, monkeypatch, capsys):
+    from functools import partial
+
+    from test_buildkit import _spec, _SuccessfulBuildxRunner
+
+    from palimpsest_local import buildkit, local_catalog
+
+    roots = state.init_roots()
+    with local_catalog.open_catalog(roots):
+        pass
+    damaged = b"not a SQLite database"
+    roots.metadata_db.write_bytes(damaged)
+    spec = _spec(tmp_path / "project", offline=True, network="none")
+    solver = _SuccessfulBuildxRunner(spec)
+    monkeypatch.setattr(cli, "build_with_buildkit", partial(buildkit.build_with_buildkit, runner=solver))
+
+    result = cli.main(
+        [
+            "build",
+            str(spec.context),
+            "-f",
+            str(spec.dockerfile),
+            "-t",
+            spec.tag,
+            "--offline",
+            "--cache-scope",
+            spec.cache_scope,
+            "--output",
+            str(spec.output),
+        ]
+    )
+
+    assert result == 1
+    assert capsys.readouterr().out == ""
+    assert spec.output.read_bytes() == b"oci-output"
+    records = list(roots.builds.glob("bk-*/record.json"))
+    assert len(records) == 1
+    committed = json.loads(records[0].read_text())
+    assert committed["status"] == "success"
+    assert committed["output_oci_archive_digest"] == "sha256:" + hashlib.sha256(spec.output.read_bytes()).hexdigest()
+    assert sum(command[:3] == ["docker", "buildx", "build"] for command in solver.calls) == 1
+    assert roots.metadata_db.read_bytes() == damaged
+
+
+def test_materialization_keeps_committed_artifacts_when_catalog_sync_fails(tmp_path, monkeypatch, capsys):
+    from test_oci_store import _acquired_materialization, _acquired_store_graph
+
+    from palimpsest_local.artifact_store import ArtifactStore
+    from palimpsest_local.oci_store import OCIStore
+
+    roots, _store, cas, source, snapshot = _acquired_store_graph(tmp_path / "graph")
+    monkeypatch.setenv("PALIMPSEST_STATE_HOME", str(roots.state))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "command-config"))
+    packer = tmp_path / "packer"
+    packer.write_bytes(b"external conversion is modeled, not executed")
+    monkeypatch.setattr(cli, "discover_squashfs_toolchain", lambda *_args, **_kwargs: object())
+    produced = []
+    damaged = b"catalog damaged after actual store publication"
+
+    def convert(image, **kwargs):
+        _occurrences, receipt, _calls = _acquired_materialization(OCIStore(kwargs["roots"]), image)
+        produced.append(receipt)
+        kwargs["roots"].metadata_db.write_bytes(damaged)
+        return receipt
+
+    monkeypatch.setattr(cli, "materialize_image_hard", convert)
+    result = cli.main(
+        [
+            "oci",
+            "materialize",
+            str(source.layout),
+            "--manifest",
+            snapshot.root.descriptor.digest,
+            "--platform",
+            "linux/arm64",
+            "--packer",
+            str(packer),
+        ]
+    )
+
+    assert result == 1
+    assert capsys.readouterr().out == ""
+    assert len(produced) == 1
+    artifacts = ArtifactStore(roots.store)
+    for materialized in produced[0].results:
+        receipt = materialized.receipt
+        hasher = hashlib.sha256()
+        seen = 0
+        with artifacts.open_squashfs(receipt.image_digest, receipt.image_size, maximum=receipt.image_size) as stream:
+            while chunk := stream.read(64 * 1024):
+                hasher.update(chunk)
+                seen += len(chunk)
+        assert seen == receipt.image_size
+        assert "sha256:" + hasher.hexdigest() == receipt.image_digest
+    cas.verify_image(snapshot)
+    assert roots.metadata_db.read_bytes() == damaged

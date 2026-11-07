@@ -590,7 +590,7 @@ New payloads cannot be exposed through the old project-wide layer/blob grants.
 | --- | --- |
 | `private` | Exact creator user, including that user's other authenticated project scopes |
 | `internal` | Authenticated members authorized in the originating project |
-| `public` | All authenticated callers with Palimpsest inventory/download authority |
+| `public` | All authenticated callers with Palimpsest inventory/download authority, plus anonymous list/get/blob reads (merge-worktree source) |
 
 Visibility is immutable for a publication. Publishing another reference does
 not change the old one. Borrowed restrictions survive intermediate publications;
@@ -598,6 +598,17 @@ another creator cannot automatically turn a project's restricted inherited
 input into a public image. Explicit labels are visible to the selected audience:
 do not put credentials in descriptive metadata. Authorized execution necessarily
 receives the full runtime, even though catalog reads omit environment values.
+
+In the M2 merge-worktree source, `push_image(..., source_closure=..., source_blobs=...)`
+may also publish an `oci-root` image's original OCI closure. The closure's config
+blob then exposes environment **values** to every reader of the image, including
+anonymous readers of a `public` image. Publication is also subject to the Hub's
+database-authoritative quota: one distinct name per scope (private/public: user,
+internal: project) and distinct-digest compressed chain/source bytes, refused as
+403 `image_count_limit` or 413 `image_chain_size_limit`/`image_source_size_limit`.
+Image API keys (`ppi_v1_`) are accepted as `HubClient` credentials alongside
+Keystone tokens. See the [architecture section](../ARCHITECTURE.md) for the full
+contract.
 
 `list_published_images()` and `get_published_image(id)` discover these images.
 `get_layer_node(node_id)`, `get_layer_children(node_id)` and

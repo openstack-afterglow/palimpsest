@@ -1,8 +1,9 @@
-"""Archive-order OCI changeset normalization shared by proof and converter paths."""
+"""Lower-only OCI marker effects and ordered visible-member normalization."""
 
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Generic, TypeVar
@@ -11,7 +12,7 @@ from .errors import ArtifactValidationError
 
 PayloadT = TypeVar("PayloadT")
 
-OCI_CHANGESET_NORMALIZATION_ID = "palimpsest.oci-changeset-normalization.v1"
+OCI_CHANGESET_NORMALIZATION_ID = "palimpsest.oci-changeset-normalization.v3"
 
 
 class ChangesetValidationError(ArtifactValidationError):
@@ -96,6 +97,7 @@ class NormalizedEntry(Generic[PayloadT]):
     opaque: bool
     synthetic: bool
     source_ordinal: int | None
+    inherit_directory_metadata: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,6 +108,115 @@ class NormalizedChangeset(Generic[PayloadT]):
 
     def by_path(self) -> dict[str, NormalizedEntry[PayloadT]]:
         return {entry.path: entry for entry in self.entries}
+
+
+class EffectiveFilesystem(Generic[PayloadT]):
+    """Bounded effective prefix, reduced solely from canonical changesets.
+
+    Overlay control xattrs belong to a changeset, not to the visible directory
+    metadata inherited by a later changeset.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_entries: int = 500_000,
+        max_metadata_bytes: int = 64 * 1024**2,
+        checkpoint: Callable[[], None] | None = None,
+    ) -> None:
+        if type(max_entries) is not int or max_entries <= 0:
+            raise ChangesetValidationError("oci-changeset-limit", "effective entry limit must be positive")
+        if type(max_metadata_bytes) is not int or max_metadata_bytes <= 0:
+            raise ChangesetValidationError("oci-changeset-limit", "effective metadata limit must be positive")
+        self.entries: dict[str, NormalizedEntry[PayloadT]] = {}
+        self.children: dict[str, set[str]] = {}
+        self.max_entries = max_entries
+        self.max_metadata_bytes = max_metadata_bytes
+        self.metadata_bytes = 0
+        self.checkpoint = checkpoint or (lambda: None)
+
+    def _purge(self, path: str, *, include_root: bool = True) -> None:
+        pending = list(self.children.get(path, ()))
+        while pending:
+            self.checkpoint()
+            descendant = pending.pop()
+            pending.extend(self.children.pop(descendant, ()))
+            self.entries.pop(descendant, None)
+        self.children.pop(path, None)
+        if include_root and path != ".":
+            self.entries.pop(path, None)
+            parent = _parent(path)
+            self.children.get(parent, set()).discard(path)
+
+    def apply(
+        self,
+        changeset: NormalizedChangeset[PayloadT],
+        *,
+        retain_payloads: bool = True,
+    ) -> NormalizedChangeset[PayloadT]:
+        """Resolve omitted directory attributes and advance the effective view.
+
+        The returned layer retains its own whiteouts/opacity and payload
+        capabilities. The prefix retains neither lower-only controls nor, when
+        requested, capabilities belonging to a soon-to-close staged layer.
+        """
+        for entry in changeset.entries:
+            self.checkpoint()
+            if entry.kind is EntryKind.WHITEOUT:
+                self._purge(entry.path)
+            elif entry.opaque:
+                self._purge(entry.path, include_root=False)
+        resolved: list[NormalizedEntry[PayloadT]] = []
+        for entry in changeset.entries:
+            self.checkpoint()
+            if entry.kind is EntryKind.WHITEOUT:
+                resolved.append(entry)
+                continue
+            prior = self.entries.get(entry.path)
+            if (
+                entry.kind is EntryKind.DIRECTORY
+                and entry.inherit_directory_metadata
+                and prior is not None
+                and prior.kind is EntryKind.DIRECTORY
+            ):
+                attrs = dict(prior.xattrs)
+                attrs.update(entry.xattrs)
+                entry = replace(
+                    entry,
+                    mode=prior.mode,
+                    uid=prior.uid,
+                    gid=prior.gid,
+                    mtime=prior.mtime,
+                    xattrs=tuple(sorted(attrs.items())),
+                )
+            self.metadata_bytes += (
+                256
+                + len(entry.path.encode("utf-8"))
+                + len(entry.link_target.encode("utf-8"))
+                + sum(len(key.encode("utf-8")) + len(value.encode("utf-8")) for key, value in entry.xattrs)
+            )
+            if self.metadata_bytes > self.max_metadata_bytes:
+                raise ChangesetValidationError(
+                    "oci-changeset-metadata-limit", "effective prefix metadata exceeds its limit"
+                )
+            if entry.kind is not EntryKind.DIRECTORY or (prior is not None and prior.kind is not EntryKind.DIRECTORY):
+                self._purge(entry.path)
+            if entry.path not in self.entries and len(self.entries) >= self.max_entries:
+                raise ChangesetValidationError(
+                    "oci-changeset-entry-limit", "effective filesystem exceeds its entry limit"
+                )
+            resolved.append(entry)
+            self.entries[entry.path] = replace(
+                entry,
+                payload=entry.payload if retain_payloads else None,
+                opaque=False,
+                inherit_directory_metadata=False,
+                xattrs=tuple((key, value) for key, value in entry.xattrs if key != "trusted.overlay.opaque"),
+            )
+            parent = _parent(entry.path)
+            if parent is not None:
+                self.children.setdefault(parent, set()).add(entry.path)
+        return NormalizedChangeset(tuple(resolved))
 
 
 @dataclass(slots=True)
@@ -146,8 +257,15 @@ def _synthetic_directory(path: str, mtime: int, ordinal: int) -> ChangesetMember
 
 def normalize_changeset(
     members: tuple[ChangesetMember[PayloadT], ...],
+    *,
+    max_entries: int = 500_000,
+    max_metadata_bytes: int = 64 * 1024**2,
+    checkpoint: Callable[[], None] | None = None,
 ) -> NormalizedChangeset[PayloadT]:
     """Reduce exact physical occurrences into deterministic final filesystem state.
+
+    Whiteout and opaque markers affect lower layers only, independent of their
+    archive position. Ordinary members retain their original replacement order.
 
     Backward hardlinks bind to the regular payload occurrence visible at their
     own archive position.  Forward hardlinks bind to the first later regular
@@ -156,13 +274,67 @@ def normalize_changeset(
     """
     if not isinstance(members, tuple):
         raise ChangesetValidationError("oci-changeset-input", "members must be an immutable tuple")
-    if any(not isinstance(member, ChangesetMember) for member in members):
-        raise ChangesetValidationError("oci-changeset-input", "members contain an invalid value")
-    if any(member.ordinal != index for index, member in enumerate(members)):
-        raise ChangesetValidationError("oci-changeset-input", "member ordinals are not contiguous archive order")
+    if type(max_entries) is not int or max_entries <= 0:
+        raise ChangesetValidationError("oci-changeset-limit", "normalized entry limit must be positive")
+    if type(max_metadata_bytes) is not int or max_metadata_bytes <= 0:
+        raise ChangesetValidationError("oci-changeset-limit", "normalization metadata limit must be positive")
+    if checkpoint is not None and not callable(checkpoint):
+        raise ChangesetValidationError("oci-changeset-limit", "normalization checkpoint must be callable")
+
+    def check_work() -> None:
+        if checkpoint is not None:
+            checkpoint()
+
+    metadata_work = 0
+    lower_effects: dict[str, ChangesetMember[PayloadT]] = {}
+
+    def account_metadata(path: str, member: ChangesetMember[PayloadT]) -> None:
+        nonlocal metadata_work
+        try:
+            amount = 256 + len(path.encode("utf-8")) + len(member.link_target.encode("utf-8"))
+            amount += sum(len(key.encode("utf-8")) + len(value.encode("utf-8")) for key, value in member.xattrs)
+        except UnicodeEncodeError:
+            raise ChangesetValidationError("oci-changeset-metadata", "normalized metadata is not UTF-8") from None
+        metadata_work += amount
+        if metadata_work > max_metadata_bytes:
+            raise ChangesetValidationError(
+                "oci-changeset-metadata-limit", "cumulative normalized metadata exceeds its byte limit"
+            )
+
+    # Keep only one lower-layer effect per path. Deletion hides the lower path
+    # itself, so it dominates opacity until an ordinary member recreates it.
+    # Charge every physical occurrence: the validation prepass itself is bounded,
+    # including repetitions that do not increase the final table or effect index.
+    for index, member in enumerate(members):
+        check_work()
+        if not isinstance(member, ChangesetMember):
+            raise ChangesetValidationError("oci-changeset-input", "members contain an invalid value")
+        if member.ordinal != index:
+            raise ChangesetValidationError("oci-changeset-input", "member ordinals are not contiguous archive order")
+        account_metadata(member.path, member)
+        basename = os.path.basename(member.path)
+        if not basename.startswith(".wh."):
+            continue
+        opaque = basename == ".wh..wh..opq"
+        target_name = basename.removeprefix(".wh.")
+        if not opaque and (not target_name or target_name in {".", ".."} or target_name.startswith(".wh.")):
+            raise ChangesetValidationError("oci-whiteout-target", "Invalid OCI whiteout target")
+        if member.kind is not EntryKind.FILE or member.size != 0 or member.xattrs:
+            description = "opaque marker" if opaque else "whiteout marker"
+            raise ChangesetValidationError(
+                "oci-whiteout-marker",
+                f"OCI {description} must be an empty regular file without control metadata",
+            )
+        parent = os.path.dirname(member.path) or "."
+        path = parent if opaque else (os.path.join(parent, target_name) if parent != "." else target_name)
+        if path not in lower_effects and len(lower_effects) >= max_entries:
+            raise ChangesetValidationError("oci-changeset-entry-limit", "lower-layer effects exceed the entry limit")
+        if not opaque or path not in lower_effects:
+            lower_effects[path] = member
 
     table: dict[str, _Node[PayloadT]] = {}
     children: dict[str, set[str]] = {}
+    directory_barriers: set[str] = set()
     pending_by_target: dict[str, set[str]] = {}
     groups: dict[int, ChangesetMember[PayloadT]] = {}
 
@@ -193,6 +365,7 @@ def normalize_changeset(
     def purge_subtree(path: str, *, include_root: bool) -> None:
         pending = list(children.get(path, ()))
         while pending:
+            check_work()
             descendant = pending.pop()
             pending.extend(children.get(descendant, ()))
             remove_exact(descendant, keep_children=False)
@@ -201,6 +374,14 @@ def normalize_changeset(
             remove_exact(path, keep_children=False)
 
     def set_node(path: str, node: _Node[PayloadT], *, preserve_children: bool) -> None:
+        if node.kind is EntryKind.DIRECTORY and (path in lower_effects or path in directory_barriers):
+            # A deleted/replaced lower directory must not regain old children
+            # when recreated, including after an intermediate file/type churn.
+            node.opaque = True
+        check_work()
+        if path not in table and len(table) >= max_entries:
+            raise ChangesetValidationError("oci-changeset-entry-limit", "normalized filesystem exceeds its entry limit")
+        account_metadata(path, node.member)
         remove_exact(path, keep_children=preserve_children)
         table[path] = node
         register(path)
@@ -211,12 +392,10 @@ def normalize_changeset(
         *,
         refresh_opaque_placeholder: bool = True,
     ) -> None:
-        parent = _parent(path)
-        chain: list[str] = []
-        while parent not in {None, "."}:
-            chain.append(parent)
-            parent = _parent(parent)
-        for directory in reversed(chain):
+        directory = ""
+        for component in path.split("/")[:-1]:
+            check_work()
+            directory = f"{directory}/{component}" if directory else component
             current = table.get(directory)
             if current is not None and current.kind is EntryKind.DIRECTORY:
                 if current.opaque_placeholder and refresh_opaque_placeholder:
@@ -233,24 +412,27 @@ def normalize_changeset(
 
     def resolve_forward(target_path: str, group_id: int) -> None:
         for link_path in tuple(sorted(pending_by_target.pop(target_path, set()))):
+            check_work()
             node = table.get(link_path)
             if node is None or node.pending_target != target_path:
                 continue
             node.pending_target = None
             node.group_id = group_id
 
-    for member in members:
-        path = member.path
-        basename = os.path.basename(path)
-        parent = os.path.dirname(path) or "."
-
-        if basename == ".wh..wh..opq":
-            if member.kind is not EntryKind.FILE or member.size != 0 or member.xattrs:
-                raise ChangesetValidationError(
-                    "oci-whiteout-marker",
-                    "OCI opaque marker must be an empty regular file without control metadata",
-                )
-            opaque_path = parent
+    # Slash-terminated sort keys put ancestors before contiguous descendant
+    # subtrees (including names such as "d-other" that sort before "d/").
+    # A single active prefix suppresses descendant-only markers beneath a
+    # deletion without rescanning effects or fabricating visible directories.
+    # Retain suppressed effects for ordinary directory recreation below.
+    deleted_prefix: str | None = None
+    for path in sorted(lower_effects, key=lambda path: f"{path}/"):
+        check_work()
+        if deleted_prefix is not None and path.startswith(deleted_prefix):
+            continue
+        deleted_prefix = None
+        member = lower_effects[path]
+        if os.path.basename(member.path) == ".wh..wh..opq":
+            opaque_path = path
             if opaque_path != ".":
                 ensure_parents(opaque_path, member, refresh_opaque_placeholder=False)
             current = table.get(opaque_path)
@@ -265,18 +447,8 @@ def normalize_changeset(
                 )
                 set_node(opaque_path, current, preserve_children=True)
             current.opaque = True
-            continue
-
-        if basename.startswith(".wh."):
-            target_name = basename.removeprefix(".wh.")
-            if not target_name or target_name in {".", ".."} or target_name.startswith(".wh."):
-                raise ChangesetValidationError("oci-whiteout-target", "Invalid OCI whiteout target")
-            if member.kind is not EntryKind.FILE or member.size != 0 or member.xattrs:
-                raise ChangesetValidationError(
-                    "oci-whiteout-marker",
-                    "OCI whiteout marker must be an empty regular file without control metadata",
-                )
-            target_path = os.path.join(parent, target_name) if parent != "." else target_name
+        else:
+            target_path = path
             ensure_parents(target_path, member, refresh_opaque_placeholder=False)
             purge_subtree(target_path, include_root=True)
             whiteout_member = replace(
@@ -297,7 +469,20 @@ def normalize_changeset(
                 _Node(member=whiteout_member, kind=EntryKind.WHITEOUT),
                 preserve_children=False,
             )
+            deleted_prefix = f"{path}/"
+
+    for member in members:
+        check_work()
+        path = member.path
+        if os.path.basename(path).startswith(".wh."):
             continue
+        if member.kind is not EntryKind.DIRECTORY and path not in lower_effects and path not in directory_barriers:
+            if len(lower_effects) + len(directory_barriers) >= max_entries:
+                raise ChangesetValidationError(
+                    "oci-changeset-entry-limit", "lower-layer effects exceed the entry limit"
+                )
+            account_metadata(path, member)
+            directory_barriers.add(path)
 
         if path != ".":
             ensure_parents(path, member)
@@ -325,6 +510,7 @@ def normalize_changeset(
             target = table.get(member.link_target)
             if target is not None and target.kind is EntryKind.FILE:
                 node = _Node(member=member, kind=EntryKind.HARDLINK, group_id=target.group_id)
+                set_node(path, node, preserve_children=False)
             elif target is not None and target.kind is EntryKind.HARDLINK:
                 raise ChangesetValidationError(
                     "oci-hardlink-chain",
@@ -332,8 +518,8 @@ def normalize_changeset(
                 )
             else:
                 node = _Node(member=member, kind=EntryKind.HARDLINK, pending_target=member.link_target)
+                set_node(path, node, preserve_children=False)
                 pending_by_target.setdefault(member.link_target, set()).add(path)
-            set_node(path, node, preserve_children=False)
         else:
             node = _Node(
                 member=member,
@@ -344,7 +530,7 @@ def normalize_changeset(
 
     if "." not in table:
         root = _synthetic_directory(".", 0, len(members))
-        table["."] = _Node(member=root, kind=EntryKind.DIRECTORY, synthetic=True)
+        set_node(".", _Node(member=root, kind=EntryKind.DIRECTORY, synthetic=True), preserve_children=True)
 
     unresolved = sorted(path for path, node in table.items() if node.pending_target is not None)
     if unresolved:
@@ -355,16 +541,19 @@ def normalize_changeset(
 
     group_paths: dict[int, list[str]] = {}
     for path, node in table.items():
+        check_work()
         if node.group_id is not None:
             group_paths.setdefault(node.group_id, []).append(path)
 
     carriers: dict[int, str] = {}
     for group_id, paths in group_paths.items():
+        check_work()
         regular_paths = sorted(path for path in paths if table[path].kind is EntryKind.FILE)
         carriers[group_id] = regular_paths[0] if regular_paths else sorted(paths)[0]
 
     normalized: dict[str, NormalizedEntry[PayloadT]] = {}
     for path, node in table.items():
+        check_work()
         member = node.member
         xattrs = dict(member.xattrs)
         if node.opaque:
@@ -431,6 +620,12 @@ def normalize_changeset(
             opaque=node.opaque,
             synthetic=node.synthetic,
             source_ordinal=member.ordinal if member.ordinal < len(members) else None,
+            inherit_directory_metadata=(
+                node.kind is EntryKind.DIRECTORY
+                and node.synthetic
+                and path not in directory_barriers
+                and (path not in lower_effects or os.path.basename(lower_effects[path].path) == ".wh..wh..opq")
+            ),
         )
 
     ordered_paths: list[str] = []
@@ -439,6 +634,7 @@ def normalize_changeset(
     while remaining:
         deferred: list[str] = []
         for path in remaining:
+            check_work()
             entry = normalized[path]
             if entry.kind is EntryKind.HARDLINK and entry.link_target not in emitted:
                 deferred.append(path)
@@ -456,6 +652,7 @@ __all__ = [
     "ChangesetMember",
     "ChangesetValidationError",
     "EntryKind",
+    "EffectiveFilesystem",
     "NormalizedChangeset",
     "NormalizedEntry",
     "normalize_changeset",

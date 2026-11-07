@@ -584,6 +584,23 @@ def _hub(config, connection):
     return client
 
 
+def _require_hub_lifecycle(client):
+    """Require both admission and cleanup authority before spending a VM slot."""
+    policy = client._json_request("GET", "/policy/capabilities")
+    actions = policy.get("actions") if isinstance(policy, dict) else None
+    if (
+        not isinstance(policy, dict)
+        or policy.get("service") != "palimpsest"
+        or not isinstance(actions, list)
+        or any(not isinstance(action, str) for action in actions)
+        or "packages:write" not in actions
+        or not {"packages:manage", "packages:manage_own"}.intersection(actions)
+    ):
+        raise ArtifactValidationError(
+            "Hub benchmark requires current packages:write and packages:manage or packages:manage_own for cleanup"
+        )
+
+
 def _unsent_consumer_identity(config, role, spec, reservation):
     return {
         "job_id": config["job_id"],
@@ -998,6 +1015,7 @@ def _run_api_cluster(config, output, prefix, measurement, state, cloud, budget, 
 
     roles = [prefix + "-consumer1", prefix + "-consumer2"]
     fence()
+    _require_hub_lifecycle(_hub(config, cloud.connection))
     reservations = budget.reserve_pair(roles, config["placement"]["boot_gib"], simultaneous=True, deadline=deadline)
     for role in roles:
         journal(role + "-reservation.json", {"id": reservations[role], "role": role, "call_tracking": True})
@@ -1111,6 +1129,7 @@ def _run_api_cluster(config, output, prefix, measurement, state, cloud, budget, 
     for index, role in enumerate(roles):
         reservation = reservations[role]
         fence()
+        _require_hub_lifecycle(_hub(config, cloud.connection))
         budget.activate(reservation, pair_deadline)
         spec = {
             key: value
@@ -1380,6 +1399,8 @@ def _run_scenario(config, output, *, cloud_factory=None, connection=None):
         if connection is not None:
             kwargs["connection"] = connection
         cloud = (cloud_factory or ScenarioCloud)(config, output, event, **kwargs)
+        if config["method"].startswith("api-"):
+            _require_hub_lifecycle(_hub(config, cloud.connection))
         for repetition in range(config.get("repetitions", 1)):
             if _source_identity()["files"] != state["runner_source"]["files"]:
                 raise ArtifactValidationError("runner source changed during this run")
@@ -1520,6 +1541,7 @@ def _run_scenario(config, output, *, cloud_factory=None, connection=None):
                 )
             else:
                 client = _hub(config, cloud.connection)
+                _require_hub_lifecycle(client)
                 identity = str(uuid.uuid5(uuid.NAMESPACE_URL, config["job_id"] + ":" + prefix + ":image"))
                 paired = config["method"] == "api-cold-warm"
                 pair_roles = [prefix + "-consumer" + str(index + 1) for index in range(2)]
@@ -1617,6 +1639,7 @@ def _run_scenario(config, output, *, cloud_factory=None, connection=None):
                 measurement["consumers"] = []
                 for index in range(2 if config["method"] in {"api-reuse", "api-cold-warm"} else 1):
                     role = prefix + "-consumer" + str(index + 1)
+                    _require_hub_lifecycle(_hub(config, cloud.connection))
                     if paired:
                         reservation = pair_reservations[role]
                         budget.activate(reservation, deadline)

@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from .errors import ArtifactValidationError, UnsupportedPlatformError
-from .oci_changeset import ChangesetMember, EntryKind, normalize_changeset
+from .oci_changeset import ChangesetMember, EffectiveFilesystem, EntryKind, normalize_changeset
 from .oci_packer import SQUASHFS_PACKER_FIXED_ARGUMENTS
 from .oci_tar_emitter import emit_normalized_overlay_tar
 
@@ -303,6 +303,7 @@ def translate_oci_tar_to_overlay_tar(
     in_tar_bytes: bytes,
     *,
     limits: TarTranslationLimits = DEFAULT_TAR_TRANSLATION_LIMITS,
+    filesystem: EffectiveFilesystem[bytes] | None = None,
 ) -> bytes:
     """Translate an already decompressed OCI layer tar into an OverlayFS tar.
 
@@ -450,6 +451,8 @@ def translate_oci_tar_to_overlay_tar(
             )
 
     normalized = normalize_changeset(tuple(physical_members))
+    if filesystem is not None:
+        normalized = filesystem.apply(normalized, retain_payloads=False)
 
     out_buf = io.BytesIO()
     emit_normalized_overlay_tar(
@@ -518,12 +521,13 @@ def build_layer_filesystem(
     out_path: Path | None = None,
     packer_path: Path | None = None,
     expected_packer_sha256: str | None = None,
+    filesystem: EffectiveFilesystem[bytes] | None = None,
 ) -> Path:
     """Build one candidate without selection; a generated path owns its private parent."""
     check_platform_support()
     candidate = _candidate(target_fs)
 
-    translated_tar = translate_oci_tar_to_overlay_tar(tar_bytes)
+    translated_tar = translate_oci_tar_to_overlay_tar(tar_bytes, filesystem=filesystem)
 
     private_dir: Path | None = None
     publish_path: Path | None = None
@@ -842,6 +846,7 @@ def probe_oci_filesystem_candidate(
         for mountpoint in mountpoints.values():
             mountpoint.mkdir(mode=0o700)
 
+        prefixes = {"first": EffectiveFilesystem(), "repeat": EffectiveFilesystem()}
         for name, payload in (
             ("base", base_tar),
             ("leaf", leaf_tar),
@@ -854,6 +859,7 @@ def probe_oci_filesystem_candidate(
                 out_path=images[name],
                 packer_path=verified_packer,
                 expected_packer_sha256=prerequisites.packer_sha256,
+                filesystem=prefixes["repeat" if name.endswith("-repeat") else "first"],
             )
 
         if _sha256_file(images["base"]) != _sha256_file(images["base-repeat"]):

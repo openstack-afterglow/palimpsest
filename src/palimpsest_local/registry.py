@@ -26,6 +26,7 @@ from urllib.parse import urlsplit
 from .digest import normalize_digest
 from .errors import PalimpsestError
 from .state import StatePaths, file_lock, fsync_directory
+from .web_job_client import run_preparation_tool
 
 SCHEMA_VERSION = 1
 BUILTIN_ALIAS = "docker"
@@ -938,11 +939,12 @@ def credential_free_subprocess_environment(environment: Mapping[str, str] | None
     """Keep tool configuration while withholding Palimpsest API credentials.
 
     Package keys belong only in the native HTTPS client or helper stdin. The
-    separate legacy token must likewise not leak into Docker, BuildKit or packers.
+    separate legacy token and the Hub image key (``PALIMPSEST_IMAGE_KEY``) must
+    likewise not leak into Docker, BuildKit or packers.
     """
     child_environment = dict(os.environ if environment is None else environment)
-    child_environment.pop("PALIMPSEST_PACKAGE_KEY", None)
-    child_environment.pop("PALIMPSEST_TOKEN", None)
+    for name in ("PALIMPSEST_PACKAGE_KEY", "PALIMPSEST_TOKEN", "PALIMPSEST_IMAGE_KEY"):
+        child_environment.pop(name, None)
     return child_environment
 
 
@@ -953,8 +955,11 @@ def run_docker_command(
     timeout_seconds: float | None = 600,
     check: bool = True,
     runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    no_force: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     """Run validated Docker argv directly, never through a shell."""
+    if type(no_force) is not bool:
+        raise RegistryError("Docker no-force policy must be boolean")
     command = [_argv_text(item) for item in argv]
     if len(command) < 4 or command[0] != "docker" or command[1] != "--config":
         raise RegistryError("Docker argv must start with 'docker --config DIR'")
@@ -975,7 +980,10 @@ def run_docker_command(
             raise RegistryError("Docker command timeout must be positive")
         kwargs["timeout"] = timeout_seconds
     try:
-        result = runner(command, **kwargs)
+        if no_force:
+            result = run_preparation_tool(command, no_force=True, **kwargs)
+        else:
+            result = runner(command, **kwargs)
     except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as exc:
         raise RegistryError(f"Docker command failed to start or timed out: {command[3]}") from exc
     if check and result.returncode != 0:

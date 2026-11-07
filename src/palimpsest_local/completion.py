@@ -289,7 +289,7 @@ def print_completion(parser: argparse.ArgumentParser, words: Sequence[str], shel
 def generate_completion_script(shell: str) -> str:
     """Generate registrations; words and descriptions are always literal shell data."""
     if shell == "zsh":
-        return r"""#compdef palimpsest
+        return r"""#compdef palimpsest plm
 
 _palimpsest() {
     emulate -L zsh
@@ -320,7 +320,7 @@ _palimpsest() {
     return 0
 }
 
-compdef _palimpsest palimpsest
+compdef _palimpsest palimpsest plm
 """
     if shell == "bash":
         return r"""_palimpsest_completion() {
@@ -422,9 +422,9 @@ compdef _palimpsest palimpsest
 }
 
 if [[ $(type -t compopt) = "builtin" ]]; then
-    complete -F _palimpsest_completion palimpsest
+    complete -F _palimpsest_completion palimpsest plm
 else
-    complete -o nospace -F _palimpsest_completion palimpsest
+    complete -o nospace -F _palimpsest_completion palimpsest plm
 fi
 """
     if shell == "fish":
@@ -467,6 +467,7 @@ fi
 end
 
 complete -c palimpsest -f -k -a "(__palimpsest_completion)"
+complete -c plm -f -k -a "(__palimpsest_completion)"
 """
     raise ValueError(f"unsupported shell: {shell}")
 

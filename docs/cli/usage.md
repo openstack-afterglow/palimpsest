@@ -20,7 +20,7 @@ Do not treat these similarly named surfaces as interchangeable:
 
 | Surface | Examples | Backend and credentials |
 | --- | --- | --- |
-| Palimpsest Hub artifacts | `image ls`, `image pull`, `image push`, `layer ls/check/pack/pull/push`, `bundle *` | Native Palimpsest Hub `/v1`; `PALIMPSEST_TOKEN` for Hub operations (local `layer pack` needs none) |
+| Palimpsest Hub artifacts | `image ls`, `image pull`, `image push`, `layer ls/check/pack/pull/push`, `bundle *`, `published push/pull/status` | Native Palimpsest Hub `/v1`; `PALIMPSEST_TOKEN` for Hub operations (local `layer pack` needs none); `published` also accepts an image API key and anonymous public pulls |
 | Docker wrapper | `pull`, `push`, `tag`, `images`, `history`, `rmi`, `save`, `load`, and `image inspect/history/rm/save/load` | Installed Docker CLI and external OCI registries; Docker credentials |
 | Local OCI root | `oci pull`, `oci materialize`, `run ./image.oci.tar --runtime-kind oci-root` | Anonymous TLS registry acquisition into a verified local archive; private source CAS and Linux KVM runtime |
 | Permanent shared OCI cache | `oci cache --root PATH init/pull/import/materialize/retain/release/inspect` | Explicit private directory on pre-mounted persistent storage; anonymous verified TLS for pulls, current local CAS/materializer authority |
@@ -62,6 +62,28 @@ palimpsest run ./palimpsest-bundle --name bundled
 ```
 
 Run only on a compatible host with documented backend prerequisites and a matching raw/qcow2 base plus known matching base/layer architecture. The verified bundle resolves base and ordered layers automatically; no manual `--layer` selection is required. No-base chains remain reusable/discoverable but not locally runnable. Catalog local_supported is metadata eligibility, not byte/guest readiness; download authority remains independent of public/site/project/shared visibility. New catalog routes require matching Hub rollout. Neither rollout nor VM boot was performed for source qualification.
+
+### Published images: local catalog ↔ Hub
+
+`published push IMAGE --name NAME [--visibility private|internal|public]` publishes one completely materialized local catalog image (`IMAGE` is its `sha256:` image id) as a Hub published image. `NAME` must match `^[a-z0-9][a-z0-9.+-]{0,63}$` (checked before anything is uploaded); one name is one image per scope. Visibility defaults to `private`; `--visibility public` additionally requires `--confirm-public`. The manifest is built from the catalog's ordered per-layer SquashFS conversions, including the original base layers with their compressed descriptors and DiffIDs, and carries only content-derived conversion facts, so the same image published from two state roots has the same manifest digest. `--os-family`/`--os-version` record actual OS facts (default `unknown`, never guessed).
+
+By default the push also uploads the image's original OCI source closure (root index if any, image manifest, config and every compressed layer, re-verified from the local source CAS), which makes the image runnable after a pull. Before uploading, the command prints who can read it: the config, including environment variable **values**, becomes readable by everyone who can read the image — only you for `private`, every member of your project for `internal`, anyone anonymously for `public`. The public manifest projection hides those values, but the closure does not. `--no-source` publishes layers and metadata only; such an image cannot be run after a pull.
+
+Publication status lives in the local catalog. A row is written as `pending` with a request id before the first network call; `pending` also means an interrupted attempt whose outcome is unknown. The row becomes `published` only after the Hub's returned image id, owner project, manifest digest, name, visibility and layer chain match the local manifest. A definitive 4xx refusal is recorded as `failed`; a 5xx, timeout, transport error or mismatching response as `unknown`. Local bytes that change after they were verified are reported as a local integrity error (recorded as `failed`, nothing registered), not as a Hub outcome. Re-running the same command reuses the same request id, so the Hub replays an already committed publication. An unpublished generation (`pending`, `failed`, `unknown`) belongs to the credential that began it (an image key by its public `ppi_v1_` id; every credential without a key id counts as one owner): another credential never retries, adopts or ends it. A Hub `request_id conflicts` answer (in practice between Keystone-token users, for example another user's token retrying your token's row) or a second mismatching response ends that request id; the next attempt starts a new generation with a new id. Every `published` generation of the same intent is revalidated with the current credential, newest first, and the first that still matches (image, manifest digest, name, visibility, owner project and closure) is reused, so alternating credentials of different projects do not publish duplicates. A deleted image or a credential that cannot see it (HTTP 404) makes a generation stale; only when none matches is a new generation started, and concurrent runs of the same credential share that one new generation. A credential that may publish but not read (HTTP 403 on the read, for example an image key with `images:publish` but not `images:read`) cannot validate any row by reading, so it only tracks publications that this same image key recorded: it revalidates one of them by replaying its stored Hub request id through the normal publication request (the Hub answers it idempotently per project and user); a replay answer that matches the intent is adopted without another request, and the row is rebound if the Hub re-registered the image in the same project, while a non-matching answer makes the row stale. A credential that cannot read never replays or adopts publications recorded by other credentials (a read-capable credential reuses any matching image it can read), and a credential without an image-key id that cannot read refuses and asks for `images:read`. Quota refusals name the limit: HTTP 403 `image_count_limit`, HTTP 413 `image_chain_size_limit` (distinct layer bytes) or `image_source_size_limit` (distinct closure bytes); GiB = 2^30.
+
+Replay details: a credential's own unresolved attempt is retried with its own request id, even when another credential has published a newer generation, and while it exists no replay runs; the exception is a published row that revalidates by reading with that credential, whose image is reused instead (a credential without a key id that cannot read refuses when any published row exists). A refused or uncertain replay never starts a new generation: a definitive refusal (a 4xx other than 404 and 409, for example 403 or 429) is reported as refused before anything was registered and leaves the row unchanged; an uncertain failure (5xx, timeout, transport error) is reported as outcome unknown, never as "nothing changed", and re-running replays the same request id. HTTP 404 (this key has not staged the payloads) starts a new generation that re-sends the same Hub request id, so the Hub answers an image it already holds instead of registering another. HTTP 409 ends the row's request id. By design these situations can still register a second Hub image: switching credentials while an attempt is uncertain (the other credential cannot see that attempt and publishes its own; switching back retries the original unless the original credential can read the other credential's image, which it then reuses); two different image keys of one user; publish-only keys of different users of one project (including `internal` images of the same name); a publish-only key next to a read-capable credential, because a key that cannot read cannot recognise images published by other credentials; Keystone tokens, which have no key id and therefore share unresolved attempts across users and projects (another user's retry ends the request id with a 409, a token of another project registers the id in its own project); and the same image published from two state roots, because tracking lives in each root's catalog. Using one image key per publication avoids all of them; a credential with `images:read` avoids only the publish-only cases. A Hub that answers replays with a different manifest (a broken Hub; the real Hub does not) makes the key start a fresh generation each time, and a refused attempt retried later can then register an extra image (about one per two runs while the Hub keeps answering that way).
+
+Known limit: the arm64 pull precheck counts only the declared compressed closure bytes against the 8 GiB local OCI source intake limit; decompressed layer bytes are counted separately against the same limit during registration, so a registration refusal after the download is possible. It is reported as `source_registration_error` with the downloaded layout kept, not as a failed pull.
+
+`published pull HUB_IMAGE_ID --state-root DIR [--name NAME] [--anonymous]` downloads every SquashFS payload into `DIR`'s store and, when the image carries its source closure, every closure blob, each with SHA-256 and size verification (a corrupt, short or oversized blob leaves no file). The image's manifest must commit to its closure (manifest, config and root digests, and each layer's original compressed digest and size by ordinal); root/manifest/config documents above 1 MiB are refused before download. It verifies the OCI chain itself (root index lists the manifest; manifest lists the config and every layer by digest and size; config platform and DiffIDs match; documents with repeated JSON keys are refused), rebuilds a standard OCI image layout at `DIR/published/<image-id>/layout` atomically (read-only files in owner-only directories, no symlinks), registers that layout through the normal local OCI source intake, records the pull in `DIR`'s catalog as source `published` (Hub URL, image id, manifest digest, closure, layout) and prints the exact `plm run` command with its host requirement (Linux x86_64 with KVM for amd64; a qualified Ubuntu 24.04 arm64 Lima VZ profile on macOS for arm64). Downloaded SquashFS layers are kept. It never starts a VM or converts layers, and touches no other state root. Before anything is downloaded, declared sizes are checked against a client cap, the local OCI source intake limit (8 GiB for arm64 acquisition) and the state root's free space (payloads plus the closure twice: layout and source CAS copy). Concurrent pulls of one image into the same state root share one layout; staging directories in which nothing (directory or blob file) was modified for a day are treated as abandoned and removed by the next pull, so a slow active download is kept. Repeating a pull of identical content is a no-op; a differing identity, chain or closure for an already registered image id is refused. There is no command to remove a pulled image yet. `store rm` refuses to delete payloads that a pulled published image references; `store move` relocates pulled layouts with the rest of the state root. `published status [--state-root DIR]` prints local publication rows and pulled images without contacting Hub.
+
+Credentials for `published`: `--image-key-file PATH` (owner-only file holding one `ppi_v1_` image API key), then `PALIMPSEST_IMAGE_KEY`, then `PALIMPSEST_TOKEN` (printable ASCII without spaces). Exactly one is sent. `pull` without any credential, or with `--anonymous`, reads `public` images anonymously; private/internal images then answer as not found. Credentials are never written to the catalog and never printed, including in error messages; unexpected errors are reported by type only. The Hub URL must not embed credentials, redirects are never followed, and credentials are not sent over plain `http://` to a non-loopback host unless `--allow-insecure-http` is given.
+
+```sh
+palimpsest published push "$LOCAL_IMAGE_ID" --name app --os-family ubuntu --os-version 24.04
+palimpsest published pull "$HUB_IMAGE_ID" --state-root "$HOME/palimpsest-consumer/state" --anonymous
+palimpsest published status --state-root "$HOME/palimpsest-consumer/state"
+```
 
 
 ### External copy-on-write runtime user-data
@@ -226,8 +248,10 @@ requested number of complete compatible results is found or inventory ends.
 
 These are platform-metadata checks, not GPU/Vulkan/CUDA, guest ABI, hardware
 availability or boot qualification. Runtime preflight remains mandatory.
-OCI-root remains restricted to Linux amd64 KVM; an ARM64 OCI image does not
-become executable on macOS merely because its CPU architecture matches.
+OCI-root supports Linux amd64 KVM and an explicitly configured, qualified
+Ubuntu24.04 arm64 Lima VZ profile on macOS. Native VZ requires its pinned boot
+assets and Linux worker; matching an image's CPU architecture alone does not
+establish execution admission. Registry acquisition support remains separate.
 
 The Docker-compatible `image inspect`, `image history`, `image rm`, `image save`, and `image load` commands are aliases for Docker-backed operations; they do not inspect or mutate Hub `/v1` cloud-image records.
 
@@ -286,6 +310,36 @@ Build restrictions enforced before execution:
 - `--output` is an OCI archive path, not arbitrary BuildKit exporter syntax; omission creates an invocation-unique archive beneath local build state.
 - Dockerfile builds reject legacy `--base`/`--layer`; use `--runtime-base` and `--local-image` instead.
 - `--progress` defaults to `plain`; build networking defaults to `none`.
+
+### Local Dockerfile `.plmignore`
+
+Local Dockerfile builds apply only the context-root `.plmignore`, with paths
+relative to the **context**, not the directory containing `-f`. The baseline is
+`<actual Dockerfile filename>.dockerignore` adjacent to that Dockerfile when
+present (including an empty file); otherwise it is the context-root
+`.dockerignore`. `.plmignore` appends after the baseline: the last matching
+pattern wins, and `!` can reinstate baseline-excluded files. Use Docker-compatible
+ancestor exceptions when reinstating files below an excluded directory.
+
+BuildKit evaluates Docker ignore grammar, including comments, blank lines,
+wildcards/`**`, `!` exceptions and CRLF. This is not complete Git-ignore syntax;
+parent/nested `.plmignore` files are not recursively loaded. Selected ignore
+files must be regular non-symlink UTF-8 files, at most 1 MiB each, without NUL.
+Invalid inputs fail closed.
+
+Palimpsest sends Buildx the unchanged original context and, only when root
+`.plmignore` exists, a temporary exact-byte Dockerfile plus merged adjacent
+ignore. It never copies/filters the context or writes back to user sources.
+The temporary definition is removed after success or failure. Without root
+`.plmignore`, the original `-f` path and Docker ignore selection remain intact.
+Effective ignore bytes enter the build identity, including a selected
+Dockerfile-specific ignore outside the context.
+
+This scope is the **local Dockerfile frontend**, independent of local/native
+cache mode. It does not implement remote Git, Hub worker, or commit-phase
+ignores; those require a later cutover. Source-policy admission/transport,
+strict-offline topology and native/runtime/publication gates remain mandatory.
+See [the workflow contract](../buildkit-block-workflow.md#local-dockerfile-context-ignores).
 
 ### Local build → Palimpsest Hub → another client
 
@@ -352,7 +406,15 @@ An explicit authority or `--registry` restricts reference resolution to that aut
 
 Cloud-image runs accept a local/Hub image digest or a Palimpsest bundle directory. Extra `--layer` values must continue the verified SquashFS parent chain. Backend `auto` selects KVM on Linux and Lima/VZ on macOS; experimental `libvirt-hvf` and `lima-krunkit` must be selected explicitly. Conventional cloud runs attach the image and layers but do not pivot the guest root.
 
-OCI-root runs accept local OCI archives/layouts, verified build/package/retained bindings, or OCI registry references acquired through Skopeo. The public runtime is limited to Linux x86_64/amd64 KVM with `qemu:///system` and qualified absolute kernel/config/packer paths with digest proof. Unsupported hosts fail capability checks before Docker export, registry acquisition or runtime-state mutation. `--network` selects `nat` (the default when omitted), `host-only`, or `none`, and OCI-root-only `--publish` adds explicit loopback-by-default forwarding; see [OCI-root guest networking](../oci-network.md). The runtime remains capabilityless and is not a general hostile-container sandbox.
+OCI-root runs accept local OCI archives/layouts, verified build/package/retained
+bindings, or OCI registry references acquired through Skopeo. Linux amd64 KVM uses
+`qemu:///system` and qualified kernel/config/packer paths. The unreleased native
+macOS profile additionally supports explicitly configured, qualified Ubuntu24.04
+arm64 roots on Lima VZ with pinned boot assets and its Linux worker. Matching an
+image's architecture alone does not qualify execution. Unsupported hosts fail
+before source export/acquisition or runtime-state mutation. Networking remains
+profile-specific; see [OCI-root guest networking](../oci-network.md). Neither
+profile is a general hostile-container sandbox.
 
 Without `-d`, OCI `run` waits for the image workload, streams its output, and returns its exit status; it does not imply `palimpsest rm` or deletion of durable run state. `-d` returns the run name only after authenticated READY and leaves the VM running. Detach is OCI-root-only. `--manifest` pins an otherwise ambiguous root descriptor. `--user USER[:GROUP]` is OCI-root-only and changes the image user selection without adding capabilities, supplementary groups, or ownership changes. A literal `-- COMMAND [ARG...]` replaces only the local OCI image Cmd while preserving Entrypoint; see the [command override contract](../oci-run-command.md). It is literal argv and does not add a shell, environment override, TTY, keepalive, GPU, or device access.
 
@@ -404,6 +466,21 @@ gone; force cannot bypass that gate. Invalid retained metadata blocks deletion.
 
 `ps`, `inspect NAME`, `logs NAME [--follow]`, `start NAME`, `stop NAME`, and `rm NAME` act on managed runs. `ps` includes configured publications in its `PORTS` column as `HOST_IP:HOST_PORT->GUEST_PORT/PROTOCOL`; `inspect` emits the stable runtime record and, for OCI-root runs with a committed domain plan, typed `detail.network`, `detail.ports`, and `detail.guest_ip` fields. These are durable configured endpoints, not proof that a stopped or failed run still has a live listener. `shell` requests an interactive runtime session; `exec NAME -- COMMAND...` is non-interactive and requires a command. `--completion-record PATH` asks OCI exec to persist its bounded completion record. Direct PID 1 access is refused.
 
+Native VZ `exec --timeout SECONDS` limits only the guest command, not host
+preflight/load/status time or mutex acquisition. A native pass shares at most
+five seconds of added contended run/custody waiting; ordinary provider work does
+not spend it. A sanitized `busy` refusal means no fresh observation or access
+grant, not VM shutdown. `inspect` reads the last durable record; public CLI `ps`
+refreshes it. Native `--completion-record` is refused because there is no KVM
+mailbox ACK to record.
+
+Once admitted, native `logs --follow` retains its original pinned console through
+pure mutex busy, including another VM's namespace operation, with one bounded
+allowance per EOF poll. It does not replay a provider or guest command. Initial
+admission/snapshots fail closed, and identity, console, actor/resource HOLD or
+uncertain provider failures terminate the stream. Cancellation during mutex
+acquisition can wait up to that poll's remaining five-second allowance.
+
 ```sh
 palimpsest ps
 palimpsest inspect app
@@ -414,9 +491,33 @@ palimpsest stop app
 palimpsest rm app
 ```
 
-`rm --volumes` explicitly purges safely owned conventional instance root/runtime/topology, never independent named data disks. It is rejected for OCI-root runs; OCI root deletion/retention follows the owned run policy. OCI-root also rejects `start`, `shell`, and `commit`; use `exec` for additional processes and `stop`/`rm` for lifecycle control. `commit NAME --tag TAG` commits a conventional runtime layer.
+`rm --volumes` purges safely owned conventional instance root/runtime/topology,
+never independent named disks, and is refused for OCI-root runs. OCI-root
+deletion/retention follows the owned run policy. KVM OCI-root retains its existing
+`start`, `shell` and `commit` refusals. The qualified native VZ profile supports
+retained `start` and interactive `shell`; native commit is outside the current
+qualification. Use `exec` for additional commands and `stop`/`rm` for lifecycle.
+`commit NAME --tag TAG` commits a conventional runtime layer.
 
 OCI diagnostic commands emit JSON: `root-proof NAME`, `exec-status NAME`, `exec-record PATH`, `resource-status`, `root-volumes`, and `root-volume UUID`. `oci init-runtime PATH` securely creates a runtime parent and prints the `PALIMPSEST_STATE_HOME=...` assignment. `oci pull FULLREF --output ARCHIVE` uses installed Skopeo to acquire one anonymously accessible HTTPS `linux/amd64` image, verifies it through the private source CAS, and only then publishes a new local archive. The caller-selected endpoint may be Internet, private-network, or local. `oci materialize SOURCE` snapshots and verifies a local archive/layout, converts layers with the selected SquashFS packer, and emits a receipt (or writes it to a new `--output` file). Their timeout defaults to 300 seconds and must be positive and finite.
+
+Unreleased `oci qualify SOURCE --platform linux/arm64 --backend lima-vz`
+inspects an original local archive/layout through the existing source CAS,
+selects a reviewed Ubuntu24.04 direct-linux source profile from effective
+`os-release`, and prints exact graph/OS/profile identities. `--manifest` pins
+the original root/index; `--maximum-bytes` bounds intake and decompression
+passes; `--timeout` is one cooperative deadline. Unknown/unsupported or malformed
+identity fails with no successful qualification output. No force/risk bypass
+exists. This is source-only (`execution_admitted: false`), not an implemented
+VZ user-root launch or a replacement for native execution preflight.
+See [source qualification semantics and limits](../registry-intake.md#original-source-osprofile-qualification).
+
+`oci materialize SOURCE --platform linux/arm64` is an explicit Linux-hosted
+filesystem conversion path, not native execution admission. It preserves the
+complete original graph and ordered SquashFS occurrences; output has no runtime
+lease. Default `linux/amd64` resolution is unchanged. A successful ARM conversion
+cannot enter the legacy KVM plan/root-preparation path or widen Hub publication.
+See [filesystem conversion scope](../registry-intake.md#explicit-arm-filesystem-materialization).
 
 ## Compose-shaped projects
 
@@ -506,12 +607,16 @@ Interactive access still requires `--allow-control`. Unsupported controls are
 disabled from the session capabilities. Completion distinguishes exit codes
 from signals, and bounded sessions expire when idle. Disconnect, drawer close
 and tab unload close only the owned console transport, never the VM.
-OCI foreground disconnect detaches the consumer, not its submitted command:
-the original owner drains output and acknowledges completion under the existing
-guest deadline and transport grace. Normal dashboard SIGINT/SIGTERM stops new
-OCI admission and waits for both console and detached probe owners (at most 32)
-before process exit. Unconfirmed ACKs are reported as unresolved; shutdown
-never takes over a result, retries the command or stops the VM.
+OCI foreground disconnect detaches the consumer, not its submitted command.
+The original non-daemon owner drains output and performs underlying cleanup;
+normal dashboard SIGINT/SIGTERM stops new OCI admission and waits for console
+and detached probe owners (at most 32) before process exit. KVM retains original
+mailbox ACK accounting under its existing guest deadline/transport grace.
+Canonical native Lima-VZ retains the same lifetime owner but has no mailbox ACK;
+process completion neither fabricates one nor counts as an unconfirmed ACK.
+Probe timers never perform native cleanup on a daemon thread. Unconfirmed
+required ACKs remain unresolved; shutdown never takes over a result, retries
+the command or stops the VM.
 
 Polling reads time out after fifteen seconds; control requests instead remain busy until the server returns, because VM starts and storage moves can outlive a polling interval. Closing a VM drawer clears its optional volume-deletion choice before inspecting another VM. The keyboard skip link reaches the active view's main content without changing the resource view.
 
@@ -530,6 +635,17 @@ across the local Lima/libvirt backend, even when they were launched with a
 different `PALIMPSEST_STATE_HOME`. Only exact backend/name/run-ID matches in the
 selected state can start or stop a VM; CLI lifecycle commands remain scoped to
 that state. Discovery never imports another state directory or adopts a resource.
+For a freshly reconciled managed native Lima-VZ guest, VM `status` describes
+physical liveness while `runtime_status` preserves canonical main-process state.
+Thus `ps` can show a running guest after its main exits; runtime `inspect`
+still reports that exit. Pinned reconciliation supplies this baseline even when
+ambient Lima tools/home differ. Supplementary provider coalescing requires the
+same home device/inode and complete identity; it never supplies generic guest
+credentials or upgrades pinned stopped state.
+Fresh removed native history retains its independently pinned home identity even
+when no live alias can be granted, so another Lima home's ordinary VM cannot
+revoke its retained console. Busy/stale snapshots do not gain that exemption or
+transport authority.
 Logs, measurements and opt-in consoles use independently reported access
 capabilities and revalidate the selected identity. Artifacts, builds and state
 storage remain scoped to the selected state. Docker containers are not VM
@@ -616,7 +732,8 @@ contacts the selected verified HTTPS service. Remote catalogs are never polled.
 - **VM setup:** a completed verified transfer can fill the VM form with its base
   and ordered layers. It closes the detail modal and preserves keyboard focus;
   a separate explicit Run is still required. OCI acquisition remains
-  `linux/amd64`-only and OCI-root execution remains Linux amd64 KVM-only, even
-  though metadata inspection exposes other platforms. Read-only mode permits
+  `linux/amd64`-only. OCI-root runs on Linux amd64 KVM or an explicitly configured,
+  qualified Ubuntu24.04 arm64 Lima VZ profile on macOS; inspecting another
+  platform's metadata does not qualify it for execution. Read-only mode permits
   connection, search and inspection, but rejects every transfer mutation.
 

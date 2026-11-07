@@ -1,0 +1,27 @@
+/* Bounded strict JSON with decoded UTF-8 strings and exact unsigned integers. */
+#ifndef PLM_VZ_JSON_H
+#define PLM_VZ_JSON_H
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#define JT_MAX 40000
+struct jt { int kind,next,child,count; char *s; uint64_t number; };
+struct json { const unsigned char *p,*end; char *arena; size_t used,cap; struct jt *t; int n,max_tokens; };
+static _Noreturn void bad(const char *s);
+static void js_space(struct json *j){while(j->p<j->end&&(*j->p==' '||*j->p=='\n'||*j->p=='\r'||*j->p=='\t'))j->p++;}
+static unsigned js_hex(unsigned c){if(c>='0'&&c<='9')return c-'0';if(c>='a'&&c<='f')return c-'a'+10;if(c>='A'&&c<='F')return c-'A'+10;bad("JSON unicode escape");return 0;}
+static unsigned js_u16(struct json *j){unsigned x=0,i;if(j->end-j->p<4)bad("short JSON unicode");for(i=0;i<4;i++)x=x*16+js_hex(*j->p++);return x;}
+static void js_put(struct json *j,unsigned c){if(j->used>=j->cap)bad("JSON string bound");j->arena[j->used++]=(char)c;}
+static void js_cp(struct json *j,unsigned c){if(!c||c>0x10ffff||(c>=0xd800&&c<=0xdfff))bad("JSON codepoint");if(c<128)js_put(j,c);else if(c<2048){js_put(j,0xc0|(c>>6));js_put(j,0x80|(c&63));}else if(c<65536){js_put(j,0xe0|(c>>12));js_put(j,0x80|((c>>6)&63));js_put(j,0x80|(c&63));}else{js_put(j,0xf0|(c>>18));js_put(j,0x80|((c>>12)&63));js_put(j,0x80|((c>>6)&63));js_put(j,0x80|(c&63));}}
+static char *js_string(struct json *j){size_t start=j->used;if(j->p==j->end||*j->p++!='"')bad("JSON string expected");while(j->p<j->end){unsigned c=*j->p++;if(c=='"'){js_put(j,0);return j->arena+start;}if(c<32)bad("JSON control byte");if(c=='\\'){if(j->p==j->end)bad("JSON escape truncated");c=*j->p++;switch(c){case '"':case '\\':case '/':js_put(j,c);break;case 'b':js_put(j,8);break;case 'f':js_put(j,12);break;case 'n':js_put(j,10);break;case 'r':js_put(j,13);break;case 't':js_put(j,9);break;case 'u':c=js_u16(j);if(c>=0xd800&&c<=0xdbff){unsigned d;if(j->end-j->p<2||j->p[0]!='\\'||j->p[1]!='u')bad("JSON surrogate");j->p+=2;d=js_u16(j);if(d<0xdc00||d>0xdfff)bad("JSON surrogate pair");c=0x10000+((c-0xd800)<<10)+(d-0xdc00);}js_cp(j,c);break;default:bad("JSON unknown escape");}continue;}if(c<128)js_put(j,c);else{unsigned n,x,min,i;if(c>=0xc2&&c<=0xdf){n=1;x=c&31;min=128;}else if(c>=0xe0&&c<=0xef){n=2;x=c&15;min=2048;}else if(c>=0xf0&&c<=0xf4){n=3;x=c&7;min=65536;}else bad("JSON UTF8 leader");if((size_t)(j->end-j->p)<n)bad("JSON UTF8 truncated");for(i=0;i<n;i++){unsigned d=*j->p++;if((d&0xc0)!=0x80)bad("JSON UTF8 continuation");x=(x<<6)|(d&63);}if(x<min)bad("JSON UTF8 overlong");js_cp(j,x);}}bad("JSON unterminated string");return NULL;}
+static int js_value(struct json *j,unsigned depth){int at,k,last=-1;struct jt *t;unsigned c;if(depth>32||j->n>=j->max_tokens)bad("JSON nesting/token bound");js_space(j);if(j->p==j->end)bad("JSON truncated value");at=j->n++;t=j->t+at;memset(t,0,sizeof *t);t->child=-1;c=*j->p;
+ if(c=='{'||c=='['){j->p++;t->kind=(int)c;js_space(j);if(j->p<j->end&&*j->p==(c=='{'?'}':']')){j->p++;t->next=j->n;return at;}for(;;){if(c=='{'){char *key;int old;if(j->n>=j->max_tokens)bad("JSON token bound");js_space(j);key=js_string(j);for(old=t->child;old>=0&&old<j->n;old=j->t[j->t[old].next].next)if(!strcmp(j->t[old].s,key))bad("JSON duplicate object key");k=j->n++;j->t[k]=(struct jt){.kind='s',.next=k+1,.child=-1,.count=0,.s=key,.number=0};if(last<0)t->child=k;last=k;t->count++;js_space(j);if(j->p==j->end||*j->p++!=':')bad("JSON colon");js_value(j,depth+1);}else{k=js_value(j,depth+1);if(last<0)t->child=k;last=k;t->count++;}js_space(j);if(j->p==j->end)bad("JSON truncated collection");k=*j->p++;if(k==(c=='{'?'}':']'))break;if(k!=',')bad("JSON collection separator");}t->next=j->n;return at;}
+ if(c=='"'){t->kind='s';t->s=js_string(j);}else if(c>='0'&&c<='9'){uint64_t x=0;t->kind='n';if(c=='0'&&j->p+1<j->end&&isdigit(j->p[1]))bad("JSON leading zero");while(j->p<j->end&&isdigit(*j->p)){unsigned d=*j->p++-'0';if(x>(UINT64_MAX-d)/10)bad("JSON integer overflow");x=x*10+d;}t->number=x;}else if(j->end-j->p>=4&&!memcmp(j->p,"null",4)){t->kind='0';j->p+=4;}else if(j->end-j->p>=4&&!memcmp(j->p,"true",4)){t->kind='t';j->p+=4;}else if(j->end-j->p>=5&&!memcmp(j->p,"false",5)){t->kind='f';j->p+=5;}else bad("JSON noncanonical value");t->next=j->n;return at;}
+static struct json js_parse(const void *v,size_t n){struct json j={0};j.p=v;j.end=(const unsigned char*)v+n;j.cap=n+1;j.max_tokens=n<JT_MAX?(int)n+1:JT_MAX;j.arena=malloc(n+1);j.t=malloc((size_t)j.max_tokens*sizeof *j.t);if(!j.arena||!j.t)bad("JSON allocation");js_value(&j,0);js_space(&j);if(j.p!=j.end)bad("JSON trailing data");return j;}
+static int field(struct json *j,int o,const char *name){int k;if(o<0||j->t[o].kind!='{')bad("JSON object expected");for(k=j->t[o].child;k>=0&&k<j->t[o].next;k=j->t[j->t[k].next].next)if(!strcmp(j->t[k].s,name))return k+1;bad("JSON missing field");return -1;}
+static void keys(struct json *j,int o,const char *const *names,size_t n){size_t i;if(j->t[o].kind!='{'||j->t[o].count!=(int)n)bad("JSON object field set");for(i=0;i<n;i++)(void)field(j,o,names[i]);}
+static char *string(struct json *j,int k){if(j->t[k].kind!='s'||strlen(j->t[k].s)>32768)bad("JSON bounded string expected");return j->t[k].s;}
+static uint64_t integer(struct json *j,int k,uint64_t max){if(k<0||k>=j->n||j->t[k].kind!='n'||j->t[k].number>max)bad("JSON bounded unsigned integer expected");return j->t[k].number;}
+static void js_free(struct json *j){free(j->arena);free(j->t);memset(j,0,sizeof *j);}
+#endif

@@ -17,7 +17,7 @@ from collections import deque
 from dataclasses import asdict, dataclass, field
 
 from . import vm_access
-from .errors import PalimpsestError
+from .errors import PalimpsestError, RuntimeBusyError
 from .oci_control_protocol_v2 import validate_exec_argv
 from .runtime_types import (
     ProcessCapabilityError,
@@ -113,11 +113,11 @@ class ConsoleManager:
                 session = access.open(mode, argv)
                 current = _Console(session_id, name, session)
                 response = {"id": current.id, "name": name, "capabilities": asdict(session.capabilities), "cursor": 0}
-                current.thread = threading.Thread(target=self._pump, args=(current,), name="console-pump", daemon=True)
+                current.thread = threading.Thread(target=self._pump, args=(current,), name="console-pump", daemon=False)
                 self._sessions[current.id] = current
                 current.thread.start()
                 if self._reaper is None:
-                    self._reaper = threading.Thread(target=self._expire, name="console-expiry", daemon=True)
+                    self._reaper = threading.Thread(target=self._expire, name="console-expiry", daemon=False)
                     self._reaper.start()
                 return response
             except Exception as exc:
@@ -131,6 +131,10 @@ class ConsoleManager:
                         current.thread.join(timeout=3)
                     if current.thread is None or not current.thread.is_alive():
                         self._sessions.pop(current.id, None)
+                if isinstance(exc, RuntimeBusyError):
+                    raise ConsoleError(
+                        "busy", "VM observation is busy; try again when the current operation completes"
+                    ) from None
                 if isinstance(exc, vm_access.VMAccessError):
                     raise ConsoleError(exc.category, str(exc)) from None
                 if isinstance(exc, (RuntimeCapabilityError, ProcessCapabilityError)):

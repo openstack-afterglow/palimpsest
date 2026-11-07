@@ -4,7 +4,8 @@ Runs as root on a dedicated Nova worker VM provisioned by ``cloud_env``. The
 CLI uploads a context archive and Dockerfile, then invokes::
 
     python -m palimpsest_local.cloud_layer_worker build --dockerfile F --context-tar T \
-        --store /mnt/palimpsest-layers --scratch /var/lib/palimpsest-cloud --name NAME
+        --store /mnt/palimpsest-layers --scratch /var/lib/palimpsest-cloud --name NAME \
+        --source-policy /private/controller-source-policy.json --policy-channel
 
 BuildKit produces an OCI archive; ``LayerCache`` converts it into ordered,
 digest-verified SquashFS layers (OCI whiteouts translated). Each layer is
@@ -17,6 +18,13 @@ Registry intake runs ``pull --reference registry/repository@sha256:...`` on this
 worker, never on the client. It retains original source/config documents and
 commits each conversion's immutable receipt and job journal before converting
 the next layer. These local image records do not claim Hub metadata authority.
+
+The copied source policy binds provenance only. Before each immutable publication
+commit the worker requests current controller authorization over the existing SSH
+pipes. Standalone operators must instead select ``--current-source-policy`` with
+their actual operator authority file; it is reopened at every checkpoint. Missing,
+changed or unknown authority preserves the job and quarantines this worker for
+operator reconciliation, without replaying or rebinding the admitted job.
 """
 
 from __future__ import annotations
@@ -34,11 +42,20 @@ import subprocess
 import sys
 import time
 import uuid
+from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path
 
+from .buildkit import BuildKitSpec, validate_online_dockerfile
 from .errors import ArtifactValidationError
 from .hub_image_builder import extract_context
+from .image_policy_channel import (
+    CurrentPolicyAuthority,
+    PipePolicyAuthority,
+    PolicyPublicationHold,
+    isolated_policy_channel,
+)
+from .image_source_policy import ImageSourcePolicy, ImageSourcePolicyError, image_source_policy_from_dict
 from .layer_cache import LayerCache
 from .oci_image import strict_json_object
 from .oci_packer import SquashFSPackProfile
@@ -114,7 +131,7 @@ def _fsync_dir(path: Path) -> None:
         os.close(fd)
 
 
-def _atomic_json(path: Path, value: dict) -> dict:
+def _atomic_json(path: Path, value: dict, *, before_commit: Callable[[], None] | None) -> dict:
     """Bind an image name once; timestamps do not change an existing binding."""
     _directory(path.parent)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
@@ -127,6 +144,8 @@ def _atomic_json(path: Path, value: dict) -> dict:
             stream.flush()
             os.fchmod(stream.fileno(), 0o444)
             os.fsync(stream.fileno())
+        if before_commit is not None:
+            before_commit()
         try:
             os.link(temporary, path, follow_symlinks=False)
         except FileExistsError:
@@ -146,7 +165,7 @@ def _atomic_json(path: Path, value: dict) -> dict:
             temporary.unlink()
 
 
-def publish_blob(source: Path, digest: str, store: Path) -> dict:
+def publish_blob(source: Path, digest: str, store: Path, *, before_commit: Callable[[], None]) -> dict:
     """Publish without replacement, including when another writer wins the link race."""
     hex_digest = _digest_hex(digest)
     blobs = store / "blobs" / "sha256"
@@ -170,8 +189,10 @@ def publish_blob(source: Path, digest: str, store: Path) -> dict:
         return {"digest": digest, "size": size, "published": "existing"}
 
     if os.path.lexists(target):
+        before_commit()
         return existing()
     temporary = store / ".incoming" / f"{hex_digest}.{uuid.uuid4().hex}"
+    before_commit()
     owned = False
     try:
         with _regular_file(source) as incoming, temporary.open("xb") as outgoing:
@@ -183,6 +204,7 @@ def publish_blob(source: Path, digest: str, store: Path) -> dict:
             os.fsync(outgoing.fileno())
         if _sha256(temporary) != digest or temporary.stat().st_size != size:
             raise WorkerError(f"copied layer {digest} failed verification")
+        before_commit()
         try:
             os.link(temporary, target, follow_symlinks=False)
         except FileExistsError:
@@ -223,14 +245,27 @@ def _term_wait(process: subprocess.Popen | None) -> bool:
     return True
 
 
-def _buildkit(context: Path, definition: Path, output: Path, root: Path, log: Path, deadline: float) -> None:
+def _buildkit(
+    context: Path,
+    definition: Path,
+    output: Path,
+    root: Path,
+    log: Path,
+    deadline: float,
+    *,
+    source_policy: ImageSourcePolicy,
+) -> None:
     # The short socket is shared even if callers select different scratch directories.
+    if not isinstance(source_policy, ImageSourcePolicy):
+        raise ImageSourcePolicyError("trusted image source policy is required")
+    policy = log.parent / "source-policy.json"
     with _exclusive_lock(BUILDKIT_SOCKET.with_suffix(".lock")):
         socket_hold = BUILDKIT_SOCKET.with_suffix(".hold.json")
         if os.path.lexists(socket_hold):
             raise WorkerHold(f"HOLD: prior socket shutdown requires review: {socket_hold}")
         if os.path.lexists(BUILDKIT_SOCKET):
             raise WorkerHold(f"HOLD: preexisting BuildKit socket requires review: {BUILDKIT_SOCKET}")
+        _atomic_json(policy, source_policy.buildkit_policy(), before_commit=None)
         config = log.parent / "buildkitd.toml"
         config.write_text('[worker.oci]\nmax-parallelism = 2\n[frontend."gateway.v0"]\nenabled = false\n')
         root.mkdir(mode=0o700, exist_ok=True)
@@ -296,6 +331,8 @@ def _buildkit(context: Path, definition: Path, output: Path, root: Path, log: Pa
                 "context=" + str(context),
                 "--local",
                 "dockerfile=" + str(definition),
+                "--source-policy-file",
+                str(policy),
                 "--output",
                 "type=oci,dest=" + str(output) + ",oci-mediatypes=true",
             ]
@@ -346,12 +383,57 @@ def _buildkit(context: Path, definition: Path, output: Path, root: Path, log: Pa
                 BUILDKIT_SOCKET.unlink()
 
 
+def _require_publication_authority(initial: ImageSourcePolicy, authority: object) -> None:
+    if (
+        not isinstance(authority, (CurrentPolicyAuthority, PipePolicyAuthority))
+        or authority.initial.to_dict() != initial.to_dict()
+    ):
+        raise ImageSourcePolicyError("explicit current publication authority must bind the admitted policy snapshot")
+
+
+def _publication_checkpoint(check: Callable[[str, float], None], stage: str, deadline: float) -> None:
+    try:
+        if not callable(check):
+            raise PolicyPublicationHold("HOLD: explicit current policy authority is required")
+        if time.monotonic() >= deadline:
+            raise PolicyPublicationHold("HOLD: publication deadline expired")
+        check(stage, deadline)
+        if time.monotonic() >= deadline:
+            raise PolicyPublicationHold("HOLD: publication deadline expired during authorization")
+    except Exception as error:
+        raise WorkerHold(f"HOLD: current publication authority denied or unknown at {stage}: {error}") from error
+
+
 def build(
-    *, dockerfile: Path, context_tar: Path, store: Path, scratch: Path, name: str, timeout_seconds: float
+    *,
+    dockerfile: Path,
+    context_tar: Path,
+    store: Path,
+    scratch: Path,
+    name: str,
+    timeout_seconds: float,
+    source_policy: ImageSourcePolicy,
+    publication_check: CurrentPolicyAuthority | PipePolicyAuthority,
 ) -> dict:
     if sys.platform != "linux" or platform.machine() not in ("x86_64", "amd64") or os.geteuid() != 0:
         raise WorkerError("the cloud layer worker requires root on Linux amd64")
     validate_name(name)
+    if not isinstance(source_policy, ImageSourcePolicy):
+        raise ImageSourcePolicyError("trusted image source policy is required")
+    if not source_policy.rules:
+        raise ImageSourcePolicyError("image_sources policy does not allow any upstream image")
+    _require_publication_authority(source_policy, publication_check)
+    validate_online_dockerfile(
+        BuildKitSpec(
+            context=dockerfile.parent,
+            dockerfile=dockerfile,
+            tag=name,
+            output=dockerfile.expanduser().resolve().parent.parent / "cloud-image.oci.tar",
+        ),
+        None,
+        source_policy=source_policy,
+        require_pins=False,
+    )
     require_ceph_store(store)
     scratch.mkdir(mode=0o700, parents=True, exist_ok=True)
     _directory(scratch)
@@ -369,6 +451,17 @@ def build(
         _directory(jobs)
         job = jobs / uuid.uuid4().hex
         job.mkdir(mode=0o700)
+
+        def build_checkpoint(stage: str) -> None:
+            try:
+                _publication_checkpoint(publication_check, stage, deadline)
+            except WorkerHold as error:
+                failure = {"status": "hold", "stage": stage, "error": str(error)}
+                _atomic_json(job / "policy-hold.json", failure, before_commit=None)
+                _atomic_json(scratch / "intake.hold.json", failure, before_commit=None)
+                raise
+
+        _atomic_json(job / "source-policy-snapshot.json", source_policy.to_dict(), before_commit=None)
         context = job / "context"
         extract_context(context_tar, context, maximum_bytes=MAX_CONTEXT_BYTES, maximum_members=MAX_CONTEXT_MEMBERS)
         definition = job / "definition"
@@ -376,7 +469,15 @@ def build(
         with _regular_file(dockerfile) as incoming, (definition / "Dockerfile").open("xb") as outgoing:
             shutil.copyfileobj(incoming, outgoing)
         oci_archive = job / "image.oci.tar"
-        _buildkit(context, definition, oci_archive, scratch / "buildkit", job / "buildctl.log", deadline)
+        _buildkit(
+            context,
+            definition,
+            oci_archive,
+            scratch / "buildkit",
+            job / "buildctl.log",
+            deadline,
+            source_policy=source_policy,
+        )
         built = time.time()
         cache_root = scratch / "layer-cache"
         fresh = not os.path.lexists(cache_root)
@@ -408,7 +509,17 @@ def build(
             digest = _sha256(path)
             if digest != expected["image_digest"] or path.stat().st_size != expected["image_size"]:
                 raise WorkerError("materialized layer differs from its conversion receipt")
-            layers.append({"ordinal": ordinal, **publish_blob(path, digest, store)})
+            layers.append(
+                {
+                    "ordinal": ordinal,
+                    **publish_blob(
+                        path,
+                        digest,
+                        store,
+                        before_commit=lambda ordinal=ordinal: build_checkpoint(f"payload:{ordinal}"),
+                    ),
+                }
+            )
         record = {
             "schema": "palimpsest.cloud-layer-image.v1",
             "name": name,
@@ -427,7 +538,16 @@ def build(
             },
             "built_at_unix": round(started, 3),
         }
-        record = _atomic_json(store / "images" / f"{name}.json", record)
+        record = _atomic_json(
+            store / "images" / f"{name}.json",
+            record,
+            before_commit=lambda: build_checkpoint("image"),
+        )
+        record = _atomic_json(
+            job / "receipt.json",
+            {**record, "source_policy": source_policy.to_dict(), "source_policy_digest": source_policy.digest},
+            before_commit=lambda: build_checkpoint("receipt"),
+        )
         return {
             **record,
             "evidence_directory": str(job),
@@ -533,10 +653,22 @@ def _pull_source(imported: dict, reference: str, pin: str) -> tuple[dict, dict]:
 
 
 def pull(
-    *, reference: str, store: Path, scratch: Path, name: str, timeout_seconds: float, job_id: str | None = None
+    *,
+    reference: str,
+    store: Path,
+    scratch: Path,
+    name: str,
+    timeout_seconds: float,
+    source_policy: ImageSourcePolicy,
+    publication_check: CurrentPolicyAuthority | PipePolicyAuthority,
+    job_id: str | None = None,
 ) -> dict:
     """Acquire anonymous pinned OCI bytes on the worker, publishing each completed layer in order."""
     reference, pin = _pull_reference(reference)
+    if not isinstance(source_policy, ImageSourcePolicy):
+        raise ImageSourcePolicyError("trusted image source policy is required")
+    source_policy.admit(resolve_anonymous_reference(reference))
+    _require_publication_authority(source_policy, publication_check)
     validate_name(name)
     if (
         not isinstance(timeout_seconds, (float, int))
@@ -579,22 +711,29 @@ def pull(
         layers = []
         receipts = []
         acquiring = True
-        request = {"job_id": job_id, "reference": reference, "name": name, "platform": "linux/amd64"}
+        request = {
+            "job_id": job_id,
+            "reference": reference,
+            "name": name,
+            "platform": "linux/amd64",
+            "source_policy": source_policy.to_dict(),
+            "source_policy_digest": source_policy.digest,
+        }
         try:
             _fsync_dir(job.parent)
             journal.mkdir(mode=0o755)
             _fsync_dir(journal.parent)
-            _atomic_json(job / "request.json", request)
-            _atomic_json(journal / "request.json", request)
+            _atomic_json(job / "request.json", request, before_commit=None)
+            _atomic_json(journal / "request.json", request, before_commit=None)
             cache_root = scratch / "layer-cache"
             fresh = not os.path.lexists(cache_root)
             if fresh:
                 cache_root.mkdir(mode=0o700)
             _directory(cache_root)
             cache = LayerCache(cache_root, initialize=fresh)
-            imported = cache.pull(reference, timeout_seconds=_remaining(deadline))
+            imported = cache.pull(reference, source_policy=source_policy, timeout_seconds=_remaining(deadline))
             source, config = _pull_source(imported, reference, pin)
-            _atomic_json(journal / "source.json", source)
+            _atomic_json(journal / "source.json", source, before_commit=None)
             acquired = time.time()
 
             def publish_layer(ordinal: int, path: Path, value: dict) -> None:
@@ -631,7 +770,12 @@ def pull(
                 with _regular_file(path) as stream:
                     if os.fstat(stream.fileno()).st_size != receipt.image_size:
                         raise WorkerError("materialized layer differs from its conversion receipt size")
-                published = publish_blob(path, receipt.image_digest, store)
+                published = publish_blob(
+                    path,
+                    receipt.image_digest,
+                    store,
+                    before_commit=lambda: _publication_checkpoint(publication_check, f"payload:{ordinal}", deadline),
+                )
                 metadata = {
                     "schema": "palimpsest.cloud-layer-receipt.v1",
                     "root_descriptor": source["root_descriptor"],
@@ -643,7 +787,11 @@ def pull(
                 }
                 receipt_digest = _json_digest(metadata)
                 relative = f"receipts/sha256/{receipt_digest[7:]}.json"
-                _atomic_json(store / relative, metadata)
+                _atomic_json(
+                    store / relative,
+                    metadata,
+                    before_commit=lambda: _publication_checkpoint(publication_check, f"receipt:{ordinal}", deadline),
+                )
                 layer = {
                     "digest": published["digest"],
                     "size": published["size"],
@@ -654,7 +802,11 @@ def pull(
                     "receipt": relative,
                 }
                 # Commit the immutable fsynced prefix before conversion N+1.
-                _atomic_json(journal / f"layer-{ordinal:06d}.json", {**layer, "published": published["published"]})
+                _atomic_json(
+                    journal / f"layer-{ordinal:06d}.json",
+                    {**layer, "published": published["published"]},
+                    before_commit=lambda: _publication_checkpoint(publication_check, f"layer:{ordinal}", deadline),
+                )
                 layers.append({**layer, "published": published["published"]})
                 receipts.append(value)
                 _remaining(deadline)
@@ -702,7 +854,21 @@ def pull(
                 },
                 "built_at_unix": round(started, 3),
             }
-            record = _atomic_json(store / "images" / f"{name}.json", record)
+            record = _atomic_json(
+                store / "images" / f"{name}.json",
+                record,
+                before_commit=lambda: _publication_checkpoint(publication_check, "image", deadline),
+            )
+            record = _atomic_json(
+                journal / "receipt.json",
+                {
+                    **record,
+                    "job_id": job_id,
+                    "source_policy": source_policy.to_dict(),
+                    "source_policy_digest": source_policy.digest,
+                },
+                before_commit=lambda: _publication_checkpoint(publication_check, "receipt", deadline),
+            )
             return {
                 **record,
                 "job_id": job_id,
@@ -728,10 +894,10 @@ def pull(
                 "error": f"{type(error).__name__}: {error}",
             }
             try:
-                _atomic_json(job / "failure.json", failure)
+                _atomic_json(job / "failure.json", failure, before_commit=None)
                 if held:
-                    _atomic_json(scratch / "intake.hold.json", failure)
-                _atomic_json(journal / "failure.json", failure)
+                    _atomic_json(scratch / "intake.hold.json", failure, before_commit=None)
+                _atomic_json(journal / "failure.json", failure, before_commit=None)
             except Exception as journal_error:
                 raise WorkerHold(
                     f"HOLD: registry intake failure journal is uncertain; inspect {job}"
@@ -755,13 +921,43 @@ def main(argv: list[str] | None = None) -> int:
         command.add_argument("--scratch", type=Path, required=True)
         command.add_argument("--name", required=True)
         command.add_argument("--timeout", type=float, default=3600.0)
+        command.add_argument("--source-policy", type=Path, required=True)
+        authority = command.add_mutually_exclusive_group(required=True)
+        authority.add_argument("--policy-channel", action="store_true")
+        authority.add_argument("--current-source-policy", type=Path)
     args = parser.parse_args(argv)
     try:
-        common = {"store": args.store, "scratch": args.scratch, "name": args.name, "timeout_seconds": args.timeout}
-        if args.command == "pull":
-            result = pull(reference=args.reference, job_id=args.job_id, **common)
+
+        def read_policy(path: Path) -> ImageSourcePolicy:
+            with _regular_file(path) as stream:
+                metadata = os.fstat(stream.fileno())
+                if metadata.st_uid not in (0, os.geteuid()) or stat.S_IMODE(metadata.st_mode) & 0o077:
+                    raise ImageSourcePolicyError("source policy authority must be an owner-private file")
+                raw = stream.read(1024 * 1024 + 1)
+            if len(raw) > 1024 * 1024:
+                raise ImageSourcePolicyError("source policy authority exceeds the supported bound")
+            return image_source_policy_from_dict(strict_json_object(raw, "trusted image source policy"))
+
+        source_policy = read_policy(args.source_policy)
+
+        def execute(publication_check: CurrentPolicyAuthority | PipePolicyAuthority) -> dict:
+            common = {
+                "store": args.store,
+                "scratch": args.scratch,
+                "name": args.name,
+                "timeout_seconds": args.timeout,
+                "source_policy": source_policy,
+                "publication_check": publication_check,
+            }
+            if args.command == "pull":
+                return pull(reference=args.reference, job_id=args.job_id, **common)
+            return build(dockerfile=args.dockerfile, context_tar=args.context_tar, **common)
+
+        if args.policy_channel:
+            with isolated_policy_channel(source_policy) as publication_check:
+                result = execute(publication_check)
         else:
-            result = build(dockerfile=args.dockerfile, context_tar=args.context_tar, **common)
+            result = execute(CurrentPolicyAuthority(source_policy, lambda: read_policy(args.current_source_policy)))
     except Exception as error:  # noqa: BLE001 - one JSON failure line for the remote caller
         status = "hold" if isinstance(error, WorkerHold) else "failed"
         print(json.dumps({"status": status, "error": f"{type(error).__name__}: {error}"}), file=sys.stderr)

@@ -97,9 +97,10 @@ def _verify_install(wheel: Path, workspace: Path, uv: str, version: str) -> None
         env=tool_environment,
         cwd=workspace,
     )
-    executable = workspace / "tool-bin" / ("palimpsest.exe" if os.name == "nt" else "palimpsest")
-    _run([str(executable), "--version"], env=tool_environment, cwd=workspace)
-    _run([str(executable), "--help"], env=tool_environment, cwd=workspace)
+    for command in ("palimpsest", "plm"):
+        executable = workspace / "tool-bin" / (f"{command}.exe" if os.name == "nt" else command)
+        _run([str(executable), "--version"], env=tool_environment, cwd=workspace)
+        _run([str(executable), "--help"], env=tool_environment, cwd=workspace)
 
 
 def _digest(path: Path) -> str:

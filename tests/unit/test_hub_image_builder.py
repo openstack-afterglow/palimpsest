@@ -17,10 +17,21 @@ from pathlib import Path
 import pytest
 
 from palimpsest_local import hub_image_builder as builder
+from palimpsest_local.image_source_policy import ImageSourcePolicy, ImageSourceRule
 from palimpsest_local.oci_converter import LayerIntakeError
 from palimpsest_local.oci_packer import SquashFSPackError
 from palimpsest_local.oci_store import OCIStoreError
 from palimpsest_local.registry_intake import RegistryIntakeError
+
+SOURCE_POLICY = ImageSourcePolicy((ImageSourceRule("docker.io", "library", "alpine"),))
+
+
+def policy_manifest():
+    return {
+        "source_policy": SOURCE_POLICY.to_dict(),
+        "source_policy_digest": SOURCE_POLICY.digest,
+        "registry_hosts": ["docker.io"],
+    }
 
 
 def sha(data):
@@ -117,6 +128,73 @@ def test_registry_shorthand_uses_canonical_resolver(source, canonical):
 def test_registry_rejects_unadmitted_hosts_ports_and_uri_credentials(reference):
     with pytest.raises((ValueError, RegistryIntakeError)):
         builder.normalize_reference(reference)
+
+
+@pytest.mark.parametrize(
+    "identifier,allowed",
+    [
+        ("docker-image://docker.io/library/alpine:3", True),
+        ("docker-image://docker.io/library/alpine@sha256:" + "a" * 64, True),
+        ("docker-image://docker.io/library/alpine-extra:3", False),
+        ("docker-image://docker.io/other/alpine:3", False),
+        ("docker-image://ghcr.io/library/alpine:3", False),
+        ("docker-image://docker.io/library/alpine/nested:3", False),
+        ("https://example.invalid/archive.tar", False),
+        ("local://context", True),
+    ],
+)
+def test_buildkit_exact_source_transport_cannot_widen_repository(identifier, allowed):
+    import fnmatch
+    import re
+
+    # BuildKit applies matching rules in order, with the last decision winning.
+    decision = None
+    for rule in builder.source_policy(SOURCE_POLICY, ["docker.io"])["rules"]:
+        selector = rule["selector"]
+        matches = (
+            re.search(selector["identifier"], identifier) is not None
+            if selector.get("match_type") == "REGEX"
+            else fnmatch.fnmatchcase(identifier, selector["identifier"])
+        )
+        if matches:
+            decision = rule["action"]
+    assert (decision == "ALLOW") is allowed
+
+
+@pytest.mark.parametrize(
+    "kind,mutation",
+    [
+        ("registry", "empty"),
+        ("registry", "digest"),
+        ("registry", "other-repository"),
+        ("dockerfile", "empty"),
+    ],
+)
+def test_source_denial_precedes_cache_mounts_and_worker_effects(tmp_path, monkeypatch, kind, mutation):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(builder, "sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setattr(builder, "platform", SimpleNamespace(machine=lambda: "x86_64"))
+    monkeypatch.setattr(builder.os, "geteuid", lambda: 0)
+    effects = []
+    monkeypatch.setattr(builder, "_cgroup", lambda *args: effects.append("cgroup"))
+    manifest = {
+        **policy_manifest(),
+        "kind": kind,
+        "platform": "linux/amd64",
+        "run_network": "none",
+        "request": {"reference": "docker.io/library/alpine:3", "dockerfile": "FROM scratch"},
+    }
+    if mutation == "empty":
+        policy = ImageSourcePolicy()
+        manifest.update(source_policy=policy.to_dict(), source_policy_digest=policy.digest)
+    elif mutation == "digest":
+        manifest["source_policy_digest"] = sha(b"not the policy")
+    else:
+        manifest["request"]["reference"] = "docker.io/other/alpine:3"
+    with pytest.raises(ValueError, match="policy|source"):
+        builder.run_image(manifest, tmp_path)
+    assert effects == [] and not list(tmp_path.iterdir())
 
 
 def materialization(tmp_path):
@@ -288,6 +366,8 @@ import os, subprocess, sys, time
 from pathlib import Path
 from palimpsest_local import hub_image_builder as builder
 from palimpsest_local.hub_builder import _mark_builder, _save
+from palimpsest_local.image_source_policy import ImageSourcePolicy, ImageSourceRule
+policy = ImageSourcePolicy((ImageSourceRule("docker.io", "library", "alpine"),))
 job, root = map(Path, sys.argv[1:3])
 stage = sys.argv[3]
 def tool():
@@ -304,6 +384,7 @@ builder.LayerCache = CacheProbe
 _mark_builder(job, os.getppid())
 builder.run_image({'platform': 'linux/amd64', 'run_network': 'none', 'cgroup_root': str(root),
     'timeout_seconds': 300, 'max_output_bytes': 1024 * 1024, 'kind': 'registry',
+    'source_policy': policy.to_dict(), 'source_policy_digest': policy.digest,
     'registry_hosts': ['docker.io'], 'request': {'reference': 'docker.io/library/alpine:3'}}, job)
 """
     executor = subprocess.Popen([sys.executable, "-c", code, str(job), str(root), stage], start_new_session=True)
@@ -426,7 +507,7 @@ def test_buildkit_overlay_preconditions_fail_before_context_or_daemon(tmp_path, 
     monkeypatch.setattr(builder, "_command", lambda *args, **kwargs: b"overlay\n")
     monkeypatch.setattr(builder.subprocess, "Popen", lambda *args, **kwargs: pytest.fail("daemon must not start"))
     with pytest.raises(RuntimeError, match="overlayfs") as failure:
-        builder._buildkit({}, tmp_path, time.monotonic() + 10, tmp_path)
+        builder._buildkit(policy_manifest(), tmp_path, time.monotonic() + 10, tmp_path)
     assert json.loads(builder._failure_summary(failure.value, "execution"))["stage"] == "overlay_snapshotter"
     assert not list(tmp_path.iterdir())
 
@@ -448,7 +529,7 @@ def test_overlay_mount_denial_retains_errno_and_never_falls_back(tmp_path, monke
     monkeypatch.setattr(builder.subprocess, "Popen", lambda *args, **kwargs: pytest.fail("daemon must not start"))
     monkeypatch.setattr(builder.os.path, "ismount", lambda path: mount_completed)
     with pytest.raises(RuntimeError, match="native fallback prohibited") as failure:
-        builder._buildkit({}, tmp_path, time.monotonic() + 10, tmp_path)
+        builder._buildkit(policy_manifest(), tmp_path, time.monotonic() + 10, tmp_path)
     assert calls == ["findmnt", "mount"] + (["umount"] if mount_completed else [])
     assert json.loads(builder._failure_summary(failure.value, "execution")) == {
         "stage": "overlay_snapshotter",
@@ -507,7 +588,7 @@ def test_overlay_actual_command_failure_retains_private_bounded_tail_and_exit_st
     monkeypatch.setattr(builder, "_command", lambda *args, **kwargs: b"ext4\n")
     monkeypatch.setattr(builder.subprocess, "Popen", launch)
     with pytest.raises(RuntimeError, match="native fallback prohibited") as failure:
-        builder._buildkit({}, scratch, time.monotonic() + 10, logs)
+        builder._buildkit(policy_manifest(), scratch, time.monotonic() + 10, logs)
     assert not list(scratch.iterdir())
     log = logs / "overlayfs-mount.log"
     assert log.read_bytes().endswith(marker)
@@ -854,6 +935,7 @@ def test_buildkit_binds_short_private_socket_with_production_length_job_root(tmp
         monkeypatch.setattr(builder, "_require_overlayfs", lambda *args: None)
         monkeypatch.setattr(builder.subprocess, "Popen", launch)
         manifest = {
+            **policy_manifest(),
             "context": None,
             "request": {"dockerfile": "FROM scratch\n"},
             "registry_hosts": ["docker.io"],
@@ -1060,6 +1142,7 @@ def test_run_image_selects_service_profile_without_extending_absolute_deadline(
     monkeypatch.setattr(builder, "LayerCache", Cache)
     monkeypatch.setattr(builder, "materialized_result", lambda *args: {"complete": True})
     manifest = {
+        **policy_manifest(),
         "platform": "linux/amd64",
         "run_network": "none",
         "cgroup_root": str(group),
@@ -1105,6 +1188,7 @@ def test_materialized_publication_retains_original_compressed_and_conversion_pro
         tmp_path,
         1024,
         {
+            **policy_manifest(),
             "kind": "registry",
             "request": {
                 "os_family": "alpine",
@@ -1119,6 +1203,8 @@ def test_materialized_publication_retains_original_compressed_and_conversion_pro
     assert manifest["layers"][0]["source"]["conversion"] == materialized["receipt"]["results"][0]
     assert manifest["source"]["metadata"]["materialization"] == materialized["receipt"]
     assert manifest["source"]["metadata"]["image"] == materialized["image"]
+    assert manifest["source"]["metadata"]["source_policy"] == SOURCE_POLICY.to_dict()
+    assert manifest["source"]["metadata"]["source_policy_digest"] == SOURCE_POLICY.digest
     assert manifest["source"]["diff_ids"] == [item["diff_id"] for item in original_layers]
     public = public_manifest(manifest)
     assert public["metadata"] == {"purpose": "queryable"}

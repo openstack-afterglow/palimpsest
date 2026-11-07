@@ -8,6 +8,7 @@ import socket
 import subprocess
 import tempfile
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,6 +16,28 @@ from types import SimpleNamespace
 import pytest
 
 from palimpsest_local import cloud_layer_worker as worker
+from palimpsest_local.image_policy_channel import CurrentPolicyAuthority
+from palimpsest_local.image_source_policy import ImageSourcePolicy, ImageSourcePolicyError, ImageSourceRule
+
+
+def _policy():
+    return ImageSourcePolicy(
+        (
+            ImageSourceRule("docker.io", "nvidia", "cuda"),
+            ImageSourceRule("registry.example.com", "team", "image"),
+        )
+    )
+
+
+def _policy_file(tmp_path, policy=None):
+    path = tmp_path / "operator-policy.json"
+    path.write_text(json.dumps((policy if policy is not None else _policy()).to_dict()))
+    path.chmod(0o600)
+    return path
+
+
+def _commit():
+    CurrentPolicyAuthority(_policy(), _policy)("payload", time.monotonic() + 60)
 
 
 @pytest.fixture
@@ -69,7 +92,7 @@ def test_invalid_digest_is_rejected_before_any_path_access(tmp_path, digest, mon
 
     monkeypatch.setattr(Path, "lstat", unexpected)
     with pytest.raises(worker.WorkerError, match="digest"):
-        worker.publish_blob(tmp_path / "missing", digest, tmp_path / "missing-store")
+        worker.publish_blob(tmp_path / "missing", digest, tmp_path / "missing-store", before_commit=_commit)
 
 
 def test_competing_blob_writers_link_once_without_clobber(tmp_path, monkeypatch):
@@ -85,7 +108,7 @@ def test_competing_blob_writers_link_once_without_clobber(tmp_path, monkeypatch)
 
     monkeypatch.setattr(worker.os, "link", competing_link)
     with ThreadPoolExecutor(max_workers=2) as pool:
-        futures = [pool.submit(worker.publish_blob, source, digest, store) for _ in range(2)]
+        futures = [pool.submit(worker.publish_blob, source, digest, store, before_commit=_commit) for _ in range(2)]
         results = [future.result(timeout=10) for future in futures]
     assert sorted(result["published"] for result in results) == ["existing", "new"]
     assert target.read_bytes() == source.read_bytes()
@@ -107,7 +130,7 @@ def test_blob_race_preserves_a_different_winning_file(tmp_path, monkeypatch):
 
     monkeypatch.setattr(worker.os, "link", race)
     with pytest.raises(worker.WorkerError, match="differs"):
-        worker.publish_blob(source, digest, store)
+        worker.publish_blob(source, digest, store, before_commit=_commit)
     assert target.read_bytes() == b"different-writer"
     assert target.stat().st_ino == winner.stat().st_ino
     assert list((store / ".incoming").iterdir()) == []
@@ -130,7 +153,7 @@ def test_publication_rejects_nonregular_files(tmp_path, kind, location):
     else:
         os.mkfifo(path)
     with pytest.raises(worker.WorkerError, match="regular"):
-        worker.publish_blob(source, digest, store)
+        worker.publish_blob(source, digest, store, before_commit=_commit)
     assert os.path.lexists(path)
     assert referent.read_bytes() == b"verified-layer"
     assert list((store / ".incoming").iterdir()) == []
@@ -139,10 +162,10 @@ def test_publication_rejects_nonregular_files(tmp_path, kind, location):
 def test_bad_source_is_rejected_even_when_target_matches(tmp_path):
     store = _store(tmp_path)
     source, digest = _source(tmp_path)
-    worker.publish_blob(source, digest, store)
+    worker.publish_blob(source, digest, store, before_commit=_commit)
     source.write_bytes(b"wrong")
     with pytest.raises(worker.WorkerError, match="verification"):
-        worker.publish_blob(source, digest, store)
+        worker.publish_blob(source, digest, store, before_commit=_commit)
     assert (store / "blobs" / "sha256" / digest[7:]).read_bytes() == b"verified-layer"
 
 
@@ -157,7 +180,7 @@ def test_failed_publication_cleans_only_its_temporary(tmp_path, monkeypatch):
 
     monkeypatch.setattr(worker.os, "link", fail_link)
     with pytest.raises(OSError, match="publication unavailable"):
-        worker.publish_blob(source, digest, store)
+        worker.publish_blob(source, digest, store, before_commit=_commit)
     assert list((store / ".incoming").iterdir()) == [unrelated]
 
 
@@ -168,7 +191,7 @@ def test_preexisting_temporary_is_never_removed(tmp_path, monkeypatch):
     temporary.write_bytes(b"other-worker")
     monkeypatch.setattr(worker.uuid, "uuid4", lambda: type("ID", (), {"hex": "fixed"})())
     with pytest.raises(FileExistsError):
-        worker.publish_blob(source, digest, store)
+        worker.publish_blob(source, digest, store, before_commit=_commit)
     assert temporary.read_bytes() == b"other-worker"
 
 
@@ -176,10 +199,10 @@ def test_image_binding_reuse_preserves_original_timestamp_and_inode(tmp_path):
     store = _store(tmp_path)
     path = store / "images" / "example.json"
     original = _record()
-    worker._atomic_json(path, original)
+    worker._atomic_json(path, original, before_commit=_commit)
     before = path.read_bytes(), path.stat().st_ino
     repeated = {**original, "built_at_unix": 999.0}
-    assert worker._atomic_json(path, repeated) == original
+    assert worker._atomic_json(path, repeated, before_commit=_commit) == original
     assert (path.read_bytes(), path.stat().st_ino) == before
     assert path.stat().st_mode & 0o777 == 0o444
     assert list(path.parent.iterdir()) == [path]
@@ -190,12 +213,12 @@ def test_image_binding_collision_never_replaces_tag(tmp_path, field):
     store = _store(tmp_path)
     path = store / "images" / "example.json"
     original = _record()
-    worker._atomic_json(path, original)
+    worker._atomic_json(path, original, before_commit=_commit)
     before = path.read_bytes(), path.stat().st_ino
     changed = copy.deepcopy(original)
     changed[field] = {"different": True} if field != "layers" else []
     with pytest.raises(worker.WorkerError, match="immutable binding"):
-        worker._atomic_json(path, changed)
+        worker._atomic_json(path, changed, before_commit=_commit)
     assert (path.read_bytes(), path.stat().st_ino) == before
     assert list(path.parent.iterdir()) == [path]
 
@@ -214,7 +237,7 @@ def test_image_binding_race_preserves_winning_record(tmp_path, monkeypatch):
 
     monkeypatch.setattr(worker.os, "link", race)
     with pytest.raises(worker.WorkerError, match="immutable binding"):
-        worker._atomic_json(path, _record())
+        worker._atomic_json(path, _record(), before_commit=_commit)
     assert json.loads(path.read_text()) == winning_record
     assert path.stat().st_ino == winner.stat().st_ino
     assert list(path.parent.iterdir()) == [path]
@@ -233,7 +256,7 @@ def test_existing_image_record_must_be_regular(tmp_path, kind):
     else:
         os.mkfifo(path)
     with pytest.raises(worker.WorkerError, match="regular"):
-        worker._atomic_json(path, _record())
+        worker._atomic_json(path, _record(), before_commit=_commit)
     assert os.path.lexists(path)
 
 
@@ -257,7 +280,15 @@ def test_preexisting_socket_is_preserved_without_starting_process(tmp_path, monk
 
     monkeypatch.setattr(worker.subprocess, "Popen", unexpected)
     with pytest.raises(worker.WorkerHold, match="preexisting"):
-        worker._buildkit(tmp_path, tmp_path, tmp_path / "out", tmp_path / "root", tmp_path / "log", 1e20)
+        worker._buildkit(
+            tmp_path,
+            tmp_path,
+            tmp_path / "out",
+            tmp_path / "root",
+            tmp_path / "log",
+            1e20,
+            source_policy=_policy(),
+        )
     assert address.read_bytes() == b"not-owned"
 
 
@@ -296,7 +327,15 @@ def test_uncertain_shutdown_is_term_only_hold_and_preserves_socket(tmp_path, mon
     monkeypatch.setattr(worker.subprocess, "Popen", Process)
     try:
         with pytest.raises(worker.WorkerHold, match="TERM"):
-            worker._buildkit(tmp_path, tmp_path, tmp_path / "out", tmp_path / "root", tmp_path / "log", 1e20)
+            worker._buildkit(
+                tmp_path,
+                tmp_path,
+                tmp_path / "out",
+                tmp_path / "root",
+                tmp_path / "log",
+                1e20,
+                source_policy=_policy(),
+            )
         assert address.exists()
         assert (tmp_path / "buildkit.hold.json").is_file()
         assert address.with_suffix(".hold.json").is_file()
@@ -308,15 +347,17 @@ def test_uncertain_shutdown_is_term_only_hold_and_preserves_socket(tmp_path, mon
         bound.close()
 
 
-def test_build_holds_scratch_lock_through_publication_and_keeps_evidence(tmp_path, monkeypatch):
+@pytest.mark.parametrize("revoke", [False, True])
+def test_build_holds_scratch_lock_through_publication_and_keeps_evidence(tmp_path, monkeypatch, revoke):
     store = _store(tmp_path)
     scratch = tmp_path / "scratch"
     dockerfile = tmp_path / "Dockerfile"
-    dockerfile.write_text("FROM scratch\n")
+    dockerfile.write_text("FROM docker.io/nvidia/cuda:12.2.2\n")
     source, digest = _source(tmp_path)
     config_path = tmp_path / ("c" * 64)
     config_path.write_text(json.dumps({"config": {"Cmd": ["true"]}}))
     seen = []
+    current = {"policy": _policy()}
 
     def locked(stage):
         with pytest.raises(worker.WorkerHold, match="already held"):
@@ -328,7 +369,7 @@ def test_build_holds_scratch_lock_through_publication_and_keeps_evidence(tmp_pat
         locked("extract")
         context.mkdir()
 
-    def buildkit(context, definition, output, root, log, deadline):
+    def buildkit(context, definition, output, root, log, deadline, *, source_policy):
         locked("buildkit")
         output.write_bytes(b"retained OCI evidence")
         log.write_text("retained client log")
@@ -343,6 +384,8 @@ def test_build_holds_scratch_lock_through_publication_and_keeps_evidence(tmp_pat
 
         def materialize(self, digest_arg, **kwargs):
             locked("materialize")
+            if revoke:
+                current["policy"] = ImageSourcePolicy()
             return {
                 "receipt": {
                     "results": [{"receipt": {"image_digest": digest, "image_size": source.stat().st_size}}],
@@ -357,13 +400,14 @@ def test_build_holds_scratch_lock_through_publication_and_keeps_evidence(tmp_pat
     real_publish = worker.publish_blob
     real_record = worker._atomic_json
 
-    def publish(*args):
+    def publish(*args, **kwargs):
         locked("blob")
-        return real_publish(*args)
+        return real_publish(*args, **kwargs)
 
-    def record(*args):
-        locked("record")
-        return real_record(*args)
+    def record(*args, **kwargs):
+        if args[0].parent == store / "images":
+            locked("record")
+        return real_record(*args, **kwargs)
 
     monkeypatch.setattr(worker, "sys", SimpleNamespace(**{**vars(worker.sys), "platform": "linux"}))
     monkeypatch.setattr(worker.platform, "machine", lambda: "x86_64")
@@ -383,19 +427,34 @@ def test_build_holds_scratch_lock_through_publication_and_keeps_evidence(tmp_pat
     monkeypatch.setattr(worker, "LayerCache", Cache)
     monkeypatch.setattr(worker, "publish_blob", publish)
     monkeypatch.setattr(worker, "_atomic_json", record)
-    result = worker.build(
-        dockerfile=dockerfile,
-        context_tar=tmp_path / "context.tar",
-        store=store,
-        scratch=scratch,
-        name="example",
-        timeout_seconds=60,
-    )
+    arguments = {
+        "dockerfile": dockerfile,
+        "context_tar": tmp_path / "context.tar",
+        "store": store,
+        "scratch": scratch,
+        "name": "example",
+        "timeout_seconds": 60,
+        "source_policy": _policy(),
+        "publication_check": CurrentPolicyAuthority(_policy(), lambda: current["policy"]),
+    }
+    if revoke:
+        with pytest.raises(worker.WorkerHold):
+            worker.build(**arguments)
+        assert not (store / "images" / "example.json").exists()
+        assert list((store / "blobs" / "sha256").iterdir()) == []
+        assert json.loads((scratch / "intake.hold.json").read_text())["status"] == "hold"
+        evidence = next((scratch / "jobs").iterdir())
+        assert json.loads((evidence / "policy-hold.json").read_text())["status"] == "hold"
+        assert (evidence / "image.oci.tar").read_bytes() == b"retained OCI evidence"
+        return
+    result = worker.build(**arguments)
     assert seen == ["extract", "buildkit", "cache", "materialize", "blob", "record"]
     evidence = Path(result["evidence_directory"])
     assert (evidence / "image.oci.tar").read_bytes() == b"retained OCI evidence"
     assert (evidence / "buildctl.log").read_text() == "retained client log"
     assert (evidence / "buildkitd.log").read_text() == "retained daemon log"
+    assert result["source_policy_digest"] == _policy().digest
+    assert json.loads((evidence / "source-policy-snapshot.json").read_text()) == _policy().to_dict()
     with worker._exclusive_lock(scratch / "worker.lock"):
         pass
 
@@ -408,6 +467,10 @@ def test_cli_reports_hold_not_success(tmp_path, monkeypatch, capsys):
     result = worker.main(
         [
             "build",
+            "--source-policy",
+            str(_policy_file(tmp_path)),
+            "--current-source-policy",
+            str(tmp_path / "operator-policy.json"),
             "--dockerfile",
             str(tmp_path / "Dockerfile"),
             "--context-tar",
@@ -465,14 +528,14 @@ def test_confirmed_shutdown_only_removes_its_owned_socket(tmp_path, monkeypatch,
     try:
         args = (tmp_path, tmp_path, tmp_path / "out", tmp_path / "root", tmp_path / "log", 1e20)
         if outcome == "success":
-            worker._buildkit(*args)
+            worker._buildkit(*args, source_policy=_policy())
         elif outcome == "timeout":
             with pytest.raises(worker.WorkerError, match="deadline") as error:
-                worker._buildkit(*args)
+                worker._buildkit(*args, source_policy=_policy())
             assert not isinstance(error.value, worker.WorkerHold)
         else:
             with pytest.raises(worker.WorkerHold, match="ownership changed"):
-                worker._buildkit(*args)
+                worker._buildkit(*args, source_policy=_policy())
         assert all(process.stopped for process in processes)
         assert processes[0].terms == 1
         if outcome == "replaced-socket":
@@ -602,7 +665,7 @@ def registry_worker(tmp_path, monkeypatch):
         def __init__(self, root, *, initialize):
             state["events"].append(("cache", initialize))
 
-        def pull(self, selected, *, timeout_seconds):
+        def pull(self, selected, *, source_policy, timeout_seconds):
             assert selected == reference
             assert 0 < timeout_seconds <= 60
             state["events"].append(("pull", selected))
@@ -615,11 +678,13 @@ def registry_worker(tmp_path, monkeypatch):
             with pytest.raises(worker.WorkerHold, match="already held"):
                 with worker._exclusive_lock(scratch / "worker.lock"):
                     pytest.fail("intake released the scratch lock")
+            image = store / "images" / "cuda.json"
+            existing_image = image.read_bytes() if image.exists() else None
             for ordinal, receipt in enumerate(receipts):
                 if state["truncate"] and ordinal == 2:
                     break
                 state["events"].append(("convert", ordinal))
-                assert not (store / "images" / "cuda.json").exists()
+                assert (image.read_bytes() if image.exists() else None) == existing_image
                 if ordinal:
                     journal = store / "jobs" / state["job_id"]
                     previous = journal / f"layer-{ordinal - 1:06d}.json"
@@ -646,7 +711,15 @@ def registry_worker(tmp_path, monkeypatch):
                 },
             }
 
-    monkeypatch.setattr(worker, "sys", SimpleNamespace(**{**vars(worker.sys), "platform": "linux"}))
+    import sys
+
+    class LinuxWorkerSys:
+        platform = "linux"
+
+        def __getattr__(self, name):
+            return getattr(sys, name)
+
+    monkeypatch.setattr(worker, "sys", LinuxWorkerSys())
     monkeypatch.setattr(worker.platform, "machine", lambda: "x86_64")
     monkeypatch.setattr(worker.os, "geteuid", lambda: 0)
     real_fstat = worker.os.fstat
@@ -664,12 +737,15 @@ def registry_worker(tmp_path, monkeypatch):
 
 
 def _pull_registry(state, **options):
+    policy = options.pop("source_policy", _policy())
     return worker.pull(
         reference=state["reference"],
         store=state["store"],
         scratch=state["scratch"],
         name="cuda",
         timeout_seconds=60,
+        source_policy=policy,
+        publication_check=options.pop("publication_check", CurrentPolicyAuthority(policy, lambda: policy)),
         job_id=state["job_id"],
         **options,
     )
@@ -681,6 +757,10 @@ def test_registry_pull_commits_each_layer_before_next_conversion_and_deduplicate
     assert result["job_id"] == state["job_id"]
     assert result["source"]["reference"] == state["reference"]
     assert result["source"]["config"] == state["config"]
+    assert result["source_policy_digest"] == _policy().digest
+    request = json.loads((state["store"] / "jobs" / state["job_id"] / "request.json").read_text())
+    assert request["source_policy"] == _policy().to_dict()
+    assert request["source_policy_digest"] == result["source_policy_digest"]
     assert "Cmd" not in result["source"]["config"]["config"]
     assert "cmd" not in result["runtime"]
     assert result["runtime"]["entrypoint"] == ["/opt/nvidia/nvidia_entrypoint.sh"]
@@ -728,12 +808,12 @@ def test_registry_callback_publication_error_holds_and_never_converts_next(regis
     real_publish = worker.publish_blob
     calls = 0
 
-    def unavailable(*args):
+    def unavailable(*args, **kwargs):
         nonlocal calls
         calls += 1
         if calls == 2:
             raise OSError("CephFS journal/publication outcome unknown")
-        return real_publish(*args)
+        return real_publish(*args, **kwargs)
 
     monkeypatch.setattr(worker, "publish_blob", unavailable)
     with pytest.raises(worker.WorkerHold, match="requires review"):
@@ -758,7 +838,7 @@ def test_registry_final_sequence_mismatch_has_no_image_success(registry_worker):
 def test_existing_blob_hit_verifies_source_without_ceph_copy(tmp_path, monkeypatch):
     store = _store(tmp_path)
     source, digest = _source(tmp_path)
-    worker.publish_blob(source, digest, store)
+    worker.publish_blob(source, digest, store, before_commit=_commit)
     target = store / "blobs" / "sha256" / digest[7:]
     before = target.stat().st_ino
 
@@ -766,11 +846,11 @@ def test_existing_blob_hit_verifies_source_without_ceph_copy(tmp_path, monkeypat
         pytest.fail("existing blob hit copied data into CephFS")
 
     monkeypatch.setattr(worker.shutil, "copyfileobj", no_copy)
-    assert worker.publish_blob(source, digest, store)["published"] == "existing"
+    assert worker.publish_blob(source, digest, store, before_commit=_commit)["published"] == "existing"
     assert target.stat().st_ino == before
     source.write_bytes(b"bad source")
     with pytest.raises(worker.WorkerError, match="verification"):
-        worker.publish_blob(source, digest, store)
+        worker.publish_blob(source, digest, store, before_commit=_commit)
     assert list((store / ".incoming").iterdir()) == []
 
 
@@ -796,47 +876,53 @@ def test_pull_rejects_nonexplicit_or_mutable_pins_before_worker_access(tmp_path,
     monkeypatch.setattr(worker.platform, "machine", lambda: "x86_64")
     monkeypatch.setattr(worker.os, "geteuid", lambda: 0)
     with pytest.raises(worker.WorkerError, match="digest|fully qualified"):
-        worker.pull(reference=reference, store=tmp_path, scratch=tmp_path, name="cuda", timeout_seconds=60)
-
-
-def test_pull_cli_passes_reference_job_and_shared_options(tmp_path, monkeypatch, capsys):
-    seen = {}
-
-    def intake(**kwargs):
-        seen.update(kwargs)
-        return {"name": kwargs["name"], "job_id": kwargs["job_id"]}
-
-    monkeypatch.setattr(worker, "pull", intake)
-    reference = "docker.io/nvidia/cuda@sha256:" + "a" * 64
-    assert (
-        worker.main(
-            [
-                "pull",
-                "--reference",
-                reference,
-                "--job-id",
-                "b" * 32,
-                "--store",
-                str(tmp_path / "store"),
-                "--scratch",
-                str(tmp_path / "scratch"),
-                "--name",
-                "cuda",
-                "--timeout",
-                "120",
-            ]
+        worker.pull(
+            reference=reference,
+            store=tmp_path,
+            scratch=tmp_path,
+            name="cuda",
+            timeout_seconds=60,
+            source_policy=_policy(),
+            publication_check=CurrentPolicyAuthority(_policy(), _policy),
         )
-        == 0
+
+
+@pytest.mark.parametrize(
+    "policy", [ImageSourcePolicy(), ImageSourcePolicy((ImageSourceRule("docker.io", "foreign", "cuda"),))]
+)
+def test_pull_cli_denies_unapproved_source_without_worker_effects(tmp_path, monkeypatch, capsys, policy):
+    def unexpected(*args, **kwargs):
+        pytest.fail("denied source reached worker storage or acquisition")
+
+    monkeypatch.setattr(worker, "require_ceph_store", unexpected)
+    monkeypatch.setattr(worker, "LayerCache", unexpected)
+    store, scratch = tmp_path / "store", tmp_path / "scratch"
+    result = worker.main(
+        [
+            "pull",
+            "--reference",
+            "docker.io/nvidia/cuda@sha256:" + "a" * 64,
+            "--source-policy",
+            str(_policy_file(tmp_path, policy)),
+            "--current-source-policy",
+            str(tmp_path / "operator-policy.json"),
+            "--job-id",
+            "b" * 32,
+            "--store",
+            str(store),
+            "--scratch",
+            str(scratch),
+            "--name",
+            "cuda",
+        ]
     )
-    assert seen == {
-        "reference": reference,
-        "job_id": "b" * 32,
-        "store": tmp_path / "store",
-        "scratch": tmp_path / "scratch",
-        "name": "cuda",
-        "timeout_seconds": 120,
-    }
-    assert json.loads(capsys.readouterr().out)["status"] == "success"
+    assert result == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    failure = json.loads(captured.err)
+    assert failure["status"] == "failed"
+    assert "ImageSourcePolicyError" in failure["error"]
+    assert not store.exists() and not scratch.exists()
 
 
 def test_registry_worker_real_cache_callback_binds_graph_not_manifest(tmp_path, monkeypatch):
@@ -888,6 +974,7 @@ def test_registry_worker_real_cache_callback_binds_graph_not_manifest(tmp_path, 
         occurrence = DerivedLayerOccurrence.from_image(snapshot, ordinal)
         key = DerivedSquashFSKey.for_occurrence(
             occurrence,
+            parent_chain_digest=layer_cache.parent_chain_digest(snapshot, ordinal),
             intake_policy_id=layer_cache.LAYER_INTAKE_POLICY_ID,
             intake_policy_fingerprint=layer_cache.DEFAULT_LAYER_CONVERSION_LIMITS.fingerprint,
             pack_policy_id=layer_cache.SQUASHFS_PACK_POLICY_ID,
@@ -946,6 +1033,8 @@ def test_registry_worker_real_cache_callback_binds_graph_not_manifest(tmp_path, 
         name="real-cache",
         timeout_seconds=60,
         job_id=job_id,
+        source_policy=_policy(),
+        publication_check=CurrentPolicyAuthority(_policy(), _policy),
     )
     assert events == ["registry", 0, 1]
     assert result["source"]["root_digest"] == pin
@@ -958,26 +1047,67 @@ def test_registry_worker_real_cache_callback_binds_graph_not_manifest(tmp_path, 
     assert not (scratch / "intake.hold.json").exists()
 
 
+@pytest.mark.parametrize(
+    "policy",
+    [
+        ImageSourcePolicy(),
+        ImageSourcePolicy((ImageSourceRule("docker.io", "foreign", "cuda"),)),
+    ],
+)
+def test_build_denied_image_never_starts_worker_recipe(tmp_path, monkeypatch, policy):
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text("FROM docker.io/nvidia/cuda:12.2.2\nRUN true\n")
+    monkeypatch.setattr(worker, "sys", SimpleNamespace(**{**vars(worker.sys), "platform": "linux"}))
+    monkeypatch.setattr(worker.platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(worker.os, "geteuid", lambda: 0)
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("denied image started a worker recipe or accessed the Ceph store")
+
+    monkeypatch.setattr(worker, "require_ceph_store", unexpected)
+    monkeypatch.setattr(worker, "_buildkit", unexpected)
+    monkeypatch.setattr(worker.subprocess, "Popen", unexpected)
+    scratch, store = tmp_path / "scratch", tmp_path / "store"
+    with pytest.raises(ImageSourcePolicyError):
+        worker.build(
+            dockerfile=dockerfile,
+            context_tar=tmp_path / "context.tar",
+            store=store,
+            scratch=scratch,
+            name="denied",
+            timeout_seconds=60,
+            source_policy=policy,
+            publication_check=CurrentPolicyAuthority(policy, lambda: policy),
+        )
+    assert not scratch.exists() and not store.exists()
+
+
 def test_registry_publication_consumes_original_deadline_without_image_success(registry_worker, monkeypatch):
     from types import SimpleNamespace
+
+    from palimpsest_local import image_policy_channel
 
     state = registry_worker
     clock = SimpleNamespace(now=0.0)
     monkeypatch.setattr(worker, "time", SimpleNamespace(monotonic=lambda: clock.now, time=lambda: 100.0))
+    monkeypatch.setattr(image_policy_channel, "time", worker.time)
     real_publish = worker.publish_blob
 
-    def slow_publish(*args):
-        result = real_publish(*args)
+    def slow_publish(*args, **kwargs):
+        result = real_publish(*args, **kwargs)
         clock.now = 61.0
         return result
 
     monkeypatch.setattr(worker, "publish_blob", slow_publish)
-    with pytest.raises(worker.WorkerError, match="deadline expired"):
+    with pytest.raises(worker.WorkerHold):
         _pull_registry(state)
     assert ("convert", 1) not in state["events"]
     journal = state["store"] / "jobs" / state["job_id"]
-    assert (journal / "layer-000000.json").exists()
-    assert json.loads((journal / "failure.json").read_text())["completed_layers"] == 1
+    assert not (journal / "layer-000000.json").exists()
+    assert json.loads((journal / "failure.json").read_text())["completed_layers"] == 0
+    assert len(list((state["store"] / "blobs" / "sha256").iterdir())) == 1
+    assert clock.now == 61.0
+    assert "receipt:0" in json.loads((journal / "failure.json").read_text())["error"]
     assert not (state["store"] / "images" / "cuda.json").exists()
 
 
@@ -1020,3 +1150,230 @@ def test_deterministic_acquisition_failure_does_not_quarantine_worker(registry_w
     assert json.loads((journal / "failure.json").read_text())["status"] == "failed"
     assert ("convert", 0) not in state["events"]
     assert not (state["store"] / "images" / "cuda.json").exists()
+
+
+def test_policy_snapshot_binds_job_not_immutable_image_content(registry_worker):
+    state = registry_worker
+    first = _pull_registry(state)
+    image = state["store"] / "images" / "cuda.json"
+    binding = image.read_bytes()
+    broader = ImageSourcePolicy((*_policy().rules, ImageSourceRule("docker.io", "pytorch", "pytorch")))
+    state["job_id"] = "b" * 32
+    second = _pull_registry(state, source_policy=broader)
+    assert image.read_bytes() == binding
+    assert second["source"] == first["source"] and second["layers"] == first["layers"]
+    assert first["source_policy_digest"] == _policy().digest
+    assert second["source_policy_digest"] == broader.digest
+    receipt = json.loads((state["store"] / "jobs" / state["job_id"] / "receipt.json").read_text())
+    assert receipt["source_policy"] == broader.to_dict()
+    assert receipt["source_policy_digest"] == broader.digest
+    assert receipt["source"] == second["source"]
+
+
+def test_pull_cli_admitted_policy_completes_original_source_publication(registry_worker, capsys):
+    state = registry_worker
+    result = worker.main(
+        [
+            "pull",
+            "--reference",
+            state["reference"],
+            "--source-policy",
+            str(_policy_file(state["scratch"].parent)),
+            "--current-source-policy",
+            str(state["scratch"].parent / "operator-policy.json"),
+            "--job-id",
+            state["job_id"],
+            "--store",
+            str(state["store"]),
+            "--scratch",
+            str(state["scratch"]),
+            "--name",
+            "cuda",
+            "--timeout",
+            "60",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert result == 0 and captured.err == ""
+    receipt = json.loads(captured.out)
+    assert receipt["source_policy"] == _policy().to_dict()
+    assert receipt["source_policy_digest"] == _policy().digest
+    assert receipt["source"]["reference"] == state["reference"]
+    assert receipt["source"]["config"] == state["config"]
+    assert len(receipt["layers"]) == len(state["imported"]["image"]["layers"])
+    assert json.loads((state["store"] / "images" / "cuda.json").read_text())["layers"] == receipt["layers"]
+
+
+@pytest.mark.parametrize("revoke_before", [0, 1])
+def test_current_policy_revocation_holds_before_next_layer_and_preserves_prefix(
+    registry_worker,
+    monkeypatch,
+    revoke_before,
+):
+    state = registry_worker
+    current = {"policy": _policy() if revoke_before else ImageSourcePolicy()}
+    real_json = worker._atomic_json
+
+    def record(path, value, **kwargs):
+        result = real_json(path, value, **kwargs)
+        if path.name == "layer-000000.json":
+            current["policy"] = ImageSourcePolicy()
+        return result
+
+    monkeypatch.setattr(worker, "_atomic_json", record)
+    authority = CurrentPolicyAuthority(_policy(), lambda: current["policy"])
+    with pytest.raises(worker.WorkerHold):
+        _pull_registry(state, publication_check=authority)
+    journal = state["store"] / "jobs" / state["job_id"]
+    failure = json.loads((journal / "failure.json").read_text())
+    assert failure["status"] == "hold"
+    assert failure["completed_layers"] == revoke_before
+    assert (journal / "layer-000000.json").exists() is bool(revoke_before)
+    assert not (journal / "layer-000001.json").exists()
+    assert not (state["store"] / "images" / "cuda.json").exists()
+    assert len(list((state["store"] / "blobs" / "sha256").iterdir())) == revoke_before
+    current["policy"] = _policy()
+    state["job_id"] = "c" * 32
+    with pytest.raises(worker.WorkerHold):
+        _pull_registry(state, publication_check=authority)
+    assert not (state["store"] / "jobs" / state["job_id"]).exists()
+
+
+@pytest.mark.parametrize(
+    "authority",
+    [
+        None,
+        lambda stage, deadline: None,
+        CurrentPolicyAuthority(ImageSourcePolicy(), ImageSourcePolicy),
+    ],
+)
+def test_unbound_or_mismatched_authority_is_rejected_before_acquisition(registry_worker, authority):
+    state = registry_worker
+    with pytest.raises(ImageSourcePolicyError):
+        _pull_registry(state, publication_check=authority)
+    assert not state["scratch"].exists()
+    assert not (state["store"] / "jobs").exists()
+    assert not (state["store"] / "images" / "cuda.json").exists()
+    assert list((state["store"] / "blobs" / "sha256").iterdir()) == []
+    assert not any(event[0] in {"pull", "convert"} for event in state["events"])
+
+
+def test_build_rejects_mismatched_authority_before_recipe_or_store_effects(registry_worker):
+    state = registry_worker
+    with pytest.raises(ImageSourcePolicyError):
+        worker.build(
+            dockerfile=state["scratch"].parent / "missing-Dockerfile",
+            context_tar=state["scratch"].parent / "missing-context.tar",
+            store=state["store"],
+            scratch=state["scratch"],
+            name="cuda",
+            timeout_seconds=60,
+            source_policy=_policy(),
+            publication_check=CurrentPolicyAuthority(ImageSourcePolicy(), ImageSourcePolicy),
+        )
+    assert not state["scratch"].exists()
+    assert list((state["store"] / "blobs" / "sha256").iterdir()) == []
+
+
+@pytest.mark.parametrize("kind", ["payload", "image"])
+def test_revocation_during_staging_prevents_final_immutable_commit(tmp_path, monkeypatch, kind):
+    from palimpsest_local.image_policy_channel import PolicyPublicationHold
+
+    store = _store(tmp_path)
+    current = {"policy": _policy()}
+    authority = CurrentPolicyAuthority(_policy(), lambda: current["policy"])
+
+    def checkpoint():
+        authority(kind, time.monotonic() + 60)
+
+    if kind == "payload":
+        source, digest = _source(tmp_path)
+        original = worker.shutil.copyfileobj
+
+        def stage(*args, **kwargs):
+            original(*args, **kwargs)
+            current["policy"] = ImageSourcePolicy()
+
+        monkeypatch.setattr(worker.shutil, "copyfileobj", stage)
+        with pytest.raises(PolicyPublicationHold):
+            worker.publish_blob(source, digest, store, before_commit=checkpoint)
+        assert list((store / "blobs" / "sha256").iterdir()) == []
+        assert list((store / ".incoming").iterdir()) == []
+    else:
+        original = worker.json.dump
+
+        def stage(*args, **kwargs):
+            original(*args, **kwargs)
+            current["policy"] = ImageSourcePolicy()
+
+        monkeypatch.setattr(worker.json, "dump", stage)
+        with pytest.raises(PolicyPublicationHold):
+            worker._atomic_json(store / "images" / "example.json", _record(), before_commit=checkpoint)
+        assert list((store / "images").iterdir()) == []
+
+
+def test_standalone_cli_requires_authority_beyond_job_snapshot(tmp_path):
+    with pytest.raises(SystemExit) as error:
+        worker.main(
+            [
+                "pull",
+                "--reference",
+                "docker.io/nvidia/cuda@sha256:" + "a" * 64,
+                "--source-policy",
+                str(_policy_file(tmp_path)),
+                "--store",
+                str(tmp_path / "store"),
+                "--scratch",
+                str(tmp_path / "scratch"),
+                "--name",
+                "cuda",
+            ]
+        )
+    assert error.value.code == 2
+    assert not (tmp_path / "scratch").exists() and not (tmp_path / "store").exists()
+
+
+def test_standalone_cli_reloads_explicit_operator_file_before_publication(registry_worker, monkeypatch, capfd):
+    state = registry_worker
+    snapshot = _policy_file(state["scratch"].parent)
+    current = snapshot.with_name("current-policy.json")
+    current.write_bytes(snapshot.read_bytes())
+    current.chmod(0o600)
+    original = worker._atomic_json
+
+    def record(path, value, **kwargs):
+        result = original(path, value, **kwargs)
+        if path.name == "source.json":
+            current.write_text(json.dumps(ImageSourcePolicy().to_dict()))
+        return result
+
+    monkeypatch.setattr(worker, "_atomic_json", record)
+    code = worker.main(
+        [
+            "pull",
+            "--reference",
+            state["reference"],
+            "--source-policy",
+            str(snapshot),
+            "--current-source-policy",
+            str(current),
+            "--job-id",
+            state["job_id"],
+            "--store",
+            str(state["store"]),
+            "--scratch",
+            str(state["scratch"]),
+            "--name",
+            "cuda",
+            "--timeout",
+            "60",
+        ]
+    )
+    output = capfd.readouterr()
+    assert code == 1 and output.out == ""
+    assert json.loads(output.err)["status"] == "hold"
+    assert json.loads(snapshot.read_text()) == _policy().to_dict()
+    assert list((state["store"] / "blobs" / "sha256").iterdir()) == []
+    assert not (state["store"] / "images" / "cuda.json").exists()
+    failure = json.loads((state["store"] / "jobs" / state["job_id"] / "failure.json").read_text())
+    assert failure["status"] == "hold" and failure["completed_layers"] == 0

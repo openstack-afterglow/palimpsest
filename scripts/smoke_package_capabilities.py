@@ -1445,6 +1445,7 @@ class Smoke:
             "owner": {"id": secrets.token_hex(32), "project": project_a},
             "inventory": {"id": secrets.token_hex(16), "project": project_a},
             "writer": {"id": secrets.token_hex(16), "project": project_a},
+            "member": {"id": secrets.token_hex(16), "project": project_a},
             "tenant_admin": {"id": secrets.token_hex(16), "project": project_a},
             "system_admin": {"id": secrets.token_hex(16), "project": project_a},
             "protected": {"id": secrets.token_hex(16), "project": project_a},
@@ -1453,14 +1454,15 @@ class Smoke:
             **{role: {"id": secrets.token_hex(16), "project": project_a} for role in LEGACY_ROLES},
         }
         assignments = {
-            "owner": ["member"],
+            "owner": ["manager"],
             "inventory": ["reader"],
-            "writer": ["project_member"],
+            "writer": ["project_manager"],
+            "member": ["project_member"],
             "tenant_admin": ["admin"],
             "system_admin": ["member"],
             "protected": ["member"],
             "service_member": ["member"],
-            "foreign": ["member"],
+            "foreign": ["manager"],
             **{role: [role] for role in LEGACY_ROLES},
         }
         validator = {"id": secrets.token_hex(16), "name": "palimpsest-smoke-validator", "password": validator_password}
@@ -1571,6 +1573,8 @@ class Smoke:
             "PALIMPSEST_HUB_PACKAGE_FORBIDDEN_USER_IDS": json.dumps([self.users["protected"]["id"]]),
             "PALIMPSEST_HUB_PACKAGE_NAMESPACE_BINDINGS": "{}",
             "PALIMPSEST_HUB_PACKAGE_PUBLIC_ORIGIN": PUBLIC_ORIGIN,
+            # Admission-only synthetic worker credential; no executor is started.
+            "PALIMPSEST_HUB_BUILD_WORKER_KEY": self.secrets.add(secrets.token_urlsafe(32)),
         }
         self.hub_env = self.env_file(workdir, "hub.env", hub_values)
         probe_env = self.env_file(
@@ -1633,6 +1637,7 @@ class Smoke:
         owner = self.mint("owner")
         inventory = self.mint("inventory")
         writer = self.mint("writer")
+        member = self.mint("member")
         tenant_admin = self.mint("tenant_admin")
         system_admin = self.mint("system_admin")
         protected = self.mint("protected")
@@ -1691,6 +1696,26 @@ class Smoke:
         )
         namespace = registered.json()["namespace"]
         base = f"/v1/projects/{namespace}"
+        read_actions = {"packages:inventory", "packages:read", "cache:read", "keys:list", "keys:revoke_own"}
+        write_actions = read_actions | {"packages:write", "cache:write", "packages:manage_own"}
+        manage_actions = write_actions | {"packages:delete", "packages:manage", "keys:issue", "keys:revoke"}
+        for label, token, expected in (
+            ("inventory", inventory, read_actions),
+            ("member", member, write_actions),
+            ("owner", owner, manage_actions),
+            ("tenant_admin", tenant_admin, manage_actions),
+        ):
+            self.http(
+                f"{label} has exactly its native project tier",
+                label,
+                "GET",
+                "/v1/policy/capabilities",
+                expect=200,
+                auth=token,
+                validate=lambda r, expected=expected: ensure(
+                    set(r.json()["actions"]) == expected, "project tier mismatch", r.json()
+                ),
+            )
         self.http(
             "namespace registration is idempotent",
             "owner",
@@ -1754,25 +1779,24 @@ class Smoke:
                 auth=legacy_token,
             )
             self.assignment(False, role, "member")
-        # Existing roles remain intact: a legitimate native inference can grant core authority.
-        self.control("edge", prior="palimpsest_editor", implied="member", present=True)
-        inferred_member = self.mint("palimpsest_editor")
+        # Project aliases work only through real native implication edges.
+        self.control("edge", prior="project_member", implied="member", present=False)
         self.http(
-            "native graph inference from retained role grants member access",
-            "palimpsest_editor",
-            "GET",
-            base + "/packages",
-            expect=200,
-            auth=inferred_member,
-        )
-        self.control("edge", prior="palimpsest_editor", implied="member", present=False)
-        self.http(
-            "removed native inference attenuates retained token",
-            "palimpsest_editor",
+            "project alias without native implication loses member access",
+            "member",
             "GET",
             base + "/packages",
             expect=403,
-            auth=inferred_member,
+            auth=member,
+        )
+        self.control("edge", prior="project_member", implied="member", present=True)
+        self.http(
+            "restored native implication restores retained member access",
+            "member",
+            "GET",
+            base + "/packages",
+            expect=200,
+            auth=member,
         )
         for label, token in (
             ("system_admin", system_admin),
@@ -1856,8 +1880,19 @@ class Smoke:
         writer_secret, _ = issue(
             "writer", writer, "write-no-read", ["packages:inventory", "packages:write"], ["smoke/writer", "smoke/app"]
         )
-        issue("writer", writer, "member-read", ["packages:read"], ["smoke/writer"])
+        issue("writer", writer, "manager-read", ["packages:read"], ["smoke/writer"])
         issue("inventory", inventory, "no-key-authority", ["packages:inventory"], ["smoke/app"], expect=403)
+        issue("member", member, "member-no-key-authority", ["packages:read"], ["smoke/app"], expect=403)
+        for label, token in (("inventory", inventory), ("member", member)):
+            self.http(
+                f"{label} lists only its own key metadata",
+                label,
+                "GET",
+                base + "/keys",
+                expect=200,
+                auth=token,
+                validate=lambda r: ensure(not r.json()["items"], "another owner's key metadata leaked"),
+            )
         sub, writer_key = bearer(sub_secret), bearer(writer_secret)
         self.http(
             "key metadata never returns secrets",
@@ -1960,6 +1995,35 @@ class Smoke:
         )
 
         version = f"{base}/versions/{root}"
+        self.http(
+            "member cannot delete published project package",
+            "member",
+            "DELETE",
+            base + "/package",
+            expect=403,
+            auth=member,
+            params=app,
+        )
+        member_upload = self.http(
+            "member creates its own upload without manager authority",
+            "member",
+            "POST",
+            base + "/uploads",
+            expect=201,
+            auth=member,
+            params=app,
+            json_body=body(pending_archive, pending_root, "member-proof"),
+            require=True,
+        )
+        self.http(
+            "member cancels only its exact own upload as create/edit",
+            "member",
+            "DELETE",
+            base + "/uploads/" + member_upload.json()["upload_id"],
+            expect=204,
+            auth=member,
+            params=app,
+        )
         self.http(
             "version metadata names the exact graph",
             "key:full",
@@ -2195,12 +2259,20 @@ class Smoke:
         revocable = bearer(revoke_secret)
         self.http("revocable key authenticates", "key:revocable", "GET", "/v1/auth/me", expect=200, auth=revocable)
         self.http(
-            "member cannot revoke another user's key",
+            "manager cannot revoke another user's key",
             "writer",
             "DELETE",
             f"{base}/keys/{revoke_id}",
             expect=404,
             auth=writer,
+        )
+        self.http(
+            "member cannot revoke another owner's key",
+            "member",
+            "DELETE",
+            f"{base}/keys/{revoke_id}",
+            expect=404,
+            auth=member,
         )
         self.http("owner revokes own key", "owner", "DELETE", f"{base}/keys/{revoke_id}", expect=204, auth=owner)
         self.http("revoked key is rejected", "key:revocable", "GET", "/v1/auth/me", expect=401, auth=revocable)
@@ -2433,6 +2505,31 @@ class Smoke:
         )
         ticket("foreign", foreign, expect=404)
         self.http("foreign project cannot read export", "foreign", "GET", export_path, expect=404, auth=foreign)
+        self.http("reader cannot delete export", "inventory", "DELETE", export_path, expect=403, auth=inventory)
+        self.http("member cannot delete export", "member", "DELETE", export_path, expect=403, auth=member)
+        self.http("foreign manager cannot delete export", "foreign", "DELETE", export_path, expect=404, auth=foreign)
+        disposable_export = self.run_once(
+            "seed-export-delete",
+            self.names["derived_image"],
+            "python",
+            SCRIPT_IN_CONTAINER,
+            "seed-export",
+            "--project",
+            project,
+            "--user",
+            self.users["owner"]["id"],
+            "--label",
+            f"{self.run_id}:export-delete",
+            "--size",
+            "1024",
+            env_file=self.hub_env,
+        )
+        disposable_export_id = json.loads(disposable_export.stdout.decode().strip().splitlines()[-1])["export_id"]
+        disposable_export_path = f"/v1/image-exports/{disposable_export_id}"
+        self.http(
+            "manager deletes exact project export", "owner", "DELETE", disposable_export_path, expect=204, auth=owner
+        )
+        self.http("deleted export is no longer visible", "owner", "GET", disposable_export_path, expect=404, auth=owner)
         missing = "/v1/image-exports/11111111-1111-1111-1111-111111111111/download-token"
         self.http(
             "missing export ticket is 404 for download authority", "owner", "POST", missing, expect=404, auth=owner
@@ -2446,9 +2543,39 @@ class Smoke:
             auth=inventory,
         )
 
-        # Project builds use native read/write roles; worker execution stays unconfigured.
-        build = {"name": "smoke-build", "recipe": "RUN true", "base_digest": legacy_digest}
-        self.http("member lists project builds", "owner", "GET", "/v1/builds", expect=200, auth=owner)
+        # Real registered build admission against an unbooted synthetic raw fixture.
+        # No build worker runs: queued admission is not guest/build execution proof.
+        build_base = synthetic_bytes(f"{self.run_id}:build-admission-base", 1024)
+        build_session, build_half = legacy_upload("owner", build_base, "build-admission-base", require=True)
+        self.http(
+            "synthetic raw build input receives remaining bytes",
+            "owner",
+            "PATCH",
+            build_session,
+            expect=200,
+            auth=owner,
+            headers={"Upload-Offset": str(build_half)},
+            body=build_base[build_half:],
+            require=True,
+        )
+        self.http(
+            "register admission-only raw input metadata",
+            "owner",
+            "PUT",
+            build_session,
+            expect=200,
+            auth=owner,
+            headers={"Upload-Offset": str(len(build_base))},
+            json_body={
+                "name": "smoke-admission-only-not-boot-qualified",
+                "kind": "cloud-image",
+                "disk_format": "raw",
+                "arch": "x86_64",
+            },
+            require=True,
+        )
+        build = {"name": "smoke-build", "recipe": "RUN true", "base_digest": sha256_digest(build_base)}
+        self.http("member lists project builds", "member", "GET", "/v1/builds", expect=200, auth=member)
         self.http("reader lists project builds", "inventory", "GET", "/v1/builds", expect=200, auth=inventory)
         self.http(
             "reader cannot create project build",
@@ -2460,20 +2587,21 @@ class Smoke:
             json_body=build,
         )
         self.http(
-            "member passes project build auth; worker unconfigured",
-            "owner",
+            "member admits a queued project build",
+            "member",
             "POST",
             "/v1/builds",
-            expect=503,
-            auth=owner,
+            expect=202,
+            auth=member,
             json_body=build,
+            validate=lambda r: ensure(r.json()["status"] == "queued", "build was not admitted"),
         )
         self.http(
-            "tenant admin passes project build auth; worker unconfigured",
+            "tenant admin admits a queued project build",
             "tenant_admin",
             "POST",
             "/v1/builds",
-            expect=503,
+            expect=202,
             auth=tenant_admin,
             json_body=build,
         )
@@ -2488,20 +2616,21 @@ class Smoke:
         )
         self.http("system admin lists builds", "system_admin", "GET", "/v1/builds", expect=200, auth=system_admin)
         self.http(
-            "system admin passes build auth; builder unconfigured",
+            "system admin admits a queued build",
             "system_admin",
             "POST",
             "/v1/builds",
-            expect=503,
+            expect=202,
             auth=system_admin,
             json_body=build,
         )
         gc_path = f"/v1/layers/{sha256_digest(gc_payload)}"
         self.http("reader role cannot GC layer", "inventory", "DELETE", gc_path, expect=403, auth=inventory)
         self.http("package key cannot GC layer", "key:full", "DELETE", gc_path, expect=401, auth=full)
-        self.http("foreign member cannot delete project layer", "foreign", "DELETE", gc_path, expect=404, auth=foreign)
+        self.http("foreign manager cannot delete project layer", "foreign", "DELETE", gc_path, expect=404, auth=foreign)
+        self.http("member cannot delete project layer", "member", "DELETE", gc_path, expect=403, auth=member)
         self.http(
-            "member deletes its own project-visible proof layer", "owner", "DELETE", gc_path, expect=204, auth=owner
+            "manager deletes its own project-visible proof layer", "owner", "DELETE", gc_path, expect=204, auth=owner
         )
         self.http("GC'd proof layer is gone", "owner", "GET", gc_path, expect=404, auth=owner)
         self.http("retained legacy layer survives GC", "owner", "GET", layer_path, expect=200, auth=owner)
@@ -2573,8 +2702,11 @@ class Smoke:
                 headers={**octet, "Upload-Offset": "0"},
                 body=pending_archive,
             )
+        reader_revoke_secret, reader_revoke_id = issue(
+            "owner", owner, "reader-self-revoke", ["packages:inventory"], ["smoke/app"]
+        )
         pre_ticket = ticket("owner (pre-downgrade)", owner)
-        self.assignment(False, "owner", "member")
+        self.assignment(False, "owner", "manager")
         self.assignment(True, "owner", "reader")
         if pre_ticket:
             self.http(
@@ -2628,12 +2760,20 @@ class Smoke:
             json_body={"name": "late", "scope": {"packages": ["smoke/app"]}, "actions": ["packages:inventory"]},
         )
         self.http(
-            "downgrade: retained token cannot revoke keys",
+            "reader downgrade: original token revokes its own previously issued key",
             "owner",
             "DELETE",
-            f"{base}/keys/{full_id}",
-            expect=403,
+            f"{base}/keys/{reader_revoke_id}",
+            expect=204,
             auth=owner,
+        )
+        self.http(
+            "self-revoked key cannot authenticate",
+            "key:reader-self-revoke",
+            "GET",
+            "/v1/auth/me",
+            expect=401,
+            auth=bearer(reader_revoke_secret),
         )
         self.http(
             "reader downgrade: retained token keeps legacy download",
@@ -2692,7 +2832,7 @@ class Smoke:
         )
         ticket("owner (legacy-only downgrade)", owner, expect=403)
         self.assignment(False, "owner", "palimpsest_admin")
-        self.assignment(True, "owner", "member")
+        self.assignment(True, "owner", "manager")
         self.http(
             "restored assignment: key downloads again",
             "key:full",
@@ -2715,7 +2855,7 @@ class Smoke:
             )
         if pending:
             self.http(
-                "restored assignment: pending upload aborted",
+                "restored manager owner: key aborts its exact own upload",
                 "key:full",
                 "DELETE",
                 pending,
@@ -2832,6 +2972,20 @@ class Smoke:
             auth=inventory,
             params=app,
             json_body=body(pending_archive, pending_root, "v3"),
+        )
+        self.set_policy({"packages:delete": "@", "packages:manage": "@", "keys:issue": "@", "keys:revoke": "@"})
+        self.http(
+            "permissive policy cannot uplift member into management",
+            "member",
+            "GET",
+            "/v1/policy/capabilities",
+            expect=200,
+            auth=member,
+            validate=lambda r: ensure(
+                not {"packages:delete", "packages:manage", "keys:issue", "keys:revoke"} & set(r.json()["actions"]),
+                "member management ceiling was bypassed",
+                r.json(),
+            ),
         )
         self.set_policy({})
 

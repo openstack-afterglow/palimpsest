@@ -8,7 +8,13 @@ from uuid import UUID
 from fastapi import APIRouter, BackgroundTasks, Depends, Query
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from palimpsest_hub.api.hub import _factory_or_503, _legacy_inventory, _legacy_writer, _store_or_503
+from palimpsest_hub.api.hub import (
+    _factory_or_503,
+    _instance_controller,
+    _legacy_inventory,
+    _legacy_writer,
+    _store_or_503,
+)
 from palimpsest_hub.auth import get_os_conn
 from palimpsest_hub.config import get_settings
 from palimpsest_hub.services import native_instances as service
@@ -69,7 +75,7 @@ async def get(instance_id: UUID, actor: dict = Depends(_legacy_inventory)):
 async def delete(
     instance_id: UUID,
     background: BackgroundTasks,
-    actor: dict = Depends(_legacy_writer),
+    actor: dict = Depends(_instance_controller),
     conn=Depends(get_os_conn),
 ):
     return await service.delete(

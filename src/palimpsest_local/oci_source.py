@@ -284,7 +284,30 @@ def _open_child_directory(parent_fd: int, name: str, checkpoint: Checkpoint) -> 
         _close_noerror(child_fd)
 
 
-def _read_stable_regular_file(parent_fd: int, name: str, *, max_bytes: int) -> bytes:
+@dataclass(slots=True)
+class _AcquisitionBudget:
+    """Bound logical intake bytes independently of decompressed occurrences.
+
+    Layout intake charges the marker, top index and each distinct selected blob
+    once, even when the CAS already contains it.  A pinned top index is the same
+    input as index.json, not another blob.  Unselected layout files are not read
+    or copied.  Archive intake additionally bounds the entire plain-tar carrier
+    (including unused blobs, headers and padding) and all staged member payloads.
+    Staging and CAS promotion are separate bounded passes, not additive charges.
+    """
+
+    maximum_bytes: int
+    consumed_bytes: int = 0
+
+    def charge(self, size: int) -> None:
+        if size > self.maximum_bytes - self.consumed_bytes:
+            raise ArtifactValidationError("OCI input bytes exceed acquisition size limit")
+        self.consumed_bytes += size
+
+
+def _read_stable_regular_file(
+    parent_fd: int, name: str, *, max_bytes: int, _budget: _AcquisitionBudget | None = None
+) -> bytes:
     file_fd: int | None = None
     try:
         try:
@@ -302,6 +325,8 @@ def _read_stable_regular_file(parent_fd: int, name: str, *, max_bytes: int) -> b
             or opened_before.st_size > max_bytes
         ):
             raise ArtifactValidationError(f"OCI layout file {name!r} is unsafe or too large")
+        if _budget is not None:
+            _budget.charge(opened_before.st_size)
         payload = bytearray()
         while True:
             try:
@@ -532,7 +557,7 @@ class SnapshottedOCIImage(_SnapshottedGraph):
 
 @dataclass(frozen=True, slots=True)
 class SnapshottedOCIArchive(_SnapshottedGraph):
-    """Acquisition receipt, distinct from the native materialization input."""
+    """Acquired graph usable for filesystem materialization, not native launch authority."""
 
     def __post_init__(self) -> None:
         if not isinstance(self.image, OCIArchiveImage):
@@ -950,10 +975,13 @@ class SourceCAS:
         checkpoint: Checkpoint = _noop_checkpoint,
         *,
         _fixed_index: bool = False,
+        _acquisition_budget: _AcquisitionBudget | None = None,
     ) -> SourceSnapshot:
         """Securely promote a descriptor from pinned blobs, or fixed layout index.json."""
         if not isinstance(descriptor, Descriptor):
             raise ArtifactValidationError("source-CAS import requires a Descriptor")
+        if _acquisition_budget is not None:
+            _acquisition_budget.charge(descriptor.size)
         digest_hex = descriptor.digest.split(":", 1)[1]
         source_name = "index.json" if _fixed_index else digest_hex
         source_fd: int | None = None
@@ -1310,14 +1338,17 @@ class LocalLayoutSource:
     ) -> SnapshottedOCIImage | SnapshottedOCIArchive:
         if (reference is not None and not isinstance(reference, OCIImageRef)) or not isinstance(cas, SourceCAS):
             raise ArtifactValidationError("local OCI snapshot requires an OCIImageRef and SourceCAS")
+        budget = _AcquisitionBudget(maximum_bytes) if acquisition_platform is not None else None
         with _open_absolute_directory(self.layout, self._checkpoint) as layout_fd:
             marker = strict_json_object(
-                _read_stable_regular_file(layout_fd, "oci-layout", max_bytes=4096),
+                _read_stable_regular_file(layout_fd, "oci-layout", max_bytes=4096, _budget=budget),
                 "OCI layout marker",
             )
             if marker != {"imageLayoutVersion": "1.0.0"}:
                 raise ArtifactValidationError("unsupported OCI image layout version")
-            top_index_bytes = _read_stable_regular_file(layout_fd, "index.json", max_bytes=MAX_IMAGE_JSON_BYTES)
+            top_index_bytes = _read_stable_regular_file(
+                layout_fd, "index.json", max_bytes=MAX_IMAGE_JSON_BYTES, _budget=budget
+            )
             top_index = strict_json_object(top_index_bytes, "OCI layout index.json")
             if type(top_index.get("schemaVersion")) is not int or top_index["schemaVersion"] != 2:
                 raise ArtifactValidationError("OCI layout index.json must use schemaVersion 2")
@@ -1401,9 +1432,10 @@ class LocalLayoutSource:
                             raise ArtifactValidationError("same OCI digest has contradictory descriptor metadata")
                         return existing
                     if pinned_top_index and descriptor == root_descriptor:
+                        # index.json was already charged before its stable read.
                         created = cas.import_source_blob(layout_fd, descriptor, checkpoint, _fixed_index=True)
                     else:
-                        created = cas.import_source_blob(sha256_fd, descriptor, checkpoint)
+                        created = cas.import_source_blob(sha256_fd, descriptor, checkpoint, _acquisition_budget=budget)
                     memo[descriptor.digest] = created
                     return created
 
@@ -1555,6 +1587,8 @@ class LocalArchiveSource:
         if (reference is not None and not isinstance(reference, OCIImageRef)) or not isinstance(cas, SourceCAS):
             raise ArtifactValidationError("local OCI snapshot requires an OCIImageRef and SourceCAS")
         with _open_absolute_regular_file(self.archive) as (archive_fd, archive_metadata):
+            if acquisition_platform is not None and archive_metadata.st_size > maximum_bytes:
+                raise ArtifactValidationError("OCI archive carrier exceeds acquisition size limit")
             with tempfile.TemporaryDirectory(prefix="palimpsest-oci-archive-") as temporary:
                 # TemporaryDirectory may spell a platform alias such as macOS
                 # /var; canonicalize this process-created directory before the
@@ -1564,6 +1598,7 @@ class LocalArchiveSource:
                 (layout / "blobs" / "sha256").mkdir(parents=True, mode=_PRIVATE_DIRECTORY_MODE)
                 seen: set[str] = set()
                 content_bytes = 0
+                budget = _AcquisitionBudget(maximum_bytes) if acquisition_platform is not None else None
                 stream = os.fdopen(os.dup(archive_fd), "rb")
                 try:
                     with tarfile.open(fileobj=stream, mode="r:") as tar:
@@ -1596,6 +1631,8 @@ class LocalArchiveSource:
                                 raise ArtifactValidationError("local OCI archive marker exceeds its size limit")
                             if name == "index.json" and member.size > MAX_IMAGE_JSON_BYTES:
                                 raise ArtifactValidationError("local OCI archive index exceeds its size limit")
+                            if budget is not None:
+                                budget.charge(member.size)
                             _write_archive_member(tar, member, layout.joinpath(*name.split("/")), deadline=deadline)
                 except (tarfile.TarError, EOFError):
                     raise ArtifactValidationError("local OCI archive is not a valid uncompressed tar archive") from None

@@ -8,6 +8,86 @@ Palimpsest separates three remote contracts:
 
 Hub's native `/v1` API is not a Docker `/v2` registry. Configure its native profile explicitly; do not rely on a hostname to infer the protocol. The [project package contract](project-package-registry.md) records the design; this guide describes the consumer cutover in source. The [2026-10-02 candidate integration](development-handoff.md#candidate-integration--2026-10-02) records portable and Hub gates plus real BuildKit → native deferred push → byte-identical pull and remote exact-cache reuse over loopback HTTPS. That proof used synthetic Keystone and isolated SQLite; it does not qualify production identity policy, migrations, native VM execution or deployment.
 
+## Upstream image source admission
+
+Registry routing/authentication and source permission are separate. Before
+Palimpsest's image-intake/runtime path acquires an upstream image or reuses a
+retained upstream reference, the local operator selects exact sources in the
+existing owner-only main configuration:
+
+```text
+${XDG_CONFIG_HOME:-~/.config}/palimpsest/config.toml
+```
+
+```toml
+[image_sources]
+schema_version = 1
+publisher_policy = "registry-namespace"
+rules = [
+  { registry = "docker.io", namespace = "library", repository = "ubuntu" },
+  { registry = "docker.io", namespace = "nvidia", repository = "cuda" },
+]
+```
+
+Keep the directory owned and not shared-writable, and the file owned with mode
+`0600`. Existing storage/Hub configuration stays in the same file; do not replace
+it wholesale with this example. Missing or empty rules deny upstream images.
+Unknown fields, malformed rules and unsafe/replaced files fail closed. Rules
+are exact normalized registry/namespace/repository tuples, not prefix matches or
+wildcards. `ubuntu:24.04` becomes `docker.io/library/ubuntu:24.04`;
+`nvidia/cuda:TAG` becomes `docker.io/nvidia/cuda:TAG`. Neither rule allows another
+namespace, `ubuntuevil`, `cuda-extra`, a nested repository or a lookalike host.
+Add separate exact rules for the other repository examples in this guide.
+For a registry that really has a root-level repository, use an explicit empty
+namespace, for example `registry = "registry.k8s.io", namespace = "",
+repository = "pause"`. This grants only that root repository, not a nested
+namespace or prefix. It is an explicit source selector, not a claim that a
+publisher namespace was independently verified.
+
+`registry-namespace` is a deliberate namespace-based trust policy, not a
+cryptographic signature, verified-vendor badge or proof of image contents.
+Actual descriptor/digest/platform/OS validation remains separate. A configured
+source does not authorize a VM, GPU, device, download budget or deployment.
+Dockerfile FROM/frontend/image-copy/mount identities use Docker's canonical
+defaults, not an ambient Palimpsest package-registry override.
+
+The permanent cache receives this configured authority explicitly. A retained
+pin or `pull --offline` does not bypass current source admission; local
+import/inspect/retain/release do not invent registry access. Authenticated image
+acquisition still requires verified OCI HTTPS and its separate routing/credential
+profile. Native package credentials are not upstream image permission.
+
+Retained registry/Docker-origin archives remain subject to current policy even
+when selected by their archive/root/manifest digest. Docker-store adoption checks
+permission before daemon inspection and cannot fall through to remote acquisition
+after denial. Generic Docker passthrough commands are not a policy firewall;
+subsequent Palimpsest runtime adoption still applies these checks. Explicit local
+archive/layout inputs retain their local-artifact contract without fabricating a
+verified upstream publisher identity.
+
+Hub operators configure the same strict DTO through
+`PALIMPSEST_HUB_IMAGE_SOURCE_POLICY`; Kolla exposes
+`palimpsest_image_source_policy` with empty rules by default and passes it to both
+API and build worker. The existing registry-host fence is an additional
+restriction, never permission for every repository on that host. Workload input
+cannot supply the operator policy. Source wiring is not evidence that a running
+deployment has received the setting.
+
+Jobs bind the admitted policy and digest immutably. A duplicate request may
+retrieve its original receipt after operator reconfiguration; it does not
+re-authorize execution or replace provenance. New admission, worker claim and
+publication require current policy. Old queued jobs without a valid snapshot
+fail closed rather than receiving invented permission.
+
+Long-running direct workers recheck the operator's current local config over
+their existing authenticated SSH pipes immediately before output links and
+metadata commits, including after payload verification or fsync. Hub workers also
+check current worker policy for recovered output publication. Revocation places
+the job on durable HOLD, preserving any earlier committed prefix and refusing
+automatic replay after policy restoration. A policy timeout is separate from
+the bounded process-settlement allowance; uncertain child custody is retained,
+not force-killed. No new network listener or credential is introduced.
+
 ## Profile configuration
 
 Registry profiles are stored in:
@@ -93,13 +173,13 @@ Profiles do not rewrite Dockerfile `FROM` lines. Remote Dockerfile inputs must r
 
 ### Operator binding and secret-once key issuance
 
-Before using `cloud.dmslab.re.kr/openstack-afterglow/test:v1`, the operator must configure the trusted public origin and bind `openstack-afterglow` to the **actual immutable Keystone project UUID**, then register that namespace with a member's original project-scoped token carrying current Palimpsest publish authority. Key issuance additionally requires keys-editor authority and every requested action; own-key revocation requires keys-admin authority. A display name, client `X-Project-Id` header or familiar hostname is not a binding. This example is conditional, not evidence that this authority is deployed or that a binding exists. See the [capability matrix](project-package-registry.md#3-identity-and-authorization) and [Hub service settings](install.md#hub-service-settings).
+Before using `cloud.dmslab.re.kr/openstack-afterglow/test:v1`, configure the trusted public origin and bind `openstack-afterglow` to the **actual immutable Keystone project UUID**, then register the namespace with an original project-scoped member-or-above token carrying `packages:write`. Existing standard reader/member/manager roles include lower tiers: reader queries/downloads and lists/revokes only its own keys using its original Keystone token; member adds create/edit/publication and exact-own consumer cleanup; manager adds project management/removal and own-key issuance. Issuance requires manager-or-above and every requested action; no operation-specific Keystone roles are required. Bearer package keys cannot manage/revoke keys or consumers. Project manager/admin is not a system administrator. A display name, client header or familiar hostname is not a binding. This conditional example is not deployed-authority evidence. See the [capability matrix](project-package-registry.md#3-identity-and-authorization) and [Hub service settings](install.md#hub-service-settings).
 
-Control calls use the original member token (`X-Auth-Token`), never a package key:
+Control calls use the original human project token (`X-Auth-Token`), never a package key:
 
-1. `GET /v1/projects/current` returns the original project and any registered namespace.
-2. `PUT /v1/projects/{project_id}/namespace` registers the operator-configured alias (or the deterministic project namespace); it cannot rename/rebind an existing namespace.
-3. `POST /v1/projects/openstack-afterglow/keys` issues the following exact-package key:
+1. Reader-or-above `GET /v1/projects/current` returns the original project and any registered namespace.
+2. Member-or-above `PUT /v1/projects/{project_id}/namespace` registers the operator-configured alias (or the deterministic project namespace); it cannot rename/rebind an existing namespace.
+3. Manager-or-above `POST /v1/projects/openstack-afterglow/keys` issues its own following exact-package key:
 
 ```json
 {

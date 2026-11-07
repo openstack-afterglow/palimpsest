@@ -956,3 +956,120 @@ def test_shutdown_waits_for_admitted_factory_not_only_constructed_owner(case):
     assert_original_ack(case)
     assert opened[0].observed_completion.acknowledgement == "confirmed"
     opened[0].close()
+
+
+@pytest.mark.parametrize("detach", ["timeout", "drawer"])
+def test_native_process_owner_retains_cleanup_after_foreground_detach(tmp_path, detach):
+    import json
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    program = """
+import sys, json, threading
+sys.path.insert(0, SOURCE_ROOT)
+from palimpsest_local.process_session import LocalProcessSession
+from palimpsest_local.vm_exec_session import ExecOwners
+from palimpsest_local.vm_access import _collect, VMAccessError
+closed_by = []
+class Tracked(LocalProcessSession):
+    def close(self):
+        closed_by.append(threading.current_thread().daemon)
+        super().close()
+source = Tracked((sys.executable, '-B', '-c', 'import sys;sys.stdin.buffer.read(1);print(31)'), tty=False, stdin=True)
+owners = ExecOwners()
+session = owners.open(lambda: source, requires_ack=False)
+waiter = None
+try:
+    if MODE == 'timeout':
+        try:
+            _collect(session, timeout=0.01)
+        except VMAccessError as error:
+            assert error.category == 'timeout'
+        else:
+            raise AssertionError('probe did not time out')
+    else:
+        session.close()
+    assert source._process.poll() is None and closed_by == []
+    owners.stop_admitting()
+    outcomes, done = [], threading.Event()
+    def shutdown():
+        outcomes.append(owners.wait())
+        done.set()
+    waiter = threading.Thread(target=shutdown)
+    waiter.start()
+    assert not done.wait(0.05)
+    source.write_stdin(b'x')
+    source.close_stdin()
+    waiter.join(2)
+    session._worker.join(2)
+    assert not waiter.is_alive() and not session._worker.is_alive()
+    assert outcomes == [0] and source._process.returncode == 0
+    assert closed_by == [False]
+    assert session.observed_completion is None
+    print(json.dumps({'foreground_detached': True, 'shutdown_waited_for_process': True, 'cleanup_threads_daemon': closed_by, 'unconfirmed_mailboxes': outcomes[0]}))
+finally:
+    if source._process.poll() is None:
+        try:
+            source.write_stdin(b'x')
+            source.close_stdin()
+        except BaseException:
+            pass
+        source._process.wait(timeout=2)
+    session.close()
+    session._worker.join(2)
+    if waiter is not None:
+        waiter.join(2)
+""".replace("SOURCE_ROOT", repr(str(Path(sessions.__file__).resolve().parents[1]))).replace("MODE", repr(detach))
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", program], cwd=tmp_path, capture_output=True, text=True, timeout=8
+    )
+    assert result.returncode == 0, result.stderr
+    observed = json.loads(result.stdout)
+    assert observed == {
+        "foreground_detached": True,
+        "shutdown_waited_for_process": True,
+        "cleanup_threads_daemon": [False],
+        "unconfirmed_mailboxes": 0,
+    }
+
+
+@pytest.mark.parametrize("requires_ack", [False, True])
+def test_process_completion_does_not_fabricate_required_mailbox_ack(tmp_path, requires_ack):
+    import json
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    program = """
+import sys, json
+sys.path.insert(0, SOURCE_ROOT)
+from palimpsest_local.process_session import LocalProcessSession
+from palimpsest_local.vm_exec_session import ExecOwners
+from palimpsest_local.vm_access import _collect
+source = LocalProcessSession((sys.executable, '-B', '-c', 'print(19+5+7)'), tty=False, stdin=False)
+owners = ExecOwners()
+session = owners.open(lambda: source, requires_ack=ACK_REQUIRED)
+assert _collect(session) == b'31\\n'
+session._worker.join(2)
+assert not session._worker.is_alive() and source._process.returncode == 0
+owners.stop_admitting()
+unknown = owners.wait()
+print(json.dumps({'unconfirmed_mailboxes': unknown, 'process_exit': source._process.returncode}))
+""".replace("SOURCE_ROOT", repr(str(Path(sessions.__file__).resolve().parents[1]))).replace(
+        "ACK_REQUIRED", repr(requires_ack)
+    )
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", program], cwd=tmp_path, capture_output=True, text=True, timeout=8
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"unconfirmed_mailboxes": 1 if requires_ack else 0, "process_exit": 0}
+
+
+@pytest.mark.parametrize("requires_ack", [None, 0, 1, "false"])
+def test_completion_protocol_selector_is_boolean_before_process_admission(requires_ack):
+    owners = ExecOwners()
+    with pytest.raises(TypeError):
+        owners.open(lambda: pytest.fail("invalid protocol admitted a process"), requires_ack=requires_ack)
+    owners.stop_admitting()
+    assert owners.wait() == 0

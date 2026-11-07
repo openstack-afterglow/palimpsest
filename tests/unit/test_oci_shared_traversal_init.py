@@ -196,7 +196,7 @@ def test_private_initialization_occurs_inside_guard_cleanup_outside(tmp_path, mo
         assert active
         real_private(path, protected)
 
-    def cleanup(roots):
+    def cleanup(roots, *, lock_deadline=None):
         assert not active
 
     monkeypatch.setattr(shared, "shared_traversal_initialization", guard)

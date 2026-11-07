@@ -51,15 +51,15 @@ def test_root_opaque_whiteout_is_explicitly_translated():
         assert root.pax_headers["SCHILY.xattr.trusted.overlay.opaque"] == "y"
 
 
-def test_later_whiteout_wins_over_an_earlier_opaque_directory_marker():
+@pytest.mark.parametrize("whiteout_first", [False, True])
+def test_lower_directory_deletion_dominates_marker_only_opacity_regardless_order(whiteout_first):
     opaque = tarfile.TarInfo("d/.wh..wh..opq")
     whiteout = tarfile.TarInfo(".wh.d")
-
-    translated = translate_oci_tar_to_overlay_tar(_tar(opaque, whiteout))
-
+    members = (whiteout, opaque) if whiteout_first else (opaque, whiteout)
+    translated = translate_oci_tar_to_overlay_tar(_tar(*members))
     with tarfile.open(fileobj=io.BytesIO(translated), mode="r:*") as archive:
         actual = archive.getmember("d")
-        assert actual.ischr()
+        assert actual.ischr() and actual.devmajor == 0 and actual.devminor == 0
         assert "SCHILY.xattr.trusted.overlay.opaque" not in actual.pax_headers
 
 

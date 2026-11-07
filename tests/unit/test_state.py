@@ -53,6 +53,85 @@ def test_xdg_roots_and_permissions() -> None:
         assert state.permission_bits(roots.oci_root_volumes) == 0o700
 
 
+def test_source_roots_initialize_only_configured_source_parents(tmp_path: Path) -> None:
+    roots = state.resolve_roots(
+        {"XDG_CONFIG_HOME": str(tmp_path / "cfg"), "PALIMPSEST_STATE_HOME": str(tmp_path / "selected-state")}
+    )
+
+    initialized = state.init_source_roots(roots)
+
+    assert initialized.config == roots.config.resolve()
+    assert initialized.state == roots.state.resolve()
+    assert set(roots.state.iterdir()) == {roots.runtime_packs}
+    assert set(roots.runtime_packs.iterdir()) == {roots.oci_source_cas}
+    assert list(roots.oci_source_cas.iterdir()) == []
+    assert not roots.config.parent.exists()
+    for directory in (roots.state, roots.runtime_packs, roots.oci_source_cas):
+        assert state.permission_bits(directory) == 0o700
+
+
+def test_source_roots_preserve_existing_state_traversal_mode_and_unrelated_bytes(tmp_path: Path) -> None:
+    roots = state.StatePaths(config=tmp_path / "config", state=tmp_path / "state")
+    roots.state.mkdir(mode=0o700)
+    roots.state.chmod(0o710)
+    retained = roots.state / "retained-runtime"
+    retained.write_bytes(b"not source state")
+    before = roots.state.stat()
+
+    initialized = state.init_source_roots(roots)
+    assert state.init_source_roots(initialized) == initialized
+
+    after = roots.state.stat()
+    assert (after.st_dev, after.st_ino, after.st_mode) == (before.st_dev, before.st_ino, before.st_mode)
+    assert retained.read_bytes() == b"not source state"
+    assert set(roots.state.iterdir()) == {retained, roots.runtime_packs}
+    assert not roots.runs.exists()
+    assert not roots.locks.exists()
+    assert not roots.oci_root_volumes.exists()
+
+
+@pytest.mark.parametrize("component", ["config", "state", "runtime_packs", "oci_source_cas"])
+def test_source_roots_fail_closed_on_unsafe_permissions_without_repair(tmp_path: Path, component: str) -> None:
+    roots = state.StatePaths(config=tmp_path / "config", state=tmp_path / "state")
+    state.init_source_roots(roots)
+    if component == "config":
+        roots.config.mkdir(mode=0o700)
+    selected = getattr(roots, component)
+    selected.chmod(0o777 if component == "state" else 0o755)
+    before = selected.stat()
+    marker = selected / "keep"
+    marker.write_bytes(b"no permission repair")
+
+    with pytest.raises(StateError):
+        state.init_source_roots(roots)
+
+    after = selected.stat()
+    assert (after.st_dev, after.st_ino, after.st_mode) == (before.st_dev, before.st_ino, before.st_mode)
+    assert marker.read_bytes() == b"no permission repair"
+    assert not roots.runs.exists()
+    assert not roots.locks.exists()
+
+
+def test_source_roots_support_configured_ancestor_alias_but_not_state_alias(tmp_path: Path) -> None:
+    parent = tmp_path / "real-parent"
+    parent.mkdir(mode=0o700)
+    ancestor = tmp_path / "ancestor"
+    ancestor.symlink_to(parent, target_is_directory=True)
+    roots = state.StatePaths(config=tmp_path / "config", state=ancestor / "selected-state")
+
+    initialized = state.init_source_roots(roots)
+
+    assert initialized.state == parent / "selected-state"
+    assert initialized.oci_source_cas.is_dir()
+    assert set(parent.iterdir()) == {initialized.state}
+    alias = parent / "state-alias"
+    alias.symlink_to(initialized.state, target_is_directory=True)
+    with pytest.raises(StateError):
+        state.init_source_roots(state.StatePaths(config=roots.config, state=alias))
+    assert alias.is_symlink()
+    assert initialized.oci_source_cas.is_dir()
+
+
 def test_run_paths_and_owner_record() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         tmppath = Path(tmp)
@@ -1563,3 +1642,59 @@ def test_write_state_root_requires_absolute_path(tmp_path: Path) -> None:
     roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "cfg"), "XDG_STATE_HOME": str(tmp_path / "st")})
     with pytest.raises(StateError, match="state root destination must be an absolute path"):
         state.write_state_root(roots, Path("relative/dest"))
+
+
+@pytest.mark.parametrize(
+    ("started", "remaining", "now", "expected"),
+    [
+        # A sub-ULP allowance can round upward when added to this clock.
+        (float(2**50), 0.2, float(2**50), 0.2),
+        (float(2**50), 0.2, float(2**50) - 1.0, 0.2),
+        (600.0, 0.2, 600.2, 0.0),
+        (600.0, 0.2, 601.0, 0.0),
+        (600.0, 0.0, 600.0, 0.0),
+        (600.0, 5.0, 602.0, 3.0),
+    ],
+)
+def test_observation_wait_allowance_never_grows_or_survives_its_deadline(
+    monkeypatch, started, remaining, now, expected
+):
+    budget = state.RunObservationWaitBudget(remaining)
+    monkeypatch.setattr(state.time, "monotonic", lambda: now)
+    assert budget.seconds_left(started) == expected
+    budget.charge_wait(started)
+    assert budget.remaining_seconds == expected
+    assert budget.remaining_seconds <= remaining
+
+
+@pytest.mark.parametrize("contended", [False, True])
+def test_try_once_reservation_admits_free_name_but_never_creates_under_contention(tmp_path, contended):
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "cfg"), "XDG_STATE_HOME": str(tmp_path / "st")})
+    if contended:
+        with state._new_run_name_lock(roots, "try-once"):
+            with pytest.raises(state.RunLockTimeoutError):
+                with state.reserve_new_run(roots, "try-once", _cloud_key(), _lock_deadline=0):
+                    pytest.fail("a busy name cannot enter a reservation")
+        assert not (roots.runs / "try-once").exists()
+    else:
+        # A past deadline still permits exactly one uncontended attempt, even
+        # after the lock's permission/fsync checks have consumed real time.
+        with state.reserve_new_run(roots, "try-once", _cloud_key(), _lock_deadline=0) as reservation:
+            reservation.write_state("defined", {"vcpus": 1})
+            run_id = reservation.record.run_id
+        record = state.read_run_dispatch_record(roots, "try-once")
+        assert record.run_id == run_id and record.dispatch_key == _cloud_key()
+        assert state.read_run_ledger_snapshot(roots, "try-once").state["status"] == "defined"
+
+
+def test_try_once_root_initialization_preserves_busy_committed_quarantine(tmp_path):
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "cfg"), "XDG_STATE_HOME": str(tmp_path / "st")})
+    quarantine = roots.run_deletions / ("locked-retry-" + "a" * 32)
+    quarantine.mkdir(mode=0o700)
+    artifact = quarantine / "artifact"
+    artifact.write_bytes(b"pending committed deletion")
+    with state._new_run_name_lock(roots, "locked-retry"):
+        state.init_resolved_roots(roots, _run_lock_deadline=0)
+        assert artifact.read_bytes() == b"pending committed deletion"
+    state.init_resolved_roots(roots)
+    assert not quarantine.exists()

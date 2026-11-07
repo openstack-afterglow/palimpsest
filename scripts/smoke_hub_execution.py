@@ -28,6 +28,7 @@ from palimpsest_local.benchmark_scenarios import (  # noqa: E402
     _delete_consumer,
     _digest,
     _hub,
+    _require_hub_lifecycle,
     _wait,
     connection_from_stdin,
 )
@@ -92,6 +93,7 @@ def run(config, output, *, connection=None):
         budget = ResourceBudget(config, output)
         observer = ScenarioCloud(config, output, event, connection=connection, budget=budget, observation_only=True)
         client = _hub(config, observer.connection)
+        _require_hub_lifecycle(client)
         source = Path(config["smoke"]["layer_file"])
         event("layer-upload", {"bytes": source.stat().st_size})
         receipt = client.push_blob(source, {"name": "api-smoke-" + config["job_id"], "arch": "x86_64"}, resume=False)
@@ -205,6 +207,7 @@ def run(config, output, *, connection=None):
         previous = None
         for index in (1, 2):
             role = "consumer" + str(index)
+            _require_hub_lifecycle(_hub(config, observer.connection))
             reservation = budget.reserve(role, config["placement"]["boot_gib"])
             spec = {
                 k: v

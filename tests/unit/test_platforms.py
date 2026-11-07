@@ -27,6 +27,49 @@ from palimpsest_local.runtime_types import (
 )
 
 
+def test_native_root_source_profile_is_exact_immutable_and_host_independent(monkeypatch):
+    monkeypatch.setattr(platforms, "detect_host", lambda: pytest.fail("source profile probed the host"))
+    profile = platforms.select_native_root_boot_profile(
+        os_id="ubuntu", version_id="24.04", platform="linux/arm64", backend="lima-vz"
+    )
+    assert profile.to_dict() == {
+        "profile_id": "palimpsest.native-root.ubuntu-24.04.arm64.lima-vz.direct-linux.v1",
+        "os_id": "ubuntu",
+        "version_id": "24.04",
+        "platform": "linux/arm64",
+        "backend": "lima-vz",
+        "boot_method": "direct-linux",
+    }
+    with pytest.raises(AttributeError):
+        profile.boot_method = "efi"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("os_id", "debian"),
+        ("os_id", "Ubuntu"),
+        ("os_id", ""),
+        ("os_id", None),
+        ("version_id", "24.04.1"),
+        ("version_id", "22.04"),
+        ("version_id", 24.04),
+        ("platform", "linux/amd64"),
+        ("platform", "linux/aarch64"),
+        ("platform", "linux/arm64/v8"),
+        ("platform", "windows/arm64"),
+        ("backend", "auto"),
+        ("backend", "kvm"),
+        ("backend", "lima-krunkit"),
+    ],
+)
+def test_native_root_source_profile_has_no_identity_or_backend_fallback(field, value):
+    target = dict(os_id="ubuntu", version_id="24.04", platform="linux/arm64", backend="lima-vz")
+    target[field] = value
+    with pytest.raises(ArtifactValidationError, match="unsupported native-root source profile"):
+        platforms.select_native_root_boot_profile(**target)
+
+
 @pytest.mark.parametrize(
     ("value", "expected"),
     [

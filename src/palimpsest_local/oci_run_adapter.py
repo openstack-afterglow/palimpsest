@@ -97,6 +97,8 @@ def _launch_local_oci(roots, request, host_config, interrupted):
         if type(request) is not LocalOCIRunRequest:
             raise StateError("OCI launch requires a typed local request")
         request.__post_init__()
+        if request.backend != "kvm":
+            raise StateError("OCI adapter supports only the KVM backend")
         config = OCIHostConfig.from_environment() if host_config is None else host_config
         # All readonly host checks and toolchain identity precede state mutation.
         preflight_oci_host(config, roots, request.name)

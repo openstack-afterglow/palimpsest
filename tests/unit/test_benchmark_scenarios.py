@@ -356,6 +356,10 @@ def test_failed_api_consumer_keeps_its_Hub_identity_visible_without_server_id(tm
             pytest.fail("API lane cannot allocate an SDK baseline VM")
 
     class Hub:
+        def _json_request(self, method, path):
+            assert (method, path) == ("GET", "/policy/capabilities")
+            return {"service": "palimpsest", "actions": ["packages:write", "packages:manage"]}
+
         def import_registry_image(self, request):
             return {"id": "image-job", "status": "queued"}
 
@@ -667,6 +671,13 @@ def _api_scenario_model(tmp_path, monkeypatch, method="api-import"):
             self.volume_deletes = 0
             self.lose_volume_delete = False
             self.volume_delete_effect = True
+            self.policy = {"service": "palimpsest", "actions": ["packages:write", "packages:manage"]}
+            self.policy_reads = 0
+
+        def _json_request(self, method, path):
+            assert (method, path) == ("GET", "/policy/capabilities")
+            self.policy_reads += 1
+            return copy.deepcopy(self.policy)
 
         def import_registry_image(self, request):
             self.images.append(request)
@@ -782,7 +793,109 @@ def _scenario_reservations(value):
     from pathlib import Path
 
     ledger = Path(value["approval"]["ledger_root"]) / (value["approval"]["id"] + ".json")
+    if not ledger.exists():
+        return []
     return list(json.loads(ledger.read_text())["reservations"].values())
+
+
+@pytest.mark.parametrize("method", ["api-import", "api-cold-warm"])
+@pytest.mark.parametrize(
+    "policy",
+    [
+        {"service": "palimpsest", "actions": ["packages:write"]},
+        {"service": "palimpsest", "actions": ["packages:manage"]},
+        {"service": "palimpsest", "actions": ["packages:read"]},
+        {"service": "palimpsest", "capabilities": ["palimpsest-publish_editor"]},
+        {"service": "palimpsest", "actions": "packages:write packages:manage"},
+        {"service": "another", "actions": ["packages:write", "packages:manage"]},
+        None,
+    ],
+)
+def test_api_authority_preflight_denies_before_images_intents_and_budget(tmp_path, monkeypatch, method, policy):
+    value, output, model, cloud = _api_scenario_model(tmp_path, monkeypatch, method)
+    model.policy = policy
+    result = run_scenario(value, output, cloud_factory=cloud)
+    assert result["status"] == "failed"
+    assert model.policy_reads == 1
+    assert not model.images and not model.creates
+    assert _scenario_reservations(value) == []
+    assert not list(output.glob("*-intent.json"))
+
+
+def test_api_authority_is_refreshed_before_consumer_reservation(tmp_path, monkeypatch):
+    value, output, model, cloud = _api_scenario_model(tmp_path, monkeypatch)
+    original = model.get_image_job
+
+    def revoke_management(identity):
+        model.policy["actions"].remove("packages:manage")
+        return original(identity)
+
+    monkeypatch.setattr(model, "get_image_job", revoke_management)
+    result = run_scenario(value, output, cloud_factory=cloud)
+    assert result["status"] == "failed"
+    assert model.images and not model.creates
+    assert _scenario_reservations(value) == []
+    assert not list(output.glob("*-consumer*-intent.json"))
+
+
+@pytest.mark.parametrize("cleanup_action", ["packages:manage", "packages:manage_own"])
+def test_api_original_caller_cleanup_action_allows_owned_consumer_lifecycle(tmp_path, monkeypatch, cleanup_action):
+    value, output, model, cloud = _api_scenario_model(tmp_path, monkeypatch)
+    model.policy["actions"] = ["packages:write", cleanup_action]
+    result = run_scenario(value, output, cloud_factory=cloud)
+    assert result["status"] == "success"
+    assert len(model.creates) == 1 and model.provider_deletes == 1
+    assert model.absence_checks == [("original-server", "original-boot")]
+    assert all(row["released"] for row in _scenario_reservations(value))
+
+
+def test_api_policy_transport_failure_has_no_authority_fallback(tmp_path, monkeypatch):
+    value, output, model, cloud = _api_scenario_model(tmp_path, monkeypatch)
+
+    def unavailable(*args):
+        raise ConnectionError("isolated policy transport unavailable")
+
+    monkeypatch.setattr(model, "_json_request", unavailable)
+    result = run_scenario(value, output, cloud_factory=cloud)
+    assert result["status"] == "failed"
+    assert not model.images and not model.creates
+    assert _scenario_reservations(value) == []
+    assert not list(output.glob("*-intent.json"))
+
+
+def test_fixed_hub_execution_smoke_denies_missing_cleanup_before_mutations_and_budget(tmp_path, monkeypatch):
+    import importlib.util
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    path = Path(__file__).resolve().parents[2] / "scripts/smoke_hub_execution.py"
+    spec = importlib.util.spec_from_file_location("hub_execution_smoke", path)
+    smoke = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(smoke)
+    value = config(tmp_path)
+    value["schema"] = "palimpsest.hub-execution-smoke-config.v1"
+    value["approval"]["allowed_scenarios"] = ["hub-execution-smoke"]
+    value["smoke"] = {
+        "image_reference": "docker.io/library/alpine@sha256:" + "a" * 64,
+        "os_family": "fixture-os",
+        "os_version": "1",
+        "layer_file": str(tmp_path / "must-not-open"),
+    }
+    calls = []
+
+    class Member:
+        def _json_request(self, method, route):
+            calls.append((method, route))
+            return {"service": "palimpsest", "actions": ["packages:write"]}
+
+    monkeypatch.setattr(smoke, "ScenarioCloud", lambda *a, **kw: SimpleNamespace(connection=object()))
+    monkeypatch.setattr(smoke, "_hub", lambda *a: Member())
+    output = tmp_path / "smoke"
+    result = smoke.run(value, output)
+    assert result["status"] == "failed" and result["consumer_creations"] == 0
+    assert calls == [("GET", "/policy/capabilities")]
+    assert _scenario_reservations(value) == []
+    assert not list(output.glob("*-intent.json"))
 
 
 @pytest.mark.parametrize("first_delete", ["normal", "cleanup"])

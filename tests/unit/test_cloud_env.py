@@ -9,6 +9,7 @@ import os
 import subprocess
 import sys
 import time
+from pathlib import Path
 from types import SimpleNamespace as Obj
 from unittest.mock import Mock
 
@@ -16,6 +17,7 @@ import pytest
 
 from palimpsest_local import cloud_cli, cloud_env
 from palimpsest_local.cloud_env import CONSUMER_SCRIPT, SCHEMA, CloudEnv, CloudEnvError
+from palimpsest_local.image_source_policy import ImageSourcePolicyError
 
 
 def image():
@@ -27,6 +29,16 @@ def image():
 
 @pytest.fixture
 def environment(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "operator-config"))
+    monkeypatch.setenv("PALIMPSEST_STATE_HOME", str(tmp_path / "operator-state"))
+    config = tmp_path / "operator-config" / "palimpsest"
+    config.mkdir(mode=0o700, parents=True)
+    policy = config / "config.toml"
+    policy.write_text(
+        '[image_sources]\nschema_version=1\npublisher_policy="registry-namespace"\n'
+        '[[image_sources.rules]]\nregistry="docker.io"\nnamespace="nvidia"\nrepository="cuda"\n'
+    )
+    policy.chmod(0o600)
     env = CloudEnv("test", root=tmp_path)
     conn = Obj(
         current_project_id="project",
@@ -766,6 +778,7 @@ def intake_worker(environment, monkeypatch):
     conn.compute.get_server.return_value = owned(env, id="worker", metadata={"palimpsest_role": "worker"})
     monkeypatch.setattr(cloud_env, "package_archive", lambda: (b"package", "verified-package"))
     monkeypatch.setattr(env, "_send_mount", Mock())
+    monkeypatch.setattr(env, "_send_source_policy", Mock())
     monkeypatch.setattr(env, "upload", Mock(side_effect=AssertionError("registry payload must not come from client")))
     return env
 
@@ -783,7 +796,7 @@ def test_registry_pull_requires_pin_before_remote_effects(environment, monkeypat
 def test_registry_pull_unknown_response_is_durable_hold_not_replayed(environment, monkeypatch):
     env = intake_worker(environment, monkeypatch)
     remote = Mock(side_effect=subprocess.TimeoutExpired("ssh", 60))
-    monkeypatch.setattr(env, "ssh", remote)
+    monkeypatch.setattr(env, "_policy_ssh", remote)
     reference = "docker.io/nvidia/cuda@sha256:" + "b" * 64
     with pytest.raises(subprocess.TimeoutExpired):
         env.pull(reference=reference, tag="cuda", timeout=60)
@@ -795,7 +808,9 @@ def test_registry_pull_unknown_response_is_durable_hold_not_replayed(environment
     assert remote.call_count == 1
 
 
-@pytest.mark.parametrize("mismatch", ["job_id", "name", "root_digest", "reference"])
+@pytest.mark.parametrize(
+    "mismatch", ["job_id", "name", "root_digest", "reference", "source_policy", "source_policy_digest"]
+)
 def test_registry_receipt_must_match_original_intake(environment, monkeypatch, mismatch):
     env = intake_worker(environment, monkeypatch)
     reference = "docker.io/nvidia/cuda@sha256:" + "b" * 64
@@ -807,12 +822,14 @@ def test_registry_receipt_must_match_original_intake(environment, monkeypatch, m
             "name": "cuda",
             "job_id": env.state["image_intakes"]["cuda"]["id"],
             "source": {"root_digest": "sha256:" + "b" * 64, "reference": reference},
+            "source_policy": env.state["image_intakes"]["cuda"]["source_policy"],
+            "source_policy_digest": env.state["image_intakes"]["cuda"]["source_policy_digest"],
         }
         target = receipt["source"] if mismatch in {"root_digest", "reference"} else receipt
         target[mismatch] = "wrong"
         return subprocess.CompletedProcess([], 0, json.dumps(receipt).encode(), b"")
 
-    monkeypatch.setattr(env, "ssh", response)
+    monkeypatch.setattr(env, "_policy_ssh", response)
     with pytest.raises(CloudEnvError, match="receipt differs"):
         env.pull(reference=reference, tag="cuda", timeout=60)
     persisted = json.loads(env.state_path.read_text())
@@ -884,9 +901,11 @@ def test_registry_intake_preserves_source_occurrences_and_original_runtime(envir
         receipt = copy.deepcopy(fixture)
         receipt["job_id"] = env.state["image_intakes"]["cuda"]["id"]
         receipt["source"]["reference"] = reference
+        receipt["source_policy"] = env.state["image_intakes"]["cuda"]["source_policy"]
+        receipt["source_policy_digest"] = env.state["image_intakes"]["cuda"]["source_policy_digest"]
         return subprocess.CompletedProcess([], 0, json.dumps(receipt).encode(), b"")
 
-    monkeypatch.setattr(env, "ssh", response)
+    monkeypatch.setattr(env, "_policy_ssh", response)
     env.pull(reference=reference, tag="cuda", timeout=60)
     persisted = json.loads(env.state_path.read_text())
     assert persisted["images"]["cuda"]["runtime"] == fixture["runtime"]
@@ -894,6 +913,7 @@ def test_registry_intake_preserves_source_occurrences_and_original_runtime(envir
     assert persisted["images"]["cuda"]["layers"] == fixture["layers"]
     assert persisted["images"]["cuda"]["source"]["config"] == fixture["source"]["config"]
     assert persisted["image_intakes"]["cuda"]["status"] == "success"
+    assert persisted["images"]["cuda"]["source_policy"] == persisted["image_intakes"]["cuda"]["source_policy"]
     env.upload.assert_not_called()
 
 
@@ -1123,16 +1143,28 @@ def test_cloud_factory_preserves_read_only_metadata_redirects(monkeypatch, cloud
         connection.close()
 
 
-def test_nonroot_build_is_retained_but_consumer_refuses_before_allocation(environment, monkeypatch, tmp_path):
+@pytest.mark.parametrize("relative_context", [False, True])
+def test_nonroot_build_is_retained_but_consumer_refuses_before_allocation(
+    environment,
+    monkeypatch,
+    tmp_path,
+    relative_context,
+):
     env, conn = environment
     context = tmp_path / "context"
     context.mkdir()
     dockerfile = context / "Dockerfile"
     dockerfile.write_text('FROM scratch\nUSER 1000:1000\nCMD ["/app/server"]\n')
+    if relative_context:
+        monkeypatch.chdir(context)
+        context, dockerfile = Path("."), Path("Dockerfile")
+    source_policy = cloud_env.load_image_source_policy(cloud_env.resolve_roots())
     record = {
         "schema": "palimpsest.cloud-layer-image.v1",
         "status": "success",
         "name": "nonroot-app",
+        "source_policy": source_policy.to_dict(),
+        "source_policy_digest": source_policy.digest,
         "source": {
             "root_digest": "sha256:" + "b" * 64,
             "manifest_digest": "sha256:" + "c" * 64,
@@ -1157,13 +1189,18 @@ def test_nonroot_build_is_retained_but_consumer_refuses_before_allocation(enviro
     monkeypatch.setattr(cloud_env, "package_archive", lambda: (b"package", "package-digest"))
     monkeypatch.setattr(env, "_send_mount", Mock())
     monkeypatch.setattr(env, "upload", Mock())
+    monkeypatch.setattr(env, "_send_source_policy", Mock())
     monkeypatch.setattr(
-        env, "ssh", Mock(return_value=subprocess.CompletedProcess([], 0, json.dumps(record).encode(), b""))
+        env, "_policy_ssh", Mock(return_value=subprocess.CompletedProcess([], 0, json.dumps(record).encode(), b""))
     )
+    monkeypatch.setattr(env, "ssh", Mock(return_value=subprocess.CompletedProcess([], 0, b"", b"")))
     built = env.build(dockerfile=dockerfile, context=context, tag="nonroot-app", timeout=0.5)
     assert built["runtime"]["user"] == "1000:1000"
     persisted = json.loads(env.state_path.read_text())["images"]["nonroot-app"]
-    assert persisted == {key: record[key] for key in ("name", "source", "layers", "runtime", "built_at_unix")}
+    assert persisted == {
+        key: record[key]
+        for key in ("name", "source", "layers", "runtime", "built_at_unix", "source_policy", "source_policy_digest")
+    }
     grant = Mock()
     allocate = Mock()
     monkeypatch.setattr(env, "grant", grant)
@@ -1174,6 +1211,40 @@ def test_nonroot_build_is_retained_but_consumer_refuses_before_allocation(enviro
     grant.assert_not_called()
     allocate.assert_not_called()
     assert not conn.compute.mock_calls and not conn.shared_file_system.mock_calls
+
+
+@pytest.mark.parametrize("policy_state", ["missing", "foreign"])
+def test_direct_worker_denied_source_never_mounts_uploads_or_creates_intake(
+    environment,
+    monkeypatch,
+    tmp_path,
+    policy_state,
+):
+    env = intake_worker(environment, monkeypatch)
+    config = cloud_env.resolve_roots().config / "config.toml"
+    if policy_state == "missing":
+        config.unlink()
+    else:
+        config.write_text(
+            '[image_sources]\nschema_version=1\npublisher_policy="registry-namespace"\n'
+            '[[image_sources.rules]]\nregistry="docker.io"\nnamespace="foreign"\nrepository="cuda"\n'
+        )
+    remote = Mock()
+    monkeypatch.setattr(env, "ssh", remote)
+    reference = "docker.io/nvidia/cuda@sha256:" + "b" * 64
+    with pytest.raises(ImageSourcePolicyError):
+        env.pull(reference=reference, tag="cuda", timeout=60)
+    assert "image_intakes" not in json.loads(env.state_path.read_text())
+    context = tmp_path / "denied-context"
+    context.mkdir()
+    dockerfile = context / "Dockerfile"
+    dockerfile.write_text("FROM docker.io/nvidia/cuda:12.2.2\nRUN true\n")
+    with pytest.raises(ImageSourcePolicyError):
+        env.build(dockerfile=dockerfile, context=context, tag="cuda", timeout=60)
+    remote.assert_not_called()
+    env._send_mount.assert_not_called()
+    env.upload.assert_not_called()
+    assert "cuda" not in json.loads(env.state_path.read_text())["images"]
 
 
 @pytest.mark.parametrize("assembly_code,command_code", [(0, 0), (0, 7), (23, 0)])
@@ -1984,3 +2055,229 @@ def test_worker_source_archive_ignores_non_distributed_finder_metadata(tmp_path,
     with tarfile.open(fileobj=io.BytesIO(actual)) as archive:
         assert archive.getnames() == ["palimpsest_local/cloud_env.py"]
         assert archive.extractfile("palimpsest_local/cloud_env.py").read() == module.read_bytes()
+
+
+@pytest.mark.parametrize("revoke_at", [None, 0, 1])
+def test_existing_process_pipes_check_current_operator_policy_before_publication(tmp_path, monkeypatch, revoke_at):
+    from palimpsest_local.image_policy_channel import run_policy_process
+    from palimpsest_local.image_source_policy import load_image_source_policy
+    from palimpsest_local.state import resolve_roots
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "operator"))
+    monkeypatch.setenv("PALIMPSEST_STATE_HOME", str(tmp_path / "state"))
+    config = tmp_path / "operator" / "palimpsest"
+    config.mkdir(mode=0o700, parents=True)
+    operator = config / "config.toml"
+    operator.write_text(
+        '[image_sources]\nschema_version=1\npublisher_policy="registry-namespace"\n'
+        '[[image_sources.rules]]\nregistry="docker.io"\nnamespace="nvidia"\nrepository="cuda"\n'
+    )
+    operator.chmod(0o600)
+    initial = load_image_source_policy(resolve_roots())
+    payload, image_path, hold = (tmp_path / name for name in ("payload", "image", "hold"))
+    # This is a real consumer of the bounded pipe protocol, not an echo mock:
+    # neither publication executes until its nonce-bound reply is accepted.
+    code = (
+        "import sys,json,time; from pathlib import Path; "
+        f"sys.path.insert(0,{str(Path(cloud_env.__file__).parents[1])!r})\n"
+        "from palimpsest_local.image_policy_channel import PipePolicyAuthority,PolicyPublicationHold\n"
+        "from palimpsest_local.image_source_policy import image_source_policy_from_dict\n"
+        f"authority=PipePolicyAuthority(image_source_policy_from_dict({initial.to_dict()!r}))\n"
+        "try:\n"
+        " authority('payload:0',time.monotonic()+10)\n"
+        f" Path({str(payload)!r}).write_bytes(b'committed-prefix')\n"
+        " authority('image',time.monotonic()+10)\n"
+        f" Path({str(image_path)!r}).write_bytes(b'image')\n"
+        "except PolicyPublicationHold:\n"
+        f" Path({str(hold)!r}).write_text('hold')\n"
+        " print(json.dumps({'status':'hold'}),flush=True)\n"
+        " sys.exit(1)\n"
+        "print(json.dumps({'status':'success'}),flush=True)\n"
+    )
+    checkpoints = []
+
+    def current():
+        index = len(checkpoints)
+        checkpoints.append(index)
+        if index == revoke_at:
+            operator.write_text('[image_sources]\nschema_version=1\npublisher_policy="registry-namespace"\nrules=[]\n')
+        return load_image_source_policy(resolve_roots())
+
+    result = run_policy_process(
+        [sys.executable, "-c", code],
+        initial=initial,
+        current_policy=current,
+        policy_timeout=10,
+        process_timeout=12,
+    )
+    receipt = json.loads(result.stdout)
+    assert result.stderr == b""
+    assert receipt["status"] == ("success" if revoke_at is None else "hold")
+    assert result.returncode == (0 if revoke_at is None else 1)
+    assert payload.exists() is (revoke_at != 0)
+    assert image_path.exists() is (revoke_at is None)
+    assert hold.exists() is (revoke_at is not None)
+    assert checkpoints == ([0] if revoke_at == 0 else [0, 1])
+
+
+@pytest.mark.parametrize("fault", ["nonce", "stage", "digest", "eof", "oversize", "deadline"])
+def test_pipe_publication_authority_rejects_unknown_or_stale_replies(tmp_path, fault):
+    import threading
+
+    from palimpsest_local.image_policy_channel import MAX_FRAME, PREFIX, PipePolicyAuthority, PolicyPublicationHold
+    from palimpsest_local.image_source_policy import ImageSourcePolicy
+
+    request_read, request_write = os.pipe()
+    reply_read, reply_write = os.pipe()
+    initial = ImageSourcePolicy()
+    replies = []
+
+    def controller():
+        raw = bytearray()
+        while not raw.endswith(b"\n"):
+            chunk = os.read(request_read, 1)
+            if not chunk:
+                return
+            raw.extend(chunk)
+        request = json.loads(raw[len(PREFIX) :])
+        replies.append(request)
+        response = {**request, "allow": True}
+        if fault in {"nonce", "stage"}:
+            response[fault] = "wrong"
+        elif fault == "digest":
+            response["initial_policy_digest"] = "sha256:" + "f" * 64
+        if fault == "oversize":
+            os.write(reply_write, b"x" * (MAX_FRAME + 1) + b"\n")
+        elif fault != "eof":
+            os.write(reply_write, PREFIX + json.dumps(response).encode() + b"\n")
+        os.close(reply_write)
+
+    thread = None
+    try:
+        if fault != "deadline":
+            thread = threading.Thread(target=controller, daemon=True)
+            thread.start()
+        authority = PipePolicyAuthority(initial, read_fd=reply_read, write_fd=request_write)
+        with pytest.raises(PolicyPublicationHold):
+            authority("image", time.monotonic() + (2 if fault != "deadline" else -1))
+        if thread:
+            thread.join(timeout=2)
+            assert not thread.is_alive()
+            assert len(replies) == 1 and len(replies[0]["nonce"]) == 32
+        else:
+            assert replies == []
+    finally:
+        for fd in (request_read, request_write, reply_read):
+            os.close(fd)
+        if fault == "deadline":
+            os.close(reply_write)
+
+
+@pytest.mark.parametrize("fault", ["replayed-challenge", "oversized-challenge", "oversized-stderr"])
+def test_controller_bounds_protocol_and_reaps_rejected_process(tmp_path, monkeypatch, fault):
+    from palimpsest_local import image_policy_channel as channel
+    from palimpsest_local.image_source_policy import ImageSourcePolicy
+
+    initial = ImageSourcePolicy()
+    challenge = (
+        channel.PREFIX
+        + json.dumps(
+            {
+                "nonce": "a" * 32,
+                "initial_policy_digest": initial.digest,
+                "stage": "image",
+            }
+        ).encode()
+        + b"\n"
+    )
+    if fault == "replayed-challenge":
+        code = f"import os; os.write(1,{challenge!r}); os.read(0,2048); os.write(1,{challenge!r}); os.read(0,2048)"
+    elif fault == "oversized-challenge":
+        code = f"import os,time; os.write(1,{channel.PREFIX!r}+b'x'*2048); time.sleep(10)"
+    else:
+        monkeypatch.setattr(channel, "MAX_STDERR", 1024)
+        code = "import os,time; os.write(2,b'x'*2048); time.sleep(10)"
+    real_popen = subprocess.Popen
+    processes = []
+
+    def start(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(channel.subprocess, "Popen", start)
+    with pytest.raises(channel.PolicyPublicationHold):
+        channel.run_policy_process(
+            [sys.executable, "-c", code],
+            initial=initial,
+            current_policy=lambda: initial,
+            policy_timeout=2,
+            process_timeout=3,
+        )
+    assert len(processes) == 1 and processes[0].returncode is not None
+    assert all(stream.closed for stream in (processes[0].stdin, processes[0].stdout, processes[0].stderr))
+
+
+def test_expired_policy_denies_publication_but_preserves_process_settlement_grace(tmp_path):
+    from palimpsest_local.image_policy_channel import PREFIX, run_policy_process
+    from palimpsest_local.image_source_policy import ImageSourcePolicy
+
+    initial = ImageSourcePolicy()
+    request = {
+        "nonce": "a" * 32,
+        "initial_policy_digest": initial.digest,
+        "stage": "image",
+    }
+    # Start with an already-expired policy deadline. The real subprocess must
+    # still receive a denial and settle itself, rather than being TERMed.
+    code = (
+        "import os,sys,json,time\n"
+        f"os.write(1,{PREFIX + json.dumps(request).encode() + bytes([10])!r})\n"
+        "reply=json.loads(sys.stdin.buffer.readline().split(b' ',1)[1])\n"
+        "assert reply['allow'] is False\n"
+        "time.sleep(0.1)\n"
+        "print(json.dumps({'status':'hold','settled':True}),flush=True)\n"
+        "sys.exit(1)\n"
+    )
+    result = run_policy_process(
+        [sys.executable, "-c", code],
+        initial=initial,
+        current_policy=lambda: initial,
+        policy_timeout=0,
+        process_timeout=3,
+    )
+    assert result.returncode == 1 and result.stderr == b""
+    assert json.loads(result.stdout) == {"status": "hold", "settled": True}
+
+
+def test_private_policy_descriptors_exclude_child_stdin_and_stdout(tmp_path):
+    from palimpsest_local.image_policy_channel import run_policy_process
+    from palimpsest_local.image_source_policy import ImageSourcePolicy
+
+    initial = ImageSourcePolicy()
+    image_path = tmp_path / "image"
+    code = (
+        "import sys,json,time,subprocess; from pathlib import Path\n"
+        f"sys.path.insert(0,{str(Path(cloud_env.__file__).parents[1])!r})\n"
+        "from palimpsest_local.image_policy_channel import isolated_policy_channel\n"
+        "from palimpsest_local.image_source_policy import ImageSourcePolicy\n"
+        "with isolated_policy_channel(ImageSourcePolicy()) as authority:\n"
+        " assert not __import__('os').get_inheritable(authority.read_fd)\n"
+        " assert not __import__('os').get_inheritable(authority.write_fd)\n"
+        " child=subprocess.run([sys.executable,'-c',"
+        '\'import sys; assert sys.stdin.buffer.read()==b""; print("child-output")\'],check=True)\n'
+        " authority('image',time.monotonic()+10)\n"
+        f" Path({str(image_path)!r}).write_bytes(b'published')\n"
+        "print(json.dumps({'status':'success'}),flush=True)\n"
+    )
+    result = run_policy_process(
+        [sys.executable, "-c", code],
+        initial=initial,
+        current_policy=lambda: initial,
+        policy_timeout=10,
+        process_timeout=12,
+    )
+    assert result.returncode == 0
+    assert json.loads(result.stdout) == {"status": "success"}
+    assert result.stderr == b"child-output\n"
+    assert image_path.read_bytes() == b"published"

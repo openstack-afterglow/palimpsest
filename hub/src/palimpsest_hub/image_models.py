@@ -142,3 +142,48 @@ class PalimpsestHubImageMembership(Base):
         Index("idx_image_membership_node", "project_id", "node_id"),
         Index("idx_image_membership_payload", "blob_digest"),
     )
+
+
+class PalimpsestHubImageQuotaPolicy(Base):
+    """Administrator-owned publication limits; NULL means unlimited, never a code default."""
+
+    __tablename__ = "palimpsest_hub_image_quota_policies"
+
+    tier: Mapped[str] = mapped_column(VARCHAR(16), primary_key=True)
+    visibility: Mapped[str] = mapped_column(VARCHAR(16), primary_key=True)
+    max_images: Mapped[int | None] = mapped_column(BIGINT)
+    max_chain_bytes: Mapped[int | None] = mapped_column(BIGINT)
+    max_source_bytes: Mapped[int | None] = mapped_column(BIGINT)
+    # NULL updated_by marks an untouched startup seed row.
+    updated_by: Mapped[str | None] = mapped_column(VARCHAR(128))
+    updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False, default=_now)
+
+
+class PalimpsestHubImageQuotaTier(Base):
+    """Explicit tier assignment; an absent subject is on the free tier."""
+
+    __tablename__ = "palimpsest_hub_image_quota_tiers"
+
+    subject_kind: Mapped[str] = mapped_column(VARCHAR(16), primary_key=True)
+    subject_id: Mapped[str] = mapped_column(VARCHAR(128), primary_key=True)
+    tier: Mapped[str] = mapped_column(VARCHAR(16), nullable=False)
+    updated_by: Mapped[str] = mapped_column(VARCHAR(128), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False, default=_now)
+
+
+class PalimpsestHubImageSourceBlob(Base):
+    """One OCI source-closure blob of a publication (root/manifest/config/compressed layer)."""
+
+    __tablename__ = "palimpsest_hub_image_source_blobs"
+
+    image_id: Mapped[str] = mapped_column(
+        CHAR(36), ForeignKey("palimpsest_hub_published_images.id", ondelete="CASCADE"), primary_key=True
+    )
+    role: Mapped[str] = mapped_column(VARCHAR(16), primary_key=True)
+    ordinal: Mapped[int] = mapped_column(BIGINT, primary_key=True)
+    project_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
+    blob_digest: Mapped[str] = mapped_column(VARCHAR(71), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(BIGINT, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False, default=_now)
+
+    __table_args__ = (Index("idx_image_source_blob_digest", "blob_digest"),)

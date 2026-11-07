@@ -7,7 +7,7 @@ import pytest
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from palimpsest_hub.image_models import PalimpsestHubBuildContext, PalimpsestHubImageJob
+from palimpsest_hub.image_models import PalimpsestHubBuildContext, PalimpsestHubImageJob, PalimpsestHubImageQuotaTier
 from palimpsest_hub.instance_models import PalimpsestHubInstance
 from palimpsest_hub.migrate import MigrationError, migrate
 from palimpsest_hub.models import (
@@ -117,6 +117,345 @@ async def test_migrate_rejects_partial_native_state_before_copying_any_legacy_ro
             await destination.dispose()
     finally:
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "damage",
+    [
+        None,
+        "unknown-tier",
+        "negative-limit",
+        "negative-source",
+        "subject-kind",
+        "subject-id",
+        "blank-updater",
+        "partial-schema",
+    ],
+)
+async def test_migrate_copies_image_quota_policy_and_tiers_or_rejects_corrupt_rows(tmp_path: Path, damage):
+    source_url = f"sqlite+aiosqlite:///{tmp_path / 'quota-source.sqlite'}"
+    destination_url = f"sqlite+aiosqlite:///{tmp_path / 'quota-destination.sqlite'}"
+    await create_database(source_url, with_rows=True)
+    await create_database(destination_url, with_rows=False)
+    policies = Base.metadata.tables["palimpsest_hub_image_quota_policies"]
+    tiers = Base.metadata.tables["palimpsest_hub_image_quota_tiers"]
+    policy_rows = [
+        {
+            "tier": "free",
+            "visibility": "private",
+            "max_images": 3,
+            "max_chain_bytes": 4096,
+            "max_source_bytes": 8192,
+            "updated_by": "f" * 32,
+        },
+        {
+            "tier": "paid",
+            "visibility": "public",
+            "max_images": None,
+            "max_chain_bytes": 2**63 - 1,
+            "max_source_bytes": None,
+            "updated_by": None,
+        },
+    ]
+    tier_rows = [{"subject_kind": "user", "subject_id": "d" * 32, "tier": "paid", "updated_by": "f" * 32}]
+    if damage == "unknown-tier":
+        policy_rows[0]["tier"] = "gold"
+    elif damage == "negative-limit":
+        policy_rows[0]["max_images"] = -1
+    elif damage == "subject-kind":
+        tier_rows[0]["subject_kind"] = "group"
+    elif damage == "subject-id":
+        tier_rows[0]["subject_id"] = "bad id"
+    elif damage == "blank-updater":
+        tier_rows[0]["updated_by"] = "  "
+    elif damage == "negative-source":
+        policy_rows[1]["max_source_bytes"] = -5
+    source = create_async_engine(source_url)
+    try:
+        async with source.begin() as connection:
+            await connection.execute(policies.insert(), policy_rows)
+            await connection.execute(tiers.insert(), tier_rows)
+            if damage == "partial-schema":
+                await connection.execute(text("DROP TABLE palimpsest_hub_image_quota_tiers"))
+    finally:
+        await source.dispose()
+    destination = create_async_engine(destination_url)
+    try:
+        if damage:
+            with pytest.raises(MigrationError):
+                await migrate(source_url, destination_url)
+            async with destination.connect() as connection:
+                assert await connection.scalar(text("SELECT count(*) FROM palimpsest_hub_layers")) == 0
+                assert await connection.scalar(text("SELECT count(*) FROM palimpsest_hub_image_quota_policies")) == 0
+                assert await connection.scalar(text("SELECT count(*) FROM palimpsest_hub_image_quota_tiers")) == 0
+            return
+        copied = await migrate(source_url, destination_url)
+        assert copied["palimpsest_hub_image_quota_policies"] == 2
+        assert copied["palimpsest_hub_image_quota_tiers"] == 1
+        fields = ("tier", "visibility", "max_images", "max_chain_bytes", "max_source_bytes", "updated_by")
+        async with destination.connect() as connection:
+            stored = (await connection.execute(select(*(policies.c[name] for name in fields)))).all()
+            by_tier = {row["tier"]: row for row in (dict(zip(fields, item, strict=True)) for item in stored)}
+            assert by_tier == {row["tier"]: row for row in policy_rows}
+            assigned = (
+                await connection.execute(
+                    select(tiers.c.subject_kind, tiers.c.subject_id, tiers.c.tier, tiers.c.updated_by)
+                )
+            ).all()
+            assert [tuple(row) for row in assigned] == [("user", "d" * 32, "paid", "f" * 32)]
+    finally:
+        await destination.dispose()
+
+
+@pytest.mark.asyncio
+async def test_migrate_accepts_a_source_from_before_image_quota(tmp_path: Path):
+    source_url = f"sqlite+aiosqlite:///{tmp_path / 'pre-quota.sqlite'}"
+    destination_url = f"sqlite+aiosqlite:///{tmp_path / 'quota-ready.sqlite'}"
+    await create_database(source_url, with_rows=True)
+    await create_database(destination_url, with_rows=False)
+    source = create_async_engine(source_url)
+    try:
+        async with source.begin() as connection:
+            await connection.execute(text("DROP TABLE palimpsest_hub_image_quota_policies"))
+            await connection.execute(text("DROP TABLE palimpsest_hub_image_quota_tiers"))
+    finally:
+        await source.dispose()
+    copied = await migrate(source_url, destination_url)
+    assert copied["palimpsest_hub_layers"] == 1
+    assert copied["palimpsest_hub_image_quota_policies"] == copied["palimpsest_hub_image_quota_tiers"] == 0
+
+
+@pytest.mark.asyncio
+async def test_migrate_fills_a_missing_source_cap_from_the_chain_cap(tmp_path: Path):
+    source_url = f"sqlite+aiosqlite:///{tmp_path / 'pre-source-cap.sqlite'}"
+    destination_url = f"sqlite+aiosqlite:///{tmp_path / 'source-cap.sqlite'}"
+    await create_database(source_url, with_rows=True)
+    await create_database(destination_url, with_rows=False)
+    source = create_async_engine(source_url)
+    try:
+        async with source.begin() as connection:
+            await connection.execute(
+                text("ALTER TABLE palimpsest_hub_image_quota_policies DROP COLUMN max_source_bytes")
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO palimpsest_hub_image_quota_policies "
+                    "(tier, visibility, max_images, max_chain_bytes, updated_by, updated_at) "
+                    "VALUES ('free', 'private', 2, 4096, NULL, '2026-11-07 00:00:00')"
+                )
+            )
+    finally:
+        await source.dispose()
+    await migrate(source_url, destination_url)
+    destination = create_async_engine(destination_url)
+    try:
+        async with destination.connect() as connection:
+            row = (
+                await connection.execute(
+                    text("SELECT max_chain_bytes, max_source_bytes FROM palimpsest_hub_image_quota_policies")
+                )
+            ).one()
+            assert tuple(row) == (4096, 4096)
+    finally:
+        await destination.dispose()
+
+
+def _closure_image(image_id: str, project: str) -> tuple[dict, list[dict]]:
+    from palimpsest_local.image_manifest import manifest_from_result
+
+    manifest = manifest_from_result(
+        {
+            "layers": [
+                {
+                    "digest": "sha256:" + "a" * 64,
+                    "size_bytes": 4096,
+                    "source": {
+                        "oci_layer": {"ordinal": 0, "compressed": {"digest": "sha256:" + "6" * 64, "size": 600}}
+                    },
+                }
+            ],
+            "source": {
+                "manifest_digest": "sha256:" + "4" * 64,
+                "config_digest": "sha256:" + "5" * 64,
+                "root_digest": "sha256:" + "4" * 64,
+            },
+            "runtime": {"entrypoint": [], "cmd": [], "env": [], "working_dir": "/", "user": "0"},
+        },
+        os_family="fixture-os",
+        os_version="1",
+        source_kind="local",
+    )
+    image = {
+        "id": image_id,
+        "project_id": project,
+        "created_by": "d" * 32,
+        "request_id": image_id,
+        "name": "closure",
+        "visibility": "private",
+        "manifest_digest": "sha256:" + "1" * 64,
+        "manifest_json": manifest,
+        "leaf_id": manifest["layers"][-1]["id"],
+        "storage_binding_json": {"kind": "local", "root": "blobs/sha256"},
+    }
+    blobs = [
+        {"role": role, "ordinal": 0, "blob_digest": "sha256:" + char * 64, "size_bytes": size}
+        for role, char, size in (("manifest", "4", 400), ("config", "5", 500), ("layer", "6", 600))
+    ]
+    return image, [{**item, "image_id": image_id, "project_id": project} for item in blobs]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", [None, "unknown-role", "orphan", "two-manifests", "project", "uncommitted"])
+async def test_migrate_copies_source_closure_rows_or_rejects_incoherent_ones(tmp_path: Path, damage):
+    from uuid import uuid4
+
+    source_url = f"sqlite+aiosqlite:///{tmp_path / 'closure-source.sqlite'}"
+    destination_url = f"sqlite+aiosqlite:///{tmp_path / 'closure-destination.sqlite'}"
+    await create_database(source_url, with_rows=True)
+    await create_database(destination_url, with_rows=False)
+    image_id = str(uuid4())
+    image, blobs = _closure_image(image_id, "c" * 32)
+    if damage == "unknown-role":
+        blobs[0]["role"] = "kernel"
+    elif damage == "orphan":
+        blobs = [{**item, "image_id": str(uuid4())} for item in blobs]
+    elif damage == "two-manifests":
+        blobs.append({**blobs[0], "ordinal": 1})
+    elif damage == "project":
+        blobs[0]["project_id"] = "e" * 32
+    elif damage == "uncommitted":
+        # Manifest that does not name its closure: its digest would not commit to these blobs.
+        image["manifest_json"] = {**image["manifest_json"], "source": {"kind": "local"}}
+    source = create_async_engine(source_url)
+    try:
+        async with source.begin() as connection:
+            await connection.execute(Base.metadata.tables["palimpsest_hub_published_images"].insert(), [image])
+            await connection.execute(Base.metadata.tables["palimpsest_hub_image_source_blobs"].insert(), blobs)
+    finally:
+        await source.dispose()
+    destination = create_async_engine(destination_url)
+    try:
+        if damage:
+            with pytest.raises(MigrationError):
+                await migrate(source_url, destination_url)
+            async with destination.connect() as connection:
+                assert await connection.scalar(text("SELECT count(*) FROM palimpsest_hub_image_source_blobs")) == 0
+            return
+        copied = await migrate(source_url, destination_url)
+        assert copied["palimpsest_hub_image_source_blobs"] == 3
+        async with destination.connect() as connection:
+            rows = (
+                await connection.execute(
+                    text("SELECT role, blob_digest, size_bytes FROM palimpsest_hub_image_source_blobs ORDER BY role")
+                )
+            ).all()
+            assert [tuple(row) for row in rows] == [
+                ("config", "sha256:" + "5" * 64, 500),
+                ("layer", "sha256:" + "6" * 64, 600),
+                ("manifest", "sha256:" + "4" * 64, 400),
+            ]
+    finally:
+        await destination.dispose()
+
+
+def _image_key_row(**changes) -> dict:
+    created = datetime(2026, 11, 1, 8, 0, 0, 123456)
+    return {
+        "id": "e" * 32,
+        "project_id": "c" * 32,
+        "owner_user_id": "f" * 64,
+        "secret_hash": "9" * 64,
+        "name": "ci publisher",
+        "actions": ["images:publish", "images:read"],
+        "created_at": created,
+        "expires_at": created + timedelta(days=90),
+        "revoked_at": created + timedelta(days=2),
+        "last_used_at": created + timedelta(days=1, microseconds=7),
+        **changes,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "damage",
+    [
+        None,
+        "plaintext-secret",
+        "uppercase-hash",
+        "lifetime-over-90-days",
+        "expires-before-issue",
+        "revoked-before-issue",
+        "unknown-action",
+        "duplicate-action",
+        "bad-owner",
+        "bad-project",
+        "bad-id",
+    ],
+)
+async def test_migrate_copies_image_keys_verbatim_or_rejects_corrupt_rows(tmp_path: Path, damage):
+    source_url = f"sqlite+aiosqlite:///{tmp_path / 'keys-source.sqlite'}"
+    destination_url = f"sqlite+aiosqlite:///{tmp_path / 'keys-destination.sqlite'}"
+    await create_database(source_url, with_rows=True)
+    await create_database(destination_url, with_rows=False)
+    keys = Base.metadata.tables["palimpsest_image_keys"]
+    created = _image_key_row()["created_at"]
+    # A valid, already-expired and never-used key is preserved as well.
+    expired = _image_key_row(
+        id="d" * 32, actions=["images:read"], expires_at=created + timedelta(days=1), revoked_at=None, last_used_at=None
+    )
+    changes = {
+        None: {},
+        "plaintext-secret": {"secret_hash": "ppi_v1_" + "0" * 32 + "." + "A" * 43},
+        "uppercase-hash": {"secret_hash": "A" * 64},
+        "lifetime-over-90-days": {"expires_at": created + timedelta(days=90, seconds=1)},
+        "expires-before-issue": {"expires_at": created},
+        "revoked-before-issue": {"revoked_at": created - timedelta(seconds=1)},
+        "unknown-action": {"actions": ["images:read", "packages:write"]},
+        "duplicate-action": {"actions": ["images:read", "images:read"]},
+        "bad-owner": {"owner_user_id": "bad owner"},
+        "bad-project": {"project_id": ""},
+        "bad-id": {"id": "E" * 32},
+    }[damage]
+    rows = [_image_key_row(**changes), expired]
+    source = create_async_engine(source_url)
+    try:
+        async with source.begin() as connection:
+            await connection.execute(keys.insert(), rows)
+    finally:
+        await source.dispose()
+    destination = create_async_engine(destination_url)
+    try:
+        if damage:
+            with pytest.raises(MigrationError, match="palimpsest_image_keys"):
+                await migrate(source_url, destination_url)
+            async with destination.connect() as connection:
+                assert await connection.scalar(text("SELECT count(*) FROM palimpsest_hub_layers")) == 0
+                assert await connection.scalar(text("SELECT count(*) FROM palimpsest_image_keys")) == 0
+            return
+        copied = await migrate(source_url, destination_url)
+        assert copied["palimpsest_image_keys"] == 2 and copied["palimpsest_hub_layers"] == 1
+        async with destination.connect() as connection:
+            stored = [dict(row) for row in (await connection.execute(select(keys).order_by(keys.c.id))).mappings()]
+        assert stored == sorted(rows, key=lambda row: row["id"])
+    finally:
+        await destination.dispose()
+
+
+@pytest.mark.asyncio
+async def test_migrate_accepts_a_source_from_before_image_keys(tmp_path: Path):
+    source_url = f"sqlite+aiosqlite:///{tmp_path / 'pre-keys.sqlite'}"
+    destination_url = f"sqlite+aiosqlite:///{tmp_path / 'keys-ready.sqlite'}"
+    await create_database(source_url, with_rows=True)
+    await create_database(destination_url, with_rows=False)
+    source = create_async_engine(source_url)
+    try:
+        async with source.begin() as connection:
+            await connection.execute(text("DROP TABLE palimpsest_image_keys"))
+    finally:
+        await source.dispose()
+    copied = await migrate(source_url, destination_url)
+    assert copied["palimpsest_hub_layers"] == 1 and copied["palimpsest_image_keys"] == 0
 
 
 @pytest.mark.asyncio
@@ -497,6 +836,12 @@ async def test_published_graph_survives_migration_or_rejects_corrupt_parent_atom
                         size_bytes=verified.size_bytes,
                     )
                 )
+            # Three private names exceed the free seed (2); this test is about graph migration, not quota.
+            session.add(
+                PalimpsestHubImageQuotaTier(
+                    subject_kind="user", subject_id=actor["user_id"], tier="paid", updated_by="test"
+                )
+            )
             await session.commit()
         images = []
         for branch, indices in (("left", [0, 1]), ("right", [0, 2]), ("reused", [2, 1])):

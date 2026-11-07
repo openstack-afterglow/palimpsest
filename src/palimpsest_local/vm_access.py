@@ -17,10 +17,17 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from . import lima, platforms, runtime_dispatch, state
-from .errors import PalimpsestError
+from . import host_vm_control, lima, platforms, runtime_dispatch, state
+from .errors import PalimpsestError, RuntimeBusyError
 from .process_session import bind_process_session_context, spawn_process_session
-from .runtime_types import ExpectedRunIdentity, ProcessOutputEvent, ProcessStatusEvent, ProcessStream
+from .runtime_types import (
+    ExpectedRunIdentity,
+    ProcessOutputEvent,
+    ProcessStatusEvent,
+    ProcessStream,
+    RuntimeBackend,
+    RuntimeKind,
+)
 
 if TYPE_CHECKING:
     from .vm_exec_session import ExecOwners
@@ -37,13 +44,27 @@ class VMAccessError(PalimpsestError):
         super().__init__(message)
 
 
-def capabilities(row: dict, *, live: bool = True, collision: bool = False) -> dict:
+def capabilities(row: dict, *, live: bool = True, collision: bool = False, busy: bool = False) -> dict:
     reason = message = None
     transport = None
+    retained_console = False
     if not live:
         reason, message = "unobserved", "Live VM identity has not been observed"
+    elif busy:
+        reason, message = "busy", "VM observation is busy; try again when the current operation completes"
     elif row.get("stale") or collision:
         reason, message = "identity", "VM identity is stale or collides with a selected run"
+    elif not row.get("managed") and row.get("runtime_kind") in {"oci-root", "unknown"}:
+        reason, message = "identity", "Native OCI access requires its original managed runtime"
+    elif row.get("managed") and row.get("runtime_kind") == "oci-root":
+        if (
+            row.get("backend") == RuntimeBackend.LIMA_VZ.value
+            and row.get("runtime_status", row.get("status")) == "removed"
+        ):
+            reason, message = "stopped", "VM is removed; guest access is unavailable"
+            retained_console = row.get("status") == "removed"
+        else:
+            transport = "owned-ssh" if row.get("backend") in platforms.LIMA_BACKENDS else "oci-monitor"
     elif row.get("backend") in platforms.LIMA_BACKENDS:
         if not row.get("managed") and row.get("run_id") is None:
             reason, message = "identity", "Unmarked external Lima identity cannot be authenticated"
@@ -59,7 +80,7 @@ def capabilities(row: dict, *, live: bool = True, collision: bool = False) -> di
         "shell": available and running and row.get("runtime_kind") != "oci-root",
         "exec": available and running,
         "metrics": available and running,
-        "logs": available,
+        "logs": available or retained_console,
         "transport": transport,
         "reason": reason or (None if running else "stopped"),
         "message": message or (None if running else "VM is not running; guest access is unavailable"),
@@ -231,16 +252,23 @@ class Access:
     row: dict
     record: object | None = None
     exec_owners: ExecOwners | None = None
+    _observation_budget: state.RunObservationWaitBudget | None = None
 
     @classmethod
-    def resolve(cls, roots, identifier, *, expected_run_id=None):
+    def resolve(cls, roots, identifier, *, expected_run_id=None, purpose="guest"):
         from .inventory import get_vm
 
-        row = get_vm(roots, identifier)
+        budget = state.RunObservationWaitBudget()
+        try:
+            row = get_vm(roots, identifier, _observation_budget=budget)
+        except RuntimeBusyError:
+            raise VMAccessError(
+                "busy", "VM observation is busy; try again when the current operation completes"
+            ) from None
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", row["name"]):
             raise VMAccessError("identity", "Backend VM name is not safe for transport selection")
         access = row["access"]
-        if access["transport"] is None:
+        if access["transport"] is None and not (purpose == "logs" and access["logs"]):
             raise VMAccessError(access["reason"], access["message"])
         record = None
         if expected_run_id is not None and expected_run_id != row.get("run_id"):
@@ -248,7 +276,15 @@ class Access:
         if not row["managed"] and expected_run_id is None:
             raise VMAccessError("identity", "External VM access requires the observed run identity")
         if row["managed"]:
-            record = runtime_dispatch.resolve_existing_run(row["name"], roots=roots)
+            try:
+                if row["backend"] == "lima-vz" and row.get("runtime_kind") == "oci-root":
+                    record = runtime_dispatch.resolve_existing_run(row["name"], roots=roots, _observation_budget=budget)
+                else:
+                    record = runtime_dispatch.resolve_existing_run(row["name"], roots=roots)
+            except RuntimeBusyError:
+                raise VMAccessError(
+                    "busy", "VM observation is busy; try again when the current operation completes"
+                ) from None
             if record.run_id != row["run_id"] or record.dispatch_key.backend.value != row["backend"]:
                 raise VMAccessError("identity", "Selected VM identity changed")
             if (
@@ -264,14 +300,27 @@ class Access:
                             raise OSError
                 except OSError:
                     raise VMAccessError("credentials", "Selected VM SSH credentials or trust are unavailable") from None
-        return cls(roots, row, record)
+        return cls(roots, row, record, _observation_budget=budget)
 
     def _require_running(self):
+        # Inventory status is physical liveness; runtime_status may still be exited.
+        # Never admit an exited main without the fresh identity-bound VM observation.
         if self.row["status"] != "running":
             raise VMAccessError("stopped", "VM is not running; guest access is unavailable")
 
+    def _require_generic_lima(self, instance):
+        if (
+            self.row.get("runtime_kind") in {"oci-root", "unknown"}
+            or self.record is not None
+            and self.record.dispatch_key.runtime_kind.value == "oci-root"
+            or self.record is None
+            and host_vm_control.lima_oci_runtime_kind(instance) is not None
+        ):
+            raise VMAccessError("identity", "Native OCI access requires its original managed runtime")
+
     def _check(self, path, identity, *, running):
         current = _instance(self.row["name"])
+        self._require_generic_lima(current)
         if (
             lima.instance_backend(current) != self.row["backend"]
             or _directory(current) != path
@@ -288,6 +337,7 @@ class Access:
     def _lima_authority(self, *, running=True):
         with ExitStack() as resources:
             first = _instance(self.row["name"])
+            self._require_generic_lima(first)
             if lima.instance_backend(first) != self.row["backend"] or lima._instance_run_id(first) != self.row.get(
                 "run_id"
             ):
@@ -300,12 +350,21 @@ class Access:
             yield fd, lambda: self._check(path, identity, running=running)
 
     def open(self, mode="shell", argv=(), *, probe=False):
+        if self.record is None and self.row.get("runtime_kind") in {"oci-root", "unknown"}:
+            raise VMAccessError("identity", "Native OCI access requires its original managed runtime")
         self._require_running()
-        if self.row["backend"] not in platforms.LIMA_BACKENDS:
+        if self.row["backend"] not in platforms.LIMA_BACKENDS or (
+            self.record is not None and self.record.dispatch_key.runtime_kind.value == "oci-root"
+        ):
             identity = ExpectedRunIdentity(self.record.name, self.record.run_id, self.record.dispatch_key)
             if mode == "shell":
-                return runtime_dispatch.shell(self.row["name"], roots=self.roots, expected_identity=identity)
-            if self.row.get("runtime_kind") == "oci-root":
+                return runtime_dispatch.shell(
+                    self.row["name"],
+                    roots=self.roots,
+                    expected_identity=identity,
+                    _observation_budget=self._observation_budget,
+                )
+            if self.record.dispatch_key.runtime_kind is RuntimeKind.OCI_ROOT:
                 from .vm_exec_session import RetainedExecSession
 
                 def submit():
@@ -315,9 +374,18 @@ class Access:
                         roots=self.roots,
                         expected_identity=identity,
                         timeout_ms=8000 if probe else None,
+                        _observation_budget=(
+                            self._observation_budget
+                            if self.record.dispatch_key.backend is RuntimeBackend.LIMA_VZ
+                            else None
+                        ),
                     )
 
-                return self.exec_owners.open(submit) if self.exec_owners is not None else RetainedExecSession(submit())
+                # SSH processes retain lifetime but do not own an OCI mailbox ACK.
+                requires_ack = self.record.dispatch_key.backend is not RuntimeBackend.LIMA_VZ
+                if self.exec_owners is not None:
+                    return self.exec_owners.open(submit, requires_ack=requires_ack)
+                return RetainedExecSession(submit(), requires_ack=requires_ack)
             return runtime_dispatch.exec(self.row["name"], argv, roots=self.roots, expected_identity=identity)
         authority = ExitStack()
         session = None
@@ -355,29 +423,49 @@ class Access:
         return _collect(self.open("exec", argv, probe=True))
 
     def logs(self, tail):
+        if self.record is not None and (
+            self.record.dispatch_key.runtime_kind.value == "oci-root"
+            or self.row["status"] != "running"
+            and self.row["backend"] not in platforms.LIMA_BACKENDS
+        ):
+            with ExitStack() as locks:
+                run_authority = None
+                if (
+                    self.record.dispatch_key.runtime_kind is RuntimeKind.OCI_ROOT
+                    and self.record.dispatch_key.backend is RuntimeBackend.LIMA_VZ
+                ):
+                    budget = self._observation_budget
+                    if budget is None:
+                        budget = state.RunObservationWaitBudget()
+                    run_authority = locks.enter_context(
+                        state.locked_existing_run(
+                            self.roots, self.record.name, expected=self.record, observation_budget=budget
+                        )
+                    )
+                console = state.open_pinned_run_console(self.roots, self.record)
+                try:
+                    console.current_status()
+                    console.position = max(0, console.initial_size - MAX_OUTPUT_BYTES)
+                    clipped = console.position > 0
+                    data = bytearray()
+                    while chunk := console.read(64 * 1024, snapshot=True):
+                        data.extend(chunk)
+                    console.current_status()
+                    if run_authority is not None:
+                        run_authority.verify_binding()
+                    lines = data.decode("utf-8", "replace").splitlines()
+                    if clipped:
+                        lines = lines[1:]
+                    return {
+                        "log": "\n".join(lines[-tail:]),
+                        "source": "retained-console",
+                        "truncated": clipped or len(lines) > tail,
+                    }
+                finally:
+                    console.close()
         if self.row["status"] == "running":
             data = self.probe(("sudo", "-n", "journalctl", "--no-pager", "--quiet", "-n", str(tail), "-o", "short-iso"))
             return {"log": data.decode("utf-8", "replace"), "source": "guest-journal", "truncated": False}
-        if self.record is not None and self.row["backend"] not in platforms.LIMA_BACKENDS:
-            console = state.open_pinned_run_console(self.roots, self.record)
-            try:
-                console.current_status()
-                console.position = max(0, console.initial_size - MAX_OUTPUT_BYTES)
-                clipped = console.position > 0
-                data = bytearray()
-                while chunk := console.read(64 * 1024, snapshot=True):
-                    data.extend(chunk)
-                console.current_status()
-                lines = data.decode("utf-8", "replace").splitlines()
-                if clipped:
-                    lines = lines[1:]
-                return {
-                    "log": "\n".join(lines[-tail:]),
-                    "source": "retained-console",
-                    "truncated": clipped or len(lines) > tail,
-                }
-            finally:
-                console.close()
         if self.row["backend"] not in platforms.LIMA_BACKENDS:
             raise VMAccessError("stopped", "Guest journal is unavailable while the VM is stopped")
         # Native Lima's fixed serial console, never a guessed home/instance path.

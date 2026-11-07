@@ -37,6 +37,7 @@ from .project_volumes import (
 from .state import StatePaths, file_lock, pinned_owner_directory
 
 OCI_ROOT_VOLUME_SCHEMA = "palimpsest.oci-root-volume.v1"
+VZ_ROOT_VOLUME_SCHEMA = "palimpsest.oci-root-volume.v2"
 OCI_ROOT_VOLUME_RETENTION_POLICIES = frozenset({"delete", "retain"})
 MAX_OCI_ROOT_VOLUME_GENERATION_DIGITS = 4096
 MAX_OCI_ROOT_VOLUME_GENERATION = 10**MAX_OCI_ROOT_VOLUME_GENERATION_DIGITS - 1
@@ -225,6 +226,75 @@ def _root_authority(roots: StatePaths) -> Iterator[int]:
 
 
 @dataclass(frozen=True, slots=True)
+class VZRootVolumeStorage:
+    """Physical Lima attachment; the canonical root-volume record remains owner."""
+
+    lima_home: str
+    disk_name: str
+    directory_identity: tuple[int, int] | None = None
+    file_identity: tuple[int, int] | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.lima_home, str):
+            raise StateError("VZ root-volume Lima home is invalid")
+        path = Path(self.lima_home)
+        if (
+            not isinstance(self.lima_home, str)
+            or not path.is_absolute()
+            or str(path) != self.lima_home
+            or ".." in path.parts
+            or "\x00" in self.lima_home
+        ):
+            raise StateError("VZ root-volume Lima home is invalid")
+        if not isinstance(self.disk_name, str) or re.fullmatch(r"plm-root-[0-9a-f]{32}", self.disk_name) is None:
+            raise StateError("VZ root-volume disk name is invalid")
+        for identity in (self.directory_identity, self.file_identity):
+            if identity is not None and (
+                not isinstance(identity, tuple)
+                or len(identity) != 2
+                or any(type(number) is not int or number < 0 for number in identity)
+                or identity[1] == 0
+            ):
+                raise StateError("VZ root-volume physical identity is invalid")
+
+    @property
+    def directory(self) -> Path:
+        return Path(self.lima_home) / "_disks" / self.disk_name
+
+    @property
+    def path(self) -> Path:
+        return self.directory / "datadisk"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "backend": "lima-vz",
+            "lima_home": self.lima_home,
+            "disk_name": self.disk_name,
+            "directory_identity": list(self.directory_identity) if self.directory_identity is not None else None,
+            "file_identity": list(self.file_identity) if self.file_identity is not None else None,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Any) -> VZRootVolumeStorage:
+        if (
+            not isinstance(value, dict)
+            or set(value) != {"backend", "lima_home", "disk_name", "directory_identity", "file_identity"}
+            or value["backend"] != "lima-vz"
+        ):
+            raise StateError("VZ root-volume storage fields are invalid")
+        identities = []
+        for name in ("directory_identity", "file_identity"):
+            raw = value[name]
+            if raw is not None and (not isinstance(raw, list) or len(raw) != 2):
+                raise StateError("VZ root-volume storage identity is invalid")
+            identities.append(tuple(raw) if raw is not None else None)
+        result = cls(value["lima_home"], value["disk_name"], *identities)
+        if result.to_dict() != value:
+            raise StateError("VZ root-volume storage is not canonical")
+        return result
+
+
+@dataclass(frozen=True, slots=True)
 class OCIRootVolumeRecord:
     volume_id: str
     size_bytes: int
@@ -234,6 +304,7 @@ class OCIRootVolumeRecord:
     attached_run_id: str | None
     attached_run_name: str | None
     generation: int
+    storage: VZRootVolumeStorage | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "volume_id", _canonical_uuid(self.volume_id))
@@ -255,9 +326,18 @@ class OCIRootVolumeRecord:
                 raise StateError("retained OCI-root volume cannot have an attachment")
         else:
             ArtifactLeaseOwner(self.attached_run_id or "", self.attached_run_name or "", "root-lower")
+        if self.storage is not None:
+            if not isinstance(self.storage, VZRootVolumeStorage):
+                raise StateError("OCI-root volume backend storage is invalid")
+            if self.storage.disk_name != "plm-root-" + self.volume_id.replace("-", ""):
+                raise StateError("VZ root-volume physical name does not match its owner")
+            if self.status != "creating" and (
+                self.storage.directory_identity is None or self.storage.file_identity is None
+            ):
+                raise StateError("VZ root-volume physical binding is incomplete")
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        value = {
             "attached_run_id": self.attached_run_id,
             "attached_run_name": self.attached_run_name,
             "filesystem": "ext4",
@@ -269,6 +349,10 @@ class OCIRootVolumeRecord:
             "status": self.status,
             "volume_id": self.volume_id,
         }
+        if self.storage is not None:
+            value["schema"] = VZ_ROOT_VOLUME_SCHEMA
+            value["storage"] = self.storage.to_dict()
+        return value
 
     @classmethod
     def from_dict(cls, value: Any) -> OCIRootVolumeRecord:
@@ -284,13 +368,20 @@ class OCIRootVolumeRecord:
             "status",
             "volume_id",
         }
+        if isinstance(value, dict) and value.get("schema") == VZ_ROOT_VOLUME_SCHEMA:
+            expected.add("storage")
         if not isinstance(value, dict) or set(value) != expected:
             raise StateError("OCI-root volume record fields are invalid")
-        if value.get("schema") != OCI_ROOT_VOLUME_SCHEMA or value.get("filesystem") != "ext4":
+        if (
+            value.get("schema") not in {OCI_ROOT_VOLUME_SCHEMA, VZ_ROOT_VOLUME_SCHEMA}
+            or value.get("filesystem") != "ext4"
+        ):
             raise StateError("OCI-root volume record schema is invalid")
         fields = dict(value)
         fields.pop("schema")
         fields.pop("filesystem")
+        if "storage" in fields:
+            fields["storage"] = VZRootVolumeStorage.from_dict(fields["storage"])
         try:
             record = cls(**fields)
         except (StateError, TypeError, ValueError):
@@ -508,6 +599,8 @@ def claim_oci_root_volume(
             raise StateError("OCI-root volume artifact and owner record are inconsistent")
         if record_exists:
             record = _read_record(directory_fd, record_path)
+            if record.storage is not None:
+                raise StateError("VZ root volume requires its native backend attachment owner")
             from .oci_root_access import require_root_access_revoked
 
             require_root_access_revoked(roots, record)
@@ -660,6 +753,8 @@ def load_oci_root_volume(
     path, record_path, lock_path = _paths(roots, volume_id)
     with file_lock(lock_path), _root_authority(roots) as directory_fd:
         record = _read_record(directory_fd, record_path)
+        if record.storage is not None:
+            raise StateError("VZ root volume requires its native backend attachment owner")
         if record.status in {"creating", "deleting"}:
             raise StateError("OCI-root volume lifecycle is incomplete")
         file_fd: int | None = None
@@ -750,6 +845,8 @@ def _locked_exact_root_volume(
     if type(expected) is not OCIRootVolumeRecord:
         raise StateError("exact root retention record is invalid")
     expected.__post_init__()
+    if expected.storage is not None:
+        raise StateError("VZ root volume requires its native backend attachment owner")
     if expected.retention_policy != "retain" or expected.status != "attached":
         raise StateError("exact root retention requires an originally retained attachment")
     retained = (
@@ -885,6 +982,8 @@ def release_oci_root_volume(
             if str(exc) == "OCI-root volume record is missing" and not path.exists() and not path.is_symlink():
                 return None
             raise
+        if record.storage is not None:
+            raise StateError("VZ root volume requires its native backend attachment owner")
         if (
             record.volume_id != volume_id
             or record.lower_graph_digest != lower_graph_digest
@@ -1011,7 +1110,8 @@ def list_oci_root_volume_records(roots: StatePaths) -> tuple[OCIRootVolumeRecord
         expected_raws = {
             record.volume_id.replace("-", "")
             for record in found
-            if record.status != "creating" or record.volume_id.replace("-", "") in raw_names
+            if record.storage is None
+            and (record.status != "creating" or record.volume_id.replace("-", "") in raw_names)
         }
         if raw_names != expected_raws or not expected_raws.issubset(record_stems):
             raise StateError("OCI-root volume artifact and owner records are inconsistent")
@@ -1043,6 +1143,8 @@ __all__ = [
     "MAX_OCI_ROOT_VOLUME_GENERATION_DIGITS",
     "OCI_ROOT_VOLUME_RETENTION_POLICIES",
     "OCI_ROOT_VOLUME_SCHEMA",
+    "VZ_ROOT_VOLUME_SCHEMA",
+    "VZRootVolumeStorage",
     "OCIRootVolumeRecord",
     "VerifiedOCIRootVolume",
     "claim_oci_root_volume",

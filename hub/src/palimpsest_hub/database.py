@@ -202,7 +202,7 @@ async def create_schema() -> None:
     if _engine is None:
         raise RuntimeError("database is not initialized")
     # Register the independent image-job and instance ledgers before cold bootstrap.
-    from palimpsest_hub import image_models, instance_models, native_models  # noqa: F401
+    from palimpsest_hub import image_key_models, image_models, instance_models, native_models  # noqa: F401
     from palimpsest_hub.models import Base
 
     async with _engine.begin() as connection:

@@ -16,34 +16,34 @@ are not deployed-service acceptance; see the [control-plane boundaries](ARCHITEC
 
 ## Status
 
-- **macOS Apple Silicon:** supported default runtime through Lima 2.1+ and VZ (`lima-vz`); QEMU/libvirt Hypervisor.framework (`libvirt-hvf`) and Lima krunkit Vulkan GPU (`lima-krunkit`) are experimental.
-- **Linux:** supported libvirt/KVM runtime for conventional cloud-image VMs on `x86_64` and `aarch64`; the OCI-root runtime is narrower and supports Linux `x86_64`/`amd64` KVM only.
+- **macOS Apple Silicon:** conventional cloud-image VMs use Lima 2.1+ and VZ (`lima-vz`). Working source also provides an explicitly configured native OCI-root profile for qualified Ubuntu24.04/arm64 on pinned Lima2.2.1, with separate boot assets and a Linux worker; see the [native-root contract](openspec/specs/vz-native-root/spec.md) and dated live evidence in the [handoff](docs/development-handoff.md). This is not arbitrary ARM image support or KVM security parity. QEMU/libvirt Hypervisor.framework (`libvirt-hvf`) and Lima krunkit Vulkan GPU (`lima-krunkit`) remain experimental.
+- **Linux:** supported libvirt/KVM runtime for conventional cloud-image VMs on `x86_64` and `aarch64`; Linux OCI-root execution supports `x86_64`/`amd64` KVM only.
 - **Declarative projects:** a strict `palimpsest.yml` workflow reconciles multiple VM services with dependencies, environment, typed cloud-init, persistent block volumes, networks, and Lima TCP forwarding.
-- **Release source:** 0.3.12 adds Hub-authoritative SDK image publication/query/extension, parent-aware logical layers, immutable visibility-scoped payloads and an opt-in Manila/CephFS native lane. It preserves the released HTTPS worker, HA/readiness and catalog/instance paths. New native profiles remain inactive until storage/issuer qualification; source, publication and actual deployment have separate evidence in the [latest handoff](docs/development-handoff.md).
+- **Release source:** 0.3.13 adds Hub image quotas, `ppi_v1_` image API keys, anonymous reads of `public` images, optional OCI source-closure publication, `palimpsest published push|pull|status`, and the local Lima VZ arm64 OCI-root runtime, on top of 0.3.12 (Hub-authoritative SDK image publication/query/extension, parent-aware logical layers, immutable visibility-scoped payloads, opt-in Manila/CephFS native lane, standard reader/member/manager project roles). It preserves the released HTTPS worker, HA/readiness and catalog/instance paths. New native profiles remain inactive until storage/issuer qualification; source, publication and actual deployment have separate evidence in the [latest handoff](docs/development-handoff.md).
 
 ## Install from PyPI
 
 Requires Python 3.11 or newer. Prefer an isolated uv tool, or a pip virtual environment:
 
 ```sh
-uv tool install --python 3.11 "palimpsest-client==0.3.12"
+uv tool install --python 3.11 "palimpsest-client==0.3.13"
 palimpsest --version
 
 # Alternative: pip, without modifying the system Python.
 python3.11 -m venv .venv
-.venv/bin/python -m pip install "palimpsest-client==0.3.12"
+.venv/bin/python -m pip install "palimpsest-client==0.3.13"
 .venv/bin/palimpsest --version
 ```
 
 If uv's tool directory is not on `PATH`, run `uv tool update-shell` explicitly
 and open a new terminal. One-off use: `uvx --python 3.11 --from
-palimpsest-client==0.3.12 palimpsest --version`.
+palimpsest-client==0.3.13 palimpsest --version`.
 
 Root client installation and Hub service deployment are separate. API, export
 worker and build-worker images must match the reviewed release; updating the
 root wheel alone does not update running Kolla containers.
 
-The commands above select version0.3.12 after its formal publication. Check the
+The commands above select version0.3.13 after its formal publication. Check the
 [release handoff](docs/development-handoff.md) for actual PyPI/image receipts and
 the deployment-server package/lock selection. Older release and production
 receipts remain historical and do not establish the currently running version.
@@ -61,6 +61,11 @@ palimpsest
 palimpsest store ls --kind image
 palimpsest completion zsh --install  # select bash or fish instead if appropriate
 ```
+
+This checkout also installs `plm` as the same implementation, for example
+`plm store ls --kind image`. Help uses the canonical `palimpsest` name.
+The alias requires bytes containing the updated entrypoint metadata; its presence
+must not be inferred from a version string or an older published package.
 
 Installation does not edit shell profiles; the final command explicitly opts in.
 No commit, push, package publication, or server setup is implied.
@@ -198,11 +203,11 @@ and [exact deployment pins and prerequisites](docs/install.md).
 
 ## Hub configuration & Standalone Service
 
-Palimpsest Hub runs as a standalone FastAPI service on default port 8020 using the original OpenStack project-scoped token (`X-Auth-Token` and optional `X-Project-Id` assertion, never re-scoping). Its same-origin `/app` console reads exact identity and fresh independent inventory/download/upload/build/delete permissions from `GET /v1/me`; credentials and transfer state remain in tab memory, not browser storage. Upload requires current publish authority, metadata browsing requires inventory authority, and downloading requires download authority. A verified system administrator can build/delete legacy artifacts; legacy image/layer upload additionally requires ordinary current-project membership and publish authority, never admin privilege alone. Native package controls retain their separate elevated-owner exclusion.
+Palimpsest Hub runs as a standalone FastAPI service on default port 8020 using the original OpenStack project-scoped token (`X-Auth-Token` and optional `X-Project-Id` assertion, never re-scoping). Its same-origin `/app` console reads fresh feature permissions from `GET /v1/me`; credentials and transfer state remain in tab memory, not browser storage. Existing native `reader` grants visible queries/downloads; `member` adds creation/publication/editing; `manager` adds project management, package/layer/export deletion and key issuance. Higher tiers include lower. Approved self-service exceptions let members stop/delete only their own VM/native consumers and exclusive boot volumes, and reader-or-above revoke only their own keys with an original token. Other private creators stay protected. Canonical `project_*` roles work only through their actual native role graph; no separately assigned Palimpsest grade/leaf or personal-owner fallback is required. Shared catalog, global policy and worker callbacks retain separate system/machine boundaries.
 
-The console searches filtered, newest-first layer/image pages (`offset >= 0`, `1 <= limit <= 200`), verifies SHA-256 and size before saving downloads, and supports acknowledged-offset upload resume/status/abort with captured registration metadata. Native package browsing/publication is a separate console credential domain: original member tokens handle member controls, while `ppk_v1_…` package keys handle native writes. Neither credential is substituted for the other; connection changes cancel tab-controlled work without automatic re-publication.
+The console searches filtered, newest-first layer/image pages (`offset >= 0`, `1 <= limit <= 200`), verifies SHA-256 and size before saving downloads, and supports acknowledged-offset upload resume/status/abort with captured registration metadata. Original project tokens receive the role-appropriate operations; exact creator/key-bound cancellation of an unfinished upload remains write-tier rollback. Native `ppk_v1_…` credentials are a separate domain limited to five delegated package/cache read/write actions. They never gain key issuance/revocation, VM cleanup, package deletion, project switching or build admission. Connection changes cancel tab-controlled work without automatic re-publication.
 
-Hub's native `/v1` API stores Palimpsest boot images, SquashFS runtime blocks and bundles, with separate project-scoped package/BuildKit-cache APIs. Native package keys authorize only package/cache operations; legacy commands retain the original Keystone token. `POST /v1/builds` queues system-admin/project-scoped work and GET routes report project state. The retained 0.3.4 HTTPS-only dedicated CPU service-VM executor is also the 0.3.5 contract: direct recipe execution and API-registered private project outputs, no nested/per-build KVM/libvirt or API-container recipe execution. Hub is not a Docker/OCI `/v2` registry; profiles explicitly select `palimpsest` or `oci` transport.
+Hub's native `/v1` API stores Palimpsest boot images, SquashFS runtime blocks and bundles, with separate project-scoped package/BuildKit-cache APIs. Native package keys authorize only their delegated package/cache operations; legacy commands retain the original Keystone token. `POST /v1/builds` queues member-authorized project work and reader-authorized GET routes report only that project state. The retained HTTPS-only dedicated CPU service-VM executor performs direct recipe execution and API-registered private project outputs, with no nested/per-build KVM/libvirt or API-container recipe execution. Hub is not a Docker/OCI `/v2` registry; profiles explicitly select `palimpsest` or `oci` transport.
 
 ### Working-source Hub execution APIs
 
@@ -257,7 +262,7 @@ docker build --file docker/hub/Dockerfile --target palimpsest-hub-build-worker .
 
 ### Client Hub Configuration
 
-Legacy Hub artifact CLI commands use a base URL (`PALIMPSEST_URL` or `--url`) and the original Keystone token from `PALIMPSEST_TOKEN` over `X-Auth-Token`. This token is separate from native package/cache keys and cannot authorize BuildKit-cache writes. Keep credentials in approved secret handling, not documentation, shell history or state files. Token validation uses a separate read-only Keystone validator. Ordinary package owners retain protected-principal and fresh membership checks; human native package/layer/build administration instead accepts a freshly verified `system:all` administrator without target membership/service leaves. `X-Project-Id` always asserts the original caller project; `X-Target-Project-Id` independently selects an administrator's logical target, never a replacement provider scope. See [Hub service settings](docs/install.md#hub-service-settings) and [the native registry contract](docs/project-package-registry.md#31-original-identity-and-explicit-human-administration).
+Legacy Hub artifact CLI commands use a base URL (`PALIMPSEST_URL` or `--url`) and the original Keystone token from `PALIMPSEST_TOKEN` over `X-Auth-Token`. This remains distinct from bounded package/cache keys. Original member tokens can publish/edit and clean up only their own consumers; manager tokens can perform the permitted project-management operations without gaining other creators' private content or global authority. Keep credentials in approved secret handling, not documentation, shell history or state files. A separate read-only Keystone validator checks current roles, protected principals, exact ownership and original-issued-role ceilings. A separately verified human `system:all` administrator has an explicit logical-target path. `X-Project-Id` asserts original caller scope; `X-Target-Project-Id` never replaces provider scope. See [Hub settings](docs/install.md#hub-service-settings) and [native authorization](docs/project-package-registry.md#31-original-identity-and-explicit-human-administration).
 
 ```sh
 export PALIMPSEST_URL="http://hub.example:8020"
@@ -300,9 +305,9 @@ palimpsest registry add hub packages.example.invalid \
   --namespace project-apps
 ```
 
-Native transport verifies the system CA trust plus profile `--ca` files and refuses redirects; mirrors, plain HTTP, TLS-skip and Docker cache exporters are not supported. A project member with current Palimpsest publish and keys-editor capabilities uses the original project-scoped token to register the operator-bound namespace and issue a secret-once key scoped to exact packages/actions. Plain member/reader roles do not grant service authority; see the [capability matrix and isolated HTTP smoke](docs/project-package-registry.md#3-identity-and-authorization). Native login checks `/auth/me` before saving that key through an **installed** Docker credential helper at `api_base.rstrip('/') + '/projects/' + namespace` (exact `credHelpers` entry, then `credsStore`, with no host-only/plaintext fallback). `--username` must match the key's public UUID; secrets enter through `--password-stdin` or a prompt. An ephemeral `PALIMPSEST_PACKAGE_KEY` can instead serve the native client, never the legacy runtime client.
+Native transport verifies the system CA trust plus profile `--ca` files and refuses redirects; mirrors, plain HTTP, TLS-skip and Docker cache exporters are not supported. An original project member token can register the operator-bound namespace and publish; a manager token is required to issue a secret-once key scoped to exact packages/actions. Reader-or-above may list and revoke only their own keys using an original token. Existing standard roles supply these permissions without custom Palimpsest roles; see the [authorization matrix](docs/project-package-registry.md#3-identity-and-authorization). Native login checks `/auth/me` before saving a key through an **installed** Docker credential helper at `api_base.rstrip('/') + '/projects/' + namespace` (exact `credHelpers` entry, then `credsStore`, no host-only/plaintext fallback). `--username` must match its public UUID; secrets enter through `--password-stdin` or a prompt. Ephemeral `PALIMPSEST_PACKAGE_KEY` can serve the native client, never the legacy runtime client.
 
-Verified personal-project owners are the project-local exception: native services re-read the exact owner marker, enabled native `Personal` domain/user/home/project and direct member provenance, then allow project package/cache/own-key actions through operator policy without extra Keystone roles. Original personal humans may also delete their exact-project package metadata through the existing endpoint after fresh original-token/owner/provenance/policy checks, without deleting shared CAS bytes. Ordinary members and keys cannot delete packages; operator deny, delegated key/package ceilings and system-only shared artifact deletion/build/settings boundaries still apply.
+Personal-project metadata does not manufacture authorization or replace current native membership. Original-token/current-owner and issued-key/current-owner intersections enforce the role ceiling, exact project/package/private-user scope, expiry and revocation. Package/layer/export deletion remains manager-tier, including for personal projects; the creator cleanup exception applies only to its own consumers and exclusive boot volumes. Foreign-project layer grants and parent/base-image dependencies block unsafe deletion. Operator deny, package-key attenuation and separately verified system authority remain effective.
 
 Native `build --output ARCHIVE` produces a verified OCI export and typed, immutable-byte-bound local reference, not a Docker image. Deferred `push` reads that reference; `push --input LAYOUT_OR_ARCHIVE --manifest sha256:...` can supply another source (manifest required for multiple roots). Native `pull --output ARCHIVE` downloads and verifies original bytes without `docker load`. Receipts are owner-only under `state/package-references/`; frozen exports are under `state/package-artifacts/`, separate from SquashFS runtime tags. Native transfers reject `--all-tags`/`--platform`; native builds reject `--load`/external Docker caches and native `tag` is not supported.
 
@@ -380,10 +385,14 @@ palimpsest oci materialize ./image.oci.tar --output ./materialization.json
 palimpsest oci materialize ./image-layout --manifest 'sha256:<root-digest>'
 ```
 
-This requires the qualified SquashFS packer (`/usr/bin/mksquashfs` by default)
-and currently supports `linux/amd64`. It produces verified layer artifacts,
-not a running VM by itself. Public local OCI-root `run/-d` and the protected-root
-Gate 2 have separate qualified proofs on Linux/x86_64 KVM; see the
+This requires a Linux host and the qualified SquashFS packer
+(`/usr/bin/mksquashfs` by default). The default is `linux/amd64`; explicit
+`--platform linux/arm64` materializes a validated ARM archive without granting
+VZ launch authority. It produces verified ordered layer artifacts, not a running
+VM. New recipes bind preceding layer context so omitted directory attributes
+cannot reuse another parent's output; historical recipes remain readable only.
+Public local OCI-root `run/-d` and the protected-root Gate 2 have separate
+qualified proofs on Linux/x86_64 KVM; see the
 [public-runtime roadmap](docs/oci-public-runtime-roadmap.md). `run IMAGE` now
 resolves local sources first and acquires missing OCI references through
 configured profiles; only verified local archives cross into the runtime.
@@ -399,6 +408,10 @@ compressed layer digests and qualified SquashFS recipes, records consumers and
 keeps bytes even after their last release. Cache initialization, storage
 provisioning and immutable guest runtime exports are separate operations.
 
+Local BuildKit builds apply root `.plmignore` after selected Docker ignore rules.
+CloudEnv remote context archives do not support that matcher and reject any root
+`.plmignore` before packing/upload; they never silently upload excluded content.
+
 OCI-root runs accept an explicit `--user USER[:GROUP]` (name or canonical
 numeric ID), for example `palimpsest run ./redis.oci.tar --name redis-demo
 --user redis -d`. This changes only the launch identity, not the source image,
@@ -412,6 +425,15 @@ the guest execution deadline for that one command; the option is rejected for
 cloud-image runs. Retry, locking, privilege, cleanup and the 64 KiB output
 limit are unchanged, and a longer deadline does not change host monitor or run
 lock bounds.
+
+For the qualified native Lima-VZ profile, live observation shares at most five
+seconds of **additional mutex waiting** across a pass; ordinary provider work
+and the guest execution timer are separate. `busy` means no fresh observation
+or guest/lifecycle grant, not that the VM has stopped. Main-process exit is also
+not physical VM shutdown. Public CLI `ps` refreshes live state; `inspect` reports
+the last durable record. An admitted `logs --follow` keeps its pinned console
+through pure mutex contention, but integrity failures and uncertain custody
+HOLDs still terminate it. Initial log admission and snapshots fail closed.
 
 OCI-root runs select one virtual network with `--network nat|host-only|none`
 and publish guest ports with the repeatable
@@ -440,6 +462,15 @@ shared VM network are separately gated future contracts; neither is implied by
 the current per-VM network modes.
 
 The Dockerfile workflow keeps BuildKit's logical vertex cache separate from the runtime artifact. BuildKit reuses unchanged build work; Palimpsest feeds BuildKit's metadata-preserving rootfs tar directly into SquashFS, binds the block to its boot-base/platform contract, and the Linux KVM runtime attaches the verified result as a read-only `virtio-blk` disk.
+
+Unreleased source requires an explicit owner-only
+[upstream image-source policy](docs/registries.md#upstream-image-source-admission)
+for online image intake/builds and retained upstream runtime adoption. Configure
+each exact registry/namespace/repository; absent or empty policy denies images.
+Registry credentials or an allowed host do not grant repository permission.
+Buildx must be stable0.11 or newer and every running BuildKit node0.12 or newer.
+This source/local-proof feature has not been built into or deployed as new Kolla
+images; existing release/deployment receipts remain separate.
 
 ```sh
 palimpsest build . \
@@ -756,7 +787,7 @@ palimpsest start
 palimpsest compose config|up|down|ps|logs|exec|stop|port
 palimpsest ps|inspect|logs|shell|exec|stop|rm|commit
 palimpsest web                               # foreground local dashboard; no Hub required
-palimpsest store show|ls|rm|move|set         # storage state & artifact management
+palimpsest store show|ls|catalog|rm|move|set # selected-state storage & artifact metadata
 palimpsest completion zsh|bash|fish          # shell completion generator
 ```
 
@@ -764,6 +795,37 @@ Use `palimpsest <command> --help` for exact arguments. The checked generated
 [CLI reference](docs/cli/README.md) records the complete command tree, and the
 [command workflow catalog](docs/cli/workflows.md) documents the per-command
 order, configuration, and platform limits with Archify workflow diagrams.
+
+## Local metadata catalog
+
+```sh
+palimpsest store catalog             # persisted selected-root frame; no refresh
+palimpsest store catalog --refresh   # recollect local ledgers and commit a frame
+```
+
+The private `catalog-v1/metadata.sqlite3` in the selected state stores discovery
+registrations and observations of build/provenance, original ordered image
+graphs, derivation receipts, distinct real aliases/output labels and UUID-bound
+run ledgers. Existing JSON/CAS, ownership, leases, deletion guards and Hub retain
+their authority; a DB row is not proof that an image can run or bytes can be
+deleted. Source/config descriptors do not duplicate image process environments.
+
+Artifact/build inventory queries may refresh this metadata cache without probing
+live VMs, downloading inputs, initializing absent state/config or repairing
+runtime journals. An existing state may gain only this private catalog subtree.
+Inspect `observation.scope`, `captured_at`, `complete` and `warnings` in the
+catalog output; legacy build list/detail shapes do not imply complete discovery.
+Malformed entries preserve valid unrelated facts with warnings. A corrupt or
+unknown-schema DB fails visibly; it is not silently rebuilt from another parser.
+
+Build/materialize commands synchronize after their outputs commit. If the
+metadata step fails, the command reports it while preserving committed bytes and
+successful build records; do not blindly replay. Build context/Dockerfile hashes
+are pre-solve lookup observations; `canonical-json-semantic-v1` record hashes are
+not raw file or atomic BuildKit attestations. State moves close/quiesce the
+catalog, preserve graph facts and revalidate destination source bytes while
+invalidating copied derivations; no lease or execution authority is copied.
+Actual VZ run linkage remains an open Goal item.
 
 ## Local web dashboard
 
@@ -782,7 +844,11 @@ Dockerfile editing and local host cache, run local or automatically acquired OCI
 references, and open capability-aware VM consoles. Build/run operations expose
 bounded asynchronous output. Conventional shells use a PTY; OCI-root consoles
 use non-TTY guest exec. Console disconnect does not stop the VM.
-Five-second refresh can be paused. Image availability is a file observation,
+VM metrics start every five seconds independently of inventory/log completion;
+overlapping samples join one request. Automatic sampling can be paused and
+stops while hidden or closed. Rates require matching run/boot identities and
+valid consecutive counters within15seconds; missing rates are not shown as zero.
+Image availability is a file observation,
 not digest verification or proof that OCI-root execution works. Automatic OCI
 run remains Linux amd64 KVM-only; local cache mode does not itself prohibit
 remote Dockerfile inputs.

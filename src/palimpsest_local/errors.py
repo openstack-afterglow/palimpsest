@@ -45,6 +45,10 @@ class StateError(PalimpsestError):
     """Local owner-only state cannot safely support an operation."""
 
 
+class RuntimeBusyError(StateError):
+    """A bounded runtime mutex acquisition ended before admitting its operation."""
+
+
 class LifecycleError(PalimpsestError):
     """A KVM lifecycle or guest-control operation failed."""
 

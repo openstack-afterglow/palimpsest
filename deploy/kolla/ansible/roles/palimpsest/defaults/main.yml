@@ -1,7 +1,7 @@
 ---
 # Palimpsest kolla role defaults
 
-palimpsest_image_tag: "0.3.12"
+palimpsest_image_tag: "0.3.13"
 palimpsest_image_namespace: "ghcr.io/openstack-afterglow"
 palimpsest_api_image: "{{ palimpsest_image_namespace }}/palimpsest-hub-api"
 palimpsest_worker_image: "{{ palimpsest_image_namespace }}/palimpsest-hub-worker"
@@ -37,6 +37,12 @@ palimpsest_build_worker_timeout_seconds: 3600
 palimpsest_build_worker_max_blob_bytes: 107374182400
 # Image import/build inputs are bounded separately from retained result blobs.
 palimpsest_registry_hosts: ["docker.io", "registry-1.docker.io", "ghcr.io", "quay.io"]
+# Registry hosts are a transport fence, not publisher permission. Empty denies
+# all image jobs until the operator selects exact namespace/repository rules.
+palimpsest_image_source_policy:
+  schema_version: 1
+  publisher_policy: "registry-namespace"
+  rules: []
 palimpsest_image_run_network: "none"
 # The worker's own delegated cgroup namespace; never a host-global writable mount.
 palimpsest_image_cgroup_root: "/sys/fs/cgroup"
@@ -79,6 +85,12 @@ palimpsest_build_worker_etc_hosts: {}
 palimpsest_api_port: 8020
 palimpsest_api_listen_address: "{{ 'api' | kolla_address(inventory_hostname) }}"
 palimpsest_api_listen_port: 18020
+# uvicorn runs with --proxy-headers and trusts X-Forwarded-For only from these
+# peers (comma-separated addresses/CIDRs). "127.0.0.1" is uvicorn's own default,
+# so the rendered behaviour is unchanged. Behind Kolla HAProxy, list the HAProxy
+# source addresses so anonymous per-client rate limits see real clients rather
+# than one shared proxy address. Never list untrusted networks.
+palimpsest_api_forwarded_allow_ips: "127.0.0.1"
 palimpsest_database_name: "palimpsest_kolla"
 palimpsest_database_user: "palimpsest_kolla"
 palimpsest_database_address: "{{ database_address }}"
@@ -108,6 +120,9 @@ palimpsest_keystone_project_domain_name: "{{ default_project_domain_name }}"
 palimpsest_keystone_user_domain_name: "{{ default_user_domain_name }}"
 palimpsest_reader_user: "palimpsest-reader"
 palimpsest_reader_user_domain_name: "{{ default_user_domain_name }}"
+# Requesters use existing native project reader/member/manager assignments.
+# This role never creates application roles/implications or grants tenant access.
+# Project manager includes member/read actions, never human system-admin authority.
 # Exact immutable Keystone IDs; operators must supply both protected sets.
 palimpsest_package_forbidden_project_ids: []
 palimpsest_package_forbidden_user_ids: []
@@ -200,6 +215,7 @@ palimpsest_hub_api_service:
          if palimpsest_native_profiles | length > 0 else []) }}
   environment:
     PALIMPSEST_CONFIG: "/etc/palimpsest/palimpsest.conf"
+    FORWARDED_ALLOW_IPS: "{{ palimpsest_api_forwarded_allow_ips }}"
     PALIMPSEST_HUB_BUILD_WORKER_KEY: "{{ palimpsest_build_worker_key if (enable_palimpsest_hub_build_worker | bool) else '' }}"
     DATABASE_URL: "{{ palimpsest_database_url }}"
     REDIS_URL: "{{ palimpsest_redis_url }}"
@@ -221,6 +237,7 @@ palimpsest_hub_api_service:
     PALIMPSEST_HUB_MAX_BUNDLE_EXPANDED_BYTES: "{{ palimpsest_hub_max_bundle_expanded_bytes | string }}"
     PALIMPSEST_HUB_MAX_BLOCKING_OPERATIONS: "{{ palimpsest_hub_max_blocking_operations | string }}"
     PALIMPSEST_HUB_REGISTRY_HOSTS: "{{ palimpsest_registry_hosts | to_json }}"
+    PALIMPSEST_HUB_IMAGE_SOURCE_POLICY: "{{ palimpsest_image_source_policy | to_json }}"
     PALIMPSEST_HUB_IMAGE_RUN_NETWORK: "{{ palimpsest_image_run_network }}"
     PALIMPSEST_HUB_IMAGE_CGROUP_ROOT: "{{ palimpsest_image_cgroup_root }}"
     PALIMPSEST_HUB_MAX_CONTEXT_BYTES: "{{ palimpsest_max_context_bytes | string }}"
@@ -282,6 +299,7 @@ palimpsest_hub_build_worker_service:
     PALIMPSEST_HUB_BUILD_TIMEOUT_SECONDS: "{{ palimpsest_build_worker_timeout_seconds | string }}"
     PALIMPSEST_HUB_MAX_BLOB_BYTES: "{{ palimpsest_build_worker_max_blob_bytes | string }}"
     PALIMPSEST_HUB_REGISTRY_HOSTS: "{{ palimpsest_registry_hosts | to_json }}"
+    PALIMPSEST_HUB_IMAGE_SOURCE_POLICY: "{{ palimpsest_image_source_policy | to_json }}"
     PALIMPSEST_HUB_IMAGE_RUN_NETWORK: "{{ palimpsest_image_run_network }}"
     PALIMPSEST_HUB_IMAGE_CGROUP_ROOT: "{{ palimpsest_image_cgroup_root }}"
     PALIMPSEST_HUB_IMAGE_SCRATCH_BYTES: "{{ palimpsest_image_scratch_bytes | string }}"

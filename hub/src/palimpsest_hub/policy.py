@@ -15,34 +15,33 @@ from palimpsest_hub.config import get_settings
 
 DEFAULT_POLICY_FILE = "/etc/palimpsest/policy.yaml"
 _LOCK = RLock()
-# Capability names are presentation labels, never synthesized Keystone role claims.
-CAPABILITY_ACTIONS = {
-    "palimpsest-inventory_reader": "packages:inventory",
-    "palimpsest-download_user": "packages:read",
-    "palimpsest-publish_editor": "packages:write",
-    "palimpsest-keys_editor": "keys:issue",
-    "palimpsest-keys_admin": "keys:revoke",
-}
 _READ = "role:reader or role:member or role:manager or role:admin"
 _WRITE = "role:member or role:manager or role:admin"
+_MANAGE = "role:manager or role:admin"
 _CHECKS = {
     "packages:inventory": _READ,
     "packages:read": _READ,
     "packages:write": _WRITE,
     "cache:read": _READ,
     "cache:write": _WRITE,
-    "keys:issue": _WRITE,
-    "keys:list": _WRITE,
-    "keys:revoke": _WRITE,
+    "keys:issue": _MANAGE,
+    "keys:list": _READ,
+    "keys:revoke": _MANAGE,
+    "keys:revoke_own": _READ,
     "system:manage": "role:admin",
-    "packages:delete": _WRITE,
+    "packages:delete": _MANAGE,
+    "packages:manage": _MANAGE,
+    "packages:manage_own": _WRITE,
 }
 ACTIONS = tuple(sorted(_CHECKS))
 KEY_ACTIONS = frozenset({"packages:inventory", "packages:read", "packages:write", "cache:read", "cache:write"})
 SYSTEM_ACTIONS = frozenset({"system:manage"})
-READ_ACTIONS = frozenset({"packages:inventory", "packages:read", "cache:read"})
+READ_ACTIONS = frozenset({"packages:inventory", "packages:read", "cache:read", "keys:list", "keys:revoke_own"})
+WRITE_ACTIONS = frozenset({"packages:write", "cache:write", "packages:manage_own"})
+MANAGE_ACTIONS = frozenset({"packages:delete", "packages:manage", "keys:issue", "keys:revoke"})
 PROJECT_READ_ROLES = frozenset({"reader", "member", "manager", "admin"})
 PROJECT_WRITE_ROLES = frozenset({"member", "manager", "admin"})
+PROJECT_MANAGE_ROLES = frozenset({"manager", "admin"})
 
 
 def list_rules():
@@ -160,7 +159,9 @@ def allowed_actions(roles, project_id: str, user_id: str = "", *, system_admin: 
     if roles & PROJECT_READ_ROLES:
         ceiling.update(READ_ACTIONS)
     if roles & PROJECT_WRITE_ROLES:
-        ceiling.update(set(ACTIONS) - SYSTEM_ACTIONS)
+        ceiling.update(WRITE_ACTIONS)
+    if roles & PROJECT_MANAGE_ROLES:
+        ceiling.update(MANAGE_ACTIONS)
     if system_admin:
         ceiling.update(SYSTEM_ACTIONS)
     actions = tuple(action for action in ACTIONS if action in ceiling)
@@ -194,7 +195,3 @@ def _evaluate_actions(actions, target, creds):
             # Never retain partially loaded rules or a cached malformed file after failure.
             _enforcer.cache_clear()
             raise HTTPException(status_code=503, detail="Palimpsest authorization policy unavailable") from None
-
-
-def capabilities_for(actions) -> frozenset[str]:
-    return frozenset(label for label, action in CAPABILITY_ACTIONS.items() if action in actions)

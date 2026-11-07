@@ -538,6 +538,7 @@ async def _create_release_0310_schema(connection):
 
 @pytest.mark.asyncio
 async def test_released_0310_full_fifteen_table_schema_bootstraps_then_orm_claims(tmp_path, monkeypatch):
+    from palimpsest_local.image_source_policy import ImageSourcePolicy, ImageSourceRule
     from sqlalchemy import inspect, select
     from sqlalchemy.ext.asyncio import async_sessionmaker
 
@@ -545,6 +546,8 @@ async def test_released_0310_full_fifteen_table_schema_bootstraps_then_orm_claim
     from palimpsest_hub.image_models import PalimpsestHubImageJob
     from palimpsest_hub.services import image_jobs
     from palimpsest_hub.services.digest import compute_config_digest
+
+    source_policy = ImageSourcePolicy((ImageSourceRule("docker.io", "library", "alpine"),))
 
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'released-0310.db'}")
     factory = async_sessionmaker(engine, expire_on_commit=False)
@@ -555,6 +558,7 @@ async def test_released_0310_full_fifteen_table_schema_bootstraps_then_orm_claim
         "get_settings",
         lambda: SimpleNamespace(
             palimpsest_hub_registry_hosts=("docker.io",),
+            palimpsest_hub_image_source_policy=source_policy.to_dict(),
             palimpsest_hub_build_timeout_seconds=60,
             palimpsest_hub_max_blob_bytes=4096,
         ),
@@ -585,6 +589,8 @@ async def test_released_0310_full_fifteen_table_schema_bootstraps_then_orm_claim
                 "os_family": "alpine",
                 "os_version": "3",
                 "visibility": "private",
+                "source_policy": source_policy.to_dict(),
+                "source_policy_digest": source_policy.digest,
             }
             session.add(
                 PalimpsestHubImageJob(
@@ -677,7 +683,7 @@ async def _create_prepublication_image_schema(
 
 
 @pytest.mark.asyncio
-async def test_prepublication_image_schema_upgrade_is_idempotent_and_real_orm_claim_works(tmp_path, monkeypatch):
+async def test_prepublication_image_schema_upgrade_preserves_bytes_but_retires_unbound_job(tmp_path, monkeypatch):
     from sqlalchemy import inspect, select
     from sqlalchemy.ext.asyncio import async_sessionmaker
 
@@ -725,19 +731,22 @@ async def test_prepublication_image_schema_upgrade_is_idempotent_and_real_orm_cl
             )
             await session.commit()
         claimed = await image_jobs.claim("00000000-0000-4000-8000-000000000003", 1)
-        assert claimed["id"] == "00000000-0000-4000-8000-000000000001"
-        assert (await image_jobs.claim("00000000-0000-4000-8000-000000000003", 1)) == claimed
+        assert claimed is None
+        assert (await image_jobs.claim("00000000-0000-4000-8000-000000000003", 1)) is None
         await database.create_schema()
         async with factory() as session:
             job = (await session.scalars(select(PalimpsestHubImageJob))).one()
-            assert job.status == "building" and job.visibility == "internal"
-            assert job.lease_owner == claimed["lease"]
+            assert job.status == "error" and job.visibility == "internal"
+            assert job.error_code == "build_failed" and job.lease_owner is None
+            assert "source_policy" not in job.request_json
     finally:
         await engine.dispose()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("missing_fact", [None, "creator", "os"], ids=["supported", "missing-creator", "missing-os"])
+@pytest.mark.parametrize(
+    "missing_fact", [None, "creator", "os"], ids=["missing-policy", "missing-creator", "missing-os"]
+)
 @pytest.mark.parametrize("inflight", [False, True], ids=["queued", "already-building"])
 async def test_upgraded_image_worker_http_complete_preserves_publication_authority(
     tmp_path, monkeypatch, missing_fact, inflight
@@ -795,11 +804,12 @@ async def test_upgraded_image_worker_http_complete_preserves_publication_authori
             if inflight
             else await image_jobs.claim("00000000-0000-4000-8000-000000000003", 1)
         )
-        if missing_fact and not inflight:
+        if not inflight:
             assert claimed is None
             async with factory() as session:
                 job = (await session.scalars(select(PalimpsestHubImageJob))).one()
-                assert job.status == "error" and job.error_code == "publication_metadata_required"
+                expected_error = "publication_metadata_required" if missing_fact else "build_failed"
+                assert job.status == "error" and job.error_code == expected_error
                 assert job.visibility == "internal"
                 assert (job.created_by is None) == (missing_fact == "creator")
                 assert job.lease_owner is None and job.started_at is None
@@ -819,28 +829,22 @@ async def test_upgraded_image_worker_http_complete_preserves_publication_authori
         )
         path = "/v1/image-worker/jobs/" + claimed["id"]
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://legacy.test") as client:
-            if not missing_fact:
-                staged = await client.put(path + "/outputs/" + digest, content=payload)
-                assert staged.status_code == 200, staged.text
+            staged = await client.put(path + "/outputs/" + digest, content=payload)
+            assert staged.status_code == 409, staged.text
+            assert staged.json()["detail"] == "image source policy binding changed"
             response = await client.post(path + "/complete", json=descriptor)
-            if missing_fact:
-                assert response.status_code == 409, response.text
-                assert response.json()["detail"] == "image publication requires proven creator and OS declarations"
-                async with factory() as session:
-                    job = (await session.scalars(select(PalimpsestHubImageJob))).one()
-                    assert job.request_json == original_request
-                    assert (await session.scalars(select(PalimpsestHubPublishedImage))).all() == []
-                return
-            assert response.status_code == 200, response.text
-            assert response.json()["status"] == "complete"
-            assert response.json()["visibility"] == "internal"
-            assert response.json()["published_image_id"] == claimed["id"]
-            replay = await client.post(path + "/complete", json=descriptor)
-            assert replay.status_code == 200, replay.text
+            assert response.status_code == 409, response.text
+            expected = (
+                "image publication requires proven creator and OS declarations"
+                if missing_fact
+                else "image source policy binding changed"
+            )
+            assert response.json()["detail"] == expected
         async with factory() as session:
-            images = (await session.scalars(select(PalimpsestHubPublishedImage))).all()
-            assert len(images) == 1
-            assert images[0].created_by == "original-user" and images[0].visibility == "internal"
+            job = (await session.scalars(select(PalimpsestHubImageJob))).one()
+            assert job.request_json == original_request and job.staged_outputs == []
+            assert job.result_json is None and not store.exists(digest)
+            assert (await session.scalars(select(PalimpsestHubPublishedImage))).all() == []
     finally:
         await engine.dispose()
 

@@ -37,6 +37,9 @@ def _run_ui_consumer(start, end, invocation, data):
         pytest.skip("UI JavaScript consumer regressions require Node.js")
     source = Path(ui.__file__).with_name("webui").joinpath("app.js").read_text()
     handler = source[source.index(start) : source.index(end, source.index(start))]
+    observation_wait = source[
+        source.index("  async function waitForObservations(") : source.index("  function metricChart(")
+    ]
     script = (
         r"""
 import fs from 'node:fs';
@@ -53,7 +56,7 @@ function $(id) {
 const state = { summary: { data: { host: data.host } }, volumes: { data: {} } };
 const remoteState = { result: { connection_id: 'docker' } };
 const remoteDetail = {}, hubState = {}, pendingRemoteRuns = new Set();
-let actionBusy = false, refreshPromise = null;
+let actionBusy = false, refreshPromise = null, inspector = null;
 const array = value => Array.isArray(value) ? value : [];
 const object = value => value || {};
 const text = value => String(value);
@@ -69,6 +72,7 @@ $('run-image').value = '/private/image.oci';
 $('run-runtime-kind').value = data.runtime_kind || 'oci-root';
 $('run-force-architecture').checked = data.force || false;
 """
+        + observation_wait
         + handler
         + "\n"
         + invocation
@@ -145,6 +149,29 @@ def test_run_form_emits_disposable_carrier_but_retains_native_roots(force, runti
     assert request["path"] == "/api/v1/vms" and request["method"] == "POST"
     assert request["body"]["root_retention"] == ("delete" if force else "retain")
     assert request["body"].get("force_architecture", False) is force
+
+
+def test_run_form_waits_for_admitted_sample_after_inventory_replaces_handle():
+    result = _run_ui_consumer(
+        "  $('form-run-vm').addEventListener(",
+        "  $('form-build').addEventListener(",
+        """
+let releaseInventory, releaseMetrics;
+refreshPromise = new Promise(resolve => { releaseInventory = resolve; });
+inspector = { metricsPromise: new Promise(resolve => { releaseMetrics = resolve; }) };
+const completion = submit({ preventDefault() {} });
+await Promise.resolve();
+if (requests.length) throw new Error('creation overtook inventory');
+inspector.metricsPromise = null;
+releaseInventory();
+await new Promise(resolve => setImmediate(resolve));
+if (requests.length) throw new Error('creation overtook the admitted metrics sample');
+releaseMetrics();
+await completion;
+""",
+        {"host": {"system": "Linux", "machine": "x86_64"}, "runtime_kind": "oci-root"},
+    )
+    assert [(request["path"], request["method"]) for request in result["requests"]] == [("/api/v1/vms", "POST")]
 
 
 def _setup_roots(tmp_path: Path) -> state.StatePaths:

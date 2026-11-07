@@ -529,6 +529,7 @@ ALLOWED_RUNTIME_COMBINATIONS = frozenset(
         (RuntimeKind.CLOUD_IMAGE, RuntimeBackend.LIMA_VZ),
         (RuntimeKind.CLOUD_IMAGE, RuntimeBackend.LIMA_KRUNKIT),
         (RuntimeKind.OCI_ROOT, RuntimeBackend.KVM),
+        (RuntimeKind.OCI_ROOT, RuntimeBackend.LIMA_VZ),
     }
 )
 
@@ -1527,6 +1528,15 @@ class OCIRootInspectDetail:
     network: str | None
     ports: tuple[InspectPort, ...]
     guest_ip: str | None
+    mode: str | None = None
+    restart: str | None = None
+    main_state: str | None = None
+    main_pid: int | None = None
+    main_exit_code: int | None = None
+    user_session_count: int | None = None
+    user_sessions_known: bool | None = None
+    main_exit_signal: int | None = None
+    main_oom_kill_count: int | None = None
 
     def __post_init__(self) -> None:
         for value, minimum, maximum in ((self.memory_mib, 256, 1_048_576), (self.vcpus, 1, 256)):
@@ -1538,6 +1548,34 @@ class OCIRootInspectDetail:
             raise TypeError("OCI-root inspect detail requires immutable ports")
         if self.guest_ip is not None and not _valid_ip(self.guest_ip):
             raise ValueError("OCI-root inspect detail has an invalid guest IP")
+        if self.mode is not None and self.mode not in {"dev", "prod"}:
+            raise ValueError("OCI-root inspect detail has an invalid lifecycle mode")
+        if self.restart is not None and self.restart not in {"no", "unless-stopped"}:
+            raise ValueError("OCI-root inspect detail has an invalid restart policy")
+        if self.main_state is not None and self.main_state not in {
+            "not-started",
+            "absent",
+            "running",
+            "exited",
+        }:
+            raise ValueError("OCI-root inspect detail has an invalid workload state")
+        for value in (self.main_pid, self.user_session_count):
+            if value is not None and (type(value) is not int or value < 0):
+                raise ValueError("OCI-root inspect detail has an invalid process/session count")
+        if self.main_exit_code is not None and (
+            type(self.main_exit_code) is not int or not 0 <= self.main_exit_code <= 255
+        ):
+            raise ValueError("OCI-root inspect detail has an invalid workload exit status")
+        if self.user_sessions_known is not None and type(self.user_sessions_known) is not bool:
+            raise ValueError("OCI-root inspect detail has an invalid session observation")
+        if self.main_exit_signal is not None and (
+            type(self.main_exit_signal) is not int or not 0 <= self.main_exit_signal <= 64
+        ):
+            raise ValueError("OCI-root inspect detail has an invalid workload exit signal")
+        if self.main_oom_kill_count is not None and (
+            type(self.main_oom_kill_count) is not int or not 0 <= self.main_oom_kill_count <= 2**64 - 1
+        ):
+            raise ValueError("OCI-root inspect detail has an invalid workload OOM observation")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1619,6 +1657,7 @@ _AGGREGATION_ERROR_CODES = frozenset(
     {
         "invalid-entry",
         "invalid-ledger",
+        "runtime-busy",
         "runtime-capability",
         "runtime-failure",
         "runtime-warning",

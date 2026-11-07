@@ -452,6 +452,10 @@ class _CallerEnvironment(CloudEnv):
             raise CloudEnvError("original caller identity changed; HOLD")
         if self.state.get("project_id") != fresh["project_id"] or self.state.get("user_id") != fresh["user_id"]:
             raise CloudEnvError("operator environment belongs to another caller; HOLD")
+        authorize_actor = getattr(self.checkpoint, "authorize_actor", None)
+        if not callable(authorize_actor):
+            raise CloudEnvError("native original caller action fence unavailable; HOLD")
+        authorize_actor()
         self._checkpoint()
         self._connection = self.caller
 
@@ -678,6 +682,16 @@ async def _run(factory, actor, conn, profile, row, deleting=False):
     def authorize():
         asyncio.run_coroutine_threadsafe(authorize_selected(), loop).result()
 
+    async def authorize_actor():
+        from palimpsest_hub.services.instances import fresh_instance_controller, fresh_writer
+
+        await (fresh_instance_controller(actor, conn, row) if deleting else fresh_writer(actor, conn))
+
+    def check_actor():
+        asyncio.run_coroutine_threadsafe(authorize_actor(), loop).result()
+
+    checkpoint.authorize_actor = check_actor
+
     checkpoint.authorize = authorize
 
     try:
@@ -714,10 +728,15 @@ async def _background_run(factory, settings, original, identity, profile_digest,
         if fresh["project_id"] != original["project_id"] or fresh["user_id"] != original["user_id"]:
             raise CloudEnvError("native background original caller identity changed; HOLD")
         actor = await get_package_manager_info(token_info=fresh)
-        if "packages:write" not in actor.get("package_actions", ()):
-            raise CloudEnvError("native background original caller lost publication authority; HOLD")
+        required_actions = {"packages:manage", "packages:manage_own"} if deleting else {"packages:write"}
+        if not required_actions & set(actor.get("package_actions", ())):
+            raise CloudEnvError("native background original caller lost required action authority; HOLD")
         async with factory() as session:
             row = await _owned(session, identity, actor)
+            if deleting:
+                from palimpsest_hub.services.instances import require_instance_control
+
+                require_instance_control(actor, row)
             if row.status != ("deleting" if deleting else "creating"):
                 return
             if row.profile_digest != profile_digest:
@@ -863,6 +882,8 @@ async def create(factory, store, settings, actor, conn, request, *, background=N
 
 
 async def delete(factory, settings, actor, conn, identity, *, background=None):
+    from palimpsest_hub.services.instances import fresh_instance_controller
+
     async with factory() as session:
         row = await _owned(session, identity, actor)
         name, environment = row.profile, row.environment_digest
@@ -872,6 +893,7 @@ async def delete(factory, settings, actor, conn, identity, *, background=None):
         raise HTTPException(409, "Native operator environment changed; HOLD")
     async with sql_mutex(factory, "build-api:native-env:" + environment[7:]) as session:
         row = await _owned(session, identity, actor)
+        await fresh_instance_controller(actor, conn, row)
         if row.profile_digest != _digest(profile):
             raise HTTPException(409, "Native operator profile changed; HOLD")
         if row.status == "deleted":

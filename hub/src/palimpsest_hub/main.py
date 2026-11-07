@@ -29,7 +29,9 @@ from palimpsest_hub.api.builds import router as build_router
 from palimpsest_hub.api.catalog import router as catalog_router
 from palimpsest_hub.api.hub import configure_blocking_operations
 from palimpsest_hub.api.hub import router as hub_router
+from palimpsest_hub.api.image_admin import router as image_admin_router
 from palimpsest_hub.api.image_jobs import router as image_job_router
+from palimpsest_hub.api.image_keys import router as image_key_router
 from palimpsest_hub.api.instances import router as instance_router
 from palimpsest_hub.api.native_instances import router as native_instance_router
 from palimpsest_hub.api.packages import router as package_router
@@ -117,6 +119,8 @@ app.include_router(image_job_router, prefix="/v1", tags=["image-jobs"])
 app.include_router(instance_router, prefix="/v1", tags=["instances"])
 app.include_router(published_image_router, prefix="/v1", tags=["published-images"])
 app.include_router(native_instance_router, prefix="/v1", tags=["native-instances"])
+app.include_router(image_admin_router, prefix="/v1", tags=["image-quota"])
+app.include_router(image_key_router, prefix="/v1", tags=["image-keys"])
 
 
 def _package_path(request: Request) -> bool:
@@ -137,6 +141,8 @@ def _execution_path(request: Request) -> bool:
         "/v1/published-images",
         "/v1/layer-nodes",
         "/v1/native-instances",
+        "/v1/image-quota",
+        "/v1/admin/image-quota",
     )
     return any(path == root or path.startswith(root + "/") for root in roots)
 

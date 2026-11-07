@@ -13,9 +13,87 @@ it rejects native and external cache authorities and permits `--no-cache`.
 It retains the same builder/export and source-validation contracts. It is not
 offline mode: only `--offline` forbids remote Dockerfile inputs.
 
+A config-only Dockerfile may legitimately produce no BuildKit cache records.
+In optional local cache mode (including strict offline local caching), an
+existing empty export directory is recorded as `cache_exported=false`, a null
+`cache_archive_digest` and zero cache-archive bytes. No archive/index is invented
+and the prior scope cache is preserved. A missing or nonempty incomplete export
+still fails, as does any missing index under mandatory native cache mode.
+
+## Operator image-source policy
+
+Online builds require the exact [upstream source policy](registries.md#upstream-image-source-admission)
+before builder preflight or any local/native cache hit. Admission covers external
+FROM, an actually used external frontend, COPY `--from` and RUN mount `from`;
+scratch, declared local stages and verified named inputs are not upstream images.
+Absent policy is not a wildcard. Offline source validation remains separate.
+
+Static checks do not replace the solve boundary. The client writes its admitted
+policy snapshot and supplies `EXPERIMENTAL_BUILDKIT_SOURCE_POLICY` to Buildx,
+overriding an ambient value. Buildx must be stable0.11 or newer (including a
+qualified stable Desktop suffix); every selected node must report a running
+BuildKit0.12-or-newer version so metadata fetches are fenced as well as Solve.
+Missing, duplicate, inactive or older node metadata fails closed. Dedicated workers
+pass `buildctl build --source-policy-file`. Hub's fixed built-in frontend ignores an unused
+`# syntax=` header rather than granting permission to a remote frontend.
+
+This restricts image resolution, not every network operation in a Dockerfile
+RUN or HTTP/Git ADD. Existing checksum/Git/network policies still apply. A local
+arm64 BuildKit0.34.1 smoke exercised actual COPY-to-OCI output, including local
+prior-stage name/ordinal copies with empty upstream rules, and source denial.
+The engine itself rejected future-stage COPY; the scanner did not misclassify
+that local alias as an upstream image. An allowed Ubuntu repository passed policy
+but its fetch was blocked by the OS network namespace. None of these is Ubuntu
+acquisition, a Buildx/Desktop live proof or native VM-root qualification.
+
+## Local Dockerfile context ignores
+
+The **local Dockerfile frontend** recognizes only `CONTEXT/.plmignore`; it does
+not search parent directories or recursively load nested `.plmignore` files.
+Patterns are relative to the build-context root, even when `-f` selects a
+Dockerfile in an ancestor or sibling directory.
+
+BuildKit is the pattern-matching authority. The baseline is the adjacent
+`<actual Dockerfile filename>.dockerignore` when that file exists; otherwise it
+is `CONTEXT/.dockerignore`. A present but empty Dockerfile-specific file still
+replaces the root baseline. Root `.plmignore` patterns append **after** that
+baseline, so the last matching pattern wins: an explicit `!private/public.txt`
+can reinstate a file excluded by the baseline. To reinstate a descendant of an
+excluded directory, use Docker-compatible ancestor/exception patterns; this is
+Docker ignore grammar, not a complete Git-ignore implementation.
+
+Docker-style comments, blank lines, `!` exceptions, wildcard patterns including
+`**`, and CRLF inputs are passed to BuildKit rather than interpreted by a second
+Python matcher. Each selected ignore input must be a regular, non-symlink UTF-8
+file of at most 1 MiB without NUL bytes; invalid inputs fail closed, not by
+silently dropping `.dockerignore`.
+
+With root `.plmignore` present, Palimpsest creates a private temporary definition
+directory containing the exact Dockerfile bytes under the same filename and a
+merged filename-specific `.dockerignore`. It supplies that generated `--file`
+to Buildx while leaving the complete **original context path** unchanged.
+No context copy/filter engine is used, no source or user ignore is rewritten,
+and no `FROM` or image-source policy is changed. The definition exists through
+solve/export and cache finalization and is removed on success or exception;
+it is not retained as a source copy in build records. Without root `.plmignore`,
+Buildx receives the original Dockerfile path and ordinary Docker ignore
+selection is preserved.
+
+The existing conservative build identity continues hashing the whole context,
+including excluded files, and additionally binds the effective ignore bytes.
+In particular, changes to a selected Dockerfile-specific ignore outside the
+context invalidate the lookup key. This does not relax fresh source admission,
+policy transport, strict-offline builder topology, runtime architecture or
+publication gates.
+
+This change does **not** implement `.plmignore` for remote Git sources, Hub
+worker execution, or commit phases. Those paths require a later explicit
+cutover and their own acceptance evidence; local frontend support is not a
+claim that those phases or the roadmap goal are complete.
+
 ## Selected Buildx builder preflight
 
-Dockerfile builds in default native cache mode first authorize `cache:read` and `cache:write` for the exact native cache package, then inspect the builder already selected by Buildx or `BUILDX_BUILDER`. Local cache mode skips Hub authorization but still inspects that selected builder. The inspected name is pinned into `docker buildx build --builder <name>`, so a concurrent global `docker buildx use` cannot switch the executor between preflight and solve. Inspection is read-only: Palimpsest does not create, select or bootstrap a builder. Unauthorized native package-only keys fail before inspection or build-directory creation.
+After source admission, Dockerfile builds in default native cache mode authorize `cache:read` and `cache:write` for the exact native cache package, then inspect the builder already selected by Buildx or `BUILDX_BUILDER`. Local cache mode skips Hub authorization but still inspects that selected builder. The inspected name is pinned into `docker buildx build --builder <name>`, so a concurrent global `docker buildx use` cannot switch the executor between preflight and solve. Inspection is read-only: Palimpsest does not create, select or bootstrap a builder. Unauthorized native package-only keys fail before inspection or build-directory creation.
 
 The OCI output required by this workflow is supported by the `docker-container`, `kubernetes`, and `remote` drivers. The default `docker` driver is rejected before Hub cache resolution or the Buildx solve because it cannot export `type=oci`. The successful build receipt records the inspected `buildx_driver`.
 

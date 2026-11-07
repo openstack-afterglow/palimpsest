@@ -252,7 +252,7 @@ print("ok")
 
 def test_dispatch_key_rejects_unsupported_or_untyped_identity() -> None:
     with pytest.raises(ValueError, match="unsupported runtime/backend combination"):
-        DispatchKey(RuntimeKind.OCI_ROOT, RuntimeBackend.LIMA_VZ)
+        DispatchKey(RuntimeKind.OCI_ROOT, RuntimeBackend.LIMA_KRUNKIT)
     with pytest.raises(TypeError, match="RuntimeKind and RuntimeBackend"):
         DispatchKey("cloud-image", "kvm")  # type: ignore[arg-type]
 
@@ -1499,6 +1499,7 @@ def test_legacy_state_may_omit_both_identity_fields_without_being_rewritten(tmp_
         (1, "cloud-image", "lima-vz", RuntimeKind.CLOUD_IMAGE, RuntimeBackend.LIMA_VZ),
         (2, "cloud-image", "kvm", RuntimeKind.CLOUD_IMAGE, RuntimeBackend.KVM),
         (2, "oci-root", "kvm", RuntimeKind.OCI_ROOT, RuntimeBackend.KVM),
+        (2, "oci-root", "lima-vz", RuntimeKind.OCI_ROOT, RuntimeBackend.LIMA_VZ),
     ],
 )
 def test_read_run_dispatch_record_normalizes_only_durable_schema_rules(
@@ -1540,7 +1541,7 @@ def test_read_run_dispatch_record_normalizes_only_durable_schema_rules(
         {"schema_version": 2, "runtime_kind": "cloud-image"},
         {"schema_version": 2, "runtime_kind": "unknown", "backend": "kvm"},
         {"schema_version": 2, "runtime_kind": "cloud-image", "backend": "unknown"},
-        {"schema_version": 2, "runtime_kind": "oci-root", "backend": "lima-vz"},
+        {"schema_version": 2, "runtime_kind": "oci-root", "backend": "lima-krunkit"},
         {"schema_version": 1, "runtime_kind": "oci-root", "backend": "kvm"},
     ],
 )
@@ -2268,6 +2269,140 @@ def test_inspect_is_one_snapshot_typed_immutable_allowlisted_and_state_only(
         inspected.lifecycle.status = "stopped"  # type: ignore[misc]
 
 
+@pytest.mark.parametrize("binding", ["absent", "null", "preplan"])
+def test_unprepared_native_failure_remains_visible_without_runtime_authority(tmp_path, monkeypatch, binding):
+    roots = _roots(tmp_path)
+    dispatch = DispatchKey(RuntimeKind.OCI_ROOT, RuntimeBackend.LIMA_VZ)
+    with pytest.raises(RuntimeError):
+        with state.reserve_new_run(roots, "unprepared", dispatch) as reservation:
+            run_id = reservation.record.run_id
+            raise RuntimeError("preparation did not complete")
+    if binding != "absent":
+        ledger = roots.runs / "unprepared" / "state.json"
+        payload = state.read_json(ledger)
+        payload["vz_native"] = (
+            None
+            if binding == "null"
+            else {
+                "schema": "palimpsest.vz-native-run.v1",
+                "instance": "plm-" + run_id.replace("-", "")[:12],
+                "instance_identity": None,
+                "lease_set_id": str(uuid.uuid4()),
+                "root_volume_id": str(uuid.uuid4()),
+                "hold": "launch-incomplete",
+            }
+        )
+        state.atomic_write_json(ledger, payload)
+    before = _snapshot_tree(roots.state)
+
+    def forbid_runtime(*args, **kwargs):
+        pytest.fail("durable discovery invoked a runtime")
+
+    monkeypatch.setattr(runtime_dispatch, "_native_vz_adapter", forbid_runtime)
+    result = runtime_dispatch.ps(roots=roots)
+    inspected = runtime_dispatch.inspect_run("unprepared", roots=roots)
+
+    assert result.errors == ()
+    assert [(summary.name, summary.status) for summary in result.summaries] == [("unprepared", "failed")]
+    assert inspected.record.run_id == run_id
+    assert inspected.lifecycle.status == "failed"
+    assert inspected.detail.mode is None
+    assert _snapshot_tree(roots.state) == before
+
+
+@pytest.mark.parametrize(
+    "native",
+    [
+        {},
+        {"schema": "unknown"},
+        {"schema": "palimpsest.vz-native-run.v1", "plan_sha256": "a" * 64},
+        {"schema": "palimpsest.vz-native-run.v1", "plan": None},
+        {"schema": "palimpsest.vz-native-run.v1", "plan": {}},
+        {"schema": "palimpsest.vz-native-run.v1", "plan": []},
+    ],
+    ids=["empty-binding", "wrong-schema", "lost-committed-plan", "null-plan", "empty-plan", "list-plan"],
+)
+def test_native_invalid_preparation_reports_discovery_errors_without_changing_ledger(tmp_path, native):
+    roots = _roots(tmp_path)
+    _write_ledger(
+        roots,
+        record={
+            "schema_version": 2,
+            "runtime_kind": "oci-root",
+            "backend": "lima-vz",
+            "status": "failed",
+            "vz_native": native,
+        },
+    )
+    before = _snapshot_tree(roots.state)
+
+    result = runtime_dispatch.ps(roots=roots)
+
+    assert result.summaries == ()
+    assert len(result.errors) == 1
+    assert result.errors[0].name == "demo"
+    with pytest.raises(StateError):
+        runtime_dispatch.inspect_run("demo", roots=roots)
+    assert _snapshot_tree(roots.state) == before
+
+
+@pytest.mark.parametrize(
+    "changed", ["unchanged", "missing-process", "invalid-process", "missing-mode", "invalid-restart"]
+)
+def test_native_self_hashed_plan_discovery_distinguishes_valid_and_malformed_contracts(tmp_path, changed):
+    from palimpsest_local.oci_process import OCIProcessSpec
+    from palimpsest_local.oci_provenance import canonical_json_bytes
+
+    roots = _roots(tmp_path)
+    paths, run_id = _write_ledger(
+        roots,
+        record={"schema_version": 2, "runtime_kind": "oci-root", "backend": "lima-vz", "status": "failed"},
+    )
+    root_volume_id = str(uuid.uuid4())
+    plan = {
+        "schema": "palimpsest.vz-root-plan.v1",
+        "run_id": run_id,
+        "run_name": "demo",
+        "root_volume_id": root_volume_id,
+        "process": OCIProcessSpec.empty().to_dict(),
+        "mode": "dev",
+        "restart": "no",
+    }
+    if changed == "missing-process":
+        del plan["process"]
+    elif changed == "invalid-process":
+        plan["process"] = {}
+    elif changed == "missing-mode":
+        del plan["mode"]
+    elif changed == "invalid-restart":
+        plan["restart"] = []
+    payload = state.read_json(paths.state)
+    payload["vz_native"] = {
+        "schema": "palimpsest.vz-native-run.v1",
+        "root_volume_id": root_volume_id,
+        "plan": plan,
+        "plan_sha256": hashlib.sha256(canonical_json_bytes(plan)).hexdigest(),
+    }
+    state.atomic_write_json(paths.state, payload)
+    before = _snapshot_tree(roots.state)
+
+    result = runtime_dispatch.ps(roots=roots)
+
+    if changed == "unchanged":
+        assert result.errors == ()
+        assert [(row.name, row.status) for row in result.summaries] == [("demo", "failed")]
+        inspected = runtime_dispatch.inspect_run("demo", roots=roots)
+        assert inspected.record.run_id == run_id
+        assert inspected.detail.mode == "dev" and inspected.detail.restart == "no"
+    else:
+        assert result.summaries == ()
+        assert len(result.errors) == 1
+        assert result.errors[0].name == "demo"
+        with pytest.raises(StateError):
+            runtime_dispatch.inspect_run("demo", roots=roots)
+    assert _snapshot_tree(roots.state) == before
+
+
 @pytest.mark.parametrize("backend", ["kvm", "lima-vz"])
 @pytest.mark.parametrize(
     ("_operation", "target_name", "dispatch", "kwargs"),
@@ -2298,9 +2433,9 @@ def test_eager_dispatch_rejects_identity_and_kind_swap_between_selection_and_ada
     original_reader = state.read_run_dispatch_record
     reads = 0
 
-    def racing_reader(read_roots: state.StatePaths, name: str) -> ExistingRunRecord:
+    def racing_reader(read_roots: state.StatePaths, name: str, **kwargs) -> ExistingRunRecord:
         nonlocal reads
-        record = original_reader(read_roots, name)
+        record = original_reader(read_roots, name, **kwargs)
         reads += 1
         if reads == 1:
             replacement_id = str(uuid.uuid4())
@@ -2417,9 +2552,9 @@ def test_adapter_entry_guard_blocks_swap_after_dispatch_revalidation_before_real
     original_reader = state.read_run_dispatch_record
     reads = 0
 
-    def racing_reader(read_roots: state.StatePaths, name: str) -> ExistingRunRecord:
+    def racing_reader(read_roots: state.StatePaths, name: str, **kwargs) -> ExistingRunRecord:
         nonlocal reads
-        record = original_reader(read_roots, name)
+        record = original_reader(read_roots, name, **kwargs)
         reads += 1
         if reads == 2:
             _replace_ledger_with_oci(roots, rpaths)
@@ -3377,6 +3512,155 @@ def test_process_operations_route_by_durable_record_without_returning_host_argv(
     assert kwargs["_expected_record"].dispatch_key.backend is RuntimeBackend(backend)
 
 
+@pytest.mark.parametrize(("guest_seconds", "expected_code"), [(0.1, 0), (1.5, 124)])
+def test_native_exec_guest_timer_starts_after_slow_host_preflight_load_and_status(
+    tmp_path, monkeypatch, guest_seconds, expected_code
+):
+    import fcntl
+    import time
+
+    from palimpsest_local import vz_native_runtime as native
+
+    roots = _roots(tmp_path / "ledger")
+    name = "guest-duration-native"
+    _, run_id = _write_ledger(
+        roots,
+        name=name,
+        record={"schema_version": 2, "runtime_kind": "oci-root", "backend": "lima-vz", "status": "running"},
+    )
+    home = tmp_path / "pinned-home"
+    home.mkdir(mode=0o700)
+    custody = home / "_palimpsest-native"
+    custody.mkdir(mode=0o700)
+    value = {"lima_home": str(home), "expires_unix": 3600}
+    config_path = tmp_path / "host.json"
+    config_path.write_bytes(native._json(value))
+    config_path.chmod(0o600)
+    _, digest, stamp = native._file(config_path, private=True, limit=native._MAX_JSON)
+    info = home.stat()
+    config = native.VZHostConfig(config_path, digest, tuple(stamp), value, {}, {}, (info.st_dev, info.st_ino))
+    native_data = {
+        "plan": {"run_id": run_id, "root_filesystem_uuid": "root-uuid", "root_nonce": "nonce", "layers": []},
+        "plan_sha256": "a" * 64,
+    }
+    status = {
+        "schema": "palimpsest.vz-root-status.v1",
+        "platform_abi": native.PLATFORM_ABI,
+        "run_id": run_id,
+        "plan_sha256": native_data["plan_sha256"],
+        "root_filesystem_uuid": "root-uuid",
+        "root_nonce": "nonce",
+        "root_filesystem": "overlay",
+        "root_device": 1,
+        "root_inode": 2,
+        "pid1_root_device": 1,
+        "pid1_root_inode": 2,
+        "lower_mounts": [],
+        "bootstrap_tcp_open": False,
+        "phase": "ready",
+        "user_sessions_known": True,
+        "user_session_count": 0,
+        "main": {"state": "running", "pid": 3},
+    }
+    clock = [600.0]
+    real_monotonic = time.monotonic
+    evaluate = runtime_dispatch.platforms.evaluate_capability_profile
+    bounded = native._bounded
+
+    def slow_preflight(*args, **kwargs):
+        clock[0] += 2
+        return evaluate(*args, **kwargs)
+
+    def slow_load(*_args, **_kwargs):
+        clock[0] += 2
+        return ({"vz_native": native_data},)
+
+    def ssh_argv(_config, _native, *, control=False, command=None, **_kwargs):
+        if control:
+            # A real status actor takes longer than the entire guest timeout.
+            return [sys.executable, "-c", "import time; time.sleep(1.1); print(" + repr(json.dumps(status)) + ")"]
+        assert command.startswith("plm-exec-v1 ")
+        # Model the guest-side timer with an actual child and timeout, rather
+        # than accepting an echoed duration or manufacturing an exit receipt.
+        return [
+            sys.executable,
+            "-c",
+            "import base64,json,subprocess,sys\n"
+            "encoded=sys.argv[1].split(' ',1)[1]\n"
+            "payload=json.loads(base64.urlsafe_b64decode(encoded+'='*(-len(encoded)%4)))\n"
+            "try:\n"
+            " result=subprocess.run(payload['argv'],timeout=payload['timeout_ms']/1000)\n"
+            "except subprocess.TimeoutExpired:\n"
+            " sys.exit(124)\n"
+            "sys.exit(result.returncode)\n",
+            command,
+        ]
+
+    def status_actor(*args, **kwargs):
+        with monkeypatch.context() as actor_clock:
+            actor_clock.setattr(native.time, "monotonic", real_monotonic)
+            result = bounded(*args, **kwargs)
+        clock[0] += 2
+        return result
+
+    def no_retained_actor(*args):
+        for actor in args:
+            if hasattr(actor, "wait"):
+                actor.wait(timeout=3)
+        pytest.fail("settled local status/guest actor must not manufacture HOLD")
+
+    monkeypatch.setattr(native.time, "time", lambda: 0)
+    monkeypatch.setattr(native.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(native, "_require_native_custody_owner", lambda: None)
+    monkeypatch.setattr(native, "_config_for", lambda _authority: config)
+    monkeypatch.setattr(native, "_bound_host_config", lambda _native: config)
+    monkeypatch.setattr(native, "_load", slow_load)
+    monkeypatch.setattr(native, "_ssh_argv", ssh_argv)
+    monkeypatch.setattr(native, "_bounded", status_actor)
+    monkeypatch.setattr(native, "_owned_instance", lambda *_a, **_kw: {"status": "Running"})
+    monkeypatch.setattr(native, "retain_preparation_custody", no_retained_actor)
+    monkeypatch.setattr(native, "_HELD", [])
+    monkeypatch.setattr(runtime_dispatch.platforms, "evaluate_capability_profile", slow_preflight)
+    budget = state.RunObservationWaitBudget()
+    guest_marker = tmp_path / "guest-command-runs"
+    guest_program = (
+        "import time\n"
+        f"with open({str(guest_marker)!r}, 'ab', buffering=0) as marker: marker.write(b'ran\\n')\n"
+        f"time.sleep({guest_seconds})\n"
+        "print('guest-completed', flush=True)\n"
+    )
+    session = runtime_dispatch.exec(
+        name,
+        [sys.executable, "-c", guest_program],
+        roots=roots,
+        timeout_ms=1000,
+        _observation_budget=budget,
+    )
+    try:
+        events = list(session.events())
+        result = session.wait()
+    finally:
+        session.close()
+    assert result.returncode == expected_code
+    output = b"".join(event.data for event in events if hasattr(event, "data"))
+    assert (b"guest-completed" in output) is (expected_code == 0)
+    assert guest_marker.read_bytes() == b"ran\n"
+    assert budget.remaining_seconds == 5
+    assert not (custody / "active.json").exists()
+    assert not list(custody.glob("*.actor.json"))
+    assert not list(custody.glob("session-*.json")) and not list(custody.glob("hold-*.json"))
+    assert not native._HELD
+    # Both the durable run mutex and namespace mutex are immediately reusable.
+    with state.locked_existing_run(roots, name, observation_budget=state.RunObservationWaitBudget(0)):
+        with native._custody(config):
+            lock = os.open(custody / "lock", os.O_RDWR)
+            try:
+                with pytest.raises(BlockingIOError):
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(lock)
+
+
 def test_exec_timeout_is_refused_for_cloud_image_runs_before_the_adapter(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3868,3 +4152,690 @@ def test_lifecycle_revision_max_rejects_every_operation_before_preflight_or_adap
     with pytest.raises(StateError, match="cannot be incremented"):
         dispatch("demo", roots=roots, **kwargs)
     assert effects == []
+
+
+@pytest.fixture
+def native_read_flight(tmp_path, monkeypatch):
+    """Real run/custody locks and child actors; only provider transport is local."""
+    import queue
+    import threading
+
+    from palimpsest_local import vz_native_runtime as native
+
+    roots = _roots(tmp_path / "ledger")
+    paths, _ = _write_ledger(
+        roots,
+        record={
+            "schema_version": 2,
+            "runtime_kind": "oci-root",
+            "backend": "lima-vz",
+            "status": "running",
+            "lifecycle_revision": 1,
+        },
+    )
+    paths.root.chmod(0o700)
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    custody = home / "_palimpsest-native"
+    custody.mkdir(mode=0o700)
+    config = SimpleNamespace(home=home, verify=lambda **_kwargs: None)
+    configs = {roots: config}
+
+    def config_for(selected):
+        if selected not in configs:
+            selected_home = tmp_path / ("home-" + hashlib.sha256(str(selected.state).encode()).hexdigest()[:12])
+            selected_home.mkdir(mode=0o700)
+            (selected_home / "_palimpsest-native").mkdir(mode=0o700)
+            configs[selected] = SimpleNamespace(home=selected_home, verify=lambda **_kwargs: None)
+        return configs[selected]
+
+    started = threading.Event()
+    release = threading.Event()
+    resume_joiners = threading.Event()
+    resume_joiners.set()
+    joined = queue.Queue()
+    actors = tmp_path / "status-actors"
+    command_effect = tmp_path / "command-effect"
+    threads = []
+    results = {}
+    failures = {}
+    observations = {}
+    fault = [None]
+    outer_fault = [None]
+    producer = runtime_dispatch._produce_read_observation
+
+    def controlled_producer(*args):
+        result = producer(*args)
+        if outer_fault[0] is not None:
+            raise outer_fault[0]
+        return result
+
+    monkeypatch.setattr(runtime_dispatch, "_produce_read_observation", controlled_producer)
+    original_flight = runtime_dispatch._ReadObservationFlight
+
+    class JoinEvent:
+        def __init__(self):
+            self.event = threading.Event()
+
+        def wait(self, timeout):
+            joined.put(threading.current_thread().name)
+            complete = self.event.wait(timeout)
+            if complete:
+                assert resume_joiners.wait(3), "joiner release was not supplied"
+            return complete
+
+        def set(self):
+            self.event.set()
+
+    monkeypatch.setattr(
+        runtime_dispatch,
+        "_ReadObservationFlight",
+        lambda owner: original_flight(owner, done=JoinEvent()),
+    )
+
+    def refresh(selected, name, *, expected_record, _observation_budget):
+        with state.locked_existing_run(
+            selected, name, expected=expected_record, observation_budget=_observation_budget
+        ) as authority:
+            with native._custody(config_for(selected), observation_budget=_observation_budget):
+                actor = subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-c",
+                        "import pathlib,sys; "
+                        "p=pathlib.Path(sys.argv[1]); "
+                        "f=p.open('a'); f.write('status\\n'); f.close(); "
+                        "print('ready',flush=True); sys.stdin.buffer.read(1)",
+                        str(actors),
+                    ],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                )
+                try:
+                    assert actor.stdout.readline() == b"ready\n"
+                    started.set()
+                    assert release.wait(3), "provider release was not supplied"
+                    actor.communicate(b"x", timeout=3)
+                    assert actor.returncode == 0
+                    if fault[0] is not None:
+                        raise fault[0]
+                    return authority.write_state("running", authority.mutable_state())
+                finally:
+                    if actor.poll() is None:
+                        actor.kill()
+                        actor.communicate(timeout=3)
+
+    def execute(name, request, *, roots, _expected_record, _observation_budget):
+        with state.locked_existing_run(roots, name, expected=_expected_record, observation_budget=_observation_budget):
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import pathlib,sys; pathlib.Path(sys.argv[1]).write_text('command')",
+                    str(command_effect),
+                ],
+                check=True,
+            )
+        return _FakeProcessSession()
+
+    adapter = SimpleNamespace(
+        refresh_run=refresh,
+        host_config_for_run=lambda selected, *_args, **_kwargs: config_for(selected),
+        _custody=native._custody,
+        exec_session=execute,
+    )
+    monkeypatch.setattr(runtime_dispatch, "_native_vz_adapter", lambda: adapter)
+    monkeypatch.setattr(runtime_dispatch, "_preflight_existing_adapter", lambda *_args, **_kwargs: adapter)
+
+    def launch(label, *, selected=roots, budget=None, command=False):
+        observed = observations.setdefault(label, [])
+
+        def run():
+            try:
+                if command:
+                    results[label] = runtime_dispatch.exec("demo", ["true"], roots=selected)
+                else:
+                    results[label] = runtime_dispatch.reconcile(
+                        roots=selected,
+                        _observation_budget=budget,
+                        _snapshot_observer=observed.append,
+                    )
+            except BaseException as error:
+                failures[label] = error
+
+        thread = threading.Thread(target=run, name=label)
+        threads.append(thread)
+        thread.start()
+        return thread
+
+    fixture = SimpleNamespace(
+        roots=roots,
+        paths=paths,
+        launch=launch,
+        started=started,
+        release=release,
+        resume=resume_joiners,
+        joined=joined,
+        actors=actors,
+        command_effect=command_effect,
+        results=results,
+        failures=failures,
+        observations=observations,
+        fault=fault,
+        custody=custody,
+        adapter=adapter,
+        outer_fault=outer_fault,
+    )
+    try:
+        yield fixture
+    finally:
+        release.set()
+        resume_joiners.set()
+        for thread in threads:
+            thread.join(4)
+            assert not thread.is_alive(), f"unfinished read flight thread: {thread.name}"
+
+
+def test_native_concurrent_root_readers_share_actual_status_actor_without_starving_command(native_read_flight):
+    f = native_read_flight
+    leader = f.launch("leader")
+    assert f.started.wait(3)
+    readers = [f.launch(f"reader-{index}") for index in range(2)]
+    assert {f.joined.get(timeout=3), f.joined.get(timeout=3)} == {"reader-0", "reader-1"}
+    command = f.launch("command", command=True)
+    f.release.set()
+    for thread in [leader, *readers, command]:
+        thread.join(4)
+        assert not thread.is_alive()
+    assert f.failures == {}
+    assert f.actors.read_text().splitlines() == ["status"]
+    assert f.command_effect.read_text() == "command"
+    assert all(not f.results[label].summaries[0].stale for label in ("leader", "reader-0", "reader-1"))
+    assert f.observations["reader-0"] == f.observations["reader-1"] == f.observations["leader"]
+    later = f.launch("later")
+    later.join(4)
+    assert not later.is_alive()
+    assert f.failures == {}
+    assert f.actors.read_text().splitlines() == ["status", "status"]
+    assert runtime_dispatch._READ_OBSERVATION_FLIGHTS == {}
+
+
+def test_native_flight_wait_consumes_own_remaining_allowance_without_alias_or_replay(native_read_flight):
+    f = native_read_flight
+    leader = f.launch("leader")
+    assert f.started.wait(3)
+    budget = state.RunObservationWaitBudget(0.03)
+    waiter = f.launch("short", budget=budget)
+    assert f.joined.get(timeout=3) == "short"
+    waiter.join(1)
+    assert not waiter.is_alive()
+    assert budget.remaining_seconds == 0
+    assert f.observations["short"] == []
+    assert len(f.results["short"].summaries) == 1
+    assert f.results["short"].summaries[0].stale
+    assert [item.code for item in f.results["short"].errors] == ["runtime-busy"]
+    assert f.actors.read_text().splitlines() == ["status"]
+    f.release.set()
+    leader.join(4)
+    assert f.failures == {}
+
+
+@pytest.mark.parametrize(
+    ("where", "failure"),
+    [
+        ("adapter", StateError("leader-failed")),
+        ("adapter", KeyboardInterrupt("leader-cancelled")),
+        ("outer", RuntimeError("producer-failed")),
+        ("outer", SystemExit("producer-exited")),
+    ],
+)
+def test_native_flight_leader_failure_wakes_joiners_and_removes_entry(native_read_flight, where, failure):
+    f = native_read_flight
+    (f.fault if where == "adapter" else f.outer_fault)[0] = failure
+    leader = f.launch("leader")
+    assert f.started.wait(3)
+    waiter = f.launch("waiter")
+    assert f.joined.get(timeout=3) == "waiter"
+    f.release.set()
+    leader.join(4)
+    waiter.join(4)
+    assert not leader.is_alive() and not waiter.is_alive()
+    assert f.observations["leader"] == f.observations["waiter"] == []
+    if isinstance(failure, StateError):
+        assert all(result.summaries[0].stale for result in f.results.values())
+    else:
+        assert f.failures["leader"] is failure
+        assert "waiter" not in f.failures
+        assert f.results["waiter"].summaries[0].stale
+        assert any(error.code == "runtime-failure" for error in f.results["waiter"].errors)
+    assert runtime_dispatch._READ_OBSERVATION_FLIGHTS == {}
+    f.fault[0] = None
+    f.outer_fault[0] = None
+    later = f.launch("later")
+    later.join(4)
+    assert not later.is_alive()
+    assert not f.results["later"].summaries[0].stale
+    assert f.actors.read_text().splitlines() == ["status", "status"]
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "uuid",
+        "schema",
+        "dispatch",
+        "run-directory",
+        "runs-root",
+        "state-root",
+        "config-root",
+        "run-mode",
+        "new-name",
+        "revision",
+        "state-generation",
+        "stop",
+        "removed",
+        "ledger-hold",
+        "custody-hold",
+    ],
+)
+def test_joined_native_snapshot_refuses_changed_binding_or_generation(native_read_flight, change):
+    f = native_read_flight
+    f.resume.clear()
+    leader = f.launch("leader")
+    assert f.started.wait(3)
+    waiter = f.launch("waiter")
+    assert f.joined.get(timeout=3) == "waiter"
+    f.release.set()
+    leader.join(4)
+    assert not leader.is_alive()
+    payload = json.loads(f.paths.state.read_text())
+    if change == "uuid":
+        replacement = str(uuid.uuid4())
+        owner = json.loads(f.paths.owner.read_text())
+        owner["run_id"] = payload["run_id"] = replacement
+        f.paths.owner.write_text(json.dumps(owner))
+    elif change == "schema":
+        payload["schema_version"] = 1
+    elif change == "dispatch":
+        payload["backend"] = "kvm"
+    elif change == "run-directory":
+        f.paths.root.rename(f.roots.runs / "original")
+        f.paths.root.mkdir(mode=0o700)
+    elif change == "runs-root":
+        f.roots.runs.rename(f.roots.state / "original-runs")
+        f.roots.runs.mkdir(mode=0o700)
+    elif change == "state-root":
+        f.roots.state.rename(f.roots.state.with_name("original-state"))
+        f.roots.state.mkdir(mode=0o700)
+    elif change == "config-root":
+        f.roots.config.rename(f.roots.config.with_name("original-config"))
+        f.roots.config.mkdir(mode=0o700)
+    elif change == "run-mode":
+        f.paths.root.chmod(0o755)
+    elif change == "new-name":
+        (f.roots.runs / "new-name").mkdir(mode=0o700)
+    elif change == "revision":
+        payload["lifecycle_revision"] += 1
+    elif change == "state-generation":
+        payload["guest_ip"] = "192.0.2.88"
+    elif change in {"stop", "removed"}:
+        payload["status"] = "stopped" if change == "stop" else "removed"
+    elif change == "ledger-hold":
+        payload["vz_native"] = {"schema": "palimpsest.vz-native-run.v1", "hold": "stop-incomplete"}
+    elif change == "custody-hold":
+        (f.custody / "hold-current.json").write_text("{}")
+    if change not in {
+        "run-directory",
+        "runs-root",
+        "state-root",
+        "config-root",
+        "run-mode",
+        "new-name",
+        "custody-hold",
+    }:
+        f.paths.state.write_text(json.dumps(payload))
+    f.resume.set()
+    waiter.join(4)
+    assert not waiter.is_alive()
+    assert f.observations["waiter"] == []
+    assert f.actors.read_text().splitlines() == ["status"]
+    if "waiter" in f.results:
+        assert f.results["waiter"].errors
+        assert all(item.stale for item in f.results["waiter"].summaries)
+        if change in {"revision", "stop"}:
+            assert any(error.code == "runtime-busy" for error in f.results["waiter"].errors)
+        elif change == "removed":
+            assert any(error.code == "invalid-ledger" for error in f.results["waiter"].errors)
+    else:
+        assert isinstance(f.failures["waiter"], StateError)
+
+
+def test_native_read_flights_do_not_cross_selected_roots(native_read_flight, tmp_path):
+    f = native_read_flight
+    other = _roots(tmp_path / "other")
+    other_paths, _ = _write_ledger(
+        other,
+        record={
+            "schema_version": 2,
+            "runtime_kind": "oci-root",
+            "backend": "lima-vz",
+            "status": "running",
+        },
+    )
+    other_paths.root.chmod(0o700)
+    leader = f.launch("leader")
+    assert f.started.wait(3)
+    # The second root cannot join the first flight, even with the same run name.
+    second = f.launch("other", selected=other)
+    f.release.set()
+    leader.join(4)
+    second.join(4)
+    assert not leader.is_alive() and not second.is_alive()
+    assert f.failures == {}
+    assert f.joined.empty()
+    assert f.actors.read_text().splitlines() == ["status", "status"]
+    assert f.results["leader"].summaries[0].record != f.results["other"].summaries[0].record
+
+
+def test_native_read_observer_can_reenter_after_flight_removal(native_read_flight):
+    f = native_read_flight
+    f.release.set()
+    nested = []
+
+    def observer(snapshot):
+        assert isinstance(snapshot, state.RunLedgerSnapshot)
+        assert runtime_dispatch._READ_OBSERVATION_FLIGHTS == {}
+        nested.append(runtime_dispatch.reconcile(roots=f.roots))
+
+    result = runtime_dispatch.reconcile(roots=f.roots, _snapshot_observer=observer)
+    assert not result.summaries[0].stale
+    assert len(nested) == 1 and not nested[0].summaries[0].stale
+    assert f.actors.read_text().splitlines() == ["status", "status"]
+
+
+def test_missing_reconcile_root_does_not_initialize_state_or_register_flight(tmp_path):
+    roots = state.StatePaths(tmp_path / "missing-config", tmp_path / "missing-state")
+    assert runtime_dispatch.reconcile(roots=roots) == RunAggregationResult((), ())
+    assert not roots.config.exists() and not roots.state.exists()
+    assert runtime_dispatch._READ_OBSERVATION_FLIGHTS == {}
+
+
+def test_native_read_producer_reentry_is_busy_without_self_wait_or_replay(native_read_flight):
+    f = native_read_flight
+    f.release.set()
+    refresh = f.adapter.refresh_run
+    nested = []
+
+    def reentrant(selected, name, **kwargs):
+        nested.append(runtime_dispatch.reconcile(roots=selected))
+        return refresh(selected, name, **kwargs)
+
+    f.adapter.refresh_run = reentrant
+    result = runtime_dispatch.reconcile(roots=f.roots)
+    assert not result.summaries[0].stale
+    assert len(nested) == 1
+    assert len(nested[0].summaries) == 1
+    assert nested[0].summaries[0].stale
+    assert [error.code for error in nested[0].errors] == ["runtime-busy"]
+    assert f.joined.empty()
+    assert f.actors.read_text().splitlines() == ["status"]
+
+
+def test_native_offline_ps_never_joins_or_starts_observation(native_read_flight):
+    f = native_read_flight
+    result = runtime_dispatch.ps(roots=f.roots)
+    assert result.summaries[0].stale
+    assert f.observations == {}
+    assert not f.actors.exists()
+    assert f.joined.empty()
+    assert runtime_dispatch._READ_OBSERVATION_FLIGHTS == {}
+
+
+def test_new_run_during_native_read_keeps_leader_listing_and_waiter_stale(native_read_flight):
+    f = native_read_flight
+    leader = f.launch("leader")
+    assert f.started.wait(3)
+    waiter = f.launch("waiter")
+    assert f.joined.get(timeout=3) == "waiter"
+    new_paths, _ = _write_ledger(
+        f.roots,
+        name="concurrent-new",
+        record={
+            "schema_version": 2,
+            "runtime_kind": "oci-root",
+            "backend": "lima-vz",
+            "status": "stopped",
+        },
+    )
+    new_paths.root.chmod(0o700)
+    f.release.set()
+    leader.join(4)
+    waiter.join(4)
+    assert not leader.is_alive() and not waiter.is_alive()
+    assert f.failures == {}
+    assert [item.record.name for item in f.results["leader"].summaries] == ["demo"]
+    assert not f.results["leader"].summaries[0].stale
+    assert [item.record.name for item in f.results["waiter"].summaries] == ["concurrent-new", "demo"]
+    assert all(item.stale for item in f.results["waiter"].summaries)
+    assert f.observations["waiter"] == []
+    assert f.actors.read_text().splitlines() == ["status"]
+
+
+def test_read_observation_directory_binding_uses_constant_descriptor_count(tmp_path):
+    roots = _roots(tmp_path)
+    for index in range(80):
+        (roots.runs / f"run-{index}").mkdir(mode=0o700)
+    descriptors = Path("/proc/self/fd") if Path("/proc/self/fd").is_dir() else Path("/dev/fd")
+    before = len(os.listdir(descriptors))
+    with state._pinned_run_observation_binding(roots) as binding:
+        assert binding is not None
+        assert len(binding.directories) == 3
+        assert len(binding.entries) == 80
+        assert len(os.listdir(descriptors)) <= before + 3
+        binding.verify()
+    assert len(os.listdir(descriptors)) <= before
+
+
+@pytest.mark.parametrize("reason", ["timeout", "failed", "binding-before", "binding-after"])
+def test_failed_native_join_keeps_legacy_provider_independent(native_read_flight, monkeypatch, reason, tmp_path):
+    import threading
+
+    f = native_read_flight
+    legacy_paths, _ = _write_ledger(
+        f.roots,
+        name="legacy",
+        record={
+            "schema_version": 2,
+            "runtime_kind": "cloud-image",
+            "backend": "kvm",
+            "status": "running",
+        },
+    )
+    legacy_paths.root.chmod(0o700)
+    effects = tmp_path / "legacy-actors"
+
+    def refresh_legacy(name, *, roots, _expected_record):
+        with state.locked_existing_run(roots, name, expected=_expected_record) as authority:
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import pathlib,sys; f=pathlib.Path(sys.argv[1]).open('a'); f.write('legacy\\n'); f.close()",
+                    str(effects),
+                ],
+                check=True,
+            )
+            if reason == "binding-after" and threading.current_thread().name == "waiter":
+                (roots.runs / "concurrent-entry").mkdir(mode=0o700)
+            return authority.write_state("running", authority.mutable_state())
+
+    monkeypatch.setattr(runtime_dispatch.cloud_runtime, "reconcile_run", refresh_legacy)
+    monkeypatch.setattr(
+        runtime_dispatch,
+        "_preflight_existing_adapter",
+        lambda record, *_args, **_kwargs: (
+            f.adapter if record.dispatch_key == runtime_dispatch._NATIVE_READ_KEY else runtime_dispatch.cloud_runtime
+        ),
+    )
+    if reason == "failed":
+        f.outer_fault[0] = RuntimeError("outer producer failed")
+    if reason == "binding-before":
+        f.resume.clear()
+    leader = f.launch("leader")
+    assert f.started.wait(3)
+    budget = state.RunObservationWaitBudget(0.03 if reason == "timeout" else 5)
+    waiter = f.launch("waiter", budget=budget)
+    assert f.joined.get(timeout=3) == "waiter"
+    if reason != "timeout":
+        f.release.set()
+        leader.join(4)
+    if reason == "binding-before":
+        (f.roots.runs / "concurrent-entry").mkdir(mode=0o700)
+        f.resume.set()
+    waiter.join(4)
+    assert not waiter.is_alive()
+    assert "waiter" not in f.failures
+    rows = {item.record.name: item for item in f.results["waiter"].summaries}
+    assert rows["demo"].stale
+    assert not rows["legacy"].stale
+    assert [item.record.name for item in f.observations["waiter"]] == ["legacy"]
+    assert effects.read_text().splitlines() == (["legacy"] if reason == "timeout" else ["legacy", "legacy"])
+    assert f.actors.read_text().splitlines() == ["status"]
+    f.release.set()
+    leader.join(4)
+    assert not leader.is_alive()
+
+
+def test_native_join_checks_supersession_again_under_current_run_lock(native_read_flight):
+    f = native_read_flight
+    f.resume.clear()
+    leader = f.launch("leader")
+    assert f.started.wait(3)
+    waiter = f.launch("waiter")
+    assert f.joined.get(timeout=3) == "waiter"
+    f.release.set()
+    leader.join(4)
+    assert not leader.is_alive()
+    host_config = f.adapter.host_config_for_run
+
+    def advance_after_enumeration(roots, name, *, expected_record, _observation_budget):
+        with state.locked_existing_run(roots, name, expected=expected_record) as authority:
+            authority.write_state("running", authority.mutable_state())
+        return host_config(roots, name, expected_record=expected_record, _observation_budget=_observation_budget)
+
+    f.adapter.host_config_for_run = advance_after_enumeration
+    f.resume.set()
+    waiter.join(4)
+    assert not waiter.is_alive()
+    assert f.failures == {}
+    assert f.observations["waiter"] == []
+    assert f.results["waiter"].summaries[0].stale
+    assert [error.code for error in f.results["waiter"].errors] == ["runtime-busy"]
+    assert f.actors.read_text().splitlines() == ["status"]
+
+
+def test_joined_enumeration_failure_preserves_leader_failed_rows(native_read_flight, monkeypatch):
+    import threading
+
+    f = native_read_flight
+    f.resume.clear()
+    f.fault[0] = StateError("provider observation failed")
+    leader = f.launch("leader")
+    assert f.started.wait(3)
+    waiter = f.launch("waiter")
+    assert f.joined.get(timeout=3) == "waiter"
+    f.release.set()
+    leader.join(4)
+    assert not leader.is_alive()
+    assert f.results["leader"].summaries[0].stale
+    enumerate_snapshots = state.enumerate_run_snapshots
+
+    def changing_enumeration(*args, **kwargs):
+        if threading.current_thread().name == "waiter":
+            raise StateError("run enumeration changed")
+        return enumerate_snapshots(*args, **kwargs)
+
+    monkeypatch.setattr(state, "enumerate_run_snapshots", changing_enumeration)
+    f.resume.set()
+    waiter.join(4)
+    assert not waiter.is_alive()
+    assert f.failures == {}
+    assert len(f.results["waiter"].summaries) == 1
+    assert f.results["waiter"].summaries[0].record.name == "demo"
+    assert f.results["waiter"].summaries[0].stale
+    assert f.observations["waiter"] == []
+    assert f.actors.read_text().splitlines() == ["status"]
+
+
+@pytest.mark.parametrize("reason", ["timeout", "failed"])
+def test_failed_join_metadata_failure_keeps_producer_known_rows_without_reread(
+    native_read_flight,
+    monkeypatch,
+    reason,
+):
+    import threading
+
+    f = native_read_flight
+    paths, _ = _write_ledger(
+        f.roots,
+        name="known-failed",
+        record={
+            "schema_version": 2,
+            "runtime_kind": "oci-root",
+            "backend": "lima-vz",
+            "status": "failed",
+        },
+    )
+    paths.root.chmod(0o700)
+    enumerate_snapshots = state.enumerate_run_snapshots
+    reads = []
+
+    def failing_waiter_read(*args, **kwargs):
+        if threading.current_thread().name == "waiter":
+            reads.append("failed-read")
+            raise StateError("run enumeration changed")
+        return enumerate_snapshots(*args, **kwargs)
+
+    monkeypatch.setattr(state, "enumerate_run_snapshots", failing_waiter_read)
+    if reason == "failed":
+        f.fault[0] = StateError("provider observation failed")
+        f.outer_fault[0] = RuntimeError("outer producer failed")
+    leader = f.launch("leader")
+    assert f.started.wait(3)
+    waiter = f.launch("waiter", budget=state.RunObservationWaitBudget(0.03 if reason == "timeout" else 5))
+    assert f.joined.get(timeout=3) == "waiter"
+    if reason == "failed":
+        f.release.set()
+        leader.join(4)
+    waiter.join(4)
+    assert not waiter.is_alive()
+    assert "waiter" not in f.failures
+    assert reads == ["failed-read"]
+    assert [item.record.name for item in f.results["waiter"].summaries] == ["demo", "known-failed"]
+    assert all(item.stale for item in f.results["waiter"].summaries)
+    assert f.observations["waiter"] == []
+    assert f.actors.read_text().splitlines() == (["status"] if reason == "timeout" else ["status", "status"])
+    f.release.set()
+    leader.join(4)
+    assert not leader.is_alive()
+
+
+def test_native_read_cancellation_at_registration_removes_and_notifies(native_read_flight, monkeypatch):
+    f = native_read_flight
+    registered = []
+
+    class InterruptedRegistry(dict):
+        def __setitem__(self, key, value):
+            super().__setitem__(key, value)
+            registered.append(value)
+            raise KeyboardInterrupt("cancelled immediately after registration")
+
+    registry = InterruptedRegistry()
+    monkeypatch.setattr(runtime_dispatch, "_READ_OBSERVATION_FLIGHTS", registry)
+    with pytest.raises(KeyboardInterrupt, match="immediately after registration"):
+        runtime_dispatch.reconcile(roots=f.roots)
+    assert registry == {}
+    assert len(registered) == 1
+    assert registered[0].failed
+    assert registered[0].done.event.is_set()
+    assert not f.actors.exists()

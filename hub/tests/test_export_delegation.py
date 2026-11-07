@@ -799,6 +799,10 @@ async def test_trust_wider_than_requested_is_deleted_and_refused(hub):
 async def test_soft_deleted_queued_export_retires_delegation(hub):
     h = hub
     created = await _admit(h)
+    assert (
+        await h.client.delete(f"/v1/image-exports/{created['id']}", headers={"X-Auth-Token": ORIGINAL})
+    ).status_code == 403
+    h.identity["project_roles"] = ["manager"]
     deleted = await h.client.delete(f"/v1/image-exports/{created['id']}", headers={"X-Auth-Token": ORIGINAL})
     assert deleted.status_code == 204
     _, [delegation] = await _rows(h)
@@ -820,6 +824,7 @@ async def test_soft_delete_claimed_export_normalizes_database_utc_lease(hub, lea
                 lease_expires_at=datetime.now(UTC) + timedelta(seconds=lease_seconds),
             )
         )
+    h.identity["project_roles"] = ["manager"]
     deleted = await h.client.delete(f"/v1/image-exports/{created['id']}", headers={"X-Auth-Token": ORIGINAL})
     assert deleted.status_code == expected
     [job], [delegation] = await _rows(h)

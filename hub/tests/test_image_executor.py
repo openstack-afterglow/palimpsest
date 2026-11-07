@@ -15,12 +15,14 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
+from palimpsest_local.image_source_policy import ImageSourcePolicy, ImageSourceRule
 
 from palimpsest_hub import build_worker as worker
 from palimpsest_hub import image_executor as image
 
 JOB = "11111111-1111-4111-8111-111111111111"
 LEASE = "22222222-2222-4222-8222-222222222222"
+SOURCE_POLICY = ImageSourcePolicy((ImageSourceRule("docker.io", "library", "alpine"),))
 
 
 def sha(data):
@@ -32,6 +34,7 @@ def settings():
         palimpsest_hub_max_blob_bytes=4096,
         palimpsest_hub_build_timeout_seconds=60,
         palimpsest_hub_registry_hosts=("docker.io", "ghcr.io"),
+        palimpsest_hub_image_source_policy=SOURCE_POLICY.to_dict(),
         palimpsest_hub_max_context_bytes=1024,
         palimpsest_hub_max_context_expanded_bytes=4096,
         palimpsest_hub_max_context_members=10,
@@ -51,6 +54,8 @@ def claim():
         "kind": "registry",
         "platform": "linux/amd64",
         "max_output_bytes": 4096,
+        "source_policy": SOURCE_POLICY.to_dict(),
+        "source_policy_digest": SOURCE_POLICY.digest,
         "request": {
             "reference": "docker.io/library/alpine:3",
             "os_family": "alpine",
@@ -70,6 +75,10 @@ def result():
     from palimpsest_local.image_manifest import manifest_from_result
 
     value["manifest"] = manifest_from_result(value, os_family="alpine", os_version="3", source_kind="registry")
+    value["manifest"]["source"]["metadata"] = {
+        "source_policy": SOURCE_POLICY.to_dict(),
+        "source_policy_digest": SOURCE_POLICY.digest,
+    }
     return value
 
 
@@ -281,6 +290,37 @@ def test_context_claim_requires_exact_digest_descriptor_binding():
     )
     with pytest.raises(ValueError, match="context"):
         image.validate_claim(value, settings())
+
+
+@pytest.mark.parametrize(
+    "mutation", ["missing", "empty", "digest", "widened", "operator-revoked", "request-policy", "other-repository"]
+)
+def test_claim_source_policy_cannot_be_missing_forged_or_widened(mutation):
+    value = claim()
+    operator = settings()
+    if mutation == "missing":
+        value.pop("source_policy")
+    elif mutation == "empty":
+        empty = ImageSourcePolicy()
+        value.update(source_policy=empty.to_dict(), source_policy_digest=empty.digest)
+    elif mutation == "digest":
+        value["source_policy_digest"] = sha(b"not this policy")
+    elif mutation == "widened":
+        widened = ImageSourcePolicy(
+            (
+                *SOURCE_POLICY.rules,
+                ImageSourceRule("ghcr.io", "other", "image"),
+            )
+        )
+        value.update(source_policy=widened.to_dict(), source_policy_digest=widened.digest)
+    elif mutation == "operator-revoked":
+        operator.palimpsest_hub_image_source_policy = ImageSourcePolicy().to_dict()
+    elif mutation == "request-policy":
+        value["request"]["source_policy"] = SOURCE_POLICY.to_dict()
+    else:
+        value["request"]["reference"] = "docker.io/library/alpine-other:3"
+    with pytest.raises(ValueError, match="source|policy"):
+        image.validate_claim(value, operator)
 
 
 def test_result_rejects_total_layer_size_and_noncanonical_provenance():
@@ -693,6 +733,104 @@ def test_legacy_output_pending_binds_exact_intent_before_continuing(harness):
         ("POST", "/v1/image-worker/jobs/" + JOB + "/publication-intent"),
         ("PUT", "/v1/image-worker/jobs/" + JOB + "/outputs/" + sha(b"hsqstwo")),
     ]
+    assert harness.executions == [JOB]
+
+
+@pytest.mark.parametrize(
+    "bound,staged",
+    [
+        (False, ()),
+        (True, ()),
+        (True, result()["layers"][:1]),
+        (True, result()["layers"]),
+    ],
+)
+def test_recovered_publication_holds_revoked_policy_despite_old_api_receipt(harness, bound, staged):
+    instance, _ = harness.make(
+        [
+            Response(202, claim()),
+            Response(200, publication_status(bound=False)),
+            Response(200, publication_status()),
+            TimeoutError("lost first output"),
+        ]
+    )
+    with pytest.raises(worker.WorkerHalted):
+        instance.process_one()
+    saved = harness.journal.load()
+    packed = harness.journal.job_dir(saved) / "outputs.pack"
+    original_bytes = packed.read_bytes()
+    restarted, transport = harness.make([Response(200, publication_status(bound=bound, staged=staged))])
+    restarted.settings.palimpsest_hub_image_source_policy = ImageSourcePolicy().to_dict()
+
+    with pytest.raises(worker.WorkerHalted, match="retained") as failed:
+        restarted.reconcile()
+
+    assert "source policy changed" in str(failed.value.__cause__)
+    assert transport.calls == [("GET", "/v1/image-worker/jobs/" + JOB)]
+    retained = harness.journal.load()
+    assert retained["phase"] == "output_pending"
+    assert retained["output"] == saved["output"]
+    assert retained["publication"] == saved["publication"]
+    assert packed.read_bytes() == original_bytes
+    assert harness.executions == [JOB]
+
+
+@pytest.mark.parametrize("state", ["complete", "error"])
+def test_recovered_terminal_publication_settles_after_worker_policy_revocation(harness, state):
+    instance, _ = harness.make(
+        [
+            Response(202, claim()),
+            Response(200, publication_status(bound=False)),
+            Response(200, publication_status()),
+            TimeoutError("lost first output"),
+        ]
+    )
+    with pytest.raises(worker.WorkerHalted):
+        instance.process_one()
+    directory = harness.journal.job_dir(harness.journal.load())
+    # Terminal receipts must settle without requiring packed output to survive.
+    (directory / "outputs.pack").unlink()
+    restarted, transport = harness.make([Response(200, publication_status(state, bound=state == "complete"))])
+    restarted.settings.palimpsest_hub_image_source_policy = ImageSourcePolicy().to_dict()
+
+    restarted.reconcile()
+
+    assert transport.calls == [("GET", "/v1/image-worker/jobs/" + JOB)]
+    assert harness.journal.load() is None
+    assert not directory.exists()
+    assert harness.executions == [JOB]
+
+
+@pytest.mark.parametrize(
+    "revoke_at,expected_methods",
+    [
+        (1, ["POST", "GET"]),
+        (2, ["POST", "GET", "POST"]),
+        (3, ["POST", "GET", "POST", "PUT"]),
+        (4, ["POST", "GET", "POST", "PUT", "PUT", "GET"]),
+        (5, ["POST", "GET", "POST", "PUT", "PUT", "GET"]),
+    ],
+)
+def test_current_worker_policy_fences_each_publication_mutation(harness, revoke_at, expected_methods):
+    responses = [Response(202, claim()), *publication_responses()]
+    received = responses[revoke_at]
+
+    def revoke():
+        instance.settings.palimpsest_hub_image_source_policy = ImageSourcePolicy().to_dict()
+        return received
+
+    responses[revoke_at] = revoke
+    instance, transport = harness.make(responses)
+    with pytest.raises(worker.WorkerHalted, match="retained") as failed:
+        instance.process_one()
+
+    assert "source policy changed" in str(failed.value.__cause__)
+    assert [method for method, _ in transport.calls] == expected_methods
+    retained = harness.journal.load()
+    assert retained["phase"] == "output_pending"
+    assert retained["output"] == result()
+    assert retained["publication"]["completion"] == "unattempted"
+    assert (harness.journal.job_dir(retained) / "outputs.pack").read_bytes() == (b"hsqsonehsqstwo" + bytes(4096 - 14))
     assert harness.executions == [JOB]
 
 

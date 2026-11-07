@@ -240,6 +240,7 @@ async def test_upload_sessions_are_project_bounded_and_released_on_abort(tmp_pat
         return {"project_id": request.headers.get("x-project-id", "alpha"), "user_id": "member"}
 
     app.dependency_overrides[hub_api._legacy_writer] = identity
+    app.dependency_overrides[hub_api._upload_reader] = identity
     try:
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
             uploads = []

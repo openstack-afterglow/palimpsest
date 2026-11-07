@@ -17,14 +17,17 @@ import re
 import socket
 import stat
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from .errors import ArtifactValidationError, PalimpsestError
+from .image_policy_channel import PolicyPublicationHold, require_current_policy
+from .image_source_policy import ImageSourcePolicy, load_image_source_policy
 from .layer_cache import LayerCache, _directory, _private_directory, _read_file
 from .nova_assets import AssetCatalog
 from .oci_image import strict_json_object
 from .registry_intake import RegistryIntakeError, resolve_anonymous_reference
-from .state import atomic_write_json
+from .state import atomic_write_json, resolve_roots
 
 SCHEMA = "palimpsest.registry-worker-job.v1"
 RESULT_SCHEMA = "palimpsest.registry-worker-result.v1"
@@ -63,13 +66,27 @@ def validate_request(value: dict) -> dict:
     return {**value, "reference": reference, "timeout_seconds": float(timeout), "packer": packer}
 
 
-def _request_digest(request: dict) -> str:
-    return "sha256:" + hashlib.sha256(json.dumps(request, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+def _request_digest(request: dict, source_policy: ImageSourcePolicy) -> str:
+    bound = {"request": request, "source_policy": source_policy.to_dict()}
+    return "sha256:" + hashlib.sha256(json.dumps(bound, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
-def run_job(request: dict, *, cache_root: Path, jobs_root: Path, assets_root: Path) -> dict:
+def run_job(
+    request: dict,
+    *,
+    source_policy: ImageSourcePolicy,
+    current_policy: Callable[[], ImageSourcePolicy],
+    cache_root: Path,
+    jobs_root: Path,
+    assets_root: Path,
+) -> dict:
     """Acquire once inside this worker, convert, register and durably settle the exact job."""
     request = validate_request(request)
+    if not isinstance(source_policy, ImageSourcePolicy):
+        _fail("trusted image source policy is required separately from the job request")
+    source_policy.admit(resolve_anonymous_reference(request["reference"]))
+    if not callable(current_policy):
+        _fail("explicit trusted current operator policy provider is required")
     job_id = request["job_id"]
     jobs_root = jobs_root.expanduser().absolute()
     cache = LayerCache(cache_root)
@@ -89,7 +106,7 @@ def run_job(request: dict, *, cache_root: Path, jobs_root: Path, assets_root: Pa
             ):
                 _fail("job lock is not an owner-private regular file")
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
-            identity = _request_digest(request)
+            identity = _request_digest(request, source_policy)
             try:
                 previous = strict_json_object(
                     _read_file(jobs_fd, name, mode=0o600, maximum=4 * 1024 * 1024), "registry job"
@@ -110,6 +127,8 @@ def run_job(request: dict, *, cache_root: Path, jobs_root: Path, assets_root: Pa
                 "project_id": request["project_id"],
                 "request_digest": identity,
                 "reference": request["reference"],
+                "source_policy": source_policy.to_dict(),
+                "source_policy_digest": source_policy.digest,
                 "status": "intent",
                 "worker": {"hostname": socket.gethostname(), "machine_id_sha256": None},
                 "started_unix_seconds": time.time(),
@@ -126,7 +145,9 @@ def run_job(request: dict, *, cache_root: Path, jobs_root: Path, assets_root: Pa
             atomic_write_json(path, result)
             started = time.monotonic()
             try:
-                acquired = cache.pull(request["reference"], timeout_seconds=request["timeout_seconds"])
+                acquired = cache.pull(
+                    request["reference"], source_policy=source_policy, timeout_seconds=request["timeout_seconds"]
+                )
                 acquired_at = time.monotonic()
                 result.update(root_digest=acquired["root_digest"], stage="materialize")
                 atomic_write_json(path, result)
@@ -158,15 +179,25 @@ def run_job(request: dict, *, cache_root: Path, jobs_root: Path, assets_root: Pa
                 }
                 result["stage"] = "register"
                 atomic_write_json(path, result)
+                require_current_policy(source_policy, current_policy, float("inf"))
                 registered = assets.register(
                     arch="x86_64",
                     source=source,
                     layers=layers,
                     blob_paths=[Path(p) for p in converted["blob_paths"]],
                     name=job_id,
+                    before_commit=lambda: require_current_policy(source_policy, current_policy, float("inf")),
                 )
+                result["asset_id"] = registered["asset_id"]
+                atomic_write_json(path, result)
                 if request.get("consumer") is not None:
-                    cache.retain(acquired["root_digest"], request["consumer"])
+                    result["stage"] = "retain"
+                    require_current_policy(source_policy, current_policy, float("inf"))
+                    cache.retain(
+                        acquired["root_digest"],
+                        request["consumer"],
+                        before_commit=lambda: require_current_policy(source_policy, current_policy, float("inf")),
+                    )
                 result.update(
                     status="success",
                     stage="complete",
@@ -194,7 +225,9 @@ def run_job(request: dict, *, cache_root: Path, jobs_root: Path, assets_root: Pa
                 return result
             except BaseException as error:
                 result.update(
-                    status="error", error_class=type(error).__name__, elapsed_seconds=time.monotonic() - started
+                    status="hold" if isinstance(error, PolicyPublicationHold) else "error",
+                    error_class=type(error).__name__,
+                    elapsed_seconds=time.monotonic() - started,
                 )
                 atomic_write_json(path, result)
                 raise
@@ -233,7 +266,12 @@ def main(argv=None) -> int:
     try:
         roots = {"cache_root": args.cache_root, "jobs_root": args.jobs_root, "assets_root": args.assets_root}
         if args.operation == "run":
-            result = run_job(strict_json_object(args.request.read_bytes(), "registry job request"), **roots)
+            result = run_job(
+                strict_json_object(args.request.read_bytes(), "registry job request"),
+                source_policy=load_image_source_policy(resolve_roots()),
+                current_policy=lambda: load_image_source_policy(resolve_roots()),
+                **roots,
+            )
         else:
             result = inspect_job(args.job_id, project_id=args.project_id, **roots)
         print(json.dumps(result, sort_keys=True, indent=2))

@@ -26,6 +26,7 @@ from .oci_process import OCIProcessSpec, OCIUserSpec
 from .oci_source import LocalArchiveSource, LocalLayoutSource, SourceCAS, SourceSnapshot
 from .oci_store import OCIStore
 from .project_volumes import _validate_size
+from .refs import HostDirectoryShare
 from .runtime_types import DispatchKey, ExperimentalOCIDispatchKey, RuntimeBackend, RuntimeKind, RunVolumeIntent
 from .state import StatePaths
 
@@ -52,6 +53,9 @@ class LocalOCIRunRequest:
     vm_image: Path | None = field(default=None, repr=False)
     vm_image_digest: str | None = None
     volume_intents: tuple[RunVolumeIntent, ...] = ()
+    mode: str | None = None
+    restart: str | None = None
+    host_shares: tuple[HostDirectoryShare, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", self.name) is None:
@@ -128,8 +132,15 @@ class LocalOCIRunRequest:
                 raise ArtifactValidationError("experimental OCI execution supports nat or none, not host-only")
             if any(port.protocol != "tcp" or port.host_ip != "127.0.0.1" for port in self.network.published_ports):
                 raise ArtifactValidationError("experimental OCI publications require TCP on 127.0.0.1")
+        elif self.backend == "lima-vz":
+            if self.platform != "linux/arm64" or self.force_architecture:
+                raise ArtifactValidationError(
+                    "native Lima VZ run supports only linux/arm64 without --force-architecture"
+                )
+            if self.vm_image is not None or self.vm_image_digest is not None:
+                raise ArtifactValidationError("--vm-image and --vm-image-digest require --force-architecture")
         elif self.platform != "linux/amd64" or self.backend != "kvm" or self.force_architecture:
-            raise ArtifactValidationError("native local OCI run supports only linux/amd64 on KVM")
+            raise ArtifactValidationError("native local OCI run supports linux/amd64 on KVM or linux/arm64 on lima-vz")
         elif self.vm_image is not None or self.vm_image_digest is not None:
             raise ArtifactValidationError("--vm-image and --vm-image-digest require --force-architecture")
         if self.vm_image is not None and (not isinstance(self.vm_image, Path) or not self.vm_image.is_absolute()):
@@ -138,12 +149,57 @@ class LocalOCIRunRequest:
             not isinstance(self.vm_image_digest, str) or normalize_digest(self.vm_image_digest) != self.vm_image_digest
         ):
             raise ArtifactValidationError("experimental VM carrier digest must be canonical sha256")
+        if self.backend == "lima-vz":
+            if self.root_volume_id is not None:
+                raise ArtifactValidationError(
+                    "VZ --root-volume reuse across new runs is unsupported; use start to resume the same retained VM"
+                )
+            mode = "dev" if self.mode is None else self.mode
+            if not isinstance(mode, str) or mode not in {"dev", "prod"}:
+                raise ArtifactValidationError("native VZ mode must be dev or prod")
+            restart = ("no" if mode == "dev" else "unless-stopped") if self.restart is None else self.restart
+            if not isinstance(restart, str) or restart not in {"no", "unless-stopped"}:
+                raise ArtifactValidationError("native VZ restart must be no or unless-stopped")
+            object.__setattr__(self, "mode", mode)
+            object.__setattr__(self, "restart", restart)
+        elif self.mode is not None or self.restart is not None or self.host_shares:
+            raise ArtifactValidationError("--mode, --restart and --mount-source require native Lima VZ")
+        if (
+            not isinstance(self.host_shares, tuple)
+            or len(self.host_shares) > 8
+            or any(not isinstance(share, HostDirectoryShare) for share in self.host_shares)
+        ):
+            raise ArtifactValidationError("native VZ source mounts must be at most eight immutable directory shares")
+        targets = []
+        protected = (
+            "/.palimpsest",
+            "/proc",
+            "/sys",
+            "/dev",
+            "/run",
+            "/etc/machine-id",
+            "/var/lib/dbus/machine-id",
+            "/etc/hostname",
+            "/etc/resolv.conf",
+        )
+        for share in self.host_shares:
+            share.__post_init__()
+            target = share.mount_path
+            if any(
+                target == path or target.startswith(path + "/") or path.startswith(target + "/") for path in protected
+            ):
+                raise ArtifactValidationError("native VZ source mount overlaps a protected guest path")
+            if any(
+                target == path or target.startswith(path + "/") or path.startswith(target + "/") for path in targets
+            ):
+                raise ArtifactValidationError("native VZ source mounts overlap")
+            targets.append(target)
 
     @property
     def dispatch_key(self) -> DispatchKey | ExperimentalOCIDispatchKey:
         if self.backend == "lima-qemu-oci":
             return ExperimentalOCIDispatchKey()
-        return DispatchKey(RuntimeKind.OCI_ROOT, RuntimeBackend.KVM)
+        return DispatchKey(RuntimeKind.OCI_ROOT, RuntimeBackend(self.backend))
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,7 +225,8 @@ class PreparedLocalOCIRun:
             raise ArtifactValidationError("prepared local OCI run config authority is invalid")
         if self.config_snapshot.descriptor != self.receipt.config_descriptor:
             raise ArtifactValidationError("prepared local OCI run config descriptor is invalid")
-        self.receipt.process.require_bootable()
+        if self.request.backend != "lima-vz":
+            self.receipt.process.require_bootable()
 
 
 def resolve_local_oci_run_request(
@@ -193,6 +250,9 @@ def resolve_local_oci_run_request(
     vm_image: Path | None = None,
     vm_image_digest: str | None = None,
     volume_intents: tuple[RunVolumeIntent, ...] = (),
+    mode: str | None = None,
+    restart: str | None = None,
+    host_shares: tuple[HostDirectoryShare, ...] = (),
 ) -> LocalOCIRunRequest:
     """Resolve only a local path; image selection happens in the secure snapshot."""
     if not isinstance(source, Path):
@@ -210,10 +270,10 @@ def resolve_local_oci_run_request(
         ) from None
     from .platforms import select_backend
 
-    # Native resolution remains host-independent; its existing adapter owns
-    # strict preflight. Only explicit experimental consent adds host selection.
+    # Preserve the existing amd64 KVM intake. Native ARM requests enter the
+    # centralized host selector rather than inventing a second host probe.
     selected_backend = "kvm" if backend == "auto" else backend
-    if force_architecture or backend == "lima-qemu-oci":
+    if force_architecture or backend in {"lima-qemu-oci", "lima-vz"} or platform == "linux/arm64":
         selected_backend = select_backend(
             platform.removeprefix("linux/"),
             requested=backend,
@@ -241,6 +301,9 @@ def resolve_local_oci_run_request(
         vm_image=selected_carrier,
         vm_image_digest=vm_image_digest,
         volume_intents=volume_intents,
+        mode=mode,
+        restart=restart,
+        host_shares=host_shares,
     )
 
 
@@ -259,6 +322,10 @@ def materialize_local_oci_run(
     """
     if not isinstance(request, LocalOCIRunRequest) or not isinstance(roots, StatePaths):
         raise ArtifactValidationError("local OCI intake requires a typed request and state paths")
+    if request.backend == "lima-vz":
+        raise ArtifactValidationError(
+            "native VZ materialization requires the worker bridge path with source qualification"
+        )
     if request.backend != "kvm" or request.platform != "linux/amd64" or request.force_architecture:
         raise ArtifactValidationError("native OCI materialization does not accept experimental VM execution requests")
     if os.name != "posix" or not sys.platform.startswith("linux"):

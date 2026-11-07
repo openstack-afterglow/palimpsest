@@ -21,10 +21,7 @@ from keystoneclient import exceptions as ks_exceptions
 from pydantic import SecretStr
 
 from palimpsest_hub.config import get_settings, validate_keystone_id
-from palimpsest_hub.policy import (
-    allowed_actions,
-    capabilities_for,
-)
+from palimpsest_hub.policy import allowed_actions
 
 _logger = logging.getLogger(__name__)
 
@@ -81,12 +78,12 @@ def _role_directory(client):
     edges = {role_id: set() for role_id in by_id}
     for inference in inferences["role_inferences"]:
         prior = inference["prior_role"]["id"]
-        referenced_role(prior)
-        edges.setdefault(prior, set())
+        prior_role = referenced_role(prior)
         for implied in inference["implies"]:
-            referenced_role(implied["id"])
-            edges.setdefault(implied["id"], set())
-            edges[prior].add(implied["id"])
+            implied_role = referenced_role(implied["id"])
+            # Domain/custom aliases never assert global builtin capabilities through inference.
+            if prior_role.get("domain_id") is None and implied_role.get("domain_id") is None:
+                edges[prior].add(implied["id"])
     return by_id, global_names, edges
 
 
@@ -101,13 +98,12 @@ def _effective_role_names(role_ids, directory):
             return
         role = by_id[role_id]
         name = role["name"]
-        if role.get("domain_id") is None:
-            if global_names.get(name.casefold()) != [role_id]:
-                raise ValueError("Role is not a unique global binding")
-            names.add(name)
-        # Native domain-role edges remain authoritative; domain names themselves
-        # never masquerade as global builtins, even when spelled identically.
+        if role.get("domain_id") is not None:
+            return
+        if global_names.get(name.casefold()) != [role_id]:
+            raise ValueError("Role is not a unique global binding")
         visiting.add(role_id)
+        names.add(name)
         for implied in edges[role_id]:
             visit(implied)
         visiting.remove(role_id)
@@ -466,7 +462,6 @@ def validate_package_owner(user_id: str, project_id: str, *, allow_empty: bool =
         if not roles:
             raise HTTPException(status_code=403, detail="Current native project membership is required")
         actions = allowed_actions(roles, project_id, user_id)
-        capabilities = capabilities_for(actions)
         if not actions and not allow_empty:
             raise HTTPException(status_code=403, detail="Current Palimpsest service authority is required")
         return {
@@ -476,9 +471,8 @@ def validate_package_owner(user_id: str, project_id: str, *, allow_empty: bool =
             "project_name": _value(project, "name") or "",
             "project_domain_id": _value(project, "domain_id") or "",
             "roles": sorted(roles),
-            "package_capabilities": capabilities,
             "package_actions": actions,
-            "can_write": "palimpsest-publish_editor" in capabilities,
+            "can_write": "packages:write" in actions,
             "role_directory": directory,
         }
     except HTTPException:
@@ -524,15 +518,13 @@ async def get_package_member_info(
     if owner["user_id"] != token_info["user_id"] or owner["project_id"] != token_info["project_id"]:
         raise HTTPException(status_code=403, detail="Package owner does not match original token identity")
     actions = token_actions & owner["package_actions"]
-    capabilities = capabilities_for(actions)
     if not actions and not allow_empty:
         raise HTTPException(status_code=403, detail="Current Palimpsest service authority is required")
     return {
         **token_info,
         "current_roles": owner["roles"],
-        "package_capabilities": capabilities,
         "package_actions": actions,
-        "can_write": "palimpsest-publish_editor" in capabilities,
+        "can_write": "packages:write" in actions,
     }
 
 
@@ -657,7 +649,6 @@ def _package_admin_context(token_info: dict[str, Any]) -> dict[str, Any]:
         "is_package_system_admin": True,
         "target_project_id": target,
         "package_actions": actions,
-        "package_capabilities": capabilities_for(actions),
         "target_project_name": _value(project, "name") or "",
     }
 
@@ -675,6 +666,31 @@ async def get_package_manager_info(token_info: dict[str, Any] = Depends(require_
     if token_info.get("is_system_admin"):
         return await asyncio.to_thread(_package_admin_context, token_info)
     return await get_package_member_info(token_info=token_info)
+
+
+def credential_headers(request: Request) -> tuple[str | None, str | None]:
+    """Return (Authorization, X-Auth-Token); presenting both is ambiguous and never downgraded."""
+    authorization = request.headers.get("authorization")
+    token = request.headers.get("x-auth-token")
+    if authorization is not None and token is not None:
+        raise HTTPException(status_code=401, detail="Choose an original Keystone token or a bearer key, not both")
+    return authorization, token
+
+
+async def original_token_info(request: Request) -> dict[str, Any]:
+    """Validate the request's own X-Auth-Token exactly like `require_token`."""
+    _, token = credential_headers(request)
+    return await require_token(request, x_auth_token=token, x_project_id=request.headers.get("x-project-id"))
+
+
+async def original_human_member(
+    request: Request, _token_scheme: str | None = Security(keystone_token_header)
+) -> dict[str, Any]:
+    """Current human project member from an original Keystone token; bearer keys are refused."""
+    authorization, _ = credential_headers(request)
+    if authorization is not None:
+        raise HTTPException(status_code=401, detail="An original Keystone member token is required")
+    return await get_package_member_info(token_info=await original_token_info(request))
 
 
 def require_admin(token_info: dict[str, Any] = Depends(require_token)) -> dict[str, Any]:

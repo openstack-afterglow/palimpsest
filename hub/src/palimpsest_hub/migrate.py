@@ -3,18 +3,26 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import re
 from collections import defaultdict, deque
 from collections.abc import Sequence
+from datetime import datetime, timedelta
 from pathlib import Path
 
+from fastapi import HTTPException
+from palimpsest_local.image_manifest import normalize_manifest
 from sqlalchemy import JSON, MetaData, Table, func, inspect, select
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import NoSuchTableError
 from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 
 # Keep the complete destination metadata available to offline migration callers.
-from palimpsest_hub import image_models, instance_models, native_models  # noqa: F401
+from palimpsest_hub import image_key_models, image_models, instance_models, native_models  # noqa: F401
+from palimpsest_hub.config import validate_keystone_id
+from palimpsest_hub.image_key_models import IMAGE_ACTIONS, MAX_EXPIRY_DAYS
 from palimpsest_hub.image_models import LEGACY_JOB_VISIBILITY
+from palimpsest_hub.services.image_quota import MAX_BIGINT, SUBJECT_KINDS, TIERS, VISIBILITIES
+from palimpsest_hub.services.published_images import normalize_source_closure
 
 _TABLES = (
     "palimpsest_hub_layers",
@@ -30,6 +38,9 @@ _TABLES = (
     "palimpsest_hub_layer_nodes",
     "palimpsest_hub_published_images",
     "palimpsest_hub_image_memberships",
+    "palimpsest_hub_image_source_blobs",
+    "palimpsest_hub_image_quota_policies",
+    "palimpsest_hub_image_quota_tiers",
     "palimpsest_native_instances",
     "palimpsest_hub_instances",
     "palimpsest_runtime_blob_references",
@@ -41,7 +52,17 @@ _TABLES = (
     "palimpsest_package_tags",
     "palimpsest_package_uploads",
     "palimpsest_package_caches",
+    "palimpsest_image_keys",
 )
+# Quota tables have no foreign keys; older sources lack both, a partial pair is corrupt.
+_QUOTA_PREFIX = "palimpsest_hub_image_quota_"
+_QUOTA_TABLES = frozenset(name for name in _TABLES if name.startswith(_QUOTA_PREFIX))
+_IMAGE_KEYS = "palimpsest_image_keys"
+_HEX32 = re.compile(r"[0-9a-f]{32}", re.ASCII)
+_HEX64 = re.compile(r"[0-9a-f]{64}", re.ASCII)
+_KEY_NAME = re.compile(r"[^\x00-\x1f\x7f]{1,128}")
+_SOURCE_BLOBS = "palimpsest_hub_image_source_blobs"
+_SOURCE_FIELDS = {"role": "role", "digest": "blob_digest", "size_bytes": "size_bytes", "ordinal": "ordinal"}
 
 
 class MigrationError(RuntimeError):
@@ -172,6 +193,106 @@ def _reviewed_image_rows(table: Table, rows: list[dict], mapping: list[dict], us
     return rows
 
 
+def _limit_valid(value) -> bool:
+    return value is None or (type(value) is int and 0 <= value <= MAX_BIGINT)
+
+
+def _validate_quota_rows(table_name: str, rows: list[dict], table: Table) -> None:
+    """Copy policy data verbatim, never a value the Hub itself would refuse to store."""
+    for row in rows:
+        if table_name == "palimpsest_hub_image_quota_policies":
+            if "max_source_bytes" not in table.c:
+                # Pre-source-cap policy rows: the owner rule seeds the source cap equal to the chain cap.
+                row["max_source_bytes"] = row.get("max_chain_bytes")
+            valid = (
+                row.get("tier") in TIERS
+                and row.get("visibility") in VISIBILITIES
+                and _limit_valid(row.get("max_images"))
+                and _limit_valid(row.get("max_chain_bytes"))
+                and _limit_valid(row.get("max_source_bytes"))
+                and (
+                    row.get("updated_by") is None or (isinstance(row["updated_by"], str) and row["updated_by"].strip())
+                )
+            )
+        else:
+            subject = row.get("subject_id")
+            try:
+                validate_keystone_id(subject)
+            except ValueError:
+                subject = None
+            valid = (
+                row.get("subject_kind") in SUBJECT_KINDS
+                and subject is not None
+                and row.get("tier") in TIERS
+                and isinstance(row.get("updated_by"), str)
+                and row["updated_by"].strip()
+            )
+        if not valid:
+            raise MigrationError(f"source {table_name} row is invalid; correct it in the source before migrating")
+
+
+def _validate_source_blob_rows(rows: list[dict], published: dict[str, dict]) -> None:
+    """Each image's closure must be one the Hub itself would accept for that image."""
+    closures: dict[str, list[dict]] = defaultdict(list)
+    for row in rows:
+        image = published.get(row.get("image_id"))
+        if image is None or row.get("project_id") != image["project_id"]:
+            raise MigrationError(f"source {_SOURCE_BLOBS} row has no matching published image")
+        closures[row["image_id"]].append({key: row.get(column) for key, column in _SOURCE_FIELDS.items()})
+    for image_id, items in closures.items():
+        manifest = published[image_id]["manifest_json"]
+        if isinstance(manifest, str):
+            try:
+                manifest = json.loads(manifest)
+            except json.JSONDecodeError:
+                manifest = None
+        try:
+            if normalize_source_closure(items, normalize_manifest(manifest)) is None:
+                raise ValueError
+        except (HTTPException, ValueError, TypeError, KeyError):
+            raise MigrationError(
+                f"source {_SOURCE_BLOBS} closure is invalid; correct it in the source before migrating"
+            ) from None
+
+
+def _image_key_valid(row: dict) -> bool:
+    """Exactly the state the Hub can issue: hash only, bounded lifetime, exact owner ids."""
+    try:
+        validate_keystone_id(row.get("project_id"))
+        validate_keystone_id(row.get("owner_user_id"))
+    except ValueError:
+        return False
+    created, expires = row.get("created_at"), row.get("expires_at")
+    actions = row.get("actions")
+    if not (
+        isinstance(row.get("id"), str)
+        and _HEX32.fullmatch(row["id"])
+        and isinstance(row.get("secret_hash"), str)
+        and _HEX64.fullmatch(row["secret_hash"])
+        and isinstance(row.get("name"), str)
+        and _KEY_NAME.fullmatch(row["name"])
+        and isinstance(actions, list)
+        and actions
+        and len(set(actions)) == len(actions)
+        and all(isinstance(action, str) for action in actions)
+        and set(actions) <= IMAGE_ACTIONS
+        and isinstance(created, datetime)
+        and isinstance(expires, datetime)
+        and created < expires <= created + timedelta(days=MAX_EXPIRY_DAYS)
+    ):
+        return False
+    # Revocation and last use are preserved verbatim; they never predate issuance.
+    return all(
+        row.get(field) is None or (isinstance(row[field], datetime) and row[field] >= created)
+        for field in ("revoked_at", "last_used_at")
+    )
+
+
+def _validate_image_key_rows(rows: list[dict]) -> None:
+    if any(not _image_key_valid(row) for row in rows):
+        raise MigrationError(f"source {_IMAGE_KEYS} row is invalid; correct it in the source before migrating")
+
+
 async def migrate(
     source_url: str,
     destination_url: str,
@@ -205,6 +326,10 @@ async def migrate(
             present_native = source_names & native_names
             if present_native and present_native != native_names:
                 raise MigrationError("source native package schema is incomplete")
+            present_quota = source_names & _QUOTA_TABLES
+            if present_quota and present_quota != _QUOTA_TABLES:
+                raise MigrationError("source image quota schema is incomplete")
+            published: dict[str, dict] = {}
             for table_name in _TABLES:
                 destination_table = await _reflect(destination, table_name)
                 destination_count = await _row_count(destination, destination_table)
@@ -227,7 +352,9 @@ async def migrate(
                         "palimpsest_native_instances",
                         "palimpsest_hub_instances",
                         "palimpsest_runtime_blob_references",
-                    } and not table_name.startswith(("palimpsest_package_", "palimpsest_packages")):
+                        _IMAGE_KEYS,
+                        _SOURCE_BLOBS,
+                    } and not table_name.startswith(("palimpsest_package_", "palimpsest_packages", _QUOTA_PREFIX)):
                         raise
                     copied[table_name] = 0
                     continue
@@ -244,6 +371,14 @@ async def migrate(
                     # Retired SQL-connected builder location is not HTTP attempt authority.
                     for row in rows:
                         row.pop("execution_node", None)
+                if table_name in _QUOTA_TABLES:
+                    _validate_quota_rows(table_name, rows, source_table)
+                if table_name == "palimpsest_hub_published_images":
+                    published = {row["id"]: row for row in rows}
+                if table_name == _SOURCE_BLOBS:
+                    _validate_source_blob_rows(rows, published)
+                if table_name == _IMAGE_KEYS:
+                    _validate_image_key_rows(rows)
                 copied[table_name] = len(rows)
                 planned.append((destination_table, rows))
             if len(used) != len(mapping):

@@ -20,7 +20,7 @@ from typing import Any
 
 from .artifact_store import ArtifactStore, ArtifactStoreError
 from .digest import normalize_digest
-from .errors import ArtifactValidationError
+from .errors import ArtifactValidationError, InvalidDigestError
 from .oci_changeset import OCI_CHANGESET_NORMALIZATION_ID
 from .oci_converter import LayerIntakeReceipt
 from .oci_packer import (
@@ -32,7 +32,7 @@ from .oci_packer import (
     SquashFSToolchainIdentity,
     VerifiedSquashFSToolchain,
 )
-from .oci_source import SnapshottedOCIImage
+from .oci_source import SnapshottedOCIArchive, SnapshottedOCIImage
 from .oci_tar_emitter import OCI_NORMALIZED_TAR_EMISSION_ID
 from .state import StatePaths
 
@@ -75,7 +75,9 @@ class _ForkCloseFD:
 _FORK_CLOSE_LOCK_FDS: set[_ForkCloseFD] = set()
 _FORK_REGISTRY_LOCK = threading.Lock()
 
-DERIVED_RECIPE_SCHEMA = "palimpsest.oci-derived-recipe.v1"
+_DERIVED_RECIPE_SCHEMA_V1 = "palimpsest.oci-derived-recipe.v1"
+DERIVED_RECIPE_SCHEMA = "palimpsest.oci-derived-recipe.v2"
+_PARENT_CHAIN_SCHEMA = "palimpsest.oci-derived-parent-chain.v1"
 DERIVED_RECORD_SCHEMA = "palimpsest.oci-derived-record.v1"
 DERIVED_OCCURRENCE_SCHEMA = "palimpsest.oci-derived-occurrence.v1"
 _DERIVED_LEASE_SCHEMA_V1 = "palimpsest.oci-derived-lease.v1"
@@ -215,8 +217,8 @@ class DerivedLayerOccurrence:
             raise OCIStoreError("oci-store-occurrence", "derived occurrence size is invalid")
 
     @classmethod
-    def from_image(cls, image: SnapshottedOCIImage, ordinal: int) -> DerivedLayerOccurrence:
-        if not isinstance(image, SnapshottedOCIImage) or type(ordinal) is not int:
+    def from_image(cls, image: SnapshottedOCIImage | SnapshottedOCIArchive, ordinal: int) -> DerivedLayerOccurrence:
+        if not isinstance(image, (SnapshottedOCIImage, SnapshottedOCIArchive)) or type(ordinal) is not int:
             raise OCIStoreError("oci-store-occurrence", "snapshotted image occurrence is invalid")
         if not 0 <= ordinal < len(image.image.layers):
             raise OCIStoreError("oci-store-occurrence", "snapshotted image ordinal is out of range")
@@ -271,6 +273,32 @@ class DerivedLayerOccurrence:
         return occurrence
 
 
+def parent_chain_digest(snapshot: SnapshottedOCIImage | SnapshottedOCIArchive, ordinal: int) -> str:
+    """Bind only the ordered preceding compressed descriptors and verified DiffIDs."""
+    if not isinstance(snapshot, (SnapshottedOCIImage, SnapshottedOCIArchive)) or type(ordinal) is not int:
+        raise OCIStoreError("oci-store-key", "snapshotted parent chain is invalid")
+    if not 0 <= ordinal < len(snapshot.image.layers):
+        raise OCIStoreError("oci-store-key", "snapshotted parent chain ordinal is out of range")
+    return _digest_bytes(
+        _canonical(
+            {
+                "domain": _PARENT_CHAIN_SCHEMA,
+                "layers": [
+                    {
+                        "compressed": {
+                            "mediaType": layer.compressed.media_type,
+                            "digest": layer.compressed.digest,
+                            "size": layer.compressed.size,
+                        },
+                        "diff_id": layer.diff_id,
+                    }
+                    for layer in snapshot.image.layers[:ordinal]
+                ],
+            }
+        )
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class DerivedSquashFSKey:
     source_media_type: str
@@ -289,8 +317,11 @@ class DerivedSquashFSKey:
     packer_dependency_digests: tuple[str, ...]
     packer_toolchain_fingerprint: str
     structural_verifier: str
+    parent_chain_digest: str | None = None
 
     def __post_init__(self) -> None:
+        if self.parent_chain_digest is not None:
+            object.__setattr__(self, "parent_chain_digest", normalize_digest(self.parent_chain_digest))
         for field_name in (
             "compressed_digest",
             "diff_id",
@@ -333,6 +364,7 @@ class DerivedSquashFSKey:
         cls,
         occurrence: DerivedLayerOccurrence,
         *,
+        parent_chain_digest: str,
         intake_policy_id: str,
         intake_policy_fingerprint: str,
         pack_policy_id: str,
@@ -341,12 +373,15 @@ class DerivedSquashFSKey:
     ) -> DerivedSquashFSKey:
         if not isinstance(occurrence, DerivedLayerOccurrence) or not isinstance(toolchain, VerifiedSquashFSToolchain):
             raise OCIStoreError("oci-store-key", "derived recipe input is invalid")
+        if not isinstance(parent_chain_digest, str):
+            raise OCIStoreError("oci-store-key", "derived recipe parent chain is required")
         identity = toolchain.identity
         return cls(
             source_media_type=occurrence.media_type,
             compressed_digest=occurrence.compressed_digest,
             compressed_size=occurrence.compressed_size,
             diff_id=occurrence.diff_id,
+            parent_chain_digest=parent_chain_digest,
             intake_policy_id=intake_policy_id,
             intake_policy_fingerprint=intake_policy_fingerprint,
             normalization_contract_id=OCI_CHANGESET_NORMALIZATION_ID,
@@ -363,7 +398,9 @@ class DerivedSquashFSKey:
 
     def to_dict(self) -> dict[str, Any]:
         value = asdict(self)
-        value["domain"] = DERIVED_RECIPE_SCHEMA
+        value["domain"] = DERIVED_RECIPE_SCHEMA if self.parent_chain_digest is not None else _DERIVED_RECIPE_SCHEMA_V1
+        if self.parent_chain_digest is None:
+            value.pop("parent_chain_digest")
         value["packer_dependency_digests"] = list(self.packer_dependency_digests)
         return value
 
@@ -388,15 +425,24 @@ class DerivedSquashFSKey:
             "structural_verifier",
             "tar_emission_contract_id",
         }
+        if not isinstance(data, dict):
+            raise OCIStoreError("oci-store-wire", "derived key must be an object")
+        domain = data.get("domain")
+        if domain == DERIVED_RECIPE_SCHEMA:
+            fields.add("parent_chain_digest")
+            if not isinstance(data.get("parent_chain_digest"), str):
+                raise OCIStoreError("oci-store-wire", "derived key parent chain is invalid")
+        elif domain != _DERIVED_RECIPE_SCHEMA_V1:
+            raise OCIStoreError("oci-store-wire", "derived key schema is invalid")
         value = _exact_wire_fields(data, fields, "derived key")
-        if value["domain"] != DERIVED_RECIPE_SCHEMA or not isinstance(value["packer_dependency_digests"], list):
+        if not isinstance(value["packer_dependency_digests"], list):
             raise OCIStoreError("oci-store-wire", "derived key schema is invalid")
         constructor = dict(value)
         constructor.pop("domain")
         constructor["packer_dependency_digests"] = tuple(value["packer_dependency_digests"])
         try:
             key = cls(**constructor)
-        except (ArtifactValidationError, TypeError, ValueError):
+        except (ArtifactValidationError, InvalidDigestError, TypeError, ValueError):
             raise OCIStoreError("oci-store-wire", "derived key is invalid") from None
         if key.to_dict() != value:
             raise OCIStoreError("oci-store-wire", "derived key is not canonical")
@@ -1272,7 +1318,7 @@ class OCIStore:
                 return None
             raise
         index = self._decode(index_payload)
-        if index.get("schema") != DERIVED_RECIPE_SCHEMA or index.get("key_digest") != key.digest:
+        if index.get("schema") != key.to_dict()["domain"] or index.get("key_digest") != key.digest:
             raise OCIStoreError("oci-store-corrupt", "derived recipe index binding is invalid")
         try:
             record_digest = normalize_digest(index.get("record_digest", ""))
@@ -1432,6 +1478,17 @@ class OCIStore:
         ):
             raise OCIStoreError("oci-store-producer", "derived producer receipts do not match the recipe")
 
+    def verify_cached_recipe(self, key: DerivedSquashFSKey) -> tuple[str, int]:
+        """Read a historical or current immutable recipe without minting occurrences."""
+        if not isinstance(key, DerivedSquashFSKey):
+            raise OCIStoreError("oci-store-input", "derived recipe is invalid")
+        with self._authority() as authority:
+            cached = self._record_from_index(authority, key)
+            if cached is None:
+                raise OCIStoreError("oci-store-missing", "derived recipe is missing")
+            record, _record_digest = cached
+            return record["image_digest"], record["image_size"]
+
     def materialize(
         self,
         occurrence: DerivedLayerOccurrence,
@@ -1448,6 +1505,8 @@ class OCIStore:
     ) -> MaterializationResult:
         if not isinstance(occurrence, DerivedLayerOccurrence) or not isinstance(key, DerivedSquashFSKey):
             raise OCIStoreError("oci-store-input", "derived materialization input is invalid")
+        if key.parent_chain_digest is None:
+            raise OCIStoreError("oci-store-input", "legacy derived recipes are read-only")
         if not key.matches(occurrence) or not callable(producer):
             raise OCIStoreError("oci-store-input", "derived recipe does not match its occurrence")
         with self._authority() as authority, self._lock(authority, f"recipe-{_digest_hex(key.digest)}.lock"):
@@ -1555,6 +1614,27 @@ class OCIStore:
         if verify_artifact:
             self._artifacts.verify_squashfs(receipt.image_digest, receipt.image_size, maximum=_MAX_IMAGE_BYTES)
         return value
+
+    def read_producer_record(self, receipt: DerivedLayerReceipt) -> dict[str, Any]:
+        """Read verified conversion facts, never transferable occurrence authority.
+
+        A conversion worker may export these facts and verified payload bytes.
+        The receiver must bind its own original source and publish through
+        ``materialize``; worker store IDs and leases cannot cross that boundary.
+        """
+        if not isinstance(receipt, DerivedLayerReceipt):
+            raise OCIStoreError("oci-store-receipt", "producer export requires a derived receipt")
+        with self._authority() as authority:
+            self._read_occurrence(authority, receipt)
+            payload, _ = self._read_file(authority.records_fd, _digest_hex(receipt.record_digest))
+            if _digest_bytes(payload) != receipt.record_digest:
+                raise OCIStoreError("oci-store-corrupt", "producer record digest is invalid")
+            record = self._decode(payload)
+            key = DerivedSquashFSKey.from_dict(record.get("key"))
+            if key.digest != receipt.key_digest:
+                raise OCIStoreError("oci-store-corrupt", "producer record recipe binding is invalid")
+            self._validate_cached_receipts(record, key, receipt.image_digest, receipt.image_size)
+            return record
 
     def validate_receipt_occurrences(
         self,
@@ -2653,6 +2733,7 @@ __all__ = [
     "DerivedLayerOccurrence",
     "DerivedLayerReceipt",
     "DerivedSquashFSKey",
+    "parent_chain_digest",
     "DurableDerivedLayerLease",
     "DurableLeaseSet",
     "DurableLeaseSetMember",

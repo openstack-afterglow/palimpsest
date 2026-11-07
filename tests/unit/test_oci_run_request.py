@@ -293,3 +293,36 @@ def test_unsupported_host_precedes_any_source_or_state_mutation(tmp_path, monkey
             toolchain=object(),
         )
     assert not roots.state.exists()
+
+
+@pytest.mark.parametrize(
+    "target",
+    ["/.palimpsest", "/.palimpsest/seed", "/run", "/run/native", "/etc/hostname", "/etc/resolv.conf"],
+)
+def test_vz_explicit_source_mount_cannot_hide_native_control_or_identity(tmp_path, target):
+    from palimpsest_local.refs import HostDirectoryShare
+
+    share = HostDirectoryShare(tmp_path, "source", target)
+    with pytest.raises(ArtifactValidationError, match="protected guest path"):
+        intake.LocalOCIRunRequest(
+            "demo", tmp_path / "image", platform="linux/arm64", backend="lima-vz", host_shares=(share,)
+        )
+
+
+def test_vz_source_mounts_cannot_overlap_each_other(tmp_path):
+    from palimpsest_local.refs import HostDirectoryShare
+
+    shares = (
+        HostDirectoryShare(tmp_path, "source", "/workspace"),
+        HostDirectoryShare(tmp_path, "other", "/workspace/nested"),
+    )
+    with pytest.raises(ArtifactValidationError, match="source mounts overlap"):
+        intake.LocalOCIRunRequest(
+            "demo", tmp_path / "image", platform="linux/arm64", backend="lima-vz", host_shares=shares
+        )
+
+
+@pytest.mark.parametrize("policy", [{"mode": []}, {"mode": "test"}, {"restart": []}, {"restart": "always"}])
+def test_vz_lifecycle_policy_has_no_mutable_or_silent_fallback(tmp_path, policy):
+    with pytest.raises(ArtifactValidationError):
+        intake.LocalOCIRunRequest("demo", tmp_path / "image", platform="linux/arm64", backend="lima-vz", **policy)

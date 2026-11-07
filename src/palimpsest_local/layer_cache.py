@@ -22,6 +22,7 @@ from typing import Any
 
 from . import registry_intake
 from .errors import ArtifactValidationError
+from .image_source_policy import ImageSourcePolicy, ImageSourcePolicyError
 from .oci_converter import DEFAULT_LAYER_CONVERSION_LIMITS, LAYER_INTAKE_POLICY_ID
 from .oci_image import OCIImageRef, resolve_image, strict_json_object
 from .oci_materializer import OCIHardWorkerError, materialize_image_hard
@@ -39,7 +40,7 @@ from .oci_source import (
     SourceCAS,
     SourceSnapshot,
 )
-from .oci_store import DerivedLayerOccurrence, DerivedSquashFSKey, MaterializationResult, OCIStore
+from .oci_store import DerivedLayerOccurrence, DerivedSquashFSKey, MaterializationResult, OCIStore, parent_chain_digest
 from .state import StatePaths
 
 SCHEMA = "palimpsest.layer-cache.v1"
@@ -173,10 +174,6 @@ def _image_record(snapshot: SnapshottedOCIImage) -> dict[str, Any]:
     }
 
 
-def _missing_derived():
-    raise LayerCacheError("retained layer cache recipe or SquashFS bytes are missing or corrupt")
-
-
 class LayerCache:
     """One private, already-mounted cache; flock must work across all writers."""
 
@@ -205,9 +202,11 @@ class LayerCache:
                 os.mkdir("runtime-packs", 0o700, dir_fd=state_fd)
                 os.fsync(state_fd)
             else:
+                self._source = SourceCAS(self.roots.oci_source_cas, _create_missing=False)
                 catalog = self._load(state_fd)
             self._cache_id = catalog["cache_id"]
-            self._source = SourceCAS(self.roots.oci_source_cas)
+            if fresh:
+                self._source = SourceCAS(self.roots.oci_source_cas)
             self._store = OCIStore(self.roots)
             self._pin_storage()
 
@@ -366,6 +365,7 @@ class LayerCache:
                 for image in catalog["images"].values()
                 for layer in image["layers"]
             }
+            contexts: set[tuple[str, str, int, str, str]] | None = None
             for digest, record in catalog["derived"].items():
                 if not isinstance(record, dict) or set(record) != {
                     "key",
@@ -379,6 +379,33 @@ class LayerCache:
                 key = DerivedSquashFSKey.from_dict(record["key"])
                 if (key.source_media_type, key.compressed_digest, key.compressed_size, key.diff_id) not in sources:
                     raise LayerCacheError("layer cache derived recipe has no retained source")
+                if key.parent_chain_digest is not None:
+                    if contexts is None:
+                        contexts = set()
+                        for image_record in catalog["images"].values():
+                            snapshot = self._snapshot(
+                                _descriptor(image_record["root_descriptor"]), verify_payloads=False
+                            )
+                            if _image_record(snapshot) != image_record:
+                                raise LayerCacheError("layer cache image record contradicts its verified source graph")
+                            contexts.update(
+                                (
+                                    layer.compressed.media_type,
+                                    layer.compressed.digest,
+                                    layer.compressed.size,
+                                    layer.diff_id,
+                                    parent_chain_digest(snapshot, ordinal),
+                                )
+                                for ordinal, layer in enumerate(snapshot.image.layers)
+                            )
+                    if (
+                        key.source_media_type,
+                        key.compressed_digest,
+                        key.compressed_size,
+                        key.diff_id,
+                        key.parent_chain_digest,
+                    ) not in contexts:
+                        raise LayerCacheError("layer cache derived recipe has no retained parent context")
                 if (
                     digest != key.digest
                     or record["key_digest"] != digest
@@ -393,7 +420,7 @@ class LayerCache:
         except (ValueError, TypeError, KeyError, AttributeError, RecursionError) as exc:
             raise LayerCacheError("layer cache catalog is malformed") from exc
 
-    def _save(self, state_fd: int, catalog: dict[str, Any]) -> None:
+    def _save(self, state_fd: int, catalog: dict[str, Any], *, before_commit: Callable[[], None] | None = None) -> None:
         payload = json.dumps(catalog, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
         if len(payload) > _MAX_CATALOG_BYTES:
             raise LayerCacheError("layer cache catalog exceeds its size bound")
@@ -416,6 +443,8 @@ class LayerCache:
                 visible = None
             if visible != expected:
                 raise LayerCacheError("layer cache catalog changed before publication")
+            if before_commit is not None:
+                before_commit()
             os.replace(temporary, _MARKER, src_dir_fd=state_fd, dst_dir_fd=state_fd)
             os.fsync(state_fd)
             self._catalog_signature = _stable(os.stat(_MARKER, dir_fd=state_fd, follow_symlinks=False))
@@ -426,7 +455,7 @@ class LayerCache:
             except FileNotFoundError:
                 pass
 
-    def _snapshot(self, descriptor: Descriptor) -> SnapshottedOCIImage:
+    def _snapshot(self, descriptor: Descriptor, *, verify_payloads: bool = True) -> SnapshottedOCIImage:
         def member(value):
             return SourceSnapshot(value, self._source.identity)
 
@@ -440,7 +469,8 @@ class LayerCache:
             member(image.config.descriptor),
             tuple(member(layer.compressed) for layer in image.layers),
         )
-        self._source.verify_image(snapshot)
+        if verify_payloads:
+            self._source.verify_image(snapshot)
         return snapshot
 
     def _verified(self, catalog: dict[str, Any], root: str) -> SnapshottedOCIImage:
@@ -452,13 +482,17 @@ class LayerCache:
         if _image_record(snapshot) != record:
             raise LayerCacheError("layer cache image record contradicts its verified source graph")
         recipes = [(DerivedSquashFSKey.from_dict(value["key"]), value) for value in catalog["derived"].values()]
-        for ordinal in range(len(snapshot.layers)):
-            occurrence = DerivedLayerOccurrence.from_image(snapshot, ordinal)
-            for key, derived in recipes:
-                if key.matches(occurrence):
-                    receipt = self._store.materialize(occurrence, key, _missing_derived)
-                    if receipt.image_digest != derived["image_digest"] or receipt.image_size != derived["image_size"]:
-                        raise LayerCacheError("layer cache derived catalog contradicts the verified recipe")
+        for key, derived in recipes:
+            if any(
+                key.matches(DerivedLayerOccurrence.from_image(snapshot, ordinal))
+                and (
+                    key.parent_chain_digest is None or key.parent_chain_digest == parent_chain_digest(snapshot, ordinal)
+                )
+                for ordinal in range(len(snapshot.layers))
+            ):
+                digest, size = self._store.verify_cached_recipe(key)
+                if digest != derived["image_digest"] or size != derived["image_size"]:
+                    raise LayerCacheError("layer cache derived catalog contradicts the verified recipe")
         return snapshot
 
     def _check_retained_files(self, catalog: dict[str, Any]) -> set[str]:
@@ -487,9 +521,17 @@ class LayerCache:
                         raise LayerCacheError("retained layer cache blob metadata is invalid")
         return set(sources)
 
-    def _view(self, catalog: dict[str, Any], root: str | None = None) -> dict[str, Any]:
+    def _view(
+        self,
+        catalog: dict[str, Any],
+        root: str | None = None,
+        *,
+        snapshot: SnapshottedOCIImage | None = None,
+    ) -> dict[str, Any]:
         result = {**catalog, "root": os.fspath(self.root), "retention": "permanent"}
         if root is not None:
+            if snapshot is None or snapshot.root.descriptor.digest != root:
+                raise LayerCacheError("layer cache view requires the verified source graph")
             record = catalog["images"][root]
             result.update(
                 root_digest=root,
@@ -507,12 +549,19 @@ class LayerCache:
                     )
                 ],
             )
-            sources = {(layer["compressed"]["digest"], layer["diff_id"]) for layer in record["layers"]}
+            contexts = [
+                (DerivedLayerOccurrence.from_image(snapshot, ordinal), parent_chain_digest(snapshot, ordinal))
+                for ordinal in range(len(snapshot.layers))
+            ]
             result["derived_blob_paths"] = sorted(
                 {
                     os.fspath(self.roots.store / "blobs" / "sha256" / derived["image_digest"].split(":")[1])
                     for derived in catalog["derived"].values()
-                    if (derived["compressed_digest"], derived["diff_id"]) in sources
+                    if any(
+                        (key := DerivedSquashFSKey.from_dict(derived["key"])).matches(occurrence)
+                        and key.parent_chain_digest == prefix
+                        for occurrence, prefix in contexts
+                    )
                 }
             )
         return result
@@ -539,14 +588,26 @@ class LayerCache:
                 self._verified(catalog, root)
             catalog["images"][root] = record
             self._save(fd, catalog)
-            return self._view(catalog, root)
+            return self._view(catalog, root, snapshot=snapshot)
 
     def pull(
-        self, reference: str, *, offline: bool = False, timeout_seconds: float = 300.0, skopeo: Path | None = None
+        self,
+        reference: str,
+        *,
+        source_policy: ImageSourcePolicy,
+        offline: bool = False,
+        timeout_seconds: float = 300.0,
+        skopeo: Path | None = None,
     ) -> dict[str, Any]:
         if type(offline) is not bool:
             raise LayerCacheError("layer cache offline option must be boolean")
         resolved = registry_intake.resolve_anonymous_reference(reference)
+        if not isinstance(source_policy, ImageSourcePolicy):
+            raise LayerCacheError("layer cache pull requires an explicit validated source policy")
+        try:
+            source_policy.admit(resolved)
+        except ImageSourcePolicyError as exc:
+            raise LayerCacheError(str(exc)) from None
         canonical = resolved.canonical
         pin = canonical.rsplit("@", 1)[1] if "@" in canonical else None
         with self._locked() as (fd, _fresh):
@@ -557,12 +618,16 @@ class LayerCache:
             if offline or (pin is not None and root is not None):
                 if root is None:
                     raise LayerCacheError("reference is not available in the offline layer cache")
-                self._verified(catalog, root)
-                return self._view(catalog, root)
+                snapshot = self._verified(catalog, root)
+                return self._view(catalog, root, snapshot=snapshot)
             # A mutable tag refreshes by default. Failure never falls back silently.
             self._check_retained_files(catalog)
             pulled = registry_intake.pull_anonymous_oci_layout(
-                canonical, self.roots, timeout_seconds=timeout_seconds, skopeo=skopeo
+                canonical,
+                self.roots,
+                source_policy=source_policy,
+                timeout_seconds=timeout_seconds,
+                skopeo=skopeo,
             )
             with _directory(self.roots.oci_source_cas) as layout_fd:
                 # The helper publishes one selected transport label, not history.
@@ -603,7 +668,7 @@ class LayerCache:
             catalog["images"][root] = _image_record(snapshot)
             catalog["references"][canonical] = root
             self._save(fd, catalog)
-            return self._view(catalog, root)
+            return self._view(catalog, root, snapshot=snapshot)
 
     def materialize(
         self,
@@ -670,6 +735,7 @@ class LayerCache:
                 occurrence = DerivedLayerOccurrence.from_image(snapshot, ordinal)
                 key = DerivedSquashFSKey.for_occurrence(
                     occurrence,
+                    parent_chain_digest=parent_chain_digest(snapshot, ordinal),
                     intake_policy_id=LAYER_INTAKE_POLICY_ID,
                     intake_policy_fingerprint=DEFAULT_LAYER_CONVERSION_LIMITS.fingerprint,
                     pack_policy_id=SQUASHFS_PACK_POLICY_ID,
@@ -718,7 +784,7 @@ class LayerCache:
             if len(committed_results) != len(snapshot.layers) or tuple(committed_results) != receipt.results:
                 raise LayerCacheError("image materialization results contradict the committed layer sequence")
             return {
-                **self._view(catalog, root_digest),
+                **self._view(catalog, root_digest, snapshot=snapshot),
                 "receipt": receipt.to_dict(),
                 "blob_paths": [
                     os.fspath(self.roots.store / "blobs" / "sha256" / result.receipt.image_digest.split(":")[1])
@@ -726,32 +792,40 @@ class LayerCache:
                 ],
             }
 
-    def retain(self, root_digest: str, consumer: str) -> dict[str, Any]:
+    def retain(
+        self, root_digest: str, consumer: str, *, before_commit: Callable[[], None] | None = None
+    ) -> dict[str, Any]:
         _consumer(consumer)
         with self._locked() as (fd, _fresh):
             catalog = self._load(fd)
-            self._verified(catalog, _digest(root_digest))
+            snapshot = self._verified(catalog, _digest(root_digest))
             if catalog["consumers"].get(consumer, root_digest) != root_digest:
                 raise LayerCacheError("layer cache consumer is already bound to a different immutable root")
             if consumer not in catalog["consumers"]:
                 catalog["consumers"][consumer] = root_digest
-                self._save(fd, catalog)
-            return self._view(catalog, root_digest)
+                self._save(fd, catalog, before_commit=before_commit)
+            return self._view(catalog, root_digest, snapshot=snapshot)
 
     def release(self, consumer: str) -> dict[str, Any]:
         _consumer(consumer)
         with self._locked() as (fd, _fresh):
             catalog = self._load(fd)
             root = catalog["consumers"].get(consumer)
+            snapshot = None
             if root is not None:
-                self._verified(catalog, root)
+                snapshot = self._verified(catalog, root)
                 del catalog["consumers"][consumer]
                 self._save(fd, catalog)
-            return {**self._view(catalog, root), "consumer": consumer, "released": root is not None}
+            return {
+                **self._view(catalog, root, snapshot=snapshot),
+                "consumer": consumer,
+                "released": root is not None,
+            }
 
     def inspect(self, root_digest: str | None = None) -> dict[str, Any]:
         with self._locked() as (fd, _fresh):
             catalog = self._load(fd)
+            snapshot = None
             for root in [_digest(root_digest)] if root_digest is not None else catalog["images"]:
-                self._verified(catalog, root)
-            return self._view(catalog, root_digest)
+                snapshot = self._verified(catalog, root)
+            return self._view(catalog, root_digest, snapshot=snapshot if root_digest is not None else None)

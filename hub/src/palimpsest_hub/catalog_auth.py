@@ -68,12 +68,12 @@ def _role_directory(client):
     edges = {role_id: set() for role_id in by_id}
     for inference in inferences["role_inferences"]:
         prior = inference["prior_role"]["id"]
-        referenced_role(prior)
-        edges.setdefault(prior, set())
+        prior_role = referenced_role(prior)
         for implied in inference["implies"]:
-            referenced_role(implied["id"])
-            edges.setdefault(implied["id"], set())
-            edges[prior].add(implied["id"])
+            implied_role = referenced_role(implied["id"])
+            # Domain/custom aliases never assert global builtin capabilities through inference.
+            if prior_role.get("domain_id") is None and implied_role.get("domain_id") is None:
+                edges[prior].add(implied["id"])
     return by_id, global_names, edges
 
 
@@ -88,12 +88,12 @@ def _effective_role_names(role_ids, directory):
             return
         role = by_id[role_id]
         name = role["name"]
-        if role.get("domain_id") is None:
-            if global_names.get(name.casefold()) != [role_id]:
-                raise ValueError("Role is not a unique global binding")
-            names.add(name)
-        # Follow exact native implications, not domain-local builtin lookalikes.
+        if role.get("domain_id") is not None:
+            return
+        if global_names.get(name.casefold()) != [role_id]:
+            raise ValueError("Role is not a unique global binding")
         visiting.add(role_id)
+        names.add(name)
         for implied in edges[role_id]:
             visit(implied)
         visiting.remove(role_id)

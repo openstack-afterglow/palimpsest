@@ -15,6 +15,7 @@ from uuid import uuid4
 import httpx
 import pytest
 from fastapi import FastAPI, HTTPException, Request
+from palimpsest_local.image_source_policy import ImageSourcePolicy, ImageSourceRule
 from pydantic import SecretStr
 from sqlalchemy import select
 from sqlalchemy.exc import OperationalError
@@ -37,6 +38,12 @@ from palimpsest_hub.services.hub_store import HubStoreError, LocalPathBlobStore
 KEY = "disposable-image-worker-key-01234567890123456789"
 WORKER = {"X-Palimpsest-Build-Worker-Key": KEY}
 HUMAN = {"X-Identity": "human"}
+SOURCE_POLICY = ImageSourcePolicy(
+    (
+        ImageSourceRule("docker.io", "library", "alpine"),
+        ImageSourceRule("docker.io", "library", "ubuntu"),
+    )
+)
 
 
 def digest(payload):
@@ -64,6 +71,7 @@ async def images(tmp_path, monkeypatch):
         palimpsest_hub_build_timeout_seconds=60,
         palimpsest_hub_max_blob_bytes=1024 * 1024,
         palimpsest_hub_registry_hosts=("docker.io", "ghcr.io", "quay.io", "registry-1.docker.io"),
+        palimpsest_hub_image_source_policy=SOURCE_POLICY.to_dict(),
         palimpsest_hub_max_context_bytes=16 * 1024 * 1024,
         palimpsest_hub_max_context_expanded_bytes=256 * 1024 * 1024,
         palimpsest_hub_max_context_members=10000,
@@ -80,13 +88,12 @@ async def images(tmp_path, monkeypatch):
     async def identity(request: Request):
         if request.headers.get("X-Identity") != "human":
             raise HTTPException(status_code=403, detail="human native authority required")
-        admin = request.headers.get("X-Target") is not None
         return {
             "project_id": request.headers.get("X-Project", "alpha"),
             "user_id": request.headers.get("X-User", "caller"),
             "package_actions": {"packages:read", "packages:write", "packages:inventory"},
-            "is_package_system_admin": admin,
-            **({"target_project_id": request.headers["X-Target"]} if admin else {}),
+            "is_package_system_admin": request.headers.get("X-Target") is not None,
+            **({"target_project_id": request.headers["X-Target"]} if request.headers.get("X-Target") else {}),
             "token": "disposable-native-token:" + request.headers.get("X-User", "caller"),
         }
 
@@ -94,6 +101,13 @@ async def images(tmp_path, monkeypatch):
     app.dependency_overrides[hub._legacy_inventory] = identity
     app.dependency_overrides[hub._legacy_download] = identity
     app.dependency_overrides[hub._project_delete] = identity
+    for dependency in (
+        published_images.image_writer,
+        published_images.image_inventory,
+        published_images.image_download,
+        published_images.image_graph_reader,
+    ):
+        app.dependency_overrides[dependency] = identity
 
     async def refresh(token_info):
         return token_info
@@ -175,6 +189,10 @@ def descriptor(*payloads):
     from palimpsest_local.image_manifest import manifest_from_result
 
     value["manifest"] = manifest_from_result(value, os_family="alpine", os_version="3", source_kind="registry")
+    value["manifest"]["source"]["metadata"] = {
+        "source_policy": SOURCE_POLICY.to_dict(),
+        "source_policy_digest": SOURCE_POLICY.digest,
+    }
     return value
 
 
@@ -233,6 +251,175 @@ async def test_fresh_authority_revocation_never_admits(images, monkeypatch):
 async def test_registry_policy_rejects_unapproved_sources(images, reference):
     response = await enqueue(images, reference=reference)
     assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reference", ["docker.io/other/alpine:3", "docker.io/library/alpine-extra:3", "ghcr.io/library/alpine:3"]
+)
+async def test_operator_exact_policy_denies_host_allowed_other_sources_without_job(images, reference):
+    response = await enqueue(images, reference=reference)
+    assert response.status_code == 422
+    assert response.json()["detail"] == "image source is not allowed by operator policy"
+    async with images.factory() as session:
+        assert (await session.scalars(select(PalimpsestHubImageJob))).all() == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["registry", "dockerfile"])
+async def test_empty_operator_policy_rejects_before_context_or_queue_effects(images, kind):
+    images.settings.palimpsest_hub_image_source_policy = ImageSourcePolicy().to_dict()
+    if kind == "registry":
+        response = await enqueue(images)
+    else:
+        response = await images.client.post(
+            "/v1/dockerfile-builds",
+            headers=HUMAN,
+            json={
+                "request_id": str(uuid4()),
+                "name": "denied",
+                "dockerfile": "FROM scratch",
+                "os_family": "alpine",
+                "os_version": "3",
+                "context_digest": digest(b"absent"),
+            },
+        )
+    assert response.status_code == 503
+    assert response.json()["detail"] == "image source policy is not configured"
+    async with images.factory() as session:
+        assert (await session.scalars(select(PalimpsestHubImageJob))).all() == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["source_policy", "source_policy_digest"])
+async def test_workload_cannot_supply_operator_policy(images, field):
+    value = SOURCE_POLICY.to_dict() if field == "source_policy" else SOURCE_POLICY.digest
+    assert (await enqueue(images, **{field: value})).status_code == 422
+    async with images.factory() as session:
+        assert (await session.scalars(select(PalimpsestHubImageJob))).all() == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "dockerfile",
+    [
+        "FROM docker.io/other/alpine:3",
+        "FROM scratch\nRUN --mount=type=bind,from=ghcr.io/other/image:tag,target=/x true",
+        "FROM scratch\nCOPY --from=ghcr.io/other/image:tag /x /x",
+        "ARG BASE=ignored\nFROM docker.io/library/alpine-extra:3 AS build",
+    ],
+)
+async def test_known_dockerfile_external_sources_denied_before_queue(images, dockerfile):
+    response = await images.client.post(
+        "/v1/dockerfile-builds",
+        headers=HUMAN,
+        json={
+            "request_id": str(uuid4()),
+            "name": "denied",
+            "dockerfile": dockerfile,
+            "os_family": "alpine",
+            "os_version": "3",
+        },
+    )
+    assert response.status_code == 422
+    async with images.factory() as session:
+        assert (await session.scalars(select(PalimpsestHubImageJob))).all() == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "dockerfile",
+    [
+        "# syntax=docker/dockerfile:1\nFROM alpine:3",
+        'FROM alpine:3\nRUN --mount="type=bind,from=alpine:3,target=/x" true',
+        "FROM scratch AS final\nCOPY --from=build /x /x\nFROM alpine:3 AS build",
+        "FROM alpine:3\nRUN <<EOF\nFROM ghcr.io/other/not-an-instruction:tag\nEOF",
+        "FROM alpine:3\nCOPY -- ./--from=not-an-image /file",
+    ],
+)
+async def test_early_dockerfile_admission_does_not_interpret_stage_or_payload_as_registry(images, dockerfile):
+    response = await images.client.post(
+        "/v1/dockerfile-builds",
+        headers=HUMAN,
+        json={
+            "request_id": str(uuid4()),
+            "name": "literal-boundary",
+            "dockerfile": dockerfile,
+            "os_family": "alpine",
+            "os_version": "3",
+        },
+    )
+    assert response.status_code == 202, response.text
+    job, _ = await claim(images)
+    assert job["kind"] == "dockerfile" and job["source_policy_digest"] == SOURCE_POLICY.digest
+
+
+@pytest.mark.asyncio
+async def test_claim_policy_snapshot_is_server_bound_and_revocation_retires_queue(images):
+    first = (await enqueue(images)).json()
+    job, _ = await claim(images)
+    assert job["source_policy"] == SOURCE_POLICY.to_dict()
+    assert job["source_policy_digest"] == SOURCE_POLICY.digest
+    assert "source_policy" not in job["request"]
+    async with images.factory() as session:
+        stored = await session.get(PalimpsestHubImageJob, first["id"])
+        assert stored.request_json["source_policy"] == SOURCE_POLICY.to_dict()
+        assert stored.request_digest == compute_config_digest({"kind": stored.kind, **stored.request_json})
+        stored.status = "error"
+        await session.commit()
+    second = (await enqueue(images)).json()
+    images.settings.palimpsest_hub_image_source_policy = ImageSourcePolicy().to_dict()
+    response = await images.client.post("/v1/image-worker/claim", headers=claim_headers())
+    assert response.status_code == 204
+    async with images.factory() as session:
+        stored = await session.get(PalimpsestHubImageJob, second["id"])
+        assert stored.status == "error" and stored.lease_owner is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reconfigured", ["empty", "expanded"])
+async def test_identical_request_retry_returns_original_policy_bound_receipt(images, reconfigured):
+    request_id = str(uuid4())
+    first = await enqueue(images, request_id=request_id)
+    assert first.status_code == 202
+    policy = (
+        ImageSourcePolicy()
+        if reconfigured == "empty"
+        else ImageSourcePolicy(
+            (
+                *SOURCE_POLICY.rules,
+                ImageSourceRule("ghcr.io", "operator", "additional"),
+            )
+        )
+    )
+    images.settings.palimpsest_hub_image_source_policy = policy.to_dict()
+    repeated = await enqueue(images, request_id=request_id)
+    assert repeated.status_code == 202
+    assert repeated.json()["id"] == first.json()["id"]
+    assert repeated.json()["request_digest"] == first.json()["request_digest"]
+    async with images.factory() as session:
+        rows = (await session.scalars(select(PalimpsestHubImageJob))).all()
+        assert len(rows) == 1 and rows[0].request_json["source_policy"] == SOURCE_POLICY.to_dict()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ["missing", "digest", "snapshot"])
+async def test_publication_rejects_unbound_source_policy_receipt(images, mutation):
+    await enqueue(images)
+    job, headers = await claim(images)
+    result = descriptor(b"hsqs-denied")
+    metadata = result["manifest"]["source"]["metadata"]
+    if mutation == "missing":
+        metadata.clear()
+    elif mutation == "digest":
+        metadata["source_policy_digest"] = digest(b"other-policy")
+    else:
+        metadata["source_policy"] = ImageSourcePolicy().to_dict()
+    response = await images.client.post(path(job) + "/publication-intent", headers=headers, json=result)
+    assert response.status_code == 409
+    async with images.factory() as session:
+        stored = await session.get(PalimpsestHubImageJob, job["id"])
+        assert stored.result_json is None and stored.staged_outputs == []
 
 
 @pytest.mark.asyncio
@@ -507,7 +694,7 @@ async def test_descriptor_conflict_rolls_back_every_layer(images):
     await h.client.post(path(first) + "/complete", json=descriptor(b), headers=first_headers)
     async with h.factory() as session:
         existing = await session.scalar(select(PalimpsestHubLayer).where(PalimpsestHubLayer.blob_digest == digest(b)))
-        existing.arch = "aarch64"
+        existing.media_type = "application/octet-stream"
         await session.commit()
     await enqueue(h)
     job, headers = await claim(h)
@@ -889,54 +1076,6 @@ async def test_publication_registers_single_parent_many_child_and_shared_payload
             "/v1/layer-nodes/" + one["leaf_id"], headers={**HUMAN, "X-Project": "beta", "X-User": "other"}
         )
     ).status_code == 404
-
-
-@pytest.mark.asyncio
-async def test_publication_revoked_during_payload_copy_never_commits(images, monkeypatch):
-    payload = b"hsqsrevoked-during-copy"
-    assert (await upload_publication_payload(images, payload)).status_code == 200
-    state = {"revoked": False}
-    original_copy = publications._publish_no_replace
-
-    def copy_then_revoke(*args, **kwargs):
-        result = original_copy(*args, **kwargs)
-        state["revoked"] = True
-        return result
-
-    async def current(token_info):
-        if state["revoked"]:
-            raise HTTPException(status_code=403, detail="membership removed")
-        return token_info
-
-    monkeypatch.setattr(publications, "_publish_no_replace", copy_then_revoke)
-    monkeypatch.setattr(service, "get_package_member_info", current)
-    response = await publish_manifest(images, publication_manifest(payload))
-    assert response.status_code == 403
-    assert state["revoked"] is True
-    async with images.factory() as session:
-        assert (await session.scalars(select(publications.PalimpsestHubPublishedImage))).all() == []
-
-
-@pytest.mark.asyncio
-async def test_admin_target_publication_revalidates_original_token_scope(images, monkeypatch):
-    admin = {**HUMAN, "X-Target": "beta", "X-User": "operator"}
-    seen = []
-
-    async def revalidate(token_info):
-        seen.append(token_info["project_id"])
-        if token_info["project_id"] != "alpha":
-            raise HTTPException(status_code=403, detail="PROJECT_SCOPE_MISMATCH")
-        return token_info
-
-    monkeypatch.setattr(service, "revalidate_package_admin", revalidate)
-    payload = b"hsqsadmin-target-payload"
-    assert (await upload_publication_payload(images, payload, headers=admin)).status_code == 200
-    response = await publish_manifest(images, publication_manifest(payload), headers=admin)
-    assert response.status_code == 201, response.text
-    assert seen and set(seen) == {"alpha"}
-    async with images.factory() as session:
-        [row] = (await session.scalars(select(publications.PalimpsestHubPublishedImage))).all()
-    assert row.project_id == "beta"
 
 
 @pytest.mark.asyncio
@@ -1985,3 +2124,54 @@ async def test_os_declarations_reject_unpublishable_values_before_worker_admissi
             assert len(rows) == 1 and rows[0].request_json[field] == value
     offered = await images.client.post("/v1/image-worker/claim", headers=claim_headers())
     assert offered.status_code == (204 if status == 422 else 202), offered.text
+
+
+# ---- ported verbatim from release origin/dev (92ee9ad) ----
+
+
+@pytest.mark.asyncio
+async def test_rel312_publication_revoked_during_payload_copy_never_commits(images, monkeypatch):
+    payload = b"hsqsrevoked-during-copy"
+    assert (await upload_publication_payload(images, payload)).status_code == 200
+    state = {"revoked": False}
+    original_copy = publications._publish_no_replace
+
+    def copy_then_revoke(*args, **kwargs):
+        result = original_copy(*args, **kwargs)
+        state["revoked"] = True
+        return result
+
+    async def current(token_info):
+        if state["revoked"]:
+            raise HTTPException(status_code=403, detail="membership removed")
+        return token_info
+
+    monkeypatch.setattr(publications, "_publish_no_replace", copy_then_revoke)
+    monkeypatch.setattr(service, "get_package_member_info", current)
+    response = await publish_manifest(images, publication_manifest(payload))
+    assert response.status_code == 403
+    assert state["revoked"] is True
+    async with images.factory() as session:
+        assert (await session.scalars(select(publications.PalimpsestHubPublishedImage))).all() == []
+
+
+@pytest.mark.asyncio
+async def test_rel312_admin_target_publication_revalidates_original_token_scope(images, monkeypatch):
+    admin = {**HUMAN, "X-Target": "beta", "X-User": "operator"}
+    seen = []
+
+    async def revalidate(token_info):
+        seen.append(token_info["project_id"])
+        if token_info["project_id"] != "alpha":
+            raise HTTPException(status_code=403, detail="PROJECT_SCOPE_MISMATCH")
+        return token_info
+
+    monkeypatch.setattr(service, "revalidate_package_admin", revalidate)
+    payload = b"hsqsadmin-target-payload"
+    assert (await upload_publication_payload(images, payload, headers=admin)).status_code == 200
+    response = await publish_manifest(images, publication_manifest(payload), headers=admin)
+    assert response.status_code == 201, response.text
+    assert seen and set(seen) == {"alpha"}
+    async with images.factory() as session:
+        [row] = (await session.scalars(select(publications.PalimpsestHubPublishedImage))).all()
+    assert row.project_id == "beta"

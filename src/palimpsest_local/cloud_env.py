@@ -40,7 +40,10 @@ from functools import wraps
 from pathlib import Path
 from typing import Any
 
+from .buildkit import BuildKitSpec, validate_online_dockerfile
 from .errors import PalimpsestError
+from .image_policy_channel import run_policy_process
+from .image_source_policy import ImageSourcePolicy, ImageSourcePolicyError, load_image_source_policy
 from .state import resolve_roots
 
 SCHEMA = "palimpsest.cloud-env.v1"
@@ -306,10 +309,19 @@ def package_archive() -> tuple[bytes, str]:
 
 
 def context_archive(context: Path) -> bytes:
-    """Fail closed on unsupported dockerignore semantics before any context upload."""
+    """Fail closed on unsupported ignore semantics before any context upload."""
     context = context.resolve(strict=True)
     if not context.is_dir():
         raise CloudEnvError(f"build context is not a directory: {context}")
+    try:
+        (context / ".plmignore").lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        raise CloudEnvError(
+            ".plmignore is unsupported for cloud env remote build contexts; "
+            "use the local BuildKit build route to apply .plmignore"
+        )
     ignored = {".git"}
     ignore_file = context / ".dockerignore"
     if ignore_file.is_symlink():
@@ -1156,12 +1168,54 @@ python3 -c {shlex.quote(check)} {STORE_MOUNT} {shlex.quote(export)} {shlex.quote
         self.state["worker_package_sha256"] = digest
         self.save()
 
+    def _send_source_policy(self, address: str, remote: str, source_policy: ImageSourcePolicy) -> None:
+        # This is controller-selected authority, never a field supplied by the image request.
+        self.ssh(
+            address,
+            f"sudo install -d -m 0700 -o {SSH_USER} {remote} && "
+            f"sudo sh -c {shlex.quote('umask 077; cat > ' + remote + '/source-policy.json')}",
+            input=json.dumps(source_policy.to_dict(), sort_keys=True).encode(),
+        )
+
+    def _policy_ssh(
+        self,
+        address: str,
+        command: str,
+        *,
+        source_policy: ImageSourcePolicy,
+        timeout: float,
+    ) -> subprocess.CompletedProcess:
+        # Same authenticated transport/key/known-hosts path; only its private
+        # stdin/stdout carry fresh authorization. Never use the copied snapshot.
+        return run_policy_process(
+            [*self.ssh_argv(address), command],
+            initial=source_policy,
+            current_policy=lambda: load_image_source_policy(resolve_roots()),
+            policy_timeout=timeout,
+            process_timeout=timeout + 300,
+        )
+
     @_operation
     def build(self, *, dockerfile: Path, context: Path, tag: str, timeout: float) -> dict:
         if not isinstance(tag, str) or re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,127}", tag) is None:
             raise CloudEnvError("image name must be lowercase [a-z0-9._-], at most 128 characters")
         if isinstance(timeout, bool) or not isinstance(timeout, (float, int)) or not 0 < timeout < 604800:
             raise CloudEnvError("build timeout must be finite and positive (less than one week)")
+        roots = resolve_roots()
+        source_policy = load_image_source_policy(roots)
+        if not source_policy.rules:
+            raise ImageSourcePolicyError("image_sources policy does not allow any upstream image")
+        validate_online_dockerfile(
+            BuildKitSpec(
+                context=context,
+                dockerfile=dockerfile,
+                tag=tag,
+                output=context.expanduser().resolve().parent / "cloud-image.oci.tar",
+            ),
+            roots,
+            source_policy=source_policy,
+            require_pins=False,
+        )
         data = dockerfile.read_bytes()
         context_data = context_archive(context)
         _, digest = package_archive()
@@ -1178,7 +1232,7 @@ python3 -c {shlex.quote(check)} {STORE_MOUNT} {shlex.quote(export)} {shlex.quote
         job = uuid.uuid4().hex
         remote = f"{WORKER_SCRATCH}/uploads/{job}"
         started = time.monotonic()
-        self.ssh(address, f"sudo install -d -m 0700 -o {SSH_USER} {remote}")
+        self._send_source_policy(address, remote, source_policy)
         self.upload(address, data, f"{remote}/Dockerfile")
         self.upload(address, context_data, f"{remote}/context.tar")
         uploaded = time.monotonic()
@@ -1186,9 +1240,10 @@ python3 -c {shlex.quote(check)} {STORE_MOUNT} {shlex.quote(export)} {shlex.quote
             "sudo env PYTHONDONTWRITEBYTECODE=1 python3 -I -m "
             f"palimpsest_local.cloud_layer_worker build --dockerfile {remote}/Dockerfile "
             f"--context-tar {remote}/context.tar --store {STORE_MOUNT} --scratch {WORKER_SCRATCH} "
-            f"--name {shlex.quote(tag)} --timeout {str(timeout)}"
+            f"--name {shlex.quote(tag)} --timeout {str(timeout)} --source-policy {remote}/source-policy.json "
+            "--policy-channel"
         )
-        result = self.ssh(address, command, timeout=timeout + 300, check=False)
+        result = self._policy_ssh(address, command, source_policy=source_policy, timeout=timeout)
         self.ssh(address, f"sudo rm -rf {remote}", check=False)
         if result.returncode != 0:
             log = self.ssh(
@@ -1203,11 +1258,17 @@ python3 -c {shlex.quote(check)} {STORE_MOUNT} {shlex.quote(export)} {shlex.quote
                 + result.stderr.decode(errors="replace")[-1500:]
             )
         record = json.loads(result.stdout.decode().strip().splitlines()[-1])
+        if (
+            record.get("source_policy") != source_policy.to_dict()
+            or record.get("source_policy_digest") != source_policy.digest
+        ):
+            raise CloudEnvError("worker build receipt differs from the configured source policy")
         _validate_image(record, require_root=False)
         record["timings_seconds"]["upload"] = round(uploaded - started, 3)
         record["timings_seconds"]["total"] = round(time.monotonic() - started, 3)
         self.state.setdefault("images", {})[tag] = {
-            key: record[key] for key in ("name", "source", "layers", "runtime", "built_at_unix")
+            key: record[key]
+            for key in ("name", "source", "layers", "runtime", "built_at_unix", "source_policy", "source_policy_digest")
         }
         self.save()
         return record
@@ -1221,10 +1282,13 @@ python3 -c {shlex.quote(check)} {STORE_MOUNT} {shlex.quote(export)} {shlex.quote
             raise CloudEnvError("image name must be lowercase [a-z0-9._-], at most 128 characters")
         if isinstance(timeout, bool) or not isinstance(timeout, (float, int)) or not 0 < timeout < 604800:
             raise CloudEnvError("pull timeout must be finite and positive (less than one week)")
-        canonical = resolve_anonymous_reference(reference).canonical
+        resolved = resolve_anonymous_reference(reference)
+        canonical = resolved.canonical
         pin = canonical.rsplit("@", 1)[-1]
         if "@" not in canonical or re.fullmatch(r"sha256:[0-9a-f]{64}", pin) is None:
             raise CloudEnvError("registry acquisition requires an explicit sha256 digest pin")
+        source_policy = load_image_source_policy(resolve_roots())
+        source_policy.admit(resolved)
         prior = self.state.get("image_intakes", {}).get(tag)
         if prior and prior.get("status") != "success":
             raise CloudEnvError("prior image intake outcome requires reconciliation; HOLD, no replay")
@@ -1249,6 +1313,8 @@ python3 -c {shlex.quote(check)} {STORE_MOUNT} {shlex.quote(export)} {shlex.quote
             "started_at": _now(),
             "worker_id": worker["id"],
             "worker_package_sha256": digest,
+            "source_policy": source_policy.to_dict(),
+            "source_policy_digest": source_policy.digest,
         }
         if prior:
             self.state.setdefault("image_intake_history", []).append(dict(prior))
@@ -1256,6 +1322,8 @@ python3 -c {shlex.quote(check)} {STORE_MOUNT} {shlex.quote(export)} {shlex.quote
         self.save()
         try:
             self._send_mount(address, "worker")
+            remote = f"{WORKER_SCRATCH}/uploads/{intake['id']}"
+            self._send_source_policy(address, remote, source_policy)
             argv = [
                 "sudo",
                 "env",
@@ -1277,8 +1345,16 @@ python3 -c {shlex.quote(check)} {STORE_MOUNT} {shlex.quote(export)} {shlex.quote
                 str(timeout),
                 "--job-id",
                 intake["id"],
+                "--source-policy",
+                remote + "/source-policy.json",
+                "--policy-channel",
             ]
-            response = self.ssh(address, shlex.join(argv), timeout=timeout + 300, check=False)
+            response = self._policy_ssh(
+                address,
+                shlex.join(argv),
+                source_policy=source_policy,
+                timeout=timeout,
+            )
             if response.returncode != 0:
                 intake["worker_returncode"] = response.returncode
                 raise CloudEnvError("worker registry acquisition failed; preserve its journal, no automatic replay")
@@ -1289,6 +1365,8 @@ python3 -c {shlex.quote(check)} {STORE_MOUNT} {shlex.quote(export)} {shlex.quote
                 or record.get("source", {}).get("root_digest") != pin
                 or record.get("source", {}).get("reference") != canonical
                 or record.get("job_id") != intake["id"]
+                or record.get("source_policy") != source_policy.to_dict()
+                or record.get("source_policy_digest") != source_policy.digest
             ):
                 raise CloudEnvError("worker image receipt differs from requested job/tag/reference/digest")
             _validate_registry_image(record)

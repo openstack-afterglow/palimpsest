@@ -677,3 +677,22 @@ async def test_catalog_current_native_implication_can_establish_system_administr
     h.identity["edges"][role] = ["admin"]
     response = await h.client.get("/v1/admin/catalog/layers", headers={"X-Auth-Token": ORIGINAL_SUBJECT})
     assert response.status_code == 200, response.text
+
+
+# ---- review probe (not in the release suite): catalog_policy NotCheck/undefined-reference validation ----
+
+
+@pytest.mark.asyncio
+async def test_rel312_probe_catalog_negated_undefined_rule_fails_closed(native_http, tmp_path, monkeypatch):
+    h = native_http
+    h.identity["system_roles"] = ["admin"]
+    h.identity["project_roles"] = h.identity["token_roles"] = []
+    h.identity["subject_scope"] = "system"
+    policy_file = tmp_path / "catalog-freeze-typo.yaml"
+    # Operator intends "system admins manage the catalog unless frozen"; the referenced rule is absent.
+    policy_file.write_text(json.dumps({"system:manage": "role:admin and not rule:catalog_frozen"}))
+    monkeypatch.setenv("OSLO_POLICY_POLICY_FILE", str(policy_file))
+    get_settings.cache_clear()
+    response = await h.client.get("/v1/admin/catalog/layers", headers={"X-Auth-Token": ORIGINAL_SUBJECT})
+    # Release: 503. Ours: 200 (negated missing reference evaluates to allow).
+    assert response.status_code == 503, response.text

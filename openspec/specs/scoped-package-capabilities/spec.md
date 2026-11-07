@@ -4,16 +4,25 @@
 Separate authorized package metadata, content download, publishing and owned key administration while attenuating tokens and delegated keys to current Keystone owner authority.
 ## Requirements
 ### Requirement: Service-local policy over trusted current Keystone roles
-Hub SHALL evaluate service-local policy against original-token and fresh current-owner authority under a mandatory standard native role ceiling. Current unique native reader/member/manager/admin roles SHALL authorize visible reads; member/manager/admin SHALL authorize project management, including package/cache publication, own-key issue/list/revoke, project builds and exact-project package/layer deletion. Existing canonical project roles and legitimate native group/domain/custom inference SHALL use the current native role-ID graph, not local aliases or new provenance filters. Legacy Palimpsest grades/leaves and personal-owner metadata alone SHALL NOT create authority. Capability labels SHALL remain internal presentation labels, not assignable IAM roles. Operator YAML SHALL narrow but SHALL NOT uplift the core role ceiling.
+Hub SHALL evaluate service-local policy against original-token and fresh current-owner authority under a mandatory standard native role ceiling. Reader-or-above SHALL authorize visible reads and original-token own-key list/revoke; member-or-above SHALL additionally authorize create/edit/publication, build/export/instance admission and original-token stop/delete of its own consumers/exclusive boot volumes; manager-or-above SHALL additionally authorize project management, package/layer/export deletion and own-key issuance. Self-actions SHALL require fresh exact creator/key-owner/project checks and SHALL NOT reach another private creator's resource. Higher tiers SHALL include lower without weakening visibility, ownership or credential fences. Canonical project roles and genuine native group/domain/custom inference SHALL use current native role-ID implications, never local aliases or fabricated claims. Custom-only operation roles and personal markers SHALL NOT create authority. Capabilities SHALL expose actions without old role labels. Operator YAML SHALL only narrow ceilings, even when permissive. Project manager/admin SHALL NOT imply system/cross-project authority.
 
 Native current owner-home and project domains SHALL remain enabled independently of personal metadata or role provenance. Disabled domains SHALL deny access; missing, mismatched or unknown enabled-state domain metadata SHALL fail closed as unavailable authority, not downgrade into ordinary member permission.
 
-#### Scenario: Standard reader and member
-- **WHEN** current native reader calls metadata/content/build-status routes
-- **THEN** only existing visible authorized resources are returned
-- **AND** reader cannot publish, delete, admit builds or issue/revoke keys, even with permissive operator rules.
-- **WHEN** current native member/manager/admin calls project management routes
-- **THEN** the role is sufficient without service grades, subject to original issued-role, current membership and resource boundaries.
+#### Scenario: Standard reader, member and manager
+- **WHEN** current native reader calls metadata/content/build-status or own-key-list routes
+- **THEN** only existing visible authorized resources and its own key metadata are returned
+- **AND** reader cannot publish, delete project packages/exports, control consumers, admit builds or issue keys; original-token own-key revocation remains allowed.
+- **WHEN** current native member calls create/publish/upload/edit or build/export/instance admission routes
+- **THEN** member authority is sufficient without operation roles, subject to original issued-role, current membership and resource boundaries.
+- **AND** member cannot delete project packages/exports, issue keys or stop/delete another private creator's resources; exact-own consumer/exclusive-boot cleanup and original-token own-key revocation remain allowed.
+- **WHEN** current native manager/admin calls those management/removal routes
+- **THEN** existing project, user, ownership and visibility boundaries remain mandatory and no system/cross-project authority is inferred.
+
+#### Scenario: Distinct action ceilings
+- **WHEN** the policy is evaluated
+- **THEN** reader actions are `packages:inventory`, `packages:read`, `cache:read`, `keys:list`, `keys:revoke_own`; member adds `packages:write`, `cache:write`, `packages:manage_own`; manager adds `packages:delete`, `packages:manage`, `keys:issue`, `keys:revoke`.
+- **AND** stop/delete and prepared-root disposal admit management or fresh original-token exact-own consumer cleanup; package/layer/export deletion remains manager, and key revocation always retains exact ownership.
+- **AND** exact-own upload cancellation remains create/edit under its package/cache write action with creator/key ownership enforced; package keys retain only the existing read/write allowlist and cannot acquire project management/delete/key administration.
 
 #### Scenario: Disabled native domain cannot borrow standard membership
 - **WHEN** an otherwise valid current core member's native home or project domain is disabled
@@ -56,8 +65,8 @@ Hub SHALL revalidate current effective named Keystone assignments and enabled ow
 ### Requirement: Preserve global and credential boundaries
 Hub SHALL retain genuine human system-only shared catalog/global policy/control-plane authority and machine-only build callback leases. Project-native build admission SHALL require write authority and project build reads SHALL require inventory; exact-project layer deletion SHALL require delete authority and additionally system authority for published shared-catalog rows. Foreign project/user private resources SHALL remain isolated. Native package writes MAY use bounded keys or authorized original human project tokens; keys SHALL NOT administer keys, delete metadata, select logical targets or launch builds. Recognized human federation including native `openid` SHALL NOT suppress Trust/application-credential/OAuth/bind/access-rule restrictions or mint replacement subjects.
 
-#### Scenario: Member project flow cannot cross global boundary
-- **WHEN** a member publishes, builds or deletes a project resource
+#### Scenario: Project tiers cannot cross global boundary
+- **WHEN** a member-or-above publishes/builds, or a manager-or-above deletes a project resource
 - **THEN** only the exact project/owner-visible resource can be managed with fresh authority before effects/commit
 - **AND** global catalogs, foreign project selection and machine worker claim/callback routes remain denied.
 

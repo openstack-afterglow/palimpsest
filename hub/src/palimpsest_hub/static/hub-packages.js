@@ -566,7 +566,7 @@
   const controlActions = node("div", "", "actions");
   controlActions.append(button("Refresh current project", refreshMember, () => !!memberConnection),
     button("Register namespace", registerNamespace, () => !!memberConnection && !memberConnection.identity.namespace && memberAllows("packages_write")),
-    button("List my keys", listKeys, () => !!memberConnection?.identity.namespace && (memberAllows("keys_issue") || memberAllows("keys_revoke"))));
+    button("List my keys", listKeys, () => !!memberConnection?.identity.namespace && memberAllows("keys_list")));
   controlSection.append(controlActions, status("native-control-message"));
   const issueForm = identified("form", "native-issue-form", "", "form-grid");
   const keyName = field(issueForm, "Key name", "native-issue-name", "text", true);

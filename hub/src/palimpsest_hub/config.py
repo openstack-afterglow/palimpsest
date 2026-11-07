@@ -35,6 +35,22 @@ def default_project_namespace(project_id: str) -> str:
 
 DEFAULT_REGISTRY_HOSTS = ("docker.io", "registry-1.docker.io", "ghcr.io", "quay.io")
 
+EMPTY_IMAGE_SOURCE_POLICY = {"schema_version": 1, "publisher_policy": "registry-namespace", "rules": []}
+
+
+def configured_image_source_policy(settings):
+    """Parse only operator settings; workload descriptors are never authority."""
+    from palimpsest_local.image_source_policy import image_source_policy_from_dict
+    from palimpsest_local.registry import RegistryError
+
+    try:
+        policy = image_source_policy_from_dict(settings.palimpsest_hub_image_source_policy)
+    except RegistryError:
+        raise ValueError("invalid operator image source policy") from None
+    if any(rule.registry not in settings.palimpsest_hub_registry_hosts for rule in policy.rules):
+        raise ValueError("image source rules must also satisfy registry_hosts")
+    return policy
+
 
 def validate_registry_hosts(values: tuple[str, ...]) -> tuple[str, ...]:
     """Operators explicitly select registry authorities, never caller-supplied URLs."""
@@ -217,6 +233,7 @@ class Settings(DatabaseSettings):
     palimpsest_hub_build_worker_key: SecretStr = SecretStr("")
     palimpsest_hub_build_timeout_seconds: int = Field(default=3600, ge=60, le=3600)
     palimpsest_hub_registry_hosts: tuple[str, ...] = DEFAULT_REGISTRY_HOSTS
+    palimpsest_hub_image_source_policy: dict = Field(default_factory=lambda: dict(EMPTY_IMAGE_SOURCE_POLICY))
     palimpsest_hub_image_run_network: Literal["none", "default"] = "none"
     palimpsest_hub_image_cgroup_root: str = "/sys/fs/cgroup"
     palimpsest_hub_max_context_bytes: int = Field(default=16 * 1024**2, ge=1, le=1024**3)
@@ -247,6 +264,21 @@ class Settings(DatabaseSettings):
     # `download_image` policy requires `member` even for project-owned images.
     palimpsest_hub_export_delegated_roles: tuple[str, ...] = ("member",)
     palimpsest_hub_export_delegation_ttl_seconds: int = Field(default=21600, ge=900, le=86400)
+    # Anonymous public-image reads are counted per client address as resolved by
+    # uvicorn (request.client.host): the TCP peer, or the X-Forwarded-For value
+    # only when uvicorn runs with --proxy-headers and the peer is listed in its
+    # forwarded-allow-ips (FORWARDED_ALLOW_IPS, default 127.0.0.1). Behind a
+    # proxy that is not in that list, every anonymous caller shares the proxy's
+    # bucket. The Hub itself never parses forwarding headers. IPv4-mapped IPv6
+    # addresses count as IPv4 and other IPv6 addresses are grouped per /64.
+    # Counters are per process and bounded to max_clients entries, so the
+    # effective limit is multiplied by the number of API processes and nodes.
+    palimpsest_hub_anonymous_rate_limit_enabled: bool = True
+    palimpsest_hub_anonymous_rate_limit_requests: int = Field(default=120, ge=1, le=100000)
+    palimpsest_hub_anonymous_rate_limit_window_seconds: int = Field(default=60, ge=1, le=3600)
+    palimpsest_hub_anonymous_rate_limit_max_clients: int = Field(default=10000, ge=16, le=1000000)
+    # Unrevoked, unexpired `ppi_v1_` image keys one user may hold across projects.
+    palimpsest_hub_image_key_max_active_per_user: int = Field(default=50, ge=1, le=10000)
 
     os_auth_url: str
     # Export Trust trustee. It authenticates only to its own service project; it is
@@ -295,6 +327,11 @@ class Settings(DatabaseSettings):
     @classmethod
     def registry_hosts(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         return validate_registry_hosts(value)
+
+    @model_validator(mode="after")
+    def image_source_policy(self):
+        self.palimpsest_hub_image_source_policy = configured_image_source_policy(self).to_dict()
+        return self
 
     @field_validator("palimpsest_hub_instance_base_images")
     @classmethod
@@ -512,6 +549,7 @@ class BuildWorkerSettings(BaseSettings):
     palimpsest_hub_build_timeout_seconds: int = Field(default=3600, ge=60, le=3600)
     palimpsest_hub_max_blob_bytes: int = Field(default=107374182400, ge=1)
     palimpsest_hub_registry_hosts: tuple[str, ...] = DEFAULT_REGISTRY_HOSTS
+    palimpsest_hub_image_source_policy: dict = Field(default_factory=lambda: dict(EMPTY_IMAGE_SOURCE_POLICY))
     palimpsest_hub_image_run_network: Literal["none", "default"] = "none"
     palimpsest_hub_image_cgroup_root: str = "/sys/fs/cgroup"
     palimpsest_hub_image_scratch_bytes: int = Field(default=4 * 1024**3, ge=256 * 1024**2, le=64 * 1024**3)
@@ -523,6 +561,11 @@ class BuildWorkerSettings(BaseSettings):
     @classmethod
     def registry_hosts(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         return validate_registry_hosts(value)
+
+    @model_validator(mode="after")
+    def image_source_policy(self):
+        self.palimpsest_hub_image_source_policy = configured_image_source_policy(self).to_dict()
+        return self
 
     @field_validator("palimpsest_hub_image_cgroup_root")
     @classmethod

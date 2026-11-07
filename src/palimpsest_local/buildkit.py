@@ -27,22 +27,30 @@ import stat
 import subprocess
 import sys
 import tarfile
+import tempfile
 import time
 import uuid
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import ExitStack, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
 
 from . import state
 from .digest import digest_file, require_digest, require_file_digest
 from .errors import ArtifactValidationError, BuildError, DigestMismatchError, HubError
+from .image_source_policy import ImageSourcePolicy, load_image_source_policy
 from .oci_image import verify_blob_chunks
 from .oci_layout import MEDIA_TYPE_LAYER_CONFIG, MEDIA_TYPE_LAYER_SQUASHFS, ContentStore
 from .package_reference import read_package_reference
 from .package_source import snapshot_package
-from .registry import RegistryError, credential_free_subprocess_environment, validate_cache_spec
+from .registry import (
+    RegistryError,
+    credential_free_subprocess_environment,
+    default_registry_config,
+    resolve_image_reference,
+    validate_cache_spec,
+)
 from .state import TagRecord, validate_tag, write_tag_record
 
 if TYPE_CHECKING:
@@ -66,6 +74,7 @@ _ENCODED_SOURCE_RE = re.compile(r"\\(?:u[0-9a-f]{4}|x[0-9a-f]{2})", re.IGNORECAS
 _PINNED_REMOTE_REF_RE = re.compile(r"@sha256:[0-9a-f]{64}$", re.I)
 _ADD_CHECKSUM_OPTION_RE = re.compile(r"^--checksum=sha256:[0-9a-f]{64}$", re.I)
 _PARSER_DIRECTIVE_RE = re.compile(r"^#\s*(syntax|escape)\s*=\s*(.*?)\s*$", re.I)
+_FRONTEND_DIRECTIVE_RE = re.compile(r"^(?:#|//)\s*syntax\s*=\s*(.*?)\s*$", re.I)
 _CACHE_GENERATION_RE = re.compile(r"^bk-[0-9a-f]{12}$")
 _BUILDX_DRIVER_RE = re.compile(r"^Driver:\s*(\S+)\s*$", re.MULTILINE)
 _BUILDX_NAME_RE = re.compile(r"^Name:\s*(\S+)\s*$", re.MULTILINE)
@@ -76,6 +85,7 @@ _MAX_CACHE_MEMBERS = 250_000
 _MAX_CACHE_BYTES = 32 * 1024 * 1024 * 1024
 _MAX_OCI_DESCRIPTORS = 100_000
 _MAX_RUNTIME_MANIFEST_BYTES = 64 * 1024
+_MAX_DOCKERIGNORE_BYTES = 1024 * 1024
 _READ_CHUNK = 1024 * 1024
 
 
@@ -467,8 +477,76 @@ def _canonical_json(value: Any) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 
+def _read_dockerignore(path: Path) -> bytes | None:
+    """Read one bounded regular ignore file without following a symlink."""
+    try:
+        before = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ArtifactValidationError(f"cannot inspect Docker ignore input: {path}") from exc
+    if not stat.S_ISREG(before.st_mode) or before.st_size > _MAX_DOCKERIGNORE_BYTES:
+        raise ArtifactValidationError(f"Docker ignore input must be a regular file of at most 1 MiB: {path}")
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        with os.fdopen(descriptor, "rb") as handle:
+            opened = os.fstat(handle.fileno())
+            if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                raise ArtifactValidationError(f"Docker ignore input changed while opening: {path}")
+            payload = handle.read(_MAX_DOCKERIGNORE_BYTES + 1)
+            after = os.fstat(handle.fileno())
+
+        def identity(info: os.stat_result) -> tuple[int, int, int, int, int]:
+            return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+
+        if len(payload) > _MAX_DOCKERIGNORE_BYTES or identity(before) != identity(after):
+            raise ArtifactValidationError(f"Docker ignore input changed or exceeded 1 MiB: {path}")
+        payload.decode("utf-8")
+        if b"\0" in payload:
+            raise ArtifactValidationError(f"Docker ignore input contains NUL: {path}")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ArtifactValidationError(f"cannot read UTF-8 Docker ignore input: {path}") from exc
+    return payload
+
+
+def _effective_dockerignore(spec: BuildKitSpec) -> tuple[bytes | None, bool]:
+    baseline = _read_dockerignore(spec.dockerfile.with_name(spec.dockerfile.name + ".dockerignore"))
+    if baseline is None:
+        baseline = _read_dockerignore(spec.context / ".dockerignore")
+    overlay = _read_dockerignore(spec.context / ".plmignore")
+    if overlay is None:
+        return baseline, False
+    # BuildKit alone interprets patterns. A separator prevents an unterminated
+    # baseline comment/pattern from swallowing the first appended pattern.
+    return (baseline or b"") + b"\n" + overlay.removeprefix(b"\xef\xbb\xbf"), True
+
+
+@contextmanager
+def _local_dockerfile_definition(spec: BuildKitSpec) -> Iterator[tuple[Path, bytes | None]]:
+    effective_ignore, has_overlay = _effective_dockerignore(spec)
+    if not has_overlay:
+        yield spec.dockerfile, effective_ignore
+        return
+    temporary_root = Path(tempfile.gettempdir()).resolve()
+    if temporary_root == spec.context or spec.context in temporary_root.parents:
+        raise ArtifactValidationError("Dockerfile definition temporary directory must be outside the build context")
+    with tempfile.TemporaryDirectory(prefix="palimpsest-dockerfile-", dir=temporary_root) as directory:
+        dockerfile = Path(directory) / spec.dockerfile.name
+        dockerfile.write_bytes(spec.dockerfile.read_bytes())
+        assert effective_ignore is not None
+        dockerfile.with_name(dockerfile.name + ".dockerignore").write_bytes(effective_ignore)
+        yield dockerfile, effective_ignore
+
+
 def compute_build_key(spec: BuildKitSpec, *, builder_fingerprint: str = "unresolved") -> str:
     """Compute the pre-build lookup key; raw build-arg values are never persisted."""
+    effective_ignore, _ = _effective_dockerignore(spec)
+    return _compute_build_identity(spec, builder_fingerprint=builder_fingerprint, effective_ignore=effective_ignore)[0]
+
+
+def _compute_build_identity(
+    spec: BuildKitSpec, *, builder_fingerprint: str, effective_ignore: bytes | None
+) -> tuple[str, str, str]:
     context_digest = compute_context_digest(spec.context)
     dockerfile_digest = digest_file(spec.dockerfile)
     build_args_digest = f"sha256:{hashlib.sha256(_canonical_json(list(spec.build_args))).hexdigest()}"
@@ -489,22 +567,42 @@ def compute_build_key(spec: BuildKitSpec, *, builder_fingerprint: str = "unresol
         "builder_contract": "docker-buildx-local-cache-v1",
         "builder_fingerprint": builder_fingerprint,
     }
-    return f"sha256:{hashlib.sha256(_canonical_json(definition)).hexdigest()}"
+    if effective_ignore is not None:
+        definition["dockerignore_digest"] = f"sha256:{hashlib.sha256(effective_ignore).hexdigest()}"
+    key = f"sha256:{hashlib.sha256(_canonical_json(definition)).hexdigest()}"
+    return key, context_digest, dockerfile_digest
 
 
-def _logical_dockerfile_lines(path: Path) -> list[str]:
+def _logical_dockerfile_lines(path: Path, *, active_frontends_only: bool = False) -> list[str]:
     try:
-        # Docker's parser discards one UTF-8 BOM from the first line before it
-        # interprets parser directives; mirror that behavior for policy checks.
-        raw_lines = path.read_text(encoding="utf-8-sig").split("\n")
+        text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         raise ArtifactValidationError(f"cannot read Dockerfile as UTF-8: {path}") from exc
+    return _logical_dockerfile_text_lines(text, active_frontends_only=active_frontends_only)
+
+
+def _logical_dockerfile_text_lines(text: str, *, active_frontends_only: bool = False) -> list[str]:
+    # Docker discards one initial BOM before interpreting parser directives.
+    raw_lines = text.removeprefix("\ufeff").split("\n")
     logical: list[str] = []
     current: str | None = None
-    for raw in raw_lines:
+    frontend_header = True
+    for index, raw in enumerate(raw_lines):
         if raw.endswith("\r"):
             raw = raw[:-1]
         stripped = raw.strip(" \t")
+        if active_frontends_only:
+            if index == 0 and raw.startswith("#!"):
+                continue
+            frontend = _FRONTEND_DIRECTIVE_RE.fullmatch(stripped)
+            if frontend:
+                # Frontend detection stops at the first non-directive line,
+                # including a blank or ordinary comment. Only admit headers
+                # proven active; uncertain forms remain BuildKit's decision.
+                if not frontend_header or _FRONTEND_DIRECTIVE_RE.fullmatch(raw) is None:
+                    continue
+            elif _PARSER_DIRECTIVE_RE.fullmatch(raw) is None:
+                frontend_header = False
         if not stripped or stripped.startswith("#"):
             if current is None and _PARSER_DIRECTIVE_RE.fullmatch(stripped):
                 logical.append(stripped)
@@ -638,25 +736,68 @@ def validate_offline_dockerfile(spec: BuildKitSpec) -> None:
         raise ArtifactValidationError("Dockerfile must contain at least one FROM instruction")
 
 
-def validate_online_dockerfile(spec: BuildKitSpec) -> None:
-    """Require immutable registry inputs before using a pre-build Hub cache key."""
-    if spec.offline:
-        return
+def validate_online_dockerfile(
+    spec: BuildKitSpec,
+    roots: state.StatePaths | None = None,
+    *,
+    require_pins: bool = True,
+    source_policy: ImageSourcePolicy | None = None,
+) -> ImageSourcePolicy:
+    """Admit literal upstream inputs before preflight or either cache path.
+
+    Native Hub cache keys additionally require digest-pinned inputs. Local
+    builds defer syntax this scanner cannot interpret to the mandatory BuildKit
+    metadata/solve policy. Identities use Docker defaults, not registry overrides.
+    """
+    if source_policy is None:
+        if roots is None:
+            raise ArtifactValidationError("Dockerfile admission requires configured roots or an explicit source policy")
+        policy = load_image_source_policy(roots)
+    else:
+        policy = source_policy
+    if not isinstance(policy, ImageSourcePolicy):
+        raise ArtifactValidationError("Dockerfile admission requires a validated source policy")
+    registry_config = default_registry_config()
     local_aliases = {item.alias.lower() for item in spec.local_images}
     stages: set[str] = set()
     stage_count = 0
-    for line in _logical_dockerfile_lines(spec.dockerfile):
-        directive = _PARSER_DIRECTIVE_RE.fullmatch(line)
+    lines = _logical_dockerfile_lines(spec.dockerfile, active_frontends_only=not require_pins)
+    local_stage_names: set[str] = set()
+    if not require_pins:
+        for ordinal, match in enumerate(filter(None, (_FROM_RE.fullmatch(line) for line in lines))):
+            local_stage_names.add(str(ordinal))
+            if match[2]:
+                local_stage_names.add(match[2].lower())
+    for line in lines:
+        # Alternate frontend formats can define their own input language. Do
+        # not interpret JSON as Dockerfile instructions, or relax native pins.
+        if line.startswith("{"):
+            if require_pins:
+                raise ArtifactValidationError(
+                    "native-cache Dockerfiles require a pinned # syntax= or // syntax= frontend, not JSON input"
+                )
+            return policy
+        if not require_pins and "<<" in line:
+            # Heredoc contents are data, even when they look like FROM/COPY.
+            return policy
+        directive = _PARSER_DIRECTIVE_RE.fullmatch(line) or re.fullmatch(
+            r"//\s*(syntax)\s*=\s*(.*?)\s*", line, re.IGNORECASE
+        )
         if directive:
             if directive.group(1).lower() == "escape":
+                if not require_pins:
+                    return policy
                 raise ArtifactValidationError("online Dockerfiles cannot change the parser escape directive")
             frontend = directive.group(2)
-            if _PINNED_REMOTE_REF_RE.search(frontend) is None:
+            if require_pins and _PINNED_REMOTE_REF_RE.search(frontend) is None:
                 raise ArtifactValidationError(
                     "online Dockerfile # syntax= frontends must be pinned with @sha256:<64hex>"
                 )
+            policy.admit(resolve_image_reference(frontend, registry_config, environment={}))
             continue
         if _is_instruction(line, "FROM") and any(character in line for character in ("\\", "'", '"')):
+            if not require_pins:
+                return policy
             raise ArtifactValidationError("online FROM instructions cannot use quotes or backslash escapes")
         from_match = _FROM_RE.fullmatch(line)
         if from_match is not None:
@@ -664,14 +805,16 @@ def validate_online_dockerfile(spec: BuildKitSpec) -> None:
             lowered = source.lower()
             is_prior_stage = lowered in stages or (lowered.isdigit() and int(lowered) < stage_count)
             if "$" in source:
-                raise ArtifactValidationError(
-                    "online FROM values cannot be expanded from ARG variables; pin the image digest"
-                )
-            if lowered != "scratch" and lowered not in local_aliases and not is_prior_stage:
-                if _PINNED_REMOTE_REF_RE.search(source) is None:
+                if require_pins:
+                    raise ArtifactValidationError(
+                        "online FROM values cannot be expanded from ARG variables; pin the image digest"
+                    )
+            elif lowered != "scratch" and lowered not in local_aliases and not is_prior_stage:
+                if require_pins and _PINNED_REMOTE_REF_RE.search(source) is None:
                     raise ArtifactValidationError(
                         f"online Dockerfile FROM {source!r} must be pinned with @sha256:<64hex>"
                     )
+                policy.admit(resolve_image_reference(source, registry_config, environment={}))
             if stage_alias:
                 alias = stage_alias.lower()
                 if _ALIAS_RE.fullmatch(alias) is None:
@@ -680,8 +823,12 @@ def validate_online_dockerfile(spec: BuildKitSpec) -> None:
             stages.add(str(stage_count))
             stage_count += 1
             continue
+        if _is_instruction(line, "FROM"):
+            if not require_pins:
+                return policy
+            raise ArtifactValidationError("Dockerfile FROM must name one literal image or prior stage")
 
-        if _is_instruction(line, "ADD"):
+        if require_pins and _is_instruction(line, "ADD"):
             if "$" in line or _ENCODED_SOURCE_RE.search(line):
                 raise ArtifactValidationError("online ADD sources cannot be expanded or escape-encoded")
             if _SCP_GIT_RE.search(line) or _REMOTE_GIT_RE.search(line):
@@ -689,19 +836,33 @@ def validate_online_dockerfile(spec: BuildKitSpec) -> None:
             if re.search(r"(?i)https?://", line) and not _add_has_pinned_checksum_option(line):
                 raise ArtifactValidationError("online HTTP ADD must declare --checksum=sha256:<64hex>")
 
-        for source in _copy_from_sources(line):
+        try:
+            copy_sources = _copy_from_sources(line)
+        except ArtifactValidationError:
+            if require_pins:
+                raise
+            copy_sources = ()
+        for source in copy_sources:
+            if not require_pins and "$" in source:
+                continue
             lowered = source.lower()
-            is_local = lowered in local_aliases or lowered in stages
-            if "$" in source or (not is_local and _PINNED_REMOTE_REF_RE.search(source) is None):
+            is_local = lowered in local_aliases or lowered in stages or lowered in local_stage_names
+            if "$" in source or (require_pins and not is_local and _PINNED_REMOTE_REF_RE.search(source) is None):
                 raise ArtifactValidationError(
                     f"online COPY/ADD --from={source} must name a local stage/context or digest-pinned image"
                 )
+            if not is_local:
+                policy.admit(resolve_image_reference(source, registry_config, environment={}))
 
         if _is_instruction(line, "RUN"):
+            try:
+                run_options = _instruction_leading_options(line, "RUN")
+            except ArtifactValidationError:
+                if require_pins:
+                    raise
+                continue
             for mount_value in (
-                option.split("=", 1)[1]
-                for option in _instruction_leading_options(line, "RUN")
-                if option.lower().startswith("--mount=")
+                option.split("=", 1)[1] for option in run_options if option.lower().startswith("--mount=")
             ):
                 fields = {
                     key.strip().lower(): value.strip().strip("\"'")
@@ -712,14 +873,19 @@ def validate_online_dockerfile(spec: BuildKitSpec) -> None:
                 source = fields.get("from")
                 if source is None:
                     continue
+                if not require_pins and "$" in source:
+                    continue
                 lowered = source.lower()
-                is_local = lowered in local_aliases or lowered in stages
-                if "$" in source or (not is_local and _PINNED_REMOTE_REF_RE.search(source) is None):
+                is_local = lowered in local_aliases or lowered in stages or lowered in local_stage_names
+                if "$" in source or (require_pins and not is_local and _PINNED_REMOTE_REF_RE.search(source) is None):
                     raise ArtifactValidationError(
                         f"online RUN --mount from={source!r} must name a local stage/context or digest-pinned image"
                     )
-    if stage_count == 0:
+                if not is_local:
+                    policy.admit(resolve_image_reference(source, registry_config, environment={}))
+    if require_pins and stage_count == 0:
         raise ArtifactValidationError("Dockerfile must contain at least one FROM instruction")
+    return policy
 
 
 def preflight_buildx_oci_exporter(
@@ -867,12 +1033,26 @@ def preflight_buildx_oci_exporter(
                     f"offline BuildKit container {container_id} has active Docker network attachments: {names}"
                 )
     if environment_out is not None:
-        buildkit_versions = sorted(set(_BUILDKIT_VERSION_RE.findall(output)))
-        if not buildkit_versions:
+        nodes_marker = re.search(r"(?m)^Nodes:\s*$", output)
+        nodes_output = output[nodes_marker.end() :] if nodes_marker is not None else ""
+        node_names = list(_BUILDX_NAME_RE.finditer(nodes_output))
+        node_versions: list[str] = []
+        for index, node in enumerate(node_names):
+            end = node_names[index + 1].start() if index + 1 < len(node_names) else len(nodes_output)
+            node_output = nodes_output[node.end() : end]
+            versions = _BUILDKIT_VERSION_RE.findall(node_output)
+            statuses = re.findall(r"(?m)^Status:\s*(\S+)\s*$", node_output)
+            if len(versions) != 1 or (statuses and statuses != ["running"]):
+                raise BuildError(
+                    "image source policy transport requires one running BuildKit version per selected builder node; "
+                    f"node {node.group(1)!r} has missing, ambiguous, or inactive version metadata"
+                )
+            node_versions.extend(versions)
+        if not node_versions:
             raise BuildError(
-                "docker buildx inspect did not report a running BuildKit version; bootstrap the selected builder "
-                "before using content-addressed Hub cache keys"
+                "image source policy transport requires a Nodes section with a running BuildKit version for every node"
             )
+        buildkit_versions = sorted(set(node_versions))
         version_result = _run_checked(
             runner,
             ["docker", "buildx", "version"],
@@ -896,6 +1076,26 @@ def preflight_buildx_oci_exporter(
             }
         )
     return driver
+
+
+def _require_source_policy_transport(environment: dict[str, str]) -> None:
+    """Fail closed when the selected client/daemon can silently ignore policies.
+
+    Buildx 0.11 introduced EXPERIMENTAL_BUILDKIT_SOURCE_POLICY; BuildKit
+    0.12 also enforces it before frontend/image metadata fetches, not just Solve.
+    No builder or daemon is reconfigured.
+    """
+    buildx = re.search(r"(?:^|\s)v?(\d+)\.(\d+)\.(\d+)(?:-desktop\.\d+)?(?=\s|$)", environment["buildx_version"])
+    versions = [re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", value) for value in environment["buildkit_versions"].split(",")]
+    if (
+        buildx is None
+        or tuple(map(int, buildx.groups())) < (0, 11, 0)
+        or any(version is None or tuple(map(int, version.groups())) < (0, 12, 0) for version in versions)
+    ):
+        raise BuildError(
+            "image source policy transport requires stable Docker Buildx >= 0.11.0 and BuildKit >= 0.12.0 "
+            "for pre-fetch metadata enforcement; the selected builder's policy support is not established"
+        )
 
 
 def build_buildx_command(
@@ -1441,14 +1641,25 @@ def build_runtime_pack_command(rootfs_tar: Path, output: Path, *, block_size: in
     ]
 
 
-def _run_checked(runner: Callable[..., Any], command: list[str], *, operation: str) -> Any:
+def _run_checked(
+    runner: Callable[..., Any],
+    command: list[str],
+    *,
+    operation: str,
+    source_policy: Path | None = None,
+) -> Any:
+    environment = credential_free_subprocess_environment()
+    # Never allow an ambient policy to replace the administrator's snapshot.
+    environment.pop("EXPERIMENTAL_BUILDKIT_SOURCE_POLICY", None)
+    if source_policy is not None:
+        environment["EXPERIMENTAL_BUILDKIT_SOURCE_POLICY"] = str(source_policy)
     try:
         result = runner(
             command,
             capture_output=True,
             text=True,
             check=False,
-            env=credential_free_subprocess_environment(),
+            env=environment,
         )
     except FileNotFoundError as exc:
         raise BuildError(f"{operation} executable not found: {command[0]}") from exc
@@ -1926,10 +2137,12 @@ def build_with_buildkit(
     """Build, cache, optionally pack, and optionally upload one Dockerfile."""
     project_id: str | None = None
     native_cache = not spec.offline and spec.cache_mode == "native"
+    source_policy: ImageSourcePolicy | None = None
     if spec.offline:
         validate_offline_dockerfile(spec)
-    elif native_cache:
-        validate_online_dockerfile(spec)
+    else:
+        source_policy = validate_online_dockerfile(spec, roots, require_pins=native_cache)
+    if native_cache:
         if hub_client is None or not cache_package:
             raise BuildError(
                 "native-cache BuildKit builds require an explicit native cache client and cache_package; "
@@ -1939,7 +2152,7 @@ def build_with_buildkit(
         project_id = actor.get("project_id") if isinstance(actor, dict) else None
         if not isinstance(project_id, str) or not project_id:
             raise HubError("native cache authorization returned an invalid project_id")
-    elif hub_client is not None or cache_package is not None:
+    elif not spec.offline and (hub_client is not None or cache_package is not None):
         raise BuildError("local-cache builds do not accept native cache clients or package scopes")
     if spec.push and runtime_hub_client is None:
         raise BuildError("runtime upload requires a separate original-token runtime Hub client")
@@ -1953,12 +2166,18 @@ def build_with_buildkit(
         environment_out=builder_environment,
         runner=runner,
     )
+    if source_policy is not None:
+        _require_source_policy_transport(builder_environment)
     timings: dict[str, int] = {
         "buildx_driver_preflight": round((time.monotonic() - phase) * 1000),
     }
     build_id = f"bk-{uuid.uuid4().hex[:12]}"
     build_dir = roots.builds / build_id
     build_dir.mkdir(parents=True, exist_ok=False, mode=0o700)
+    policy_file: Path | None = None
+    if source_policy is not None:
+        policy_file = build_dir / "image-source-policy.json"
+        state.atomic_write_json(policy_file, source_policy.buildkit_policy())
     spec.output.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     if spec.rootfs_output is not None:
         if spec.rootfs_output.exists():
@@ -1995,9 +2214,11 @@ def build_with_buildkit(
         scope_root = partition_root / "scope"
         scope_lock = roots.locks / f"build-cache-{partition}.lock"
         cache_blob_root = partition_root / "blobs"
-    with state.file_lock(scope_lock):
+    with state.file_lock(scope_lock), _local_dockerfile_definition(spec) as (dockerfile, effective_ignore):
         phase = time.monotonic()
-        build_key = compute_build_key(spec, builder_fingerprint=builder_environment["fingerprint"])
+        build_key, context_digest, dockerfile_digest = _compute_build_identity(
+            spec, builder_fingerprint=builder_environment["fingerprint"], effective_ignore=effective_ignore
+        )
         timings["context_scan"] = round((time.monotonic() - phase) * 1000)
 
         cache_from: Path | None = None
@@ -2023,7 +2244,7 @@ def build_with_buildkit(
         cache_export = build_dir / "cache-export"
         metadata_file = build_dir / "buildkit-metadata.json"
         command = build_buildx_command(
-            spec,
+            replace(spec, dockerfile=dockerfile) if dockerfile != spec.dockerfile else spec,
             cache_from=cache_from,
             cache_to=cache_export,
             metadata_file=metadata_file,
@@ -2031,7 +2252,7 @@ def build_with_buildkit(
         )
 
         phase = time.monotonic()
-        result = _run_checked(runner, command, operation="docker buildx build")
+        result = _run_checked(runner, command, operation="docker buildx build", source_policy=policy_file)
         timings["buildkit_solve_export"] = round((time.monotonic() - phase) * 1000)
         (build_dir / "buildkit.log").write_text(
             f"{getattr(result, 'stdout', '')}\n{getattr(result, 'stderr', '')}", encoding="utf-8"
@@ -2040,7 +2261,8 @@ def build_with_buildkit(
             raise BuildError(f"BuildKit OCI exporter did not create {spec.output}")
         if spec.runtime_rootfs_archive is not None and not spec.runtime_rootfs_archive.is_file():
             raise BuildError(f"BuildKit tar exporter did not create {spec.runtime_rootfs_archive}")
-        if not (cache_export / "index.json").is_file():
+        cache_exported = (cache_export / "index.json").is_file()
+        if not cache_exported and (native_cache or not cache_export.is_dir() or any(cache_export.iterdir())):
             raise BuildError("BuildKit local cache exporter did not create index.json")
 
         metadata = _read_buildx_metadata(metadata_file)
@@ -2065,9 +2287,11 @@ def build_with_buildkit(
         }
         if native_cache:
             cache_descriptor.update(project_id=project_id, namespace=hub_client.namespace, package=cache_package)
-        _create_cache_archive(cache_export, cache_archive, cache_descriptor)
-        cache_archive_digest = digest_file(cache_archive)
-        timings["cache_archive"] = round((time.monotonic() - phase) * 1000)
+        cache_archive_digest: str | None = None
+        if cache_exported:
+            _create_cache_archive(cache_export, cache_archive, cache_descriptor)
+            cache_archive_digest = digest_file(cache_archive)
+            timings["cache_archive"] = round((time.monotonic() - phase) * 1000)
 
         if native_cache and spec.push_cache:
             phase = time.monotonic()
@@ -2094,7 +2318,8 @@ def build_with_buildkit(
                     raise HubError(f"Hub cache upload receipt has mismatched {field}")
             timings["hub_cache_upload"] = round((time.monotonic() - phase) * 1000)
 
-        _promote_scope_cache(cache_export, scope_root, build_id)
+        if cache_exported:
+            _promote_scope_cache(cache_export, scope_root, build_id)
 
     runtime_digest: str | None = None
     runtime_size: int | None = None
@@ -2235,10 +2460,15 @@ def build_with_buildkit(
         "builder_fingerprint": builder_environment["fingerprint"],
         "build_id": build_id,
         "build_key": build_key,
+        # Capture the pre-build lookup observations, not a post-build rescan or
+        # a claim that a mutable host context was atomically attested by BuildKit.
+        "context_digest": context_digest,
+        "dockerfile_digest": dockerfile_digest,
         "status": "success",
         "mode": "offline" if spec.offline else "online",
         "cache_mode": "local" if spec.offline else spec.cache_mode,
         "cache_source": cache_source,
+        "cache_exported": cache_exported,
         "cache_archive_digest": cache_archive_digest,
         "cache_scope": spec.cache_scope,
         "cache_project_id": project_id,
@@ -2252,6 +2482,7 @@ def build_with_buildkit(
         "external_cache_to": [_cache_spec_receipt(value) for value in spec.external_cache_to],
         "registry_profile": spec.registry_profile,
         "registry_config_digest": spec.registry_config_digest,
+        "image_source_policy_digest": source_policy.digest if source_policy is not None else None,
         "output_path": str(spec.output),
         "output_oci_archive_digest": oci_archive_digest,
         "output_oci_manifest_digest": oci_manifest_digest,
@@ -2277,7 +2508,7 @@ def build_with_buildkit(
         "timings_ms": timings,
         "bytes": {
             "oci_archive": spec.output.stat().st_size,
-            "cache_archive": cache_archive.stat().st_size,
+            "cache_archive": cache_archive.stat().st_size if cache_exported else 0,
             "runtime_block": runtime_size or 0,
         },
         "started_at": started_at,

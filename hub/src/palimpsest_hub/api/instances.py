@@ -14,11 +14,12 @@ from sqlalchemy import or_, select
 
 from palimpsest_hub.api.hub import (
     _factory_or_503,
+    _instance_controller,
     _legacy_inventory,
     _legacy_writer,
     _store_or_503,
 )
-from palimpsest_hub.auth import get_os_conn, package_target_project_id
+from palimpsest_hub.auth import get_os_conn, get_package_manager_info, package_target_project_id
 from palimpsest_hub.config import get_settings
 from palimpsest_hub.instance_models import PalimpsestHubInstance
 from palimpsest_hub.models import exact_identity
@@ -160,7 +161,10 @@ class InstanceAdvanceRequest(BaseModel):
 
 @router.post("/instances/{instance_id}/advance", status_code=202, operation_id="advance_hub_instance")
 async def advance_instance(
-    instance_id: UUID, req: InstanceAdvanceRequest, actor: dict = Depends(_legacy_writer), conn=Depends(get_os_conn)
+    instance_id: UUID,
+    req: InstanceAdvanceRequest,
+    actor: dict = Depends(get_package_manager_info),
+    conn=Depends(get_os_conn),
 ):
     return await service.advance(
         _factory_or_503(), actor, conn, str(instance_id), req.model_dump(mode="json"), get_settings()
@@ -168,12 +172,12 @@ async def advance_instance(
 
 
 @router.post("/instances/{instance_id}/stop", status_code=202, operation_id="stop_hub_instance")
-async def stop_instance(instance_id: UUID, actor: dict = Depends(_legacy_writer), conn=Depends(get_os_conn)):
+async def stop_instance(instance_id: UUID, actor: dict = Depends(_instance_controller), conn=Depends(get_os_conn)):
     return await service.action(_factory_or_503(), actor, conn, str(instance_id), "stop")
 
 
 @router.delete("/instances/{instance_id}", status_code=202, operation_id="delete_hub_instance")
-async def delete_instance(instance_id: UUID, actor: dict = Depends(_legacy_writer), conn=Depends(get_os_conn)):
+async def delete_instance(instance_id: UUID, actor: dict = Depends(_instance_controller), conn=Depends(get_os_conn)):
     return await service.action(_factory_or_503(), actor, conn, str(instance_id), "delete")
 
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -18,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .errors import ArtifactValidationError, PalimpsestError
+from .image_source_policy import ImageSourcePolicy, load_image_source_policy
 from .oci_image import (
     ACQUISITION_PLATFORMS,
     MAX_IMAGE_JSON_BYTES,
@@ -43,7 +45,15 @@ from .registry import (
     run_docker_command,
 )
 from .state import StatePaths
-from .web_job_client import defer_web_cancellation
+from .web_job_client import (
+    PreparationToolHold,
+    defer_preparation_termination,
+    defer_web_cancellation,
+    preparation_custody_held,
+    require_preparation_custody_owner,
+    retain_preparation_custody,
+    run_preparation_tool,
+)
 
 SUPPORTED_PLATFORM = "linux/amd64"
 DEFAULT_TIMEOUT_SECONDS = 300.0
@@ -76,6 +86,33 @@ class RegistryTLSError(RegistryIntakeError):
 
 class RegistryNetworkError(RegistryIntakeError):
     """Network connection or DNS resolution to the registry failed."""
+
+
+@dataclass(frozen=True, slots=True)
+class AcquisitionDeadline:
+    """One fixed native source-phase deadline, never refreshed by helper entry."""
+
+    monotonic: float
+    expires_unix: int | None = None
+
+    def __post_init__(self):
+        if type(self.monotonic) not in (int, float) or not math.isfinite(self.monotonic):
+            raise RegistryIntakeError("source acquisition deadline is invalid")
+        if self.expires_unix is not None and (type(self.expires_unix) is not int or self.expires_unix <= 0):
+            raise RegistryIntakeError("source acquisition fixed expiry is invalid")
+
+    def checkpoint(self, _event=None):
+        if time.monotonic() >= self.monotonic or (self.expires_unix is not None and time.time() >= self.expires_unix):
+            raise RegistryIntakeError("source acquisition fixed deadline expired")
+
+    def remaining(self, maximum):
+        self.checkpoint()
+        remaining = min(float(maximum), self.monotonic - time.monotonic())
+        if self.expires_unix is not None:
+            remaining = min(remaining, self.expires_unix - time.time())
+        if remaining <= 0:
+            raise RegistryIntakeError("source acquisition fixed deadline expired")
+        return remaining
 
 
 @dataclass(frozen=True, slots=True)
@@ -370,7 +407,13 @@ def _run_bounded_copy(
     stdin=subprocess.DEVNULL,
     stdout=subprocess.DEVNULL,
     incremental_bytes: Callable[[], int] | None = None,
+    no_force: bool = False,
+    acquisition_deadline: AcquisitionDeadline | None = None,
 ) -> None:
+    if type(no_force) is not bool:
+        raise RegistryIntakeError("registry no-force policy must be boolean")
+    if acquisition_deadline is not None:
+        timeout_seconds = acquisition_deadline.remaining(timeout_seconds)
     if not 0 < timeout_seconds <= 3600:
         raise RegistryIntakeError("registry pull timeout must be between 0 and 3600 seconds")
     if type(maximum_bytes) is not int or not 1 <= maximum_bytes <= MAX_ARCHIVE_BYTES:
@@ -378,6 +421,42 @@ def _run_bounded_copy(
 
     def staged_bytes() -> int:
         return _staged_bytes(private_home) + (0 if incremental_bytes is None else incremental_bytes())
+
+    if no_force:
+        require_preparation_custody_owner()
+        stderr_file = None
+        try:
+            with defer_web_cancellation(), defer_preparation_termination():
+                stderr_file = open(private_home / "stderr.log", "w+b")
+
+            def check_bytes():
+                if acquisition_deadline is not None:
+                    acquisition_deadline.checkpoint()
+                if staged_bytes() > maximum_bytes:
+                    raise RegistryIntakeError("registry response exceeds the OCI archive size limit")
+
+            result = run_preparation_tool(
+                argv,
+                stdin=stdin,
+                stdout=stdout,
+                stderr=stderr_file,
+                env=_isolated_environment(private_home) if environment is None else environment,
+                close_fds=True,
+                timeout=timeout_seconds,
+                no_force=True,
+                checkpoint=check_bytes,
+            )
+            if result.returncode:
+                stderr_file.seek(0)
+                captured = stderr_file.read(16384).decode("utf-8", errors="replace")
+                raise _classify_skopeo_error(captured, result.returncode)
+            return
+        finally:
+            with defer_web_cancellation(), defer_preparation_termination():
+                if preparation_custody_held():
+                    retain_preparation_custody(stderr_file, private_home, archive, stdin, stdout)
+                elif stderr_file is not None:
+                    stderr_file.close()
 
     stderr_path = private_home / "stderr.log"
     stderr_file = None
@@ -433,12 +512,24 @@ def _stage_and_publish_oci_archive(
     platform: str = SUPPORTED_PLATFORM,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     maximum_bytes: int = MAX_ARCHIVE_BYTES,
+    no_force: bool = False,
+    acquisition_deadline: AcquisitionDeadline | None = None,
 ) -> RegistryPullReceipt:
+    if no_force:
+        require_preparation_custody_owner()
+    if no_force and preparation_custody_held():
+        raise PreparationToolHold("previous acquisition retains custody; no next request permitted")
     target, parent_before = _safe_output_parent(output)
-    deadline = time.monotonic() + timeout_seconds
+    deadline = (
+        min(time.monotonic() + timeout_seconds, acquisition_deadline.monotonic)
+        if acquisition_deadline is not None
+        else time.monotonic() + timeout_seconds
+    )
     parent_fd = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
     staging: Path | None = None
     try:
+        if acquisition_deadline is not None:
+            acquisition_deadline.checkpoint()
         held_parent = os.fstat(parent_fd)
         if (held_parent.st_dev, held_parent.st_ino) != (parent_before.st_dev, parent_before.st_ino):
             raise RegistryIntakeError("OCI archive output parent changed before registry pull")
@@ -454,7 +545,14 @@ def _stage_and_publish_oci_archive(
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise RegistryIntakeError("registry pull timed out before archive verification")
-        snapshot = LocalArchiveSource(archive).snapshot_acquisition(
+        source = (
+            LocalArchiveSource(archive, _checkpoint=acquisition_deadline.checkpoint)
+            if acquisition_deadline is not None
+            else LocalArchiveSource(archive)
+        )
+        if acquisition_deadline is not None:
+            remaining = acquisition_deadline.remaining(remaining)
+        snapshot = source.snapshot_acquisition(
             image_ref,
             source_cas,
             platform=platform,
@@ -464,6 +562,8 @@ def _stage_and_publish_oci_archive(
         parent_after = target.parent.stat(follow_symlinks=False)
         if (parent_after.st_dev, parent_after.st_ino) != (parent_before.st_dev, parent_before.st_ino):
             raise RegistryIntakeError("OCI archive output parent changed during registry pull")
+        if acquisition_deadline is not None:
+            acquisition_deadline.checkpoint()
         staging_fd = os.open(staging.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
         try:
             os.link(archive.name, target.name, src_dir_fd=staging_fd, dst_dir_fd=parent_fd, follow_symlinks=False)
@@ -492,9 +592,31 @@ def _stage_and_publish_oci_archive(
     except OSError:
         raise RegistryIntakeError("registry pull filesystem boundary failed") from None
     finally:
-        if staging is not None:
-            _remove_owned_tree(parent_fd, staging.name)
-        os.close(parent_fd)
+        with defer_web_cancellation(), defer_preparation_termination():
+            if no_force and preparation_custody_held():
+                retain_preparation_custody(parent_fd, staging)
+            else:
+                try:
+                    if staging is not None:
+                        _remove_owned_tree(parent_fd, staging.name)
+                    os.close(parent_fd)
+                except BaseException:
+                    if no_force:
+                        retain_preparation_custody(parent_fd, staging)
+                        raise PreparationToolHold("registry staging cleanup is unknown; custody retained") from None
+                    raise
+
+
+def _admit_upstream_source(roots: StatePaths, reference, source_policy: ImageSourcePolicy | None) -> None:
+    try:
+        policy = load_image_source_policy(roots) if source_policy is None else source_policy
+        if not isinstance(policy, ImageSourcePolicy):
+            raise RegistryIntakeError("upstream image acquisition requires a validated source policy")
+        policy.admit(reference)
+    except PalimpsestError as exc:
+        raise RegistryIntakeError(str(exc)) from None
+    except OSError:
+        raise RegistryIntakeError("image source policy unavailable") from None
 
 
 def pull_anonymous_oci_archive(
@@ -506,10 +628,12 @@ def pull_anonymous_oci_archive(
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     maximum_bytes: int = MAX_ARCHIVE_BYTES,
     skopeo: Path | None = None,
+    source_policy: ImageSourcePolicy | None = None,
 ) -> RegistryPullReceipt:
     """Acquire anonymously, verify through SourceCAS, then publish without overwrite."""
     _selected_architecture(platform)
     resolved = resolve_anonymous_reference(reference)
+    _admit_upstream_source(roots, resolved, source_policy)
     executable_text = shutil.which("skopeo") if skopeo is None else os.fspath(skopeo)
     if executable_text is None:
         raise RegistryIntakeError("skopeo is required for OCI registry pull")
@@ -650,6 +774,7 @@ def pull_anonymous_oci_layout(
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     maximum_bytes: int = MAX_ARCHIVE_BYTES,
     skopeo: Path | None = None,
+    source_policy: ImageSourcePolicy | None = None,
 ) -> RegistryPullReceipt:
     """Pull into a retained source CAS; the caller holds its whole-cache lock.
 
@@ -660,6 +785,7 @@ def pull_anonymous_oci_layout(
     if platform != SUPPORTED_PLATFORM:
         raise RegistryIntakeError(f"registry pull supports only {SUPPORTED_PLATFORM}")
     resolved = resolve_anonymous_reference(reference)
+    _admit_upstream_source(roots, resolved, source_policy)
     executable_text = shutil.which("skopeo") if skopeo is None else os.fspath(skopeo)
     if executable_text is None:
         raise RegistryIntakeError("skopeo is required for OCI registry pull")
@@ -893,7 +1019,15 @@ def pull_anonymous_oci_layout(
         raise RegistryIntakeError("registry layout filesystem boundary failed") from None
 
 
-def _stage_docker_auth(config_dir: Path, endpoint: str, staging: Path, *, timeout_seconds: float) -> Path | None:
+def _stage_docker_auth(
+    config_dir: Path,
+    endpoint: str,
+    staging: Path,
+    *,
+    timeout_seconds: float,
+    no_force: bool = False,
+    acquisition_deadline: AcquisitionDeadline | None = None,
+) -> Path | None:
     """Resolve only the Docker registry credential domain into private staging."""
     try:
         fd = os.open(config_dir / "config.json", os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK)
@@ -949,7 +1083,10 @@ def _stage_docker_auth(config_dir: Path, endpoint: str, staging: Path, *, timeou
         input_path.write_text(server + "\n", encoding="utf-8")
         output_path = private / "helper-output.json"
         try:
-            with input_path.open("rb") as helper_input, output_path.open("x+b") as helper_output:
+            helper_input = input_path.open("rb")
+            helper_output = None
+            try:
+                helper_output = output_path.open("x+b")
                 os.fchmod(helper_output.fileno(), 0o600)
                 _run_bounded_copy(
                     (executable, "get"),
@@ -960,7 +1097,17 @@ def _stage_docker_auth(config_dir: Path, endpoint: str, staging: Path, *, timeou
                     environment=environment,
                     stdin=helper_input,
                     stdout=helper_output,
+                    **({"no_force": True} if no_force else {}),
+                    **({"acquisition_deadline": acquisition_deadline} if acquisition_deadline is not None else {}),
                 )
+            finally:
+                with defer_web_cancellation(), defer_preparation_termination():
+                    if no_force and preparation_custody_held():
+                        retain_preparation_custody(helper_input, helper_output)
+                    else:
+                        helper_input.close()
+                        if helper_output is not None:
+                            helper_output.close()
         except RegistryIntakeError:
             # Docker helpers use this exact protocol error for an anonymous caller.
             for path in (output_path, private / "stderr.log"):
@@ -1080,19 +1227,14 @@ def pull_registry_oci_archive(
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     maximum_bytes: int = MAX_ARCHIVE_BYTES,
     skopeo: Path | None = None,
+    source_policy: ImageSourcePolicy | None = None,
+    no_force: bool = False,
+    acquisition_deadline: AcquisitionDeadline | None = None,
 ) -> RegistryPullReceipt:
     """Acquire an OCI image from a registry using configured profile and credentials."""
+    if type(no_force) is not bool:
+        raise RegistryIntakeError("registry no-force policy must be boolean")
     _selected_architecture(platform)
-    config_dir = docker_config_dir or resolve_docker_config_dir()
-    executable_text = shutil.which("skopeo") if skopeo is None else os.fspath(skopeo)
-    if executable_text is None:
-        raise RegistryIntakeError("skopeo is required for OCI registry pull")
-    try:
-        executable = Path(executable_text).expanduser().resolve(strict=True)
-    except OSError:
-        raise RegistryIntakeError("skopeo executable is unavailable") from None
-    if not executable.is_file():
-        raise RegistryIntakeError("skopeo executable is not a regular file")
 
     config = load_registry_config(roots)
     if profile is not None:
@@ -1103,11 +1245,31 @@ def pull_registry_oci_archive(
     selected_profile = config.registries.get(resolved.registry_alias)
     if selected_profile is not None and selected_profile.protocol != "oci":
         raise RegistryIntakeError("native profiles cannot be acquired through Docker /v2")
+    if selected_profile is not None and (selected_profile.plain_http or selected_profile.tls_skip_verify):
+        raise RegistryIntakeError("upstream image acquisition requires verified OCI HTTPS")
+    _admit_upstream_source(roots, resolved, source_policy)
+    config_dir = docker_config_dir or resolve_docker_config_dir()
+    executable_text = shutil.which("skopeo") if skopeo is None else os.fspath(skopeo)
+    if executable_text is None:
+        raise RegistryIntakeError("skopeo is required for OCI registry pull")
+    try:
+        executable = Path(executable_text).expanduser().resolve(strict=True)
+    except OSError:
+        raise RegistryIntakeError("skopeo executable is unavailable") from None
+    if not executable.is_file():
+        raise RegistryIntakeError("skopeo executable is not a regular file")
     image_ref = OCIImageRef(resolved.endpoint, resolved.repository, resolved.canonical)
 
     def _build(staging: Path, archive: Path) -> None:
         certificates = _stage_registry_ca(selected_profile, staging)
-        auth_config = _stage_docker_auth(config_dir, resolved.endpoint, staging, timeout_seconds=timeout_seconds)
+        auth_config = _stage_docker_auth(
+            config_dir,
+            resolved.endpoint,
+            staging,
+            timeout_seconds=timeout_seconds,
+            **({"no_force": True} if no_force else {}),
+            **({"acquisition_deadline": acquisition_deadline} if acquisition_deadline is not None else {}),
+        )
         argv = skopeo_pull_argv(
             executable,
             resolved.canonical,
@@ -1123,6 +1285,8 @@ def pull_registry_oci_archive(
             staging,
             timeout_seconds=timeout_seconds,
             maximum_bytes=maximum_bytes,
+            **({"no_force": True} if no_force else {}),
+            **({"acquisition_deadline": acquisition_deadline} if acquisition_deadline is not None else {}),
         )
 
     return _stage_and_publish_oci_archive(
@@ -1133,6 +1297,8 @@ def pull_registry_oci_archive(
         platform=platform,
         timeout_seconds=timeout_seconds,
         maximum_bytes=maximum_bytes,
+        **({"no_force": True} if no_force else {}),
+        **({"acquisition_deadline": acquisition_deadline} if acquisition_deadline is not None else {}),
     )
 
 
@@ -1146,9 +1312,36 @@ def export_docker_image_to_oci_archive(
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     maximum_bytes: int = MAX_ARCHIVE_BYTES,
     skopeo: Path | None = None,
+    source_policy: ImageSourcePolicy | None = None,
+    no_force: bool = False,
+    acquisition_deadline: AcquisitionDeadline | None = None,
 ) -> RegistryPullReceipt:
     """Export and verify the Docker image config against the requested platform."""
+    if type(no_force) is not bool:
+        raise RegistryIntakeError("registry no-force policy must be boolean")
     _selected_architecture(platform)
+    if re.fullmatch(r"sha256:[0-9a-f]{64}", reference):
+        raise RegistryIntakeError(
+            "bare Docker image IDs are local artifacts, not upstream image references; "
+            "select an explicit local OCI archive or a named Docker image"
+        )
+    # Docker's short-name identity is independent of the configured registry
+    # default. Re-resolve its canonical identity against operator profiles to
+    # enforce the same protocol/TLS and source policy as registry acquisition.
+    canonical = resolve_image_reference(
+        reference,
+        default_registry_config(),
+        registry_alias=None if _has_explicit_registry(reference) else "docker",
+        environment={},
+    ).canonical
+    config = load_registry_config(roots)
+    resolved = resolve_image_reference(canonical, config)
+    selected_profile = config.registries.get(resolved.registry_alias)
+    if selected_profile is not None and (
+        selected_profile.protocol != "oci" or selected_profile.plain_http or selected_profile.tls_skip_verify
+    ):
+        raise RegistryIntakeError("upstream image acquisition requires verified OCI HTTPS")
+    _admit_upstream_source(roots, resolved, source_policy)
     config_dir = docker_config_dir or resolve_docker_config_dir()
     executable_text = shutil.which("skopeo") if skopeo is None else os.fspath(skopeo)
     if executable_text is None:
@@ -1162,7 +1355,12 @@ def export_docker_image_to_oci_archive(
 
     inspect_argv = docker_image_inspect_argv(config_dir, [reference])
     try:
-        inspect_res = run_docker_command(inspect_argv, timeout_seconds=30, check=False)
+        inspect_res = run_docker_command(
+            inspect_argv,
+            timeout_seconds=acquisition_deadline.remaining(30) if acquisition_deadline is not None else 30,
+            check=False,
+            **({"no_force": True} if no_force else {}),
+        )
     except PalimpsestError:
         raise RegistryIntakeError("cannot inspect the configured local Docker daemon") from None
     if inspect_res.returncode != 0:
@@ -1171,9 +1369,7 @@ def export_docker_image_to_oci_archive(
             raise RegistryImageNotFoundError("image was not found in the configured local Docker daemon")
         raise RegistryIntakeError("local Docker image inspection failed; not an image miss")
 
-    resolved = resolve_image_reference(
-        reference, default_registry_config(), registry_alias=None if _has_explicit_registry(reference) else "docker"
-    )
+    # The admitted canonical identity also binds the retained export receipt.
     image_ref = OCIImageRef(resolved.endpoint, resolved.repository, resolved.canonical)
 
     def _build(staging: Path, archive: Path) -> None:
@@ -1186,6 +1382,8 @@ def export_docker_image_to_oci_archive(
             timeout_seconds=timeout_seconds,
             maximum_bytes=maximum_bytes,
             environment=credential_free_subprocess_environment(),
+            **({"no_force": True} if no_force else {}),
+            **({"acquisition_deadline": acquisition_deadline} if acquisition_deadline is not None else {}),
         )
         if not docker_tar.is_file():
             raise RegistryIntakeError("docker save did not produce an archive file")
@@ -1196,6 +1394,8 @@ def export_docker_image_to_oci_archive(
             staging,
             timeout_seconds=timeout_seconds,
             maximum_bytes=maximum_bytes,
+            **({"no_force": True} if no_force else {}),
+            **({"acquisition_deadline": acquisition_deadline} if acquisition_deadline is not None else {}),
         )
 
     return _stage_and_publish_oci_archive(
@@ -1206,11 +1406,14 @@ def export_docker_image_to_oci_archive(
         platform=platform,
         timeout_seconds=timeout_seconds,
         maximum_bytes=maximum_bytes,
+        **({"no_force": True} if no_force else {}),
+        **({"acquisition_deadline": acquisition_deadline} if acquisition_deadline is not None else {}),
     )
 
 
 __all__ = [
     "ACQUISITION_PLATFORMS",
+    "AcquisitionDeadline",
     "DEFAULT_TIMEOUT_SECONDS",
     "MAX_ARCHIVE_BYTES",
     "RegistryAuthenticationError",

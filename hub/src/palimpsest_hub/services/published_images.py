@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import stat
@@ -18,15 +19,22 @@ from sqlalchemy import LargeBinary, and_, cast, or_, select
 from palimpsest_hub.config import get_settings
 from palimpsest_hub.image_models import (
     PalimpsestHubImageMembership,
+    PalimpsestHubImageSourceBlob,
     PalimpsestHubLayerNode,
     PalimpsestHubPublicationPayload,
     PalimpsestHubPublishedImage,
 )
 from palimpsest_hub.models import PalimpsestHubLayer, exact_identity
+from palimpsest_hub.services import image_quota
 from palimpsest_hub.services.blob_references import retain_blob
 from palimpsest_hub.services.digest import compute_config_digest
 from palimpsest_hub.services.hub_store import MEDIA_TYPE_LAYER_SQUASHFS, HubStoreError, LocalPathBlobStore
 from palimpsest_hub.services.worker_leases import run_blocking
+
+# Physical payload rows keep the Hub's existing arch vocabulary (x86_64/aarch64).
+PLATFORM_ARCH = {"linux/amd64": "x86_64", "linux/arm64": "aarch64"}
+# One SQL mutex serializes every image publication, quota check and policy change.
+IMAGE_MUTEX = "build-api:image:single-flight"
 
 
 def normalized(value):
@@ -146,6 +154,228 @@ async def reusable_payload(session, digest, size, actor, visibility):
         ):
             return policies[digest]
     return None
+
+
+_DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
+SOURCE_ROLES = ("root", "manifest", "config", "layer")
+SOURCE_CLOSURE_LIMIT = 300
+_SOURCE_DOCUMENT_BYTES = 1024 * 1024
+_IMAGE_MANIFEST_TYPES = {
+    "application/vnd.oci.image.manifest.v1+json",
+    "application/vnd.docker.distribution.manifest.v2+json",
+}
+_INDEX_TYPES = {
+    "application/vnd.oci.image.index.v1+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+}
+
+
+def _is_squashfs(path):
+    with open(path, "rb") as stream:
+        return stream.read(4) == b"hsqs"
+
+
+def _incoherent(reason):
+    # Reasons describe only the caller's own declaration and own staged documents.
+    return HTTPException(status_code=422, detail="image source closure is incoherent: " + reason)
+
+
+def normalize_source_closure(items, manifest):
+    """Shape-check a declared OCI closure; ``None`` means a publication without source."""
+    if items is None:
+        return None
+    if manifest["mode"] != "oci-root":
+        raise _incoherent("only oci-root images carry an OCI source closure")
+    if not isinstance(items, list) or not 1 <= len(items) <= SOURCE_CLOSURE_LIMIT:
+        raise _incoherent(f"between 1 and {SOURCE_CLOSURE_LIMIT} items are required")
+    result, sizes = {}, {}
+    for item in items:
+        if not isinstance(item, dict) or set(item) != {"role", "digest", "size_bytes", "ordinal"}:
+            raise _incoherent("each item needs exactly role, digest, size_bytes and ordinal")
+        role, digest, size, ordinal = item["role"], item["digest"], item["size_bytes"], item["ordinal"]
+        if role not in SOURCE_ROLES or not isinstance(digest, str) or not _DIGEST.match(digest):
+            raise _incoherent("unknown role or invalid digest")
+        if type(size) is not int or not 1 <= size <= image_quota.MAX_BIGINT:
+            raise _incoherent("size_bytes must be a positive integer")
+        if type(ordinal) is not int or not 0 <= ordinal < SOURCE_CLOSURE_LIMIT:
+            raise _incoherent("ordinal must be a small non-negative integer")
+        if (role, ordinal) in result:
+            raise _incoherent("duplicate role and ordinal")
+        if sizes.setdefault(digest, size) != size:
+            raise _incoherent("one digest declared with two sizes")
+        result[(role, ordinal)] = {"role": role, "digest": digest, "size_bytes": size, "ordinal": ordinal}
+    counts = {role: sorted(ordinal for kind, ordinal in result if kind == role) for role in SOURCE_ROLES}
+    if counts["manifest"] != [0] or counts["config"] != [0] or counts["root"] not in ([], [0]):
+        raise _incoherent("exactly one manifest and config and at most one root, each at ordinal 0")
+    if not counts["layer"] or counts["layer"] != list(range(len(counts["layer"]))):
+        raise _incoherent("layer ordinals must be contiguous from 0")
+    if any(item["digest"] in sizes and item["size_bytes"] != sizes[item["digest"]] for item in manifest["layers"]):
+        raise _incoherent("a closure digest contradicts a payload size")
+    _require_closure_commitment(manifest, result)
+    return [result[key] for key in sorted(result, key=lambda key: (SOURCE_ROLES.index(key[0]), key[1]))]
+
+
+def _require_closure_commitment(manifest, slots):
+    """The hashed manifest must name its closure, so ``manifest_digest`` commits to it.
+
+    The closure is stored outside ``manifest_json``; without these fields the same
+    manifest digest could be republished with a different (coherent) OCI closure.
+    """
+    root = slots.get(("root", 0))
+    expected = {
+        "manifest_digest": slots[("manifest", 0)]["digest"],
+        "config_digest": slots[("config", 0)]["digest"],
+        "root_digest": root["digest"] if root is not None else slots[("manifest", 0)]["digest"],
+    }
+    source = manifest.get("source") or {}
+    for key, value in expected.items():
+        if source.get(key) != value:
+            raise _incoherent(f"image source {key} is missing or differs from the closure")
+    covered = set()
+    for item in manifest["layers"]:
+        origin = item["source"].get("oci_layer") if isinstance(item.get("source"), dict) else None
+        compressed = origin.get("compressed") if isinstance(origin, dict) else None
+        ordinal = origin.get("ordinal") if isinstance(origin, dict) else None
+        slot = slots.get(("layer", ordinal)) if type(ordinal) is int else None
+        if slot is None or _descriptor(compressed) != (slot["digest"], slot["size_bytes"]):
+            raise _incoherent("every payload must name its original OCI layer, matching the closure at that ordinal")
+        covered.add(ordinal)
+    if covered != {ordinal for role, ordinal in slots if role == "layer"}:
+        raise _incoherent("some closure layers are not the origin of any payload")
+
+
+def source_bytes(closure):
+    """Each distinct closure digest counts once."""
+    return sum({item["digest"]: item["size_bytes"] for item in closure or ()}.values())
+
+
+class _DuplicateKey(ValueError):
+    pass
+
+
+def _pairs_reject_duplicates(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise _DuplicateKey(f"duplicate key {key!r}")
+        result[key] = value
+    return result
+
+
+def _read_document(store, item, *, schema_version=2):
+    """Bounded, re-hashed read of an immutable CAS document blob (blocking)."""
+    if item["size_bytes"] > _SOURCE_DOCUMENT_BYTES:
+        raise _incoherent(f"{item['role']} document exceeds 1 MiB")
+    try:
+        with open(store.blob_path(item["digest"]), "rb") as stream:
+            raw = stream.read(item["size_bytes"] + 1)
+    except OSError:
+        raw = b""
+    if len(raw) != item["size_bytes"] or "sha256:" + hashlib.sha256(raw).hexdigest() != item["digest"]:
+        raise HTTPException(status_code=409, detail="publication payload unavailable or changed")
+    try:
+        value = json.loads(raw, object_pairs_hook=_pairs_reject_duplicates)
+    except _DuplicateKey:
+        raise _incoherent(f"{item['role']} document contains duplicate keys") from None
+    except (ValueError, UnicodeError, RecursionError):
+        raise _incoherent(f"{item['role']} document is not JSON") from None
+    if not isinstance(value, dict):
+        raise _incoherent(f"{item['role']} document must be a JSON object")
+    if schema_version is not None and value.get("schemaVersion") != schema_version:
+        raise _incoherent(f"{item['role']} document is not a schemaVersion {schema_version} OCI/Docker document")
+    return value
+
+
+def _descriptor(value):
+    if not isinstance(value, dict):
+        return None
+    digest, size = value.get("digest"), value.get("size")
+    return (digest, size) if isinstance(digest, str) and type(size) is int else None
+
+
+def _check_closure_documents(store, manifest, closure):
+    """Every declared byte must be the exact OCI chain the closure declares (blocking)."""
+    by_role = {}
+    for item in closure:
+        by_role.setdefault(item["role"], []).append(item)
+    image_manifest, config, layers = by_role["manifest"][0], by_role["config"][0], by_role["layer"]
+    document = _read_document(store, image_manifest, schema_version=2)
+    media = document.get("mediaType")
+    if media is not None and media not in _IMAGE_MANIFEST_TYPES:
+        raise _incoherent("manifest document is not an OCI image manifest or Docker v2 schema 2 manifest")
+    declared = document.get("layers")
+    if _descriptor(document.get("config")) != (config["digest"], config["size_bytes"]):
+        raise _incoherent("manifest config descriptor differs from the config item")
+    if not isinstance(declared, list) or [_descriptor(item) for item in declared] != [
+        (item["digest"], item["size_bytes"]) for item in layers
+    ]:
+        raise _incoherent("manifest layer descriptors differ from the layer items (digest, size, order or count)")
+    config_doc = _read_document(store, config, schema_version=None)
+    source_diff_ids = (manifest.get("source") or {}).get("diff_ids")
+    if source_diff_ids is not None:
+        rootfs = config_doc.get("rootfs") if isinstance(config_doc, dict) else None
+        config_diff_ids = rootfs.get("diff_ids") if isinstance(rootfs, dict) else None
+        if config_diff_ids != source_diff_ids:
+            raise _incoherent("config rootfs.diff_ids differs from manifest source.diff_ids")
+    root = by_role.get("root", [None])[0]
+    if root is not None:
+        index = _read_document(store, root, schema_version=2)
+        media = index.get("mediaType")
+        entries = index.get("manifests")
+        if (media is not None and media not in _INDEX_TYPES) or not isinstance(entries, list):
+            raise _incoherent("root document is not an OCI index or Docker manifest list")
+        if (image_manifest["digest"], image_manifest["size_bytes"]) not in {_descriptor(item) for item in entries}:
+            raise _incoherent("root document does not list the manifest")
+
+
+async def verify_source_closure(session, store, actor, manifest, closure):
+    """Own staging proves possession: identical bytes elsewhere never grant access."""
+    for digest, size in {item["digest"]: item["size_bytes"] for item in closure}.items():
+        stage = await session.get(
+            PalimpsestHubPublicationPayload,
+            {"project_id": actor["project_id"], "created_by": actor["user_id"], "blob_digest": digest},
+        )
+        if stage is None or stage.project_id != actor["project_id"] or stage.created_by != actor["user_id"]:
+            raise HTTPException(status_code=404, detail="publication payload not found")
+        if stage.size_bytes != size:
+            # The caller's own staged size; revealing the mismatch discloses nothing foreign.
+            raise _incoherent("a declared size differs from the staged blob")
+    await run_blocking(_check_closure_documents, store, manifest, closure)
+
+
+async def stored_source_closure(session, image_id):
+    rows = (
+        await session.scalars(
+            select(PalimpsestHubImageSourceBlob).where(PalimpsestHubImageSourceBlob.image_id == image_id)
+        )
+    ).all()
+    value = [
+        {"role": row.role, "digest": row.blob_digest, "size_bytes": row.size_bytes, "ordinal": row.ordinal}
+        for row in rows
+    ]
+    if any(item["role"] not in SOURCE_ROLES for item in value):
+        raise HTTPException(status_code=409, detail="published image source closure is invalid")
+    return sorted(value, key=lambda item: (SOURCE_ROLES.index(item["role"]), item["ordinal"]))
+
+
+async def image_blob_roles(session, row, digest):
+    """Roles under which ``digest`` belongs to this image, and its recorded size.
+
+    Returns ``(roles, size_bytes)``: ``"payload"`` for SquashFS layer payloads,
+    ``"source-<role>"`` for OCI source-closure blobs; ``([], None)`` for non-members.
+    """
+    roles, size = [], None
+    for item in normalized(row.manifest_json)["layers"]:
+        if item["digest"] == digest:
+            roles, size = ["payload"], item["size_bytes"]
+            break
+    for item in await stored_source_closure(session, row.id):
+        if item["digest"] == digest:
+            if size is not None and size != item["size_bytes"]:
+                raise HTTPException(status_code=409, detail="published image source closure is invalid")
+            roles.append("source-" + item["role"])
+            size = item["size_bytes"]
+    return sorted(set(roles)), size
 
 
 def _open_directory(path):
@@ -465,6 +695,7 @@ async def image_value(session, row, *, internal=False, actor=None):
         "leaf_id": row.leaf_id,
         "storage_binding": row.storage_binding_json,
         "nodes": nodes,
+        "source_closure": await stored_source_closure(session, row.id),
         "created_at": row.created_at.isoformat(),
         **({"created_by": row.created_by} if internal or (actor and actor.get("user_id") == row.created_by) else {}),
     }
@@ -491,12 +722,14 @@ async def register_image(
     require_staged=False,
     image_id=None,
     inherited_policies=None,
+    source_closure=None,
 ):
     """Caller holds all payload locks and owns the encompassing SQL transaction."""
     manifest = normalized(manifest)
     visibility = visibility_value(visibility)
     visible_images(actor)
     identity = manifest_digest(manifest)
+    closure = normalize_source_closure(source_closure, manifest)
     project = actor["project_id"]
     existing = await session.scalar(
         select(PalimpsestHubPublishedImage)
@@ -515,7 +748,13 @@ async def register_image(
             or (image_id is not None and existing.id != image_id)
         ):
             raise HTTPException(status_code=409, detail="publication request_id conflicts")
+        if await stored_source_closure(session, existing.id) != (closure or []):
+            raise HTTPException(status_code=409, detail="publication request_id conflicts")
         return existing
+    # Replay above returns before quota; the caller's global image mutex makes check-then-insert atomic.
+    await image_quota.enforce(session, actor, name, manifest, visibility, source=source_bytes(closure))
+    if closure:
+        await verify_source_closure(session, store, actor, manifest, closure)
     opened = []
 
     def open_destination():
@@ -554,6 +793,7 @@ async def register_image(
             require_staged=require_staged,
             image_id=image_id,
             inherited_policies=inherited_policies or {},
+            closure=closure,
         )
     finally:
         for destination in opened:
@@ -575,11 +815,15 @@ async def _register_payloads(
     require_staged,
     image_id,
     inherited_policies,
+    closure,
 ):
     from palimpsest_hub.api.hub import _visible_filter
 
     project, identity = actor["project_id"], manifest_digest(manifest)
     compatibility = {key: manifest[key] for key in ("mode", "platform", "os_family", "os_version", "base_image_digest")}
+    arch = PLATFORM_ARCH.get(manifest["platform"])
+    if arch is None:
+        raise HTTPException(status_code=422, detail="unsupported image platform")
     reuse_policies = {}
     for item in {item["digest"]: item for item in manifest["layers"]}.values():
         digest, size = item["digest"], item["size_bytes"]
@@ -623,6 +867,13 @@ async def _register_payloads(
             verified = await run_blocking(store.inspect_file, store.blob_path(digest), max_bytes=size)
             if verified.blob_digest != digest or verified.size_bytes != size:
                 raise HubStoreError("payload mismatch")
+            squashfs = await run_blocking(_is_squashfs, store.blob_path(digest))
+        except (HubStoreError, OSError):
+            raise HTTPException(status_code=409, detail="publication payload unavailable or changed") from None
+        if not squashfs:
+            # Staging accepts opaque source blobs; only SquashFS bytes may become a layer payload.
+            raise HTTPException(status_code=422, detail="publication payload is not SquashFS")
+        try:
             await run_blocking(_publish_no_replace, store.blob_path(digest), destination, verified)
         except (HubStoreError, OSError):
             raise HTTPException(status_code=409, detail="publication payload unavailable or changed") from None
@@ -634,7 +885,7 @@ async def _register_payloads(
                 "name": "payload-" + digest[7:63],
                 "kind": "image-payload",
                 "blob_digest": digest,
-                "arch": "x86_64",
+                "arch": arch,
                 "parent_digest": None,
                 "chain_id": None,
                 "base_image_digest": None,
@@ -645,7 +896,7 @@ async def _register_payloads(
                 blob_md5=verified.blob_md5,
                 size_bytes=size,
                 media_type=MEDIA_TYPE_LAYER_SQUASHFS,
-                arch="x86_64",
+                arch=arch,
                 name=config["name"],
                 kind="image-payload",
                 config_digest=compute_config_digest(config),
@@ -659,10 +910,22 @@ async def _register_payloads(
             physical.size_bytes != size
             or physical.kind not in ("squashfs", "image-payload")
             or physical.media_type != MEDIA_TYPE_LAYER_SQUASHFS
-            or physical.arch != "x86_64"
         ):
+            # The arch of the first registrant is not a property of the bytes: rejecting
+            # another platform here would block it and reveal a private publication.
             raise HTTPException(status_code=409, detail="payload registration conflicts")
         await session.flush()
+    # Source closure blobs take the same visibility-scoped storage path as payloads.
+    for digest, size in {item["digest"]: item["size_bytes"] for item in closure or ()}.items():
+        if digest in reuse_policies:
+            continue
+        try:
+            verified = await run_blocking(store.inspect_file, store.blob_path(digest), max_bytes=size)
+            if verified.blob_digest != digest or verified.size_bytes != size:
+                raise HubStoreError("payload mismatch")
+            await run_blocking(_publish_no_replace, store.blob_path(digest), destination, verified)
+        except (HubStoreError, OSError):
+            raise HTTPException(status_code=409, detail="publication payload unavailable or changed") from None
     for item in manifest["layers"]:
         node = await session.get(PalimpsestHubLayerNode, (project, item["id"]))
         if node is None:
@@ -709,13 +972,25 @@ async def _register_payloads(
                 reuse_projects_json=reuse_policies[item["digest"]],
             )
         )
-    for digest in {item["digest"] for item in manifest["layers"]}:
+    for item in closure or ():
+        session.add(
+            PalimpsestHubImageSourceBlob(
+                image_id=row.id,
+                role=item["role"],
+                ordinal=item["ordinal"],
+                project_id=project,
+                blob_digest=item["digest"],
+                size_bytes=item["size_bytes"],
+            )
+        )
+    stored = {item["digest"] for item in [*manifest["layers"], *(closure or ())]}
+    for digest in stored:
         await retain_blob(session, digest, "published-image", row.id)
     await session.flush()
     if hasattr(destination, "fd"):
         try:
             if hasattr(destination, "check_payload_layout"):
-                for digest in {item["digest"] for item in manifest["layers"]}:
+                for digest in stored:
                     await run_blocking(destination.check_payload_layout, digest)
             await run_blocking(destination.check_identity)
         except HubStoreError:
@@ -735,7 +1010,8 @@ async def publish_image(
     visibility="private",
     base_image_id=None,
     base_manifest_digest=None,
-    authority=None,
+    source_closure=None,
+    recheck=None,
 ):
     from palimpsest_hub.api.hub import _locked_blobs
     from palimpsest_hub.services.worker_leases import sql_mutex
@@ -743,9 +1019,10 @@ async def publish_image(
     if storage_binding is not None:
         raise HTTPException(status_code=422, detail="publication storage is operator bound")
     manifest = normalized(manifest)
+    closure = normalize_source_closure(source_closure, manifest)
     async with (
-        _locked_blobs(store, [item["digest"] for item in manifest["layers"]]),
-        sql_mutex(factory, "build-api:image:single-flight") as session,
+        _locked_blobs(store, [item["digest"] for item in [*manifest["layers"], *(closure or ())]]),
+        sql_mutex(factory, IMAGE_MUTEX) as session,
     ):
         inherited_policies = {}
         if base_image_id is not None:
@@ -768,12 +1045,11 @@ async def publish_image(
             visibility=visibility,
             require_staged=True,
             inherited_policies=inherited_policies,
+            source_closure=closure,
         )
-        if authority is not None:
-            # Revalidate the original, pre-target-rewrite subject after locks and copies.
-            from palimpsest_hub.services.image_jobs import fresh_writer
-
-            await fresh_writer(authority)
+        if recheck is not None:
+            # Revalidate the original, pre-target-rewrite subject after locks and payload copies.
+            await recheck()
         await session.commit()
         return await image_value(session, row, actor=actor)
 
@@ -789,7 +1065,7 @@ async def extend_image(
     *,
     visibility="private",
     metadata=None,
-    authority=None,
+    recheck=None,
 ):
     base = await resolve_image(factory, base_image_id, actor)
     full = base["manifest"]
@@ -822,5 +1098,5 @@ async def extend_image(
         visibility=visibility,
         base_image_id=base_image_id,
         base_manifest_digest=base["manifest_digest"],
-        authority=authority,
+        recheck=recheck,
     )

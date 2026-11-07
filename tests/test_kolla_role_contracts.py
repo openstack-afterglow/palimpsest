@@ -80,6 +80,39 @@ def test_openstack_modules_run_inside_kolla_toolbox_not_on_deploy_hosts():
     assert reader_grant["become"] is True
 
 
+def test_keystone_provisioning_preserves_native_roles_without_service_role_creation_or_deletion():
+    tasks = yaml.safe_load(keystone_text)
+    registration = next(task for task in tasks if "ansible.builtin.import_role" in task)
+    assert "service_ks_register_roles" not in registration["vars"]
+    assert {user["role"] for user in registration["vars"]["service_ks_register_users"]} == {"admin"}
+    modules = [task["kolla_toolbox"] for task in tasks if "kolla_toolbox" in task]
+    assert {module["module_name"] for module in modules} == {
+        "openstack.cloud.identity_user",
+        "openstack.cloud.role_assignment",
+    }
+    assert all(module["module_args"]["state"] == "present" for module in modules)
+    assignments = [module["module_args"] for module in modules if module["module_name"].endswith(".role_assignment")]
+    assert [(args["role"], args.get("system"), args.get("project")) for args in assignments] == [
+        ("reader", "all", None)
+    ]
+    assert not any(key in defaults_yaml for key in ("palimpsest_roles", "palimpsest_role_inferences"))
+
+
+def test_kolla_default_policy_uses_registered_defaults_and_preserves_operator_edits():
+    tasks = yaml.safe_load((ROLE_DIR / "tasks/config.yml").read_text(encoding="utf-8"))
+    policy_tasks = [
+        task
+        for task in tasks
+        if task.get("ansible.builtin.copy", {}).get("dest") == "{{ palimpsest_config_dir }}/policy/policy.yaml"
+    ]
+    assert len(policy_tasks) == 2
+    supplied = next(task for task in policy_tasks if "src" in task["ansible.builtin.copy"])
+    initialized = next(task for task in policy_tasks if "content" in task["ansible.builtin.copy"])
+    assert "palimpsest_policy_source | length > 0" in supplied["when"]
+    assert yaml.safe_load(initialized["ansible.builtin.copy"]["content"]) == {}
+    assert initialized["ansible.builtin.copy"]["force"] is False
+
+
 def test_bootstrap_runs_dedicated_command_without_automatic_data_migration():
     assert 'command: ["palimpsest-hub-bootstrap"]' in bootstrap_text
     assert 'OS_PROJECT_NAME: "{{ palimpsest_service_project_name }}"' in bootstrap_text

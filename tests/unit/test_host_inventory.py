@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import io
 import json
 import subprocess
 from pathlib import Path
@@ -1015,3 +1017,251 @@ def test_native_libvirt_inactive_tpm_is_retained_before_stop(external_libvirt, m
     with pytest.raises(StateError, match="TPM state"):
         host_vm_control.remove_vm(row, expected_identity=row["removal_identity"], roots=external_libvirt["roots"])
     assert native["active"] and native["exists"] and native["flags"] is None
+
+
+@pytest.fixture
+def held_native_vz_inventory(tmp_path, monkeypatch):
+    """Real inventory/API projection with only read-only provider observations."""
+    from palimpsest_local import host_vm_control, inventory, state, ui
+    from palimpsest_local.oci_process import OCIProcessSpec
+    from palimpsest_local.oci_provenance import canonical_json_bytes
+    from palimpsest_local.runtime_types import DispatchKey, RuntimeBackend, RuntimeKind
+
+    roots = state.init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    canonical_name = "held-native-consumer"
+    with state.reserve_new_run(
+        roots, canonical_name, DispatchKey(RuntimeKind.OCI_ROOT, RuntimeBackend.LIMA_VZ)
+    ) as reservation:
+        run_id = reservation.record.run_id
+        reservation.write_failure({"error": "native stop did not complete"})
+    ledger = roots.runs / canonical_name / "state.json"
+    payload = state.read_json(ledger)
+    root_id = "22222222-2222-4222-8222-222222222222"
+    plan = {
+        "schema": "palimpsest.vz-root-plan.v1",
+        "run_id": run_id,
+        "run_name": canonical_name,
+        "root_volume_id": root_id,
+        "process": OCIProcessSpec.empty().to_dict(),
+        "mode": "dev",
+        "restart": "no",
+    }
+    payload.update(
+        status="stopped",
+        vz_native={
+            "schema": "palimpsest.vz-native-run.v1",
+            "hold": "stop-incomplete",
+            "root_volume_id": root_id,
+            "lease_set_id": "33333333-3333-4333-8333-333333333333",
+            "plan": plan,
+            "plan_sha256": hashlib.sha256(canonical_json_bytes(plan)).hexdigest(),
+        },
+    )
+    state.atomic_write_json(ledger, payload)
+    home = tmp_path / "lima"
+    home.mkdir(mode=0o700)
+    monkeypatch.setenv("LIMA_HOME", str(home))
+
+    def instance(name, marker):
+        directory = home / name
+        directory.mkdir(mode=0o700)
+        config = {"vmType": "vz", "env": {} if marker is None else {"PALIMPSEST_RUN_ID": marker}}
+        (directory / "lima.yaml").write_text(json.dumps(config))
+        return {"name": name, "vmType": "vz", "status": "Stopped", "dir": str(directory), "config": config}
+
+    native = instance("plm-" + run_id.replace("-", "")[:12], run_id)
+    cloud = instance("ordinary-cloud", "44444444-4444-4444-8444-444444444444")
+    foreign = instance("foreign-vm", None)
+    upper = home / "native-upper.raw"
+    upper.write_bytes(b"retained native upper")
+    observed = [native, cloud, foreign]
+
+    def query(argv, **kwargs):
+        if argv == ["limactl", "list", "--format", "json"]:
+            return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(observed), stderr="")
+        if argv in (["limactl", "network", "list", "--json"], ["limactl", "disk", "list", "--json"]):
+            return subprocess.CompletedProcess(argv, 0, stdout="[]", stderr="")
+        pytest.fail(f"provider mutation forbidden: {argv}")
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("generic or canonical runtime mutation must not be reached from this host selection")
+
+    monkeypatch.setattr(host_inventory.shutil, "which", lambda _: "/bin/limactl")
+    monkeypatch.setattr(host_inventory.subprocess, "run", query)
+    monkeypatch.setattr(host_inventory, "_observe_libvirt", lambda: ([], [], [], []))
+    monkeypatch.setattr(host_vm_control.lima, "_run_command", forbidden)
+    monkeypatch.setattr(platforms, "detect_host", lambda: platforms.HostPlatform("Darwin", "aarch64"))
+    monkeypatch.setattr(
+        host_vm_control.lima,
+        "_instance_info_or_none",
+        lambda name: next((value for value in observed if value["name"] == name), None),
+    )
+
+    # Isolate backend reconciliation, not host classification or API selection.
+    # Return live summaries so canonical refusal cannot pass just from stale state.
+    def reconciled(*, roots, _snapshot_observer=None, _observation_budget=None):
+        from dataclasses import replace
+
+        result = inventory.runtime_dispatch.ps(roots=roots)
+        if _snapshot_observer is not None:
+            for snapshot in inventory.state.enumerate_run_snapshots(roots)[0]:
+                _snapshot_observer(snapshot)
+        return replace(result, summaries=tuple(replace(summary, stale=False) for summary in result.summaries))
+
+    monkeypatch.setattr(inventory.runtime_dispatch, "reconcile", reconciled)
+    for operation in ("start", "stop", "rm"):
+        monkeypatch.setattr(inventory.runtime_dispatch, operation, forbidden)
+
+    handler_type = ui.build_handler(roots, token="test-native-token", origin="http://localhost", read_only=False)
+    handler = handler_type.__new__(handler_type)
+    responses = []
+    handler._send_json = lambda body, status=200: responses.append((status, body))
+
+    def request(method, path, body=None):
+        encoded = b"" if body is None else json.dumps(body).encode()
+        handler.path = path
+        handler.headers = {
+            "Authorization": "Bearer test-native-token",
+            "Origin": "http://localhost",
+            "Content-Length": str(len(encoded)),
+        }
+        handler.rfile = io.BytesIO(encoded)
+        responses.clear()
+        getattr(handler, "do_" + method)()
+        assert len(responses) == 1
+        return responses[0]
+
+    return {
+        "roots": roots,
+        "native": native,
+        "request": request,
+        "run_id": run_id,
+        "canonical_name": canonical_name,
+        "ledger": ledger,
+        "upper": upper,
+    }
+
+
+@pytest.mark.parametrize("marker", ["valid", "missing", "null", "invalid", "changed"])
+@pytest.mark.parametrize("status", ["Stopped", "Running"])
+def test_native_vz_provider_identity_cannot_escape_through_dashboard_controls(held_native_vz_inventory, marker, status):
+    fixture = held_native_vz_inventory
+    native = fixture["native"]
+    native["status"] = status
+    if marker == "missing":
+        native["config"]["env"].clear()
+    elif marker == "null":
+        native["config"]["env"]["PALIMPSEST_RUN_ID"] = None
+    elif marker == "invalid":
+        native["config"]["env"]["PALIMPSEST_RUN_ID"] = "not-a-uuid"
+    elif marker == "changed":
+        native["config"]["env"]["PALIMPSEST_RUN_ID"] = "55555555-5555-4555-8555-555555555555"
+    config_path = Path(native["dir"]) / "lima.yaml"
+    config_path.write_text(json.dumps(native["config"]))
+    protected = {path: path.read_bytes() for path in (fixture["ledger"], fixture["upper"], config_path)}
+    request = fixture["request"]
+    code, body = request("GET", "/api/v1/vms")
+    assert code == 200
+    canonical = next(row for row in body["vms"] if row["name"] == fixture["canonical_name"])
+    row = next(row for row in body["vms"] if row["name"] == native["name"])
+    assert canonical["run_id"] == fixture["run_id"] and canonical["runtime_kind"] == "oci-root"
+    assert canonical["managed"] is True and canonical["stale"] is False
+    assert canonical["name"] != row["name"]
+    assert row["runtime_kind"] == ("oci-root" if marker == "valid" else "unknown")
+    assert row["managed"] is False and row["source"] == "host-backend"
+    assert row["removal_identity"] is None
+    assert not any(row["lifecycle"].values())
+    for name, kind in (("ordinary-cloud", "cloud-image"), ("foreign-vm", "external")):
+        ordinary = next(value for value in body["vms"] if value["name"] == name)
+        assert ordinary["runtime_kind"] == kind and ordinary["lifecycle"]["remove"] is True
+        assert ordinary["removal_identity"]
+    for volumes in (False, True):
+        for selected in (row, canonical):
+            code, error = request(
+                "DELETE",
+                "/api/v1/vms/" + selected["id"],
+                {
+                    "expected_run_id": selected["run_id"],
+                    **({"expected_removal_identity": "a" * 64} if selected is row else {}),
+                    "confirmation": selected["name"],
+                    "volumes": volumes,
+                },
+            )
+            assert code == 409 and "error" in error
+    for action in ("start", "stop"):
+        for name in (native["name"], fixture["canonical_name"]):
+            code, error = request("POST", f"/api/v1/vms/{name}/{action}", {"expected_run_id": fixture["run_id"]})
+            assert code == 409 and "error" in error
+    assert {path: path.read_bytes() for path in protected} == protected
+
+
+@pytest.mark.parametrize("evidence", ["reserved-name", "seed-mount", "kernel-plan"])
+def test_native_vz_removal_rechecks_provider_classification_not_caller_row(held_native_vz_inventory, evidence):
+    from palimpsest_local import host_vm_control
+
+    fixture = held_native_vz_inventory
+    native = fixture["native"]
+    if evidence != "reserved-name":
+        native["name"] = "renamed-provider"
+        directory = Path(native["dir"]).with_name(native["name"])
+        Path(native["dir"]).rename(directory)
+        native["dir"] = str(directory)
+        if evidence == "seed-mount":
+            native["config"]["mounts"] = [{"mountPoint": "/.palimpsest/seed"}]
+        else:
+            native["config"]["images"] = [{"kernel": {"cmdline": "rdinit=/init plm.plan_sha256=" + "b" * 64}}]
+    native["config"]["env"].clear()
+    (Path(native["dir"]) / "lima.yaml").write_text(json.dumps(native["config"]))
+    identity = host_vm_control.lima_removal_identity(native)
+    assert identity is not None
+    # Even an old/forged removable row cannot authorize a native provider command.
+    row = {
+        "id": "host:lima-vz:" + native["name"],
+        "name": native["name"],
+        "run_id": fixture["run_id"],
+        "backend": "lima-vz",
+        "runtime_kind": "cloud-image",
+        "managed": False,
+        "source": "host-backend",
+        "removal_identity": identity,
+    }
+    assert host_vm_control.lima_oci_runtime_kind(native) == "unknown"
+    for volumes in (False, True):
+        with pytest.raises(StateError):
+            host_vm_control.remove_vm(
+                row, expected_identity=row["removal_identity"], roots=fixture["roots"], volumes=volumes
+            )
+
+
+def test_owned_cloud_image_reserved_name_preserves_original_removal_admission(held_native_vz_inventory, monkeypatch):
+    from palimpsest_local import host_vm_control, lima, state
+    from palimpsest_local.runtime_types import DispatchKey, RuntimeBackend, RuntimeKind
+
+    fixture = held_native_vz_inventory
+    native = fixture["native"]
+    name = native["name"]
+    roots = fixture["roots"]
+    with state.reserve_new_run(
+        roots, name, DispatchKey(RuntimeKind.CLOUD_IMAGE, RuntimeBackend.LIMA_VZ)
+    ) as reservation:
+        run_id = reservation.record.run_id
+        reservation.write_failure({"error": "test-owned cloud image"})
+    native["config"]["env"]["PALIMPSEST_RUN_ID"] = run_id
+    (Path(native["dir"]) / "lima.yaml").write_text(json.dumps(native["config"]))
+    fingerprint = host_vm_control.lima_removal_identity(native)
+    assert fingerprint is not None
+    ledger = roots.runs / name / "state.json"
+    original = ledger.read_bytes()
+
+    class ReachedOwnedRemoval(Exception):
+        pass
+
+    def stop_before_removal(selected_roots, current, *, identity, ledger):
+        assert selected_roots == roots and current["name"] == name and identity == fingerprint
+        assert ledger["run_id"] == run_id and ledger["runtime_kind"] == "cloud-image"
+        raise ReachedOwnedRemoval
+
+    monkeypatch.setattr(host_vm_control.retained_instances, "retain_lima", stop_before_removal)
+    with pytest.raises(ReachedOwnedRemoval):
+        lima.rm(name, roots=roots)
+    assert ledger.read_bytes() == original
