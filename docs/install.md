@@ -1,5 +1,18 @@
 # Detailed installation and configuration guide
 
+## 0.3.13 transition gate — 2026-11-08 (UTC)
+
+This candidate contains the local reviewed line (SDK/publication source, native thirteen-action role cutover, M1 Lima VZ arm64 native root, M2 Hub image quotas/tiers, `ppi_v1_` image keys, anonymous public image reads, OCI source-closure publication) on top of the published 0.3.12 release infrastructure. Use the new immutable numeric `0.3.13` tag after exact-SHA CI and publication; published `0.3.12` is not reused. All three API/export cohorts and the separate HTTPS build-worker cohort must run the same reviewed release. Updating the operator wheel/default tag is not a rollout.
+
+1. Record actual old/new manifests, private settings, override precedence, SQL database default charset/collation and all CAS mount identities as timestamped observations, not a standing no-writer certificate. Preserve every original row and private journal.
+2. Close new ingress; stop/drain the dedicated build worker while the old API remains available for exact uncertain-claim status. Retain unknown scratch/loops/leases and do not reset or replay a claim. Then stop all API/export/upload/GC writers on all three controllers and drain already-started effects. The dedicated worker is outside the controller inventory limit and must be included through its packaged playbook.
+3. During one no-writers interval capture encrypted/restricted SQL+CAS+private configuration and exact old pins. Preserve SQL database charset/collation as well as per-table DDL. A hot SQL backup or copied CAS alone is a rehearsal, not a consistent recovery point.
+4. Run the new immutable API image's `palimpsest-hub-bootstrap` once against the stopped database using its private config. It upgrades the context primary key to `(project_id,digest,created_by)` and creator NOT NULL only for proven creators, adds historical image-job `visibility=internal`, then creates the dependent publication, native, quota (`palimpsest_hub_image_quota_policies`, `palimpsest_hub_image_quota_tiers`), image-key (`palimpsest_image_keys`) and source-blob (`palimpsest_hub_image_source_blobs`) tables. Unknown creators, unexpected indexes/FKs/triggers or incompatible schemas fail closed; never fabricate creator/OS/visibility facts or blindly rerun partial MariaDB DDL. `reconfigure` does not bootstrap.
+5. Use canonical image-mode Kolla pull/reconfigure for the exact controller set with `--tags palimpsest --skip-tags haproxy`. Use the packaged `palimpsest-build-worker.yml` separately with `kolla_action=pull` then `reconfigure`; preserve its mounted scratch/journal/key. List the HAProxy source addresses in `palimpsest_api_forwarded_allow_ips` so anonymous per-client rate limits see real clients. No Keystone provisioning, global HAProxy edit, new Ceph issuer or native-profile activation is implied.
+6. Before ingress reopen, require exact new image revisions/versions, public/direct ready, authenticated management, anonymous public list capped at 20, `/v1/image-quota/me`, key/private/global denials and cross-replica state. Rollback requires stopping every new writer, restoring the paired old SQL/CAS/config and old exact images; do not restart old workers over new publication state or erase claim history.
+
+Image mode uses reviewed immutable image refs. Source mode requires an explicitly reviewed published full SHA and a clean separate checkout. An explicitly skipped native lane is not a native proof.
+
 This guide covers end-user installation from PyPI or a GitHub VCS URL,
 package selection, supported host/runtime combinations, external dependencies,
 initial configuration, upgrades, and administrator-owned Linux deployment.

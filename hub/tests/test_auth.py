@@ -3251,3 +3251,144 @@ async def test_package_key_bearer_never_admits_instance_or_native_self_cleanup(k
         assert (await client.post("/v1/instances/" + identity + "/stop", headers=headers)).status_code == 401
         assert (await client.delete("/v1/instances/" + identity, headers=headers)).status_code == 401
         assert (await client.delete("/v1/native-instances/" + identity, headers=headers)).status_code == 401
+
+
+# ---- ported verbatim from release origin/dev (92ee9ad) ----
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "check",
+    ["not rule:missing", "role:member and not (rule:missing or role:reader)", "not rule:cycle"],
+)
+async def test_rel312_negated_missing_or_cyclic_policy_fails_closed(native_http, tmp_path, monkeypatch, check):
+    h = native_http
+    path = tmp_path / "negated-bad-policy.yaml"
+    document = dict.fromkeys(ACTIONS, "role:member")
+    document["packages:read"] = check
+    if check == "not rule:cycle":
+        document["cycle"] = "not rule:cycle"
+    path.write_text(json.dumps(document))
+    monkeypatch.setenv("OSLO_POLICY_POLICY_FILE", str(path))
+    get_settings.cache_clear()
+    response = await h.client.get(
+        "/v1/policy/capabilities", headers={"X-Auth-Token": ORIGINAL_SUBJECT, "X-Project-Id": PROJECT_A}
+    )
+    assert response.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_rel312_revalidated_writer_denies_revoked_member_before_commit(native_http):
+    from palimpsest_hub.auth import get_package_member_info, validate_token
+    from palimpsest_hub.services.image_jobs import fresh_writer as _revalidate_writer
+
+    h = native_http
+    token_info = await get_package_member_info(validate_token(ORIGINAL_SUBJECT))
+    assert (await _revalidate_writer(token_info))["can_write"] is True
+    h.identity["project_roles"] = []
+    with pytest.raises(HTTPException) as revoked:
+        await _revalidate_writer(token_info)
+    assert revoked.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_rel312_policy_replaced_between_check_and_authorize_fails_closed(native_http, tmp_path, monkeypatch):
+    import os
+    import time
+
+    from palimpsest_hub import policy as native_policy
+
+    h = native_http
+    path = tmp_path / "swapped-policy.yaml"
+    path.write_text("{}\n")
+    monkeypatch.setenv("OSLO_POLICY_POLICY_FILE", str(path))
+    get_settings.cache_clear()
+    original = native_policy._StrictEnforcer.check_rules
+
+    def check_then_replace(self, *args, **kwargs):
+        result = original(self, *args, **kwargs)
+        path.write_text(json.dumps({"packages:read": "not rule:missing"}))
+        later = time.time() + 5
+        os.utime(path, (later, later))
+        return result
+
+    monkeypatch.setattr(native_policy._StrictEnforcer, "check_rules", check_then_replace)
+    response = await h.client.get(
+        "/v1/policy/capabilities", headers={"X-Auth-Token": ORIGINAL_SUBJECT, "X-Project-Id": PROJECT_A}
+    )
+    assert response.status_code == 503
+
+
+# ---- review probes (not in the release suite) ----
+# The release's test_missing_policy_directory_fails_closed sets a non-JSON OSLO_POLICY_POLICY_DIRS, which
+# fails pydantic Settings parsing in BOTH trees (503 for an unrelated reason). These probes use a valid
+# JSON list so only the configured-directory check is exercised, and show the operator-narrowing impact.
+
+
+@pytest.mark.asyncio
+async def test_rel312_probe_missing_policy_directory_json_list_fails_closed(native_http, tmp_path, monkeypatch):
+    absent = tmp_path / "absent-policy.d"
+    monkeypatch.setenv("OSLO_POLICY_POLICY_DIRS", json.dumps([str(absent)]))
+    get_settings.cache_clear()
+    assert get_settings().oslo_policy_policy_dirs == (str(absent),)
+    response = await native_http.client.get(
+        "/v1/policy/capabilities", headers={"X-Auth-Token": ORIGINAL_SUBJECT, "X-Project-Id": PROJECT_A}
+    )
+    assert response.status_code == 503, response.text
+
+
+@pytest.mark.asyncio
+async def test_rel312_probe_unmounted_policy_directory_cannot_drop_operator_deny(native_http, tmp_path, monkeypatch):
+    h = native_http
+    h.identity["token_roles"] = h.identity["project_roles"] = ["member"]
+    policy_dir = tmp_path / "policy.d"
+    policy_dir.mkdir()
+    (policy_dir / "freeze.yaml").write_text('"packages:write": "!"\n')
+    monkeypatch.setenv("OSLO_POLICY_POLICY_DIRS", json.dumps([str(policy_dir)]))
+    get_settings.cache_clear()
+    headers = {"X-Auth-Token": ORIGINAL_SUBJECT, "X-Project-Id": PROJECT_A}
+    narrowed = await h.client.get("/v1/policy/capabilities", headers=headers)
+    assert narrowed.status_code == 200 and "packages:write" not in narrowed.json()["actions"]
+    policy_dir.rename(tmp_path / "policy.d.unmounted")
+    from palimpsest_hub import policy as _native_policy
+
+    _native_policy._enforcer.cache_clear()  # a restarted API process re-reads configuration
+    unmounted = await h.client.get("/v1/policy/capabilities", headers=headers)
+    # Release: 503. Ours: 200 with packages:write restored (operator deny silently lost).
+    assert unmounted.status_code == 503, unmounted.text
+
+
+@pytest.mark.asyncio
+async def test_rel312_probe_negated_undefined_rule_cannot_widen_operator_narrowing(native_http, tmp_path, monkeypatch):
+    h = native_http
+    h.identity["token_roles"] = h.identity["project_roles"] = ["member"]
+    path = tmp_path / "freeze-typo.yaml"
+    # Operator intends "members may write unless frozen"; the referenced rule is missing (typo/unmounted).
+    path.write_text(json.dumps({"packages:write": "role:member and not rule:frozen_project"}))
+    monkeypatch.setenv("OSLO_POLICY_POLICY_FILE", str(path))
+    get_settings.cache_clear()
+    response = await h.client.get(
+        "/v1/policy/capabilities", headers={"X-Auth-Token": ORIGINAL_SUBJECT, "X-Project-Id": PROJECT_A}
+    )
+    # Release: 503 (undefined reference under NotCheck). Ours: 200 and packages:write granted.
+    assert response.status_code == 503, response.text
+
+
+# ---- adapted port of test_reduced_original_token_preview_never_advertises_human_mutations: assert the
+# security property (no executable human action is advertised) without fixing the response shape ----
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("marker", ["application_credential", "OS-TRUST:trust", "OS-OAUTH2", "access_rules", "bind"])
+async def test_rel312_adapted_reduced_original_token_never_advertises_human_mutations(native_http, marker):
+    h = native_http
+    h.identity["token_methods"] = ["token"]
+    h.identity["token_markers"] = {marker: {"id": "synthetic-reduced"}}
+    headers = {"X-Auth-Token": ORIGINAL_SUBJECT, "X-Project-Id": PROJECT_A}
+    response = await h.client.get("/v1/policy/capabilities", headers=headers)
+    assert response.status_code == 403 or (response.status_code == 200 and response.json()["actions"] == [])
+    assert (await h.client.get("/v1/layers", headers=headers)).status_code == 403
+    me = await h.client.get("/v1/me", headers=headers)
+    assert me.status_code == 200 and not any(me.json()["capabilities"].values()), me.text
+    h.identity["subject_revoked"] = True
+    assert (await h.client.get("/v1/policy/capabilities", headers=headers)).status_code == 401

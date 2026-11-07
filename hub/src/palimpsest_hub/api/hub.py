@@ -1743,6 +1743,10 @@ async def _finalize_upload_locked(
                     await _legacy_writer(token_info)
                     if meta.is_published and "system:manage" not in token_info["package_actions"]:
                         raise HTTPException(status_code=403, detail="System publication policy denied")
+                else:
+                    from palimpsest_hub.services.image_jobs import fresh_writer
+
+                    await fresh_writer(token_info)
                 commit_started = True
                 await session.commit()
         except BaseException:
@@ -2070,6 +2074,10 @@ async def import_bundle(file: UploadFile, token_info: dict = Depends(_legacy_wri
                         if token_info.get("is_package_system_admin"):
                             token_info = await revalidate_package_admin(token_info)
                             await _legacy_writer(token_info)
+                        else:
+                            from palimpsest_hub.services.image_jobs import fresh_writer
+
+                            await fresh_writer(token_info)
                         commit_started = True
                         await session.commit()
                 except BaseException:

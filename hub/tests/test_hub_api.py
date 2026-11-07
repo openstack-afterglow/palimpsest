@@ -88,6 +88,17 @@ def store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> LocalPathBlobStore
     return LocalPathBlobStore(tmp_path / "hub")
 
 
+@pytest.fixture(autouse=True)
+def storage_contract_writer(monkeypatch: pytest.MonkeyPatch):
+    """Tokenless synthetic storage actors; original-subject revalidation is covered in test_auth/test_image_jobs."""
+    from palimpsest_hub.services import image_jobs
+
+    async def unchanged(token_info):
+        return token_info
+
+    monkeypatch.setattr(image_jobs, "fresh_writer", unchanged)
+
+
 def _put_blob(store: LocalPathBlobStore, payload: bytes) -> str:
     session_id = "a" * 32
     store.start_upload(session_id)
@@ -3253,4 +3264,80 @@ async def test_admin_bundle_import_keeps_target_and_actual_creator(store, tmp_pa
                 assert (await session.execute(select(PalimpsestHubLayerAccess))).scalars().all() == []
     finally:
         app.dependency_overrides.clear()
+        await engine.dispose()
+
+
+# ---- adapted port: same scenario, but our delete revalidates the original subject before the
+# foreign-grant fence, so the synthetic caller needs a token and a fresh current authority ----
+
+
+@pytest.mark.asyncio
+async def test_rel312_adapted_delete_preserves_other_project_identical_layer(store, monkeypatch):
+    system_admin = False  # system administrators deliberately bypass this fence (ARCHITECTURE.md)
+    from palimpsest_hub.api import hub as hub_module
+    from palimpsest_hub.api.hub import delete_hub_layer
+
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    monkeypatch.setattr("palimpsest_hub.api.hub.get_session_factory", lambda: factory)
+    monkeypatch.setattr("palimpsest_hub.api.hub.get_blob_store", lambda: store)
+    actions = {"packages:delete", "system:manage"} if system_admin else {"packages:delete"}
+    owner = {
+        "project_id": "project-a",
+        "user_id": "user-a",
+        "token": "original",
+        "package_actions": actions,
+        "is_package_system_admin": system_admin,
+    }
+
+    async def fresh(token_info=None, **_):
+        return dict(owner)
+
+    monkeypatch.setattr(hub_module, "validate_token", lambda token, project: dict(owner))
+    monkeypatch.setattr(hub_module, "get_package_member_info", fresh)
+    monkeypatch.setattr(hub_module, "revalidate_package_admin", fresh)
+    try:
+        payload = b"shared identical layer bytes"
+        digest = _put_blob(store, payload)
+        config = {
+            "name": "shared",
+            "kind": "squashfs",
+            "blob_digest": digest,
+            "arch": None,
+            "parent_digest": None,
+            "chain_id": None,
+            "disk_format": None,
+            "os_variant": None,
+            "base_image_digest": None,
+        }
+        async with factory() as session:
+            session.add(
+                PalimpsestHubLayer(
+                    blob_digest=digest,
+                    blob_md5=None,
+                    size_bytes=len(payload),
+                    media_type=MEDIA_TYPE_LAYER_SQUASHFS,
+                    config_digest=compute_config_digest(config),
+                    name="shared",
+                    kind="squashfs",
+                    config_json=config,
+                    project_id="project-a",
+                    is_published=False,
+                    created_by="user-a",
+                )
+            )
+            session.add(PalimpsestHubLayerAccess(blob_digest=digest, project_id="project-b", created_by="user-b"))
+            await session.commit()
+        outcome = None
+        try:
+            await delete_hub_layer(digest, dict(owner))
+        except HTTPException as error:
+            outcome = error.status_code
+        async with factory() as session:
+            grant = await session.get(PalimpsestHubLayerAccess, (digest, "project-b"))
+        # Project callers are refused with 409 and the other project's grant is kept.
+        assert (outcome, grant is not None) == (409, True)
+    finally:
         await engine.dispose()

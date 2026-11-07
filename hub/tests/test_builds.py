@@ -100,8 +100,13 @@ async def remote_hub(tmp_path, monkeypatch):
     async def recheck(token_info):
         return current_identity(token_info["roles"][0], token_info["project_id"])
 
-    monkeypatch.setattr(builds, "validate_token", lambda token, project: current_identity(token.split(":")[0], project))
-    monkeypatch.setattr(builds, "get_package_member_info", recheck)
+    from palimpsest_hub.services import image_jobs as image_job_service
+
+    for module in (builds, image_job_service):
+        monkeypatch.setattr(
+            module, "validate_token", lambda token, project: current_identity(token.split(":")[0], project)
+        )
+        monkeypatch.setattr(module, "get_package_member_info", recheck)
     # Only tenant identity is replaced. Native action gates and worker header authentication are real.
     app.dependency_overrides[hub._legacy_writer] = writer
     app.dependency_overrides[hub._legacy_inventory] = reader

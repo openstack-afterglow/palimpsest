@@ -305,6 +305,7 @@ async def publish(request: Request, actor: dict = Depends(image_writer)):
         source_closure=(
             [item.model_dump() for item in payload.source_closure] if payload.source_closure is not None else None
         ),
+        recheck=lambda: _fresh_writer(actor),
     )
 
 
@@ -349,6 +350,7 @@ async def extension(request: Request, actor: dict = Depends(image_writer)):
         [layer.model_dump(exclude_none=True, exclude={"id", "parent_id"}) for layer in payload.layers],
         visibility=payload.visibility,
         metadata=payload.metadata,
+        recheck=lambda: _fresh_writer(actor),
     )
 
 

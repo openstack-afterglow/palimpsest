@@ -8,7 +8,14 @@ All notable changes to Palimpsest Local are documented here.
 
 Supersedes the 0.3.12 release candidate below: this version keeps 0.3.12's SDK publication and
 native lifecycle work and replaces its standard-role authority implementation with the
-reviewed thirteen-action reader/member/manager cutover. Formal publication and deployment
+reviewed thirteen-action reader/member/manager cutover. The 0.3.12 security fixes are retained
+in the new implementation: member layer DELETE returns 409 instead of cascading another
+project's grant (system administrators still bypass it by design), upload finalize, bundle
+import and SDK/image-key publication revalidate the original subject immediately before commit
+(after locks and payload copies), and both policy modules reject undefined or cyclic rule
+references, including inside negations, and a missing configured policy directory with 503.
+Hub does not follow role-implication links through domain-scoped intermediate roles; Keystone
+already expands implied roles before the Hub sees tokens. Formal publication and deployment
 are recorded separately in `docs/development-handoff.md`.
 
 ### Changed

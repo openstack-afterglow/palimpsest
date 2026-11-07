@@ -176,7 +176,9 @@ def test_real_process_birth_and_natural_exit_are_distinct() -> None:
         assert identity is not None
         assert (identity.pid, identity.ppid, identity.uid) == (child.pid, os.getpid(), os.geteuid())
         assert 0 < identity.start_time_ns <= time.time_ns()
-        assert identity.argv == (sys.executable, "-c", code)
+        # A venv interpreter re-executes the framework binary, so argv[0] may be the resolved path.
+        assert identity.argv[1:] == ("-c", code)
+        assert os.path.realpath(identity.argv[0]) == os.path.realpath(sys.executable)
         assert darwin_process.read_process(child.pid) == identity
         child.communicate(b"x", timeout=10)
         assert child.returncode == 0

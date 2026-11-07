@@ -92,7 +92,8 @@ async def images(tmp_path, monkeypatch):
             "project_id": request.headers.get("X-Project", "alpha"),
             "user_id": request.headers.get("X-User", "caller"),
             "package_actions": {"packages:read", "packages:write", "packages:inventory"},
-            "is_package_system_admin": False,
+            "is_package_system_admin": request.headers.get("X-Target") is not None,
+            **({"target_project_id": request.headers["X-Target"]} if request.headers.get("X-Target") else {}),
             "token": "disposable-native-token:" + request.headers.get("X-User", "caller"),
         }
 
@@ -2123,3 +2124,54 @@ async def test_os_declarations_reject_unpublishable_values_before_worker_admissi
             assert len(rows) == 1 and rows[0].request_json[field] == value
     offered = await images.client.post("/v1/image-worker/claim", headers=claim_headers())
     assert offered.status_code == (204 if status == 422 else 202), offered.text
+
+
+# ---- ported verbatim from release origin/dev (92ee9ad) ----
+
+
+@pytest.mark.asyncio
+async def test_rel312_publication_revoked_during_payload_copy_never_commits(images, monkeypatch):
+    payload = b"hsqsrevoked-during-copy"
+    assert (await upload_publication_payload(images, payload)).status_code == 200
+    state = {"revoked": False}
+    original_copy = publications._publish_no_replace
+
+    def copy_then_revoke(*args, **kwargs):
+        result = original_copy(*args, **kwargs)
+        state["revoked"] = True
+        return result
+
+    async def current(token_info):
+        if state["revoked"]:
+            raise HTTPException(status_code=403, detail="membership removed")
+        return token_info
+
+    monkeypatch.setattr(publications, "_publish_no_replace", copy_then_revoke)
+    monkeypatch.setattr(service, "get_package_member_info", current)
+    response = await publish_manifest(images, publication_manifest(payload))
+    assert response.status_code == 403
+    assert state["revoked"] is True
+    async with images.factory() as session:
+        assert (await session.scalars(select(publications.PalimpsestHubPublishedImage))).all() == []
+
+
+@pytest.mark.asyncio
+async def test_rel312_admin_target_publication_revalidates_original_token_scope(images, monkeypatch):
+    admin = {**HUMAN, "X-Target": "beta", "X-User": "operator"}
+    seen = []
+
+    async def revalidate(token_info):
+        seen.append(token_info["project_id"])
+        if token_info["project_id"] != "alpha":
+            raise HTTPException(status_code=403, detail="PROJECT_SCOPE_MISMATCH")
+        return token_info
+
+    monkeypatch.setattr(service, "revalidate_package_admin", revalidate)
+    payload = b"hsqsadmin-target-payload"
+    assert (await upload_publication_payload(images, payload, headers=admin)).status_code == 200
+    response = await publish_manifest(images, publication_manifest(payload), headers=admin)
+    assert response.status_code == 201, response.text
+    assert seen and set(seen) == {"alpha"}
+    async with images.factory() as session:
+        [row] = (await session.scalars(select(publications.PalimpsestHubPublishedImage))).all()
+    assert row.project_id == "beta"
