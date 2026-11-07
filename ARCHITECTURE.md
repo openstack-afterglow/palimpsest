@@ -3995,9 +3995,9 @@ that CI never sees).
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "81d91b884af6f890771b6c6127a2fd23532fbbf4f4fbb891a41a13dc99cfd5d8",
-  "reviewed_at": "2026-11-07T16:54:44Z",
-  "summary": "Reviewed the merged 0.3.12 candidate source: primary dev WIP (native-role cutover, previously reviewed) + M1 Lima VZ arm64 native root work + M2 Hub image publication (quotas, ppi_v1_ image keys, anonymous public reads capped at 20 per page, OCI source-closure publication, arm64 oci-root manifests) and client published push/pull/status with credential-owned replay and catalog schema v2. Independent reviews 2026-11-08: whole-surface M2 security review (no P0/P1, one P2 fixed), merge-integrity review (no merge-induced defect; four lost v0.3.11 release fixes restored), architecture-document review (12 blockers and 14 nits fixed; PALIMPSEST_IMAGE_KEY now removed from tool child environments), plus six client replay review rounds. Test-passed only in scrubbed macOS runs (test_hub_publish 72 cases, Hub M2 files 113, real-Hub loopback harness 77/77, GiB boundary script 11/11, synthetic Keystone and SQLite); not live-verified: no live Hub/Keystone/Afterglow OAuth, Kolla rollout, MariaDB, Manila/CephFS, Linux-only tests, pulled-image plm run or second Apple Silicon device. The stamp covers source review only, not CI or deployment."
+  "source_sha256": "73670f75170ab72beee9db632f41a917e9c29e1e19804d405c01d83a22b8bdfe",
+  "reviewed_at": "2026-11-07T17:13:32Z",
+  "summary": "Reviewed the 0.3.13 candidate: local dev line (native thirteen-action role cutover, M1 Lima VZ arm64 native root, M2 Hub image quotas/keys/anonymous public reads/OCI source closure/client published push-pull-status) reconciled with the published 0.3.12 release infrastructure (numeric tag gates). Independent security, merge-integrity and architecture reviews on 2026-11-08 found no open P0/P1/P2 after fixes; verification is test-passed (Hub lane 1968 passed, root per-file runs, loopback end-to-end harness 77/77 and GiB boundaries 11/11) and not live-verified. The stamp is computed from the committed tree and covers source review only, not CI, publication or deployment."
 }
 ```
 <!-- architecture-review:end -->
