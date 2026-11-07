@@ -3996,8 +3996,8 @@ that CI never sees).
 {
   "schema_version": 1,
   "source_sha256": "b5bfbaa2e719a8b09a115279cabec0bcfa7aed8c47d4c2d7fe2fff48a029ab66",
-  "reviewed_at": "2026-11-07T17:59:03Z",
-  "summary": "Reviewed the 0.3.13 candidate: local dev line (native thirteen-action role cutover, M1 Lima VZ arm64 native root, M2 Hub image quotas/keys/anonymous public reads/OCI source closure/client published push-pull-status) reconciled with the published 0.3.12 release infrastructure (numeric tag gates); an independent comparison against 0.3.12 added pre-commit subject revalidation and policy rule-graph validation. Independent security, merge-integrity, architecture and release-gap reviews on 2026-11-08 found no open P0/P1/P2 after fixes; verification is test-passed and hosted-CI based, not live-verified. The stamp is computed from the committed tree and covers source review only, not publication or deployment."
+  "reviewed_at": "2026-11-07T19:00:16Z",
+  "summary": "Reviewed the 0.3.13 line (local dev, native thirteen-action role cutover, M1 Lima VZ arm64 native root, M2 Hub image quotas/keys/anonymous public reads/OCI source closure/client published push-pull-status) reconciled with the published 0.3.12 release infrastructure; independent security, merge-integrity, architecture and release-gap reviews found no open P0/P1/P2 after fixes. Verification is test-passed and hosted-CI based; the 0.3.13 release was published and deployed to the three controllers with read-only live verification recorded in the handoff. The stamp is computed from the committed tree and covers source review only."
 }
 ```
 <!-- architecture-review:end -->
