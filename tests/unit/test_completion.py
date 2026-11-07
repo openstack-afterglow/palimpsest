@@ -170,7 +170,8 @@ def test_conditional_shell_syntax_checks():
         assert proc.returncode == 0, f"fish -n failed: {proc.stderr.decode()}"
 
 
-def test_executable_bash_completion():
+@pytest.mark.parametrize("command", ["palimpsest", "plm"])
+def test_executable_bash_completion(command):
     if not shutil.which("bash"):
         pytest.skip("bash not installed")
 
@@ -181,7 +182,7 @@ def test_executable_bash_completion():
         tmp_path = Path(tmpdir)
         bin_dir = tmp_path / "bin"
         bin_dir.mkdir()
-        palimpsest_bin = bin_dir / "palimpsest"
+        palimpsest_bin = bin_dir / command
         palimpsest_bin.write_text(f'#!/usr/bin/env sh\nexec "{sys.executable}" -m palimpsest_local.cli "$@"\n')
         palimpsest_bin.chmod(0o755)
 
@@ -196,7 +197,7 @@ def test_executable_bash_completion():
         # Case 1: --backend=a yields auto
         test_cmd_1 = f"""
 source "{script_file}"
-COMP_WORDS=("palimpsest" "run" "--backend" "=" "a")
+COMP_WORDS=("{command}" "run" "--backend" "=" "a")
 COMP_CWORD=4
 _palimpsest_completion
 printf "%s\\n" "${{COMPREPLY[@]}}"
@@ -214,7 +215,7 @@ printf "%s\\n" "${{COMPREPLY[@]}}"
         # Case 2: ordinary completion
         test_cmd_2 = f"""
 source "{script_file}"
-COMP_WORDS=("palimpsest" "st")
+COMP_WORDS=("{command}" "st")
 COMP_CWORD=1
 _palimpsest_completion
 printf "%s\\n" "${{COMPREPLY[@]}}"

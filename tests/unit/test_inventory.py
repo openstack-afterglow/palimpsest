@@ -10,11 +10,13 @@ from pathlib import Path
 import pytest
 
 from palimpsest_local import inventory, state
-from palimpsest_local.errors import ArtifactValidationError, StateError
+from palimpsest_local.errors import ArtifactValidationError, RuntimeBusyError, StateError
 from palimpsest_local.hub import KIND_CLOUD_IMAGE, MEDIA_TYPE_LAYER_SQUASHFS
 from palimpsest_local.oci_layout import ContentStore, build_bundle_tar_bytes
 from palimpsest_local.runtime_types import CapabilityCheck
 from palimpsest_local.state import TagRecord, init_roots, write_tag_record
+
+_REAL_CHECK_CAPABILITY = inventory.runtime_dispatch.platforms._check_capability
 
 
 @pytest.fixture(autouse=True)
@@ -454,6 +456,8 @@ def test_plain_buildkit_exports_are_images_with_typed_identity_and_provenance(tm
 
 
 def test_buildkit_inventory_preserves_cloud_and_runtime_projections(tmp_path):
+    from palimpsest_local.project import deterministic_service_name
+
     roots = _setup_roots(tmp_path)
     store = ContentStore(roots.store)
     cloud_digest = "sha256:" + store.write_stream([b"cloud image"]).name
@@ -462,12 +466,9 @@ def test_buildkit_inventory_preserves_cloud_and_runtime_projections(tmp_path):
     store.write_metadata(runtime_digest, {"kind": "squashfs", "media_type": MEDIA_TYPE_LAYER_SQUASHFS})
     inventory.tag_artifact(roots, runtime_digest, "runtime")
     build = _buildkit_export(roots, "bk-000000000001", runtime_block_digest=runtime_digest, runtime_tag="runtime")
-    run = roots.runs / "user"
-    run.mkdir()
-    state.atomic_write_json(run / "state.json", {"base": {"digest": cloud_digest}, "layers": [runtime_digest]})
-    project = roots.projects / "project"
-    project.mkdir()
-    state.atomic_write_json(project / "state.json", {"project": "project", "services": [{"run_name": "user"}]})
+    run_name = deterministic_service_name("project", "user")
+    run_id = _resource_run(roots, run_name, base={"digest": cloud_digest}, layers=[{"digest": runtime_digest}])
+    _resource_project(roots, "project", service="user", run_id=run_id)
 
     result = inventory.list_artifacts(roots)
 
@@ -475,7 +476,7 @@ def test_buildkit_inventory_preserves_cloud_and_runtime_projections(tmp_path):
     cloud = next(image for image in result["images"] if image["kind"] == KIND_CLOUD_IMAGE)
     image = next(image for image in result["images"] if image["kind"] == "oci-image")
     layer = result["layers"][0]
-    assert cloud["referenced_by"] == layer["referenced_by"] == {"runs": ["user"], "projects": ["project"]}
+    assert cloud["referenced_by"] == layer["referenced_by"] == {"runs": [run_name], "projects": ["project"]}
     assert layer["digest"] == layer["runtime_block_digest"] == runtime_digest
     assert image["digest"] == build["output_oci_manifest_digest"] != runtime_digest
     assert layer["tags"][0]["tag"] == "runtime"
@@ -575,6 +576,9 @@ def test_buildkit_archive_identity_and_conservative_detail(tmp_path, manifest):
     assert detail["output_oci_manifest_digest"] is detail["runtime_block_digest"] is None
     assert detail["output_tags"] == []
     assert detail["platform"] is detail["started_at"] is detail["duration_ms"] is None
+    assert detail["timings_ms"] == {}
+    assert detail["source_record_digest"] is detail["source_record_digest_kind"] is None
+    assert inventory.metadata_snapshot(roots)["observation"]["complete"] is False
 
 
 def test_image_monitoring_does_not_release_a_blocked_fifo_writer(tmp_path):
@@ -1881,11 +1885,1660 @@ def _observed_vm(name, run_id=None, *, status="running", backend="lima-vz"):
     }
 
 
-def _live_ledger_projection(*, roots):
+def _stale_ledger_projection(*, roots, _snapshot_observer=None, _observation_budget=None):
+    return inventory.runtime_dispatch.ps(roots=roots)
+
+
+def _live_ledger_projection(*, roots, _snapshot_observer=None, _observation_budget=None):
     result = inventory.runtime_dispatch.ps(roots=roots)
+    if _snapshot_observer is not None:
+        snapshots, _errors = state.enumerate_run_snapshots(roots)
+        for snapshot in snapshots:
+            if any(row.record == snapshot.record for row in result.summaries):
+                _snapshot_observer(snapshot)
     return dataclasses.replace(
         result, summaries=tuple(dataclasses.replace(row, stale=False) for row in result.summaries)
     )
+
+
+def _native_exited_vm(tmp_path, monkeypatch):
+    """Committed native metadata and a separate current provider observation."""
+    from test_native_root_source import os_layout, qualify
+
+    from palimpsest_local import vz_native_runtime
+    from palimpsest_local.oci_source import LocalLayoutSource, SourceCAS
+
+    roots = _setup_roots(tmp_path)
+    home = tmp_path / "pinned-lima-home"
+    home.mkdir(mode=0o700)
+    home_info = home.stat()
+    monkeypatch.setenv("LIMA_HOME", str(home))
+    name = "native-main-exited"
+    run_id = _resource_run(roots, name, runtime_kind="oci-root", status="exited")
+    layout, root, *_ = os_layout(tmp_path / "layout")
+    qualification = qualify(LocalLayoutSource(layout.root, root.digest), SourceCAS(roots.oci_source_cas))
+    source = qualification.snapshot
+    alias = "plm-" + run_id.replace("-", "")[:12]
+    root_volume_id = "22222222-2222-4222-8222-222222222222"
+    plan = {
+        "schema": "palimpsest.vz-root-plan.v1",
+        "run_id": run_id,
+        "run_name": name,
+        "root_volume_id": root_volume_id,
+        "source_snapshot_binding_digest": source.binding_digest,
+        "process": source.image.config.process.to_dict(),
+        "mode": "dev",
+        "restart": "no",
+    }
+    ledger = roots.runs / name / "state.json"
+    payload = state.read_json(ledger)
+    payload.update(
+        source_image_digest=source.image.digest,
+        source_snapshot_binding_digest=source.binding_digest,
+        source_qualification=qualification.to_dict(),
+        vz_native={
+            "schema": "palimpsest.vz-native-run.v1",
+            "host_authority": {"home_identity": [home_info.st_dev, home_info.st_ino]},
+            "instance": alias,
+            "instance_identity": [42, 43],
+            "hold": None,
+            "root_volume_id": root_volume_id,
+            "source_snapshot": vz_native_runtime._snapshot_wire(source),
+            "plan": plan,
+            "plan_sha256": hashlib.sha256(vz_native_runtime._json(plan)).hexdigest(),
+        },
+        vz_status={
+            "main": {
+                "state": "exited",
+                "pid": 41,
+                "exit_code": 15,
+                "exit_signal": None,
+                "oom_kill_count": 0,
+                "output_complete": True,
+            },
+            "user_session_count": 0,
+            "user_sessions_known": True,
+        },
+    )
+    state.atomic_write_json(ledger, payload)
+    observed = _observed_vm(alias, run_id)
+    observed.update(runtime_kind="oci-root", stale=False)
+    monkeypatch.setattr(inventory.runtime_dispatch, "reconcile", _live_ledger_projection)
+    monkeypatch.setattr(
+        inventory.host_inventory,
+        "observe",
+        lambda: {"vms": [dict(observed)], "volumes": [], "networks": [], "warnings": []},
+    )
+    return roots, name, run_id, observed
+
+
+def test_native_main_exited_inventory_uses_exact_physical_alias_without_adopting_transport(tmp_path, monkeypatch):
+    roots, name, run_id, observed = _native_exited_vm(tmp_path, monkeypatch)
+    ledger = roots.runs / name / "state.json"
+    before = ledger.read_bytes()
+    observed["ports"] = [{"host_ip": "127.0.0.1", "host_port": 2222, "guest_port": 22, "protocol": "tcp"}]
+    observed["guest_ip"] = "192.0.2.66"
+    result = inventory.list_vms(roots)
+    assert len(result["vms"]) == 1
+    row = inventory.get_vm(roots, name)
+    assert row["run_id"] == run_id and row["managed"] is True
+    assert row["status"] == "running" and row["runtime_status"] == "exited"
+    for field in ("ssh", "guest_ip", "ports"):
+        assert row[field] != observed[field]
+    assert row["access"]["exec"] and row["access"]["metrics"]
+    assert not any(row["lifecycle"][action] for action in ("start", "stop", "remove", "remove_volumes"))
+    inspected = inventory.runtime_dispatch.inspect_run(name, roots=roots)
+    assert inspected.lifecycle.status == "exited"
+    assert ledger.read_bytes() == before
+
+    observed["status"] = "stopped"
+    stopped = inventory.get_vm(roots, name)
+    assert stopped["status"] == "stopped" and stopped["runtime_status"] == "exited"
+    assert stopped["access"]["exec"] is False and stopped["access"]["metrics"] is False
+    assert stopped["access"]["logs"] is True
+
+
+def test_native_inventory_projects_one_locked_refresh_observation_without_ledger_reread(tmp_path, monkeypatch):
+    real_reconcile = inventory.runtime_dispatch.reconcile
+    roots, name, run_id, _observed = _native_exited_vm(tmp_path, monkeypatch)
+    ledger = roots.runs / name / "state.json"
+    refreshed_state = state.read_json(ledger)
+    refreshed_state["lifecycle_revision"] = 14
+    pre_refresh = {
+        **refreshed_state,
+        "status": "running",
+        "vz_status": {
+            **refreshed_state["vz_status"],
+            "main": {**refreshed_state["vz_status"]["main"], "state": "running", "exit_code": None},
+        },
+    }
+    state.atomic_write_json(ledger, pre_refresh)
+
+    class Adapter:
+        def refresh_run(self, selected_roots, selected_name, *, expected_record, _observation_budget=None):
+            # The next cooperating poll has already replaced the status file by
+            # the time this observation's owner releases its lock and returns.
+            successor = {**refreshed_state, "lifecycle_revision": 15, "status": "stopped"}
+            state.atomic_write_json(ledger, successor)
+            return refreshed_state
+
+    def raced_reread(*_args, **_kwargs):
+        raise StateError("run ledger changed during read")
+
+    monkeypatch.setattr(inventory.runtime_dispatch, "reconcile", real_reconcile)
+    monkeypatch.setattr(inventory.runtime_dispatch, "_preflight_existing_adapter", lambda *_args, **_kwargs: Adapter())
+    monkeypatch.setattr(state, "read_run_ledger_snapshot", raced_reread)
+    result = inventory.list_vms(roots)
+    row = next(row for row in result["vms"] if row["id"] == name)
+    assert result["warnings"] == []
+    assert row["run_id"] == run_id and row["managed"] is True and row["stale"] is False
+    assert row["status"] == "running" and row["runtime_status"] == "exited"
+    assert row["access"]["exec"] and row["access"]["metrics"]
+    assert "home_identity" not in repr(result) and str(roots.state) not in repr(result)
+    # This is eligibility at the fresh observation, not permission to reuse an
+    # old transport: Access.open still supplies ExpectedRunIdentity to dispatch.
+
+
+def test_native_refresh_observation_identity_mismatch_remains_stale(tmp_path, monkeypatch):
+    real_reconcile = inventory.runtime_dispatch.reconcile
+    roots, name, _run_id, _observed = _native_exited_vm(tmp_path, monkeypatch)
+    payload = state.read_json(roots.runs / name / "state.json")
+    payload["run_id"] = "33333333-3333-4333-8333-333333333333"
+
+    class Adapter:
+        def refresh_run(self, *_args, **_kwargs):
+            return payload
+
+    monkeypatch.setattr(inventory.runtime_dispatch, "reconcile", real_reconcile)
+    monkeypatch.setattr(inventory.runtime_dispatch, "_preflight_existing_adapter", lambda *_args, **_kwargs: Adapter())
+    result = inventory.list_vms(roots)
+    row = next(row for row in result["vms"] if row["id"] == name)
+    assert row["stale"] is True and row["managed"] is False
+    assert row["access"]["reason"] == "identity"
+    assert not row["access"]["exec"] and not row["access"]["metrics"]
+
+
+@pytest.mark.parametrize(
+    ("failure", "category"),
+    [
+        ("lock-timeout", "runtime-busy"),
+        ("namespace-timeout", "runtime-busy"),
+        ("hold", "runtime-failure"),
+        ("unrelated-state", "runtime-failure"),
+    ],
+)
+def test_reconcile_degrades_only_typed_mutex_timeout_as_busy(tmp_path, monkeypatch, failure, category):
+    real_reconcile = inventory.runtime_dispatch.reconcile
+    roots, name, _run_id, _observed = _native_exited_vm(tmp_path, monkeypatch)
+
+    def fail_before_provider(*_args, **_kwargs):
+        if failure == "lock-timeout":
+            raise state.RunLockTimeoutError()
+        if failure == "namespace-timeout":
+            raise RuntimeBusyError("private namespace /secret/lock holder 123456")
+        if failure == "hold":
+            from palimpsest_local.vz_native_runtime import VZNativeHold
+
+            raise VZNativeHold("unsettled actor")
+        raise StateError("unrelated state validation failure")
+
+    def no_live_observer(_snapshot):
+        pytest.fail("failed authority reached live alias observer")
+
+    monkeypatch.setattr(inventory.runtime_dispatch, "_preflight_existing_adapter", fail_before_provider)
+    result = real_reconcile(roots=roots, _snapshot_observer=no_live_observer)
+    assert len(result.summaries) == 1
+    assert result.summaries[0].name == name and result.summaries[0].stale is True
+    assert [error.code for error in result.errors] == [category]
+    assert "/secret" not in repr(result) and "123456" not in repr(result)
+
+
+def _assert_run_lock_held(roots, name):
+    import fcntl
+
+    probe = os.open(roots.locks / f"{name}.lock", os.O_RDWR)
+    try:
+        with pytest.raises(BlockingIOError):
+            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        os.close(probe)
+
+
+@pytest.mark.parametrize("boundary", ["enumeration", "revalidation", "access-resolution", "retained-console"])
+def test_live_native_reads_wait_for_cooperating_status_writer(tmp_path, monkeypatch, boundary):
+    import fcntl
+
+    from palimpsest_local import vm_access
+
+    roots = _setup_roots(tmp_path)
+    name = "cooperating-native"
+    run_id = _resource_run(roots, name, runtime_kind="oci-root", status="running")
+    record = state.read_run_dispatch_record(roots, name)
+    ledger = roots.runs / name / "state.json"
+    payload = state.read_json(ledger)
+    console = roots.runs / name / "console.log"
+    console.write_bytes(b"retained native output\n")
+    console.chmod(0o600)
+    row = {
+        "name": name,
+        "run_id": run_id,
+        "managed": True,
+        "backend": "lima-vz",
+        "runtime_kind": "oci-root",
+        "status": "running",
+    }
+    row["access"] = vm_access.capabilities(row)
+    monkeypatch.setattr(inventory, "get_vm", lambda *_args, **_kwargs: row)
+    monkeypatch.setattr(state.time, "monotonic", lambda: 0.0)
+    holder = os.open(roots.locks / f"{name}.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    settled, reads = [], []
+    budget = state.RunObservationWaitBudget()
+    original_payloads = state._read_pinned_run_payloads
+    original_private_file = state._open_pinned_private_file
+
+    def settle_writer(_delay):
+        state.atomic_write_json(ledger, {**payload, "status": "exited", "lifecycle_revision": 1})
+        settled.append(True)
+        fcntl.flock(holder, fcntl.LOCK_UN)
+
+    def guarded_read(fn, *args, **kwargs):
+        assert settled == [True]
+        _assert_run_lock_held(roots, name)
+        reads.append(True)
+        return fn(*args, **kwargs)
+
+    monkeypatch.setattr(state.time, "sleep", settle_writer)
+    monkeypatch.setattr(
+        state,
+        "_read_pinned_run_payloads",
+        lambda *args, **kwargs: guarded_read(original_payloads, *args, **kwargs),
+    )
+    monkeypatch.setattr(
+        state,
+        "_open_pinned_private_file",
+        lambda *args, **kwargs: guarded_read(original_private_file, *args, **kwargs),
+    )
+    try:
+        if boundary == "enumeration":
+            snapshots, errors = state.enumerate_run_snapshots(roots, observation_budget=budget)
+            assert errors == () and snapshots[0].state["status"] == "exited"
+        elif boundary == "revalidation":
+            inventory.runtime_dispatch._revalidate_bound_record(record, roots, _observation_budget=budget)
+        elif boundary == "access-resolution":
+            access = vm_access.Access.resolve(roots, name, expected_run_id=run_id)
+            assert access.record == record
+        else:
+            access = vm_access.Access(roots, row, record, _observation_budget=budget)
+            assert access.logs(20)["log"] == "retained native output"
+        assert settled == [True] and reads
+    finally:
+        os.close(holder)
+
+
+def test_live_enumeration_has_one_wait_budget_across_all_name_locks(tmp_path, monkeypatch):
+    import fcntl
+
+    roots = _setup_roots(tmp_path)
+    holders = []
+    for index in range(6):
+        name = f"busy-native-{index}"
+        _resource_run(roots, name, runtime_kind="oci-root", status="running")
+        holder = os.open(roots.locks / f"{name}.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        holders.append(holder)
+    clock = [0.0]
+    budget = state.RunObservationWaitBudget()
+    monkeypatch.setattr(state.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(state.time, "sleep", lambda delay: clock.__setitem__(0, clock[0] + delay))
+    monkeypatch.setattr(
+        inventory.runtime_dispatch,
+        "_preflight_existing_adapter",
+        lambda *_args, **_kwargs: pytest.fail("degraded metadata reached provider preflight"),
+    )
+    try:
+        snapshots, errors = state.enumerate_run_snapshots(roots, observation_budget=budget)
+        assert len(snapshots) == len(errors) == 6
+        assert all(error.code == "runtime-busy" for error in errors)
+        assert clock[0] == pytest.approx(5)
+        assert budget.remaining_seconds == 0
+        result = inventory.runtime_dispatch.reconcile(
+            roots=roots,
+            _observation_budget=budget,
+            _snapshot_observer=lambda _snapshot: pytest.fail("degraded metadata reached fresh observer"),
+        )
+        assert len(result.summaries) == 6 and all(row.stale for row in result.summaries)
+        rows = inventory.list_vms(roots, _observation_budget=budget)["vms"]
+        assert len(rows) == 6 and all(row["stale"] and not row["managed"] for row in rows)
+        assert all(row["access"]["transport"] is None for row in rows)
+        assert all(row["access"]["reason"] == "busy" for row in rows)
+        assert all(not any(row["lifecycle"].values()) for row in rows)
+        assert clock[0] == pytest.approx(5)
+    finally:
+        for holder in holders:
+            os.close(holder)
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "stable",
+        "invalid-json",
+        "owner-name",
+        "run-id",
+        "state-symlink",
+        "mode",
+        "hardlink",
+        "owner-uid",
+        "plan",
+        "directory-replacement",
+    ],
+)
+def test_busy_degraded_metadata_never_grants_unproved_or_replaced_identity(tmp_path, monkeypatch, tamper):
+    import fcntl
+    from types import SimpleNamespace
+
+    real_reconcile = inventory.runtime_dispatch.reconcile
+    roots, name, _run_id, _observed = _native_exited_vm(tmp_path, monkeypatch)
+    monkeypatch.setattr(inventory.runtime_dispatch, "reconcile", real_reconcile)
+    run = roots.runs / name
+    owner = state.read_json(run / "owner.json")
+    payload = state.read_json(run / "state.json")
+    if tamper == "invalid-json":
+        (run / "state.json").write_bytes(b"{")
+    elif tamper == "owner-name":
+        state.atomic_write_json(run / "owner.json", {**owner, "name": "another-run"})
+    elif tamper == "run-id":
+        state.atomic_write_json(run / "state.json", {**payload, "run_id": "33333333-3333-4333-8333-333333333333"})
+    elif tamper == "state-symlink":
+        original = tmp_path / "original-state.json"
+        (run / "state.json").rename(original)
+        (run / "state.json").symlink_to(original)
+    elif tamper == "mode":
+        (run / "state.json").chmod(0o644)
+    elif tamper == "hardlink":
+        os.link(run / "state.json", tmp_path / "retained-state-link")
+    elif tamper == "plan":
+        payload["vz_native"]["plan"]["run_name"] = "another-run"
+        state.atomic_write_json(run / "state.json", payload)
+    elif tamper == "owner-uid":
+        original_stat = state._safe_stat
+
+        def changed_owner(path, **kwargs):
+            info = original_stat(path, **kwargs)
+            if path == "owner.json" and info is not None:
+                fields = {key: getattr(info, key) for key in dir(info) if key.startswith("st_")}
+                fields["st_uid"] = os.geteuid() + 1
+                return SimpleNamespace(**fields)
+            return info
+
+        monkeypatch.setattr(state, "_safe_stat", changed_owner)
+
+    clock, reads = [0.0], []
+    original_payloads = state._read_pinned_run_payloads
+
+    def one_private_read(*args, **kwargs):
+        assert kwargs["require_private"] is True
+        reads.append(True)
+        return original_payloads(*args, **kwargs)
+
+    monkeypatch.setattr(state, "_read_pinned_run_payloads", one_private_read)
+    monkeypatch.setattr(state.time, "monotonic", lambda: clock[0])
+    holder = os.open(roots.locks / f"{name}.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def retained_holder_wait(delay):
+        clock[0] += delay
+        if tamper == "directory-replacement":
+            run.rename(roots.runs / "retired-native")
+            run.mkdir(mode=0o700)
+            state.atomic_write_json(run / "owner.json", owner)
+            state.atomic_write_json(run / "state.json", payload)
+
+    monkeypatch.setattr(state.time, "sleep", retained_holder_wait)
+    monkeypatch.setattr(
+        inventory.runtime_dispatch,
+        "_preflight_existing_adapter",
+        lambda *_args, **_kwargs: pytest.fail("degraded metadata reached a provider"),
+    )
+
+    def observer(_snapshot):
+        pytest.fail("degraded metadata reached live observer")
+
+    try:
+        budget = state.RunObservationWaitBudget(0.01)
+        if tamper == "directory-replacement":
+            with pytest.raises(StateError, match="changed during read"):
+                real_reconcile(roots=roots, _observation_budget=budget, _snapshot_observer=observer)
+        else:
+            result = real_reconcile(roots=roots, _observation_budget=budget, _snapshot_observer=observer)
+            if tamper == "stable":
+                assert len(result.summaries) == 1 and result.summaries[0].stale is True
+                assert str(roots.state) not in repr(result)
+            else:
+                assert result.summaries == ()
+            assert any(error.code == "runtime-busy" for error in result.errors)
+        assert reads == [True] and clock[0] == pytest.approx(0.01)
+    finally:
+        os.close(holder)
+
+
+def test_native_access_resolution_reuses_remaining_inventory_budget(tmp_path, monkeypatch):
+    import fcntl
+
+    from palimpsest_local import vm_access
+
+    roots = _setup_roots(tmp_path)
+    name = "budget-native"
+    run_id = _resource_run(roots, name, runtime_kind="oci-root", status="running")
+    row = {
+        "name": name,
+        "run_id": run_id,
+        "managed": True,
+        "backend": "lima-vz",
+        "runtime_kind": "oci-root",
+        "status": "running",
+    }
+    row["access"] = vm_access.capabilities(row)
+    clock = [0.0]
+    observed_budget = []
+
+    def inventory_uses_budget(*_args, **kwargs):
+        budget = kwargs["_observation_budget"]
+        observed_budget.append(budget)
+        clock[0] = 4.99
+        budget.charge_wait(0.0)  # Prior contention consumed 4.99 seconds.
+        clock[0] += 20  # Ordinary provider work consumes no wait allowance.
+        return row
+
+    monkeypatch.setattr(inventory, "get_vm", inventory_uses_budget)
+    monkeypatch.setattr(state.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(state.time, "sleep", lambda delay: clock.__setitem__(0, clock[0] + delay))
+    holder = os.open(roots.locks / f"{name}.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        with pytest.raises(vm_access.VMAccessError) as caught:
+            vm_access.Access.resolve(roots, name, expected_run_id=run_id)
+        assert caught.value.category == "busy"
+        assert clock[0] == pytest.approx(25)
+        assert observed_budget[0].remaining_seconds == 0
+    finally:
+        os.close(holder)
+
+
+@pytest.mark.parametrize("tamper", ["owner-uid", "owner-name", "directory-replaced", "raw-status-replacement"])
+def test_live_run_lock_keeps_strict_foreign_writer_identity_checks(tmp_path, monkeypatch, tamper):
+    from types import SimpleNamespace
+
+    roots = _setup_roots(tmp_path)
+    name = "strict-native"
+    _resource_run(roots, name, runtime_kind="oci-root", status="running")
+    run = roots.runs / name
+    owner, payload = state.read_json(run / "owner.json"), state.read_json(run / "state.json")
+    original_stat = state._safe_stat
+    original_payloads = state._read_pinned_run_payloads
+    original_json = state._read_pinned_json_object
+
+    def stat_with_changed_owner(path, **kwargs):
+        info = original_stat(path, **kwargs)
+        if path == "owner.json" and info is not None:
+            _assert_run_lock_held(roots, name)
+            attributes = {key: getattr(info, key) for key in dir(info) if key.startswith("st_")}
+            attributes["st_uid"] = os.geteuid() + 1
+            return SimpleNamespace(**attributes)
+        return info
+
+    def foreign_change(*args, **kwargs):
+        _assert_run_lock_held(roots, name)
+        if tamper == "owner-name":
+            state.atomic_write_json(run / "owner.json", {**owner, "name": "another-run"})
+        elif tamper == "directory-replaced":
+            run.rename(roots.runs / "retired-native")
+            run.mkdir(mode=0o700)
+            state.atomic_write_json(run / "owner.json", owner)
+            state.atomic_write_json(run / "state.json", payload)
+        return original_payloads(*args, **kwargs)
+
+    def replace_status_during_read(directory_fd, filename):
+        value = original_json(directory_fd, filename)
+        if filename == "state.json":
+            _assert_run_lock_held(roots, name)
+            state.atomic_write_json(run / "state.json", {**payload, "lifecycle_revision": 1})
+        return value
+
+    if tamper == "owner-uid":
+        monkeypatch.setattr(state, "_safe_stat", stat_with_changed_owner)
+    elif tamper == "raw-status-replacement":
+        monkeypatch.setattr(state, "_read_pinned_json_object", replace_status_during_read)
+    else:
+        monkeypatch.setattr(state, "_read_pinned_run_payloads", foreign_change)
+    with pytest.raises(StateError):
+        state.read_run_dispatch_record(roots, name, observation_budget=state.RunObservationWaitBudget())
+
+
+def test_live_enumeration_keeps_runs_root_ctime_guard_across_cooperating_create(tmp_path, monkeypatch):
+    import fcntl
+
+    from palimpsest_local.runtime_types import DispatchKey, RuntimeBackend, RuntimeKind
+
+    roots = _setup_roots(tmp_path)
+    name = "existing-native"
+    _resource_run(roots, name, runtime_kind="oci-root", status="running")
+    holder = os.open(roots.locks / f"{name}.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    clock = [0.0]
+    budget = state.RunObservationWaitBudget()
+    monkeypatch.setattr(state.time, "monotonic", lambda: clock[0])
+
+    def create_other_run_during_wait(delay):
+        clock[0] += delay
+        key = DispatchKey(RuntimeKind.OCI_ROOT, RuntimeBackend.LIMA_VZ)
+        with state.reserve_new_run(roots, "new-native", key) as reservation:
+            reservation.write_state("defined", {})
+        fcntl.flock(holder, fcntl.LOCK_UN)
+
+    monkeypatch.setattr(state.time, "sleep", create_other_run_during_wait)
+    try:
+        with pytest.raises(StateError, match="changed during read"):
+            state.enumerate_run_snapshots(roots, observation_budget=budget)
+        assert 0 < clock[0] <= 5
+    finally:
+        os.close(holder)
+
+
+@pytest.mark.parametrize("entry", ["owner.json", "state.json"])
+@pytest.mark.parametrize("legacy_shape", ["nonprivate-mode", "hardlink"])
+def test_live_observation_requires_private_single_link_ledgers_without_offline_fixup(tmp_path, entry, legacy_shape):
+    roots = _setup_roots(tmp_path)
+    _resource_run(roots, "legacy-native", runtime_kind="oci-root", status="removed")
+    target = roots.runs / "legacy-native" / entry
+    if legacy_shape == "nonprivate-mode":
+        target.chmod(0o644)
+    else:
+        os.link(target, tmp_path / "retained-link")
+    assert inventory.runtime_dispatch.ps(roots=roots).summaries[0].status == "removed"
+    snapshots, errors = state.enumerate_run_snapshots(roots, observation_budget=state.RunObservationWaitBudget())
+    assert snapshots == () and [error.code for error in errors] == ["invalid-ledger"]
+    if legacy_shape == "nonprivate-mode":
+        assert target.stat().st_mode & 0o777 == 0o644
+    else:
+        assert target.stat().st_nlink == 2
+
+
+def test_live_missing_root_and_offline_catalog_do_not_initialize_metadata(tmp_path):
+    absent = state.StatePaths(tmp_path / "absent-config", tmp_path / "absent-state")
+    assert inventory.runtime_dispatch.reconcile(roots=absent).summaries == ()
+    with pytest.raises(StateError):
+        state.read_run_dispatch_record(absent, "missing", observation_budget=state.RunObservationWaitBudget())
+    assert not absent.state.exists() and not absent.config.exists()
+    offline = state.StatePaths(tmp_path / "offline-config", tmp_path / "offline-state")
+    offline.runs.mkdir(parents=True, mode=0o700)
+    _resource_run(offline, "history", runtime_kind="oci-root", status="removed")
+    assert inventory.runtime_dispatch.ps(roots=offline).summaries[0].status == "removed"
+    assert not offline.locks.exists() and not offline.config.exists()
+
+
+def test_removed_native_history_skips_provider_preflight_without_granting_transport(tmp_path, monkeypatch):
+    roots = _setup_roots(tmp_path)
+    from palimpsest_local import vm_access
+
+    run_id = _resource_run(roots, "removed-native", runtime_kind="oci-root", status="removed")
+    console = roots.runs / "removed-native" / "console.log"
+    console.write_bytes(b"retained output after removal\n")
+    console.chmod(0o600)
+    monkeypatch.setattr(
+        inventory.runtime_dispatch,
+        "_preflight_existing_adapter",
+        lambda *_args, **_kwargs: pytest.fail("removed history reached provider/tool preflight"),
+    )
+    row = inventory.list_vms(roots)["vms"][0]
+    assert row["status"] == row["runtime_status"] == "removed" and row["stale"] is False
+    assert row["source"] == "run-ledger" and row["access"]["transport"] is None
+    assert row["access"]["logs"] is True
+    assert not any(row["access"][key] for key in ("shell", "exec", "metrics"))
+    monkeypatch.setattr(
+        vm_access.runtime_dispatch, "exec", lambda *_args, **_kwargs: pytest.fail("removed logs reached guest exec")
+    )
+    result = inventory.vm_logs(roots, "removed-native", expected_run_id=run_id)
+    assert result["status"] == "available" and result["source"] == "retained-console"
+    assert result["log"] == "retained output after removal"
+    wrong = inventory.vm_logs(roots, "removed-native", expected_run_id="33333333-3333-4333-8333-333333333333")
+    assert wrong["status"] == "unavailable" and wrong["reason"] == "identity" and wrong["log"] == ""
+    with pytest.raises(vm_access.VMAccessError, match="removed"):
+        vm_access.Access.resolve(roots, "removed-native", expected_run_id=run_id)
+    logs_only = vm_access.Access.resolve(roots, "removed-native", expected_run_id=run_id, purpose="logs")
+    with pytest.raises(vm_access.VMAccessError, match="not running"):
+        logs_only.open("exec", ("true",))
+
+
+@pytest.mark.parametrize("native_status", ["removed", "failed", "starting", "unbound"])
+def test_fresh_native_home_classification_is_independent_of_live_alias(tmp_path, monkeypatch, native_status):
+    roots, name, run_id, observed = _native_exited_vm(tmp_path, monkeypatch)
+    ledger = roots.runs / name / "state.json"
+    payload = state.read_json(ledger)
+    payload["status"] = "failed" if native_status == "unbound" else native_status
+    if native_status == "unbound":
+        payload["vz_native"].pop("plan")
+        payload["vz_native"].pop("plan_sha256")
+        payload["vz_native"]["instance"] = None
+        payload.pop("vz_status")
+    state.atomic_write_json(ledger, payload)
+    before = ledger.read_bytes()
+    observed.clear()
+    observed.update(_observed_vm(name, status="running"))
+    foreign = tmp_path / "ordinary-lima-home"
+    foreign.mkdir(mode=0o700)
+    monkeypatch.setenv("LIMA_HOME", str(foreign))
+
+    rows = inventory.list_vms(roots)["vms"]
+    assert len(rows) == 2
+    canonical = inventory.get_vm(roots, name)
+    assert canonical["managed"] is True and canonical["stale"] is False
+    assert canonical["run_id"] == run_id and canonical["source"] == "run-ledger"
+    assert canonical["status"] == canonical["runtime_status"] == payload["status"]
+    assert canonical["ssh"] != observed["ssh"] and canonical["ports"] == payload.get("ports", [])
+    assert not any(canonical["access"][key] for key in ("shell", "exec", "metrics"))
+    assert not any(canonical["lifecycle"].values())
+    assert str(tmp_path) not in repr(rows) and "home_identity" not in repr(rows)
+    assert ledger.read_bytes() == before
+
+
+@pytest.mark.parametrize("collision", ["foreign-home", "same-home", "missing-home", "invalid-home", "stale"])
+def test_removed_native_console_survives_only_proved_foreign_home_collision(tmp_path, monkeypatch, collision):
+    from palimpsest_local import vm_access
+
+    real_reconcile = inventory.runtime_dispatch.reconcile
+    roots, name, run_id, observed = _native_exited_vm(tmp_path, monkeypatch)
+    ledger = roots.runs / name / "state.json"
+    payload = state.read_json(ledger)
+    payload["status"] = "removed"
+    if collision == "missing-home":
+        payload["vz_native"].pop("host_authority")
+    elif collision == "invalid-home":
+        payload["vz_native"]["host_authority"]["home_identity"] = [True, -1]
+    state.atomic_write_json(ledger, payload)
+    console = roots.runs / name / "console.log"
+    console.write_bytes(b"original retained native output\n")
+    console.chmod(0o600)
+    before = ledger.read_bytes()
+    observed.clear()
+    observed.update(_observed_vm(name, status="running"))
+    if collision != "same-home":
+        foreign = tmp_path / "ordinary-lima-home"
+        foreign.mkdir(mode=0o700)
+        monkeypatch.setenv("LIMA_HOME", str(foreign))
+    monkeypatch.setattr(
+        inventory.runtime_dispatch, "reconcile", _stale_ledger_projection if collision == "stale" else real_reconcile
+    )
+    monkeypatch.setattr(
+        inventory.runtime_dispatch,
+        "_preflight_existing_adapter",
+        lambda *_args, **_kwargs: pytest.fail("removed history reached provider preflight"),
+    )
+    monkeypatch.setattr(
+        vm_access, "spawn_process_session", lambda *_args, **_kwargs: pytest.fail("retained logs reached a transport")
+    )
+    monkeypatch.setattr(
+        vm_access.runtime_dispatch, "exec", lambda *_args, **_kwargs: pytest.fail("retained logs reached guest exec")
+    )
+
+    rows = inventory.list_vms(roots)["vms"]
+    canonical = next(row for row in rows if row["id"] == name)
+    assert canonical["status"] == canonical["runtime_status"] == "removed"
+    assert not any(canonical["access"][key] for key in ("shell", "exec", "metrics"))
+    assert canonical["access"]["transport"] is None
+    assert not any(canonical["lifecycle"].values())
+    result = inventory.vm_logs(roots, name, expected_run_id=run_id)
+    if collision == "foreign-home":
+        assert canonical["managed"] is True and canonical["stale"] is False
+        assert canonical["access"]["logs"] is True
+        assert inventory.get_vm(roots, name)["run_id"] == run_id
+        assert result["status"] == "available" and result["source"] == "retained-console"
+        assert result["log"] == "original retained native output"
+        wrong = inventory.vm_logs(roots, name, expected_run_id="33333333-3333-4333-8333-333333333333")
+        assert wrong["status"] == "unavailable" and wrong["reason"] == "identity" and wrong["log"] == ""
+    else:
+        assert canonical["managed"] is False and canonical["stale"] is True
+        assert canonical["access"]["logs"] is False and canonical["access"]["reason"] == "identity"
+        with pytest.raises(StateError):
+            inventory.get_vm(roots, name)
+        assert result["status"] == "unavailable" and result["log"] == ""
+    assert str(tmp_path) not in repr(rows) + repr(result)
+    assert "home_identity" not in repr(rows) + repr(result)
+    assert ledger.read_bytes() == before and console.read_bytes() == b"original retained native output\n"
+
+
+@pytest.mark.parametrize(
+    ("boundary", "operation"),
+    [
+        ("enumeration", "logs"),
+        ("enumeration", "metrics"),
+        ("enumeration", "access"),
+        ("access-resolution", "logs"),
+        ("access-resolution", "access"),
+        ("retained-console", "logs"),
+    ],
+)
+def test_native_detail_contention_is_bounded_busy_without_transport_or_path_leak(
+    tmp_path, monkeypatch, boundary, operation
+):
+    import fcntl
+
+    from palimpsest_local import vm_access
+
+    real_reconcile = inventory.runtime_dispatch.reconcile
+    roots, name, run_id, observed = _native_exited_vm(tmp_path, monkeypatch)
+    ledger = roots.runs / name / "state.json"
+    payload = state.read_json(ledger)
+    payload["status"] = "removed"
+    state.atomic_write_json(ledger, payload)
+    before = ledger.read_bytes()
+    console = roots.runs / name / "console.log"
+    console.write_bytes(b"retained bytes must not be read on busy admission\n")
+    console.chmod(0o600)
+    observed.clear()
+    observed.update(_observed_vm(name))
+    foreign = tmp_path / "ordinary-lima-home"
+    foreign.mkdir(mode=0o700)
+    monkeypatch.setenv("LIMA_HOME", str(foreign))
+    monkeypatch.setattr(inventory.runtime_dispatch, "reconcile", real_reconcile)
+    monkeypatch.setattr(
+        inventory.runtime_dispatch,
+        "_preflight_existing_adapter",
+        lambda *_args, **_kwargs: pytest.fail("busy removed history reached provider preflight"),
+    )
+    monkeypatch.setattr(
+        vm_access, "spawn_process_session", lambda *_args, **_kwargs: pytest.fail("busy admission reached transport")
+    )
+    monkeypatch.setattr(
+        vm_access.runtime_dispatch, "exec", lambda *_args, **_kwargs: pytest.fail("busy admission reached guest exec")
+    )
+    clock = [0.0]
+    monkeypatch.setattr(state.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(state.time, "sleep", lambda delay: clock.__setitem__(0, clock[0] + delay))
+    holders = []
+
+    def hold():
+        holder = os.open(roots.locks / f"{name}.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        holders.append(holder)
+
+    if boundary == "enumeration":
+        hold()
+    elif boundary == "access-resolution":
+        get_vm = inventory.get_vm
+
+        def hold_after_inventory(*args, **kwargs):
+            row = get_vm(*args, **kwargs)
+            hold()
+            return row
+
+        monkeypatch.setattr(inventory, "get_vm", hold_after_inventory)
+    else:
+        resolve = vm_access.Access.resolve
+
+        def hold_after_resolution(*args, **kwargs):
+            access = resolve(*args, **kwargs)
+            hold()
+            return access
+
+        monkeypatch.setattr(vm_access.Access, "resolve", staticmethod(hold_after_resolution))
+    try:
+        if operation == "access":
+            with pytest.raises(vm_access.VMAccessError) as caught:
+                vm_access.Access.resolve(roots, name, expected_run_id=run_id, purpose="logs")
+            assert caught.value.category == "busy"
+            assert str(tmp_path) not in str(caught.value)
+        else:
+            endpoint = inventory.vm_logs if operation == "logs" else inventory.vm_metrics
+            result = endpoint(roots, name, expected_run_id=run_id)
+            assert result["status"] == "unavailable" and result["reason"] == "busy"
+            if operation == "logs":
+                assert result["log"] == "" and result["source"] is None
+            else:
+                assert result["cpu"] is None and result["memory"] is None and result["measured_at"] is None
+            assert str(tmp_path) not in repr(result) and "holder" not in repr(result)
+        assert clock[0] == pytest.approx(5) and len(holders) == 1
+        assert ledger.read_bytes() == before
+    finally:
+        for holder in holders:
+            os.close(holder)
+
+
+def _native_custody_fixture(tmp_path, monkeypatch):
+    from palimpsest_local import vz_native_runtime as native
+
+    home = tmp_path / "pinned-home"
+    home.mkdir(mode=0o700)
+    custody = home / "_palimpsest-native"
+    custody.mkdir(mode=0o700)
+    value = {"lima_home": str(home), "expires_unix": 1}
+    config_path = tmp_path / "host.json"
+    config_path.write_bytes(native._json(value))
+    config_path.chmod(0o600)
+    _raw, digest, stamp = native._file(config_path, private=True, limit=native._MAX_JSON)
+    info = home.stat()
+    config = native.VZHostConfig(config_path, digest, tuple(stamp), value, {}, {}, (info.st_dev, info.st_ino))
+    monkeypatch.setattr(native.time, "time", lambda: 0)
+    monkeypatch.setattr(native, "_require_native_custody_owner", lambda: None)
+    monkeypatch.setattr(native.platforms, "select_backend", lambda *_args, **_kwargs: "lima-vz")
+    return native, config, custody
+
+
+@pytest.mark.parametrize(
+    ("operation", "outcome"),
+    [
+        ("exec", "healthy"),
+        ("shell", "healthy"),
+        ("exec", "short-guest-timeout"),
+        ("exec", "shared-budget"),
+        ("shell", "shared-budget"),
+        ("exec", "hold"),
+        ("shell", "hold"),
+        ("exec", "expired-budget"),
+    ],
+)
+def test_native_session_admission_waits_once_within_caller_budget_before_any_guest_submission(
+    tmp_path, monkeypatch, operation, outcome
+):
+    import fcntl
+
+    from palimpsest_local.runtime_types import ExecRequest
+
+    native, config, custody = _native_custody_fixture(tmp_path, monkeypatch)
+    roots = _setup_roots(tmp_path / "ledger")
+    name = "admission-native"
+    _resource_run(roots, name, runtime_kind="oci-root", status="running")
+    record = state.read_run_dispatch_record(roots, name)
+    clock, loaded = [0.0], []
+    monkeypatch.setattr(native.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(native, "_config_for", lambda _authority: config)
+
+    class AdmissionReached(Exception):
+        pass
+
+    def stop_before_provider(*_args, **_kwargs):
+        _assert_run_lock_held(roots, name)
+        loaded.append(True)
+        raise AdmissionReached
+
+    monkeypatch.setattr(native, "_load", stop_before_provider)
+    monkeypatch.setattr(
+        native, "_control", lambda *_args, **_kwargs: pytest.fail("admission test reached guest control")
+    )
+    monkeypatch.setattr(
+        native, "NativeProcessSession", lambda *_args, **_kwargs: pytest.fail("admission test submitted guest process")
+    )
+    holder = os.open(custody / "lock", os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def previous_observer_settles(delay):
+        clock[0] += delay
+        if outcome in {"healthy", "hold"}:
+            if outcome == "hold":
+                marker = custody / "hold-11111111-1111-4111-8111-111111111111.json"
+                marker.write_bytes(b"{}")
+                marker.chmod(0o600)
+            fcntl.flock(holder, fcntl.LOCK_UN)
+
+    monkeypatch.setattr(native.time, "sleep", previous_observer_settles)
+    budget = state.RunObservationWaitBudget({"shared-budget": 0.02, "expired-budget": 0}.get(outcome, 5))
+    request = ExecRequest(("true",), 10 if outcome == "short-guest-timeout" else 1000)
+
+    def admit():
+        if operation == "exec":
+            return native.exec_session(name, request, roots=roots, _expected_record=record, _observation_budget=budget)
+        return native.shell_session(name, roots=roots, _expected_record=record, _observation_budget=budget)
+
+    try:
+        if outcome == "healthy":
+            with pytest.raises(AdmissionReached):
+                admit()
+            assert loaded == [True] and clock[0] > 0
+        else:
+            with pytest.raises(native.VZNativeHold if outcome == "hold" else RuntimeBusyError):
+                admit()
+            assert loaded == []
+            if outcome in {"short-guest-timeout", "shared-budget", "expired-budget"}:
+                assert clock[0] == pytest.approx(
+                    {"short-guest-timeout": 5, "shared-budget": 0.02, "expired-budget": 0}[outcome]
+                )
+    finally:
+        os.close(holder)
+
+
+@pytest.mark.parametrize(
+    "after_wait", ["healthy", "expired", "expired-allowed", "changed-binding", "active-actor", "malformed-hold"]
+)
+def test_native_pinned_preflight_waits_for_custody_then_rechecks_authority(tmp_path, monkeypatch, after_wait):
+    import fcntl
+
+    native, config, custody = _native_custody_fixture(tmp_path, monkeypatch)
+    waits, probes = [], []
+    monkeypatch.setattr(native.time, "time", lambda: 2 if waits and after_wait.startswith("expired") else 0)
+
+    def probe(selected, argv, owned, **kwargs):
+        probes.append((selected, argv, owned, kwargs))
+        return b"limactl version 2.2.1\n"
+
+    monkeypatch.setattr(native, "_lima", probe)
+    holder = os.open(custody / "lock", os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def settle_previous_owner(delay):
+        waits.append(delay)
+        if after_wait == "active-actor":
+            (custody / "active.json").write_text("{}")
+        elif after_wait == "malformed-hold":
+            marker = custody / "hold-11111111-1111-4111-8111-111111111111.json"
+            marker.write_text("{}")
+            marker.chmod(0o600)
+        elif after_wait == "changed-binding":
+            config.path.write_bytes(b"{}")
+        fcntl.flock(holder, fcntl.LOCK_UN)
+
+    monkeypatch.setattr(native.time, "sleep", settle_previous_owner)
+    try:
+        if after_wait in {"healthy", "expired-allowed"}:
+            allow_expired = after_wait == "expired-allowed"
+            assert (
+                native.preflight_pinned_lima(config, timeout_seconds=2, custody_timeout=2, allow_expired=allow_expired)
+                is config
+            )
+            assert len(probes) == 1
+        else:
+            with pytest.raises((StateError, native.VZNativeHold)) as caught:
+                native.preflight_pinned_lima(config, timeout_seconds=2, custody_timeout=2)
+            assert not isinstance(caught.value, RuntimeBusyError)
+            assert probes == []
+        assert len(waits) == 1
+    finally:
+        os.close(holder)
+
+
+def test_native_pinned_preflight_custody_timeout_does_not_run_or_replay_probe(tmp_path, monkeypatch):
+    import fcntl
+
+    native, config, custody = _native_custody_fixture(tmp_path, monkeypatch)
+    probes = []
+    monkeypatch.setattr(native, "_lima", lambda *_args, **_kwargs: probes.append(True))
+    holder = os.open(custody / "lock", os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        with pytest.raises(RuntimeBusyError):
+            native.preflight_pinned_lima(config, timeout_seconds=0.01, custody_timeout=0.01)
+        assert probes == []
+    finally:
+        os.close(holder)
+
+
+@pytest.mark.parametrize(
+    "change", ["benign-entry", "namespace-replaced", "namespace-mode", "lock-replaced", "lock-mode", "lock-linked"]
+)
+def test_native_custody_rechecks_visible_namespace_and_held_lock_after_wait(tmp_path, monkeypatch, change):
+    import fcntl
+
+    native, config, custody = _native_custody_fixture(tmp_path, monkeypatch)
+    holder = os.open(custody / "lock", os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    waits = []
+
+    def settle_previous_owner(delay):
+        waits.append(delay)
+        if change == "benign-entry":
+            (custody / "ordinary-entry").write_text("changes directory ctime")
+        elif change == "namespace-replaced":
+            custody.rename(custody.with_name("retired-custody"))
+            custody.mkdir(mode=0o700)
+        elif change == "namespace-mode":
+            custody.chmod(0o755)
+        elif change == "lock-replaced":
+            (custody / "lock").unlink()
+            replacement = os.open(custody / "lock", os.O_RDWR | os.O_CREAT, 0o600)
+            os.close(replacement)
+        elif change == "lock-mode":
+            (custody / "lock").chmod(0o644)
+        elif change == "lock-linked":
+            os.link(custody / "lock", custody / "unexpected-link")
+        fcntl.flock(holder, fcntl.LOCK_UN)
+
+    monkeypatch.setattr(native.time, "sleep", settle_previous_owner)
+    try:
+        if change == "benign-entry":
+            with native._custody(config, lock_timeout=1) as acquired:
+                assert acquired == custody
+        else:
+            with pytest.raises(native.VZNativeHold):
+                with native._custody(config, lock_timeout=1):
+                    pytest.fail("changed custody binding reached a native actor")
+        assert len(waits) == 1
+    finally:
+        os.close(holder)
+
+
+@pytest.mark.parametrize(
+    ("operation_name", "after_wait"),
+    [
+        (None, "healthy"),
+        ("run", "healthy"),
+        ("start", "healthy"),
+        ("rm", "healthy"),
+        ("reconcile", "healthy"),
+        ("reconcile", "active-actor"),
+        ("reconcile", "malformed-hold"),
+    ],
+)
+def test_native_capability_only_reconcile_waits_for_real_custody(tmp_path, monkeypatch, operation_name, after_wait):
+    import fcntl
+
+    from palimpsest_local.runtime_types import (
+        CapabilityErrorCategory,
+        DispatchKey,
+        RuntimeBackend,
+        RuntimeKind,
+        RuntimeOperation,
+    )
+
+    native, config, custody = _native_custody_fixture(tmp_path, monkeypatch)
+    real_check = _REAL_CHECK_CAPABILITY
+    waits, probes = [], []
+
+    def check(requirement, **kwargs):
+        if requirement.capability_id.startswith("tool."):
+            return real_check(requirement, **kwargs)
+        return CapabilityCheck(requirement.capability_id, "fixture-host", True)
+
+    def probe(*_args, **_kwargs):
+        probes.append(True)
+        return b"limactl version 2.2.1\n"
+
+    monkeypatch.setattr(native.platforms, "_check_capability", check)
+    monkeypatch.setattr(native, "_lima", probe)
+    holder = os.open(custody / "lock", os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def settle_previous_owner(delay):
+        waits.append(delay)
+        if after_wait == "active-actor":
+            (custody / "active.json").write_text("{}")
+        elif after_wait == "malformed-hold":
+            marker = custody / "hold-11111111-1111-4111-8111-111111111111.json"
+            marker.write_text("{}")
+            marker.chmod(0o600)
+        fcntl.flock(holder, fcntl.LOCK_UN)
+
+    monkeypatch.setattr(native.time, "sleep", settle_previous_owner)
+    issued_reports = dict(native.platforms._ISSUED_OPERATION_REPORTS)
+    consumed_reports = dict(native.platforms._CONSUMED_OPERATION_REPORTS)
+    try:
+        if operation_name is None:
+            with pytest.raises(RuntimeBusyError):
+                native.preflight_pinned_lima(config)
+            assert waits == [] and probes == []
+        else:
+            key = DispatchKey(RuntimeKind.OCI_ROOT, RuntimeBackend.LIMA_VZ)
+            profile = native.platforms.capability_profile(key, RuntimeOperation(operation_name))
+            if operation_name == "reconcile":
+                report = native.platforms.evaluate_capability_profile(
+                    profile,
+                    subject_digest="sha256:" + "a" * 64,
+                    native_host_config=config,
+                    host=native.platforms.HostPlatform("Darwin", "aarch64"),
+                )
+                assert len(waits) == 1
+                if after_wait == "healthy":
+                    assert report.successful and probes == [True]
+                else:
+                    assert not report.successful and probes == []
+                    check = next(item for item in report.checks if item.capability_id == "tool.limactl")
+                    assert check.error_category is CapabilityErrorCategory.CHECK_FAILED
+                    assert check.observed == "native-pin-check-failed"
+                    assert native.platforms._ISSUED_OPERATION_REPORTS == issued_reports
+                    assert native.platforms._CONSUMED_OPERATION_REPORTS == consumed_reports
+            else:
+                with pytest.raises(RuntimeBusyError):
+                    native.platforms.evaluate_capability_profile(
+                        profile,
+                        subject_digest="sha256:" + "a" * 64,
+                        native_host_config=config,
+                        host=native.platforms.HostPlatform("Darwin", "aarch64"),
+                    )
+                assert waits == [] and probes == []
+                assert native.platforms._ISSUED_OPERATION_REPORTS == issued_reports
+                assert native.platforms._CONSUMED_OPERATION_REPORTS == consumed_reports
+    finally:
+        os.close(holder)
+
+
+def test_slow_healthy_provider_work_does_not_consume_shared_acquisition_allowance(tmp_path, monkeypatch):
+    import fcntl
+    import uuid
+    from copy import deepcopy
+
+    real_reconcile = inventory.runtime_dispatch.reconcile
+    roots, first_name, first_id, _observed = _native_exited_vm(tmp_path, monkeypatch)
+    native, config, custody = _native_custody_fixture(tmp_path, monkeypatch)
+    template = state.read_json(roots.runs / first_name / "state.json")
+    names = [first_name] + [f"slow-native-{index}" for index in range(5)]
+    home = config.home.stat()
+    for name in names:
+        run_id = (
+            first_id if name == first_name else _resource_run(roots, name, runtime_kind="oci-root", status="exited")
+        )
+        payload = deepcopy(template)
+        payload.update(name=name, run_id=run_id)
+        binding = payload["vz_native"]
+        binding["instance"] = "plm-" + run_id.replace("-", "")[:12]
+        binding["root_volume_id"] = str(uuid.uuid5(uuid.NAMESPACE_DNS, "wait-budget:" + name))
+        binding["host_authority"]["home_identity"] = [home.st_dev, home.st_ino]
+        binding["plan"].update(run_id=run_id, run_name=name, root_volume_id=binding["root_volume_id"])
+        binding["plan_sha256"] = hashlib.sha256(native._json(binding["plan"])).hexdigest()
+        state.atomic_write_json(roots.runs / name / "state.json", payload)
+
+    budget = state.RunObservationWaitBudget()
+    clock, waits, probes, loads = [0.0], [], [], []
+    release_at = [None]
+    holder = os.open(custody / "lock", os.O_RDWR | os.O_CREAT, 0o600)
+
+    def slow_probe(*_args, **_kwargs):
+        probes.append(True)
+        clock[0] += 3
+        return b"limactl version 2.2.1\n"
+
+    def config_for_refresh(_authority):
+        # The prior ordinary observer owns only namespace custody, not this run.
+        fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        release_at[0] = clock[0] + 0.2
+        return config
+
+    def settle_previous_observer(delay):
+        waits.append(delay)
+        clock[0] += delay
+        if release_at[0] is not None and clock[0] + 1e-9 >= release_at[0]:
+            fcntl.flock(holder, fcntl.LOCK_UN)
+            release_at[0] = None
+
+    def slow_load(authority, *_args, **_kwargs):
+        loads.append(True)
+        clock[0] += 3
+        return (authority.mutable_state(),)
+
+    monkeypatch.setattr(inventory.runtime_dispatch, "reconcile", real_reconcile)
+    monkeypatch.setattr(native.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(native.time, "sleep", settle_previous_observer)
+    monkeypatch.setattr(native.platforms, "_check_capability", _REAL_CHECK_CAPABILITY)
+    monkeypatch.setattr(native, "host_config_for_run", lambda *_args, **_kwargs: config)
+    monkeypatch.setattr(native, "_config_for", config_for_refresh)
+    monkeypatch.setattr(native, "_lima", slow_probe)
+    monkeypatch.setattr(native, "_load", slow_load)
+    monkeypatch.setattr(native, "_owned_instance", lambda *_args, **_kwargs: {"status": "Stopped"})
+    monkeypatch.setattr(native, "_retained_stopped_observation", lambda *_args, **_kwargs: None)
+    try:
+        result = real_reconcile(roots=roots, _observation_budget=budget)
+        assert result.errors == ()
+        assert [row.name for row in result.summaries] == sorted(names)
+        assert all(not row.stale and row.status == "stopped" for row in result.summaries)
+        assert len(probes) == len(loads) == 6
+        assert clock[0] == pytest.approx(36 + sum(waits))
+        assert 0 < sum(waits) <= 5
+        assert 5 - budget.remaining_seconds == pytest.approx(sum(waits))
+    finally:
+        os.close(holder)
+
+
+@pytest.mark.parametrize("boundary", ["preflight", "refresh"])
+@pytest.mark.parametrize("action", ["start", "stop", "remove", "remove_volumes"])
+def test_native_namespace_busy_selection_refuses_lifecycle_before_identity_or_metadata(
+    tmp_path, monkeypatch, boundary, action
+):
+    import fcntl
+
+    from palimpsest_local import vm_access
+
+    real_reconcile = inventory.runtime_dispatch.reconcile
+    roots, name, run_id, _observed = _native_exited_vm(tmp_path, monkeypatch)
+    native, config, custody = _native_custody_fixture(tmp_path, monkeypatch)
+    ledger = roots.runs / name / "state.json"
+    before = ledger.read_bytes()
+    clock = [0.0]
+    monkeypatch.setattr(native.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(native.time, "sleep", lambda delay: clock.__setitem__(0, clock[0] + delay))
+    monkeypatch.setattr(inventory.runtime_dispatch, "reconcile", real_reconcile)
+    monkeypatch.setattr(native.platforms, "_check_capability", _REAL_CHECK_CAPABILITY)
+    monkeypatch.setattr(native, "host_config_for_run", lambda *_args, **_kwargs: config)
+    monkeypatch.setattr(native, "_config_for", lambda _authority: config)
+    monkeypatch.setattr(native, "_load", lambda *_args, **_kwargs: pytest.fail("busy namespace reached provider load"))
+    holder = os.open(custody / "lock", os.O_RDWR | os.O_CREAT, 0o600)
+    if boundary == "preflight":
+        fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def probe(*_args, **_kwargs):
+        # A separate run's observer acquires shared namespace custody after
+        # this run's successful preflight, before refresh admission.
+        return b"limactl version 2.2.1\n"
+
+    def config_for_refresh(_authority):
+        fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return config
+
+    monkeypatch.setattr(native, "_lima", probe)
+    if boundary == "refresh":
+        monkeypatch.setattr(native, "_config_for", config_for_refresh)
+    try:
+        row = inventory.get_vm(roots, name)
+        assert row["stale"] and row["managed"] is False
+        assert row["access"]["reason"] == "busy" and row["access"]["transport"] is None
+        assert not any(row["access"][key] for key in ("shell", "exec", "metrics", "logs"))
+        assert not any(row["lifecycle"].values())
+        assert clock[0] == pytest.approx(5)
+        assert ledger.read_bytes() == before
+
+        # Exercise selection using the genuinely degraded observation, not a
+        # fabricated managed row; busy must win over its unmanaged classification.
+        monkeypatch.setattr(inventory, "get_vm", lambda *_args, **_kwargs: row)
+        monkeypatch.setattr(
+            state,
+            "read_run_ledger_snapshot",
+            lambda *_args, **_kwargs: pytest.fail("busy selection reread metadata"),
+        )
+        for operation in ("start", "stop", "rm"):
+            monkeypatch.setattr(
+                inventory.runtime_dispatch,
+                operation,
+                lambda *_args, **_kwargs: pytest.fail("busy selection reached lifecycle dispatch"),
+            )
+        with pytest.raises(RuntimeBusyError) as caught:
+            if action in {"start", "stop"}:
+                inventory.vm_lifecycle(roots, name, action, expected_run_id=run_id)
+            else:
+                inventory.remove_vm(
+                    roots, name, expected_run_id=run_id, confirmation=name, volumes=action == "remove_volumes"
+                )
+        assert str(tmp_path) not in str(caught.value)
+        with pytest.raises(vm_access.VMAccessError) as access_error:
+            vm_access.Access.resolve(roots, name, expected_run_id=run_id)
+        assert access_error.value.category == "busy"
+        for endpoint in (inventory.vm_metrics, inventory.vm_logs):
+            result = endpoint(roots, name, expected_run_id=run_id)
+            assert result["status"] == "unavailable" and result["reason"] == "busy"
+            assert str(tmp_path) not in repr(result)
+    finally:
+        os.close(holder)
+
+
+@pytest.mark.parametrize("contention", ["all-preflight", "preflight-then-refresh"])
+def test_native_reconcile_shares_one_custody_wait_budget_across_all_runs(tmp_path, monkeypatch, contention):
+    import fcntl
+
+    native, config, custody = _native_custody_fixture(tmp_path, monkeypatch)
+    roots = _setup_roots(tmp_path / "ledger")
+    names = [f"native-{index}" for index in range(6)]
+    for name in names:
+        _resource_run(roots, name, runtime_kind="oci-root", status="exited")
+    clock, probes, refreshes = [0.0], [], []
+    monkeypatch.setattr(native.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(native.platforms, "_check_capability", _REAL_CHECK_CAPABILITY)
+    monkeypatch.setattr(native, "host_config_for_run", lambda *_args, **_kwargs: config)
+
+    def probe(*_args, **_kwargs):
+        probes.append(True)
+        return b"limactl version 2.2.1\n"
+
+    monkeypatch.setattr(native, "_lima", probe)
+    holder = os.open(custody / "lock", os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    released = False
+
+    def wait_for_previous_owner(delay):
+        nonlocal released
+        clock[0] += delay
+        if contention == "preflight-then-refresh" and not released and clock[0] >= 2:
+            fcntl.flock(holder, fcntl.LOCK_UN)
+            released = True
+
+    def config_for_refresh(_authority):
+        refreshes.append(True)
+        fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return config
+
+    monkeypatch.setattr(native.time, "sleep", wait_for_previous_owner)
+    monkeypatch.setattr(native, "_config_for", config_for_refresh)
+    monkeypatch.setattr(
+        native, "_load", lambda *_args, **_kwargs: pytest.fail("timed-out custody reached provider load")
+    )
+    try:
+        result = inventory.runtime_dispatch.reconcile(
+            roots=roots,
+            _snapshot_observer=lambda _snapshot: pytest.fail("busy namespace reached alias observer"),
+        )
+        assert [row.name for row in result.summaries] == names
+        assert all(row.stale for row in result.summaries)
+        assert clock[0] == pytest.approx(state.RUN_OBSERVATION_TIMEOUT_SECONDS)
+        assert probes == ([True] if contention == "preflight-then-refresh" else [])
+        assert refreshes == ([True] if contention == "preflight-then-refresh" else [])
+        assert [error.code for error in result.errors] == ["runtime-busy"] * 6
+    finally:
+        os.close(holder)
+
+
+@pytest.mark.parametrize("after_wait", ["healthy", "active-actor", "malformed-hold", "timeout"])
+def test_native_refresh_waits_for_custody_without_skipping_post_acquisition_guards(tmp_path, monkeypatch, after_wait):
+    import fcntl
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    native, config, custody = _native_custody_fixture(tmp_path, monkeypatch)
+    waits, provider_reads, writes = [], [], []
+    real_sleep = native.time.sleep
+    if after_wait == "timeout":
+        monkeypatch.setattr(native, "RUN_OBSERVATION_TIMEOUT_SECONDS", 0.01)
+
+    @contextmanager
+    def authority(*_args, **_kwargs):
+        yield SimpleNamespace(snapshot=SimpleNamespace(state={"status": "exited"}))
+
+    def load(*_args, **_kwargs):
+        provider_reads.append(True)
+        return ({"vz_native": {}},)
+
+    monkeypatch.setattr(native, "locked_existing_run", authority)
+    monkeypatch.setattr(native, "_config_for", lambda _authority: config)
+    monkeypatch.setattr(native, "_load", load)
+    monkeypatch.setattr(native, "_owned_instance", lambda *_args, **_kwargs: {"status": "Stopped"})
+    monkeypatch.setattr(native, "_retained_stopped_observation", lambda *_args: None)
+    monkeypatch.setattr(native, "_write", lambda _authority, status, _data: writes.append(status))
+    holder = os.open(custody / "lock", os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def settle_previous_owner(delay):
+        waits.append(delay)
+        if after_wait == "timeout":
+            real_sleep(delay)
+            return
+        if after_wait == "active-actor":
+            (custody / "active.json").write_text("{}")
+        elif after_wait == "malformed-hold":
+            marker = custody / "hold-11111111-1111-4111-8111-111111111111.json"
+            marker.write_text("{}")
+            marker.chmod(0o600)
+        fcntl.flock(holder, fcntl.LOCK_UN)
+
+    monkeypatch.setattr(native.time, "sleep", settle_previous_owner)
+    try:
+        if after_wait == "healthy":
+            native.refresh_run(None, "fixture")
+            assert provider_reads == [True] and writes == ["stopped"]
+        else:
+            with pytest.raises(RuntimeBusyError if after_wait == "timeout" else native.VZNativeHold):
+                native.refresh_run(None, "fixture")
+            assert provider_reads == [] and writes == []
+        if after_wait != "timeout":
+            assert len(waits) == 1
+    finally:
+        os.close(holder)
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "stale-ledger",
+        "stale-running",
+        "hold",
+        "failed",
+        "starting",
+        "removed",
+        "unknown-main",
+        "forged-plan",
+        "preplan",
+        "provider-broken",
+        "forged-instance",
+        "missing-home-binding",
+    ],
+)
+def test_native_alias_counterexamples_never_enable_canonical_guest_access(tmp_path, monkeypatch, damage):
+    from palimpsest_local import vm_access
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("ineligible native selection reached a guest transport")
+
+    monkeypatch.setattr(vm_access.runtime_dispatch, "exec", forbidden)
+    monkeypatch.setattr(vm_access, "spawn_process_session", forbidden)
+    roots, name, run_id, observed = _native_exited_vm(tmp_path, monkeypatch)
+    ledger = roots.runs / name / "state.json"
+    payload = state.read_json(ledger)
+    if damage == "stale-running":
+        payload["status"] = "running"
+        payload["vz_status"]["main"]["state"] = "running"
+    if damage in {"stale-ledger", "stale-running"}:
+        monkeypatch.setattr(inventory.runtime_dispatch, "reconcile", _stale_ledger_projection)
+    elif damage == "hold":
+        payload["vz_native"]["hold"] = "stop-incomplete"
+    elif damage in {"failed", "starting", "removed"}:
+        payload["status"] = damage
+    elif damage == "unknown-main":
+        payload["vz_status"]["main"]["state"] = "unknown"
+    elif damage == "forged-plan":
+        payload["vz_native"]["plan"]["run_name"] = "other"
+    elif damage == "preplan":
+        del payload["vz_native"]["plan"]
+        del payload["vz_native"]["plan_sha256"]
+    elif damage == "forged-instance":
+        payload["vz_native"]["instance"] = "plm-000000000000"
+    elif damage == "missing-home-binding":
+        del payload["vz_native"]["host_authority"]
+    elif damage == "provider-broken":
+        observed["status"] = "failed"
+    state.atomic_write_json(ledger, payload)
+    rows = inventory.list_vms(roots)["vms"]
+    canonical = [row for row in rows if row["id"] == name]
+    if damage == "forged-plan":
+        assert canonical == []
+    else:
+        assert len(canonical) == 1
+        if damage in {"failed", "starting", "removed"}:
+            assert canonical[0]["status"] == damage
+        assert not canonical[0]["access"]["exec"] and not canonical[0]["access"]["metrics"]
+    for row in rows:
+        if row["managed"] is False:
+            assert not row["access"]["exec"] and not row["access"]["metrics"]
+            assert not row["lifecycle"]["remove"]
+    result = inventory.vm_metrics(roots, name if canonical else observed["id"], expected_run_id=run_id)
+    assert result["status"] == "unavailable" and result["reason"] in {"stopped", "identity"}
+
+
+@pytest.mark.parametrize(
+    "observation",
+    [
+        "wrong-name",
+        "same-prefix-other-uuid",
+        "wrong-backend",
+        "unknown-kind",
+        "stale-provider",
+        "missing-provider",
+        "missing-path",
+        "foreign-home-clone",
+    ],
+)
+@pytest.mark.parametrize("main_status", ["running", "exited"])
+def test_native_pinned_reconcile_survives_unrelated_or_unavailable_ambient_discovery(
+    tmp_path, monkeypatch, observation, main_status
+):
+    from palimpsest_local import vm_access
+
+    roots, name, run_id, observed = _native_exited_vm(tmp_path, monkeypatch)
+    ledger = roots.runs / name / "state.json"
+    payload = state.read_json(ledger)
+    payload["status"] = main_status
+    payload["vz_status"]["main"]["state"] = main_status
+    state.atomic_write_json(ledger, payload)
+    original = ledger.read_bytes()
+    if observation == "wrong-name":
+        observed["name"] = "plm-000000000000"
+    elif observation == "same-prefix-other-uuid":
+        observed["run_id"] = run_id[:14] + ("0" if run_id[14] != "0" else "1") + run_id[15:]
+    elif observation == "wrong-backend":
+        observed["backend"] = "lima-qemu"
+    elif observation == "unknown-kind":
+        observed["runtime_kind"] = "unknown"
+    elif observation == "stale-provider":
+        observed["stale"] = True
+    elif observation == "foreign-home-clone":
+        foreign = tmp_path / "foreign-lima-home"
+        foreign.mkdir(mode=0o700)
+        monkeypatch.setenv("LIMA_HOME", str(foreign))
+        observed.update(status="stopped", memory_mib=16384, vcpus=16)
+    elif observation == "missing-provider":
+        monkeypatch.setattr(
+            inventory.host_inventory,
+            "observe",
+            lambda: {"vms": [], "volumes": [], "networks": [], "warnings": []},
+        )
+    else:
+        # Exercise the real ambient no-limactl discovery branch, not a fake VM row.
+        monkeypatch.setenv("PATH", str(tmp_path / "empty-path"))
+        monkeypatch.setattr(inventory.host_inventory.shutil, "which", lambda _tool: None)
+
+        def forbidden(*args, **kwargs):
+            pytest.fail("ambient discovery ran a process with no limactl in PATH")
+
+        monkeypatch.setattr(inventory.host_inventory.subprocess, "run", forbidden)
+
+        def unavailable_observation():
+            vms, volumes, networks, warnings = inventory.host_inventory._observe_lima()
+            return {"vms": vms, "volumes": volumes, "networks": networks, "warnings": warnings}
+
+        monkeypatch.setattr(inventory.host_inventory, "observe", unavailable_observation)
+    result = inventory.list_vms(roots)
+    row = inventory.get_vm(roots, name)
+    assert row["managed"] is True and row["stale"] is False
+    assert row["status"] == "running" and row["runtime_status"] == main_status
+    assert row["source"] == "run-ledger"
+    assert row["memory_mib"] is None and row["vcpus"] is None
+    assert row["ssh"] == {"host": None, "port": 22}
+    assert row["guest_ip"] is None and row["ports"] == []
+    assert row["access"]["exec"] and row["access"]["metrics"]
+    access = vm_access.Access.resolve(roots, name, expected_run_id=run_id)
+    assert access.record.run_id == run_id and access.row["status"] == "running"
+    for external in result["vms"]:
+        if external["id"] != name:
+            assert external["managed"] is False
+            assert not any(external["access"][action] for action in ("shell", "exec", "metrics", "logs"))
+            assert not any(external["lifecycle"][action] for action in ("start", "stop", "remove", "remove_volumes"))
+    inspected = inventory.runtime_dispatch.inspect_run(name, roots=roots)
+    assert inspected.lifecycle.status == main_status and inspected.detail.main_state == main_status
+    assert ledger.read_bytes() == original
+
+
+@pytest.mark.parametrize("ambient_running", [False, True])
+@pytest.mark.parametrize("main_state", ["exited", "absent"])
+def test_native_pinned_stopped_reconcile_cannot_be_upgraded_by_ambient_running(
+    tmp_path, monkeypatch, ambient_running, main_state
+):
+    from palimpsest_local import vm_access
+
+    roots, name, run_id, _observed = _native_exited_vm(tmp_path, monkeypatch)
+    ledger = roots.runs / name / "state.json"
+    payload = state.read_json(ledger)
+    payload["status"] = "stopped"
+    payload["vz_status"]["main"]["state"] = main_state
+    if main_state == "absent":
+        payload["vz_status"]["main"].update(pid=0, exit_code=None, exit_signal=None)
+    state.atomic_write_json(ledger, payload)
+    original = ledger.read_bytes()
+    if not ambient_running:
+        monkeypatch.setattr(
+            inventory.host_inventory,
+            "observe",
+            lambda: {"vms": [], "volumes": [], "networks": [], "warnings": []},
+        )
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("pinned stopped native selection reached a guest transport")
+
+    monkeypatch.setattr(vm_access.runtime_dispatch, "exec", forbidden)
+    monkeypatch.setattr(vm_access, "spawn_process_session", forbidden)
+    row = inventory.get_vm(roots, name)
+    assert row["managed"] is True and row["stale"] is False
+    assert row["status"] == row["runtime_status"] == "stopped"
+    assert not row["access"]["exec"] and not row["access"]["metrics"]
+    assert row["access"]["logs"] is True
+    result = inventory.vm_metrics(roots, name, expected_run_id=run_id)
+    assert result["status"] == "unavailable" and result["reason"] == "stopped"
+    inspected = inventory.runtime_dispatch.inspect_run(name, roots=roots)
+    assert inspected.lifecycle.status == "stopped" and inspected.detail.main_state == main_state
+    assert ledger.read_bytes() == original
+
+
+@pytest.mark.parametrize("runtime_status", ["exited", "stopped"])
+def test_native_canonical_id_is_not_shadowed_by_same_name_foreign_home_clone(tmp_path, monkeypatch, runtime_status):
+    from palimpsest_local import vz_native_runtime
+
+    roots, name, run_id, observed = _native_exited_vm(tmp_path, monkeypatch)
+    alias = observed["name"]
+    original = roots.runs / name
+    renamed = roots.runs / alias
+    original.rename(renamed)
+    owner = state.read_json(renamed / "owner.json")
+    owner["name"] = alias
+    state.atomic_write_json(renamed / "owner.json", owner)
+    payload = state.read_json(renamed / "state.json")
+    payload["name"] = alias
+    payload["status"] = runtime_status
+    payload["vz_native"]["plan"]["run_name"] = alias
+    payload["vz_native"]["plan_sha256"] = hashlib.sha256(
+        vz_native_runtime._json(payload["vz_native"]["plan"])
+    ).hexdigest()
+    state.atomic_write_json(renamed / "state.json", payload)
+    foreign = tmp_path / "foreign-home"
+    foreign.mkdir(mode=0o700)
+    monkeypatch.setenv("LIMA_HOME", str(foreign))
+    observed["status"] = "stopped"
+    rows = inventory.list_vms(roots)["vms"]
+    assert len(rows) == 2
+    canonical = inventory.get_vm(roots, alias)
+    assert canonical["id"] == alias and canonical["run_id"] == run_id
+    assert canonical["managed"] is True and canonical["stale"] is False
+    running = runtime_status == "exited"
+    assert canonical["status"] == ("running" if running else "stopped")
+    assert canonical["runtime_status"] == runtime_status
+    assert canonical["access"]["exec"] is running and canonical["access"]["metrics"] is running
+    assert canonical["access"]["logs"] is True
+    clone = inventory.get_vm(roots, observed["id"])
+    assert clone["managed"] is False and clone["status"] == "stopped"
+    assert not any(clone["access"][action] for action in ("shell", "exec", "metrics", "logs"))
+    assert not any(clone["lifecycle"][action] for action in ("start", "stop", "remove", "remove_volumes"))
+
+
+def test_unmanaged_native_physical_alias_is_not_adopted_or_given_generic_controls(tmp_path, monkeypatch):
+    roots, name, run_id, observed = _native_exited_vm(tmp_path, monkeypatch)
+    (roots.runs / name).rename(tmp_path / "retained-original-run")
+    rows = inventory.list_vms(roots)["vms"]
+    assert len(rows) == 1 and rows[0]["id"] == observed["id"]
+    row = rows[0]
+    assert row["managed"] is False and row["runtime_kind"] == "oci-root"
+    assert not any(row["access"][action] for action in ("shell", "exec", "metrics", "logs"))
+    assert not any(row["lifecycle"][action] for action in ("start", "stop", "remove", "remove_volumes"))
+    result = inventory.vm_metrics(roots, row["id"], expected_run_id=run_id)
+    assert result["status"] == "unavailable" and result["reason"] == "identity"
+    assert list(roots.runs.iterdir()) == []
+
+
+def test_managed_cloud_reserved_name_keeps_existing_exact_name_merge(tmp_path, monkeypatch):
+    roots = _setup_roots(tmp_path)
+    name = "plm-111111111111"
+    run_id = _resource_run(roots, name)
+    observed = _observed_vm(name, run_id)
+    observed.update(runtime_kind="unknown", stale=False)
+    monkeypatch.setattr(inventory.runtime_dispatch, "reconcile", _live_ledger_projection)
+    monkeypatch.setattr(
+        inventory.host_inventory,
+        "observe",
+        lambda: {"vms": [observed], "volumes": [], "networks": [], "warnings": []},
+    )
+    row = inventory.get_vm(roots, name)
+    assert row["managed"] is True and row["runtime_kind"] == "cloud-image"
+    assert row["status"] == "running" and row["access"]["transport"] == "lima"
+    assert row["lifecycle"]["stop"] is True
 
 
 def test_host_vms_are_visible_without_adopting_external_state(tmp_path, monkeypatch):
@@ -1904,7 +3557,7 @@ def test_host_same_name_different_run_id_is_not_managed(tmp_path, monkeypatch):
     roots = _setup_roots(tmp_path)
     _resource_run(roots, "collision")
     external = _observed_vm("collision", "33333333-3333-3333-3333-333333333333")
-    monkeypatch.setattr(inventory.runtime_dispatch, "reconcile", inventory.runtime_dispatch.ps)
+    monkeypatch.setattr(inventory.runtime_dispatch, "reconcile", _stale_ledger_projection)
     monkeypatch.setattr(
         inventory.host_inventory, "observe", lambda: {"vms": [external], "volumes": [], "networks": [], "warnings": []}
     )
@@ -2005,7 +3658,7 @@ def test_libvirt_host_refresh_preserves_recorded_published_endpoints(tmp_path, m
 def test_failed_live_ownership_reconcile_disables_managed_controls(tmp_path, monkeypatch):
     roots = _setup_roots(tmp_path)
     _resource_run(roots, "unverified")
-    monkeypatch.setattr(inventory.runtime_dispatch, "reconcile", inventory.runtime_dispatch.ps)
+    monkeypatch.setattr(inventory.runtime_dispatch, "reconcile", _stale_ledger_projection)
     vm = inventory.list_vms(roots)["vms"][0]
     assert vm["name"] == "unverified" and vm["stale"] is True and vm["managed"] is False
     assert inventory.list_vms(roots, live=False)["vms"][0]["managed"] is True
@@ -2068,7 +3721,7 @@ def _vm_access_fixture(
     row = _observed_vm("redis", run_id, status=status, backend=backend)
     row["access"] = vm_access.capabilities(row)
     roots = _setup_roots(tmp_path)
-    monkeypatch.setattr(inventory, "get_vm", lambda roots, identifier: row)
+    monkeypatch.setattr(inventory, "get_vm", lambda roots, identifier, **_kwargs: row)
     directory = tmp_path / "redis"
     directory.mkdir()
     (tmp_path / "guest-environment").write_text(f"PALIMPSEST_RUN_ID={run_id}\n")
@@ -2472,7 +4125,7 @@ def test_remove_vm_ineligible_selected_states_fail_closed(tmp_path, monkeypatch,
         backend="kvm" if condition == "oci-root" else "lima-vz",
     )
     if condition == "stale":
-        monkeypatch.setattr(inventory.runtime_dispatch, "reconcile", inventory.runtime_dispatch.ps)
+        monkeypatch.setattr(inventory.runtime_dispatch, "reconcile", _stale_ledger_projection)
     elif condition == "ambiguous":
         monkeypatch.setattr(
             inventory.host_inventory,
@@ -2974,3 +4627,1102 @@ def test_runtime_pack_platform_variant_keeps_conventional_and_oci_boundaries():
     host = HostPlatform("Darwin", "aarch64")
     assert check_artifact(layer, lookup=metadata.__getitem__, host=host)["compatible"] is True
     assert check_artifact({"kind": "oci-image", "platform": "linux/arm64/v8"}, host=host)["status"] == "incompatible"
+
+
+def test_catalog_migrates_existing_metadata_and_survives_a_fresh_process(tmp_path):
+    import subprocess
+    import sys
+
+    roots = _setup_roots(tmp_path)
+    record = _buildkit_export(roots, "bk-000000000120")
+    captured = inventory.metadata_snapshot(roots, refresh=True)
+    assert captured["builds"][0]["build_id"] == record["build_id"]
+    assert captured["observation"]["captured_at"]
+    assert roots.metadata_db.is_file()
+    (roots.builds / record["build_id"] / "record.json").unlink()
+    script = (
+        "import json,sys; from pathlib import Path; "
+        "from palimpsest_local.inventory import metadata_snapshot; "
+        "from palimpsest_local.state import StatePaths; "
+        "print(json.dumps(metadata_snapshot(StatePaths(Path(sys.argv[1]),Path(sys.argv[2])))))"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(roots.config), str(roots.state)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    restarted = json.loads(result.stdout)
+    assert restarted == captured
+
+
+def test_catalog_refresh_is_ledger_only_and_does_not_initialize_missing_state(tmp_path, monkeypatch):
+    def forbidden(*args, **kwargs):
+        raise AssertionError("metadata must not initialize roots or reconcile host resources")
+
+    monkeypatch.setattr(inventory, "init_roots", forbidden)
+    monkeypatch.setattr(inventory.runtime_dispatch, "reconcile", forbidden)
+    monkeypatch.setattr(inventory.host_inventory, "observe", forbidden)
+    roots = state.StatePaths(tmp_path / "absent-config", tmp_path / "absent-state")
+    assert inventory.refresh_metadata(roots)["captured_at"] is None
+    assert inventory.list_artifacts(roots)["artifacts"] == []
+    assert inventory.list_builds(roots) == []
+    assert inventory.metadata_snapshot(roots)["runs"] == []
+    assert not roots.state.exists() and not roots.config.exists()
+    existing = state.StatePaths(tmp_path / "existing-config", tmp_path / "existing-state")
+    state.init_resolved_roots(existing)
+    run_id = _resource_run(existing, "observed")
+    ledger = existing.runs / "observed" / "state.json"
+    before = ledger.read_bytes()
+    observed = inventory.metadata_snapshot(existing, refresh=True)
+    assert observed["runs"][0]["run_id"] == run_id
+    assert ledger.read_bytes() == before
+
+
+@pytest.mark.parametrize("kind", ["build", "tag", "content", "retained-source", "remote"])
+def test_catalog_malformed_metadata_is_visible_incomplete_and_path_free(tmp_path, kind):
+    roots = _setup_roots(tmp_path)
+    if kind == "build":
+        directory, filename = roots.builds / "bk-000000000121", "record.json"
+    elif kind == "tag":
+        directory, filename = roots.tags, "secret-value.json"
+    elif kind == "content":
+        directory, filename = roots.store / "metadata", "a" * 64 + ".json"
+    elif kind == "retained-source":
+        directory, filename = roots.state / "sources" / "records", "a" * 64 + ".json"
+    else:
+        directory, filename = roots.state / "remote-references", "a" * 64 + ".json"
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    (directory / filename).write_text('{"SENSITIVE_VALUE":')
+    (directory / filename).chmod(0o600)
+    snapshot = inventory.metadata_snapshot(roots, refresh=True)
+    observation = snapshot["observation"]
+    assert observation["complete"] is False
+    assert observation["warnings"]
+    assert "SENSITIVE_VALUE" not in repr(observation)
+    assert str(tmp_path) not in repr(observation)
+
+
+def test_catalog_uuid_project_links_do_not_adopt_a_reused_run_name(tmp_path):
+    from palimpsest_local.project import deterministic_service_name
+
+    roots = _setup_roots(tmp_path)
+    name = deterministic_service_name("catalog-project", "app")
+    first = _resource_run(roots, name)
+    _resource_project(roots, "catalog-project", service="app", run_id=first)
+    before = inventory.metadata_snapshot(roots, refresh=True)["runs"][0]
+    assert before["run_id"] == first and before["project"] == "catalog-project"
+    replacement = "22222222-2222-4222-8222-222222222222"
+    state.atomic_write_json(
+        roots.runs / name / "owner.json", {"schema_version": 1, "name": name, "run_id": replacement}
+    )
+    payload = state.read_json(roots.runs / name / "state.json")
+    payload["run_id"] = replacement
+    state.atomic_write_json(roots.runs / name / "state.json", payload)
+    after = inventory.metadata_snapshot(roots, refresh=True)["runs"][0]
+    assert after["run_id"] == replacement and after["project"] is None
+
+
+def test_catalog_source_graph_and_actual_store_occurrences_preserve_order_without_runtime_authority(tmp_path):
+    from test_oci_store import _acquired_materialization, _acquired_store_graph
+
+    roots, store, _cas, _source, snapshot = _acquired_store_graph(
+        tmp_path, process_config={"Cmd": ["/sbin/init"], "Env": ["SECRET_VALUE=must-not-be-copied"]}
+    )
+    source = inventory.record_oci_source(roots, snapshot)
+    assert source["derived"] == [] and not source["materialization_complete"]
+    assert [layer["ordinal"] for layer in source["layers"]] == [0, 1, 2]
+    assert source["layers"][0]["compressed"] == source["layers"][2]["compressed"]
+    _occurrences, receipt, _calls = _acquired_materialization(store, snapshot)
+    complete = inventory.record_oci_materialization(roots, snapshot, receipt)
+    assert complete["materialization_complete"]
+    assert inventory.record_oci_source(roots, snapshot)["materialization_complete"]
+    persisted = inventory.catalog_images(roots, refresh=False)
+    assert persisted[0]["derived"] == [result.receipt.to_dict() for result in receipt.results]
+    assert "SECRET_VALUE" not in repr(inventory.metadata_snapshot(roots))
+    image = next(row for row in inventory.list_artifacts(roots)["images"] if row["source"] == "local-catalog")
+    assert image["run_supported"] is False and image["editable"] is False
+    assert image["availability"] == "registered"
+    assert "base_image_digest" not in image
+    assert list((roots.oci_derived_store / "leases").iterdir()) == []
+
+
+@pytest.mark.parametrize("damage", ["json", "foreign-cas", "foreign-receipt", "graph-order", "occurrence-record"])
+def test_catalog_registration_rejects_unverified_or_mismatched_graphs(tmp_path, damage):
+    from test_oci_store import _acquired_materialization, _acquired_store_graph
+
+    roots, store, _cas, _source, snapshot = _acquired_store_graph(tmp_path / "first")
+    if damage == "json":
+        with pytest.raises(StateError, match="typed"):
+            inventory.record_oci_source(roots, snapshot.to_dict())
+    elif damage == "foreign-cas":
+        other_roots = _setup_roots(tmp_path / "other")
+        with pytest.raises(ArtifactValidationError):
+            inventory.record_oci_source(other_roots, snapshot)
+    elif damage == "foreign-receipt":
+        _other, other_store, _cas, _source, other_snapshot = _acquired_store_graph(tmp_path / "other")
+        _occurrences, receipt, _calls = _acquired_materialization(other_store, other_snapshot)
+        with pytest.raises(StateError, match="does not match"):
+            inventory.record_oci_materialization(roots, snapshot, receipt)
+    else:
+        _occurrences, receipt, _calls = _acquired_materialization(store, snapshot)
+        if damage == "graph-order":
+            receipt = dataclasses.replace(
+                receipt,
+                layer_descriptors=(
+                    receipt.layer_descriptors[1],
+                    receipt.layer_descriptors[0],
+                    receipt.layer_descriptors[2],
+                ),
+                layer_diff_ids=(receipt.layer_diff_ids[1], receipt.layer_diff_ids[0], receipt.layer_diff_ids[2]),
+            )
+            with pytest.raises(StateError, match="does not match"):
+                inventory.record_oci_materialization(roots, snapshot, receipt)
+        else:
+            result = dataclasses.replace(
+                receipt.results[0],
+                receipt=dataclasses.replace(receipt.results[0].receipt, record_digest="sha256:" + "f" * 64),
+            )
+            receipt = dataclasses.replace(receipt, results=(result, *receipt.results[1:]))
+            with pytest.raises(ArtifactValidationError):
+                inventory.record_oci_materialization(roots, snapshot, receipt)
+    assert inventory.catalog_images(roots, refresh=False) == []
+
+
+def test_catalog_corruption_is_not_a_json_fallback_or_relocation_repair(tmp_path):
+    roots = _setup_roots(tmp_path)
+    _buildkit_export(roots, "bk-000000000122")
+    inventory.refresh_metadata(roots)
+    roots.metadata_db.write_bytes(b"not sqlite")
+    for query in (
+        lambda: inventory.list_artifacts(roots),
+        lambda: inventory.list_builds(roots),
+        lambda: inventory.get_build(roots, "bk-000000000122"),
+        lambda: inventory.metadata_snapshot(roots),
+        lambda: inventory.move_state_root(roots, tmp_path / "destination"),
+    ):
+        with pytest.raises(StateError):
+            query()
+    assert roots.metadata_db.read_bytes() == b"not sqlite"
+    assert not (tmp_path / "destination").exists()
+
+
+def test_catalog_relocation_rebinds_independent_identity_and_discards_copied_source_bindings(tmp_path):
+    from test_oci_store import _acquired_materialization, _acquired_store_graph
+
+    roots, store, _cas, _source, snapshot = _acquired_store_graph(tmp_path / "source")
+    _occurrences, receipt, _calls = _acquired_materialization(store, snapshot)
+    inventory.record_oci_materialization(roots, snapshot, receipt)
+    inventory.refresh_metadata(roots)
+    source = inventory.metadata_snapshot(roots)
+    destination = tmp_path / "relocated"
+    inventory.move_state_root(roots, destination, keep_source=True)
+    moved_roots = state.StatePaths(roots.config, destination)
+    moved = inventory.metadata_snapshot(moved_roots)
+    assert moved["observation"]["catalog_id"] != source["observation"]["catalog_id"]
+    assert moved["runs"] == []
+    assert len(moved["images"]) == 1
+    image = moved["images"][0]
+    for field in (
+        "image_id",
+        "reference",
+        "root_descriptor",
+        "manifest_descriptor",
+        "config_descriptor",
+        "platform",
+        "layers",
+    ):
+        assert image[field] == source["images"][0][field]
+    assert image["source_binding_verified"] is True
+    assert image["source_cas_id"] != source["images"][0]["source_cas_id"]
+    assert image["source_binding_digest"] != source["images"][0]["source_binding_digest"]
+    assert image["derived"] == [] and image["materialization_complete"] is False
+    assert inventory.metadata_snapshot(roots) == source
+    assert moved_roots.metadata_db.is_file()
+    with pytest.raises(ArtifactValidationError):
+        inventory.record_oci_source(moved_roots, snapshot)
+
+
+@pytest.mark.parametrize("namespace", ["sources", "source-records", "tags", "builds", "runs"])
+def test_catalog_unsafe_namespace_is_incomplete_without_losing_other_observations(tmp_path, namespace):
+    roots = _setup_roots(tmp_path)
+    store = ContentStore(roots.store)
+    digest = f"sha256:{store.write_stream([b'observed bytes']).name}"
+    store.write_metadata(digest, {"kind": KIND_CLOUD_IMAGE, "arch": "aarch64"})
+    build = _buildkit_export(roots, "bk-000000000151") if namespace == "runs" else None
+    external = tmp_path / "external"
+    external.mkdir(mode=0o700)
+    if namespace == "sources":
+        target = roots.state / "sources"
+    elif namespace == "source-records":
+        (roots.state / "sources").mkdir(mode=0o700)
+        target = roots.state / "sources" / "records"
+    else:
+        target = roots.state / namespace
+        target.rmdir()
+    target.symlink_to(external, target_is_directory=True)
+    snapshot = inventory.metadata_snapshot(roots, refresh=True)
+    assert snapshot["observation"]["complete"] is False
+    expected = {digest, build["output_oci_manifest_digest"]} if build else {digest}
+    assert {row["digest"] for row in snapshot["artifacts"]["images"]} == expected
+    if build:
+        assert snapshot["builds"][0]["build_id"] == build["build_id"]
+        artifact = next(row for row in snapshot["artifacts"]["images"] if row["digest"] == digest)
+        assert artifact["delete_supported"] is False
+    assert list(external.iterdir()) == []
+
+
+@pytest.mark.parametrize("unsafe", ["catalog-wal", "catalog-lock-symlink", "overlap", "runs-alias"])
+def test_catalog_relocation_refuses_unsafe_copy_inputs_without_switching_config(tmp_path, unsafe):
+    roots = _setup_roots(tmp_path)
+    inventory.refresh_metadata(roots)
+    destination = tmp_path / "destination"
+    if unsafe == "catalog-wal":
+        (roots.catalog / "metadata.sqlite3-wal").write_bytes(b"unclosed journal")
+    elif unsafe == "catalog-lock-symlink":
+        (roots.catalog / "writer.lock").unlink()
+        outside = tmp_path / "outside-lock"
+        outside.write_bytes(b"")
+        outside.chmod(0o600)
+        (roots.catalog / "writer.lock").symlink_to(outside)
+    elif unsafe == "overlap":
+        destination = roots.state / "nested"
+    else:
+        roots.runs.rmdir()
+        outside = tmp_path / "outside-runs"
+        outside.mkdir(mode=0o700)
+        roots.runs.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(StateError):
+        inventory.move_state_root(roots, destination)
+    assert roots.state.exists() and not destination.exists()
+
+
+@pytest.mark.parametrize("authority", ["derived-locks", "artifact-locks", "artifact-blobs"])
+def test_catalog_materialization_validation_never_recreates_missing_authorities(tmp_path, authority):
+    from test_oci_store import _acquired_materialization, _acquired_store_graph
+
+    roots, store, _cas, _source, snapshot = _acquired_store_graph(tmp_path)
+    inventory.record_oci_source(roots, snapshot)
+    _occurrences, receipt, _calls = _acquired_materialization(store, snapshot)
+    missing = {
+        "derived-locks": roots.oci_derived_store / "locks",
+        "artifact-locks": roots.store / "oci-artifact-locks-v1",
+        "artifact-blobs": roots.store / "blobs" / "sha256",
+    }[authority]
+    moved = missing.with_name(missing.name + "-retained")
+    missing.rename(moved)
+    with pytest.raises(StateError):
+        inventory.record_oci_materialization(roots, snapshot, receipt)
+    assert not missing.exists() and moved.is_dir()
+    assert inventory.catalog_images(roots, refresh=False)[0]["materialization_complete"] is False
+
+
+@pytest.mark.parametrize("missing_member", ["config", "layer"])
+def test_catalog_relocation_preserves_registered_graph_when_copied_source_metadata_is_unavailable(
+    tmp_path, missing_member
+):
+    from test_oci_store import _acquired_store_graph
+
+    roots, _store, _cas, _source, snapshot = _acquired_store_graph(tmp_path / "source")
+    original = inventory.record_oci_source(roots, snapshot)
+    member = snapshot.config if missing_member == "config" else snapshot.layers[0]
+    missing_blob = roots.oci_source_cas / "blobs" / "sha256" / member.descriptor.digest.split(":", 1)[1]
+    missing_blob.unlink()
+    destination = tmp_path / "relocated"
+    inventory.move_state_root(roots, destination, keep_source=True)
+    moved_roots = state.StatePaths(roots.config, destination)
+    preserved = inventory.catalog_images(moved_roots, refresh=False)[0]
+    assert preserved["image_id"] == original["image_id"]
+    assert preserved["layers"] == original["layers"]
+    assert preserved["reference"] == original["reference"]
+    assert preserved["source_binding_verified"] is False
+    assert preserved["source_cas_id"] is None
+    assert preserved["materialization_complete"] is False and preserved["derived"] == []
+    inventory_result = inventory.list_artifacts(moved_roots)
+    registered = next(row for row in inventory_result["images"] if row["source"] == "local-catalog")
+    assert registered["availability"] == "unavailable" and registered["run_supported"] is False
+    assert inventory_result["observation"]["complete"] is False
+    assert not missing_blob.exists()
+
+
+@pytest.mark.parametrize("boundary", ["catalog-rebind", "graph-registration", "config-before-write"])
+def test_catalog_relocation_failure_before_config_commit_removes_only_owned_copy_and_can_retry(
+    tmp_path, monkeypatch, boundary
+):
+    from test_oci_store import _acquired_store_graph
+
+    roots, _store, _cas, _source, snapshot = _acquired_store_graph(tmp_path / "source")
+    inventory.record_oci_source(roots, snapshot)
+    destination = tmp_path / "relocated"
+    original = inventory.metadata_snapshot(roots)
+
+    def fail(*args, **kwargs):
+        raise StateError("injected relocation failure")
+
+    with monkeypatch.context() as fault:
+        if boundary == "catalog-rebind":
+            fault.setattr(inventory.local_catalog.Catalog, "rebind_destination", fail)
+        elif boundary == "graph-registration":
+            fault.setattr(inventory.local_catalog.Catalog, "register_image", fail)
+        else:
+            fault.setattr(inventory, "write_state_root", fail)
+        with pytest.raises(StateError, match="injected"):
+            inventory.move_state_root(roots, destination)
+    assert roots.state.is_dir() and not destination.exists()
+    assert inventory.metadata_snapshot(roots) == original
+    inventory.move_state_root(roots, destination, keep_source=True)
+    assert destination.is_dir() and roots.state.is_dir()
+
+
+def test_catalog_relocation_config_commit_then_failure_preserves_both_roots(tmp_path, monkeypatch):
+    roots = _setup_roots(tmp_path)
+    inventory.refresh_metadata(roots)
+    destination = tmp_path / "relocated"
+    write = inventory.write_state_root
+
+    def commit_then_fail(selected, target):
+        write(selected, target)
+        raise StateError("configuration fsync failed after replacement")
+
+    monkeypatch.setattr(inventory, "write_state_root", commit_then_fail)
+    with pytest.raises(StateError, match="after replacement"):
+        inventory.move_state_root(roots, destination)
+    assert roots.state.is_dir() and destination.is_dir()
+    assert str(destination) in (roots.config / "config.toml").read_text()
+    assert inventory.metadata_snapshot(state.StatePaths(roots.config, destination))["observation"]["catalog_id"]
+
+
+def test_catalog_index_racing_entry_preserves_other_observations(tmp_path, monkeypatch):
+    roots = _setup_roots(tmp_path)
+    store = ContentStore(roots.store)
+    digest = f"sha256:{store.write_stream([b'observed bytes']).name}"
+    store.write_metadata(digest, {"kind": KIND_CLOUD_IMAGE, "arch": "aarch64"})
+    disappearing = roots.store / "metadata" / ("a" * 64 + ".json")
+    disappearing.write_text("{}")
+    original_stat = os.stat
+
+    def race(path, *args, **kwargs):
+        if path == disappearing.name and kwargs.get("dir_fd") is not None:
+            raise FileNotFoundError("entry disappeared")
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(inventory.os, "stat", race)
+    captured = inventory.metadata_snapshot(roots, refresh=True)
+    assert captured["observation"]["complete"] is False
+    assert [row["digest"] for row in captured["artifacts"]["images"]] == [digest]
+
+
+def test_catalog_run_status_and_revision_come_from_the_same_exact_ledger(tmp_path):
+    roots = _setup_roots(tmp_path)
+    run_id = _resource_run(roots, "revision-observed")
+    legacy = inventory.metadata_snapshot(roots, refresh=True)["runs"][0]
+    assert legacy["run_id"] == run_id and legacy["lifecycle_revision"] == 0
+    ledger = roots.runs / "revision-observed" / "state.json"
+    payload = state.read_json(ledger)
+    payload.update(status="running", lifecycle_revision=7)
+    state.atomic_write_json(ledger, payload)
+    revised = inventory.metadata_snapshot(roots, refresh=True)["runs"][0]
+    assert revised["run_id"] == run_id
+    assert revised["status"] == "running" and revised["lifecycle_revision"] == 7
+    assert "source_image_digest" not in revised and "source_binding_digest" not in revised
+    payload["lifecycle_revision"] = "7"
+    state.atomic_write_json(ledger, payload)
+    invalid = inventory.metadata_snapshot(roots, refresh=True)
+    assert invalid["runs"] == [] and invalid["observation"]["complete"] is False
+
+
+@pytest.mark.parametrize(
+    ("binding", "native", "valid"),
+    [
+        ("absent", None, True),
+        ("null", None, True),
+        (
+            "preplan",
+            {
+                "schema": "palimpsest.vz-native-run.v1",
+                "instance_identity": None,
+                "lease_set_id": "11111111-1111-4111-8111-111111111111",
+                "root_volume_id": "22222222-2222-4222-8222-222222222222",
+                "hold": "launch-incomplete",
+            },
+            True,
+        ),
+        ("empty-binding", {}, False),
+        ("wrong-schema", {"schema": "unknown"}, False),
+        ("lost-plan", {"schema": "palimpsest.vz-native-run.v1", "plan_sha256": "a" * 64}, False),
+        ("null-plan", {"schema": "palimpsest.vz-native-run.v1", "plan": None}, False),
+        ("empty-plan", {"schema": "palimpsest.vz-native-run.v1", "plan": {}}, False),
+        ("list-plan", {"schema": "palimpsest.vz-native-run.v1", "plan": []}, False),
+    ],
+    ids=lambda value: value if isinstance(value, str) else None,
+)
+def test_catalog_native_failed_reservation_distinguishes_uncommitted_and_invalid_binding(
+    tmp_path, monkeypatch, binding, native, valid
+):
+    from palimpsest_local.runtime_types import DispatchKey, RuntimeBackend, RuntimeKind
+
+    roots = _setup_roots(tmp_path)
+    store = ContentStore(roots.store)
+    digest = f"sha256:{store.write_stream([b'unreferenced cloud image']).name}"
+    store.write_metadata(digest, {"kind": KIND_CLOUD_IMAGE, "arch": "aarch64"})
+    dispatch = DispatchKey(RuntimeKind.OCI_ROOT, RuntimeBackend.LIMA_VZ)
+    with pytest.raises(RuntimeError):
+        with state.reserve_new_run(roots, "failed-before-binding", dispatch) as reservation:
+            run_id = reservation.record.run_id
+            raise RuntimeError("before native preparation")
+    ledger = roots.runs / "failed-before-binding" / "state.json"
+    payload = state.read_json(ledger)
+    assert payload["status"] == "failed"
+    assert "vz_native" not in payload
+    if binding == "preplan":
+        from test_native_root_source import os_layout, qualify
+
+        from palimpsest_local import vz_native_runtime
+        from palimpsest_local.oci_source import LocalLayoutSource, SourceCAS
+
+        layout, root, *_ = os_layout(tmp_path / "layout")
+        qualification = qualify(LocalLayoutSource(layout.root, root.digest), SourceCAS(roots.oci_source_cas))
+        source = qualification.snapshot
+        native = {
+            **native,
+            "instance": "plm-" + run_id.replace("-", "")[:12],
+            "source_snapshot": vz_native_runtime._snapshot_wire(source),
+        }
+        payload.update(
+            source_image_digest=source.image.digest,
+            source_snapshot_binding_digest=source.binding_digest,
+            source_qualification=qualification.to_dict(),
+        )
+    if binding != "absent":
+        payload["vz_native"] = native
+        state.atomic_write_json(ledger, payload)
+    original = ledger.read_bytes()
+
+    def forbid_live_observation(*args, **kwargs):
+        pytest.fail("catalog collection must not inspect the host or instantiate a runtime")
+
+    monkeypatch.setattr(inventory.host_inventory, "observe", forbid_live_observation)
+    captured = inventory.metadata_snapshot(roots, refresh=True)
+    image = next(item for item in captured["artifacts"]["images"] if item["digest"] == digest)
+    assert ledger.read_bytes() == original
+    if valid:
+        assert captured["observation"]["complete"] is True
+        assert captured["observation"]["warnings"] == []
+        assert len(captured["runs"]) == 1
+        run = captured["runs"][0]
+        assert run["run_id"] == run_id and run["status"] == "failed"
+        assert run["base_digest"] is None and run["layers"] == []
+        assert "source_image_digest" not in run and "source_binding_digest" not in run
+        assert image["delete_supported"] is True
+    else:
+        assert captured["observation"]["complete"] is False
+        assert captured["observation"]["warnings"]
+        assert captured["runs"] == []
+        assert image["delete_supported"] is False
+
+
+@pytest.mark.parametrize("changed", ["image-digest", "snapshot-binding", "qualification", "plan-binding"])
+def test_catalog_native_source_link_requires_bound_metadata_and_committed_plan(tmp_path, monkeypatch, changed):
+    import hashlib
+
+    from test_native_root_source import os_layout, qualify
+
+    from palimpsest_local import vz_native_runtime
+    from palimpsest_local.oci_provenance import canonical_json_bytes
+    from palimpsest_local.oci_source import LocalLayoutSource, SourceCAS
+
+    roots = _setup_roots(tmp_path)
+    artifacts = ContentStore(roots.store)
+    artifact_digest = f"sha256:{artifacts.write_stream([b'unreferenced source-link boundary image']).name}"
+    artifacts.write_metadata(artifact_digest, {"kind": KIND_CLOUD_IMAGE, "arch": "aarch64"})
+    layout, root, *_ = os_layout(tmp_path / "layout")
+    qualification = qualify(LocalLayoutSource(layout.root, root.digest), SourceCAS(roots.oci_source_cas))
+    source = qualification.snapshot
+    inventory.record_oci_source(roots, source)
+    run_id = _resource_run(roots, "native-source-link", runtime_kind="oci-root")
+    ledger = roots.runs / "native-source-link" / "state.json"
+    payload = state.read_json(ledger)
+    root_volume_id = "22222222-2222-4222-8222-222222222222"
+    plan = {
+        "schema": "palimpsest.vz-root-plan.v1",
+        "run_id": run_id,
+        "run_name": "native-source-link",
+        "root_volume_id": root_volume_id,
+        "source_snapshot_binding_digest": source.binding_digest,
+        "process": source.image.config.process.to_dict(),
+        "mode": "dev",
+        "restart": "no",
+    }
+    payload.update(
+        source_image_digest=source.image.digest,
+        source_snapshot_binding_digest=source.binding_digest,
+        source_qualification=qualification.to_dict(),
+        vz_native={
+            "schema": "palimpsest.vz-native-run.v1",
+            "root_volume_id": root_volume_id,
+            "source_snapshot": vz_native_runtime._snapshot_wire(source),
+            "plan": plan,
+            "plan_sha256": hashlib.sha256(canonical_json_bytes(plan)).hexdigest(),
+        },
+    )
+    state.atomic_write_json(ledger, payload)
+    original = ledger.read_bytes()
+
+    def forbid_host(*args, **kwargs):
+        pytest.fail("catalog source validation must not observe the host")
+
+    monkeypatch.setattr(inventory.host_inventory, "observe", forbid_host)
+    monkeypatch.setattr(
+        vz_native_runtime,
+        "_reopen_source",
+        lambda *_a, **_k: pytest.fail("catalog source binding must not rehash or decompress source blobs"),
+    )
+    captured = inventory.metadata_snapshot(roots, refresh=True)
+    row = captured["runs"][0]
+    assert row["run_id"] == run_id
+    assert row["source_image_digest"] == source.image.digest
+    assert row["source_binding_digest"] == source.binding_digest
+    assert captured["observation"]["complete"] is True
+    deletion_control = next(image for image in captured["artifacts"]["images"] if image["digest"] == artifact_digest)
+    assert deletion_control["delete_supported"] is True
+    assert ledger.read_bytes() == original
+
+    if changed == "image-digest":
+        # Counterexample: a well-formed but unrelated digest passed the old format-only check.
+        payload["source_image_digest"] = "sha256:" + "a" * 64
+    elif changed == "snapshot-binding":
+        payload["vz_native"]["source_snapshot"]["binding_digest"] = "sha256:" + "b" * 64
+    elif changed == "qualification":
+        payload["source_qualification"]["source_binding_digest"] = "sha256:" + "c" * 64
+    else:
+        plan["source_snapshot_binding_digest"] = "sha256:" + "d" * 64
+        payload["vz_native"]["plan_sha256"] = hashlib.sha256(canonical_json_bytes(plan)).hexdigest()
+    state.atomic_write_json(ledger, payload)
+    changed_bytes = ledger.read_bytes()
+
+    refused = inventory.metadata_snapshot(roots, refresh=True)
+
+    row = refused["runs"][0]
+    assert row["run_id"] == run_id
+    assert "source_image_digest" not in row and "source_binding_digest" not in row
+    assert refused["observation"]["complete"] is False
+    protected = next(image for image in refused["artifacts"]["images"] if image["digest"] == artifact_digest)
+    assert protected["delete_supported"] is False
+    assert ledger.read_bytes() == changed_bytes
+
+
+def test_catalog_known_kvm_source_link_uses_validated_uuid_bound_preparation_only(tmp_path):
+    import test_oci_store as fixtures
+
+    from palimpsest_local.oci_root_prepare import prepare_oci_root_run, release_prepared_oci_root_run
+
+    roots, store = fixtures._store(tmp_path)
+    materialization = fixtures._image_materialization(store)
+    tools = fixtures._RootVolumeTools()
+    with state.reserve_new_run(roots, "source-link", fixtures._oci_dispatch()) as reservation:
+        prepared = prepare_oci_root_run(
+            reservation,
+            materialization,
+            store,
+            root_volume_size_bytes=fixtures._ROOT_VOLUME_SIZE,
+            runner=tools,
+        )
+    ledger = roots.runs / "source-link" / "state.json"
+    original = ledger.read_bytes()
+    try:
+        snapshot = state.read_run_ledger_snapshot(roots, "source-link")
+        row = inventory.metadata_snapshot(roots, refresh=True)["runs"][0]
+        assert row["run_id"] == snapshot.record.run_id
+        assert row["lifecycle_revision"] == state.lifecycle_revision(snapshot)
+        assert row["source_image_digest"] == materialization.source_image_digest
+        assert row["source_binding_digest"] == materialization.source_snapshot_binding_digest
+        assert ledger.read_bytes() == original
+        payload = state.read_json(ledger)
+        payload["oci_root"]["boot_plan"]["run"]["run_id"] = "22222222-2222-4222-8222-222222222222"
+        state.atomic_write_json(ledger, payload)
+        refused = inventory.metadata_snapshot(roots, refresh=True)
+        row = refused["runs"][0]
+        assert row["run_id"] == snapshot.record.run_id
+        assert "source_image_digest" not in row and "source_binding_digest" not in row
+        assert refused["observation"]["complete"] is False
+        ledger.write_bytes(original)
+        with state.reserve_new_run(roots, "other-source-link", fixtures._oci_dispatch()) as reservation:
+            other = prepare_oci_root_run(
+                reservation,
+                materialization,
+                store,
+                root_volume_size_bytes=fixtures._ROOT_VOLUME_SIZE,
+                runner=tools,
+            )
+        other_ledger = roots.runs / "other-source-link" / "state.json"
+        other_original = other_ledger.read_bytes()
+        try:
+            other_snapshot = state.read_run_ledger_snapshot(roots, "other-source-link")
+            copied = state.read_json(other_ledger)
+            copied["oci_root"] = state.read_json(ledger)["oci_root"]
+            state.atomic_write_json(other_ledger, copied)
+            refused = inventory.metadata_snapshot(roots, refresh=True)
+            row = next(item for item in refused["runs"] if item["run_id"] == other_snapshot.record.run_id)
+            assert "source_image_digest" not in row and "source_binding_digest" not in row
+            assert refused["observation"]["complete"] is False
+        finally:
+            other_ledger.write_bytes(other_original)
+            release_prepared_oci_root_run(roots, other, store, runner=tools)
+    finally:
+        ledger.write_bytes(original)
+        release_prepared_oci_root_run(roots, prepared, store, runner=tools)
+
+
+def _native_catalog_reference(roots, build_id, *, reference="example.test/team/app:selected", published=False):
+    from palimpsest_local.package_reference import LocalPackageReference, write_package_reference
+
+    build = _buildkit_export(roots, build_id)
+    archive = Path(build["output_path"])
+    record = LocalPackageReference(
+        reference=reference,
+        authority="example.test",
+        api_base="https://example.test/api/custom",
+        namespace="team",
+        package="app",
+        archive=str(archive),
+        archive_digest=build["output_oci_archive_digest"],
+        archive_size_bytes=archive.stat().st_size,
+        root_digest=build["output_oci_manifest_digest"],
+        package_type="oci-image",
+        build_id=build_id,
+        project_id="recorded-project" if published else None,
+        published_digest=build["output_oci_manifest_digest"] if published else None,
+    )
+    write_package_reference(roots, record)
+    return record, build
+
+
+@pytest.mark.parametrize("published", [False, True])
+def test_catalog_native_reference_receipts_remain_distinct_from_build_labels_and_partial_status(tmp_path, published):
+    roots = _setup_roots(tmp_path)
+    package, build = _native_catalog_reference(roots, "bk-000000000130", published=published)
+    build["status"] = "failed"
+    state.atomic_write_json(roots.builds / build["build_id"] / "record.json", build)
+    result = inventory.list_artifacts(roots)
+    image = next(item for item in result["images"] if item["source"] == "package-reference")
+    assert image["package_references"] == [dataclasses.asdict(package)]
+    assert image["digest"] == package.root_digest
+    assert image["output_oci_archive_digest"] == package.archive_digest
+    assert image["builds"][0]["status"] == "failed"
+    assert image["tags"] == [] and image["run_supported"] is False
+    assert image["package_references"][0]["published_digest"] == (package.root_digest if published else None)
+    assert image["package_references"][0]["project_id"] == ("recorded-project" if published else None)
+    captured = inventory.metadata_snapshot(roots)
+    from palimpsest_local.package_reference import package_reference_path
+
+    package_reference_path(roots, package.reference).unlink()
+    (roots.builds / build["build_id"] / "record.json").unlink()
+    assert inventory.metadata_snapshot(roots) == captured
+
+
+def test_catalog_native_aliases_merge_with_exact_observed_root_not_output_label(tmp_path):
+    from palimpsest_local.package_reference import write_package_reference
+
+    roots = _setup_roots(tmp_path)
+    package, build = _native_catalog_reference(roots, "bk-000000000131")
+    immutable = dataclasses.replace(package, reference="example.test/team/app@" + package.root_digest)
+    write_package_reference(roots, immutable)
+    images = inventory.list_artifacts(roots)["images"]
+    selected = [image for image in images if image["digest"] == package.root_digest]
+    assert len(selected) == 1 and selected[0]["source"] == "build-record"
+    assert sorted(item["reference"] for item in selected[0]["package_references"]) == sorted(
+        (package.reference, immutable.reference)
+    )
+    assert selected[0]["output_tags"] == build["output_tags"]
+    assert selected[0]["tags"] == []
+
+
+@pytest.mark.parametrize("damage", ["bad-record", "wrong-filename", "namespace-alias"])
+def test_catalog_native_reference_corruption_is_incomplete_without_losing_other_observations(tmp_path, damage):
+    from palimpsest_local.package_reference import package_reference_path
+
+    roots = _setup_roots(tmp_path)
+    package, _build = _native_catalog_reference(roots, "bk-000000000132")
+    record_path = package_reference_path(roots, package.reference)
+    if damage == "bad-record":
+        other = record_path.parent / ("f" * 64 + ".json")
+        other.write_text('{"SENSITIVE_VALUE":')
+        other.chmod(0o600)
+    elif damage == "wrong-filename":
+        record_path.rename(record_path.parent / ("f" * 64 + ".json"))
+    else:
+        outside = tmp_path / "outside-references"
+        record_path.parent.rename(outside)
+        record_path.parent.symlink_to(outside, target_is_directory=True)
+    result = inventory.metadata_snapshot(roots, refresh=True)
+    assert result["observation"]["complete"] is False
+    assert result["builds"][0]["build_id"] == "bk-000000000132"
+    assert result["artifacts"]["images"][0]["digest"] == package.root_digest
+    assert "SENSITIVE_VALUE" not in repr(result["observation"])
+    assert str(tmp_path) not in repr(result["observation"])
+
+
+def test_catalog_build_provenance_preserves_known_recipe_and_context_identities_with_semantic_record_binding(tmp_path):
+    from palimpsest_local.build import create_build_record
+    from palimpsest_local.oci_provenance import canonical_json_bytes
+
+    roots = _setup_roots(tmp_path)
+    legacy = create_build_record(
+        build_id="b-000000000140",
+        base_digest="sha256:" + "1" * 64,
+        arch="aarch64",
+        parent_digests=[],
+        recipe_sha256="sha256:" + "2" * 64,
+        status="failed",
+    )
+    directory = roots.builds / legacy["build_id"]
+    directory.mkdir(mode=0o700)
+    state.atomic_write_json(directory / "record.json", legacy)
+    buildkit = _buildkit_export(roots, "bk-000000000141")
+    buildkit.update(
+        build_key="sha256:" + "3" * 64,
+        context_digest="sha256:" + "4" * 64,
+        dockerfile_digest="sha256:" + "5" * 64,
+    )
+    record_path = roots.builds / buildkit["build_id"] / "record.json"
+    state.atomic_write_json(record_path, buildkit)
+    rows = {row["build_id"]: row for row in inventory.list_builds(roots)}
+    assert rows[legacy["build_id"]]["recipe_sha256"] == legacy["recipe_sha256"]
+    assert rows[legacy["build_id"]]["context_digest"] is None
+    assert rows[legacy["build_id"]]["build_key"] is None
+    observed = rows[buildkit["build_id"]]
+    for field in ("build_key", "context_digest", "dockerfile_digest"):
+        assert observed[field] == buildkit[field]
+    assert observed["recipe_sha256"] is None
+    assert observed["source_record_digest_kind"] == "canonical-json-semantic-v1"
+    expected = (
+        "sha256:"
+        + hashlib.sha256(b"palimpsest.local-build-record-observation.v1\0" + canonical_json_bytes(buildkit)).hexdigest()
+    )
+    assert observed["source_record_digest"] == expected
+    raw_digest = "sha256:" + hashlib.sha256(record_path.read_bytes()).hexdigest()
+    assert observed["source_record_digest"] != raw_digest
+    record_path.write_text(json.dumps(buildkit, indent=7, sort_keys=False))
+    assert inventory.get_build(roots, buildkit["build_id"])["source_record_digest"] == expected
+    buildkit["status"] = "failed"
+    state.atomic_write_json(record_path, buildkit)
+    assert inventory.get_build(roots, buildkit["build_id"])["source_record_digest"] != expected
+
+
+def test_catalog_refresh_existing_minimal_state_adds_only_private_catalog_subtree(tmp_path):
+    roots = state.StatePaths(tmp_path / "absent-config", tmp_path / "minimal-state")
+    roots.state.mkdir(mode=0o700)
+    assert list(roots.state.iterdir()) == []
+    observed = inventory.metadata_snapshot(roots, refresh=True)
+    assert observed["observation"]["complete"] is True
+    assert observed["runs"] == [] and observed["builds"] == []
+    assert {path.relative_to(roots.state).as_posix() for path in roots.state.rglob("*")} == {
+        "catalog-v1",
+        "catalog-v1/metadata.sqlite3",
+        "catalog-v1/writer.lock",
+    }
+    assert not roots.config.exists() and not roots.locks.exists()
+
+
+@pytest.mark.parametrize("damage", ["directory-alias", "not-directory"])
+def test_catalog_unsafe_retained_namespace_is_incomplete_without_writes_or_lost_artifacts(tmp_path, damage):
+    roots = _setup_roots(tmp_path)
+    store = ContentStore(roots.store)
+    digest = f"sha256:{store.write_stream([b'observed bytes']).name}"
+    store.write_metadata(digest, {"kind": KIND_CLOUD_IMAGE, "arch": "aarch64"})
+    retained = roots.state / "retained-instances"
+    outside = tmp_path / "outside-retained"
+    outside.mkdir(mode=0o700)
+    if damage == "directory-alias":
+        retained.symlink_to(outside, target_is_directory=True)
+    else:
+        retained.write_bytes(b"invalid namespace")
+    before_locks = {path.name for path in roots.locks.iterdir()}
+    observed = inventory.metadata_snapshot(roots, refresh=True)
+    assert observed["observation"]["complete"] is False
+    assert [row["digest"] for row in observed["artifacts"]["images"]] == [digest]
+    assert observed["artifacts"]["images"][0]["delete_supported"] is False
+    assert {path.name for path in roots.locks.iterdir()} == before_locks
+    assert list(outside.iterdir()) == []
+
+
+def test_catalog_large_finite_integer_timings_do_not_overflow_or_lose_archive_identity(tmp_path):
+    roots = _setup_roots(tmp_path)
+    total = 10**1000
+    build = _buildkit_export(roots, "bk-000000000150", timings_ms={"total": total, "export": total})
+    result = inventory.list_artifacts(roots)
+    image = next(item for item in result["images"] if item["digest"] == build["output_oci_manifest_digest"])
+    assert image["output_oci_archive_digest"] == build["output_oci_archive_digest"]
+    detail = inventory.get_build(roots, build["build_id"])
+    assert detail["duration_ms"] == total and detail["timings_ms"]["export"] == total
+    assert detail["source_record_digest"] is not None
+    assert inventory.metadata_snapshot(roots)["observation"]["complete"] is True
+
+
+@pytest.mark.parametrize("label", ["x" * 4097, "bad\0label", "\ud800"])
+def test_catalog_invalid_build_label_preserves_valid_archive_build_and_unrelated_artifact(tmp_path, label):
+    roots = _setup_roots(tmp_path)
+    store = ContentStore(roots.store)
+    unrelated = f"sha256:{store.write_stream([b'unrelated bytes']).name}"
+    store.write_metadata(unrelated, {"kind": KIND_CLOUD_IMAGE, "arch": "aarch64"})
+    build = _buildkit_export(roots, "bk-000000000152")
+    build["output_tags"] = ["kept:v1", label]
+    record_path = roots.builds / build["build_id"] / "record.json"
+    record_path.write_text(json.dumps(build, ensure_ascii=True))
+    result = inventory.list_artifacts(roots)
+    assert result["observation"]["complete"] is False
+    images = {image["digest"]: image for image in result["images"]}
+    assert unrelated in images and build["output_oci_manifest_digest"] in images
+    image = images[build["output_oci_manifest_digest"]]
+    assert image["output_oci_archive_digest"] == build["output_oci_archive_digest"]
+    assert image["output_tags"] == ["kept:v1"] and image["tags"] == []
+    detail = inventory.get_build(roots, build["build_id"])
+    assert detail["output_tags"] == ["kept:v1"]
+    assert detail["output_oci_archive_digest"] == build["output_oci_archive_digest"]
+    assert detail["output_oci_manifest_digest"] == build["output_oci_manifest_digest"]
+
+
+@pytest.mark.parametrize("kind", ["bad\0kind", "k" * 4097, "\ud800"])
+def test_catalog_row_admission_preserves_unrelated_facts_and_sanitizes_optional_build_fields(tmp_path, kind):
+    roots = _setup_roots(tmp_path)
+    store = ContentStore(roots.store)
+
+    def artifact(payload, metadata):
+        digest = f"sha256:{store.write_stream([payload]).name}"
+        store.write_metadata(digest, {"kind": KIND_CLOUD_IMAGE, "arch": "aarch64"})
+        path = store.metadata_path(digest)
+        record = state.read_json(path)
+        record.update(metadata)
+        path.write_text(json.dumps(record, ensure_ascii=True))
+        return digest
+
+    valid = artifact(b"valid unrelated artifact", {})
+    bad_kind = artifact(b"invalid kind", {"kind": kind})
+    oversized = artifact(b"oversized projection", {"description": "d" * (1024 * 1024)})
+    protected = artifact(b"protected projection", {"os_release": {"private_key": "do-not-copy"}})
+    build = _buildkit_export(roots, "bk-000000000153")
+    build.update(
+        output_tags=["kept:v1", "x" * 4097],
+        timings_ms={"total": 1, "private_key": 11, "export": float("inf")},
+    )
+    (roots.builds / build["build_id"] / "record.json").write_text(json.dumps(build, ensure_ascii=True))
+
+    result = inventory.list_artifacts(roots)
+    assert result["observation"]["complete"] is False
+    observed = {row["digest"]: row for row in result["artifacts"]}
+    assert set(observed) == {valid, build["output_oci_manifest_digest"]}
+    assert not {bad_kind, oversized, protected}.intersection(observed)
+    assert observed[valid]["delete_supported"] is False
+    assert "do-not-copy" not in repr(result)
+    image = observed[build["output_oci_manifest_digest"]]
+    assert image["output_tags"] == ["kept:v1"]
+    assert image["output_oci_archive_digest"] == build["output_oci_archive_digest"]
+    detail = inventory.get_build(roots, build["build_id"])
+    assert detail["output_tags"] == ["kept:v1"] and detail["timings_ms"] == {"total": 1}
+    assert detail["source_record_digest"] is detail["source_record_digest_kind"] is None
+
+
+def test_catalog_final_admission_handles_near_boundary_row_after_conservative_flags(tmp_path):
+    from palimpsest_local.oci_provenance import canonical_json_bytes
+
+    roots = _setup_roots(tmp_path)
+    store = ContentStore(roots.store)
+    near = f"sha256:{store.write_stream([b'near boundary']).name}"
+    store.write_metadata(near, {"kind": KIND_CLOUD_IMAGE, "arch": "aarch64", "description": ""})
+    initial = inventory.metadata_snapshot(roots, refresh=True)
+    initial_row = initial["artifacts"]["images"][0]
+    remaining = 1024 * 1024 - len(canonical_json_bytes(initial_row)) - 1
+    metadata_path = store.metadata_path(near)
+    metadata = state.read_json(metadata_path)
+    metadata["description"] = "d" * remaining
+    metadata_path.write_text(json.dumps(metadata))
+    near_snapshot = inventory.metadata_snapshot(roots, refresh=True)
+    assert near_snapshot["observation"]["complete"] is True
+    assert near_snapshot["artifacts"]["images"][0]["digest"] == near
+    assert near_snapshot["artifacts"]["images"][0]["delete_supported"] is True
+
+    small = f"sha256:{store.write_stream([b'small valid peer']).name}"
+    store.write_metadata(small, {"kind": KIND_CLOUD_IMAGE, "arch": "aarch64"})
+    bad = f"sha256:{store.write_stream([b'invalid peer']).name}"
+    store.write_metadata(bad, {"kind": "bad\0kind", "arch": "aarch64"})
+    build = _buildkit_export(roots, "bk-000000000154")
+    final = inventory.metadata_snapshot(roots, refresh=True)
+    assert final["observation"]["complete"] is False
+    observed = {row["digest"]: row for row in final["artifacts"]["artifacts"]}
+    assert set(observed) == {small, build["output_oci_manifest_digest"]}
+    assert final["builds"][0]["build_id"] == build["build_id"]
+    assert all(row["delete_supported"] is False for row in observed.values())
+    assert store.exists(near) and metadata_path.is_file()
+
+
+@pytest.mark.parametrize("damage", [None, "directory-alias", "not-directory"])
+def test_catalog_canonical_build_output_namespace_is_not_a_malformed_build_record(tmp_path, damage):
+    roots = _setup_roots(tmp_path)
+    build = _buildkit_export(roots, "bk-000000000155")
+    outputs = roots.builds / "outputs"
+    if damage is not None:
+        retained = tmp_path / "retained-output-transports"
+        outputs.rename(retained)
+        if damage == "directory-alias":
+            outputs.symlink_to(retained, target_is_directory=True)
+        else:
+            outputs.write_bytes(b"not an output directory")
+    snapshot = inventory.metadata_snapshot(roots, refresh=True)
+    assert snapshot["observation"]["complete"] is (damage is None)
+    assert [row["build_id"] for row in snapshot["builds"]] == [build["build_id"]]
+    image = snapshot["artifacts"]["images"][0]
+    assert image["digest"] == build["output_oci_manifest_digest"]
+    assert image["output_oci_archive_digest"] == build["output_oci_archive_digest"]
+    assert image["availability"] == ("unavailable" if damage == "not-directory" else "available")
+
+
+def test_observed_native_provider_cannot_replace_canonical_network_identity(tmp_path, monkeypatch):
+    roots = _setup_roots(tmp_path)
+    name = "a-canonical-native"
+    run_id = _resource_run(roots, name, runtime_kind="oci-root")
+    supplied = inventory.list_vms(roots, live=False)
+    supplied["vms"].append(
+        {
+            "id": "host:lima-vz:plm-" + run_id.replace("-", "")[:12],
+            "name": "plm-" + run_id.replace("-", "")[:12],
+            "run_id": run_id,
+            "backend": "lima-vz",
+            "runtime_kind": "oci-root",
+            "managed": False,
+            "source": "host-backend",
+        }
+    )
+
+    def network_status(_roots, selected):
+        if selected != name:
+            raise StateError("not a canonical run")
+        return {
+            "run": {"name": name, "run_id": run_id},
+            "mode": "none",
+            "subnet": None,
+            "guest": {"gateway": None, "address": None},
+            "exposure": {"external": False},
+            "published_ports": [],
+        }
+
+    monkeypatch.setattr(inventory.oci_network_status, "network_status", network_status)
+    result = inventory.list_networks(roots, vms_result=supplied)
+    rows = {row["id"]: row for row in result["networks"]}
+    selected = rows["oci-network:" + run_id]
+    assert selected["name"] == name and selected["status"] == "isolated"
+    assert selected["attachments"] == [{"name": name, "run_id": run_id, "guest_ip": None, "ports": []}]
+
+
+def test_same_home_same_name_collision_revokes_native_canonical_guest_access(tmp_path, monkeypatch):
+    roots, name, _, observed = _native_exited_vm(tmp_path, monkeypatch)
+    ledger = roots.runs / name / "state.json"
+    before = ledger.read_bytes()
+    observed.update(
+        id="host:lima-vz:" + name,
+        name=name,
+        run_id="33333333-3333-4333-8333-333333333333",
+        runtime_kind="cloud-image",
+    )
+    canonical = next(row for row in inventory.list_vms(roots)["vms"] if row["id"] == name)
+    assert canonical["managed"] is False and canonical["stale"] is True
+    assert canonical["access"]["exec"] is False and canonical["access"]["metrics"] is False
+    with pytest.raises(StateError):
+        inventory.get_vm(roots, name)
+    assert ledger.read_bytes() == before
+
+
+def test_empty_lima_home_coalesces_native_provider_in_default_home(tmp_path, monkeypatch):
+    roots, name, _, _ = _native_exited_vm(tmp_path, monkeypatch)
+    configured_home = Path(os.environ["LIMA_HOME"])
+    home = tmp_path / "default-user-home"
+    home.mkdir()
+    configured_home.rename(home / ".lima")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("LIMA_HOME", "")
+    result = inventory.list_vms(roots)
+    assert [row["id"] for row in result["vms"]] == [name]
+    assert result["vms"][0]["status"] == "running"
+    assert result["vms"][0]["access"]["metrics"] is True
+
+
+@pytest.mark.parametrize("removed", [False, True])
+def test_native_metrics_busy_admission_cannot_override_removed_refusal(tmp_path, monkeypatch, removed):
+    import fcntl
+
+    from palimpsest_local import vm_access
+
+    roots, name, run_id, _ = _native_exited_vm(tmp_path, monkeypatch)
+    ledger = roots.runs / name / "state.json"
+    if removed:
+        payload = state.read_json(ledger)
+        state.atomic_write_json(ledger, {**payload, "status": "removed"})
+    before = ledger.read_bytes()
+    get_vm = inventory.get_vm
+    initial = get_vm(roots, name)
+    assert initial["access"]["metrics"] is (not removed)
+    holder = None
+    clock = [0.0]
+
+    def hold_after_inventory(*args, **kwargs):
+        nonlocal holder
+        row = get_vm(*args, **kwargs)
+        holder = os.open(roots.locks / f"{name}.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return row
+
+    monkeypatch.setattr(inventory, "get_vm", hold_after_inventory)
+    monkeypatch.setattr(state.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(state.time, "sleep", lambda delay: clock.__setitem__(0, clock[0] + delay))
+    monkeypatch.setattr(
+        vm_access.runtime_dispatch, "exec", lambda *_args, **_kwargs: pytest.fail("unavailable metrics reached guest")
+    )
+    monkeypatch.setattr(
+        vm_access,
+        "spawn_process_session",
+        lambda *_args, **_kwargs: pytest.fail("unavailable metrics reached transport"),
+    )
+    try:
+        result = inventory.vm_metrics(roots, name, expected_run_id=run_id)
+        assert result["status"] == "unavailable"
+        assert result["reason"] == ("stopped" if removed else "busy")
+        assert result["cpu"] is None and result["memory"] is None and result["measured_at"] is None
+        assert clock[0] == pytest.approx(0 if removed else 5)
+        assert str(tmp_path) not in repr(result) and "holder" not in repr(result)
+        assert ledger.read_bytes() == before
+    finally:
+        if holder is not None:
+            os.close(holder)
+
+
+@pytest.mark.parametrize("backend", ["kvm", "lima-vz"])
+def test_busy_legacy_ledger_keeps_busy_after_fresh_host_merge(tmp_path, monkeypatch, backend):
+    import fcntl
+
+    roots = _setup_roots(tmp_path)
+    run_id = _resource_run(roots, "busy-legacy", backend=backend, status="running")
+    ledger = roots.runs / "busy-legacy" / "state.json"
+    before = ledger.read_bytes()
+    host = _observed_vm("busy-legacy", run_id, backend=backend)
+    host["stale"] = False
+    monkeypatch.setattr(
+        inventory.host_inventory,
+        "observe",
+        lambda: {"vms": [host], "volumes": [], "networks": [], "warnings": []},
+    )
+    monkeypatch.setattr(
+        inventory.runtime_dispatch,
+        "_preflight_existing_adapter",
+        lambda *_args, **_kwargs: pytest.fail("busy metadata reached provider preflight"),
+    )
+    holder = os.open(roots.locks / "busy-legacy.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        result = inventory.list_vms(roots, _observation_budget=state.RunObservationWaitBudget(0))
+        row = next(vm for vm in result["vms"] if vm["run_id"] == run_id)
+        assert row["source"] == "run-ledger+host-backend"
+        assert row["access"]["reason"] == "busy"
+        assert not any(row["access"][capability] for capability in ("shell", "exec", "metrics", "logs"))
+        assert row["access"]["transport"] is None
+        assert ledger.read_bytes() == before
+    finally:
+        os.close(holder)

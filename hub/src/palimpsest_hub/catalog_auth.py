@@ -12,11 +12,17 @@ from keystoneauth1 import access as ks_access
 from keystoneauth1 import exceptions as ks_auth_exceptions
 from keystoneclient import exceptions as ks_exceptions
 
-from palimpsest_hub.auth import _assignment_user, _get_reader_ks_client, _role_metadata, _value, keystone_token_header
+from palimpsest_hub.auth import (
+    _assignment_user,
+    _get_reader_ks_client,
+    _role_metadata,
+    _value,
+    keystone_token_header,
+)
 from palimpsest_hub.catalog_policy import global_admin_actions
 from palimpsest_hub.config import get_settings, validate_keystone_id
 
-_HUMAN_AUTH_METHODS = frozenset({"password", "token", "totp", "oidc", "saml2", "mapped"})
+_HUMAN_AUTH_METHODS = frozenset({"password", "token", "totp", "openid", "oidc", "saml2", "mapped"})
 _REDUCED_TOKEN_MARKERS = frozenset(
     {
         "OS-TRUST:trust",

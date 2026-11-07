@@ -1,7 +1,7 @@
 ---
 # Palimpsest kolla role defaults
 
-palimpsest_image_tag: "0.3.10"
+palimpsest_image_tag: "0.3.12"
 palimpsest_image_namespace: "ghcr.io/openstack-afterglow"
 palimpsest_api_image: "{{ palimpsest_image_namespace }}/palimpsest-hub-api"
 palimpsest_worker_image: "{{ palimpsest_image_namespace }}/palimpsest-hub-worker"
@@ -28,6 +28,8 @@ palimpsest_build_worker_key_path: "{{ palimpsest_config_dir }}/build-worker.key"
 palimpsest_build_worker_container_key_path: /run/palimpsest/build-worker.key
 palimpsest_build_worker_scratch_volume: palimpsest_build_worker_scratch
 palimpsest_build_worker_scratch_path: /var/lib/palimpsest/build-worker
+# Keep the persistent mount independent from an already-qualified journal subdirectory.
+palimpsest_build_worker_work_path: "{{ palimpsest_build_worker_scratch_path }}"
 palimpsest_build_worker_memory: 6g
 palimpsest_build_worker_cpus: 2
 palimpsest_build_worker_pids_limit: 512
@@ -35,6 +37,12 @@ palimpsest_build_worker_timeout_seconds: 3600
 palimpsest_build_worker_max_blob_bytes: 107374182400
 # Image import/build inputs are bounded separately from retained result blobs.
 palimpsest_registry_hosts: ["docker.io", "registry-1.docker.io", "ghcr.io", "quay.io"]
+# Registry hosts are a transport fence, not publisher permission. Empty denies
+# all image jobs until the operator selects exact namespace/repository rules.
+palimpsest_image_source_policy:
+  schema_version: 1
+  publisher_policy: "registry-namespace"
+  rules: []
 palimpsest_image_run_network: "none"
 # The worker's own delegated cgroup namespace; never a host-global writable mount.
 palimpsest_image_cgroup_root: "/sys/fs/cgroup"
@@ -56,6 +64,18 @@ palimpsest_instance_gpu_profiles: {}
 # Separately admitted whole-VM cluster privilege; normal CPU/GPU paths stay unchanged.
 palimpsest_instance_cluster_profiles: {}
 palimpsest_instance_ca_certificates: []
+# Explicit publisher mount and scoped native profiles; namespace isolation is required.
+# Empty values never mount a share, prepare a worker or allocate an instance.
+palimpsest_publication_manila_share_id: ""
+palimpsest_publication_manila_export: ""
+palimpsest_publication_manila_root: ""
+palimpsest_publication_manila_fs_name: ""
+palimpsest_publication_manila_data_pool: ""
+# These mounts must already exist. Kolla does not create a share or issuer key.
+palimpsest_publication_manila_host_path: ""
+palimpsest_native_operator_host_path: ""
+palimpsest_native_operator_container_path: "/var/lib/palimpsest/native-operator"
+palimpsest_native_profiles: {}
 # Optional exact hostname -> IP pins for the worker container only, e.g. when
 # the service network's DNS lacks the public Hub name. TLS still verifies the
 # certificate for the configured origin hostname.
@@ -65,6 +85,12 @@ palimpsest_build_worker_etc_hosts: {}
 palimpsest_api_port: 8020
 palimpsest_api_listen_address: "{{ 'api' | kolla_address(inventory_hostname) }}"
 palimpsest_api_listen_port: 18020
+# uvicorn runs with --proxy-headers and trusts X-Forwarded-For only from these
+# peers (comma-separated addresses/CIDRs). "127.0.0.1" is uvicorn's own default,
+# so the rendered behaviour is unchanged. Behind Kolla HAProxy, list the HAProxy
+# source addresses so anonymous per-client rate limits see real clients rather
+# than one shared proxy address. Never list untrusted networks.
+palimpsest_api_forwarded_allow_ips: "127.0.0.1"
 palimpsest_database_name: "palimpsest_kolla"
 palimpsest_database_user: "palimpsest_kolla"
 palimpsest_database_address: "{{ database_address }}"
@@ -94,6 +120,9 @@ palimpsest_keystone_project_domain_name: "{{ default_project_domain_name }}"
 palimpsest_keystone_user_domain_name: "{{ default_user_domain_name }}"
 palimpsest_reader_user: "palimpsest-reader"
 palimpsest_reader_user_domain_name: "{{ default_user_domain_name }}"
+# Requesters use existing native project reader/member/manager assignments.
+# This role never creates application roles/implications or grants tenant access.
+# Project manager includes member/read actions, never human system-admin authority.
 # Exact immutable Keystone IDs; operators must supply both protected sets.
 palimpsest_package_forbidden_project_ids: []
 palimpsest_package_forbidden_user_ids: []
@@ -174,13 +203,19 @@ palimpsest_hub_api_service:
   network_mode: host
   command: ["uvicorn", "palimpsest_hub.main:app", "--host", "{{ palimpsest_api_listen_address }}", "--port", "{{ palimpsest_api_listen_port | string }}", "--proxy-headers", "--no-access-log"]
   restart_policy: unless-stopped
-  volumes:
-    - "{{ palimpsest_config_dir }}/palimpsest.conf:/app/palimpsest.conf:ro"
-    - "{{ palimpsest_config_dir }}/policy:/etc/palimpsest:ro"
-    - "{{ palimpsest_hub_shared_path if palimpsest_hub_storage_mode == 'shared' else palimpsest_hub_volume }}:{{ palimpsest_hub_path }}"
-    - "kolla_logs:/var/log/kolla/"
+  volumes: >-
+    {{ [
+      palimpsest_config_dir ~ '/palimpsest.conf:/app/palimpsest.conf:ro',
+      palimpsest_config_dir ~ '/policy:/etc/palimpsest:ro',
+      (palimpsest_hub_shared_path if palimpsest_hub_storage_mode == 'shared' else palimpsest_hub_volume) ~ ':' ~ palimpsest_hub_path,
+      'kolla_logs:/var/log/kolla/'
+    ] + ([palimpsest_publication_manila_host_path ~ ':' ~ palimpsest_publication_manila_root ~ ':rw']
+         if palimpsest_publication_manila_root | length > 0 else [])
+      + ([palimpsest_native_operator_host_path ~ ':' ~ palimpsest_native_operator_container_path ~ ':rw']
+         if palimpsest_native_profiles | length > 0 else []) }}
   environment:
     PALIMPSEST_CONFIG: "/etc/palimpsest/palimpsest.conf"
+    FORWARDED_ALLOW_IPS: "{{ palimpsest_api_forwarded_allow_ips }}"
     PALIMPSEST_HUB_BUILD_WORKER_KEY: "{{ palimpsest_build_worker_key if (enable_palimpsest_hub_build_worker | bool) else '' }}"
     DATABASE_URL: "{{ palimpsest_database_url }}"
     REDIS_URL: "{{ palimpsest_redis_url }}"
@@ -202,6 +237,7 @@ palimpsest_hub_api_service:
     PALIMPSEST_HUB_MAX_BUNDLE_EXPANDED_BYTES: "{{ palimpsest_hub_max_bundle_expanded_bytes | string }}"
     PALIMPSEST_HUB_MAX_BLOCKING_OPERATIONS: "{{ palimpsest_hub_max_blocking_operations | string }}"
     PALIMPSEST_HUB_REGISTRY_HOSTS: "{{ palimpsest_registry_hosts | to_json }}"
+    PALIMPSEST_HUB_IMAGE_SOURCE_POLICY: "{{ palimpsest_image_source_policy | to_json }}"
     PALIMPSEST_HUB_IMAGE_RUN_NETWORK: "{{ palimpsest_image_run_network }}"
     PALIMPSEST_HUB_IMAGE_CGROUP_ROOT: "{{ palimpsest_image_cgroup_root }}"
     PALIMPSEST_HUB_MAX_CONTEXT_BYTES: "{{ palimpsest_max_context_bytes | string }}"
@@ -215,6 +251,12 @@ palimpsest_hub_api_service:
     PALIMPSEST_HUB_INSTANCE_GPU_PROFILES: "{{ palimpsest_instance_gpu_profiles | to_json }}"
     PALIMPSEST_HUB_INSTANCE_CLUSTER_PROFILES: "{{ palimpsest_instance_cluster_profiles | to_json }}"
     PALIMPSEST_HUB_INSTANCE_CA_CERTIFICATES: "{{ palimpsest_instance_ca_certificates | to_json }}"
+    PALIMPSEST_HUB_PUBLICATION_MANILA_SHARE_ID: "{{ palimpsest_publication_manila_share_id }}"
+    PALIMPSEST_HUB_PUBLICATION_MANILA_EXPORT: "{{ palimpsest_publication_manila_export }}"
+    PALIMPSEST_HUB_PUBLICATION_MANILA_ROOT: "{{ palimpsest_publication_manila_root }}"
+    PALIMPSEST_HUB_PUBLICATION_MANILA_FS_NAME: "{{ palimpsest_publication_manila_fs_name }}"
+    PALIMPSEST_HUB_PUBLICATION_MANILA_DATA_POOL: "{{ palimpsest_publication_manila_data_pool }}"
+    PALIMPSEST_HUB_NATIVE_PROFILES: "{{ palimpsest_native_profiles | to_json }}"
     OS_AUTH_URL: "{{ palimpsest_keystone_auth_url }}"
     OS_USERNAME: "{{ palimpsest_keystone_user }}"
     OS_PROJECT_NAME: "{{ palimpsest_service_project_name }}"
@@ -253,10 +295,11 @@ palimpsest_hub_build_worker_service:
   environment:
     PALIMPSEST_HUB_URL: "{{ palimpsest_build_worker_hub_origin }}"
     PALIMPSEST_HUB_BUILD_WORKER_KEY_FILE: "{{ palimpsest_build_worker_container_key_path }}"
-    PALIMPSEST_HUB_BUILD_WORK_PATH: "{{ palimpsest_build_worker_scratch_path }}"
+    PALIMPSEST_HUB_BUILD_WORK_PATH: "{{ palimpsest_build_worker_work_path }}"
     PALIMPSEST_HUB_BUILD_TIMEOUT_SECONDS: "{{ palimpsest_build_worker_timeout_seconds | string }}"
     PALIMPSEST_HUB_MAX_BLOB_BYTES: "{{ palimpsest_build_worker_max_blob_bytes | string }}"
     PALIMPSEST_HUB_REGISTRY_HOSTS: "{{ palimpsest_registry_hosts | to_json }}"
+    PALIMPSEST_HUB_IMAGE_SOURCE_POLICY: "{{ palimpsest_image_source_policy | to_json }}"
     PALIMPSEST_HUB_IMAGE_RUN_NETWORK: "{{ palimpsest_image_run_network }}"
     PALIMPSEST_HUB_IMAGE_CGROUP_ROOT: "{{ palimpsest_image_cgroup_root }}"
     PALIMPSEST_HUB_IMAGE_SCRATCH_BYTES: "{{ palimpsest_image_scratch_bytes | string }}"

@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import signal
 import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 
 from .errors import ArtifactValidationError, PalimpsestError
@@ -27,12 +29,16 @@ def _json(path: Path) -> dict:
 def _connect(cloud: str):
     try:
         import openstack
+
+        from .cloud_transport import OneShotSession
     except ImportError:
         raise PalimpsestError("Nova commands require palimpsest-client[cloud]") from None
     # No --insecure or arbitrary credential forwarding to a guest.
-    connection = openstack.connect(
+    region = openstack.config.get_cloud_region(
         cloud=cloud, interface="public", verify=True, compute_api_version="2.60", api_timeout=40
     )
+    region.set_session_constructor(OneShotSession)
+    connection = openstack.connection.Connection(config=region)
     connection.authorize()
     return connection
 
@@ -291,11 +297,52 @@ def add_parser(commands) -> None:
     worker.add_argument("--jobs-root", type=Path, required=True)
     worker.add_argument("--assets-root", type=Path, required=True)
     worker.add_argument("request", type=Path)
+    from .cloud_env import add_parser as add_env_parser
+
+    add_env_parser(operations)
+    from .nova_native_cloud import add_parser as add_native_parser
+
+    add_native_parser(operations)
+
+
+@contextmanager
+def _interruptible_consumer(enabled: bool):
+    if not enabled:
+        yield
+        return
+    interrupted = False
+
+    def terminate(_signal, _frame):
+        nonlocal interrupted
+        # Catch rather than SIG_IGN: exec children must retain normal TERM.
+        if not interrupted:
+            interrupted = True
+            raise KeyboardInterrupt
+
+    previous = signal.signal(signal.SIGTERM, terminate)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous)
 
 
 def dispatch(args) -> int:
     operation = args.cloud_operation
     try:
+        if operation == "native":
+            from .nova_native_cloud import dispatch as dispatch_native
+
+            with _interruptible_consumer(args.native_operation == "run"):
+                report = dispatch_native(args)
+            print(json.dumps(report, sort_keys=True, indent=2))
+            return report.get("exit_code", 0)
+        if operation in {"env", "dockerfile-build", "image-pull", "layer-run"}:
+            from .cloud_env import dispatch as dispatch_env
+
+            with _interruptible_consumer(operation == "layer-run"):
+                report = dispatch_env(args)
+            print(json.dumps(report, sort_keys=True, indent=2))
+            return report.get("exit_code", 0)
         if operation == "build-user-data":
             rendered = build_nova_layer_user_data(_json(args.config))
             if args.output is None:
@@ -306,10 +353,17 @@ def dispatch(args) -> int:
                     stream.write(rendered)
             return 0
         if operation == "registry-worker":
+            from .image_source_policy import load_image_source_policy
             from .registry_worker import run_job
+            from .state import resolve_roots
 
             result = run_job(
-                _json(args.request), cache_root=args.cache_root, jobs_root=args.jobs_root, assets_root=args.assets_root
+                _json(args.request),
+                cache_root=args.cache_root,
+                jobs_root=args.jobs_root,
+                assets_root=args.assets_root,
+                source_policy=load_image_source_policy(resolve_roots()),
+                current_policy=lambda: load_image_source_policy(resolve_roots()),
             )
         elif operation == "build":
             result = run_nova_build(_json(args.config), name=args.name)
@@ -346,5 +400,7 @@ def dispatch(args) -> int:
                 )
         print(json.dumps(result, sort_keys=True, indent=2))
         return 0
+    except KeyboardInterrupt:
+        return 130
     except (OSError, KeyError, TypeError, ValueError) as error:
         raise PalimpsestError("cloud command failed: " + type(error).__name__) from None

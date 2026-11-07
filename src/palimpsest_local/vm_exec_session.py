@@ -1,20 +1,19 @@
-"""Dashboard-only foreground attachment to an original OCI exec owner.
+"""Dashboard foreground attachment with a retained non-daemon process owner.
 
-Access.open should wrap only OCI exec sessions with RetainedExecSession. Dashboard
-probes should submit timeout_ms=8000; interactive console exec keeps the core's
-30-second default. This helper neither submits commands nor changes that deadline.
+Access.open wraps canonical OCI exec sessions without changing their deadlines.
+The worker starts at construction and continues draining after foreground close;
+only its finally block closes the underlying session. Probe timers and drawer
+disconnects detach the foreground, not the native SSH process or mailbox owner.
+The dashboard registry stops admission and waits through original cleanup.
 
-The worker starts at construction, even if events() is never called. Its sole
-underlying iterator continues through output drain and original-token ACK after
-foreground close, then closes the underlying session in finally. The existing OCI
-session deadline (guest timeout + 10 seconds of transport grace) bounds its life;
-there is no blocking queue put, takeover, retry, or VM STOP here. Non-daemon owners
-survive foreground shutdown; a dashboard registry stops admission and waits for
-their original bounded completion/ACK before normal process exit.
+Completion protocols are explicit. requires_ack=True is the strict default for
+KVM mailboxes; missing/unknown acknowledgement remains unconfirmed. The trusted
+native Lima-VZ route selects False: its process lifetime is retained, but it has
+no mailbox ACK to read, synthesize, confirm or count as unconfirmed.
+
 The handoff retains at most 128 output events and 64 KiB of output. Overflow fails
-and detaches the foreground instead of silently dropping part of a successful
-command. Closed foregrounds retain no queued output. Terminal/ACK facts remain
-available via observed_completion, without claiming an uncertain mailbox is free.
+and detaches instead of silently dropping successful output. Closed foregrounds
+retain no queued data; unknown outcomes never authorize command replay.
 """
 
 from __future__ import annotations
@@ -25,13 +24,14 @@ from collections.abc import Callable, Iterator
 
 from .errors import StateError
 from .oci_exec_control import MAX_EXEC_OUTPUT
-from .oci_exec_session import OCIExecCompletionObservation, OCIExecProcessSession
+from .oci_exec_session import OCIExecCompletionObservation
 from .runtime_types import (
     ProcessCapabilities,
     ProcessCapabilityError,
     ProcessEvent,
     ProcessExit,
     ProcessOutputEvent,
+    ProcessSession,
     ProcessSignal,
     ProcessStatusEvent,
 )
@@ -42,6 +42,9 @@ _CLOSED = "Dashboard OCI exec consumer is closed; the original result remains ow
 _FAILED = (
     "Dashboard OCI exec transport failed; command outcome or acknowledgement is unknown; "
     "preserve the original evidence and do not rerun"
+)
+_PROCESS_FAILED = (
+    "Dashboard exec transport failed; command outcome is unknown; preserve the original evidence and do not rerun"
 )
 _ACK_UNKNOWN = (
     "Dashboard OCI exec terminal was observed but acknowledgement is unconfirmed; "
@@ -63,7 +66,9 @@ class ExecOwners:
         self._active: set[RetainedExecSession] = set()
         self._unconfirmed = 0
 
-    def open(self, factory: Callable[[], OCIExecProcessSession]) -> RetainedExecSession:
+    def open(self, factory: Callable[[], ProcessSession], *, requires_ack: bool = True) -> RetainedExecSession:
+        if type(requires_ack) is not bool:
+            raise TypeError("requires_ack must be a bool")
         # Reserve before submission: shutdown cannot miss an admitted command.
         with self._condition:
             if self._closing:
@@ -72,7 +77,7 @@ class ExecOwners:
                 raise StateError("Dashboard OCI exec owner limit reached")
             self._opening += 1
         try:
-            return RetainedExecSession(factory(), owner=self)
+            return RetainedExecSession(factory(), owner=self, requires_ack=requires_ack)
         finally:
             with self._condition:
                 self._opening -= 1
@@ -83,15 +88,20 @@ class ExecOwners:
             self._active.add(session)
 
     def _finished(self, session: RetainedExecSession) -> None:
+        requires_ack = session.requires_ack
+        confirmed = False
         try:
-            observation = session.observed_completion
-        except StateError:
-            observation = None
-        with self._condition:
-            if observation is None or observation.acknowledgement != "confirmed":
-                self._unconfirmed += 1
-            self._active.discard(session)
-            self._condition.notify_all()
+            if requires_ack:
+                observation = session.observed_completion
+                confirmed = observation is not None and observation.acknowledgement == "confirmed"
+        except BaseException:
+            pass
+        finally:
+            with self._condition:
+                if requires_ack and not confirmed:
+                    self._unconfirmed += 1
+                self._active.discard(session)
+                self._condition.notify_all()
 
     def stop_admitting(self) -> None:
         with self._condition:
@@ -114,9 +124,12 @@ class RetainedExecSession:
     Transport, ACK and command-limit failures never synthesize successful exits.
     """
 
-    def __init__(self, session: OCIExecProcessSession, *, owner: ExecOwners | None = None) -> None:
+    def __init__(self, session: ProcessSession, *, owner: ExecOwners | None = None, requires_ack: bool = True) -> None:
+        if type(requires_ack) is not bool:
+            raise TypeError("requires_ack must be a bool")
         self._session = session
         self._owner = owner
+        self._requires_ack = requires_ack
         self._condition = threading.Condition()
         self._output: deque[ProcessOutputEvent] = deque()
         self._output_bytes = 0
@@ -143,7 +156,14 @@ class RetainedExecSession:
         return ProcessCapabilities(stdin=False, tty=False, resize=False, signal=False)
 
     @property
+    def requires_ack(self) -> bool:
+        """Whether this transport owns a mailbox whose ACK must be accounted."""
+        return self._requires_ack
+
+    @property
     def observed_completion(self) -> OCIExecCompletionObservation | None:
+        if not self._requires_ack:
+            return None
         return self._session.observed_completion
 
     def _offer(self, event: ProcessOutputEvent) -> None:
@@ -162,8 +182,10 @@ class RetainedExecSession:
     def _failure_message(self) -> str:
         # Only immutable, core-validated facts may inform the client message.
         # Never retain a raw exception (or its traceback and transport secrets).
+        if not self._requires_ack:
+            return _PROCESS_FAILED
         try:
-            observation = self._session.observed_completion
+            observation = self.observed_completion
         except BaseException:
             return _FAILED
         if observation is not None:

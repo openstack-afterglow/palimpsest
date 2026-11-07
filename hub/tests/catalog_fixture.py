@@ -146,21 +146,15 @@ async def isolated_catalog(root, *, include_packages=False):
             "target_project_id": target,
             "target_project_name": "Synthetic target",
             "package_actions": actions,
-            "package_capabilities": service_policy.capabilities_for(actions),
         }
 
     async def synthetic_member(token_info: dict):
-        capabilities = set()
-        if token_info["token"] != "no-inventory":
-            capabilities.add("palimpsest-inventory_reader")
-        if token_info["token"] == "member":
-            capabilities.add("palimpsest-download_user")
         actions = set()
-        if "palimpsest-inventory_reader" in capabilities:
+        if token_info["token"] != "no-inventory":
             actions.add("packages:inventory")
-        if "palimpsest-download_user" in capabilities:
+        if token_info["token"] == "member":
             actions.add("packages:read")
-        return {**token_info, "package_capabilities": frozenset(capabilities), "package_actions": frozenset(actions)}
+        return {**token_info, "package_actions": frozenset(actions)}
 
     async def manager(request: Request):
         value = await original(request)

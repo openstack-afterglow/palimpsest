@@ -2966,6 +2966,7 @@ def _proof_materialization(store: OCIStore, *, stop_workload: bool = False) -> O
         )
         key = DerivedSquashFSKey.for_occurrence(
             occurrence,
+            parent_chain_digest=_digest(b"proof-parent-chain\0" + b"".join(filesystems.lowers[:ordinal])),
             intake_policy_id=LAYER_INTAKE_POLICY_ID,
             intake_policy_fingerprint=DEFAULT_LAYER_CONVERSION_LIMITS.fingerprint,
             pack_policy_id=SQUASHFS_PACK_POLICY_ID,

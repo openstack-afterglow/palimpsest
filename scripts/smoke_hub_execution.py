@@ -28,6 +28,7 @@ from palimpsest_local.benchmark_scenarios import (  # noqa: E402
     _delete_consumer,
     _digest,
     _hub,
+    _require_hub_lifecycle,
     _wait,
     connection_from_stdin,
 )
@@ -59,6 +60,12 @@ def run(config, output, *, connection=None):
         raise ArtifactValidationError("functional smoke envelope cannot contain exactly two sequential consumers")
     if not re.fullmatch(r"[a-z0-9./:@_-]+@sha256:[0-9a-f]{64}", config["smoke"]["image_reference"]):
         raise ArtifactValidationError("functional smoke requires a digest-pinned image")
+    if any(
+        not isinstance(config["smoke"].get(key), str)
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.+-]{0,63}", config["smoke"][key]) is None
+        for key in ("os_family", "os_version")
+    ):
+        raise ArtifactValidationError("functional smoke requires explicit image OS family and version")
     output.mkdir(mode=0o700, parents=False, exist_ok=False)
     state = {
         "schema": "palimpsest.hub-execution-smoke.v1",
@@ -86,6 +93,7 @@ def run(config, output, *, connection=None):
         budget = ResourceBudget(config, output)
         observer = ScenarioCloud(config, output, event, connection=connection, budget=budget, observation_only=True)
         client = _hub(config, observer.connection)
+        _require_hub_lifecycle(client)
         source = Path(config["smoke"]["layer_file"])
         event("layer-upload", {"bytes": source.stat().st_size})
         receipt = client.push_blob(source, {"name": "api-smoke-" + config["job_id"], "arch": "x86_64"}, resume=False)
@@ -121,6 +129,8 @@ def run(config, output, *, connection=None):
             "name": "smoke-registry-" + config["job_id"],
             "reference": config["smoke"]["image_reference"],
             "platform": "linux/amd64",
+            "os_family": config["smoke"]["os_family"],
+            "os_version": config["smoke"]["os_version"],
         }
         atomic_write_json(output / "registry-intent.json", request)
         event("registry-submission", {"request_id": request["request_id"]})
@@ -177,6 +187,8 @@ def run(config, output, *, connection=None):
             "dockerfile": definition,
             "context_digest": context["digest"],
             "platform": "linux/amd64",
+            "os_family": config["smoke"]["os_family"],
+            "os_version": config["smoke"]["os_version"],
         }
         atomic_write_json(output / "dockerfile-intent.json", request)
         accepted = client.build_dockerfile(request)
@@ -195,6 +207,7 @@ def run(config, output, *, connection=None):
         previous = None
         for index in (1, 2):
             role = "consumer" + str(index)
+            _require_hub_lifecycle(_hub(config, observer.connection))
             reservation = budget.reserve(role, config["placement"]["boot_gib"])
             spec = {
                 k: v

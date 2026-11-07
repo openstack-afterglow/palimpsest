@@ -37,30 +37,6 @@ def test_archive_validators_require_exact_packaged_asset(tmp_path: Path) -> None
         packaging._validate_wheel(wheel, b"different")
 
 
-def test_install_smoke_is_offline_isolated_and_uses_runtime_elf_validation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    commands: list[tuple[list[str], Path, dict[str, str] | None]] = []
-    monkeypatch.setattr(
-        packaging, "_run", lambda command, *, env=None, cwd=packaging.ROOT: commands.append((command, cwd, env))
-    )
-    wheel = tmp_path / "package.whl"
-    packaging._verify_install(wheel, tmp_path, "/opt/uv", "1.2.3")
-    assert commands[0][0][:2] == ["/opt/uv", "venv"]
-    assert commands[1][0][0:3] == ["/opt/uv", "pip", "install"]
-    assert "--no-deps" in commands[1][0] and "--no-index" in commands[1][0]
-    assert commands[2][0][1:3] == ["-I", "-c"]
-    assert "_bootstrap_stage1_binary" in commands[2][0][3]
-    assert "is_relative_to" in commands[2][0][3]
-    assert commands[3][0][:3] == ["/opt/uv", "tool", "install"]
-    assert "--no-index" in commands[3][0] and "--no-deps" not in commands[3][0]
-    assert commands[3][2]["UV_TOOL_DIR"] == str(tmp_path / "tool-envs")
-    assert commands[3][2]["UV_TOOL_BIN_DIR"] == str(tmp_path / "tool-bin")
-    assert commands[4][0] == [str(tmp_path / "tool-bin/palimpsest"), "--version"]
-    assert all(command[1] == tmp_path for command in commands[2:])
-    assert all(env is None or "PYTHONPATH" not in env for _, _, env in commands[2:])
-
-
 def test_output_directory_must_be_new_and_not_a_symlink(tmp_path: Path) -> None:
     existing = tmp_path / "existing"
     existing.mkdir()

@@ -567,7 +567,17 @@ def _cleanup(cloud, budget, output):
         own_servers = {r["server_id"] for r in resources if r.get("server_id")}
         for resource in resources:
             if not resource.get("server_id"):
+                if resource.get("phase") == "aborted-before-request":
+                    receipt = cloud.receipts / (resource["job_id"] + ".json")
+                    if receipt.exists() or receipt.is_symlink():
+                        cloud._verify_aborted(resource, cloud.controller.inspect(resource["job_id"]))
+                    else:
+                        cloud._own(resource, allow_unallocated=True)
+                    continue
                 original_vm = cloud.controller.inspect(resource["job_id"])
+                if original_vm.get("phase") == "aborted-before-request":
+                    cloud._verify_aborted(resource, original_vm)
+                    continue
                 if (
                     original_vm.get("uncertain_create")
                     or not original_vm.get("server_id")

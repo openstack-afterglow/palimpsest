@@ -51,8 +51,7 @@ def request_project(actor, conn):
     return project
 
 
-async def fresh_writer(actor, conn):
-    from palimpsest_hub.api.hub import _legacy_writer
+async def _fresh_subject(actor, conn):
     from palimpsest_hub.auth import (
         get_package_member_info,
         revalidate_package_admin,
@@ -66,23 +65,86 @@ async def fresh_writer(actor, conn):
         if original.get("user_id") != actor.get("user_id") or original.get("project_id") != actor.get("project_id"):
             raise HTTPException(403, "Instance original subject or scope changed")
         current = await get_package_member_info(token_info=original)
-    await _legacy_writer(current)
     if current["user_id"] != actor["user_id"] or package_target_project_id(current) != package_target_project_id(actor):
         raise HTTPException(403, "Instance authority changed")
     request_project(current, conn)
     return current
 
 
+async def fresh_writer(actor, conn):
+    from palimpsest_hub.api.hub import _legacy_writer
+
+    current = await _fresh_subject(actor, conn)
+    return await _legacy_writer(current)
+
+
+def require_instance_control(actor, row):
+    if package_target_project_id(actor) != row.project_id:
+        raise HTTPException(403, "Instance management requires the exact project")
+    actions = actor.get("package_actions", ())
+    if "packages:manage" in actions:
+        return
+    if "packages:manage_own" in actions and actor.get("user_id") == row.created_by:
+        return
+    raise HTTPException(403, "Instance management or exact creator cleanup authority required")
+
+
+async def fresh_instance_controller(actor, conn, row):
+    current = await _fresh_subject(actor, conn)
+    require_instance_control(current, row)
+    return current
+
+
+async def _published_layers(session, spec, actor):
+    """Authorize the sealed image, not a project-wide grant on deduplicated bytes."""
+    identity = spec.get("published_image_id")
+    if identity is None:
+        return None
+    from palimpsest_hub.image_models import PalimpsestHubPublishedImage
+    from palimpsest_hub.services.published_images import image_readable, image_value
+
+    row = await session.get(PalimpsestHubPublishedImage, identity)
+    if row is None or not image_readable(row, actor):
+        raise HTTPException(404, "Published instance image not found")
+    published = await image_value(session, row, internal=True)
+    if (
+        spec.get("published_manifest_digest") not in (None, published["manifest_digest"])
+        or [layer["digest"] for layer in published["manifest"]["layers"]] != spec["layer_digests"]
+    ):
+        raise HTTPException(409, "Published instance image binding changed")
+    return published
+
+
+async def _runtime_layer(session, digest, actor, published):
+    from palimpsest_hub.api.hub import _load_visible
+    from palimpsest_hub.models import PalimpsestHubLayer
+
+    if published is None:
+        return await _load_visible(session, digest, actor)
+    item = next((layer for layer in published["manifest"]["layers"] if layer["digest"] == digest), None)
+    if item is None:
+        return await _load_visible(session, digest, actor)  # A separately authorized conventional boot base.
+    row = await session.scalar(
+        select(PalimpsestHubLayer).where(
+            PalimpsestHubLayer.blob_digest == digest,
+        )
+    )
+    if row is None or row.size_bytes != item["size_bytes"]:
+        raise HTTPException(409, "Published instance payload binding changed")
+    return row
+
+
 async def payload_authority(actor, conn, session=None, spec=None):
-    from palimpsest_hub.api.hub import _legacy_download, _load_visible
+    from palimpsest_hub.api.hub import _legacy_download
 
     current = await fresh_writer(actor, conn)
     await _legacy_download(current)
     if session is not None:
+        published = await _published_layers(session, spec, current)
         for digest in dict.fromkeys(
             [*spec["layer_digests"], *([spec["base_image_digest"]] if spec["base_image_digest"] else [])]
         ):
-            await _load_visible(session, digest, current)
+            await _runtime_layer(session, digest, current, published)
     return current
 
 
@@ -120,9 +182,13 @@ def projection(row):
     }
 
 
-async def owned(session, instance_id, project):
+async def owned(session, instance_id, project, user_id=None):
     row = await session.get(PalimpsestHubInstance, instance_id)
-    if row is None or row.project_id != project:
+    if (
+        row is None
+        or row.project_id != project
+        or (row.spec_json.get("published_visibility") == "private" and row.created_by != user_id)
+    ):
         raise HTTPException(404, "Instance not found")
     return row
 
@@ -252,10 +318,10 @@ def validate_runtime(runtime):
 
 async def snapshot(session, req, actor, store):
     # Import lazily: API owns visibility and CAS locks, not a second visibility policy.
-    from palimpsest_hub.api.hub import _load_visible
+    from palimpsest_local.image_manifest import manifest_digest
 
     source_id = req.get("source_instance_id")
-    source = await owned(session, source_id, package_target_project_id(actor)) if source_id else None
+    source = await owned(session, source_id, package_target_project_id(actor), actor["user_id"]) if source_id else None
     digests = source.spec_json["layer_digests"] if source else req["layer_digests"]
     if not digests:
         raise HTTPException(422, "An explicit complete layer stack is required")
@@ -265,7 +331,7 @@ async def snapshot(session, req, actor, store):
 
         if req.get("image_job_id"):
             job = await session.get(PalimpsestHubImageJob, req["image_job_id"])
-            if job is None or job.project_id != package_target_project_id(actor):
+            if job is None or job.project_id != package_target_project_id(actor) or job.created_by != actor["user_id"]:
                 raise HTTPException(404, "Image job not found")
             if job.status != "complete" or job.output_digests != digests:
                 raise HTTPException(422, "Image job must be complete and match the exact ordered layer stack")
@@ -280,6 +346,7 @@ async def snapshot(session, req, actor, store):
                     select(PalimpsestHubImageJob).where(
                         PalimpsestHubImageJob.id.in_(candidates),
                         exact_identity(PalimpsestHubImageJob.project_id, package_target_project_id(actor)),
+                        exact_identity(PalimpsestHubImageJob.created_by, actor["user_id"]),
                         PalimpsestHubImageJob.status == "complete",
                     )
                 )
@@ -291,14 +358,36 @@ async def snapshot(session, req, actor, store):
                     raise HTTPException(
                         422, "Select image_job_id to disambiguate identical layer bytes with different runtime metadata"
                     )
+    binding_spec = {"layer_digests": digests}
+    if source and source.spec_json.get("published_image_id"):
+        binding_spec.update(
+            published_image_id=source.spec_json["published_image_id"],
+            published_manifest_digest=source.spec_json["published_manifest_digest"],
+        )
+    elif job and isinstance((job.result_json or {}).get("manifest"), dict):
+        binding_spec.update(
+            published_image_id=job.id,
+            published_manifest_digest=manifest_digest(job.result_json["manifest"]),
+        )
+    published = await _published_layers(session, binding_spec, actor)
     previous = None
     layers = []
     base_digest = None
     modes = set()
+    if published is not None:
+        from palimpsest_hub.services.published_images import PLATFORM_ARCH
+
+        # A sealed image's declared platform decides; the arch label on a shared payload row
+        # only records whoever first registered identical bytes.
+        published_arch = PLATFORM_ARCH.get(published["manifest"]["platform"])
     for digest in digests:
-        layer = await _load_visible(session, digest, actor)
+        layer = await _runtime_layer(session, digest, actor, published)
         config = layer.config_json or {}
-        if layer.kind != "squashfs" or layer.media_type != MEDIA_TYPE_LAYER_SQUASHFS or layer.arch != "x86_64":
+        if (
+            layer.kind not in ("squashfs", "image-payload")
+            or layer.media_type != MEDIA_TYPE_LAYER_SQUASHFS
+            or (published_arch if published is not None else layer.arch) != "x86_64"
+        ):
             raise HTTPException(422, "Instance inputs must be x86_64 SquashFS runtime layers")
         if layer.size_bytes <= 0 or not store.exists(digest):
             raise HTTPException(422, "Instance layer stack is incomplete or unavailable")
@@ -326,7 +415,7 @@ async def snapshot(session, req, actor, store):
         raise HTTPException(422, "Layer stack mixes incompatible runtime modes")
     mode = next(iter(modes))
     if mode == "application":
-        base = await _load_visible(session, base_digest, actor)
+        base = await _runtime_layer(session, base_digest, actor, None)
         if base.kind != "cloud-image" or base.arch != "x86_64":
             raise HTTPException(422, "Application layer cloud base provenance is unavailable or incompatible")
     if source:
@@ -352,6 +441,10 @@ async def snapshot(session, req, actor, store):
         raise HTTPException(422, "Resolved runtime command exceeds instance argument limits")
     return {
         **req,
+        **(
+            {key: binding_spec[key] for key in ("published_image_id", "published_manifest_digest")} if published else {}
+        ),
+        **({"published_visibility": published["visibility"]} if published else {}),
         "layer_digests": list(digests),
         "layers": layers,
         "mode": mode,
@@ -363,7 +456,7 @@ async def snapshot(session, req, actor, store):
 
 
 async def create(factory, store, settings, actor, conn, req):
-    from palimpsest_hub.api.hub import _legacy_download, _load_visible, _locked_blobs
+    from palimpsest_hub.api.hub import _legacy_download, _locked_blobs
 
     project = request_project(actor, conn)
     await _legacy_download(actor)
@@ -388,25 +481,53 @@ async def create(factory, store, settings, actor, conn, req):
             )
         )
         if old is not None:
+            if old.spec_json.get("published_visibility") == "private" and old.created_by != actor["user_id"]:
+                raise HTTPException(404, "Instance not found")
             if old.request_digest != digest:
                 raise HTTPException(409, "request_id is already bound to a different immutable request")
             return projection(old)
-        source = await owned(session, req["source_instance_id"], project) if req.get("source_instance_id") else None
+        source = (
+            await owned(session, req["source_instance_id"], project, actor["user_id"])
+            if req.get("source_instance_id")
+            else None
+        )
         digests = source.spec_json["layer_digests"] if source else req["layer_digests"]
         effective_req = req
         if not digests and req.get("image_job_id"):
             from palimpsest_hub.image_models import PalimpsestHubImageJob
 
             selected_job = await session.get(PalimpsestHubImageJob, req["image_job_id"])
-            if selected_job is None or selected_job.project_id != project:
+            if (
+                selected_job is None
+                or selected_job.project_id != project
+                or selected_job.created_by != actor["user_id"]
+            ):
                 raise HTTPException(404, "Image job not found")
             if selected_job.status != "complete":
                 raise HTTPException(422, "Image job must be complete")
             digests = selected_job.output_digests
             effective_req = {**req, "layer_digests": digests}
         lock_digests = list(digests)
+        binding_spec = {"layer_digests": digests}
+        if source and source.spec_json.get("published_image_id"):
+            binding_spec.update(
+                published_image_id=source.spec_json["published_image_id"],
+                published_manifest_digest=source.spec_json["published_manifest_digest"],
+            )
+        elif req.get("image_job_id"):
+            from palimpsest_local.image_manifest import manifest_digest
+
+            from palimpsest_hub.image_models import PalimpsestHubImageJob
+
+            selected = await session.get(PalimpsestHubImageJob, req["image_job_id"])
+            if selected and isinstance((selected.result_json or {}).get("manifest"), dict):
+                binding_spec.update(
+                    published_image_id=selected.id,
+                    published_manifest_digest=manifest_digest(selected.result_json["manifest"]),
+                )
+        published = await _published_layers(session, binding_spec, actor)
         for layer_digest in set(digests):
-            layer = await _load_visible(session, layer_digest, actor)
+            layer = await _runtime_layer(session, layer_digest, actor, published)
             base = (layer.config_json or {}).get("base_image_digest")
             if base:
                 lock_digests.append(base)
@@ -421,6 +542,8 @@ async def create(factory, store, settings, actor, conn, req):
             )
         )
         if old is not None:
+            if old.spec_json.get("published_visibility") == "private" and old.created_by != actor["user_id"]:
+                raise HTTPException(404, "Instance not found")
             if old.request_digest != digest:
                 raise HTTPException(409, "request_id is already bound to a different immutable request")
             return projection(old)
@@ -488,7 +611,7 @@ async def create(factory, store, settings, actor, conn, req):
         await session.commit()  # Durable intent precedes the first allocation; never replay it.
         instance_id = row.id
     async with sql_mutex(factory, "build-api:instance:" + instance_id) as session:
-        row = await owned(session, instance_id, project)
+        row = await owned(session, instance_id, project, actor["user_id"])
         await advance_prepared_boot(session, row, actor, conn, settings, allocate=True)
         return projection(row)
 
@@ -660,7 +783,7 @@ async def allocation_authority(session, row, actor, conn, settings, *, no_call=N
             gpu,
         )
         if spec.get("cluster") and spec["cluster"]["role"] == "agent":
-            source = await owned(session, spec["cluster"]["server_instance_id"], row.project_id)
+            source = await owned(session, spec["cluster"]["server_instance_id"], row.project_id, actor["user_id"])
             require_cluster_source(source, spec, actor, settings, spec["cluster"]["qualification"])
             address = await run_blocking(server_address, conn, source, spec["network_id"])
             if address != spec["cluster"]["server_address"]:
@@ -863,9 +986,19 @@ async def advance_prepared_boot(session, row, actor, conn, settings, *, allocate
     # the commit and potentially slow mutex wait; retain these locks through POST.
     if not await allocation_authority(session, row, actor, conn, settings, no_call="server"):
         return
-    try:
-        server = await run_blocking(
-            conn.compute.create_server,
+    bootstrap_expires_at = guest["expires_at"]
+    create_not_sent = object()
+    expired_without_call = False
+
+    def create_server():
+        nonlocal expired_without_call
+        # Executor dispatch may outlive the final authority fence. Use the
+        # guest's floored deadline, not the later fractional SQL timestamp.
+        # Only this sentinel proves that Nova was never called.
+        if datetime.now(UTC).timestamp() >= bootstrap_expires_at:
+            expired_without_call = True
+            return create_not_sent
+        return conn.compute.create_server(
             name=spec["name"],
             flavor_id=spec["flavor_id"],
             networks=[{"uuid": spec["network_id"]}],
@@ -882,13 +1015,45 @@ async def advance_prepared_boot(session, row, actor, conn, settings, *, allocate
             metadata={MARKER: row.id, "palimpsest_request_digest": row.request_digest},
             user_data=user_data,
         )
-        server_id = str(value(server, "id", ""))
-        uuid.UUID(server_id)
-        row.server_id = server_id
-        preparation_update(row, phase="nova_observed")
-        row.status, row.error_code = "booting", None
+
+    async def commit_expired_without_call():
+        # The prepared Cinder root remains owned and reserved for exact cleanup.
+        fail_preparation(row, "create_bootstrap_expired", no_call="server")
+        row.updated_at = datetime.now(UTC)
+        task = asyncio.create_task(session.commit())
+        cancelled = False
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                cancelled = True
+        task.result()
+        return cancelled
+
+    try:
+        server = await run_blocking(create_server)
+    except asyncio.CancelledError:
+        # run_blocking drains the worker before re-raising cancellation. Commit
+        # definite no-call evidence before releasing the original SQL fence.
+        if expired_without_call:
+            await commit_expired_without_call()
+        raise
     except Exception:
         row.status, row.error_code = "uncertain", "provider_create_uncertain"
+    else:
+        if server is create_not_sent:
+            cancelled = await commit_expired_without_call()
+            if cancelled:
+                raise asyncio.CancelledError
+            return
+        try:
+            server_id = str(value(server, "id", ""))
+            uuid.UUID(server_id)
+            row.server_id = server_id
+            preparation_update(row, phase="nova_observed")
+            row.status, row.error_code = "booting", None
+        except Exception:
+            row.status, row.error_code = "uncertain", "provider_create_uncertain"
     row.updated_at = datetime.now(UTC)
     await session.commit()
 
@@ -1025,11 +1190,11 @@ async def dispose_prepared_volume(session, row, actor, conn, *, allow_delete=Fal
         row.error_code = "provider_boot_volume_pending"
         await session.commit()
         return
-    if not allow_delete or actor is None or "packages:write" not in actor.get("package_actions", ()):
+    if not allow_delete or actor is None:
         row.error_code = "provider_boot_volume_pending"
         await session.commit()
         return
-    await fresh_writer(actor, conn)  # Fresh writer after the slow ownership read.
+    await fresh_instance_controller(actor, conn, row)  # Fresh ownership/action fence after the slow read.
     preparation_update(row, delete_phase="uncertain")
     row.error_code = "provider_volume_delete_uncertain"
     await session.commit()
@@ -1047,7 +1212,7 @@ async def dispose_prepared_volume(session, row, actor, conn, *, allow_delete=Fal
         await session.commit()
         return
     try:
-        await fresh_writer(actor, conn)
+        await fresh_instance_controller(actor, conn, row)
     except HTTPException:
         preparation_update(row, delete_phase="not_attempted")
         await session.commit()
@@ -1145,7 +1310,7 @@ async def reconcile(session, row, conn, actor=None, settings=None):
 async def observe(factory, actor, conn, instance_id, settings=None):
     project = request_project(actor, conn)
     async with sql_mutex(factory, "build-api:instance:" + instance_id) as session:
-        row = await owned(session, instance_id, project)
+        row = await owned(session, instance_id, project, actor["user_id"])
         await reconcile(session, row, conn, actor, settings)
         return projection(row)
 
@@ -1153,16 +1318,16 @@ async def observe(factory, actor, conn, instance_id, settings=None):
 async def advance(factory, actor, conn, instance_id, request, settings):
     project = request_project(actor, conn)
     async with sql_mutex(factory, "build-api:instance:" + instance_id) as session:
-        row = await owned(session, instance_id, project)
+        row = await owned(session, instance_id, project, actor["user_id"])
         if row.request_id != request["request_id"] or row.boot_volume_id != request["boot_volume_id"]:
             raise HTTPException(409, "Advance does not match the original request and prepared boot volume")
         state = preparation(row)
         if state is None:
             raise HTTPException(409, "Legacy instances cannot advance provider creation")
-        if actor.get("user_id") != row.created_by:
-            raise HTTPException(403, "Only the original instance subject can advance its accepted intent")
-        await fresh_writer(actor, conn)
         if request["operation"] == "create-server":
+            if actor.get("user_id") != row.created_by:
+                raise HTTPException(403, "Only the original instance subject can advance its accepted intent")
+            await fresh_writer(actor, conn)
             if (
                 row.status != "booting"
                 or state.get("terminal")
@@ -1172,6 +1337,7 @@ async def advance(factory, actor, conn, instance_id, request, settings):
                 raise HTTPException(409, "Instance has no unattempted ready server creation intent")
             await advance_prepared_boot(session, row, actor, conn, settings, allocate=True, launch=True)
         else:
+            await fresh_instance_controller(actor, conn, row)
             if row.status != "deleting":
                 raise HTTPException(409, "Volume disposal requires the original explicit deletion intent")
             attempted = server_create_attempted(row)
@@ -1198,12 +1364,12 @@ async def advance(factory, actor, conn, instance_id, request, settings):
 async def action(factory, actor, conn, instance_id, operation):
     project = request_project(actor, conn)
     async with sql_mutex(factory, "build-api:instance:" + instance_id) as session:
-        row = await owned(session, instance_id, project)
+        row = await owned(session, instance_id, project, actor["user_id"])
+        await fresh_instance_controller(actor, conn, row)
         if row.status == "deleted":
             return projection(row)
         if row.status == "deleting" and operation == "stop":
             raise HTTPException(409, "Cannot stop an instance with a pending deletion")
-        await fresh_writer(actor, conn)
         if create_not_attempted(row):
             if operation != "delete":
                 raise HTTPException(409, "Instance create was never attempted")
@@ -1258,11 +1424,11 @@ async def action(factory, actor, conn, instance_id, operation):
         await session.commit()  # Durable lifecycle intent before effect.
     if server is not None:
         async with sql_mutex(factory, "build-api:instance:" + instance_id) as session:
-            row = await owned(session, instance_id, project)
+            row = await owned(session, instance_id, project, actor["user_id"])
             if operation == "stop" and row.status != "stopping":
                 return projection(row)
             try:
-                await fresh_writer(actor, conn)
+                await fresh_instance_controller(actor, conn, row)
                 current = await run_blocking(exact_server, conn, row)
                 if current is not None:
                     if operation == "delete":
@@ -1271,8 +1437,10 @@ async def action(factory, actor, conn, instance_id, operation):
                             raise HTTPException(
                                 409, "Boot volume appeared after deletion intent; retry to bind it durably"
                             )
+                        await fresh_instance_controller(actor, conn, row)
                         await run_blocking(conn.compute.delete_server, value(current, "id"), ignore_missing=False)
                     elif str(value(current, "status", "")).upper() != "SHUTOFF":
+                        await fresh_instance_controller(actor, conn, row)
                         await run_blocking(conn.compute.stop_server, value(current, "id"))
             except HTTPException:
                 raise

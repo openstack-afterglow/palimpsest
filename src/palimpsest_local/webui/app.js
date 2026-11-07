@@ -31,6 +31,7 @@
   let paused = false;
   let authFailed = false;
   let timer = null;
+  let metricsTimer = null;
   let refreshPromise = null;
   let lastSuccess = null;
   let actionBusy = false;
@@ -114,7 +115,13 @@
     'Some configured network metadata is unavailable or inconsistent': '일부 네트워크 구성 기록을 확인할 수 없습니다.',
     'Project volume metadata is unavailable or inconsistent': '프로젝트 볼륨 기록을 읽을 수 없거나 일관되지 않습니다.',
     'OCI root-volume metadata is unavailable or inconsistent': 'OCI 루트 볼륨 기록을 읽을 수 없거나 일관되지 않습니다.',
-    'OCI network status is unavailable; the exact run has no committed domain plan or its plan is invalid': 'OCI 네트워크 상태 확인 불가 · 해당 실행에 확정된 도메인 계획이 없거나 유효하지 않습니다.'
+    'OCI network status is unavailable; the exact run has no committed domain plan or its plan is invalid': 'OCI 네트워크 상태 확인 불가 · 해당 실행에 확정된 도메인 계획이 없거나 유효하지 않습니다.',
+    'Lima backend observation failed': 'Lima 백엔드 관찰에 실패했습니다.',
+    'Lima network observation failed': 'Lima 네트워크 관찰에 실패했습니다.',
+    'Lima disk observation failed': 'Lima 디스크 관찰에 실패했습니다.',
+    'libvirt backend observation failed': 'libvirt 백엔드 관찰에 실패했습니다.',
+    'libvirt network observation failed': 'libvirt 네트워크 관찰에 실패했습니다.',
+    'libvirt disk observation failed': 'libvirt 디스크 관찰에 실패했습니다.'
   };
   function warningText(value) { return warningLabels[value] || text(value); }
   function resourceSource(item) { return item.source === 'host-backend' ? '호스트 백엔드 관찰' : text(item.source); }
@@ -137,7 +144,7 @@
   }
   function referenceEntries(item) {
     const refs = object(item.referenced_by); const blockers = object(item.deletion_blockers);
-    return ['runs', 'projects', 'volumes'].flatMap(kind => [...new Set([...array(refs[kind]), ...array(blockers[kind])])].map(value => kind + ' · ' + text(value)));
+    return ['runs', 'projects', 'volumes', 'published'].flatMap(kind => [...new Set([...array(refs[kind]), ...array(blockers[kind])])].map(value => kind + ' · ' + text(value)));
   }
   function diskDeleteReason(key, item) {
     if (!canControl()) return '--allow-control 권한이 필요합니다.';
@@ -510,7 +517,12 @@
     const vms = collection('vms');
     observations.appendChild(node('p', 'muted', vms === null ? 'VM 관찰 정보가 아직 없습니다.' : 'VM ' + vms.length + '개 중 오래된 런타임 관찰 ' + vms.filter(vm => vm.stale === true).length + '개. 오래된 상태는 현재 실행 여부를 보장하지 않습니다.'));
     observations.appendChild(node('p', 'muted', '관리 기록과 호스트 발견을 함께 표시합니다. 로그·자원은 명시적 관찰 기능으로 확인하며 콘솔은 --allow-control이 필요합니다. 외부 VM도 이름·백엔드 식별자 확인 후 제거할 수 있고 시작·중지는 관리 VM만 가능합니다. 디스크의 가상 용량·파일 크기·할당량과 게스트 파일시스템 사용량은 다른 값입니다.'));
-    for (const key of ['vms', 'volumes', 'networks']) for (const warning of array(state[key].data?.warnings)) observations.appendChild(node('p', 'notice', views[key][0] + ' · ' + warningText(warning)));
+    const sharedWarnings = new Map();
+    for (const key of ['vms', 'volumes', 'networks']) for (const warning of array(state[key].data?.warnings)) {
+      if (!sharedWarnings.has(warning)) sharedWarnings.set(warning, []);
+      if (!sharedWarnings.get(warning).includes(key)) sharedWarnings.get(warning).push(key);
+    }
+    for (const [warning, keys] of sharedWarnings) observations.appendChild(node('p', 'notice', keys.map(key => views[key][0]).join('·') + ' · ' + warningText(warning)));
     content.appendChild(observations);
     const builds = collection('builds');
     const activity = node('div', 'card'); activity.appendChild(node('h2', '', '최근 빌드'));
@@ -547,6 +559,7 @@
       control.disabled = !enabled || actionBusy;
     }
     updateVolumeForms();
+    $('btn-refresh-metrics').disabled = actionBusy || inspector?.key !== 'vms' || !metricsEligible(inspector) || inspector.metricsLoading;
     for (const control of document.querySelectorAll('#form-run-vm input, #form-run-vm select, #form-run-vm textarea, #form-run-vm button')) control.disabled ||= !freshForMutation('vms', 'volumes', 'artifacts');
     for (const button of document.querySelectorAll('#vms-table-content .danger-button')) {
       const item = collection('vms')?.find(vm => itemId('vms', vm) === button.dataset.vmId);
@@ -625,6 +638,22 @@
     clearTimeout(timer);
     if (!paused && !authFailed && !document.hidden && !actionBusy) timer = setTimeout(refresh, 5000);
   }
+  function stopMetricPolling() {
+    clearInterval(metricsTimer);
+    metricsTimer = null;
+  }
+  function startMetricPolling() {
+    stopMetricPolling();
+    if (paused || authFailed || document.hidden || inspector?.key !== 'vms' || inspector.closing) return;
+    // Sample starts follow their own cadence, not completion of the inventory
+    // and log batch. loadMetrics joins a still-running sample without queuing.
+    metricsTimer = setInterval(() => {
+      if (paused || authFailed || document.hidden || inspector?.key !== 'vms' || inspector.closing) {
+        stopMetricPolling(); return;
+      }
+      if (!actionBusy) loadMetrics();
+    }, 5000);
+  }
   function refresh(full = false) {
     if (refreshPromise) return refreshPromise;
     clearTimeout(timer);
@@ -666,7 +695,10 @@
         }
       }
       render();
-      if (inspector && !authFailed) { loadDetail(); await Promise.all([inspector?.logsOpened ? loadLogs() : Promise.resolve(), loadMetrics()]); }
+      if (inspector && !authFailed) {
+        loadDetail();
+        if (inspector?.logsOpened && (inspector.key !== 'vms' || inspector.tab === 'logs')) await loadLogs();
+      }
     })().finally(() => { refreshPromise = null; updateHeader(); schedule(); });
     updateHeader();
     return refreshPromise;
@@ -799,14 +831,16 @@
   async function openInspector(key, item, opener) {
     returnFocus = opener;
     returnSelector = { key, id: itemId(key, item) };
+    stopMetricPolling();
     inspector?.abort.abort();
-    inspector = { key, id: itemId(key, item), runId: item.run_id, data: item, error: null, tab: key === 'vms' ? 'logs' : 'details', logsOpened: key === 'vms' || key === 'builds', log: null, logTime: null, abort: new AbortController(), metrics: null, metricsError: null, metricsLoading: false, metricHistory: [], previousMetrics: null };
+    inspector = { key, id: itemId(key, item), runId: item.run_id, data: item, error: null, tab: key === 'vms' ? 'logs' : 'details', logsOpened: key === 'vms' || key === 'builds', log: null, logTime: null, abort: new AbortController(), metrics: null, metricsError: null, metricsLoading: false, metricsPromise: null, metricHistory: [], previousMetrics: null };
     $('log-section').hidden = !inspector.logsOpened;
     notice($('detail-feedback'), '');
     $('log-content').textContent = '로그를 불러오는 중입니다.'; $('log-state').textContent = '';
     renderDetail();
     $('detail-drawer').showModal(); $('btn-close-drawer').focus();
     loadDetail();
+    startMetricPolling();
     await Promise.all([inspector?.logsOpened ? loadLogs() : Promise.resolve(), loadMetrics()]);
   }
   // Details are the list projections themselves; re-reading one item would repeat a live VM reconcile.
@@ -816,13 +850,13 @@
     const latest = collection(current.key)?.find(item => itemId(current.key, item) === current.id);
     if (latest) {
       if (current.key === 'vms' && latest.run_id !== current.runId) {
-        current.abort.abort(); current.abort = new AbortController(); current.metricsRequest = null; current.metricsLoading = false;
+        current.abort.abort(); current.abort = new AbortController(); current.metricsRequest = null; current.metricsPromise = null; current.metricsLoading = false;
         current.runId = latest.run_id; current.log = null; current.logTime = null;
         current.metrics = null; current.metricsError = null; resetMetricRates(current); current.metricHistory = []; current.diskName = null; current.diskSelected = false;
         $('log-content').textContent = '실행이 교체되었습니다. 새 실행의 로그를 불러오는 중입니다.';
       }
       if (current.key === 'vms' && ['metrics', 'logs'].some(capability => current.data.access?.[capability] === true && latest.access?.[capability] !== true)) {
-        current.abort.abort(); current.abort = new AbortController(); current.metricsRequest = null; current.metricsLoading = false; resetMetricRates(current);
+        current.abort.abort(); current.abort = new AbortController(); current.metricsRequest = null; current.metricsPromise = null; current.metricsLoading = false; resetMetricRates(current);
       }
       if (current.abort.signal.aborted) current.abort = new AbortController();
       current.data = latest; current.error = state[current.key].error;
@@ -859,49 +893,61 @@
     }
     return total;
   }
-  async function loadMetrics() {
+  function loadMetrics() {
     const current = inspector;
-    if (current?.key !== 'vms' || current.closing || current.metricsRequest) return;
+    if (current?.key !== 'vms' || current.closing) return Promise.resolve();
+    if (current.metricsPromise) return current.metricsPromise;
+    if (actionBusy) return Promise.resolve();
     if (!metricsEligible(current)) {
-      resetMetricRates(current); renderResources(); return;
+      resetMetricRates(current); renderResources(); return Promise.resolve();
     }
     const signal = current.abort.signal; const runId = current.runId;
     const request = {}; current.metricsRequest = request; current.metricsLoading = true; renderResources();
-    try {
-      const query = runId == null ? '' : '?expected_run_id=' + encodeURIComponent(runId);
-      const data = await api(endpoints.vms + '/' + encodeURIComponent(current.id) + '/metrics' + query, { signal });
-      if (signal.aborted || inspector !== current || runId !== current.runId || !metricsEligible(current)) return;
-      if (data.status === 'unavailable') throw new Error(text(data.message || data.reason || '자원 관찰 미지원'));
-      if (data.id !== current.id || (data.run_id ?? null) !== (runId ?? null)) throw new Error('자원 표본의 VM 실행 식별자가 변경되었습니다');
-      const timestamp = Date.parse(data.measured_at);
-      if (!Number.isFinite(timestamp)) throw new Error('자원 표본 시각이 올바르지 않습니다');
-      const previous = current.previousMetrics;
-      const wallGap = previous ? (timestamp - Date.parse(previous.measured_at)) / 1000 : 0;
-      const uptime = metricNumber(data.uptime_seconds); const oldUptime = metricNumber(previous?.uptime_seconds);
-      const elapsed = uptime !== null && oldUptime !== null ? uptime - oldUptime : 0;
-      const seconds = !paused && !document.hidden && previous?.source === data.source && previous?.id === data.id && previous?.run_id === data.run_id && data.boot_id && previous?.boot_id === data.boot_id && elapsed > 0 && elapsed <= 15 && wallGap > 0 && wallGap <= 15 ? elapsed : null;
-      const rates = {
-        cpu: cpuUsage(data.cpu, previous?.cpu, seconds),
-        rx: counterRate(data.interfaces, previous?.interfaces, 'name', 'rx_bytes', seconds),
-        tx: counterRate(data.interfaces, previous?.interfaces, 'name', 'tx_bytes', seconds),
-      };
-      if (previous && previous.boot_id !== data.boot_id) current.metricHistory = [];
-      current.deviceRates = {
-        interfaces: items(data.interfaces).map(row => ({ name: row.name, rx: counterRate([row], previous?.interfaces?.filter(old => old.name === row.name), 'name', 'rx_bytes', seconds), tx: counterRate([row], previous?.interfaces?.filter(old => old.name === row.name), 'name', 'tx_bytes', seconds) })),
-        blocks: items(data.block_devices).map(row => ({ name: row.name, read: counterRate([row], previous?.block_devices?.filter(old => old.name === row.name), 'name', 'read_bytes', seconds), write: counterRate([row], previous?.block_devices?.filter(old => old.name === row.name), 'name', 'write_bytes', seconds) }))
-      };
-      current.metrics = data; current.rates = rates; current.metricsError = null;
-      current.previousMetrics = paused || document.hidden ? null : data;
-      const used = metricNumber(data.memory?.used_bytes); const total = metricNumber(data.memory?.total_bytes);
-      current.metricHistory.push({ timestamp, memory: used !== null && total > 0 ? used / total * 100 : null, diskRates: current.deviceRates.blocks, ...rates });
-      if (current.metricHistory.length > 36) current.metricHistory.shift();
-    } catch (error) {
-      if (signal.aborted || inspector !== current || runId !== current.runId) return;
-      current.metricsError = error.message; resetMetricRates(current);
-    } finally {
-      if (current.metricsRequest === request) { current.metricsRequest = null; current.metricsLoading = false; }
-      if (inspector === current) renderResources();
-    }
+    current.metricsPromise = (async () => {
+      try {
+        const query = runId == null ? '' : '?expected_run_id=' + encodeURIComponent(runId);
+        const data = await api(endpoints.vms + '/' + encodeURIComponent(current.id) + '/metrics' + query, { signal });
+        if (signal.aborted || inspector !== current || runId !== current.runId || !metricsEligible(current)) return;
+        if (data.status === 'unavailable') throw new Error(text(data.message || data.reason || '자원 관찰 미지원'));
+        if (data.id !== current.id || (data.run_id ?? null) !== (runId ?? null)) throw new Error('자원 표본의 VM 실행 식별자가 변경되었습니다');
+        const timestamp = Date.parse(data.measured_at);
+        if (!Number.isFinite(timestamp)) throw new Error('자원 표본 시각이 올바르지 않습니다');
+        const previous = current.previousMetrics;
+        const wallGap = previous ? (timestamp - Date.parse(previous.measured_at)) / 1000 : 0;
+        const uptime = metricNumber(data.uptime_seconds); const oldUptime = metricNumber(previous?.uptime_seconds);
+        const elapsed = uptime !== null && oldUptime !== null ? uptime - oldUptime : 0;
+        const seconds = !paused && !document.hidden && previous?.source === data.source && previous?.id === data.id && previous?.run_id === data.run_id && data.boot_id && previous?.boot_id === data.boot_id && elapsed > 0 && elapsed <= 15 && wallGap > 0 && wallGap <= 15 ? elapsed : null;
+        const rates = {
+          cpu: cpuUsage(data.cpu, previous?.cpu, seconds),
+          rx: counterRate(data.interfaces, previous?.interfaces, 'name', 'rx_bytes', seconds),
+          tx: counterRate(data.interfaces, previous?.interfaces, 'name', 'tx_bytes', seconds),
+        };
+        if (previous && previous.boot_id !== data.boot_id) current.metricHistory = [];
+        current.deviceRates = {
+          interfaces: items(data.interfaces).map(row => ({ name: row.name, rx: counterRate([row], previous?.interfaces?.filter(old => old.name === row.name), 'name', 'rx_bytes', seconds), tx: counterRate([row], previous?.interfaces?.filter(old => old.name === row.name), 'name', 'tx_bytes', seconds) })),
+          blocks: items(data.block_devices).map(row => ({ name: row.name, read: counterRate([row], previous?.block_devices?.filter(old => old.name === row.name), 'name', 'read_bytes', seconds), write: counterRate([row], previous?.block_devices?.filter(old => old.name === row.name), 'name', 'write_bytes', seconds) }))
+        };
+        current.metrics = data; current.rates = rates; current.metricsError = null;
+        current.previousMetrics = paused || document.hidden ? null : data;
+        const used = metricNumber(data.memory?.used_bytes); const total = metricNumber(data.memory?.total_bytes);
+        current.metricHistory.push({ timestamp, memory: used !== null && total > 0 ? used / total * 100 : null, diskRates: current.deviceRates.blocks, ...rates });
+        if (current.metricHistory.length > 36) current.metricHistory.shift();
+      } catch (error) {
+        if (signal.aborted || inspector !== current || runId !== current.runId) return;
+        current.metricsError = error.message; resetMetricRates(current);
+      } finally {
+        if (current.metricsRequest === request) { current.metricsRequest = null; current.metricsPromise = null; current.metricsLoading = false; }
+        if (inspector === current) renderResources();
+      }
+    })();
+    return current.metricsPromise;
+  }
+  async function waitForObservations() {
+    // Capture before inventory can replace/abort the inspector's request.
+    // actionBusy prevents new samples, but an admitted sample must settle.
+    const metrics = inspector?.metricsPromise;
+    if (refreshPromise) await refreshPromise;
+    if (metrics) await metrics;
   }
   function metricChart(history, field, label, percentage = false) {
     const chart = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
@@ -955,7 +1001,7 @@
     const unavailableLabel = observationError ? '관찰 갱신 실패' : current.data.stale === true ? '오래된 관찰' : current.data.status !== 'running' ? '실행 중 아님' : '미지원';
     const stateText = (!supported ? '자원 ' + unavailableLabel + ' · ' + text(observationError || current.data.access?.message || current.data.access?.reason || '명시적 기능 없음') : current.metricsError ? '자원 갱신 실패 · ' + current.metricsError : current.metricsLoading ? '실제 자원 표본을 불러오는 중…' : !data ? '첫 표본 대기 중' : paused || document.hidden ? '자동 갱신 정지 · 재개 후 속도 기준 재설정' : '실제 표본 ' + current.metricHistory.length + '개') + (sampleLabel ? ' · ' + sampleLabel : '');
     $('resource-state').textContent = stateText;
-    $('btn-refresh-metrics').disabled = !supported || current.metricsLoading;
+    $('btn-refresh-metrics').disabled = actionBusy || !supported || current.metricsLoading;
     const cpuLabel = !supported ? unavailableLabel + (data ? ' · 마지막 표본만 유지' : '') : current.metricsError ? '갱신 실패 · 계산 안 함' : !data ? '표본 대기' : !data.cpu ? '미지원' : paused || document.hidden ? '갱신 정지' : current.rates?.cpu == null ? '연속 표본 대기' : metricPercent(current.rates.cpu);
     const memoryLabel = !data ? (!supported ? unavailableLabel : current.metricsError ? '갱신 실패' : '표본 대기') : (retained ? '마지막 표본 · ' : '') + metricBytes(data.memory?.used_bytes) + ' / ' + metricBytes(data.memory?.total_bytes);
     $('vm-resource-summary').replaceChildren(badge(current.data.status, current.data.stale === true || !!observationError), node('span', '', 'CPU ' + cpuLabel), node('span', '', '메모리 ' + memoryLabel), node('span', 'muted', sampleLabel), node('span', 'muted', vmScope(current.data)));
@@ -1033,6 +1079,7 @@
   function closeInspector() {
     const drawer = $('detail-drawer');
     if (!drawer.open || drawer.classList.contains('drawer-closing')) return;
+    stopMetricPolling();
     inspector?.abort.abort();
     if (inspector) inspector.closing = true;
     if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) { drawer.close(); return; }
@@ -1041,6 +1088,7 @@
   }
   $('detail-drawer').addEventListener('cancel', event => { event.preventDefault(); closeInspector(); });
   $('detail-drawer').addEventListener('close', () => {
+    stopMetricPolling();
     inspector?.abort.abort();
     inspector = null;
     $('detail-actions').replaceChildren();
@@ -1148,7 +1196,7 @@
     if (!window.confirm(label + '\n이 작업은 로컬 리소스를 변경합니다. 계속하시겠습니까?')) return;
     actionBusy = true; clearTimeout(timer); updateControls(); updateHeader(); feedback('작업 중 · ' + label);
     try {
-      if (refreshPromise) await refreshPromise;
+      await waitForObservations();
       if (!allowed()) throw new Error('변경 권한이나 최신 리소스 정보를 확인할 수 없습니다. 지금 갱신 후 다시 시도하세요.');
       await api(path, options);
       if (closeOnSuccess && $('detail-drawer').open) closeInspector();
@@ -1186,7 +1234,7 @@
     if (actionBusy || !target || diskDeleteReason(target.key, target.item) || $('delete-disk-confirmation').value !== target.name) return;
     actionBusy = true; clearTimeout(timer); updateControls(); updateHeader();
     try {
-      if (refreshPromise) await refreshPromise;
+      await waitForObservations();
       const reason = diskDeleteReason(target.key, target.item); if (reason) throw new Error(reason);
       const id = target.key === 'artifacts' ? target.item.digest : itemId(target.key, target.item);
       const result = await api(endpoints[target.key] + '/' + encodeURIComponent(id), { method: 'DELETE', body: { confirmation: target.name } });
@@ -1245,7 +1293,7 @@
     actionBusy = true; clearTimeout(timer); updateControls(); updateHeader();
     notice($('remove-vm-feedback'), '선택한 VM의 백엔드 식별자 확인 후 제거 중…');
     try {
-      if (refreshPromise) await refreshPromise;
+      await waitForObservations();
       if (!lifecycleEligible(target)) throw new Error(removalReason(target));
       const latest = collection('vms')?.find(item => itemId('vms', item) === itemId('vms', target));
       if (body.volumes && latest?.lifecycle?.remove_volumes !== true) throw new Error('루트 / 런타임 파일 삭제 기능이 변경되었습니다. 다시 선택하세요.');
@@ -2142,7 +2190,7 @@
     if (!name || !array(state.volumes.data?.create_backends).includes(backend) || !Number.isSafeInteger(size_bytes) || size_bytes <= 0) return;
     actionBusy = true; clearTimeout(timer); updateControls(); updateHeader(); notice($('volume-create-feedback'), '독립 볼륨 생성 중…');
     try {
-      if (refreshPromise) await refreshPromise;
+      await waitForObservations();
       if (!freshForMutation('volumes') || !array(state.volumes.data?.create_backends).includes(backend)) throw new Error('최신 볼륨 목록과 백엔드를 확인할 수 없습니다.');
       const result = await api(endpoints.volumes, { method: 'POST', body: { name, backend, size_bytes } });
       notice($('volume-create-feedback'), `볼륨 생성 완료 · ${result.name || name} · 보존 정책: ${text(result.retention_policy)} · VM 생성 시 선택할 수 있습니다.`);
@@ -2207,7 +2255,7 @@
     try {
       actionBusy = true;
       updateControls();
-      if (refreshPromise) await refreshPromise;
+      await waitForObservations();
       if (!freshForMutation('vms', 'volumes', 'artifacts')) throw new Error('최신 VM / 볼륨 / 이미지 목록을 확인할 수 없습니다.');
       selectedRunVolumes();
       const res = await api('/api/v1/vms', { method: 'POST', body: payload });
@@ -2284,6 +2332,7 @@
   });
   window.addEventListener('beforeunload', () => {
     clearTimeout(timer);
+    stopMetricPolling();
     const ownedIds = new Set(pendingConsoleOpens);
     if (activeConsoleSession) ownedIds.add(activeConsoleSession.id);
     for (const id of ownedIds) {
@@ -2309,9 +2358,16 @@
   });
   for (const key of ['vms', 'volumes', 'artifacts', 'networks', 'builds']) createList(key);
   for (const button of document.querySelectorAll('[data-view]')) button.addEventListener('click', () => navigate(button.dataset.view));
-  $('btn-pause').addEventListener('click', () => { paused = !paused; if (inspector) resetMetricRates(inspector); updateHeader(); renderResources(); if (paused) clearTimeout(timer); else if (!document.hidden) refresh(); });
-  $('btn-refresh').addEventListener('click', () => { authFailed = false; refresh(true); });
-  document.addEventListener('visibilitychange', () => { clearTimeout(timer); if (inspector) resetMetricRates(inspector); updateHeader(); renderResources(); if (!document.hidden && !paused && !authFailed) refresh(true); });
+  $('btn-pause').addEventListener('click', () => {
+    paused = !paused; if (inspector) resetMetricRates(inspector); updateHeader(); renderResources();
+    if (paused) { clearTimeout(timer); stopMetricPolling(); }
+    else if (!document.hidden) { refresh(); startMetricPolling(); loadMetrics(); }
+  });
+  $('btn-refresh').addEventListener('click', () => { authFailed = false; refresh(true); startMetricPolling(); loadMetrics(); });
+  document.addEventListener('visibilitychange', () => {
+    clearTimeout(timer); stopMetricPolling(); if (inspector) resetMetricRates(inspector); updateHeader(); renderResources();
+    if (!document.hidden && !paused && !authFailed) { refresh(true); startMetricPolling(); loadMetrics(); }
+  });
   window.addEventListener('hashchange', () => { const key = location.hash.slice(1); if (views[key]) navigate(key); });
   navigate(location.hash.slice(1) || 'overview');
   refresh(true);

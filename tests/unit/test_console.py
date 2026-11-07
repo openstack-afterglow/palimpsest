@@ -13,7 +13,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from palimpsest_local import console
+from palimpsest_local import console, state
+from palimpsest_local.errors import RuntimeBusyError
 from palimpsest_local.process_session import LocalProcessSession
 from palimpsest_local.runtime_types import (
     DispatchKey,
@@ -62,7 +63,7 @@ def manager(monkeypatch):
 def adapter(monkeypatch, source, *, tty=False, stdin=False):
     owned = []
 
-    def start(name, *args, roots, expected_identity):
+    def start(name, *args, roots, expected_identity, _observation_budget=None):
         assert name == "vm"
         assert expected_identity == ExpectedRunIdentity(
             "vm",
@@ -362,7 +363,7 @@ def _external_console(tmp_path, monkeypatch, *, status="running", stale=False, b
         "stale": stale,
     }
     row["access"] = vm_access.capabilities(row)
-    monkeypatch.setattr(inventory, "get_vm", lambda roots, identifier: row)
+    monkeypatch.setattr(inventory, "get_vm", lambda roots, identifier, **_kwargs: row)
     instance = {
         "name": "redis",
         "dir": str(directory),
@@ -574,3 +575,226 @@ def test_lima_stopped_console_and_running_journal_use_same_backend_fence(tmp_pat
         access.probe(("true",))
     assert refused.value.category == "identity"
     assert len(commands) == 1
+
+
+@pytest.mark.parametrize("runtime_kind", ["oci-root", "unknown"])
+@pytest.mark.parametrize("status", ["running", "stopped"])
+def test_observed_native_rows_deny_all_generic_detail_access(tmp_path, monkeypatch, runtime_kind, status):
+    from palimpsest_local import inventory, vm_access
+
+    row, _, _ = _external_console(tmp_path, monkeypatch, status=status)
+    row["runtime_kind"] = runtime_kind
+    row["access"] = vm_access.capabilities(row)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("observed native identity opened a generic transport")
+
+    monkeypatch.setattr(vm_access, "spawn_process_session", forbidden)
+    measurements = inventory.vm_metrics(None, row["id"], expected_run_id=row["run_id"])
+    logs = inventory.vm_logs(None, row["id"], expected_run_id=row["run_id"])
+    assert measurements["status"] == logs["status"] == "unavailable"
+    assert measurements["reason"] == logs["reason"] == "identity"
+    current = console.ConsoleManager()
+    try:
+        with pytest.raises(console.ConsoleError):
+            current.open(None, row["id"], "exec", ["true"], expected_run_id=row["run_id"])
+    finally:
+        current.close_all()
+
+
+@pytest.mark.parametrize("native_identity", ["bound", "ambiguous"])
+@pytest.mark.parametrize("operation", ["shell", "exec", "metrics", "logs"])
+def test_live_native_identity_rejects_stale_cloud_access_selection(tmp_path, monkeypatch, native_identity, operation):
+    from palimpsest_local import inventory, vm_access
+
+    row, directory, instance = _external_console(
+        tmp_path, monkeypatch, status="stopped" if operation == "logs" else "running"
+    )
+    name = "plm-" + ("111111111111" if native_identity == "bound" else "222222222222")
+    row.update(name=name, id="host:lima-vz:" + name, runtime_kind="cloud-image")
+    instance["name"] = name
+    row["access"] = vm_access.capabilities(row)
+    (directory / "serial.log").write_text("native control console must stay private\n")
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("stale cloud classification opened native generic access")
+
+    monkeypatch.setattr(vm_access, "spawn_process_session", forbidden)
+    if operation == "metrics":
+        result = inventory.vm_metrics(None, row["id"], expected_run_id=row["run_id"])
+        assert result["status"] == "unavailable" and result["reason"] == "identity"
+    elif operation == "logs":
+        result = inventory.vm_logs(None, row["id"], expected_run_id=row["run_id"])
+        assert result["status"] == "unavailable" and result["reason"] == "identity"
+        assert result["log"] == ""
+    else:
+        current = console.ConsoleManager()
+        try:
+            with pytest.raises(console.ConsoleError):
+                current.open(
+                    None,
+                    row["id"],
+                    operation,
+                    ["true"] if operation == "exec" else [],
+                    expected_run_id=row["run_id"],
+                )
+        finally:
+            current.close_all()
+
+
+@pytest.mark.filterwarnings("error::pytest.PytestUnhandledThreadExceptionWarning")
+def test_native_exited_main_public_metrics_and_console_exec_use_owned_dispatch(tmp_path, monkeypatch):
+    from test_inventory import _LINUX_METRICS, _native_exited_vm
+
+    from palimpsest_local import inventory, vm_access
+    from palimpsest_local.vm_exec_session import ExecOwners
+
+    roots, name, run_id, observed = _native_exited_vm(tmp_path, monkeypatch)
+    before = (roots.runs / name / "state.json").read_bytes()
+    completed = []
+    exec_owners = ExecOwners()
+
+    def submit(selected, argv, *, roots, expected_identity, timeout_ms, _observation_budget=None):
+        assert selected == name
+        assert expected_identity == ExpectedRunIdentity(
+            name, run_id, DispatchKey(RuntimeKind.OCI_ROOT, RuntimeBackend.LIMA_VZ)
+        )
+        program = f"import os; os.write(1, {_LINUX_METRICS!r})" if timeout_ms is not None else "print(19 + 5 + 7)"
+        source = LocalProcessSession((sys.executable, "-u", "-c", program), tty=False, stdin=False)
+        completed.append(source)
+        return source
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("native canonical access borrowed generic Lima or host credentials")
+
+    monkeypatch.setattr(vm_access.runtime_dispatch, "exec", submit)
+    monkeypatch.setattr(vm_access, "spawn_process_session", forbidden)
+    monkeypatch.setattr(vm_access, "_instance", forbidden)
+    metrics = inventory.vm_metrics(roots, name, expected_run_id=run_id, exec_owners=exec_owners)
+    assert metrics["status"] == "available"
+    current = console.ConsoleManager(exec_owners=exec_owners)
+    try:
+        opened = current.open(roots, name, "exec", ["printf", "proof"], expected_run_id=run_id)
+        events, _ = drain(current, opened["id"])
+        assert bytes_from(events) == b"31\n"
+        assert events[-1]["exit_code"] == 0
+
+        # A new detail/console request observes provider stop despite retained main exit.
+        monkeypatch.setattr(vm_access.runtime_dispatch, "exec", forbidden)
+        observed["status"] = "stopped"
+        stopped = inventory.vm_metrics(roots, name, expected_run_id=run_id, exec_owners=exec_owners)
+        assert stopped["status"] == "unavailable" and stopped["reason"] == "stopped"
+        with pytest.raises(console.ConsoleError):
+            current.open(roots, name, "exec", ["true"], expected_run_id=run_id)
+        assert all(source._process.poll() is not None for source in completed)
+        assert (roots.runs / name / "state.json").read_bytes() == before
+    finally:
+        current.close_all()
+        exec_owners.stop_admitting()
+        assert exec_owners.wait() == 0
+
+
+def test_kvm_access_keeps_required_unknown_mailbox_ack_accounting(monkeypatch):
+    from palimpsest_local import vm_access
+    from palimpsest_local.runtime_types import ExistingRunRecord
+    from palimpsest_local.vm_exec_session import ExecOwners
+
+    record = ExistingRunRecord(
+        "mailbox-run",
+        "11111111-1111-4111-8111-111111111111",
+        2,
+        DispatchKey(RuntimeKind.OCI_ROOT, RuntimeBackend.KVM),
+    )
+    owners = ExecOwners()
+    source = LocalProcessSession((sys.executable, "-B", "-c", "print(19+5+7)"), tty=False, stdin=False)
+    monkeypatch.setattr(vm_access.runtime_dispatch, "exec", lambda *args, **kwargs: source)
+    access = vm_access.Access(
+        None,
+        {"name": record.name, "backend": "kvm", "runtime_kind": "oci-root", "status": "running", "managed": True},
+        record,
+        owners,
+    )
+    try:
+        assert vm_access._collect(access.open("exec", ("probe",))) == b"31\n"
+        owners.stop_admitting()
+        assert owners.wait() == 1
+    finally:
+        source.close()
+
+
+@pytest.mark.parametrize("mode", ["shell", "exec"])
+@pytest.mark.parametrize("failure", ["run-lock", "namespace-lock"])
+def test_busy_console_admission_is_sanitized_and_does_not_consume_client_id(manager, monkeypatch, mode, failure):
+    def busy(*_args, **_kwargs):
+        if failure == "run-lock":
+            raise state.RunLockTimeoutError(123456)
+        raise RuntimeBusyError("private namespace /secret/lock holder 123456")
+
+    monkeypatch.setattr(console.vm_access.runtime_dispatch, mode, busy)
+    session_id = "11223344556677889900aabbccddeeff"
+    argv = ["guest-command"] if mode == "exec" else ()
+    with pytest.raises(console.ConsoleError) as caught:
+        manager.open(None, "vm", mode, argv, session_id=session_id)
+    assert caught.value.category == "busy"
+    assert "123456" not in str(caught.value)
+    assert "/secret" not in str(caught.value)
+    assert not manager.has_active()
+    adapter(monkeypatch, "import os; os.write(1, b'recovered-console\\n')")
+    opened = manager.open(None, "vm", mode, argv, session_id=session_id)
+    events, _ = drain(manager, opened["id"])
+    assert bytes_from(events) == b"recovered-console\n"
+    assert events[-1]["kind"] == "exit" and events[-1]["exit_code"] == 0
+
+
+@pytest.mark.parametrize("operation", ["metrics", "shell", "exec"])
+def test_real_native_namespace_admission_busy_never_grants_guest_or_console(tmp_path, monkeypatch, operation):
+    import fcntl
+
+    from test_inventory import _native_custody_fixture, _native_exited_vm
+
+    from palimpsest_local import inventory
+    from palimpsest_local.runtime_types import CapabilityCheck
+
+    roots, name, run_id, _observed = _native_exited_vm(tmp_path, monkeypatch)
+    native, config, custody = _native_custody_fixture(tmp_path, monkeypatch)
+    ledger = roots.runs / name / "state.json"
+    before = ledger.read_bytes()
+    clock = [0.0]
+    monkeypatch.setattr(native.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(native.time, "sleep", lambda delay: clock.__setitem__(0, clock[0] + delay))
+    monkeypatch.setattr(
+        native.platforms,
+        "_check_capability",
+        lambda requirement, **_kwargs: CapabilityCheck(requirement.capability_id, "fixture-host", True),
+    )
+    monkeypatch.setattr(native, "host_config_for_run", lambda *_args, **_kwargs: config)
+    monkeypatch.setattr(native, "_config_for", lambda _authority: config)
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("busy namespace admitted provider or guest work")
+
+    monkeypatch.setattr(native, "_load", forbidden)
+    monkeypatch.setattr(native, "_control", forbidden)
+    monkeypatch.setattr(native, "NativeProcessSession", forbidden)
+    monkeypatch.setattr(console.vm_access, "spawn_process_session", forbidden)
+    holder = os.open(custody / "lock", os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    current = console.ConsoleManager()
+    try:
+        if operation == "metrics":
+            result = inventory.vm_metrics(roots, name, expected_run_id=run_id)
+            assert result["status"] == "unavailable" and result["reason"] == "busy"
+            assert result["cpu"] is None and result["memory"] is None and result["measured_at"] is None
+            assert str(tmp_path) not in repr(result)
+        else:
+            with pytest.raises(console.ConsoleError) as caught:
+                current.open(roots, name, operation, ["true"] if operation == "exec" else (), expected_run_id=run_id)
+            assert caught.value.category == "busy" and str(tmp_path) not in str(caught.value)
+            assert not current.has_active()
+        assert clock[0] == pytest.approx(5)
+        assert ledger.read_bytes() == before
+        assert not (custody / "active.json").exists()
+        assert not list(custody.glob("*.actor.json")) and not list(custody.glob("session-*.json"))
+    finally:
+        current.close_all()
+        os.close(holder)

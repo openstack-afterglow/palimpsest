@@ -249,6 +249,7 @@ GUIDE_ANCHORS = {
     "": "invocation-and-configuration",
     "image": "hub-cloud-images-layers-and-bundles",
     "layer": "hub-cloud-images-layers-and-bundles",
+    "published": "hub-cloud-images-layers-and-bundles",
     "bundle": "hub-cloud-images-layers-and-bundles",
     "registry": "registry-profiles-and-docker-wrapper-commands",
     "login": "registry-profiles-and-docker-wrapper-commands",

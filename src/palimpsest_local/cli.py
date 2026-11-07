@@ -18,6 +18,7 @@ import sys
 import tempfile
 import termios
 import threading
+import time
 import tomllib
 import tty
 import unicodedata
@@ -100,7 +101,7 @@ from .project_runtime import (
     up_project,
 )
 from .project_volumes import _validate_name
-from .refs import BuildSpec, ImageRef, LayerRef, RunSpec, StackRef
+from .refs import BuildSpec, HostDirectoryShare, ImageRef, LayerRef, RunSpec, StackRef
 from .registry import (
     RegistryConfig,
     RegistryProfile,
@@ -161,6 +162,7 @@ from .state import (
     fsync_directory,
     init_resolved_roots,
     init_roots,
+    init_source_roots,
     read_tag_record,
     resolve_roots,
     write_tag_record,
@@ -244,6 +246,19 @@ def _inspect_json_payload(inspected: InspectRecord) -> dict[str, object]:
             "ports": ports,
             "guest_ip": detail.guest_ip,
         }
+        if detail.mode is not None:
+            detail_payload.update(
+                mode=detail.mode,
+                restart=detail.restart,
+                main={
+                    "state": detail.main_state,
+                    "pid": detail.main_pid,
+                    "exit_code": detail.main_exit_code,
+                    "exit_signal": detail.main_exit_signal,
+                    "oom_kill_count": detail.main_oom_kill_count,
+                },
+                sessions={"count": detail.user_session_count, "known": detail.user_sessions_known},
+            )
     else:  # pragma: no cover - InspectRecord enforces the closed detail union
         raise PalimpsestError("unsupported runtime inspect detail")
     return {
@@ -326,8 +341,8 @@ class _ComposeLogRenderState:
         self.line_started = False
 
 
-def _configured_url() -> str | None:
-    config_path = init_roots().config / "config.toml"
+def _configured_url(config: Path | None = None) -> str | None:
+    config_path = (init_roots().config if config is None else config) / "config.toml"
     if not config_path.is_file():
         return None
     try:
@@ -351,6 +366,74 @@ def resolve_token() -> str:
     if not token:
         raise PalimpsestError("PALIMPSEST_TOKEN is required")
     return token
+
+
+def _published_roots(selected: Path | None) -> StatePaths:
+    """Select an explicit state root without initializing or touching any other root."""
+    if selected is None:
+        roots = resolve_roots()
+        return StatePaths(roots.config, roots.state.parent.resolve() / roots.state.name)
+    path = selected.expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    if ".." in path.parts or not path.name:
+        raise PalimpsestError("--state-root must name a state directory without '..' components")
+    config = Path(os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")) / "palimpsest"
+    return StatePaths(config, path.parent.resolve() / path.name)
+
+
+def _dispatch_published(args: argparse.Namespace) -> int:
+    from . import hub_publish
+
+    try:
+        return _run_published(args, hub_publish)
+    except (PalimpsestError, KeyboardInterrupt):
+        raise
+    except Exception as exc:
+        # Exception text from transports can embed request headers; never print it.
+        raise PalimpsestError(
+            f"published {args.published_operation} failed unexpectedly ({type(exc).__name__}); "
+            "details are withheld because they may contain credentials"
+        ) from None
+
+
+def _run_published(args: argparse.Namespace, hub_publish) -> int:
+    roots = _published_roots(args.state_root)
+    if args.published_operation == "status":
+        print(json.dumps(hub_publish.local_status(roots), indent=2, sort_keys=True))
+        return 0
+    hub_url = hub_publish.selected_hub_url(
+        args.url or os.environ.get("PALIMPSEST_URL") or _configured_url(roots.config) or DEFAULT_HUB_URL
+    )
+    pulling = args.published_operation == "pull"
+    credential = hub_publish.resolve_credential(
+        os.environ,
+        key_file=args.image_key_file,
+        allow_anonymous=pulling,
+        anonymous=pulling and args.anonymous,
+    )
+    hub_publish.require_secure_transport(hub_url, credential, allow_insecure_http=args.allow_insecure_http)
+    client = credential.client(hub_url)
+    if pulling:
+        result = hub_publish.pull_published_image(
+            roots, args.image_id, client=client, hub_url=hub_url, expected_name=args.name
+        )
+    else:
+        result = hub_publish.publish_local_image(
+            roots,
+            require_digest(args.image),
+            client=client,
+            hub_url=hub_url,
+            name=args.name,
+            visibility=args.visibility,
+            os_family=args.os_family,
+            os_version=args.os_version,
+            include_source=not args.no_source,
+            confirm_public=args.confirm_public,
+            notify=lambda message: print(message, file=sys.stderr, flush=True),
+        )
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
 
 
 def _image_ref_from_store(store: ContentStore, digest: str) -> ImageRef:
@@ -586,6 +669,9 @@ def _run_process_session(session: ProcessSession, *, interactive: bool) -> int:
 
     if not isinstance(session, ProcessSession):
         raise PalimpsestError("runtime returned an invalid process session")
+    if interactive and not sys.stdin.isatty():
+        session.close()
+        raise PalimpsestError("interactive VM access requires a local terminal; use --detach or exec")
     if interactive and (not session.capabilities.stdin or not session.capabilities.tty):
         session.close()
         raise PalimpsestError("runtime shell does not provide an interactive terminal")
@@ -709,6 +795,23 @@ def _parse_run_volume(value: str) -> RunVolumeIntent:
         raise argparse.ArgumentTypeError(f"invalid --volume: {exc}") from exc
 
 
+def _parse_run_source_mount(value: str) -> HostDirectoryShare:
+    parts = value.split(":")
+    if len(parts) not in {2, 3} or (len(parts) == 3 and parts[2] != "ro"):
+        raise argparse.ArgumentTypeError("--mount-source must be DIRECTORY:/guest/path[:ro]")
+    try:
+        root = Path.cwd().resolve(strict=True)
+        source = Path(parts[0]).expanduser().resolve(strict=True)
+        relative = source.relative_to(root).as_posix()
+        if relative == "." or root == root.parent:
+            raise ArtifactValidationError("share an explicit directory below the current project")
+        share = HostDirectoryShare(root, relative, parts[1], read_only=len(parts) == 3)
+        share.validate_source()
+        return share
+    except (OSError, ValueError, RuntimeError, PalimpsestError) as exc:
+        raise argparse.ArgumentTypeError(f"invalid --mount-source: {exc}") from exc
+
+
 def _parse_volume_size(value: str) -> int:
     raw_size = int(value) if re.fullmatch(r"[0-9]{1,10}", value) else value
     try:
@@ -730,11 +833,13 @@ def build_parser() -> argparse.ArgumentParser:
             "  digest=$(palimpsest image import ./ubuntu.qcow2 --disk-format qcow2 --arch aarch64)\n"
             '  palimpsest run "$digest" --name dev\n'
             "  palimpsest build . -t app --offline --output ./app.oci.tar\n"
-            "  palimpsest run ./app.oci.tar --name app  # Linux amd64 KVM only\n"
+            "  palimpsest run ./app.oci.tar --name app  # Linux amd64 KVM\n"
+            "  palimpsest run ./arm.oci.tar --backend lima-vz --platform linux/arm64\n"
             "  palimpsest docker --help             # help from the installed Docker CLI\n"
             "  palimpsest completion bash\n\n"
             "run accepts imported cloud-image digests or bundles, local OCI archives/layouts,\n"
-            "and Docker/registry image references. OCI-root requires Linux amd64 KVM.\n"
+            "and Docker/registry image references. OCI-root supports Linux amd64 KVM or an\n"
+            "explicitly configured, qualified Ubuntu 24.04 arm64 Lima VZ profile on macOS.\n"
             "Use COMMAND --help for options. See docs/cli/usage.md and docs/cli/workflows.md."
         ),
     )
@@ -833,6 +938,76 @@ def build_parser() -> argparse.ArgumentParser:
     )
     image_load.add_argument("-q", "--quiet", action="store_true", help="suppress Docker progress")
 
+    published = commands.add_parser(
+        "published",
+        help="publish local catalog images to Hub and pull Hub-published images",
+        description=(
+            "push publishes one completely materialized local catalog image (ordered SquashFS layers and its "
+            "manifest) and records a local publication status; pull verifies every payload digest and size and "
+            "registers the image as source 'published' in an explicit state root without starting a VM. "
+            "Credentials: --image-key-file, then PALIMPSEST_IMAGE_KEY (ppi_v1_ image API key), then "
+            "PALIMPSEST_TOKEN; pull without credentials reads public images anonymously."
+        ),
+    )
+    published_commands = published.add_subparsers(dest="published_operation", required=True)
+    published_push = published_commands.add_parser("push", help="publish one complete local catalog image to Hub")
+    published_push.add_argument("image", help="local catalog image id (sha256:...)")
+    published_push.add_argument("--name", required=True, help="Hub image name; one name is one image in its scope")
+    published_push.add_argument(
+        "--visibility",
+        choices=("private", "internal", "public"),
+        default="private",
+        help="Hub audience: private (you), internal (your project) or public (anonymous read); default: private",
+    )
+    published_push.add_argument("--os-family", default="unknown", help="actual OS family recorded in the manifest")
+    published_push.add_argument("--os-version", default="unknown", help="actual OS version recorded in the manifest")
+    published_push.add_argument(
+        "--state-root", type=Path, help="state root containing the local image (default: the configured state root)"
+    )
+    published_push.add_argument(
+        "--image-key-file", type=Path, help="owner-only file containing one image API key (ppi_v1_...)"
+    )
+    published_push.add_argument(
+        "--no-source",
+        action="store_true",
+        help="publish SquashFS layers and metadata only, without the OCI source closure (not runnable after pull)",
+    )
+    published_push.add_argument(
+        "--confirm-public",
+        action="store_true",
+        help="required with --visibility public: anyone can then read the image and its config environment values",
+    )
+    published_push.add_argument(
+        "--allow-insecure-http",
+        action="store_true",
+        help="allow sending credentials over plain http:// to a non-loopback Hub",
+    )
+    published_pull = published_commands.add_parser(
+        "pull", help="download and verify a Hub-published image into a local state root; never starts a VM"
+    )
+    published_pull.add_argument("image_id", help="Hub published image id (UUID)")
+    published_pull.add_argument("--name", help="require the Hub image to have this name")
+    published_pull.add_argument(
+        "--state-root", type=Path, required=True, help="explicit state root receiving the payloads and catalog row"
+    )
+    published_pull.add_argument(
+        "--image-key-file", type=Path, help="owner-only file containing one image API key (ppi_v1_...)"
+    )
+    published_pull.add_argument(
+        "--anonymous", action="store_true", help="ignore configured credentials and read a public image anonymously"
+    )
+    published_pull.add_argument(
+        "--allow-insecure-http",
+        action="store_true",
+        help="allow sending credentials over plain http:// to a non-loopback Hub",
+    )
+    published_status = published_commands.add_parser(
+        "status", help="show local publication status and pulled images without contacting Hub"
+    )
+    published_status.add_argument(
+        "--state-root", type=Path, help="state root to inspect (default: the configured state root)"
+    )
+
     layer = commands.add_parser("layer", help="list, pack, pull, publish, and export SquashFS layers")
     layer_commands = layer.add_subparsers(dest="layer_operation", required=True)
     layer_cloud_init = layer_commands.add_parser(
@@ -897,12 +1072,26 @@ def build_parser() -> argparse.ArgumentParser:
     oci_pull.add_argument("--output", required=True, type=Path)
     oci_pull.add_argument("--platform", choices=("linux/amd64",), default="linux/amd64")
     oci_pull.add_argument("--timeout", type=float, default=REGISTRY_PULL_TIMEOUT)
+    oci_qualify = oci_commands.add_parser(
+        "qualify", help="qualify actual local OCI OS bytes against a reviewed source boot profile; does not launch a VM"
+    )
+    oci_qualify.add_argument("source", type=Path, help="original local OCI archive or layout")
+    oci_qualify.add_argument("--manifest", help="pin an exact root descriptor or original top-level index digest")
+    oci_qualify.add_argument("--platform", required=True, choices=("linux/arm64",))
+    oci_qualify.add_argument("--backend", required=True, choices=("lima-vz",))
+    oci_qualify.add_argument("--timeout", type=float, default=300.0, help="total cooperative deadline in seconds")
+    oci_qualify.add_argument(
+        "--maximum-bytes",
+        type=int,
+        default=8 * 1024**3,
+        help="maximum acquisition bytes and OS-reader uncompressed work, including selected-layer replay (default: 8 GiB)",
+    )
     oci_materialize = oci_commands.add_parser(
-        "materialize", help="convert a local Linux amd64 OCI image into verified SquashFS layers"
+        "materialize", help="convert a local Linux OCI filesystem into ordered SquashFS layers; not execution admission"
     )
     oci_materialize.add_argument("source", type=Path)
     oci_materialize.add_argument("--manifest", help="pin a root descriptor; required when the local index is ambiguous")
-    oci_materialize.add_argument("--platform", choices=("linux/amd64",), default="linux/amd64")
+    oci_materialize.add_argument("--platform", choices=("linux/amd64", "linux/arm64"), default="linux/amd64")
     oci_materialize.add_argument("--packer", type=Path, default=Path("/usr/bin/mksquashfs"))
     oci_materialize.add_argument("--timeout", type=float, default=300.0)
     oci_materialize.add_argument("--output", type=Path)
@@ -950,7 +1139,8 @@ def build_parser() -> argparse.ArgumentParser:
             "Dockerfile builds export OCI archives using a managed Buildx builder. The default native cache mode "
             "requires Hub cache authority (--cache-registry and --cache-package); --cache-mode local uses only "
             "the host's managed cache with an OCI output profile. --offline also forbids remote inputs. "
-            "Run the exported archive with run on Linux amd64 KVM, or use --runtime-tag/--runtime-base "
+            "Run the exported archive on Linux amd64 KVM or a qualified macOS arm64 Lima VZ profile, "
+            "or use --runtime-tag/--runtime-base "
             "to pack a SquashFS layer for a conventional cloud-image VM. Palimpsestfile builds require --base."
         ),
     )
@@ -1170,11 +1360,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = commands.add_parser(
         "run",
-        help="boot a cloud-image VM or run a local OCI image in a KVM VM",
+        help="boot a cloud-image VM or run a local OCI image in a native VM",
         description=(
-            "Boot a cloud-image digest or cloud-image/layer bundle, or run an OCI image in a KVM VM. "
+            "Boot a cloud-image digest or cloud-image/layer bundle, or run an OCI image in a native VM. "
             "Local cloud images and OCI sources (BuildKit builds, Docker daemon images, and configured OCI registries) "
-            "are resolved automatically. OCI-root requires Linux amd64 KVM. "
+            "are resolved automatically. OCI-root supports Linux amd64 KVM or an explicitly configured, "
+            "qualified Ubuntu 24.04 arm64 Lima VZ profile on macOS. "
             "For OCI-root, append -- COMMAND ARG... to override the image command."
         ),
     )
@@ -1242,6 +1433,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="OCI writable-root removal policy (default: delete)",
     )
     run.add_argument("--root-volume", help="reuse an explicitly retained OCI writable-root UUID")
+    run.add_argument("--mode", choices=("dev", "prod"), help="native VZ lifecycle mode (default: dev)")
+    run.add_argument(
+        "--restart",
+        choices=("no", "unless-stopped"),
+        help="native VZ workload restart policy (default: no in dev, unless-stopped in prod)",
+    )
+    run.add_argument(
+        "--mount-source",
+        action="append",
+        default=[],
+        type=_parse_run_source_mount,
+        dest="host_shares",
+        metavar="DIRECTORY:/guest/path[:ro]",
+        help="explicitly share a directory within the current project with native VZ; default source stays in layers",
+    )
 
     compose = commands.add_parser("compose", help="manage VM services declared in palimpsest.yml (not Docker Compose)")
     compose.add_argument("-f", "--file", dest="project_file", type=Path)
@@ -1357,6 +1563,13 @@ def build_parser() -> argparse.ArgumentParser:
     store_show.add_argument(
         "--format", choices=("table", "json"), default="table", help="output format (default: table)"
     )
+    store_catalog = store_commands.add_parser(
+        "catalog",
+        help="read persisted local metadata, not runtime or ownership authority",
+    )
+    store_catalog.add_argument(
+        "--refresh", action="store_true", help="refresh selected-root metadata without live VM reconciliation"
+    )
     store_ls = store_commands.add_parser(
         "ls",
         help="list locally stored boot images and layers (not Hub or Docker)",
@@ -1428,6 +1641,11 @@ def _validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
             parser.error("--port must be 0 or between 1024 and 65535")
     if args.operation == "oci" and args.oci_operation == "materialize" and not 0 < args.timeout < float("inf"):
         parser.error("--timeout must be a positive finite number")
+    if args.operation == "oci" and args.oci_operation == "qualify":
+        if not 0 < args.timeout <= 3600:
+            parser.error("qualify --timeout must be finite and between 0 and 3600 seconds")
+        if not 0 < args.maximum_bytes <= 8 * 1024**3:
+            parser.error("qualify --maximum-bytes must be between 1 and 8589934592")
     if (
         args.operation == "oci"
         and args.oci_operation == "cache"
@@ -2255,8 +2473,70 @@ def _dispatch_compose(
     raise PalimpsestError(f"unsupported compose operation: {operation}")
 
 
+def _dispatch_store(args: argparse.Namespace, roots: StatePaths) -> int:
+    sub = args.store_operation
+    if sub == "catalog":
+        print(json.dumps(inventory.metadata_snapshot(roots, refresh=args.refresh), indent=2, sort_keys=True))
+    elif sub == "show":
+        payload = inventory.storage_report(roots)
+        if args.format == "json":
+            print(json.dumps(payload, indent=2))
+        else:
+            print(f"{'COMPONENT':<20}\t{'VALUE':<32}")
+            print(f"{'state_root':<20}\t{payload['state_root']}")
+            print(f"{'source':<20}\t{payload['source']}")
+            print(f"{'total_state_bytes':<20}\t{payload['total_state_bytes']}")
+            print(f"{'free_bytes':<20}\t{payload['free_bytes']}")
+            print(f"{'total_bytes':<20}\t{payload['total_bytes']}")
+            for name, size in payload["directories"].items():
+                print(f"{f'dir:{name}':<20}\t{size}")
+    elif sub == "ls":
+        payload = inventory.list_artifacts(
+            roots, arch=args.arch, compatible=args.compatible, requested_backend=args.backend
+        )
+        if args.kind == "image":
+            items = payload["images"]
+        elif args.kind == "layer":
+            items = payload["layers"]
+        else:
+            items = payload["artifacts"]
+        if args.format == "json":
+            print(json.dumps(items, indent=2))
+        else:
+            print(f"{'DIGEST':<20}\t{'KIND':<16}\t{'ARCH':<10}\t{'COMPATIBILITY':<14}\t{'SIZE':<12}\t{'TAGS':<24}")
+            for item in items:
+                raw_tags = item.get("tags")
+                tags_list = raw_tags if isinstance(raw_tags, list) else []
+                tags_str = ", ".join(t.get("tag", "") for t in tags_list if isinstance(t, dict) and t.get("tag")) or "-"
+                print(
+                    f"{item['digest']:<20}\t{str(item.get('kind', '-')):<16}\t"
+                    f"{str(artifact_arch(item) or 'unknown'):<10}\t{item['compatibility']['status']:<14}\t"
+                    f"{str(item.get('size_bytes', 0)):<12}\t{tags_str:<24}"
+                )
+    elif sub == "check":
+        result = inventory.check_local_artifact(roots, args.reference, requested_backend=args.backend)
+        print(json.dumps(result, indent=2))
+        return 0 if result["compatible"] else 1
+    elif sub == "rm":
+        print(json.dumps(inventory.remove_artifact(roots, args.digest, force=args.force), indent=2))
+    elif sub == "move":
+        print(json.dumps(inventory.move_state_root(roots, args.destination, keep_source=args.keep_source), indent=2))
+    elif sub == "set":
+        print(json.dumps(inventory.set_state_root(roots, args.destination), indent=2))
+    return 0
+
+
+def _sync_completed_build_metadata(roots: StatePaths) -> None:
+    try:
+        inventory.refresh_metadata(roots)
+    except PalimpsestError as exc:
+        raise PalimpsestError(f"Build output committed; local metadata synchronization failed: {exc}") from exc
+
+
 def dispatch_args(args: argparse.Namespace) -> int:
     op = args.operation
+    if op == "published":
+        return _dispatch_published(args)
     if op == "benchmark":
         from .benchmark_cli import dispatch as dispatch_benchmark
 
@@ -2300,12 +2580,20 @@ def dispatch_args(args: argparse.Namespace) -> int:
             print(args.output.expanduser().resolve(strict=False))
         return 0
     if op == "oci" and args.oci_operation == "cache":
+        from .image_source_policy import load_image_source_policy
         from .layer_cache import LayerCache
 
-        cache = LayerCache(args.root, initialize=args.cache_operation == "init")
         cache_op = args.cache_operation
+        source_policy = load_image_source_policy(resolve_roots()) if cache_op == "pull" else None
+        if source_policy is not None:
+            from .registry_intake import resolve_anonymous_reference
+
+            source_policy.admit(resolve_anonymous_reference(args.reference))
+        cache = LayerCache(args.root, initialize=cache_op == "init")
         if cache_op == "pull":
-            payload = cache.pull(args.reference, offline=args.offline, timeout_seconds=args.timeout)
+            payload = cache.pull(
+                args.reference, source_policy=source_policy, offline=args.offline, timeout_seconds=args.timeout
+            )
         elif cache_op == "import":
             payload = cache.import_source(args.source, manifest_digest=args.manifest)
         elif cache_op == "materialize":
@@ -2383,9 +2671,13 @@ def dispatch_args(args: argparse.Namespace) -> int:
     deferred_package_state = op in {"login", "logout", "push", "pull", "tag"} or (
         op == "build" and _selected_build_frontend(args) == "dockerfile"
     )
+    deferred_source_state = op == "oci" and args.oci_operation == "qualify"
+    read_only_store = op == "store" and args.store_operation in {"show", "ls", "check", "catalog"}
     roots = (
         resolve_roots()
         if deferred_package_state
+        or deferred_source_state
+        or read_only_store
         or op in read_only_root_operations
         or (op == "oci" and args.oci_operation in read_only_oci_operations)
         else init_roots()
@@ -2414,6 +2706,37 @@ def dispatch_args(args: argparse.Namespace) -> int:
         print(json.dumps(payload, indent=2, sort_keys=True))
         return 0
     if op == "oci":
+        if args.oci_operation == "qualify":
+            from .native_root_source import qualify_native_root_source
+
+            # Preserve ".." and symlink spelling for the secure intake. Both
+            # resolve() and abspath() could silently select different bytes.
+            source_path = args.source.expanduser()
+            if not source_path.is_absolute():
+                source_path = Path.cwd() / source_path
+            manifest_digest = require_digest(args.manifest) if args.manifest is not None else None
+            source = (
+                LocalLayoutSource(layout=source_path, root_digest=manifest_digest)
+                if source_path.is_dir()
+                else LocalArchiveSource(archive=source_path, root_digest=manifest_digest)
+            )
+            qualification_roots = init_source_roots(roots)
+            qualification = qualify_native_root_source(
+                source,
+                SourceCAS(qualification_roots.oci_source_cas),
+                platform=args.platform,
+                backend=args.backend,
+                timeout_seconds=args.timeout,
+                maximum_bytes=args.maximum_bytes,
+            )
+            print(
+                json.dumps(
+                    {**qualification.to_dict(), "qualification_binding_digest": qualification.binding_digest},
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0
         if args.oci_operation == "pull":
             receipt = pull_anonymous_oci_archive(
                 args.reference,
@@ -2445,7 +2768,11 @@ def dispatch_args(args: argparse.Namespace) -> int:
         )
         manifest_digest = require_digest(args.manifest) if args.manifest is not None else None
         try:
-            source_path = args.source.expanduser().resolve(strict=True)
+            source_path = args.source.expanduser()
+            if args.platform == "linux/amd64":
+                source_path = source_path.resolve(strict=True)
+            elif not source_path.is_absolute():
+                source_path = Path.cwd() / source_path
         except OSError:
             raise PalimpsestError(f"local OCI source does not exist: {args.source}") from None
         try:
@@ -2469,11 +2796,31 @@ def dispatch_args(args: argparse.Namespace) -> int:
             else None
         )
         source_cas = SourceCAS(oci_roots.oci_source_cas)
-        snapshot = source.snapshot(reference, source_cas)
+        materialization_started = time.monotonic()
+        snapshot = (
+            source.snapshot(reference, source_cas)
+            if args.platform == "linux/amd64"
+            else source.snapshot_acquisition(
+                reference, source_cas, platform=args.platform, timeout_seconds=args.timeout
+            )
+        )
+
+        def metadata_timeout() -> float:
+            remaining = (
+                args.timeout - (time.monotonic() - materialization_started)
+                if args.platform == "linux/arm64"
+                else args.timeout
+            )
+            if remaining <= 0:
+                raise PalimpsestError("OCI materialization deadline expired before local metadata synchronization")
+            return min(5.0, remaining)
+
         toolchain = discover_squashfs_toolchain(
             packer_path,
             expected_packer_sha256=digest_hex(digest_file(packer_path)),
+            deadline=materialization_started + args.timeout if args.platform == "linux/arm64" else None,
         )
+        inventory.record_oci_source(oci_roots, snapshot, timeout_seconds=metadata_timeout())
         receipt = materialize_image_hard(
             snapshot,
             source_cas_root=oci_roots.oci_source_cas,
@@ -2481,8 +2828,18 @@ def dispatch_args(args: argparse.Namespace) -> int:
             store=OCIStore(oci_roots),
             packer_path=packer_path,
             toolchain=toolchain,
-            timeout_seconds=args.timeout,
+            timeout_seconds=(
+                args.timeout
+                if args.platform == "linux/amd64"
+                else args.timeout - (time.monotonic() - materialization_started)
+            ),
         )
+        try:
+            inventory.record_oci_materialization(oci_roots, snapshot, receipt, timeout_seconds=metadata_timeout())
+        except PalimpsestError as exc:
+            raise PalimpsestError(f"OCI layers committed; local metadata synchronization failed: {exc}") from exc
+        if args.platform == "linux/arm64" and time.monotonic() >= materialization_started + args.timeout:
+            raise PalimpsestError("OCI layers and metadata committed after the materialization deadline")
         payload = {**receipt.to_dict(), "receipt_digest": receipt.digest}
         rendered = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n"
         if args.output is None:
@@ -2491,6 +2848,8 @@ def dispatch_args(args: argparse.Namespace) -> int:
             _write_generated_config(args.output, rendered, force=False)
             print(args.output.expanduser().resolve(strict=False))
         return 0
+    if op == "store":
+        return _dispatch_store(args, roots)
     store = ContentStore(roots.store)
     if op == "registry":
         reg_op = args.registry_operation
@@ -2998,6 +3357,7 @@ def dispatch_args(args: argparse.Namespace) -> int:
                 ),
                 roots=roots,
             )
+            _sync_completed_build_metadata(roots)
             print(record["output_digest"])
         else:
             context = args.context or Path(".")
@@ -3196,6 +3556,7 @@ def dispatch_args(args: argparse.Namespace) -> int:
                                     record, project_id=package_client.project_id, published_digest=receipt["digest"]
                                 ),
                             )
+            _sync_completed_build_metadata(roots)
             result_digest = (
                 build_record.get("runtime_block_digest")
                 or build_record.get("output_oci_manifest_digest")
@@ -3256,6 +3617,9 @@ def dispatch_args(args: argparse.Namespace) -> int:
                 force_architecture=args.force_architecture,
                 vm_image=args.vm_image,
                 vm_image_digest=args.vm_image_digest,
+                mode=args.mode,
+                restart=args.restart,
+                host_shares=tuple(args.host_shares),
             )
             if request.force_architecture:
                 print(
@@ -3273,7 +3637,7 @@ def dispatch_args(args: argparse.Namespace) -> int:
                 return 0
             if result.session is None:
                 raise PalimpsestError("OCI-root foreground launch is missing its process session")
-            return _run_process_session(result.session, interactive=False)
+            return _run_process_session(result.session, interactive=result.session.capabilities.tty)
 
         if (
             getattr(args, "manifest", None) is not None
@@ -3286,6 +3650,9 @@ def dispatch_args(args: argparse.Namespace) -> int:
             or args.vm_image is not None
             or args.vm_image_digest is not None
             or args.platform != "linux/amd64"
+            or args.mode is not None
+            or args.restart is not None
+            or args.host_shares
         ):
             raise PalimpsestError(
                 "--manifest, --root-retention=delete, --root-volume, --user, --publish, selected OCI --platform, "
@@ -3496,60 +3863,6 @@ def dispatch_args(args: argparse.Namespace) -> int:
     elif op == "web":
         ui.serve(roots, port=args.port, open_browser=not args.no_browser, read_only=not args.allow_control)
         return 0
-    elif op == "store":
-        sub = args.store_operation
-        if sub == "show":
-            payload = inventory.storage_report(roots)
-            if args.format == "json":
-                print(json.dumps(payload, indent=2))
-            else:
-                print(f"{'COMPONENT':<20}\t{'VALUE':<32}")
-                print(f"{'state_root':<20}\t{payload['state_root']}")
-                print(f"{'source':<20}\t{payload['source']}")
-                print(f"{'total_state_bytes':<20}\t{payload['total_state_bytes']}")
-                print(f"{'free_bytes':<20}\t{payload['free_bytes']}")
-                print(f"{'total_bytes':<20}\t{payload['total_bytes']}")
-                for name, size in payload["directories"].items():
-                    print(f"{f'dir:{name}':<20}\t{size}")
-        elif sub == "ls":
-            payload = inventory.list_artifacts(
-                roots, arch=args.arch, compatible=args.compatible, requested_backend=args.backend
-            )
-            if args.kind == "image":
-                items = payload["images"]
-            elif args.kind == "layer":
-                items = payload["layers"]
-            else:
-                items = payload["artifacts"]
-            if args.format == "json":
-                print(json.dumps(items, indent=2))
-            else:
-                print(f"{'DIGEST':<20}\t{'KIND':<16}\t{'ARCH':<10}\t{'COMPATIBILITY':<14}\t{'SIZE':<12}\t{'TAGS':<24}")
-                for item in items:
-                    raw_tags = item.get("tags")
-                    tags_list = raw_tags if isinstance(raw_tags, list) else []
-                    tags_str = (
-                        ", ".join(t.get("tag", "") for t in tags_list if isinstance(t, dict) and t.get("tag")) or "-"
-                    )
-                    print(
-                        f"{item['digest']:<20}\t{str(item.get('kind', '-')):<16}\t"
-                        f"{str(artifact_arch(item) or 'unknown'):<10}\t{item['compatibility']['status']:<14}\t"
-                        f"{str(item.get('size_bytes', 0)):<12}\t{tags_str:<24}"
-                    )
-        elif sub == "check":
-            result = inventory.check_local_artifact(roots, args.reference, requested_backend=args.backend)
-            print(json.dumps(result, indent=2))
-            return 0 if result["compatible"] else 1
-        elif sub == "rm":
-            result = inventory.remove_artifact(roots, args.digest, force=args.force)
-            print(json.dumps(result, indent=2))
-        elif sub == "move":
-            result = inventory.move_state_root(roots, args.destination, keep_source=args.keep_source)
-            print(json.dumps(result, indent=2))
-        elif sub == "set":
-            result = inventory.set_state_root(roots, args.destination)
-            print(json.dumps(result, indent=2))
-        return 0
 
     return 0
 
@@ -3621,6 +3934,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         if (
             args.operation == "completion"
             or args.operation == "cloud"
+            # Explicit --state-root isolation: never journal into the configured root.
+            or args.operation == "published"
             or (args.operation == "build" and args.executor == "nova")
             or (args.operation == "layer" and args.layer_operation == "cloud-init")
             or (args.operation == "oci" and args.oci_operation == "cache")

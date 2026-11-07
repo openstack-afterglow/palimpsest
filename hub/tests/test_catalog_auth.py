@@ -19,15 +19,18 @@ FEDERATED_OWNER = "f" * 64
 ORIGINAL_SUBJECT = "original-project-subject"
 
 SERVICE_EDGES = {
-    "palimpsest_admin": ["palimpsest_editor", "palimpsest-keys_admin"],
-    "palimpsest_editor": ["palimpsest_user", "palimpsest-publish_editor", "palimpsest-keys_editor"],
-    "palimpsest_user": ["palimpsest_reader", "palimpsest-download_user"],
-    "palimpsest_reader": ["palimpsest-inventory_reader"],
-    "palimpsest-download_user": ["palimpsest_reader"],
-    "palimpsest-publish_editor": ["palimpsest_reader"],
-    "palimpsest-keys_editor": ["palimpsest_reader"],
-    "palimpsest-keys_admin": ["palimpsest_reader"],
+    "admin": ["manager"],
+    "manager": ["member"],
     "member": ["reader"],
+    "project_owner": ["project_admin"],
+    "project_admin": ["admin"],
+    "project_manager": ["manager"],
+    "project_member": ["member"],
+    "project_reader": ["reader"],
+    "palimpsest_admin": ["palimpsest_editor"],
+    "palimpsest_editor": ["palimpsest_user"],
+    "palimpsest_user": ["palimpsest_reader"],
+    "palimpsest_reader": ["palimpsest-inventory_reader"],
 }
 
 
@@ -93,8 +96,8 @@ def keystone_http(monkeypatch: pytest.MonkeyPatch):
         "users_next": False,
         "extra_users": [],
         "validator_roles": ["reader"],
-        "token_roles": ["member", "palimpsest_admin"],
-        "project_roles": ["member", "palimpsest_admin"],
+        "token_roles": ["member"],
+        "project_roles": ["member"],
         "other_roles": [],
         "system_roles": [],
         "groups": [],
@@ -594,9 +597,11 @@ async def test_catalog_current_raw_system_grants_are_authoritative(native_http, 
         h.identity["system_roles"] = ["admin"]
     else:
         h.identity["groups"] = ["catalog-operators"]
-        h.identity["group_system_roles"] = {"catalog-operators": ["admin" if grant == "group" else "palimpsest_admin"]}
+        alias = "native-catalog-operator"
+        h.identity["group_system_roles"] = {"catalog-operators": ["admin" if grant == "group" else alias]}
         if grant == "group-implied":
-            h.identity["edges"]["palimpsest_admin"].append("admin")
+            h.identity["directory"].append({"id": "role-" + alias, "name": alias, "domain_id": None})
+            h.identity["edges"][alias] = ["admin"]
     response = await h.client.get("/v1/admin/catalog/layers", headers={"X-Auth-Token": ORIGINAL_SUBJECT})
     assert response.status_code == 200, response.text
     h.identity["system_roles"] = []
@@ -628,3 +633,47 @@ async def test_catalog_partial_or_unavailable_system_authority_is_503(native_htt
     h.identity[failure] = True
     response = await h.client.get("/v1/admin/catalog/layers", headers={"X-Auth-Token": ORIGINAL_SUBJECT})
     assert response.status_code == 503, response.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("methods", [["openid"], ["openid", "token"]])
+async def test_catalog_openid_human_system_authority_is_not_a_project_role(native_http, methods):
+    h = native_http
+    h.identity["token_methods"] = methods
+    headers = {"X-Auth-Token": ORIGINAL_SUBJECT}
+    assert (await h.client.get("/v1/admin/catalog/layers", headers=headers)).status_code == 403
+    h.identity["system_roles"] = ["admin"]
+    assert (await h.client.get("/v1/admin/catalog/layers", headers=headers)).status_code == 200
+    h.identity["system_roles"] = []
+    assert (await h.client.get("/v1/admin/catalog/layers", headers=headers)).status_code == 403
+    assert not any(event.get("methods") == ["token"] for event in h.identity["requests"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("methods", [["openid"], ["openid", "token"]])
+@pytest.mark.parametrize(
+    "marker",
+    ["OS-TRUST:trust", "application_credential", "OS-OAUTH1", "OS-OAUTH2", "oauth1", "oauth2", "bind", "access_rules"],
+)
+async def test_catalog_openid_reduced_credentials_never_gain_human_system_authority(native_http, methods, marker):
+    h = native_http
+    h.identity["token_methods"] = methods
+    h.identity["token_markers"] = {marker: {}}
+    h.identity["system_roles"] = ["admin"]
+    response = await h.client.get("/v1/admin/catalog/layers", headers={"X-Auth-Token": ORIGINAL_SUBJECT})
+    assert response.status_code == 403, response.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", ["palimpsest_admin", "palimpsest_editor", "palimpsest_reader"])
+async def test_catalog_current_native_implication_can_establish_system_administration(native_http, role):
+    h = native_http
+    h.identity["subject_scope"] = "system"
+    h.identity["token_roles"] = []
+    h.identity["project_roles"] = []
+    h.identity["system_roles"] = [role]
+    denied = await h.client.get("/v1/admin/catalog/layers", headers={"X-Auth-Token": ORIGINAL_SUBJECT})
+    assert denied.status_code == 403, denied.text
+    h.identity["edges"][role] = ["admin"]
+    response = await h.client.get("/v1/admin/catalog/layers", headers={"X-Auth-Token": ORIGINAL_SUBJECT})
+    assert response.status_code == 200, response.text

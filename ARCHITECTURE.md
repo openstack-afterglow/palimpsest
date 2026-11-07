@@ -1,5 +1,1309 @@
 # Palimpsest Architecture
 
+## M2 Hub image publication, quotas, image keys and anonymous public reads — 2026-11-07/08 merge-worktree source
+
+**Independently reviewed merge-worktree source (whole-surface security review,
+merge-integrity review, architecture review); not committed, released, deployed
+or live-verified.** See the 2026-11-07/08 Maintenance entry for review results,
+open items and verification levels.
+
+**Quota.** [`services/image_quota.py`](hub/src/palimpsest_hub/services/image_quota.py)
+owns publication limits. SQL `palimpsest_hub_image_quota_policies` (tier
+`free|paid` × visibility; nullable `max_images`, `max_chain_bytes`,
+`max_source_bytes`, null = unlimited) and `palimpsest_hub_image_quota_tiers`
+(`user|project` subject → tier, default `free`) are authoritative. Code inserts
+only missing seed rows (free 2/1GiB private, 5/5GiB internal, unlimited/10GiB
+public; paid 20/50GiB, 50/50GiB, unlimited/100GiB; source seed = chain seed;
+paid values were kept as proposed by owner decision 537, 2026-11-08). `register_image` in
+[`services/published_images.py`](hub/src/palimpsest_hub/services/published_images.py)
+calls `image_quota.enforce` after the request_id replay lookup, so a replay is
+never re-charged, under the one global image SQL mutex that also orders admin
+policy/tier changes. Private and public publications charge the publishing user,
+internal the origin project. The count unit is one distinct name per
+(visibility, subject); another version under an existing name is not counted.
+Chain bytes are stored compressed sizes of the distinct payload digests in the
+manifest `layers` (GiB = 2^30). An application-mode original cloud image
+(`base_image_digest`) is outside every cap; oci-root counts every manifest layer,
+including original OCI base layers (owner decision 537, 2026-11-08).
+Source bytes are distinct source-closure digests. Refusals are 403
+`image_count_limit`, 413 `image_chain_size_limit` and 413
+`image_source_size_limit` with structured detail; `image_jobs.complete` settles
+exactly these as a terminal job `error` instead of an uncertain worker halt.
+[`api/image_admin.py`](hub/src/palimpsest_hub/api/image_admin.py) serves, to fresh
+human system administrators (`require_admin`, `system:manage`), `GET
+/v1/admin/image-quota/policies`, `PUT .../policies/{tier}/{visibility}`, `GET|PUT
+.../tiers/{subject_kind}/{subject_id}`, `GET .../usage?subject_kind=&subject_id=`
+and `GET .../physical`. `GET /v1/image-quota/me` needs `packages:inventory` on a
+Keystone token or `images:read` on an image key; anonymous callers get 401 and
+publish-only keys 403. Lowering a policy or tier never deletes images.
+Known consequences: limits cap distinct names and per-image chain/source bytes,
+not total storage per scope or versions under one name, and a scope already over
+a lowered count can still add versions under existing names. Usage and the
+physical report are SQL aggregations. Physical storage means Hub-known stored
+blob bytes per storage namespace (owner decision 537; cloud-side Glance raw
+conversion and Cinder usage are excluded): the report counts each digest once per
+storage namespace (Hub-wide for local, per share/scope for Manila) and separates
+logical from physical bytes. Null is reported only for unknown application
+base-image sizes and for Manila or unreadable store capacity; a missing chain-layer
+or membership row is a definite 409.
+
+**Image API keys.** [`services/image_keys.py`](hub/src/palimpsest_hub/services/image_keys.py),
+[`api/image_keys.py`](hub/src/palimpsest_hub/api/image_keys.py) and
+[`image_key_models.py`](hub/src/palimpsest_hub/image_key_models.py) add a key
+kind separate from package keys: `ppi_v1_<32 hex id>.<43 base64url>` in
+`palimpsest_image_keys`, SHA-256 of the secret only, shown once with
+`Cache-Control: no-store`, 1–90 days (default 30) and at most
+`PALIMPSEST_HUB_IMAGE_KEY_MAX_ACTIVE_PER_USER` (50) active keys per user (409
+`image_key_limit`). Only original human Keystone tokens issue/list/revoke them,
+and only actions the issuer currently holds: `images:read` (needs current
+`packages:inventory`+`packages:read`) and `images:publish` (needs
+`packages:write`). Publish does not imply read: a publish-only key may publish
+only payloads its owner staged and cannot extend or reuse visible images. Every
+use, and every mutation boundary, revalidates expiry/revocation and current owner
+project membership; effective actions are the stored actions intersected with
+that current authority. Keys cannot manage keys or select a target project, and
+`ppk_v1` package keys fail image-key decoding (401): they carry no image
+authority. `migrate.py` copies keys, quota tables and source-closure rows only
+after validating their shape, lifetime and state; membership and authority are
+enforced at use.
+
+**Public means anonymous-readable.** `public` publications are now readable
+without any credential through `GET /v1/published-images`, `GET
+/v1/published-images/{id}` and `GET /v1/published-images/{id}/blobs/{digest}`
+only ([`services/public_images.py`](hub/src/palimpsest_hub/services/public_images.py)).
+Layer-node graph routes, quota self-service and every write still require a
+credential. The anonymous projection omits `created_by`, `storage_binding`,
+`project_id` and node `project_id`/`payload_path`. A present but invalid
+credential is 401, never a fallback to anonymous; Keystone being unavailable is
+503. Anonymous requests pass a
+fixed-window per-client limiter (`PALIMPSEST_HUB_ANONYMOUS_RATE_LIMIT_*`, default
+120 requests/60s, 10000 tracked clients, 429 with `Retry-After`) keyed by
+uvicorn's resolved `request.client.host`; IPv4-mapped IPv6 counts as IPv4, other
+IPv6 per /64. When the table is full the entry whose window opened earliest is
+evicted even if its window is still open, so rotating across many client buckets
+(for example IPv6 /64s) evades the limit (accepted risk). Counters are per
+process and per node. Behind a proxy that is not in
+uvicorn's forwarded-allow list, all anonymous callers share that proxy's bucket:
+the Kolla role renders `--proxy-headers` and the new
+`palimpsest_api_forwarded_allow_ips` (default `127.0.0.1`, unchanged behaviour),
+so operators must list the actual HAProxy sources; no deployment does so yet.
+
+**OCI source closure (owner decision A).** A publication may carry an optional
+`source_closure` (root index ≤1, manifest, config and contiguous original
+compressed layers, ≤300 items) stored in `palimpsest_hub_image_source_blobs`
+(image_id, role, ordinal, project_id, blob_digest, size_bytes, created_at), for
+`oci-root` images only. Closure blobs use the existing staging route `PUT
+/v1/published-images/blobs/{digest}`, which no longer requires SquashFS magic;
+layer payloads are checked for the `hsqs` SquashFS magic bytes at registration.
+The caller must have staged every closure blob itself. The manifest
+must commit to the closure (`source.root_digest/manifest_digest/config_digest`
+and each payload's original compressed descriptor by ordinal); the server
+re-reads documents ≤1MiB, rejects duplicate JSON keys and checks manifest/config/
+layer descriptor coherence. When the manifest declares `source.diff_ids` (the
+client always does) they must equal config `rootfs.diff_ids`, and a stored root
+index must list the manifest. Closure blobs are served through the image blob
+route by image membership, and only to callers that can read the image.
+**Consequence:** the config blob exposes image environment VALUES to everyone who
+can read the image (anyone for `public`), unlike the public manifest projection,
+which hides environment values.
+
+**Platforms.** [`image_manifest.py`](src/palimpsest_local/image_manifest.py)
+admits `linux/amd64` and `linux/arm64` for `oci-root` manifests; application
+stays amd64. Payload rows accept any stored arch label (the first registrant's
+label is not a property of the bytes). Instance and native paths decide by the
+sealed manifest platform and refuse arm64 execution; image-job requests are typed
+`Literal["linux/amd64"]` and the executor refuses other platforms.
+
+**Client.** [`hub_publish.py`](src/palimpsest_local/hub_publish.py) implements
+`palimpsest published push|pull|status`. Local catalog schema v2 (unreleased)
+adds `publications`, `pulled_images` and `pulled_layers`; v1 catalogs stay
+readable and upgrade only inside a publication/pull write, while any other DDL
+under v2 (including the discarded round-1 tables) is refused. The request id is
+persisted before the first network call and reused by retries of the same intent;
+terminal outcomes start a new generation, and `published` is recorded only after
+the Hub response matches the locally computed manifest. Credentials: owner-only
+`--image-key-file`, then `PALIMPSEST_IMAGE_KEY`, then `PALIMPSEST_TOKEN`; pull may
+be anonymous, push never. Credentials are not sent over plain `http://` to a
+non-loopback Hub unless `--allow-insecure-http` is passed. `--confirm-public` is
+mandatory for public, `--no-source` omits the closure, and when the closure is
+included an environment-exposure notice precedes upload. Manifests
+carry only content-derived receipt fields, so any state root yields the same
+digest. Pull verifies every payload and the full OCI chain, rebuilds a standard
+layout under `<state-root>/published/<id>/layout` (directories 0700, files 0400),
+registers it through `LocalLayoutSource` and `inventory.record_oci_source` without
+a VM and prints a `plm run` hint. If that local source registration fails, the
+result reports `runnable: false`, no run hint, `source_registration_error` and a
+message; the verified layout is kept. `store rm` refuses digests of pulled images,
+and store listing/preview marks digests referenced by pulled Hub images as not
+deletable (`deletion_blockers.published`).
+
+**Evidence and open risks.** Test-passed only: Hub lane and root per-file runs in
+a scrubbed macOS environment with synthetic Keystone and SQLite
+(`tests/unit/test_hub_publish.py`: 72 cases, all passing; the five Hub M2 test files
+pass with 21, 6, 36, 27 and 23 cases), and an isolated end-to-end harness (real Hub
+app under loopback uvicorn, real client CLI, fake Keystone over HTTP, no dependency
+overrides) that passed 77 checks, re-run after the last code edit (anonymous list
+cap, inventory preview, registry child environment, pull result; the harness run
+recorded source aggregate `63511eb2…`). A separate Hub-level script
+exercised the seeded free chain caps with real byte counts (private 1073741824,
+internal 5368709120, public 10737418240): a chain one byte under the cap and
+exactly at the cap publish, one byte over returns 413 `image_chain_size_limit`;
+11 checks passed on the same final code. Exact counts and digests are recorded in
+docs/development-handoff.md. Not verified: live
+Hub/Keystone/Afterglow OAuth, Kolla deployment, MySQL/MariaDB (the quota code uses
+`CAST AS BINARY` and JSON extraction), Manila/CephFS closure copying, Linux-only
+tests on this host, an actual `plm run` of a pulled image on a separate state root
+and a second Apple Silicon device. Open: staged-but-unregistered blobs have no
+aggregate quota or expiry (pre-existing); the Hub serves stored blobs without
+re-verification (clients verify); in-place bootstrap does not add
+`max_source_bytes` to a dev database that already has the never-shipped quota
+tables (offline `migrate.py` copies seed it from the chain cap); the proxy
+rate-limit caveat above; the arm64 pull precheck counts compressed closure bytes
+only (a registration refusal after download is reported as
+`source_registration_error`).
+
+**Whole-surface review (2026-11-08).** An independent security reviewer reviewed
+the whole M2 Hub and client surface and found no P0/P1 and one P2, fixed:
+anonymous list pages are capped at `ANONYMOUS_LIST_LIMIT = 20` (each listed image
+is normalized and projected synchronously, and the rate limiter counts requests,
+not cost).
+Accepted open P3 items: authenticated readers of another project's public or
+internal image still see `project_id`, `storage_binding` and node payload paths
+(only the anonymous projection redacts them; for Manila that exposes share ids);
+a pulled image's local catalog reference label is the publisher-chosen source
+reference; there is no unpublish/delete route, so `--confirm-public` is
+irreversible; a publish is not re-authorized after waiting for the global image
+mutex, so a key revoked while queued can still commit; image keys of a user who
+left the project count toward the active-key cap and cannot be revoked until they
+expire; image-key issuance checks `packages:*` but not `keys:issue`; anonymous pull
+over plain `http://` is allowed without warning (a man-in-the-middle could replace
+the whole self-consistent image); anonymous bandwidth and concurrency are not
+metered; image keys hold a database connection during Keystone validation; the
+global image mutex serializes publishers, admin policy changes and job completion;
+`palimpsest_api_forwarded_allow_ips` is not validated (`*` would let clients spoof
+`X-Forwarded-For`); the Hub cannot tie each SquashFS payload to its original layer
+(pullers verify the closure, Hub-side instances run the payload); the client
+opener honours `http_proxy`.
+
+**Credential-owned publication attempts and replay (publish-only keys).** Request
+ids are unique per Hub project (another user's id there returns 409) and scoped
+by user, and a key with `images:publish` but not
+`images:read` cannot read a stored `published` row back. Local generations of one
+publication intent are therefore owned by credentials: `published` rows are
+visible to every credential (each validates them against the Hub), while an
+unpublished row (`pending`, `failed`, `unknown`) belongs to the credential that
+began it, recorded in `publications.hub_credential` (the public `ppi_v1_` image-key
+id; `NULL` for every non-key credential). `Catalog.intent_publications` and
+`begin_publication` take a `credential` and only see published rows plus the
+credential's own unresolved attempts; generation numbers stay global per intent.
+A credential that cannot read replays, through the normal publication request,
+the stored Hub request id of ONE published row that its own image key recorded
+(idempotent per project and user); rows of other credentials are never replayed
+or adopted, and a non-key credential that cannot read refuses. No replay runs
+while the credential has any unresolved non-terminal attempt of its own: the
+normal publication retries it, and a first-attempt 4xx is recorded as `failed`.
+A replay never starts a generation by itself: a
+definitive refusal (403/429/...) or an uncertain failure is reported (never as
+"nothing changed") and leaves the row unchanged; HTTP 404 starts a new generation
+that inherits the stored Hub request id (`begin_publication(inherit_hub_request_id=)`,
+sent by `publish_local_image` as `hub_request_id or request_id`) so the Hub answers
+an image it already holds. By design a second Hub image can still appear after a
+credential switch during an uncertain attempt, for two image keys of one user, and
+for a publish-only key next to a read-capable credential. Pull staging
+directories are swept only when nothing inside them changed for a day. The
+`publications` DDL changed in place under catalog `user_version` 2 (unreleased): the
+exact-DDL check refuses any earlier draft catalog instead of upgrading it, so none
+may exist on a state root meant to be kept. The test `FakeHub` routes before
+recording, tracks per-(project, user) staging and applies the Hub's publish-only
+staging precheck before the request-id lookup.
+
+## M1 completion — 2026-11-07
+
+`spec.md` records M1-01…M1-28 checked and M1 completion declared at 35/108
+(M1-27 comparison receipt `M1-27-comparison-final527.json`, M1-28 gate receipt
+`M1-28-gate-application530.json`). Completion scope is the local Lima VZ arm64
+development environment (L0/L1/R1/local S1) on one host (n=1), with no security
+attestation; OpenStack shelve/unshelve for S1 is deferred to M4. Overall goal
+progress recorded in `spec.md` is 47/108 (M1 complete at 35, plus M2-01…04, 06, 07
+and 09…14) with M2 in progress. Dated M1 sections below are historical
+checkpoints at their stated source identities; where they say "open", "pending"
+or "not implemented", the M1 checklist and the Code map/Status rows for the native
+VZ OCI-root runtime record the later state.
+
+## Standard roles with exact-owner self-service — 2026-11-06 stamped source
+
+Fresh native project roles, not custom operation roles, determine thirteen
+oslo-policy actions. Reader-or-above has visible inventory/content/cache reads,
+own-key metadata and original-token `keys:revoke_own`. Member-or-above adds
+publication/cache editing and `packages:manage_own` for only its recorded
+consumer/exclusive boot volume. Manager-or-above adds project management,
+package/layer/export deletion and key issuance/full owner-bound revocation.
+Human system administration remains separately proved; project manager/admin
+does not create cross-project or other-private-creator authority.
+
+Original-token/current-owner intersections and native role-ID implications
+remain mandatory. Both self-actions are excluded from the five package-key
+actions. Private instance/native rows remain creator-bound. Cleanup rechecks
+fresh authority after final provider observations and immediately before effect;
+prepared-volume disposal preserves recorded creator/request/volume/provenance
+rather than substituting its cleanup caller. Native profile-user/project binding
+remains exact. Exact-owned unfinished-upload cancellation is write-tier rollback,
+not permission to remove committed resources.
+
+Layer deletion rejects all parent/base consumers and foreign-project grants
+without fresh system authority. `/v1/policy/capabilities` exposes `{service,
+actions}` rather than obsolete role-shaped aliases; public feature booleans stay.
+Policy/sample and source reviews cover the thirteen-action contract, including
+the user's two explicit self-service choices. Synthetic-Keystone regression was
+then executed on the existing builder:1600 tests passed (the1388 Hub/Kolla
+cases plus212 changed benchmark cases). Independent non-pytest registered
+`main:app` Uvicorn/SQLite/CAS smoke331 passed28 actual loopback checks, including
+member publication/tag update and byte readback, manager deletion/key issuance,
+own-key revoke and fresh demotion. Keystone is synthetic; production lifespan
+is off. The8GiB sparse-tar node remains skipped by the file-size cap, nonroot
+Kolla policy-readability remains untested and the system-site-enabled hub-venv
+is not a qualified locked install. No live IAM/provider/deployment/release claim.
+
+## Historical project-role authorization — 2026-11-03 superseded source snapshot
+
+Hub project authority now uses fresh exact native core member/manager/admin for
+management and reader-or-above for visible metadata/content reads. Internal
+capability labels are unchanged; default policy does not grant directly from
+legacy service grades/leaves or personal-owner metadata. Current native role-ID
+inference remains authoritative, including legitimate group/domain/custom paths;
+this change neither reconstructs memberships nor deletes native IAM data.
+Original-token/current-owner decisions intersect and policy overrides only narrow
+the mandatory role ceiling. Keys retain exact stored package/action scope.
+
+Ordinary project humans can publish/manage project packages/cache and delete
+exact-project metadata; package keys still cannot delete or administer keys.
+Legacy layer deletion additionally protects published global catalogs. Project
+build admission uses write authority; project build status uses inventory.
+Machine worker headers/leases, global catalog/system policy, private-user/project
+visibility, deferred export credentials and unknown-I/O custody are unchanged.
+Both independent token validators admit recognized human `openid` federation,
+but all reduced credential markers still veto human administrative uplift.
+Fresh enabled native home/project domains are checked independently of personal
+provenance: disabled domains deny403 and unavailable/unknown identity state fails503.
+The integrating parent's first complete Hub run found31failures (1680passed/7skipped), then final-source qualification passed1717tests/7skips; root Kolla49 and changed-source Ruff passed. The follow-up restored current enabled native home/project domains independently of personal metadata, removed obsolete raw personal provenance/flag plumbing, and corrected synthetic policy/action-withdrawal/validation fixtures without weakening guards. Canonical API/export-worker/build-worker were built for both architectures; all six execute the packaged role ceiling and57source hashes match the checkout. Registered API/worker real Redis/SQLite/CAS with synthetic Keystone passed245checks per architecture, including restart/recreation original bytes, scoped keys, revocation and current role inference. The hash-verified derived SQLite-driver image is test-only. No canonical MariaDB/lifespan, cloud/native-build, release, deployment or IAM change is claimed. Evidence: `~/.local/share/afterglow-proofs/chat-history-admin-20261103/`.
+
+## Native live-read ownership and bounded mutex contention —192–264
+
+Live native enumeration, identity resolution, preflight and refresh cooperate
+with the canonical run-name lock before authoritative mutable payload reads.
+One request-local allowance pays for at most five seconds of actual contended
+run/custody acquisition across the pass; normal provider/file work does not
+consume it. This is not a five-second total request deadline. Every acquired
+directory/lock binding and existing config, expiry, actor, HOLD and session
+guard remains enforced. Internal offline ps/catalog/inspect do not initialize
+missing roots or rewrite legacy metadata.
+
+Within one process, simultaneous selected-root native reads can join only an
+ongoing reconciliation registered before mutable ledger/name-lock waits. Three
+root descriptors pin the sharing key; deeply frozen private snapshots never
+become public DTO authority. Each joiner pays its own remaining wait allowance
+and compares the full current run/state generation under fresh host/custody
+checks before any observer publication. Completed flights are immediately
+removed. There is no TTL, recent-result cache, cross-process sharing or provider/
+metadata retry. Leader cancellation is not re-raised into unrelated waiters.
+Legacy observations remain independent; failed native joins retain only safe
+stale discovery. A concurrent directory-membership change can still invalidate
+native sharing as runtime-failure; it is not evidence of malicious identity.
+
+VM metrics start independently every five seconds, join one in-flight promise
+without queuing, and retain the source/run/boot/counter/15-second guards. Hidden
+VM logs are not automatically reread outside Logs. Lifecycle/mutation handlers
+capture and await already-started client observations before eligibility checks;
+client abort is not server drain. Console use does not pause normal sampling.
+
+`RuntimeBusyError` distinguishes a pure failed mutex acquisition from an
+uncertain actor/resource HOLD. `RunLockTimeoutError` retains the narrower
+named-lock identity: only it permits enumeration's first strict private
+degraded read. A busy observation projects stale `runtime-busy`, issues no
+capability report and supplies no fresh observer, alias or transport/lifecycle
+grant. Native home identity is independent of alias eligibility, so fresh
+removed history keeps retained logs despite an unrelated ambient Lima home.
+Same-home and unproved identity collisions remain refused.
+
+Native logs resolve fresh locked authority, refresh and pin in separate lock
+windows. A non-authoritative routing hint preserves legacy boot-console reads;
+the legacy reader independently requires complete immutable record equality.
+Admitted native followers keep only their original pinned FD while a typed
+run/namespace mutex is busy, with a new bounded allowance per EOF observation.
+Initial admission and snapshots remain fail-closed; identity, console, actor
+HOLD and uncertain provider failures terminate rather than being replayed.
+No mutex crosses a refresh callback, yielded event or polling sleep.
+
+Native creation/source acquisition keep preflight and source guards under
+namespace custody, but try each needed run-name lock once: a busy reservation
+creates no run and busy committed-deletion cleanup waits for a later ordinary
+cleanup. Ordinary caller defaults remain unchanged. The existing registry
+initialization flock is still blocking. Guest exec timeout is solely its guest
+execution duration; host status actors keep their independent 40-second bound.
+
+Source247's expanded19-file lane passed1792/92.52s. Source248's seven changed
+nodes passed1079/21.74s and its final19-file lane passed1823/93.56s. Both
+independent source re-reviews closed findings; scoped lint/format pass.
+Those source/component results preceded immutable SDK153 capture/build249 and
+actual private host/guest install250. Public n11 CLI254 proves physicalRunning
+with mainExited7 and guest-only timeout, but single visible-tab Resources and
+first-console acceptance257 FAILED: own automatic reads caused busy and rate
+gaps. As of source264, Source154 in-flight-only reconciliation and independent
+client sampling were under correction/review, not built or live-qualified. SDK152 failures216/219
+and SDK153 failure257 remain failing evidence, not relabeled successes.
+
+Final264 changed-node reconciliation/inventory694 passed19.24s; all19 affected
+files1861 passed94.11s (`artifact://9921`). Scoped Ruff, JavaScript syntax and
+four real-handler run-form consumer cases passed, including a metrics handle
+dropped by inventory before an admitted sample settles. The first integrated
+lane1857passed/3failed because its partial JS harness omitted the new production
+helper; the harness now executes that helper, not a mock. New dataclass field
+import shadowing was corrected without renaming unrelated collection fields.
+Independent core and client source reviews closed all findings. Immutable154
+and the required real single-tab acceptance remain unexecuted at this point.
+
+Installed SDK151/152 source-share, catalog, dual-CLI and browser detach/shutdown
+proofs179/181/200/201/203/234/238 remain valid at their exact source identities.
+SDK152 with fresh profile246 also proved default prod restart, main normal/
+crash/bounded-cgroup OOM recovery and explicit-stop priority in n10. The 256MiB
+main limit was an experiment control, not a new product default or host/kernel
+fault guarantee. n07–n10 and their exclusive disks were normally removed, lease
+authorities retired and shared/source bytes reverified. Needed builder and new
+n11 reproducer/original-source control remain Running;14/28 creates are spent.
+Packer plugin/template preparation was then (source264) not an executed bake or
+benchmark; M1-27 later executed the comparison.
+
+## Native physical liveness and dashboard completion protocols —143–156
+
+Managed native inventory now separates physical `status` from canonical
+`runtime_status`. Fresh pinned reconciliation validates full run/plan/instance,
+main state, home identity and no HOLD before supplying the physical baseline.
+Ambient tools or a foreign Lima home cannot revoke that authority. Supplementary
+aliases merge only under the same home device/inode and full native identity;
+they cannot upgrade pinned stopped state or lend SSH/guest/publication fields.
+Same-home collisions still revoke eligibility. Transport custody remains final.
+
+Dashboard OCI exec keeps one retained non-daemon worker through foreground
+detach, actual drain/cleanup and registry shutdown waiting. Canonical dispatch
+selects explicit native process-only completion versus default strict KVM ACK
+completion. Native never invents/counts an ACK; missing or throwing required
+observations count unconfirmed but always remove/notify the registry entry.
+The direct-native-return proposal was withdrawn because timeout/disconnect would
+cancel the process and leave cleanup to a daemon; receipt155b is not this fix.
+
+Actual child-process counterexample154 showed exit0 plus a completion-property
+error and a stuck active entry. Real stdin-gated child regressions now cover
+timeout/drawer detach, retained non-daemon cleanup, shutdown waiting and strict
+protocol selection. Independent reviews146 found no surviving production defect;
+the requested Access-level native0/KVM1 accounting controls passed in101 focused
+tests/2.70s. Final expanded nine-file host/UI/ACK lane passed1178/76.92s,
+with Ruff check and six scoped formatting checks passing. These are component/
+host results, not a new NativeProcessSession/provider settlement or live
+dashboard VM proof.
+
+Existing Packer1.15.1 and host Buildx0.38.1 were qualified without installation.
+A real private host Buildx remote connection reached owned guest BuildKit0.34.1
+through strict pinned SSH Unix forwarding149; private client entry, forward and
+transient guest unit were fully settled150. No build/benchmark or Docker Desktop
+use followed. Offline guest wheel preparation and a separately scoped host
+private-prefix installation decision precede the next native consumer.
+
+## Native lifecycle and generic-host custody cutover —127–133
+
+Ordinary stop settlement now binds persisted authenticated quiescence to its
+original run/plan/start-attempt/HOLD marker, preserves verified-before-unlink
+recovery, and performs complete stopped/actor/socket/upper observation after the
+final source/resource reload. The loader cannot ignore its own contrary provider
+read. Unknown/unfinished journals cannot disappear on start. Port admission
+precedes start mutation and typed known pre-effect rejection does not create
+false uncertainty. Clean natural dev exits can reconcile exact provider Stopped
+before a retained-upper boot. These changes grant no force or stop replay.
+
+Observed native or ambiguous Lima rows no longer inherit generic cloud-image
+force-delete or guest/detail transport. Classification reserves native naming/
+boot evidence without asserting ownership, while actual host-control and generic
+transport rechecks independently fence stale rows. Managed native exec uses
+canonical runtime dispatch and pinned main logs, not `limactl shell` into a
+platform root. Genuine managed cloud-image fingerprints/ledger authority remain
+usable even for reserved-looking names. OCI network identity now comes only from
+owner-bound ledgers, never an observed same-UUID provider alias.
+
+Durable discovery accepts legitimate no-plan reservation metadata but rejects
+malformed planless/self-hashed contracts. Native image links are bound through
+pure canonical descriptors, CAS membership and the existing snapshot digest,
+qualification/top-level fields and committed plan; no source blobs are reopened
+or decompressed on catalog refresh. Metadata is not lifecycle/payload authority.
+
+The approved trusted host lane passed903 tests in15.72s after final review
+corrections. Its first run had902pass/1fail because the new accepted-plan control
+accidentally lacked canonical v2 ledger identity; accepted/malformed fixtures
+were corrected without weakening production. Native re-review131, host/access132
+and metadata132 now report no remaining assigned findings. The vacuous source-link
+delete check was replaced with a concrete content-store artifact: eligible before,
+protected after each invalid link. Static lint and ten scoped format checks pass;
+unrelated runtime-dispatch formatting debt was not restyled. Subsequent immutable
+host134 actually settled n06, proved cold boot/provider absence and persistent
+files/packages135, and resumed directly from canonical exited after observed
+natural dev shutdown136/138. Normal final stop/RM140 and complete absence/shared
+preservation142 closed that consumer; only the necessary builder remains.
+Canonical main logs and generic-provider denial139 work, but main-exited versus
+running native-platform status currently disables metrics; that liveness view
+is the next source correction. Native VZ network-detail projection remains
+unsupported by the KVM-only status helper and is not claimed.
+
+## Actual native VZ root, access and durable development state —105–125
+
+Frozen source100 (guardc90a4544…/634files, archive3cf6d4a7…/746files,
+package3f939968…) with platform142ed75e…/assetsc2756163… and profile1179ac2f…
+launched n06 `166584d3-c98d-4795-8fbf-f066294fa512`. Authenticated and user-observed
+OverlayFS `/` is29:2 and matches PID1's root. Five source-bound readonly loop
+lowers preserve their ordinals; OverlayFS precedence is004→000, with upper/work on
+the dedicated4f0fa194… root volume. An actual lower write returned EROFS.
+
+Real public CLI exec, CLI console PTY and an independent pinned OpenSSH PTY ran
+the embedded original C program, producing its expected41-byte stdout/15-byte
+report. Console starts at `/`; explicitly select the image workdir. Receipt114's
+incorrect success field was withdrawn by correction115; only the fail-fast
+console115 and directSSH116 qualify. No implicit host project share was present.
+An explicit opt-in source share and separate-consumer upper isolation remain
+unqualified; do not extrapolate from the successful default.
+
+Source edits and a newly compiled binary, three access-path work files, and a
+real offline dpkg package survived actual Running→stop→start118. Five file hashes
+and four package/version/status records matched before and after. This is retained
+disk state, not RAM or process checkpointing. Guest os-release bytes match the
+qualified original layer digest87458b3b…; the exact supported tuple remains
+ubuntu24.04/linux-arm64/lima-vz/direct-linux.182 qualification tests passed.
+Private plmctl1000, real privileged sudo, wrong-key rejection and normal inetd
+reaping were independently exercised in the real Linux component102.
+
+This does not complete native lifecycle acceptance: dev idle shutdown left a
+stale canonical exited state that public start109 rejected. Later cleanup stop120
+passed authenticated quiescence/poweroff but entered stop-incomplete HOLD on an
+intermediate provider state. Read-only observation122 then saw exact Stopped and
+no hostagent/driver PIDs. No RM, signal, force, stop replay or manual marker
+mutation followed. Successor lifecycle edits require review/checks before
+observation-only settlement and ordinary deletion; no next native case while held.
+
+Catalog119 persisted n06's image/binding/five ordered lower links but no build or
+tag in this selected root. Diagnosis124 initially called the partial warning valid;
+correction125 withdraws that conclusion: an unprepared failed reservation without
+a committed native plan was incorrectly rejected by the VZ discovery projection.
+Missing/null plan is discovery absence, not provider absence or lifecycle
+authority. Non-null malformed plans must remain fail-visible. Never fabricate
+build31/34 provenance from matching manifest bytes.
+
+Historical checkpoint (source125): the Canonical Goal then recorded23/108, next
+incomplete M1-08. Packer's cold, reuse and source-change comparison was then a
+measurement requirement; M1-27 later executed it and M1-28 applied the M1 gate
+(see "M1 completion — 2026-11-07").
+
+## Returned-stop reconciliation and qualified SSH bootstrap —97/98/99
+
+The supported Lima2.2.1 default network starts an in-process gvisor under the
+instance directory and names its sockets `default_ep.sock`/`default_fd.sock`.
+Normal stop may leave these inactive filesystem entries. A returned ordinary
+stop may be reconciled by observation only: no second stop, signal, manual
+endpoint unlink, VM adoption or start. Require the original actor/related
+processes absent, authoritative Stopped/zero provider PIDs, exact unconfigured
+network/namespace, full input/upper/port/directory/deadline authority and no signal
+history. Only the owned single-link0755 socket pair qualifies; both STREAM and
+DGRAM must return ECONNREFUSED. Initial mtime/ctime/birthtime must lie inside the
+original start→before-stop lifetime.
+
+Persist these as **current-after-normal-stop** pins, never fabricated pre-stop
+inode observations. Later checks may record stronger absence but reject changed
+or reappeared leaves. Recheck every leaf/directory and full process inventory
+before settlement and ordinary deletion. Unknown/active endpoints and configured/
+shared networks hold. Ordinary provider deletion removes its own directory;
+resource absence precedes root/export/lease release and HOLD removal. The separate
+SIGKILL-only original ha/vz metadata exception is unchanged.
+
+The inetd argv matches the selected static Dropbear build: omit `-E` and `-s`
+because syslog/password/PAM/plugin support is compiled out. Builder and loader
+now independently qualify actual archived bytes against the reviewed506576byte
+Dropbear digest7ecd073d… rather than trusting version strings or manifest claims.
+Alternate same-version builds fail closed. ABI2/manifest schema stay unchanged.
+
+117focused lifecycle/asset cases and Ruff passed. An actual otherwise valid
+self-consistent bundle with one changed ELF-comment byte was accepted by frozen94
+and rejected by the new public loader; the qualified original still reopens and
+the temporary forgery was removed. Tests do not pin incidental exception wording.
+Reviewed source100 has now settled the original returned stop by observation and
+completed one ordinary n05 RM. Fresh proof101 confirms actor/provider/exclusive
+root/ref/projection/HOLD absence, retired leases, unchanged5shared layers/source
+and only the necessary builder. No second Lima stop, signal or manual endpoint
+unlink. Usable native root/SSH remained unverified as of source101 (later live n06
+root/SSH: 105–125). Prepared real SSH/jail/SUID
+component code requires private network/PID namespaces and explicit SYS_PTRACE
+for genuine procfs credential checks, not weakened guards or ptrace attachment.
+Actual option probe101 rejects-E but accepts-s; the latter is omitted as redundant
+under the exact password-disabled profile, not claimed unsupported.
+
+## Native readonly file injection and private worker diagnostics — source90/92
+
+The actual n04 serial trace identified `MS_BIND|MS_REMOUNT|MS_RDONLY|MS_NOSUID|
+MS_NODEV` failing with EINVAL through the pre-bind `/proc/self/fd/3`. That FD still
+names the covered inode/mount, not the newly attached bind mount. Readonly binds
+now clone a source-pinned detached mount with `open_tree`, add readonly/nosuid/
+nodev through `mount_setattr` without clearing inherited restrictions, and attach
+directly to the validated target FD with `move_mount`. No pathname reopen,
+writable attachment window, compatibility fallback or ABI change is introduced.
+Writable binds and the separate deliberate private-jail setuid self-remount stay
+unchanged. Injection provenance continues to describe the covered target inode.
+
+Worker HOLDs expose bounded, explicitly private child diagnostics separately from
+public exception messages: at most64KiB stderr tail, observed byte count/EOF,
+truncation and observed returncode. Drain immediately available stderr before
+reporting premature stdout EOF; preserve the existing1MiB total cap, active marker,
+retained actor/locks and no-replay/no-signal behavior. Isolated root import checks
+require explicit `-B` with `-I`; the latter ignores PYTHONDONTWRITEBYTECODE. Strict
+bytecode ownership rejection is not relaxed.
+
+The production C compiled and passed an actual Linux6.8 private-namespace smoke:
+legacy EINVAL22, fixed pinned file/directory binds, readonly root-write EROFS30,
+inherited noexec/nosuid/nodev, writable source and alias, symlink rejection,
+covered-inode provenance, FD closure and independent jail flags. This is not
+usable VZ root/SSH proof. Original fixture91's exclusive-create/overwrite mistake
+is preserved; corrected fixture92 passes against unchanged production source.
+Five new real-child diagnostic cases pass on Darwin; the broader existing
+protocol run terminated with SIGSYS140 after21dots and is not claimed green.
+The complete206-case file then passed on actual isolated Linux in3.04s. A
+separate production-C sysfs bind smoke94 also passed with readonly/nosuid/nodev/
+noexec intact. Final followup changes only test formatting, replaces a bare
+serialization check with actual JSON-roundtripped evidence assertions and
+removes incidental message/copy pins; runtime package/platform bytes are unchanged.
+
+Actual n04 normal stop and one SIGTERM did not settle its actor. Its separately
+approved single SIGKILL/stale cleanup and ordinary RM settled; fresh receipt90
+proves provider/exclusive-root/projection/ref/HOLD/actor and six lease authorities
+absent, five shared layers and original OCI unchanged. Fresh nonce-bound worker
+observation91 held host/guest locks simultaneously, classified stable Lima
+baseline/query processes and found no worker/preparation actor, staging or cache.
+It does not retroactively validate earlier manual marker deletion/replays or
+retrospective create accounting. Renewal74 limits and5/12spent creates remain.
+
+## Offline renewed builder and mount diagnosis — source81/82/83
+
+After complete n03 cleanup, renewal74's successor controller preserves original
+grant timestamps/counters and requires effective expiry, original builder inode,
+isolated HOME/LIMA_HOME/cache, pinned tools, retired old run authority and resource
+bounds. Shared content-addressed projection paths may be freshly published for a
+new accounted owner; an old run reference or lease may not reappear. No custody
+list, timer clock or old quota allowance is reset by loading this fence.
+
+The necessary builder resumed normally. A new transient expiry timer targets
+2026-11-05T22:05:10Z. A separate guest-owned offline nft table allows local/SSH/DHCP
+and drops other traffic; the original quota was absent on resume and was not
+recreated/refunded. A reserved-address TCP probe increased its actual drop
+counter. Startup traffic before that guard was not wire-metered.
+
+Fresh source81 C64 diagnostic platform and immutable asset manifest282ad0a5…
+compiled/assembled offline, then strictly reopened on Darwin. The original5lower
+payloads and a new32MiB ext4 upper completed OverlayFS plus every early MS_MOVE
+in an isolated child namespace. Builder PID1 root, modprobe path and ptrace policy
+were unchanged; own loops and fixtures were removed. This does not qualify VZ
+PID1 or reproduce n03's generic mount failure. Later init_main mounts remain
+possible failure sites as well. No speculative mount fix was applied.
+
+New worker82 and host82 profiles bind source81/package2a4b8fd6… and asset81, with
+read-only native preflight for proposed case5/n04. No new VM was admitted.
+The standalone asset-builder CLI now correctly documents platform ABI2; its help
+path was exercised. This wording correction changes no runtime/package behavior.
+The standalone script keeps checkout-path setup before first-party imports,
+now inside main rather than late module imports. This resolves its existing
+E402 lint failure without suppressing diagnostics or breaking offline invocation.
+Cleanup regressions retain exception-class/state/resource invariants, not
+incidental diagnostic wording constraints.
+
+## Source80 exact forced-cleanup exception
+
+Owner amendment79 permits one SIGKILL for the original n03 actor after normal
+stop75 and one SIGTERM78 failed, followed only by exact stale-instance metadata
+and exclusive proof-resource cleanup after actual absence. It is not a standing
+fallback or a new allocation grant. Scope uses `signal_request=None|SIGTERM|SIGKILL`
+with exact enum typing and STOP-only signals; the earlier private boolean/helper
+is replaced at every current caller, not retained as a compatibility alias.
+
+Forced delivery has its own durable `forced_termination` attempt/sent/settled
+record and requires the original SIGTERM record to remain sent. Before delivery,
+capture and compare original stable ha.pid/vz.pid/ha.sock identities. After true
+actor/related-process absence, only those same owned single-link PID files with
+the original PID, or the same socket with a refused connection, may be removed.
+Unknown names, permission/probe errors, replaced endpoints and active sockets
+remain HOLD. Each unlink revalidates full original authorities, the fresh
+complete process inventory, visible and retained directory identities, leaf pin
+and both deadlines. Durable per-file intent/progress plus fsync prevent replay.
+
+Strict endpoint/provider absence and resource revalidation still precede forced
+settlement and ordinary conditional RM. The normal-stop and SIGTERM failures
+are preserved. Source review closed directory-exchange, late-actor and slow-read
+deadline gaps; component tests and real owned-child IO/signal evidence are not
+qualification of n03 itself. Same-UID numeric-PID/stat-unlink races are not claimed
+atomic. No shared layer, foreign VM, builder or host installation is authorized.
+
+Actual n03 source80 shutdown/removal then settled under amendment79. Fresh
+provider/root/projection/reference/HOLD/actor absence, retired lease-group5members,
+full5artifact readback and unchanged original-source requalification are recorded
+in the final absence receipt. Only the necessary builder remains Stopped; original
+stop/TERM failures remain recorded and no attempt/download budget was refunded.
+This qualifies exact cleanup only, not native-root/SSH behavior or standing force.
+
+## Source77 explicit one-shot failed-stop termination
+
+Normal STOP never grants a signal fallback. A parent-only failed-start scope
+must separately opt into one SIGTERM and must be a STOP scope with its own live
+deadline. The canonical original failed ordinary-stop marker, actor and attempt
+must match; any previous termination or delete intent blocks a new signal.
+Full original input/network/root/custody and positive actor checks precede a
+durable termination intent and another identity/deadline check before SIGTERM.
+
+Delivery is not settlement. The canonical path requires concrete actor, related
+process and endpoint absence, provider Stopped and full retained resource checks
+before marking termination settled. It preserves the failed ordinary-stop
+history, and RM accepts that separately settled shutdown only with fresh absence.
+Partial writes, process reuse, expired scope or remaining endpoints retain HOLD.
+As of source77 there was no SIGKILL (source80 above later added one exact
+owner-approved SIGKILL exception), extra signal, normal-stop replay, manual state adoption or
+new-consumer permission. Darwin's check-then-signal cannot eliminate concurrent
+same-UID PID reuse; immediate identity checks do not constitute a pidfd guarantee.
+
+The owner selected a single SIGTERM in amendment76, but its fixed cleanup window
+had expired before the response arrived. No signal was sent under that receipt.
+Successor78 supplied that response-relative window. Actual SIGTERM delivery did
+not settle the original actor within15seconds: termination=sent, stop=attempted
+and original HOLD remain. There was no replay, force, delete or new consumer.
+This real failed proof is separate from the357passing component contracts.
+Upstream2.2.1 pre-signal SSH-setup channel ordering can explain the persistence;
+the unsymbolized native sample does not prove that live Go location.
+
+## M1 renewal74 / source75 process-inventory correction
+
+The owner renewed the existing M1 local bounds; receipts preserve the old grants
+and cumulative four create attempts rather than refunding them. Exact n03
+normal-stop/conditional-delete qualification remains separate from boot authority.
+The first renewed preflight stopped before any effect because a live same-UID
+process had no observable executable vnode path (`proc_pidpath` ENOENT).
+An owned compiled child reproduced this condition after unlink, with stable
+kernel metadata and complete argv; this does not establish PID1081's cause.
+
+Inventory retains such a process with `executable=None`, never as absence or as
+an inferred executable name. Exact actor reads still reject it. All metadata and
+argv observations remain mandatory, bounded and double-read; other path errors
+remain fatal. Native custody classifies every inventory entry by transitive
+parentage, process group and instance/directory argv before an operation.
+Unknown-executable related actors still block positive custody or absence.
+The extracted pure classifier preserves that predicate for direct regression
+coverage. No fallback to argv[0], procargs executable prefix or filesystem name
+is introduced. This does not remove the existing concurrent-exec/snapshot limit.
+
+Actual repaired preflight75 passed before one canonical normal-stop attempt.
+The CLI returned nonzero; original PID24719 and provider Running remain, with
+durable cleanup.stop=attempted and original launch HOLD. No retry, extra signal,
+delete or new consumer followed. Component tests338passed and source-only review
+do not authorize a fallback or prove native OverlayFS root/SSH.
+
+## Source64 actual early-kernel boundary — n03 held, no actual-root success
+
+Owner successor66 separately permits n03 normal-stop/conditional-delete
+reconciliation and bounded CPU continuation; original records/counters remain.
+The builder stopped at its original timer and remains stopped, with no quota
+reset/resume or new consumer. The current exact scope uses the cleanup deadline,
+not the longer CPU deadline, and cannot restore boot/adoption authority.
+
+`darwin_process.py` reads real same-UID PID birth/UID/parent/group/executable/argv
+through libproc/sysctl, double-checking identity. Kernel ESRCH alone is absence;
+permission, partial data and unstable reads are errors. Environment data is
+never returned/copied as strings, argv is excluded from repr, and unrelated
+argument tables are not logged. Native recovery consumes this real observer,
+not an injected permission witness. It requires exact original launch provenance,
+full retained authorities, no related processes/autostart, closed default network
+semantics and no actionable daemon/global PID paths, plus exact owned upper link.
+Unknown filesystem errors are not absence. Durable single-attempt fences and
+no-timeout-signal policy retain HOLD on uncertainty; deletion follows actual
+actor/endpoint/provider absence and releases authority before HOLD removal last.
+
+Actual source69 actor/network/root observation passed, but full admission still
+fails: n03's carrier SHA and other seven historical stamp fields match, ctime
+differs. No stop/signal/delete was attempted. Clone/qemu and canonical Python
+failure/unwind components did not reproduce the writer. Historical continuity
+is not current-read stability; neither case49 approval nor successor66 waives
+this known prerequisite. Thirteen real/error-boundary process regressions and
+472 affected portable contracts passed; an explicit n03 action-specific owner
+amendment is required before any ctime exception.
+
+
+Fresh source63 n03 reached Linux6.8.0-147 `/init`, the exact ext4 UUID and five
+SquashFS loop mounts, then a generic mount EINVAL and normal PID1 poweroff at
+0.25s. OverlayFS null-UUID warning occurs before mount completion in the pinned
+kernel; it does not distinguish the overlay mount from subsequent move calls.
+Actual image-root transition, privileged roles, SSH and handoff remained unproven
+as of source63/64 (later live n06 evidence: 105–125).
+
+The guest stopped, but its exact hostagent24719 remains and the provider reports
+Running. Its upper's in_use_by points to that same instance. Never classify this
+as failed-prestart or transfer case49's approval. Ordinary Lima delete can kill
+live actor PIDs/unlock disks; stop/delete also reconcile configured global
+networks. Current read-only executable/global PID/named-usernet path absences do
+not authorize effects or remove the need for fresh predicates.
+
+Source64 C `5be7534e…` adds only failure-time mount source/target/fs/flags/saved
+errno diagnostics, not options, retries or a speculative transition fix. Parent
+static musl compile and a real nonprivileged failing mount probe passed with
+matching errno2 and existing exit125; no init/root_transition/global sysctl ran.
+Independent source review found no issue. Asset44/actual n03 still used C44;
+no replacement asset bundle or later native run is claimed. Exact started-case
+normal-stop/conditional-delete reconciliation and further CPU execution windows
+require their own owner decision; original expiries and attempts4/12 stand.
+
+
+## M1 VZ implementation — source61 component checkpoint (historical; native boot was then blocked)
+
+`vz_native_runtime.py` is the distinct typed Darwin/ARM64 OCI-root adapter.
+It reuses canonical source qualification, ordered materialization/leases,
+root-volume ownership and private lower-export authority; worker outputs do not
+import a guest store identity into host authority. Existing KVM routing remains
+separate. Current platform ABI is `palimpsest.vz-platform.v2`.
+
+Lima2.2.1 rejects a root/UID0 bootstrap account. The selected implementation uses
+real `plmctl` UID/GID1000 in its private dependency root, a separately guarded
+privileged helper/control class, and original OCI User/account lookup for main
+and structured exec. User administrative SSH/console must enter PID1's actual
+image root. Guest root/SUID/SSH authentication was not yet live-verified at
+source61; later live n06 root, exec, console and SSH are recorded above (105–125).
+
+Actual CLI `create` invokes `Prepare`: it already produces raw primary, kernel,
+initrd and command-line files without starting the VM. After the same successful
+new create, the adapter admits only exact owned outputs and compares the raw
+primary to the pinned carrier. Kernel/initrd are0400, command line0644; provider
+primary0600/0644 is recorded and must remain unchanged, without changing the
+private upper policy. Producer Lima CLI and read-only comparison qemu pins are
+distinct. Resume never repairs/regenerates boot files or adopts a failed create.
+CIDATA/stock-agent reservation precedes effects and all attachments share32GiB.
+Provider config dictionaries stay in private pinned files, not secret-shaped
+ledger keys. Actor journals fence every custody path; failed-prestart cleanup
+requires exact ownership, never-started/Stopped state, no uncertain session/actor,
+one ordinary deletion, fresh absence before storage release and HOLD removal last.
+
+Observed components: static ARM C44 compiled and actual session/JSON probes
+passed; asset44 assembled on Linux and strict-loaded on Darwin; worker45 replayed
+all five original layers and prepared a new ext4/host key. Source51 affected
+portable checks passed751/15skipped; after the new asset test's missing lane
+classification was repaired, final source61 selection passed894/15skipped in
+77.97s. Isolated filesystem/flock and orphan-actor probes passed. These are
+not native root/access proof. Case49 created one Stopped, never-started provider
+then failed the obsolete boot-file recreation assumption. Canonical cleanup51
+subsequently stopped before deletion on a carrier full-stamp mismatch: digest,
+inode/owner/mode/link count/size/mtime match, ctime differs. Isolated clone, unlink
+and full image/qemu experiments did not reproduce that drift. Cause is unproven.
+Runtime continuity remains strict. Owner-approved source62 permits only qualified
+failed-prestart destruction to compare digest and all seven non-ctime original
+stamp fields while preserving full current-read stability and the original pin.
+Only original launch-incomplete marker with launch-incomplete/retained-authority-
+changed ledger qualifies; every other authority/actor/root/absence guard remains.
+This is not permission to boot/adopt or a benign-history claim. Current source
+is uncommitted; no publication/deployment/host installation is claimed.
+
+
+## M1 platform/image separation — M1-15 design checkpoint
+
+The [platform contract](openspec/specs/vz-native-root/spec.md#m1-15-selected-platform-component-boundary)
+selects a new static POSIX-C ARM64 init/supervisor/session component, pinned
+BusyBox/Dropbear and separately pinned Lima guestagent. It reuses canonical
+process/root/ownership/control contracts, not the x86 raw-syscall/ELF or its
+sandbox claim. PID1 transitions into the original ordered OCI root. A private
+platform account/shell/key control root is dependency isolation only; user
+SSH/console must enter and verify PID1's actual root, while structured exec
+retains canonical workload-root argv/env/User/cwd/StopSignal/account resolution.
+
+Pre-start per-VM host-key binding/private known-hosts and distinct trusted key
+classes separate host control from user activity. No image account/shell/library
+overwrite, inherited daemon secrets or borrowed host SSH keys. The actual
+Lima2.2.1 DHCP/TCP22 prerequisite requires a genuine authenticated bootstrap;
+strict verified vsock handoff closes TCP22 before main admission. The initial
+direct-vsock-to-Dropbear design had a P2: stock musl `-i` performs IP address
+lookup. The corrected design selects a bounded per-connection AF_INET loopback
+connected-pair/opaque relay, no permanent alternate port, no crypto patch or
+fabricated peer address. Both final independent task design slices closed.
+
+The Ubuntu24 injection map records exact private mounts, root-confined symlink
+handling and generated placeholders; mandatory capture is consistent-copy-only.
+It does not blanket-delete user `/etc`, `/root`, network config, package DBs or
+`/tmp`. Private state/RAM/growth/peak copies stay within the resource envelope;
+disk siblings are accounting breakdowns, not duplicate raw-disk charges.
+Capture, session/restart behavior and genuine readiness remain live gates.
+
+Actual builder component evidence proves ARM static BusyBox/Lima-agent bytes,
+required applets/ash features and the observed6.8.0-147 kernel config. Approved
+guest-only35-package50.5MB download plus offline install prepared GCC13.3/
+musl1.2.4/qemu8.2.2; dpkg audit was clean and restarts deferred. Exact upstream
+Dropbear2026.94 source `e098034a…` was acquired from its listed public mirror
+after primary403, then offline-built to506576byte static ARM64 `7ecd073d…`;
+actual version passed. This is an asset component, not SSH authentication,
+the first-party helper, custom initramfs, native root or VM proof. No host
+package/service install, key generation, new VM or public release occurred.
+
+## M1 VZ transport and upper binding — M1-14 design checkpoint
+
+The selected [transport/upper contract](openspec/specs/vz-native-root/spec.md#m1-14-selected-transport-and-custody-design)
+binds Lima2.2.1 source commit `27bc4c4b…`, effective host/guest paths and read-only
+virtiofs. The guest tag is the selected source's hash of both resolved paths,
+not `mount0` or a host path. Plain mode removes mounts; Rosetta sharing must be
+explicitly disabled along with all unapproved implicit/explicit shares.
+
+Canonical source/store validation and ordered durable leases precede runtime
+preparation. An allowlisted same-chain shared export projection is only a
+transport view; no worker DB/receipt/store/lease identity is copied into host
+authority. Path custody lasts across attachment and stopped resume. Existing
+KVM QEMU-DAC boot/lower export receipts retain their guards and are not VZ
+receipts. Guest RO enforcement is not malicious-host protection or attestation.
+
+Private upper storage uses canonical run/root-volume ownership and Lima named-
+disk physical operations, not disposable treatment of user data volumes.
+Preformat an authorized new owned raw ext4 file offline, set `format:false`
+from first start and bind host inode/attachment plus unique guest UUID and a
+prelaid run/root-plan/chain nonce. Initialize once; uncertain/partial/replaced
+state fails closed. Resume never formats or clears populated upper/work.
+All attached disks/images count toward the VM bound, including cidata/installer;
+physical copies/temporaries/platform assets count separately.
+
+Before every create/first start/resume, revalidate retained projection directory
+identity/completed publication, exact file allowlist/identities/hashes/sizes,
+ordered leases and run references. Lima can auto-create a missing share path;
+unchanged YAML/tag or later guest hashing is insufficient. Missing/recreated/
+replaced/incomplete projection and unknown cleanup block resume before effects,
+without rebuilding/adopting authority. Before first start/resume also recheck
+effective/persisted upper disk name and `format:false`, not post-boot sealing.
+
+Actual installed `validate --fill` preserved the distinct paths/read-only
+setting, removed mounts for plain mode and resolved explicit Rosetta-off values.
+Five actual verified payloads totaling35491840bytes supplied schema input data;
+the resulting path-specific tag was `lima-4f213fc473c0c7df`. Two disclosed
+independent task design audits initially accepted the draft; a follow-up P2
+missing-projection resume gate reopened that checkpoint. The explicit pre-effect
+contract above closed it in snapshot8943 with no remaining assigned P1/P2 blocker.
+Receipts `M1-14-{installed-transport-schema-validation,
+resolved-transport-binding,explicit-rosetta-off-schema}.json` are source/config
+evidence only. No VM was created or booted. Native boot assets, early guest
+mount/write denial, actual root, upper mapping/resume and access remain gates.
+
+## M1 installed command names — source34 component
+
+`pyproject.toml` installs `palimpsest` and `plm` as the same
+`palimpsest_local.cli:main`, not separate dispatchers. Help retains the canonical
+program name. `scripts/build_package.py` actually installs the built wheel into
+private venv/tool prefixes and runs both commands. The former mocked-command
+echo test was removed rather than repinned.
+
+Source34 `b82231b4…` built the canonical sdist→wheel offline and installed two
+executables. Wheel `4f6d0816…` loaded both entrypoints from its own site-packages;
+both real commands built the C/source fixture to manifest `74ba65eb…`, read the
+same persisted two-build frame and returned the same empty status table.
+Focused packaging/CLI/reference/completion contracts passed298/4skips; Ruff
+check/format passed. This is an unpublished candidate, not release identity.
+Actual VZ run/exec through both commands was then M1-13's open acceptance; M1-13
+is now checked in `spec.md`.
+
+## M1 local relational catalog — source31 component (historical; VZ linkage then pending, M1-12 now checked)
+
+The [catalog contract](openspec/specs/vz-native-root/spec.md#requirement-one-local-relational-catalog-behind-state-and-inventory)
+uses standard-library SQLite at the selected state's private
+`catalog-v1/metadata.sqlite3`. `StatePaths.catalog`/`metadata_db` select the path;
+`local_catalog.py` owns the engine and shared pure row admission; existing
+`inventory.py` APIs collect/query for both CLI and web. This implements the
+metadata component, not the then-outstanding M1-12 actual VZ run linkage (M1-12
+is now checked in `spec.md`).
+
+| Existing boundary | Preserved authority / catalog role |
+|---|---|
+| `build.create_build_record`, `_finalize_build_output`, `buildkit.build_with_buildkit` | JSON progress/logs and independently committed output facts; relational discovery keeps known base/parents and does not invent ordinary OCI/cloud ancestry |
+| `state.write_tag_record`, retained package/source readers | Verified tag/reference binding; build output labels remain provenance, never inferred durable aliases |
+| `SourceCAS`, hard materializer, `OCIStore` | Original graph/bytes and contiguous ordered receipt authority; DB stores separate repeated occurrences and distinguishes source-only/partial/complete conversion |
+| `state.read_run_dispatch_record`, `runtime_dispatch.ps`, `inventory.list_vms(live=False)` | Owner UUID/backend/revision-bound ledger observations; DB name/project joins cannot confer ownership or live status |
+| `inventory.remove_artifact`, retained-instance/lease guards | Actual deletion/retention safety checks remain outside the discovery DB |
+| `inventory.move_state_root`, source-only initialization | Selected root only; no implicit quarantine cleanup/config creation or live backend probes during metadata refresh |
+
+The catalog owns local discovery registrations and a transactional read model,
+not a second payload/security authority. Existing collectors are reused for
+snapshot refresh; absent-state reads stay absent. Metadata-cache writes are
+explicitly distinguished from runtime-read-only behavior. Run identity is UUID,
+not reusable name. Image rows reference config descriptors rather than duplicate
+potentially secret process environments. Existing LayerCache and cloud-project
+AssetCatalog are scoped components, not sources of transferable local authority.
+
+M2 merge source raises the registered schema to `user_version` 2 with
+`publications`, `pulled_images` and `pulled_layers`. These are discovery facts
+about Hub results (request id, generation, terminal flag, status, Hub ids,
+public credential id; pulled chain/closure/layout), never credentials or byte
+authority. A v1 catalog stays readable unchanged and is upgraded only inside the
+first publication/pull write; any other v2 table set is refused. Pulled payload
+and closure digests block `inventory.remove_artifact`.
+
+Collect and admit rows before short SQLite transactions; never acquire runtime/
+artifact/digest locks inside a transaction. The private writer lock serializes
+catalog observers while the connection is idle outside SQL transactions.
+Malformed entries yield path-free warnings and an incomplete frame, preserving
+valid unrelated rows. Incomplete frames disable artifact deletion previews;
+actual deletion still uses independent guards. The normal `builds/outputs`
+transport directory is validated, not mistaken for a build ledger. Metadata
+refresh uses the shared unlocked retained-reference projection and creates no
+retention lock, config tree, quarantine cleanup or live backend reconciliation.
+
+`store catalog` reads the persisted frame without refreshing. Explicit
+`store catalog --refresh`, artifact and build queries recollect selected-root
+facts. Catalog/artifact envelopes expose scope/time/warnings; legacy build
+list/detail response shapes remain unchanged, with full-frame completeness
+available through `store catalog`. An absent state stays absent. Read-only
+store dispatch occurs before global `ContentStore` construction.
+
+Completed build/materialize CLI producers record metadata after durable output
+commits and released guards. A late catalog failure returns an explicit error
+but preserves the successful record/bytes, without replay. Source registration
+reopens the exact CAS graph; complete registration validates every ordered typed
+receipt and existing store authority. Re-registering the same source-only graph
+cannot downgrade complete/partial materialization. Config descriptors, not
+process environments, are stored. Original source reference is part of image
+identity. Native package aliases and build labels remain different relations.
+Build provenance records the existing pre-solve context/Dockerfile digests and
+lookup key; the source-record digest is explicitly
+`canonical-json-semantic-v1`, not raw file bytes or atomic BuildKit attestation.
+
+Private owner/no-follow/link/inode checks cover DB, lock and rollback journal;
+parent-directory aliases are canonicalized without following the selected root
+leaf. Existing shared-traversal state permissions are not tightened. Bounded
+busy waits, foreign keys, exact schema/application identity, full sync and the
+local rollback journal apply; no WAL/network multi-host writing. Corrupt/unknown
+DBs fail visibly without fallback/rebuild. Catchable first-initialization failure
+cleans only newly created pinned DB/journal files after closing. Process death/
+power loss or a pre-return file-creation failure can leave unknown files and
+require operator recovery; crash-atomic first publication is not claimed.
+
+Relocation quiesces/closes the catalog, preserves immutable graph/reference/
+ordinal facts, assigns an independent destination catalog identity and invalidates
+copied derivations. Destination CAS metadata and bytes must verify before source-
+only rebinding. No lease or global cross-filesystem atomicity is transferred.
+
+Source31 `0d1b30c8…` passed1202 focused cases/11skips. An actual pinned Ubuntu
+Dockerfile/COPY/C-compile build used the default output namespace, then all five
+original ordered occurrences were cold-materialized. Separate CLI processes
+read identical source/derived/build facts; persisted reads did not refresh.
+The actual read-only web images/build detail/log surface and provenance API
+matched those facts. BuildKit and web units stopped normally; an isolated
+installed Chrome was normally terminated and its temporary profile removed.
+These receipts are `M1-12-{real-build,new-build-chain,new-build-cli-restart,
+web-surface}31.json`; they do not prove actual VZ `/`, SSH or run UUID linkage.
+The older `M1-11-sqlite-design-proof28.json` remains engine/design evidence only.
+
+Source32 `6711ab38…` additionally binds the per-image CAS callback explicitly
+(Ruff B023, no suppression). Actual public config-selected `store move
+--keep-source` preserved the new build's graph/reference/order, verified copied
+source bytes, assigned a new catalog ID and invalidated derived registration to
+source-only; explicit refresh restored a complete observational frame. The
+environment-override rejection was preserved, then corrected using documented
+`store set` selection, not bypassed. Ruff check/format passed all12 changed files.
+The storage/integration task audits closed their latest assigned source scopes,
+with crash-first-init limitations still explicit.
+
+## M1 contextual immutable filesystem layers — source27
+
+The v3 canonical changeset normalizer applies whiteout/opaque effects only to
+the preceding filesystem, independent of marker order. Same-layer payloads
+survive; deletion/type-recreated directories cannot resurrect lower children.
+`EffectiveFilesystem` is the shared effective-prefix reducer for the OS reader
+and materializer, not a second physical-tar interpreter. Omitted parent/root
+directory headers inherit surviving effective UID/GID, mode, mtime and admitted
+xattrs. Explicit headers win; deleted/recreated directories use new metadata.
+Only generated `trusted.overlay.opaque` is removed from inherited metadata.
+
+SquashFS contains immutable filesystem entries/content/control metadata.
+The separate ordered OCI/materialization manifest owns source descriptors,
+DiffIDs, graph/config/process identity and occurrence receipts; it is not a
+filesystem payload or evidence of a running VM. No flattened fallback exists.
+The v2 derived recipe additionally binds the ordered preceding compressed
+descriptors and DiffIDs. It excludes unrelated config/future-layer identity.
+Original source/occurrence identities remain unchanged; old parentless recipe
+records/leases remain readable, but cannot authorize new contextual output.
+Cache views advertise only the exact verified parent context, and historical
+inspection never publishes new occurrence records.
+
+Warm workers authenticate the bounded CAS graph/prefix before lookup and reject
+noncurrent fixed semantic contracts. Cold workers replay preceding layers one
+at a time, retaining no closed-layer payload capabilities. Prefix admission
+caps128 layers,32GiB cumulative decompressed bytes and250000 members; the
+effective map bounds entries and cumulative metadata work. Intake still has its
+per-layer caps, and aggregate byte/member rejection occurs after each intake.
+One cooperative300s prefix deadline reaches chunk/hash/scan/normalization
+checkpoints, inside the existing parent hard boundary. Context entry failures
+retain their observed source/staging phase; new teardown failures are unknown.
+
+Source27 archive `f4f5cf45…` passed1178 focused cases and3 actual privileged
+SquashFS/OverlayFS cases: inherited directory/root attributes, read-only lower/
+merged views and same-leaf/different-parent cold/warm isolation. Original pinned
+ARM five-layer CLI cold/warm conversion and verified-stream `unsquashfs`
+inspection passed with new recipe keys, unchanged original graph/process and
+identical per-layer cold/warm receipts. Normal cleanup left no loop devices.
+These are filesystem proofs, not actual VZ `/`, SSH or runtime admission.
+
+## M1 ordered ARM filesystem conversion — source17 (execution was then separate)
+
+The existing hard materializer now accepts native and acquisition snapshots for
+Linux amd64/arm64. ARM cold workers reconstruct the exact graph with the existing
+archive resolver and compare source/CAS/image/binding/occurrence/recipe identity.
+Original native amd64 source identities and outer worker wire v3 stay unchanged.
+OCIStore keeps every ordinal, including repeated source descriptors, while immutable
+recipe/physical payloads may deduplicate. The aggregate receipt preserves original
+root/manifest/config, process, ordered compressed descriptors and DiffIDs.
+
+`oci materialize --platform linux/arm64` exposes this filesystem-only path on
+Linux; default amd64 snapshot resolution is unchanged. ARM source spelling is
+preserved for secure intake and acquisition consumes the conversion deadline.
+Neither generic conversion nor warm-cache success admits a VM. Legacy KVM
+intent rejects ARM before process/lease/volume effects; persisted root recovery
+also enforces exactly Linux amd64. The VZ consumer
+(`vz_native_runtime.run_local_oci`) now revalidates qualification and binds the
+actual root and boot inputs.
+
+Source17 focused903 passed after fixture-only repairs. Real CLI converted the
+five original fixture occurrences to five SquashFS results, then reused identical
+per-layer receipts. Actual `unsquashfs` inspection through verified artifact
+streams confirmed source/input/output, ARM ELF, owner/mode and original OS link;
+reversed receipt order failed store validation. Initial outer64MiB spool limits
+and incorrect disposable cache-label assertions are preserved as harness failures;
+only the assigned outer envelope changed to512MiB, not product limits. Native
+VZ `/`, access, durable runtime leases and complete whiteout fidelity were then
+open (as of source17); see the M1 completion record for their later status.
+
+## M1 local build context and ignore boundary
+
+The local Dockerfile frontend keeps the complete original context and explicit
+Dockerfile path. `buildkit.py` delegates ignore matching to BuildKit: the selected
+filename-specific Docker ignore (otherwise root `.dockerignore`) precedes root
+`.plmignore`, so explicit later `!` patterns may reinstate baseline exclusions.
+The existing key additionally binds effective ignore bytes, including an external
+Dockerfile's sidecar. With an overlay, a private temporary exact-byte Dockerfile
+and merged sidecar live through solve/export/cache finalization and are removed
+afterward. No context copy, second matcher, source writeback or FROM rewrite is
+introduced. Root-only lookup and bounded regular UTF-8 inputs are explicit.
+Remote CloudEnv context packing does not implement this matcher and now rejects
+any root `.plmignore` before constructing/uploading an archive, including dangling
+symlinks and nonregular entries. It cannot silently disclose excluded files.
+
+
+Optional local cache output can be genuinely empty for a config-only OCI solve.
+Only an existing empty export directory permits success without cache records:
+`cache_exported=false`, null archive digest and zero archive bytes; the previous
+cache pointer is preserved. Partial/missing export and mandatory native cache
+still fail. No empty cache index/archive is fabricated.
+
+The retained ARM fixture installs exact TCC plus development headers, copies C
+and text inputs, compiles and runs them against independently specified output.
+Real product Buildx0.30.1/BuildKit0.34.1 proof covers compilation, exact outputs,
+Dockerfile-only and external-definition contexts, absent required source,
+exclusion/reinclusion/path boundaries, and unchanged source trees. These are
+build proofs, not actual VZ user-root/SSH, direct host-source mounts, remote
+Git/Hub-worker ignore or commit implementation. M1-04 was then open; it is now
+checked.
+
+## M1 VZ actual-root contract — reviewed design (historical; `root_transition` now implemented, `base_root` schema still not)
+
+The [VZ native-root contract](openspec/specs/vz-native-root/spec.md) records the
+M1-01 exact-base and M1-02 shared-manifest designs accepted after separate
+base-binding, boot-boundary, projection and caller-cutover reviews. Neither is
+a native execution, SSH, conversion or workload-readiness receipt.
+
+- `application` requires the exact cloud-root projection explicitly selected as
+  Dockerfile ancestry. Disk identity and matching OS release do not prove that
+  an unrelated OCI image can be rebased onto the cloud root.
+- `oci-root` retains the complete original OCI base and ordered occurrences.
+  A cloud image may provide boot assets, never an unrelated userspace lower.
+  Ordinary supported Dockerfiles and imported OCI images keep this route;
+  unavailable Dockerfile genealogy is not fabricated for imported images.
+- Direct VZ Linux kernel/initrd boot and a read-only virtiofs artifact share are
+  source-backed candidates. Exact tag/device mapping, attachment-lifetime host
+  custody, early kernel capabilities and real root transition remain unproven.
+- Persistent upper/work must bind the authoritative run, exact owned host disk,
+  expected guest filesystem and immutable base/chain. First use is explicit;
+  resume never formats/clears populated state or accepts label-only identity.
+- Main workloads and public SSH/console sessions must use PID1's actual root.
+  Platform init/access is a separate M1-15 implementation gate; no assumption
+  that arbitrary OCI images contain systemd, bash, sudo, SSH or Lima guestagent.
+
+M1-02 selects a typed, absent-only `base_root` extension of the existing manifest,
+real cloud-base node plus ordered suffix, required normalization intent and one
+conditional compatibility authority. Historical OCI identities/read output stay
+stable; old application data remains descriptive, never a runtime fallback.
+Structural JSON cannot establish clean-disk/projection qualification. Throughout
+M1, SDK/Hub publication was amd64 OCI-root-only; the M2 merge source admits
+`linux/arm64` oci-root manifests (application stays amd64; Hub execution refuses
+arm64). The `base_root` schema/caller implementation remains pending; the guest
+`root_transition` in `guest/vz/platform.c` and the M1 runtime proofs exist.
+Any changed package needs its own applicable native approval; old grants do not
+carry to changed bytes. Existing cloud/deployment authority is not widened.
+
+## M1 source OS qualification — implemented; execution admission now bound (historical heading: source11)
+
+`oci_os_release.py` reads the effective OS file from a pinned original OCI graph,
+using existing SourceCAS occurrence leases and staged normalized changesets.
+Every compressed layer and DiffID is verified in order. Only metadata and exact
+payload occurrence identities survive each staging context; the selected origin
+is replayed for bounded file reads. `/etc/os-release` has exclusive precedence,
+with `/usr/lib/os-release` fallback only when absent. Image-root symlink and
+same-layer hardlink resolution never use host paths or execute image contents.
+
+The reader bounds occurrences, physical members, effective entries, retained
+metadata, decompression including replay, file/path bytes, symlink depth and a
+cooperative deadline. The shared normalizer now bounds synthetic ancestor/table
+growth, cumulative normalized UTF-8/bookkeeping work and deadline checkpoints
+before reader-level accounting. Its new entry limit is in the intake fingerprint;
+no receipt schema or alternate reducer was introduced. Accounting is not RSS or
+aggregate PAX measurement. Cross-layer hardlinks remain an explicit unsupported
+admission subset. The later v3 canonical reducer above supersedes the earlier
+whiteout-after-visible-target restriction without widening execution authority.
+
+`native_root_source.py` binds graph/OS evidence to the exact reviewed
+Ubuntu24.04/linux-arm64/lima-vz/direct-linux profile in `platforms.py`.
+`oci qualify` is a real source-inspection command, not a VM launcher. Revalidation
+reparses and rehashes CAS bytes; descriptive JSON does not confer authority.
+Acquisition independently caps the complete archive carrier before staging or
+logical layout metadata/distinct selected blobs before promotion, including warm
+CAS. Source-only state initialization preserves runtime/quarantine bytes and
+does not create an absent config tree, repair permissions or take run-name locks.
+
+Source11 passed focused778 and four portable lanes7560/20skipped/142warnings.
+Actual official Ubuntu ARM source qualification passed both Linux guest and
+Darwin arm64 CLI paths; Mac sandbox denial of network/outside-case writes was
+observed separately. Derived unsupported OS, dangling preferred OS link and wrong
+architecture were rejected. These are not image execution or native VZ proof.
+At source11 no native request/preparation/launcher consumed the qualification.
+The VZ run path now qualifies before materialization and revalidates after it
+and on reopen (`vz_native_runtime.run_local_oci`, `_reopen_source`;
+`vz_worker.materialize_vz_source`); M1-04 is checked. Existing KVM, experimental
+carrier, Hub/SDK publication and native/cloud grants were not widened.
+
+## M1 operator image-source admission — source and local proof
+
+`image_source_policy.py` owns exact normalized registry/namespace/repository
+rules in the existing owner-only main config. Missing/empty rules deny upstream
+images; a namespace permission is not a signature or verified-vendor claim.
+Acquisition, cached/offline reuse, retained upstream-origin run selection and
+Docker-store adoption share this authority before inspection or effects. Explicit
+local artifacts do not fabricate a publisher identity.
+
+Buildx receives the mandatory source-policy snapshot; stable client0.11 and
+every running BuildKit node0.12 or newer are required. Local syntax the scanner
+cannot interpret is deferred to that engine fence, not treated as permission.
+Dedicated workers use `buildctl build --source-policy-file`. Source policy is
+not a general RUN/HTTP/Git network firewall.
+
+Jobs preserve their original policy/digest and reload current authority at actual
+publication commits. `image_policy_channel.py` transports bounded nonce/digest/
+stage challenges over existing authenticated SSH stdin/stdout, without a listener
+or new credential. Cloud payload/receipt links, registry asset/cache metadata
+renames and recovered Hub output publication check after long verification/copy/
+fsync work. Revocation yields durable HOLD and preserves an already committed
+prefix; policy restoration does not replay a held job. TERM-resistant children
+retain custody; no force kill or automatic retry is added.
+
+Hub API and worker consume the same strict operator DTO, with the registry-host
+fence as an additional restriction. A same-request retry returns its immutable
+receipt after policy changes; new admission, claim and live publication fail
+closed. Legacy queued jobs without provenance are not assigned invented policy.
+Kolla's empty default and API/worker environment wiring are source-only changes:
+no image build, Kolla rollout or live operator setting is claimed.
+
+Local proof covers the declared CLI entrypoint, actual BuildKit arm64 COPY-to-OCI
+and source rejection, real publication pipes/filesystem commits, and real
+loopback Uvicorn/SQLite admission/revocation with explicitly synthetic identity.
+It does not prove original Ubuntu/CUDA acquisition, Docker Desktop, actual VZ
+user root, Keystone, Ceph/Nova/GPU or deployed service behavior.
+
+## SDK image authority and namespace-native integration — 2026-11-03
+
+**Source lineage `0.3.11.dev0` (never published); current metadata is the unpublished `0.3.12` candidate. Publication, deployed state and native qualification have separate receipts.**
+`image_manifest.py` owns bounded canonical metadata and single-parent logical
+node identities, separately from physical payload digests. `image_models.py`
+adds published images, ordered memberships, creator-bound staging and inherited
+reuse ceilings. `services/published_images.py` is the common publication engine
+for `image_jobs.complete` and SDK pushes/extensions. The extension API resolves
+the exact authorized base on the server and preserves its private runtime rather
+than reconstructing it from a redacted catalog response.
+
+Offline bootstrap upgrades pre-publication image tables before creating dependent
+FKs: historical job visibility is `internal`, proven creators become part of the
+context key, and unknown creators block before DDL. Missing legacy creator/OS
+declarations are quarantined before worker effects; admission and replay share
+nonblank, NUL-free,128-byte UTF-8 OS bounds. Audience ceilings are validated as
+decoded lists and bound to the destination's JSON or reflected LONGTEXT type.
+No migration synthesizes authors, OS facts, catalog images or reuse permission.
+MariaDB cutover requires all writers stopped and paired SQL/CAS restore proof.
+
+Visibility is immutable per publication: private selects the exact creator
+(including that user's other authenticated projects), internal selects the origin
+project, and public selects all authenticated service-authorized readers plus,
+since the M2 merge source, anonymous image list/get/blob reads (see the M2 section).
+Visible membership gates graph/image/blob discovery; old project-wide physical
+layer routes cannot expose or mutate new `image-payload` rows. Borrowed audience
+ceilings survive intermediate images and cannot be erased by public aliases for
+the same bytes. The explicit conventional HTTPS/chroot instance backend can bind
+an authorized canonical image without broad physical-blob visibility; personal
+published-image results remain creator-only in that backend.
+
+For Manila, `ceph_scoped_store.py` verifies the exact mount/device/filesystem and
+scope directory/file pool and namespace layouts. Each complete image resides in
+one private-user/internal-project/public namespace. Payloads deduplicate within
+that scope; publication across security scopes copies bytes once. MDS paths alone
+do not isolate raw RADOS access, so no hardlink-view/broad data-tag solution is
+used. `ceph_path_access.py` creates finite per-run credentials with exact
+read-only MDS path and OSD pool/namespace caps using a separately provisioned
+private issuer. Mutation intents, process custody, final original-grant checks,
+key fingerprints and auth absence are retained; no blind auth replay or global
+eviction is added.
+
+`api/native_instances.py` and `services/native_instances.py` resolve authorized
+Hub images and return durable creating/deleting intents before background work.
+That work obtains a freshly validated original-human connection; tokens are not
+persisted and service credentials are not an execution fallback. The existing
+native carrier/PID1 is reused with an explicit canonical published-image variant
+and pinned namespace storage plan. Native GET/list are SQL-only. Kept successful
+VMs are idle after a bounded command, not long-lived application readiness.
+Exact-image grants remain exact; project-image grants are explicitly CPU-only,
+share one cumulative allowance across different image IDs and retain spent
+history across deletion. Controller death/ambiguous commits or still-owned
+processes remain HOLD, not authorization to restart or refund.
+
+Hub and client package metadata are an exact unpublished pair. Kolla exposes
+disabled operator mount/profile settings but does not create shares, issuers,
+worker preparations or approvals. Existing populated ACL schemas missing required
+ownership/visibility are not silently reinterpreted. Real namespace/RADOS denial,
+native warm reuse, container/deployment and exact resource closure require their
+own final-source/resource authorization. The earlier N-tree actual-root/CUDA
+success remains historical evidence for its different package and storage path.
+
+## Consolidated local source — 2026-11-02
+
+The primary `dev` checkout now includes the committed PR36/PR37 lineage through
+`7962b18e45cd87534ee1cf0c1d5c30af68e0a8a9`, plus the retained local SDK/Manila
+experimental source and semantically ported allocation-expiry repair. This is a
+local source cutover, not a remote protected-branch merge, release or deployment.
+Dated sections below retain their original source/deployment identities.
+
+Nova's final provider-thread deadline uses the actual integer guest expiry.
+Certified no-call settlement survives cancellation but retains the prepared
+Cinder root, quota and references until exact cleanup/404. Benchmark guards bind
+original request identity and durable no-send evidence; live capacity release
+never refunds cumulative budgets. Later prepared-root and cold/warm contracts
+remain intact. Cinder/auxiliary-network final-effect expiry gaps are not claimed
+solved by this port.
+
+The separate local `cloud` path publishes immutable CephFS layers with per-consumer
+RO access, but its local/share metadata is not Hub-authoritative metadata. Native
+root/GPU execution remains unqualified. Consolidation review repairs result
+registration, one-shot deletion recovery, SSH credential isolation, bounded
+retained output, native tunnel admission and complete bounded authorized-key
+removal. Controlled SIGTERM enters existing cleanup and restores its handler;
+controller death still does not provide autonomous cleanup. No provider policy
+or live credential is changed by these source fixes.
+
 ## Finite database reads and uncertain commit preservation — 2026-10-31
 
 The Hub configures a separate asyncmy protocol read wait limit, default30seconds
@@ -307,6 +1611,137 @@ User-authorized commit/push scope on `feature/hub-execution-api-20261029`, based
 
 The API candidate retains externally authored HTTPS payload fetch, SHA/size verification and read-only SquashFS mounts. The guest already has no Palimpsest CLI/build/conversion orchestration. This is not a Manila shared-storage implementation.
 
+### Local SDK execution check — 2026-11-01
+
+The owner requested a local-first check of Dockerfile input → an existing Nova
+worker → Manila CephFS layer publication → a separate Nova consumer → actual
+package/library use. `cloud_cli.py` dispatches this path to `cloud_env.py`, which
+uses the named `clouds.yaml` connection via `cloud_cli._connect`. Credentials stay
+on the external client; the worker receives source/context and its own CephX
+write grant, while consumers receive separate read-only grants. This is not a
+change to Hub API authentication or a shared-service deployment.
+
+`cloud_transport.py` supplies `OneShotSession` through the SDK's supported
+cloud-region session constructor. Factory users (CloudEnv, NovaController and
+the importing benchmark adapters) retain original auth/public/TLS settings,
+but POST/PUT/PATCH/DELETE never silently retry, reauthenticate or follow a
+redirect, even when an SDK service default requests retries. Mutation3xx fails
+closed; GET/HEAD discovery behavior is unchanged. Independent connectors that
+do not call this factory are intentionally outside this cutover.
+
+`cloud_layer_worker.py` runs BuildKit and reuses `LayerCache`/the canonical OCI
+materializer to produce ordered SquashFS blobs. The consumer mounts those files
+from CephFS, verifies digests, assembles read-only lowers plus private upper/work,
+and executes an explicit command inside the merged root. It does not install the
+Palimpsest CLI in the consumer. The conventional Ubuntu VM boots first; this is
+not an OCI-root VM boot or container-isolation claim.
+
+The local environment/image receipt is execution evidence for this requested
+check, not a replacement for Hub-authoritative metadata in the target contract
+above. The existing Hub path still downloads layers over HTTPS; neither the Hub
+DB nor production service credentials were changed. A single CPU live check
+observed eight layers, NumPy computation, Requests import, jq and linked shared
+libraries; it does not qualify CUDA or any five-success comparison. Exact live
+source, retained resources and later local-only review fixes are recorded in the
+handoff. See [local command usage](docs/vm-workflow.md#local-driven-openstack-layers-on-manila-cephfs).
+
+The subsequent registry-intake slice adds `cloud image-pull`: only the worker
+acquires a digest-pinned OCI image. `LayerCache.materialize(on_layer=...)` commits
+each validated derived-cache result and synchronously hands it to the publisher
+before the next ordinal. The worker publishes the unique CephFS blob, an immutable
+content-addressed provenance receipt and its ordered job journal; final image
+publication requires the complete exact sequence. Callback errors or deadlines
+retain the committed prefix without claiming image success. Existing verified
+blobs incur no duplicate CephFS payload copy. The original config/manifest,
+compressed descriptors and DiffIDs are retained; graph identity is distinct from
+manifest identity. Client request/job/source/runtime checks precede local retention.
+
+The owner then explicitly required the CUDA image to become the Nova VM's actual
+root and required real GPU computation. This is not implemented by the prior
+conventional cloud-image/chroot consumer or by registry intake. See
+[native-root/GPU gates](docs/oci-gpu-support.md#registrycephfs-acceptance-selected-on-2026-11-01).
+No new boot artifact, native-root VM, CUDA execution or GPU allowance is implied
+by the registry-intake source checks.
+
+A separate experimental native candidate now has explicit ownership boundaries:
+`nova_boot_carrier.py` builds a BIOS kernel/initramfs carrier and private upper;
+`nova_ceph_boot.py` is initramfs PID1 and moves the verified CephFS-backed overlay
+onto the actual root; `nova_bootstrap_service.py` provides per-run mTLS enrollment,
+credential delivery and immutable result receipt; `nova_native_cloud.py` owns the
+grant-bound SDK lifecycle and exact cleanup. The standalone CUDA probe in
+`guest/nova/cuda_probe.c` is carried outside the unchanged upstream layers and
+requires both real Driver API/PTX arithmetic and cuBLAS SGEMM from the image.
+The protected local stage-1 parser/device/control-channel contracts are unchanged.
+
+Bootstrap media carries short-lived per-run identity, never a CephX or OpenStack
+credential. The loopback service is reached via a source-IP-restricted SSH forward
+to the existing worker; it has no cloud credentials and exposes no new SG ingress.
+Fresh controller identity/binding, client certificate fingerprint, nonce and
+expiry gate the selected RO grant. This trusted-workload proof is neither remote
+attestation nor confidentiality from a root workload/private-carrier owner.
+Source preparation preserves predecessor bytes and metadata as `.prior`; ordinary
+`env up` cannot bypass that cutover to replace recorded source. Source/carrier
+construction, actual CPU-root boot and actual GPU output remain separate gates.
+If the controller dies, expiry stops new bootstrap access but does not autonomously
+delete cloud resources; cleanup retains exact IDs and needs current bounded authority.
+
+Explicit recovery grants bind the exact predecessor preparation, all cleaned
+failed-run digests and the ordered failure-resource history. Fresh exact404
+reads, revoked enrollment, terminal builders and no orphan native records precede
+any new reservation. Acknowledgment does not rewrite failed outcomes, refund
+old counters or qualify CPU results. Source replacement additionally confirms
+the old bootstrap unit inactive/dead/MainPID0 and preserves its preparation in
+`preparation_history`; new CA/runtime/probe/service artifacts use a fresh
+`generation-<package-sha256>` directory and suffixed unit. The original kernel
+bundle path and DNS remain unchanged. `cleanup_reserve_seconds` subtracts from
+the post-Nova execution deadline, not the allocation allowance. Cleanup overruns
+fail both CPU and GPU outcomes; even acknowledged CPU overruns cannot open GPU.
+
+
+Failed native runs now attempt an exact-owned Nova serial-console read before
+cleanup. Private no-clobber evidence retains at most256KiB of sanitized UTF-8
+console tail; known carried secrets, private-key material and credential-labelled
+lines are redacted before truncation. The SDK session temporarily uses5s
+connect/read timeouts and zero proxy retries, then restores its settings. This is
+not an absolute response deadline or a new allocation allowance. Missing/invalid
+console evidence never qualifies a run or prevents ordinary cleanup. Positive
+ACTIVE/enrollment timestamps and pre-failure phase survive enrollment revocation.
+PID1 failure handling additionally emits a bounded serial diagnostic containing
+only a fixed operation label, an exact allowlisted exception type and bounded
+numeric errno. It never includes exception messages, paths, arbitrary class
+names, traceback locals or keys. Labels survive the unchanged console credential
+sanitizer. Existing failure/HOLD/result/PID1 behavior and all admission gates are
+unchanged; this diagnostic-only successor is not evidence of a repaired boot.
+Completed nonzero builder transports now retain a separate private no-clobber
+diagnostic before exact cleanup: sanitized stdout/stderr tails of64KiB each,
+bounded serialized payload, transport-client exit code and remote_outcome
+unconfirmed. A returned SSH exit status never substitutes for the existing
+carrier-terminal/custody check; interruptions remain TERM-only unknown holds.
+The carrier deliberately rejects source identity/ctime changes while copying
+live host runtime files. Operators must establish a fully configured, quiescent
+package cohort before another explicitly approved case; updater activity is not
+permission to disable updates, replay a failed build or reuse its partial tree.
+Carrier data uses one image-proxy PUT with the same Glance path/media/size
+headers as Image.upload. Its scalar socket timeout is min(remaining pre-Nova
+deadline,600s): requests sends body chunks under the connect timeout as well as
+using the read timeout for responses, so a small connect component is unsafe.
+This is not a total HTTP deadline; source reads and completion reject expiry,
+and no Nova POST can follow an expired grant. Metadata keeps its40s session
+default. No shared timeout/retry settings or full-carrier memory buffer change.
+Safe upload-failure diagnostics retain at most eight exception class/errno
+records, source bytes read (not delivered), expected size and HTTP status;
+messages, arguments, headers, URLs and tracebacks are not stored.
+
+Existing deleting intents are observation-only until authoritative404, including
+Cinder's deleting state; volume origin remains bound to its durable image intent
+if the live image record disappears. Retained upload clients block recovery.
+Strict no-replay can leave a paid resource present when the original DELETE
+never arrived. That is an explicit HOLD requiring separately authorized manual
+provider disposition, not permission to infer no effect from ConnectFailure or
+a fresh non-deleting GET and automatically dispatch another DELETE.
+
+
+
 
 #### Ownership and source map
 
@@ -496,8 +1931,9 @@ and refuse unknown delete-on-termination attachments. Empty attachments on an
 unbound legacy ERROR server do **not** prove that no boot disk exists. Prepared-
 volume-only DELETE latches intent without a Cinder mutation, including available
 or ERROR roots; GET may later expose `delete_volume_ready`. Only explicit advance
-`delete-volume` can issue one ordinary Cinder DELETE, after original writer,
-exact project/markers/image binding and unattached settled status are verified.
+`delete-volume` can issue one ordinary Cinder DELETE only after fresh original
+manager or exact-creator self-cleanup authority, exact project/markers/image
+binding and unattached settled status are verified immediately before effect.
 Creating/downloading volumes wait. When a server was attempted, its bound exact
 absence is required first; a zero-match unknown server create is not absence.
 An unknown DELETE is GET-only until actual Cinder404; it is never repeated.
@@ -551,6 +1987,8 @@ handoff; this is HTTPS/disk-backed functional evidence, not Manila mount proof.
 
 ## Overview
 
+**Current source — unpublished 0.3.12 candidate (2026-11-07/08 merge worktree):** root/Hub metadata and both package `__init__` versions are `0.3.12`; this source is not committed, released or deployed. Its lineage `0.3.11.dev0` was never published. The latest publication is still 0.3.10 (next paragraph).
+
 **Current publication —0.3.10:** protected [PR34](https://github.com/openstack-afterglow/palimpsest/pull/34) merged as `c63d9507b774220164babd1bb6e7eb450a693c26`; immutable `v0.3.10`, PyPI/GitHub client distributions and all three versioned GHCR services are published from that revision. Public package bytes and pulled image source/version labels were verified against the reviewed source. The Kolla deployment server now selects/locks/installs client0.3.10 and selects the matching immutable service digests; other packages and non-image configuration are unchanged. This is not a production service rollout, database upgrade, worker unquarantine, API workload acceptance or native/GPU qualification. Exact digests, checks and installer recovery are in the [completion handoff](docs/development-handoff.md#latest-source-formal-release0310--2026-10-28-published-operator-selection-updated-no-service-rollout). Later documentation-only follow-through never moves the release tag or changes its code.
 
 **Historical publication snapshot — 0.3.1:** the next paragraph records that
@@ -562,7 +2000,7 @@ The 0.3.4 base `ad1674e842c6cefaf4e2d38705b109a579f56040` is retained with its n
 
 0.3.5 was released on 2026-10-14: PR #24 passed all six strict required hosted checks on `1ff87efe` and merged into protected dev as `04d51ad6e1bf00c4b6e5bf82050383d0bb0a10cf`; dev CI, annotated `v0.3.5`, PyPI/GitHub release and GHCR Hub image publication succeeded. Production Hub on `dms-controller1` and the dedicated build-worker VM were upgraded after the terminal gate and cold restore receipt (15 SQL tables, 10 rows, exact; encrypted blob archive 884,766,720 bytes). The worker resumed idle polling after server-state-proven `claim_pending` disposition with the journal preserved and lock retained. Stop/drain the remote build worker before stopping the Hub API in future maintenance. Native KVM proof was NOT performed (repository-policy skip exactly as for 0.3.4); BuildKit/cloud proofs and live recipe execution/restart/cleanup remain unqualified. Hub has no migration ledger; bootstrap `create_all` is not existing-schema compatibility proof. All-writer drain, reviewed offline upgrade and paired SQL/CAS backup/isolated restore remain future cutover prerequisites.
 
-Current0.3.10 authority supersedes the following dated0.3.5 policy snapshot: registered service-local actions replace mandatory implication leaves after fresh exact native membership/role provenance. Personal project owners and independently verified human system administrators have explicit bounded paths; admin-issued keys remain attenuated and old ordinary keys cannot inherit later system promotion. Application credentials/Trust/delegated/service subjects cannot become human controllers. Required actions and identity are revalidated after blocking CAS work and before SQL publication, with reference-aware compensation on revocation. Offline MySQL/MariaDB bootstrap adds nullable human audit columns and key issuer provenance with every old writer stopped; merely updating the operator wheel does not perform that upgrade.
+The 0.3.10 authority (later revised by the 2026-11-06 standard-role cutover near the top of this document) superseded the following dated0.3.5 policy snapshot: registered service-local actions replace mandatory implication leaves after fresh exact native membership/role provenance. Personal project owners and independently verified human system administrators have explicit bounded paths; admin-issued keys remain attenuated and old ordinary keys cannot inherit later system promotion. Application credentials/Trust/delegated/service subjects cannot become human controllers. Required actions and identity are revalidated after blocking CAS work and before SQL publication, with reference-aware compensation on revocation. Offline MySQL/MariaDB bootstrap adds nullable human audit columns and key issuer provenance with every old writer stopped; merely updating the operator wheel does not perform that upgrade.
 
 **Historical0.3.5 authority snapshot:**
 `GET /v1/me` preserves original token identity/project/roles and fresh independent capabilities with `Cache-Control: no-store`. Legacy/native credentials remain separate and memory-only. Legacy upload requires ordinary current-project publish roots even for system admins, excluding builtin admin/manager roots and `links.prior_role` copies; admin alone never grants publication. Service/protected/validator identities remain denied; build/delete stay system-admin. Native owners and deferred exports retain separate admin/manager/service exclusions, including fresh direct system-grant attenuation. These authority rules need no IAM fallback; the integrated ownership schema additions are documented below.
@@ -816,10 +2254,12 @@ Buildx 출력 열 간격 가정 때문에 Gate 1 전에 실패했고 그 evidenc
 | OCI-root explicit run user | implemented | source-reviewed; focused/native 결과는 별도 기록 | `--user USER[:GROUP]`만 허용하며 capability 추가·argv/env/cwd override·자동 소유권 변경은 없음 | [`oci_run_request.py`](src/palimpsest_local/oci_run_request.py), [`oci_boot_plan.py`](src/palimpsest_local/oci_boot_plan.py), [user contract](docs/oci-run-user.md) |
 | guest stage-1 root transition와 PID 1 | implemented | source-reviewed, test-defined; `071d82d` PR native KVM proof passed | production host lifecycle와 hostile-root availability 보장은 아님; conventional cloud-image boot의 증거가 아님 | [`guest/stage1/init.c`](guest/stage1/init.c), [`guest/stage1/README.md`](guest/stage1/README.md), [`tests/kvm/test_oci_guest_stage1_live.py`](tests/kvm/test_oci_guest_stage1_live.py) |
 | native Hub `/v1` upload/download/bundle | implemented | source-reviewed, portable Hub lane test-passed | native `/v2` registry protocol은 없음 | [`hub/src/palimpsest_hub/api/hub.py`](hub/src/palimpsest_hub/api/hub.py), [`hub/tests/test_hub_api.py`](hub/tests/test_hub_api.py), [`hub/tests/test_upload_limits.py`](hub/tests/test_upload_limits.py) |
-| native project package registry (`palimpsest.project-packages.v1`) | implemented | source-reviewed; historical Hub 208, root `core-cli`/`build-registry` 1598, Afterglow BFF 95, UI controller 13 test-passed; 2026-10-02 isolated local Keystone/MariaDB/Redis/Afterglow TLS gateway proof live-verified (아래 Hub 보안 경계 참조); current 0.3.5 Hub suite and amd64 image-import smoke above | 운영 Kolla·cloud.dmslab 배포와 실제 federated owner는 미검증; emulated image import는 authenticated registry/runtime acceptance가 아님. native `/v2` registry가 아님 | [`api/packages.py`](hub/src/palimpsest_hub/api/packages.py), [`package_registry.py`](hub/src/palimpsest_hub/services/package_registry.py), [`package_contents.py`](hub/src/palimpsest_hub/services/package_contents.py), [`packages.py`](src/palimpsest_local/packages.py), [contract](docs/project-package-registry.md) |
+| native project package registry (`palimpsest.project-packages.v1`) | implemented | source-reviewed; historical Hub 208, root `core-cli`/`build-registry` 1598, Afterglow BFF 95, UI controller 13 test-passed; 2026-10-02 isolated local Keystone/MariaDB/Redis/Afterglow TLS gateway proof live-verified (아래 Hub 보안 경계 참조); historical 0.3.5 Hub suite and amd64 image-import smoke above | 운영 Kolla·cloud.dmslab 배포와 실제 federated owner는 미검증; emulated image import는 authenticated registry/runtime acceptance가 아님. native `/v2` registry가 아님 | [`api/packages.py`](hub/src/palimpsest_hub/api/packages.py), [`package_registry.py`](hub/src/palimpsest_hub/services/package_registry.py), [`package_contents.py`](hub/src/palimpsest_hub/services/package_contents.py), [`packages.py`](src/palimpsest_local/packages.py), [contract](docs/project-package-registry.md) |
 | Hub `/app` and `/v1/builds` | implemented (0.3.5 released) | local Hub suite 559 passed/2 skipped, MariaDB/process ownership 2 passed, amd64 image imports and hosted CI passed; controller1 Hub/build VM upgraded, uncertain-claim disposition and idle polling observed; live recipe execution/restart/cleanup unqualified; former 2026-09-24 KVM proof remains historical | exact system-admin/project authority, visible x86_64 base/chain; HTTPS key/lease private CPU VM executor without worker SQL/CAS. VM is kernel boundary; DNS/connect outside watchdog; synthetic provider/remote effects are not live-build acceptance | [`api/builds.py`](hub/src/palimpsest_hub/api/builds.py), [`build_worker.py`](hub/src/palimpsest_hub/build_worker.py), [`hub_builder.py`](src/palimpsest_local/hub_builder.py), [`test_builds.py`](hub/tests/test_builds.py) |
 | Hub Glance export worker | partial | source-reviewed, test-defined; 2026-09-23 분리된 scratch SQL/Redis/store에서 실제 CirrOS·Ubuntu Glance export live-verified(당시 service password tenant-scope 경로). 2026-10-07 requester Trust 전환은 source-reviewed이며 synthetic Keystone HTTP + 실제 SDK로 test-passed(Hub lane 285, delegation 28). live Trust 미검증 | 운영 Hub 배포·Keystone trust policy·실제 Trust 생성/삭제는 별도 검증; 비동기 worker는 OpenStack/DB/Redis, read-only validator와 qemu-img가 필요 | [`hub/src/palimpsest_hub/services/image_exports.py`](hub/src/palimpsest_hub/services/image_exports.py), [`hub/src/palimpsest_hub/openstack.py`](hub/src/palimpsest_hub/openstack.py), [`hub/src/palimpsest_hub/worker.py`](hub/src/palimpsest_hub/worker.py), [`hub/tests/test_image_exports.py`](hub/tests/test_image_exports.py), [`hub/tests/test_export_delegation.py`](hub/tests/test_export_delegation.py) |
 | anonymous registry → local OCI archive | implemented | source-reviewed, live-verified | `oci pull`은 GHCR·Quay 익명 HTTPS Linux amd64 취득과 source CAS 검증을 통과함. 인증 및 직접 registry `run`은 미지원이며 취득은 부팅 증거가 아님 | [`registry_intake.py`](src/palimpsest_local/registry_intake.py), [`registry-intake.md`](docs/registry-intake.md) |
+| Hub image quota/keys/anonymous public reads/source closure + `published push/pull/status` | implemented (merge worktree, independently reviewed (whole-surface security review, merge-integrity review, architecture review); not live-verified) | test-defined, test-passed: Hub lane와 root 파일별 실행(scrubbed macOS env, synthetic Keystone, SQLite); `test_hub_publish.py` 72 cases; 격리 harness(loopback uvicorn의 실제 Hub app + 실제 client CLI + HTTP fake Keystone) 77 checks 통과; 시드된 free 체인 한도 1/5/10 GiB를 실제 바이트로 검증(한도−1·한도 허용, 한도+1은 413) 11 checks 통과. 두 run은 마지막 코드 수정(anonymous list cap, inventory preview, registry child env, pull result) 뒤 재실행됨(위 M2 절 참조). live-verified 아님 | live Hub/Keystone/Afterglow OAuth, Kolla 배포, MySQL/MariaDB, Manila/CephFS closure 복사, 이 host의 Linux-only test, 별도 state root에서 pull한 image의 실제 `plm run`, 두 번째 Apple Silicon 기기 미검증. 설계상 남는 중복 게시: 불확실한 시도 중 자격증명 전환, 같은 사용자의 이미지 키 2개, 게시 전용 키와 읽기 가능 자격증명 혼용, Keystone 토큰(키 id 없음)의 공유 시도, 두 state root에서의 같은 이미지. 물리 저장량 범위는 소유자 결정(537)으로 Hub가 아는 blob 기준(클라우드측 raw 변환 제외) | [`image_quota.py`](hub/src/palimpsest_hub/services/image_quota.py), [`image_keys.py`](hub/src/palimpsest_hub/services/image_keys.py), [`public_images.py`](hub/src/palimpsest_hub/services/public_images.py), [`hub_publish.py`](src/palimpsest_local/hub_publish.py) |
+| native VZ OCI-root runtime (Darwin arm64 Lima VZ, Ubuntu 24.04 arm64 profile) | implemented | live-verified on one Apple Silicon host at M1 scope: actual OverlayFS `/`, public exec/console/SSH, retained-disk restart, dev/prod restart policy and lifecycle receipts (M1-01…M1-28 checked in `spec.md`) | n=1 host; no attestation or security-parity claim; OpenStack shelve/unshelve deferred to M4; Hub execution refuses arm64; VZ network-detail status projection unsupported | [`vz_native_runtime.py`](src/palimpsest_local/vz_native_runtime.py), [`vz_worker.py`](src/palimpsest_local/vz_worker.py), [`vz_runtime_assets.py`](src/palimpsest_local/vz_runtime_assets.py), [`guest/vz/platform.c`](guest/vz/platform.c), [`runtime_dispatch.py`](src/palimpsest_local/runtime_dispatch.py) |
 
 `162cebe` 진단 checkpoint: exact-SHA 서버 집중 검사 198건과 전용 게스트 native 43 boots / 44 QEMU proof가 통과했다. 당시 원본 Redis 실기는 실패했고, 고정 로그가 root-owned `/proc`0555와 exact0755 검사 충돌을 확인했다. entrypoint는 실행되지 않았다. 후속 사용자 승인에 따라 `/proc`에만 0555를 추가 허용하는 구현을 반영하며, 해당 수정의 native 결과는 별도로 검증한다. PID 1 보호는 유지한다. 이전 기존 빌드 이미지의 cold public exec 성공을 새 게스트 검증·전체 Gate 2·일반 이미지 호환성 완료로 확대하지 않는다. 자세한 결과는 [compatibility checkpoint](docs/oci-docker-hub-compatibility.md)에 기록한다.
 
@@ -856,6 +2296,9 @@ flowchart LR
     convert --> derived[Derived SquashFS + OCIStore]
     derived --> rootprep[Exclusive root volume + leases]
     rootprep --> ocihost[Linux amd64 qemu:///system]
+    rootprep --> vzhost[Darwin arm64 Lima VZ, Ubuntu 24.04 arm64 profile]
+    vzhost --> vzplatform[guest/vz platform PID 1]
+    vzplatform --> slash
     ocihost --> stage1[Guest stage-1 PID 1]
     stage1 --> slash[Guest actual /]
 
@@ -864,7 +2307,7 @@ flowchart LR
     localinv --> localstate[(Local state ledgers and store)]
     browser[Same-origin Hub web console /app] --> hubapi
     cli --> hubclient[HubClient]
-    hubclient --> hubapi[Palimpsest Hub native /v1]
+    hubclient -->|X-Auth-Token, Bearer ppi_v1_ or anonymous public reads| hubapi[Palimpsest Hub native /v1]
     hubapi --> hubsql[(Hub SQL metadata)]
     hubapi --> hubblob[(Hub filesystem blob store)]
     hubapi --> hubredis[(Redis ephemeral tokens)]
@@ -876,7 +2319,7 @@ flowchart LR
     hubworker --> qemuimg[qemu-img conversion]
 ```
 
-텍스트 흐름: 사용자가 CLI로 로컬 base/layer를 선택하면 conventional 경로는 base overlay와 layer disks를 hypervisor에 투영하고 guest가 `/opt/layers/merged`를 활성화한다. OCI 경로는 archive/layout의 descriptor graph를 한 번 snapshot한 뒤 source CAS를 재사용하고, 각 layer occurrence를 derived SquashFS로 변환하여 lease와 root volume을 준비한 다음 stage-1이 인증한 root를 `/`로 이동한다. Hub 요청은 Keystone token으로 native `/v1`에 도착하며 SQL metadata, 파일 blob, ephemeral Redis token이 분리된다. Hub worker는 SQL job을 polling하여 Glance image를 qemu-img로 변환하고 blob store에 publish한다.
+텍스트 흐름: 사용자가 CLI로 로컬 base/layer를 선택하면 conventional 경로는 base overlay와 layer disks를 hypervisor에 투영하고 guest가 `/opt/layers/merged`를 활성화한다. OCI 경로는 archive/layout의 descriptor graph를 한 번 snapshot한 뒤 source CAS를 재사용하고, 각 layer occurrence를 derived SquashFS로 변환하여 lease와 root volume을 준비한 다음 stage-1(Linux amd64 KVM) 또는 `guest/vz` platform PID 1(Darwin arm64 Lima VZ, Ubuntu 24.04 arm64 profile)이 인증한 root를 `/`로 이동한다. Hub 요청은 Keystone token(`X-Auth-Token`), image API key(`Authorization: Bearer ppi_v1_…`) 또는 `public` published-image 익명 읽기로 native `/v1`에 도착하며 SQL metadata, 파일 blob, ephemeral Redis token이 분리된다. Hub worker는 SQL job을 polling하여 Glance image를 qemu-img로 변환하고 blob store에 publish한다.
 
 형제 서비스는 이 저장소의 import 대상이 아니다. Afterglow는 별도 dashboard/BFF, Drover는 K3s control plane, Lumen은 chat runtime, Waygate는 gateway control plane이며, Palimpsest는 이들을 내부 모듈로 가져오지 않는다.
 
@@ -884,9 +2327,22 @@ flowchart LR
 
 | 영역 | 주요 경로와 심볼 | 책임과 의존 방향 |
 | --- | --- | --- |
+| generic ordered filesystem conversion | [`oci_materializer.py`](src/palimpsest_local/oci_materializer.py), [`oci_materializer_worker.py`](src/palimpsest_local/oci_materializer_worker.py), [`oci_store.py`](src/palimpsest_local/oci_store.py); CLI `oci materialize --platform` | validated native/acquisition snapshots, exact platform-aware cold reconstruction and original ordered receipts; native amd64 identities retained, no launch authority. Legacy intent/root transaction separately reject ARM before effects. |
+| local context/ignore and optional cache | [`buildkit.py`](src/palimpsest_local/buildkit.py)의 `_effective_dockerignore`, `_local_dockerfile_definition`, `compute_build_key`, `build_with_buildkit`; [`tests/fixtures/vz-native-root/`](tests/fixtures/vz-native-root/) | BuildKit-native effective ignore/key binding, temporary definition custody and no source writes; truthful optional cacheless result preserves prior pointer, native mandatory-cache authority unchanged. |
+| effective image OS identity | [`oci_os_release.py`](src/palimpsest_local/oci_os_release.py)의 `read_image_os_release`; [`oci_changeset.py`](src/palimpsest_local/oci_changeset.py), [`oci_converter.py`](src/palimpsest_local/oci_converter.py) | bounded metadata-only multilayer lookup, image-root links, occurrence-bound payload replay and strict data-only os-release parsing; no host extraction/image execution or self-declared OS authority. |
+| source/profile qualification | [`native_root_source.py`](src/palimpsest_local/native_root_source.py), [`platforms.py`](src/palimpsest_local/platforms.py)의 `select_native_root_boot_profile`; CLI `oci qualify`; [`state.py`](src/palimpsest_local/state.py)의 `init_source_roots` | exact CAS/OS/profile binding and source-only initialization without runtime cleanup; descriptive output explicitly does not admit execution. |
+| upstream image-source policy | [`image_source_policy.py`](src/palimpsest_local/image_source_policy.py)의 `ImageSourcePolicy`, `admit_image_source`, `load_image_source_policy`; [`state.py`](src/palimpsest_local/state.py) | canonical registry resolution and bounded owner-only main-config snapshot; exact rules shared by intake/build/cache/run without a second configuration authority. |
+| current-policy publication channel | [`image_policy_channel.py`](src/palimpsest_local/image_policy_channel.py)의 `CurrentPolicyAuthority`, `PipePolicyAuthority`, `run_policy_process`; [`cloud_env.py`](src/palimpsest_local/cloud_env.py), [`cloud_layer_worker.py`](src/palimpsest_local/cloud_layer_worker.py), [`registry_worker.py`](src/palimpsest_local/registry_worker.py) | immutable job provenance plus fresh commit-time authority over existing SSH pipes; bounded framed challenges, isolated child I/O, durable HOLD/prefix preservation and TERM-only custody. |
 | native dashboard asset catalog | [`catalog_dto.py`](hub/src/palimpsest_hub/catalog_dto.py), [`api/catalog.py`](hub/src/palimpsest_hub/api/catalog.py), [`services/catalog.py`](hub/src/palimpsest_hub/services/catalog.py) | SQL-only visible complete named leaves and separately fresh-human-system global graph/provenance inventory; exact shared DTOs, no CAS/provider synchronization or VM API. |
+| published-image quota, image keys and anonymous reads | [`services/image_quota.py`](hub/src/palimpsest_hub/services/image_quota.py), [`api/image_admin.py`](hub/src/palimpsest_hub/api/image_admin.py), [`services/image_keys.py`](hub/src/palimpsest_hub/services/image_keys.py), [`api/image_keys.py`](hub/src/palimpsest_hub/api/image_keys.py), [`services/public_images.py`](hub/src/palimpsest_hub/services/public_images.py), [`api/published_images.py`](hub/src/palimpsest_hub/api/published_images.py) | `register_image` 안의 DB-authoritative quota(count=scope별 고유 이름, 고유 digest 압축 bytes), `ppi_v1_` image key 인증, `public` list/get/blob 익명 읽기와 per-client rate limit, oci-root source closure 검증/제공 |
+| Hub publication client | [`hub_publish.py`](src/palimpsest_local/hub_publish.py)의 `publish_local_image`, `pull_published_image`, `local_status`; CLI `published push/pull/status` | catalog image → canonical manifest/closure 재검증 → durable request id → Hub 응답 일치 후 `published`; pull은 payload/OCI chain 검증 후 OCI layout 재구성과 `inventory.record_oci_source` 등록, VM 시작 없음 |
+| published-image engine and manifest | [`image_manifest.py`](src/palimpsest_local/image_manifest.py)의 `normalize_manifest`, `manifest_digest`, `public_manifest`, `native_image_projection`; [`services/published_images.py`](hub/src/palimpsest_hub/services/published_images.py)의 `register_image`, `publish_image`, `extend_image`, `verify_source_closure`; [`image_models.py`](hub/src/palimpsest_hub/image_models.py); [`image_key_models.py`](hub/src/palimpsest_hub/image_key_models.py) | client와 Hub가 공유하는 canonical manifest/logical node identity; Hub publication engine은 `image_jobs.complete`와 SDK push/extension이 공통으로 사용하며 quota·source closure·storage binding을 한 transaction 경계에서 적용 |
+| local discovery catalog | [`local_catalog.py`](src/palimpsest_local/local_catalog.py); [`inventory.py`](src/palimpsest_local/inventory.py)의 `_collect_artifacts`, `remove_artifact` | selected state `catalog-v1/metadata.sqlite3`의 owner-bound SQLite discovery/read model(schema `user_version` 2에 publication/pull 표 포함); byte·execution·lease 권위 아님. Store listing/preview와 `store rm`은 pulled Hub image가 참조하는 digest를 삭제 불가로 표시(`deletion_blockers.published`) |
+| experimental Hub native instances | [`api/native_instances.py`](hub/src/palimpsest_hub/api/native_instances.py), [`services/native_instances.py`](hub/src/palimpsest_hub/services/native_instances.py), [`native_models.py`](hub/src/palimpsest_hub/native_models.py), [`services/ceph_scoped_store.py`](hub/src/palimpsest_hub/services/ceph_scoped_store.py) | opt-in grant-bound native API(`/native-instances` POST/GET/DELETE); 일반 HTTPS instance lane으로 dispatch하지 않음. Durable SQL intent와 private journal/SQL checkpoint가 각 provider mutation보다 먼저이며 불확실성은 replay 권한이 아님 |
+| Nova native-root proof modules | [`nova_native_cloud.py`](src/palimpsest_local/nova_native_cloud.py), [`nova_boot_carrier.py`](src/palimpsest_local/nova_boot_carrier.py), [`nova_ceph_boot.py`](src/palimpsest_local/nova_ceph_boot.py), [`nova_bootstrap_service.py`](src/palimpsest_local/nova_bootstrap_service.py), [`ceph_path_access.py`](src/palimpsest_local/ceph_path_access.py), [`guest/nova/cuda_probe.c`](guest/nova/cuda_probe.c) | experimental grant-bound Nova proof transactions, BIOS carrier, trusted-workload Nova PID1, controller-enrolled loopback-mTLS bootstrap, path/namespace-bound CephX consumers와 SDK 없는 CUDA Driver API probe. Attestation·protected local stage-1·security parity가 아님 |
 | anonymous registry acquisition | [`registry_intake.py`](src/palimpsest_local/registry_intake.py)의 `pull_anonymous_oci_archive`; CLI `oci pull` | 명시적 registry reference → 익명 TLS Skopeo → private staging → 기존 LocalArchiveSource/SourceCAS 검증 → non-overwrite archive. Docker store/Hub credential과 분리; caller가 지정한 local/private authority도 허용하되 system TLS trust는 유지 |
 | explicit Nova build/runtime | [`nova_build.py`](src/palimpsest_local/nova_build.py)의 `NovaController`, `build_nova_layer_user_data`; [`cloud_cli.py`](src/palimpsest_local/cloud_cli.py); [`nova_runtime.py`](src/palimpsest_local/nova_runtime.py) | `build --executor nova --nova-config`가 explicit project/flavor/network/retained Cinder policy로 원래 cloud-init을 전달한다. GPU 할당은 Nova flavor가 소유하며 nested libvirt/host rebind는 없다. capture upper/output은 UUID·serial·size-bound `/srv/palimpsest` ext4에 기록한다. ACTIVE와 checked guest success를 구분하고 uncertain create는 재생하지 않는다. |
+| original-caller mutation transport | [`cloud_transport.py`](src/palimpsest_local/cloud_transport.py)의 `OneShotSession`; [`cloud_cli.py`](src/palimpsest_local/cloud_cli.py)의 `_connect` | Supported session constructor preserves original identity/TLS/public scope; mutation connect/status retries, implicit reauth and redirects are disabled, mutation3xx fails closed, metadata reads retain SDK behavior. Bulk Glance PUT separately binds one-pass byte/hash proof and remaining-deadline socket waits. |
 | cloud assets/internal registry worker | [`nova_assets.py`](src/palimpsest_local/nova_assets.py)의 `AssetCatalog`; [`registry_worker.py`](src/palimpsest_local/registry_worker.py)의 `run_job` | canonical LayerCache/OCIStore bytes를 재사용하는 project-bound permanent catalog와 durable internal jobs. Source manifest/config/compressed/DiffID/recipe/output identities 및 contextual occurrence parents를 구분한다. Runtime preparation은 copy/hardlink 없이 canonical blob paths와 empty RO mountpoints를 만든다. Consumer release는 metadata-only다. |
 | local OCI build asset adapter | [`oci_build_assets.py`](src/palimpsest_local/oci_build_assets.py)의 `LocalBuildEvidence`, `register_local_oci_build`; [`nova_assets.py`](src/palimpsest_local/nova_assets.py) | Verify actual paired BuildKit records/spec keys/archive bytes and source OCI→local export→assembly artifact, then reuse canonical LayerCache materialization and occurrence catalog with distinct `oci-build` provenance. No fabricated registry job, repack or native-only timestamp relaxation. |
 | sequential Nova measurements | [`nova_metrics.py`](src/palimpsest_local/nova_metrics.py); [`scripts/benchmark_nova_gpu.py`](scripts/benchmark_nova_gpu.py) | 실제 guest diskstats/network counters와 monotonic request→ordinary-user NVIDIA readiness를 수집한다. Torch/TensorFlow × cloud-init/Nova-layer/registry-layer/Ansible × 5를 순차 실행하고 exact-owned VM만 회수하며 boot/data는 보존한다. CPU fallback·다른 boot/device·불완전 횟수·측정 실패를 성공으로 승격하지 않는다. |
@@ -915,6 +2371,9 @@ flowchart LR
 | OCI command override | [`oci_run_request.py`](src/palimpsest_local/oci_run_request.py)의 `PreparedLocalOCIRun`; [`oci_boot_plan.py`](src/palimpsest_local/oci_boot_plan.py)의 `OCIBootPlanIntent`; [`oci_process.py`](src/palimpsest_local/oci_process.py)의 `image_process_vectors`, `with_command` | trusted CAS/config snapshot authority를 boot intent까지 전달하고 lease/root 획득 전 원본 process와 유효 argv를 검증. Cmd-only override를 v4 provenance에 결합 |
 | OCI root preparation | [`oci_root_prepare.py`](src/palimpsest_local/oci_root_prepare.py)의 `prepare_oci_root_run`, `release_oci_root_transaction`; [`oci_root_volume.py`](src/palimpsest_local/oci_root_volume.py) | lower lease와 VM-exclusive ext4 root volume을 durable transaction으로 claim/release; retained root는 별도 identity로 재사용 |
 | OCI host/monitor | [`oci_run_adapter.py`](src/palimpsest_local/oci_run_adapter.py)의 `run_local_oci`, `stop_oci_run`, `rm_oci_run`; [`oci_root_runtime.py`](src/palimpsest_local/oci_root_runtime.py); `oci_monitor_*` | explicit `qemu:///system` domain, ACL/export, monitor handshake, STOP/TERMINAL과 exact cleanup을 연결 |
+| native VZ OCI-root runtime | [`vz_native_runtime.py`](src/palimpsest_local/vz_native_runtime.py)의 `run_local_oci`, `start_oci_run`, `stop_oci_run`, `rm_oci_run`, `exec_session`, `shell_session`; [`vz_root_volume.py`](src/palimpsest_local/vz_root_volume.py)의 `claim_vz_root_volume`, `release_vz_root_volume`; [`vz_lower_exports.py`](src/palimpsest_local/vz_lower_exports.py)의 `publish_vz_lower_export`, `verify_vz_lower_export`; [`darwin_process.py`](src/palimpsest_local/darwin_process.py)의 `read_process`, `list_processes` | Darwin/arm64 Lima VZ adapter for the separate Ubuntu 24.04 arm64 profile; `runtime_dispatch`의 `DispatchKey(RuntimeKind.OCI_ROOT, RuntimeBackend.LIMA_VZ)`로만 도달. Source qualification before materialization, revalidation after it and on reopen, exclusive root volume과 private lower export authority. KVM `oci_run_adapter`와 분리 |
+| VZ worker and boot assets | [`vz_worker.py`](src/palimpsest_local/vz_worker.py)의 `VZWorker`, `materialize_vz_source`; [`vz_worker_server.py`](src/palimpsest_local/vz_worker_server.py)의 `main`; [`vz_runtime_assets.py`](src/palimpsest_local/vz_runtime_assets.py); [`scripts/build_vz_runtime_assets.py`](scripts/build_vz_runtime_assets.py) | one-shot Linux worker endpoint가 qualified source를 materialize하고 결과를 qualification에 재결합; offline bounded ARM64 boot assets(kernel/modules/BusyBox/Dropbear/Lima guestagent, `PLATFORM_ABI = "palimpsest.vz-platform.v2"`)는 다운로드 없이 기존 입력에서만 생성 |
+| VZ guest platform | [`guest/vz/platform.c`](guest/vz/platform.c)의 `lowers_mount`, `root_transition`, `root_proof`, `jail_setup`; [`guest/vz/json.h`](guest/vz/json.h), [`guest/vz/sha256.h`](guest/vz/sha256.h) | ABI v2 PID 1: read-only lowers mount, OverlayFS root transition, `/`와 PID1 root의 동일성·OverlayFS 검사, workload jail 준비. KVM `guest/stage1/init.c`와 별도 binary |
 | coordinator failure diagnostics | [`oci_monitor_coordinator.py`](src/palimpsest_local/oci_monitor_coordinator.py)의 `MonitorCoordinatorFailure`, `_response`, `_parse_response` | private response v2의 고정 stage/category만 부모에 전달하고 CLI 오류에도 보존; endpoint 재인증·기존 uncertainty와 no-kill/ownership 정책은 유지 |
 | monitor-client timeout diagnostics | [`oci_monitor_client.py`](src/palimpsest_local/oci_monitor_client.py)의 `MonitorClientTimeoutSource`, `MonitorClientError`, `_Deadline`, `_stable_errors` | 고정 client-deadline·ipc-timeout·run-lock-timeout 원인만 기존 보존 안내에 덧붙임; 대기 시간·동일 요청 재시도·권한·정리 계약은 변경하지 않음 |
 | public exec guest deadline | [`cli.py`](src/palimpsest_local/cli.py)의 `exec --timeout`; [`runtime_dispatch.py`](src/palimpsest_local/runtime_dispatch.py)의 `exec`; [`oci_exec_session.py`](src/palimpsest_local/oci_exec_session.py)의 `effective_exec_timeout_ms`; [`oci_control_protocol_v2.py`](src/palimpsest_local/oci_control_protocol_v2.py)의 `DEFAULT_OCI_EXEC_TIMEOUT_MS`, `MAX_OCI_EXEC_TIMEOUT_MS`; [`guest/stage1/init.c`](guest/stage1/init.c)의 `EXEC_TIMEOUT_MS_MAX` | 정수 초1–600(기본30)만 수락해 protocol/guest 상한600,000 ms 안에서 한 명령의 guest 실행 기한만 정한다. OCI-root 전용이며 cloud-image run에 지정하면 거부한다. 재시도·run lock·monitor 대기·권한·정리·64KiB 출력 한도는 바꾸지 않는다 |
@@ -937,7 +2396,7 @@ flowchart LR
 | Hub SQL checkout | [`hub/src/palimpsest_hub/database.py`](hub/src/palimpsest_hub/database.py) | asyncmy의 닫힌 uvloop TCP transport가 pre-ping에서 DBAPI 예외 대신 `RuntimeError`를 내면 해당 signature에 한해 pool disconnect로 판정하고 새 연결을 checkout한다. SQL transaction 중단이나 무관한 `RuntimeError`는 재시도하지 않는다 |
 | Hub API/worker observability | [`hub/src/palimpsest_hub/logging.py`](hub/src/palimpsest_hub/logging.py), [`main.py`](hub/src/palimpsest_hub/main.py), [`worker.py`](hub/src/palimpsest_hub/worker.py), [`build_worker.py`](hub/src/palimpsest_hub/build_worker.py) | Shared INFO default or opt-in `PALIMPSEST_HUB_LOG_LEVEL=DEBUG` for Hub namespace only; API logs matched route template/status/duration, workers log claimed task lifecycle. DEBUG includes only bounded query metadata and numeric/controlled state summaries, never raw request/SQL/recipe/disk/credential material. Direct Uvicorn launch disables its raw-target access logger during startup. |
 
-빌드 의존 방향은 `cli 또는 /app → Hub /v1 → SQL + CAS`와 `dedicated VM worker → HTTPS build-worker routes → Hub`다. Hub API package는 local runtime 모듈을 import하거나 recipe를 실행하지 않는다. Canonical worker image는 같은 source의 root wheel과 qemu-utils/bubblewrap/SquashFS/loop/ext4 도구를 설치하며 KVM/libvirt interpreter는 없다. Worker의 direct `hub_builder`만 verified input을 read-only mount하고 bounded tmpfs와 private network namespace에서 RUN을 실행한다; 사용자 token과 service/reader/DB/Redis credentials는 VM에 전달하지 않는다.
+빌드 의존 방향은 `cli 또는 /app → Hub /v1 → SQL + CAS`와 `dedicated VM worker → HTTPS build-worker routes → Hub`다. Hub package는 같은 checkout의 `palimpsest-client==0.3.12`(`hub/pyproject.toml`, `[tool.uv.sources] path = ".."`)에 의존하며, API process는 `image_manifest`, `image_source_policy`/`registry`, Dockerfile 검증용 `buildkit` parser, native instance용 `cloud_env`/`nova_native_cloud`/`ceph_path_access`를 import한다(native instance 경로는 API `BackgroundTasks` 안에서 실행). Recipe/BuildKit 실행은 worker의 `python -I -m palimpsest_local.hub_builder|hub_image_builder` child만 수행한다. Canonical worker image는 같은 source의 root wheel과 qemu-utils/bubblewrap/SquashFS/loop/ext4 도구를 설치하며 KVM/libvirt interpreter는 없다. Worker의 direct `hub_builder`만 verified input을 read-only mount하고 bounded tmpfs와 private network namespace에서 RUN을 실행한다; 사용자 token과 service/reader/DB/Redis credentials는 VM에 전달하지 않는다.
 
 `NovaController.create`의 선택적 `boot_volume_type`은 명시한 bounded type name/UUID를 boot BDM과 생성 전 durable descriptor/spec digest에 함께 결합한다(Nova2.67+). 생략하면 기존 request/descriptor 형태를 유지한다. 실제 생성된 Cinder type은 별도로 관찰하며 요청 type만으로 물리 HDD·Ceph backend 성능을 추론하지 않는다. 기존 exact-owner/DOTFalse/uncertain-create 비재생 계약은 그대로다.
 
@@ -979,9 +2438,19 @@ Guest activation·project-init·ready helper는 profile architecture의 libvirt 
 6. stage-1 PID 1은 authenticated BOOT/plan과 block identity/filesystem geometry를 확인하고 read-only lowers + ext4 upper로 OverlayFS를 조립한다. `MS_MOVE`와 `chroot(2)`를 이용해 `/`로 전환하며 `pivot_root(2)`를 호출하지 않는다. 이후 workload를 private cgroup와 seccomp/no-new-privs 경계에서 감독한다.
 7. `stop`/`rm`은 exact run/domain/monitor identity, terminal state, ACL revocation, lower lease, root volume release를 확인한 뒤 state tree를 제거한다. retain 정책은 VM-exclusive root volume만 보존하며 shared data volume이 아니다.
 
+### Native VZ OCI-root flow (Darwin arm64)
+
+1. `runtime_dispatch.run_local_oci`는 `lima-vz` backend 요청을 `vz_native_runtime`으로, 실험용 `lima-qemu-oci` 요청을 `experimental_oci_vm`으로, 나머지 OCI-root 요청을 KVM `oci_run_adapter`로 보낸다. 이 VZ profile은 Ubuntu 24.04 arm64 / linux-arm64 / lima-vz / direct-linux tuple만 지원한다.
+2. `vz_native_runtime.run_local_oci`는 `qualify_native_root_source`로 exact CAS/OS/profile binding을 만든 뒤 `materialize_vz_source`(`VZWorker` → `vz_worker_server`)로 ordered SquashFS lowers를 만들고, materialization 직후 `revalidate_native_root_source`로 다시 검증한다. 이후 reopen(`_reopen_source`)과 worker도 같은 qualification을 재검증한다.
+3. `claim_vz_root_volume`이 run-exclusive root volume을 claim하고 `publish_vz_lower_export`가 read-only lower export를 게시한다. `vz_runtime_assets`의 offline boot assets(platform ABI v2)로 Lima VZ VM을 direct Linux boot한다.
+4. `guest/vz/platform.c` PID 1은 `lowers_mount`, `root_transition`, `root_proof`로 read-only lowers + private upper OverlayFS를 실제 `/`로 만들고 PID1 root와 대조한다. Main workload, `exec_session`, `shell_session`과 SSH는 그 root 안에서 실행된다.
+5. `stop_oci_run`/`rm_oci_run`은 Darwin process identity(`darwin_process`)와 provider 상태를 관찰해 정리하고 `release_vz_root_volume`으로 root volume을 해제한다. Live 증거는 Apple Silicon host 한 대의 M1 범위(n06 root/exec/console/SSH 등)이며 attestation이 아니다.
+
 ### Native Hub flow
 
 `HubClient`는 Keystone token을 `X-Auth-Token`으로 보내 `/v1/images`, `/v1/layers`, `/v1/uploads`, `/v1/bundles`를 호출한다. upload는 `POST → PATCH(Upload-Offset) → PUT`으로 이어지고 Hub가 수신 bytes의 digest를 다시 계산한다. SQL은 upload/session 및 layer/export metadata를 보존하고 filesystem blob store는 실제 bytes를 보존한다. bundle은 complete parent chain을 OCI image-layout tar로 내보내거나 받은 tar의 각 blob digest를 재검증한다. `/v1/image-exports` 요청은 원본 token으로 Glance 가시성과 현재 publish 권한을 확인한다. 새 Glance 작업이 필요하면 요청자 token으로 bounded Keystone Trust(trustor=요청자, trustee=service identity, 해당 project, impersonation, 최소 role, 유한 만료)를 만들고 SQL job에 결합한다. worker는 lease를 claim한 뒤 요청자의 현재 enabled user/project·publish 권한·위임 role을 재검증하고, 검증된 trust token으로만 download/conversion/finalizing을 수행해 blob을 publish한다. tenant-scoped service password fallback은 없다. Redis는 짧은 수명의 download token cache이며 작업/metadata의 정본이 아니다.
+
+`hub.py`의 `HubClient`는 image API key를 `Authorization: Bearer ppi_v1_…`로 보내며 `public` published-image list/get/blob은 credential 없이 익명으로도 읽는다. `published push`는 `PUT /v1/published-images/blobs/{digest}`로 blob을 staging한 뒤 publication 요청을 보낸다.
 
 The separate administrator gate uses the reader's fresh direct `user=SUBJECT, system="all", include_names=True` assignment query. Project-oriented effective expansion is not used for this system check: production Keystone omits the direct system assignment in that view. Exact subject user, system-all scope and named admin remain mandatory; original project token, project-private SQL visibility and failure denial are preserved. Ordinary package-owner effective membership checks are unchanged.
 
@@ -1006,6 +2475,13 @@ The separate administrator gate uses the reader's fresh direct `user=SUBJECT, sy
 | image export job | Hub SQL `palimpsest_image_exports` | Redis download token 60초 | lease owner/expiry, status와 artifact key로 중복 변환을 막음; download ticket은 발급 시각의 절대 만료를 payload에 담고 사용해도 TTL을 연장하지 않는다. ticket 발급 응답과 token 인증 download 응답 모두 `Cache-Control: no-store`다 |
 | export delegation | Hub SQL `palimpsest_image_export_delegations` (Trust ID·project·trustor·trustee·role·만료만; token/password 없음) | Keystone Trust 자체 | `pending→active→cleanup→deleted/expired`; job 종료·soft delete·attempt 소진·버려진 admission은 같은 transaction 또는 grace sweep으로 cleanup에 들어가고, cleanup 실패는 backoff 재시도만 하며 export를 다시 실행하지 않는다. 새 export는 현재 요청자의 Trust만 결합하고 이전 creator Trust는 폐기한다 |
 | shared worker maintenance roles | Hub SQL `palimpsest_worker_leases` | no cache/scheduler authority | renewable token-owned export/delegation roles; SQL fences remain through cancellation drain, stale cleanup completion cannot overwrite a replacement, and age alone cannot authorize removing live/ambiguous scratch |
+| published-image quota | Hub SQL `palimpsest_hub_image_quota_policies`(tier×visibility), `palimpsest_hub_image_quota_tiers`(user/project→tier) | code seed는 누락 행 삽입에만 사용 | DB 행이 정본; 정책/tier 변경과 모든 publication check-and-insert는 같은 global image SQL mutex로 직렬화; 하향 조정은 image를 삭제하지 않음 |
+| published-image source closure | Hub SQL `palimpsest_hub_image_source_blobs`(image_id·role·ordinal·project_id·blob_digest·size_bytes·created_at)와 payload와 같은 visibility-scoped blob 저장 경로 | 없음 | `oci-root` 전용; caller 자신이 staging한 blob만, manifest commitment·OCI 문서 정합성 검사 후 등록; image membership과 caller의 image 읽기 권한이 있을 때만 제공하며 Hub는 제공 시 재해시하지 않음(client가 검증) |
+| image API key | Hub SQL `palimpsest_image_keys`(secret SHA-256·owner·project·actions·expiry·revocation·last use) | 없음 | secret 1회 반환, 평문 저장 없음; last-use는 5분 단위로만 기록 |
+| local Hub publication/pull facts | selected state의 catalog v2 `publications`, `pulled_images`, `pulled_layers` | rebuilt OCI layout `<state>/published/<id>/layout` | request id는 첫 network 호출 전에 기록; 비밀 미저장, 공개 `ppi_v1_` key id만 `hub_credential`에 저장; 실제 bytes 정본은 store/SourceCAS이며 catalog는 discovery만 담당 |
+| published images and logical graph | Hub SQL `palimpsest_hub_published_images`(project·creator·request_id·name·visibility·manifest·leaf·storage binding), `palimpsest_hub_image_memberships`(image·ordinal·node·digest·reuse ceilings), `palimpsest_hub_layer_nodes`(project-visible logical occurrence, parent), `palimpsest_hub_publication_payloads`(user·project별 staged digest) | 없음 | `(project_id, request_id)` unique; membership이 logical node 읽기를 승인하며 CAS 소유권이 아님; staging은 project-wide CAS grant가 아님 |
+| Hub native instance intents | Hub SQL `palimpsest_native_instances`(request/profile/environment digest·image·manifest·run·journal·server·status) | private native journal | `(project_id, request_id)` unique; SQL 불확실성은 replay를 승인하지 않음 |
+| local discovery catalog | selected state `catalog-v1/metadata.sqlite3`(`local_catalog.py`, `user_version` 2) | 없음; JSON/CAS/ledger가 정본 | discovery/read model만 담당하며 lifecycle·payload·lease 권위 아님; v1 catalog는 publication/pull write 안에서만 v2로 upgrade |
 
 ### Identity와 contract
 
@@ -1021,12 +2497,12 @@ The separate administrator gate uses the reader's fresh direct `user=SUBJECT, sy
 - `run_id`/run name, `OCIRootVolumeRecord.volume_id`와 generation, `ArtifactLeaseOwner`/lease-set ID, libvirt domain UUID, monitor authority는 lifecycle identity다. retained root 재사용은 같은 lower graph/size와 exclusive attachment 조건을 다시 확인한다.
 - Hub layer `kind`는 `cloud-image`, `squashfs`, `buildkit-cache`를 구분한다. cloud image는 `disk_format`과 `arch`가 필요하고 parent/chain이 없다. 새 unqualified `buildkit-cache` 등록은 은퇴했으며 기존 행은 보존·조회만 한다. Mandatory online cache는 project/package/key에 묶인 native cache upload만 받는다.
 - Artifact target architecture는 nullable canonical `arch` (`x86_64`/`aarch64`)다. Palimpsestfile/Lima build record와 SquashFS descriptor는 `spec.base.arch`, commit은 digest-verified guest base ledger, BuildKit runtime pack은 검증된 target platform에서 정한다. Host CPU로 target을 추정하지 않는다. `ContentStore.write_metadata`는 digest guard 안에서 top-level/config architecture를 대조해 known 값을 지우거나 재지정하지 못하게 한다. `LayerRef.arch`는 known mismatch를 StackRef/BuildSpec 및 CLI chain resolution에서 실행 전에 거부한다. 기존 unlabelled layer는 그대로 unknown이며 자동 migration은 없다.
-- `store/image/layer check` 및 local HTTP compatibility 조회는 `compatible`/`incompatible`/`unknown`, client/backend, dependencies, 이유와 metadata-only scope를 반환한다. SquashFS는 최대25개, root의 명시적 base binding, 전체 parent와 cloud image의 known 동종 target이 필요하다. `--compatible` 목록은 unknown도 제외하며 별도 `--arch`는 foreign target 탐색을 허용한다. 현재 client는 runtime host이고 browser 기종이 아니다. Default VZ/KVM 및 OCI-root Linux amd64 KVM 제한은 유지된다. 실제 byte verification·runtime preflight·GPU/Vulkan/CUDA·ABI·boot qualification을 대체하지 않는다.
+- `store/image/layer check` 및 local HTTP compatibility 조회는 `compatible`/`incompatible`/`unknown`, client/backend, dependencies, 이유와 metadata-only scope를 반환한다. SquashFS는 최대25개, root의 명시적 base binding, 전체 parent와 cloud image의 known 동종 target이 필요하다. `--compatible` 목록은 unknown도 제외하며 별도 `--arch`는 foreign target 탐색을 허용한다. 현재 client는 runtime host이고 browser 기종이 아니다. Default VZ/KVM 제한과 OCI-root의 두 profile(Linux amd64 KVM, 별도 Darwin arm64 Lima VZ의 Ubuntu 24.04 arm64 profile) 제한은 유지된다. 실제 byte verification·runtime preflight·GPU/Vulkan/CUDA·ABI·boot qualification을 대체하지 않는다.
 - Hub build input/result/publication은 verified x86_64 base target을 전달·대조하고 output row/config에 기록한다. 기존 `arch` column과 SQL exact filtering을 재사용하므로 DB migration은 없다. Native helper result의 `arch`는 필수이므로 Hub worker와 해당 client/helper를 함께 갱신한다. 등록은 visible known dependency 충돌만 거부하며 hidden/missing dependency를 구분해 노출하지 않는다. Bundle per-artifact config의 architecture와 leaf manifest/config 일치를 digest-verified 상태로 보존하고, local bundle runtime의 과거 hardcoded x86_64 선택을 제거한다. `image push`는 recorded arch를 재사용하거나 explicit target을 요구하며 충돌을 network publication 전에 거부한다.
 - native Hub `/v1`는 OCI Distribution `/v2` endpoint가 아니다. Native package는 `AUTHORITY/NAMESPACE/PACKAGE:TAG`이며 namespace는 정확한 Keystone project ID 하나에 불변 binding된다(자동 `p-<32hex>` 또는 `p-h-<sha256 56hex>`, 읽기 쉬운 이름은 운영자 binding만). Project/user ID는 64자 이하 opaque ASCII로 정확히 비교하고 UUID 정규화는 Hub 생성 key/package/upload ID에만 쓴다. Version은 불변 root digest, tag는 `expected_tag_digest` compare-and-set(충돌 412)이며 graph의 모든 blob은 CAS reference로 보호된다. Genuine OCI profile의 Docker `push/login/build --push`와 unconfigured authority는 기존 Docker 경로를 유지한다.
-- Native package/artifact authorization now uses registered service-local `oslo.policy` actions (`hub/src/palimpsest_hub/policy.py`) after fresh unique-global Keystone role-ID/current membership validation. Grade-only grants need no service implication edges or member/reader co-role. Original-token/current-owner action intersection and issued-key/current-owner action ceilings share the operator YAML; cache actions remain independent of package labels. Project admin is project-local, while system-only controls require fresh human system proof before `system:manage` policy attenuation. Protected identities, exact project/package/user ownership, key scope/expiry/revocation and provider credential restrictions remain hard boundaries even under `@`. Authenticated `/v1/policy/capabilities` projects the same engine; empty arrays are valid. API and export worker mount operator policy at `/etc/palimpsest/policy.yaml`; see [operator configuration and unrun HTTP probes](docs/install.md#hub-service-local-authorization-policy).
-- Fresh native personal owners are an additional registered **project-only** policy alternative, not Keystone roles: exact project owner marker = actual user ID; enabled native project and user/home; enabled owning domain named exactly `Personal`, with absent or `personal` kind; only direct global member raw binding and safe member/reader effective provenance, with no foreign/group/inherited authority. Original unrestricted human token and current-owner action intersections include the derived internal boolean. Package-key owner revalidation recomputes it but cannot extend declared package/action scope, key expiry/revocation or machine ceilings. Package read/publish, independent cache actions and own-key issue/list/revoke are project-local. Existing `packages:delete` covers only exact-project package metadata under its project/package lock: verified system humans or freshly verified personal humans may delete it, never ordinary service admins/members or keys, even under YAML `@`. A hidden request-local original token is revalidated with owner/provenance/policy before metadata mutation and before commit; no system identity or general human-write bypass is fabricated, and shared CAS/reference-aware GC remains unchanged. `system:manage`, shared artifact deletion, public layer publication and builds remain system-only. Operator deny still wins. Added SDK/HTTP regressions are test-defined, not run in this slice.
-- Hub `POST /v1/builds`는 Keystone **system-admin**과 project scope를 함께 요구하고, 보이는 x86_64 raw/qcow2 cloud base와 순서·parent/base가 일치하는 SquashFS 25개 이하만 큐에 넣는다. 1MiB 이하 recipe의 `FROM`/`LAYER`와 요청 digest는 worker의 `verify_build_integrity`에서 정확히 비교한다. 요청은 project별 동시 queued/building 최대4개·시간당 생성6개로 제한하며 output `blob_digest`는 같은 project의 private layer와 표준 `/v1/layers/{digest}/blob`에서 조회한다. `GET /v1/builds`/`{id}`는 다른 project에 404/빈 목록이고 raw recipe·worker 경로·user id를 반환하지 않는다. `/app`은 token을 storage/cookie에 넣지 않는 같은 origin의 선택적 browser client다.
+- Native package/artifact authorization uses registered `oslo.policy` actions after fresh unique-global Keystone role-ID/current membership validation. Thirteen-action defaults and hard ceilings distinguish reader, member and manager, with exact-owner `keys:revoke_own` and `packages:manage_own` exceptions. Canonical role implications remain native, not locally fabricated. Original-token/current-owner and issued-key/current-owner intersections enforce project/package/private-user ownership, expiry and credential restrictions. Package keys retain only five read/write actions; neither self-action nor management is delegated. Policy responses contain action names, not obsolete role-shaped aliases.
+- Personal-owner provenance is not transported as authorization. Required complete current membership, raw system proof, exact native role graph and enabled home/project domains remain fail-closed. Original member tokens publish/edit and may clean up only their recorded consumers; manager metadata deletion remains reference-aware, blocking foreign-project grants and all parent/base consumers. Private creators and original profile bindings remain protected. Shared catalogs and global operations retain separate fresh human system authorization.
+- Hub `POST /v1/builds` requires current project write authority; `GET /v1/builds` and detail require inventory authority and return only the exact target project. Existing visible x86_64 raw/qcow2 input checks, parent/base closure, 25-layer/1MiB limits, four-active-project queue and six/hour admission remain. Worker callbacks still require independent machine key plus exact lease/claim identity; API processes never execute recipes.
 
 - `GET /v1/layers/{digest}`의 상세 `HubLayerDetailResponse`는 보이는 root→parent 순서의 `ancestors`와, 해당 체인이 root까지 도달했는지의 필수 boolean `chain_complete`를 포함한다. 별도 `/ancestors`는 root→self 목록을 반환하며, parent가 누락되거나 보이지 않으면 체인이 끊기고 상세 응답의 `chain_complete=false`다. 검색·업로드·조상 목록은 기존 `HubLayerResponse` 형태를 유지한다. 이는 앞선 native proof에서 발견된 단일 metadata projection 누락만 고친다. 실제 native build/recovery를 다시 실행한 증거는 아니다.
 
@@ -1044,7 +2520,7 @@ PAX `x` 확장의 `size` record는 4MiB 확장 payload 상한 안에서 길이�
 - 사용자 설치 경로는 직접 Git VCS 설치다. 빠른 진입점은 [`install.md`](install.md), 패키지·플랫폼·설정 상세는 [`docs/install.md`](docs/install.md), 명령·옵션 reference는 [`docs/cli/README.md`](docs/cli/README.md), 명령별 실행 순서·설정·플랫폼 제한은 [`docs/cli/workflows.md`](docs/cli/workflows.md)다. `palimpsest-client`는 repository root, `palimpsest-hub`는 `#subdirectory=hub` selector로 설치한다. 로컬 wheel/sdist 생성과 설치 검증은 공개 PyPI 배포 또는 KVM release gate 통과를 뜻하지 않는다. 패키지 설치는 사용자 데이터·호스트 권한·게스트 정책을 자동 변경하지 않는다.
 - base package는 `palimpsest-client` Python 3.11+이며 필수 runtime dependency가 없다. Linux libvirt는 `[kvm]` extra(`libvirt-python>=10.0.0`)다.
 - conventional macOS Apple Silicon은 Lima 2.1+ VZ(`lima-vz`)를 기본으로 사용한다. 명시적 실험용 `libvirt-hvf`는 Homebrew QEMU, `pkgconf`(`libvirt-python` 빌드 시), host libvirt, `[kvm]` extra, `qemu:///session` 및 `hdiutil`이 필요하며 conventional aarch64 cloud-image VM에만 적용된다. Linux KVM은 `/dev/kvm`, QEMU, `qemu:///system`, `default` network와 `cloud-localds`, `mksquashfs`, OpenSSH가 필요하다.
-- OCI-root public adapter는 Linux x86_64, `/dev/kvm`, `qemu:///system`, qualified kernel/config/packer absolute paths와 digest pins, system libvirt event surface를 요구한다. OCI network는 `nat`·`host-only`·`none` 세 값만 허용하며 `nat`/`host-only`는 user-mode 지원 QEMU(`-netdev help`의 `user`)를 state 변경 전에 확인한다. guest 내부 loopback과 NIC 검증 때문에 kernel config의 `CONFIG_NET=y`, `CONFIG_INET=y`, `CONFIG_IP_PNP=y`, `CONFIG_VIRTIO_NET=y`를 요구한다. host bridge·libvirt network·firewall rule·IPv6·VM 간 L2는 제공하지 않는다.
+- KVM OCI-root public adapter는 Linux x86_64, `/dev/kvm`, `qemu:///system`, qualified kernel/config/packer absolute paths와 digest pins, system libvirt event surface를 요구한다. 별도 Darwin arm64 Lima VZ OCI-root profile은 Ubuntu 24.04 arm64 image만 받고 `scripts/build_vz_runtime_assets.py`로 미리 만든 offline boot assets를 사용한다(아래 network 요건은 KVM adapter 기준). OCI network는 `nat`·`host-only`·`none` 세 값만 허용하며 `nat`/`host-only`는 user-mode 지원 QEMU(`-netdev help`의 `user`)를 state 변경 전에 확인한다. guest 내부 loopback과 NIC 검증 때문에 kernel config의 `CONFIG_NET=y`, `CONFIG_INET=y`, `CONFIG_IP_PNP=y`, `CONFIG_VIRTIO_NET=y`를 요구한다. host bridge·libvirt network·firewall rule·IPv6·VM 간 L2는 제공하지 않는다.
 - OCI-root startup event service는 public 준비 connection과 bound monitor connection의 libvirt server keepalive를 위한 bounded 보조 thread일 뿐 materialization deadline을 늘리지 않는다. 10ms 이하 event timer, 1초 handshake/join 경계와 100ms event-lock 대기를 사용하지만 이는 libvirt syscall의 hard wall-clock deadline이 아니다. PID/token/libvirt identity, event-driver lock, strict integer health를 매 cycle과 foreground checkpoint에서 재검증한다. 실패 처리는 phase별로 다르다. `defineXML` 시도 뒤 durable definition 기록 전의 health loss는 기존 exact cleanup을 실행한다. durable definition 뒤 public preparation health loss는 inactive domain과 `defined` ledger를 그대로 보존한다. bound monitor가 activation intent/post-create 뒤 실패하여 connection을 quarantine한 경우에는 exact UUID의 cleanup-required ledger를 기록한다. 어느 phase에서든 quarantine된 exact connection은 자동 cleanup이나 close에 사용하지 않고 reconnect하지 않으며, guest/stage-1/monitor daemon 프로토콜은 바꾸지 않는다.
 - local state에는 `store/`, `runs/`, `projects/`, `volumes/`, `builds/`, `build-cache/`, `runtime-packs/`, `tags/`, `transfers/`, `oci-root-volumes/`가 있다. Linux에서 env/config/XDG override가 모두 없을 때만 기본 root는 `/var/lib/palimpsest`다. 기존 `~/.local/state/palimpsest` 항목이 있으면 새 기본값으로 조용히 전환하지 않고 명시적 XDG 선택을 요구하며, 기존 명시 root와 자료는 자동 이동하지 않는다. `ps`/`inspect`/`logs`의 runtime 관찰은 durable ledger 또는 retained console을 읽으며, CLI 호출의 host journal은 별도로 기록한다. 현재 raw console의 pinned identity와 경로는 바뀌지 않았다. 세부 경계는 [`docs/linux-storage-logging.md`](docs/linux-storage-logging.md)에 있다.
 
@@ -1209,9 +2685,11 @@ IOMMU 그룹과 host 사용자 확인을 요구한다. 상세 제한은 [GPU 경
 
 | 주체/경계 | 권한과 인증 | 저장/전송 원칙 |
 | --- | --- | --- |
-| 로컬 사용자와 CLI | owner-only selected state root; legacy Hub 요청은 `PALIMPSEST_TOKEN`; native package는 profile `api_base` + `/projects/NAMESPACE`의 Docker credential helper entry 또는 일회성 `PALIMPSEST_PACKAGE_KEY` | token/key를 state/ledger/log/receipt에 저장하지 않으며 두 변수는 Docker·Buildx·mksquashfs·helper child 환경에서 제거; native HTTPS는 CA 검증·redirect 거부; 원본 archive digest/size/root를 typed receipt로 고정 |
+| 로컬 사용자와 CLI | owner-only selected state root; legacy Hub 요청은 `PALIMPSEST_TOKEN`; native package는 profile `api_base` + `/projects/NAMESPACE`의 Docker credential helper entry 또는 일회성 `PALIMPSEST_PACKAGE_KEY`; `published push/pull`은 owner-only `--image-key-file` → `PALIMPSEST_IMAGE_KEY` → `PALIMPSEST_TOKEN` 중 하나(pull만 익명 가능) | token/key를 state/ledger/log/receipt에 저장하지 않으며 세 변수(`PALIMPSEST_PACKAGE_KEY`, `PALIMPSEST_TOKEN`, `PALIMPSEST_IMAGE_KEY`)는 `credential_free_subprocess_environment`가 Docker·Buildx·mksquashfs·helper child 환경에서 제거; native HTTPS는 CA 검증·redirect 거부; 원본 archive digest/size/root를 typed receipt로 고정 |
 | Hub API 사용자 | 원본 project-scoped token을 별도 reader validator가 subject 검증; `X-Project-Id`는 원본 scope assertion, `X-Target-Project-Id`는 freshly verified human system-admin의 logical target | package/layer/build management는 exact global admin role-ID의 current system:all assignment로 target membership/service leaves 없이 허용; 원본 user/token/scope와 requester audit 보존, target/namespace/visibility/state safety 유지; 일반 member/key와 machine credentials는 기존 attenuated 정책 유지 |
 | Native package key | `ppk_v1_<key UUID>.<32-byte secret>` bearer; 발급 응답에서만 secret 1회, SHA-256만 저장; exact package scope와 `packages:*`/`cache:*` action | 매 요청·finalize 때 만료/폐기·owner의 enabled user/project·fresh effective membership을 재확인하고 identity 장애는 503; key는 다른 key·OpenStack·build/export 권한이 없음 |
+| Image API key | `ppi_v1_<32 hex>.<43 base64url>` bearer, package key와 별도 kind; 원본 human Keystone token만 발급/목록/폐기, 발급자가 현재 가진 `images:read`/`images:publish`만 위임, 1–90일, 사용자당 활성 50개(설정) | 매 요청과 mutation 경계에서 만료/폐기·현재 owner project membership 재확인, 유효 action은 저장 action ∩ 현재 권한; publish는 read를 포함하지 않음; key 관리·target 선택·package 권한 없음. `ppk_v1` package key는 image 권한이 없음 |
+| Anonymous public image reader | credential 없음; `public` image의 list/get/blob만 | owner/project/storage 필드를 뺀 projection; 잘못된 credential은 401이며 익명으로 강등하지 않음; uvicorn이 해석한 client 주소별(IPv6 /64) process-local rate limit; 신뢰되지 않은 proxy 뒤에서는 proxy 하나가 bucket 하나 |
 | Hub build worker | system-admin/project-scoped jobs only; dedicated CPU-only service VM, HTTPS worker key plus exact claim lease, no SQL/CAS/NFS or DB/Redis/Keystone credentials | Root privileged VM is the kernel boundary, not hostile-kernel isolation; verified read-only inputs, bounded tmpfs and network-isolated bubblewrap, API digest/size/magic-verified private project output. Lost claim halts; lost output/fail settles status-only; restart never re-executes, unverifiable exact process/loop cleanup retains scratch and halts. DNS/connect establishment is outside the watchdog |
 | Hub `/app` browser | project-scoped token을 입력받는 same-origin client; build 버튼은 별도 system-admin gate | token은 JS 메모리에만 보관하고 reload 때 폐기; HTTPS 필요, external script/storage/cookie 사용하지 않음 |
 | Hub service identity | export Trust trustee(`OS_USERNAME`/`OS_PASSWORD`)와 별도의 read-only validator(`OS_READER_*`) | trustee는 자기 service project 인증으로 ID만 확인하고 tenant project로 password scope하지 않으며 tenant role assignment가 필요 없다; validator가 admin/manager/service role이면 503으로 fail closed; source code와 문서에 credential을 넣지 않으며, export blob은 configured local path에 저장 |
@@ -1410,15 +2888,336 @@ uv run python scripts/test_lanes.py run gate2
 | OCI descriptor/source/CAS | [`oci_source.py`](src/palimpsest_local/oci_source.py), [`oci_layout.py`](src/palimpsest_local/oci_layout.py), [`oci_store.py`](src/palimpsest_local/oci_store.py) | `tests/unit/test_oci_source.py`, `test_oci_layout.py`, `test_oci_store.py`, `docs/oci-*.md` 해당 contract |
 | materializer, packer, derived cache | [`oci_materializer.py`](src/palimpsest_local/oci_materializer.py), [`oci_materializer_worker.py`](src/palimpsest_local/oci_materializer_worker.py), [`oci_packer.py`](src/palimpsest_local/oci_packer.py) | `tests/unit/test_oci_converter_first_pass.py`, `test_oci_worker_protocol.py`, [`docs/testing.md`](docs/testing.md) |
 | root volume, monitor, guest lifecycle | [`oci_root_prepare.py`](src/palimpsest_local/oci_root_prepare.py), [`oci_root_volume.py`](src/palimpsest_local/oci_root_volume.py), [`oci_run_adapter.py`](src/palimpsest_local/oci_run_adapter.py), [`guest/stage1/init.c`](guest/stage1/init.c) | related `tests/unit/test_oci_root_*`, `tests/kvm/*`, [`docs/oci-root-proof.md`](docs/oci-root-proof.md), runtime roadmap (read-only qualification record) |
+| native VZ OCI-root (Darwin arm64) | [`vz_native_runtime.py`](src/palimpsest_local/vz_native_runtime.py), [`vz_worker.py`](src/palimpsest_local/vz_worker.py), [`vz_root_volume.py`](src/palimpsest_local/vz_root_volume.py), [`vz_lower_exports.py`](src/palimpsest_local/vz_lower_exports.py), [`vz_runtime_assets.py`](src/palimpsest_local/vz_runtime_assets.py), [`guest/vz/platform.c`](guest/vz/platform.c), [`native_root_source.py`](src/palimpsest_local/native_root_source.py) | `tests/unit/test_vz_runtime_assets.py`, `test_darwin_process.py`, `test_native_root_source.py`, `test_native_root_source_cli.py`, [`tests/fixtures/vz-native-root/`](tests/fixtures/vz-native-root/), [VZ native-root contract](openspec/specs/vz-native-root/spec.md); changed bytes need their own native approval |
 | Hub API/schema/auth/UI | [`hub/src/palimpsest_hub/api/hub.py`](hub/src/palimpsest_hub/api/hub.py), [`api/builds.py`](hub/src/palimpsest_hub/api/builds.py), [`auth.py`](hub/src/palimpsest_hub/auth.py), [`models.py`](hub/src/palimpsest_hub/models.py), [`static/hub.js`](hub/src/palimpsest_hub/static/hub.js) | `hub/tests/test_auth.py`, `test_hub_api.py`, `test_builds.py`, `test_upload_limits.py`, [`docs/install.md`](docs/install.md), this document's contracts/security |
 | Hub worker/storage/deployment | [`worker.py`](hub/src/palimpsest_hub/worker.py), [`build_worker.py`](hub/src/palimpsest_hub/build_worker.py), [`services/builds.py`](hub/src/palimpsest_hub/services/builds.py), [`hub_builder.py`](src/palimpsest_local/hub_builder.py), `services/hub_store.py`, `bootstrap.py`, `migrate.py` | `hub/tests/test_image_exports.py`, `test_builds.py`, `test_migrate.py`, [`docs/install.md`](docs/install.md), [`docs/testing.md`](docs/testing.md), native KVM 별도 승인/proof |
 | Hub export delegation (Keystone Trust) | [`openstack.py`](hub/src/palimpsest_hub/openstack.py), [`services/image_exports.py`](hub/src/palimpsest_hub/services/image_exports.py), [`auth.py`](hub/src/palimpsest_hub/auth.py), [`config.py`](hub/src/palimpsest_hub/config.py), Kolla `defaults/main.yml`·`precheck.yml` | [`hub/tests/test_export_delegation.py`](hub/tests/test_export_delegation.py), `test_image_exports.py`, `test_migrate.py`, [`docs/install.md`](docs/install.md); installed keystoneauth/keystoneclient trust API, operator Keystone trust policy 별도 확인 |
+| Hub image publication, quota, image keys, anonymous reads | [`services/published_images.py`](hub/src/palimpsest_hub/services/published_images.py), [`services/image_quota.py`](hub/src/palimpsest_hub/services/image_quota.py), [`services/image_keys.py`](hub/src/palimpsest_hub/services/image_keys.py), [`services/public_images.py`](hub/src/palimpsest_hub/services/public_images.py), [`api/published_images.py`](hub/src/palimpsest_hub/api/published_images.py), [`image_manifest.py`](src/palimpsest_local/image_manifest.py), [`hub_publish.py`](src/palimpsest_local/hub_publish.py), [`local_catalog.py`](src/palimpsest_local/local_catalog.py) | `hub/tests/test_image_quota.py`, `test_image_jobs_quota.py`, `test_image_source_closure.py`, `test_image_keys.py`, `test_public_images.py`, `tests/unit/test_hub_publish.py`, `migrate.py`, Kolla `palimpsest_api_forwarded_allow_ips`, this document's M2 section |
 | Hub DB connection recovery | [`hub/src/palimpsest_hub/database.py`](hub/src/palimpsest_hub/database.py) | [`hub/tests/test_database_pool.py`](hub/tests/test_database_pool.py), [`docs/install.md`](docs/install.md), production upload lifecycle 재검증 |
 | tests, CI, lane membership | [`scripts/test_lanes.py`](scripts/test_lanes.py), [`.github/workflows/test.yml`](.github/workflows/test.yml), `pyproject.toml` | 해당 lane, CI 형태 계약 [`tests/unit/test_test_lanes.py`](tests/unit/test_test_lanes.py), [`docs/testing.md`](docs/testing.md), [CI safety/performance spec](openspec/specs/ci-safety-and-performance/spec.md)의 전후 실측·보호 규칙, architecture check/stamp |
 
 구조 영향이 없는 bugfix/refactor도 source를 읽은 뒤 이 문서 `Maintenance`의 최신 summary에 영향 없음과 이유를 남긴다. 계획 문서나 roadmap만 갱신하고 구현 상태를 승격하지 않는다.
 
 ## Maintenance
+
+2026-11-03 standard project-role source review: traced policy defaults/override
+ceiling, native original/current role intersection, key attenuation, registry
+human mutation/deletion, layer/global catalog distinction, project build APIs,
+export role callers, independent catalog federation and console flags. Removed
+direct service-grade and personal-owner authority defaults without changing
+native membership provenance or IAM data. Added source regression contracts;
+no tests/build/lint/format/stamp/live operations run by this implementation slice.
+
+2026-11-05 observation concurrency review192/204/210: trace actual dashboard
+unavailable199 to fail-fast shared custody, use one five-second acquisition
+deadline across the whole reconcile pass and preserve lifecycle defaults.
+Revalidate current namespace/lock against held descriptors after acquisition
+without mutable-directory-ctime pins. Project native status/alias from one
+validated locked-adapter result; raw snapshots stay private and transport
+revalidation remains final. Two independent re-reviews close initial P2/P3s;
+26 boundary cases and1580pass/6skip affected tests pass. Corrected only old
+stdin test interfaces, not the production non-TTY guard. CLI help/reference and
+README now describe exact qualified native VZ support. No platform C/ABI,
+source graph/DB schema, force policy or cloud/publication change. Actual new-SDK
+cohort and remaining upper/dual-run acceptance remain required.
+
+2026-11-05 native liveness/retained-exec review146/156: trace canonical pinned
+reconciliation versus ambient home/alias authority and preserve independent main
+state. Keep native exec on the retained non-daemon registry; explicit trusted
+dispatch selects process-only completion, default KVM requires its original ACK.
+Always settle registry accounting after failed required observations. Rejected
+direct-return proposal is not activated. Independent production findings closed;
+added Access-level native0/KVM1 controls and real gated-child detach/shutdown
+regressions pass. Final1178 host/UI/ACK cases, Ruff and scoped format pass; live
+new-source native/dashboard acceptance is still pending. No gbrain sync: CLI is
+unavailable; no source upload, global setup or unrelated guidance file was added.
+
+2026-11-05 source97/98/99 review: trace closed per-instance default-gvisor endpoint
+provenance, normal returned-stop observation/ledger settlement and no-replay
+ordinary delete/release. Independent security review found no blockers; old
+forced endpoint cleanup remains separate. Qualify the exact password/PAM/syslog-
+disabled SSH build in the shared builder/loader path before omitting unsupported
+argv flags. Independent SSH/profile review found no production blockers.
+117focused cases, Ruff and actual public-loader old-accepts/new-rejects forgery
+smoke pass; actual n05 cleanup and real SSH component remain pending. Preserve
+earlier wrong-class test failures and avoid formatter escape-semantics changes.
+User-added Packer build-inclusive comparison is canonical M1-27, not an executed
+benchmark or broader resource permission.
+
+2026-11-05 source90/92 readonly-FD/diagnostic review: trace injection and all
+readonly/writable/jail callers, detached mount UAPI and source/target FD lifetime;
+preserve source hardening and covered-inode provenance. Independently review
+bounded private stderr, stdout-first EOF and unchanged HOLD custody/no-force
+invariants. Actual namespace/sysfs smokes and five real-child cases pass, plus
+206complete protocol cases on Linux; full Darwin SIGSYS remains recorded, not
+suppressed. Remove incidental test-message/copy pins, assert serialized evidence
+behavior and follow formatter output. n04 exact cleanup is verified, not native
+root/SSH acceptance or validation of past manual custody clears.
+
+2026-11-05 source83 diagnostic review: trace full init_main ordering rather than
+assuming only OverlayFS/MS_MOVE could fail. Preserve the passing child-namespace
+component and its differences from an initial rootfs. Fresh tool/package/asset
+readbacks and original empty worker custody were checked without a new consumer.
+Correct only the stale ABI1 asset-CLI documentation to the actual required ABI2;
+CLI help passed. Conditional cleanup permission for future failed starts remains
+separate from the consumed n03 grant and the existing M1 normal-operation budget.
+
+2026-11-05 source80 exact forced-cleanup review: migrate every current private
+signal caller to explicit enum scope; trace independent SIGKILL intent, preserved
+SIGTERM failure and no replay through ordinary RM. Source-only independent
+security/lifecycle audits closed concrete directory FD, late-related-process and
+post-read expiry gaps. Real filesystem fixtures and375affected tests passed;
+actual owned-child ignored-term/kill/stale-metadata/durable/replay smoke passed.
+These are bounded source/component proofs, not n03 acceptance or a race-free
+same-UID sandbox. Exact amendment79 and fresh original authority remain required.
+
+2026-11-05 source77 one-shot termination review: trace default-off scope admission,
+durable signal phases, preserved failed-stop history, exact actor and live deadline
+checks, fresh provider/endpoint/related-process absence and canonical RM release.
+Independent security/lifecycle reviews and357affected tests close the fixable
+invocation concerns. The actual local child smoke proves signal/durable-state
+behavior only, with synthetic non-VM resource authorities; it does not authorize
+n03 or prove guest shutdown. Keep documented Darwin numeric-PID race and pending
+fresh operational window; no normal-stop fallback or extra signal is enabled.
+
+2026-11-04 source75 observer review: read every observer consumer (only the native
+failed-start path), preserve strict original-executable scope/serialization and
+extract the unchanged related-process custody predicate. Kernel ENOENT means an
+unknown inventory executable, not absence; inaccessible argv and unstable reads
+still block. Owned-child failing-before/passing-after and real same-UID inventory
+proofs are separate from any VM action; exact receipts live in the Goal proof root.
+
+2026-11-04 source69 failed-start custody review: add concrete native Darwin
+observer and exact private run/actor/network/deadline scope to canonical STOP/RM.
+Keep all eight carrier fields, every original binding, durable one-attempt
+fences and full actor/endpoint absence before conditional deletion. No raw
+signal/TERM fallback or manual unlock. Independent review closed source issues,
+including omitted-zero PID decoding and conclusive lstat absence. Parent real
+self/owned-child/actor observations,13process regressions,472affected contracts
+and unknown-filesystem guards passed. Actual admission remains blocked by
+n03's historical carrier ctime; no operational effect or benign-history claim.
+
+
+2026-11-04 source64 diagnostic review: add failure-only mount syscall context
+and restore errno before the existing fatal/poweroff path. Source/target/type/
+flags are reported, mount data/options are not. Static ARM warnings-as-errors
+compile and actual UID501 failed mount output/errno/exit125 passed; fixtures
+were removed. Source-only independent review closed without findings. No mount
+behavior/root-transition fix, new bundle or new native success is claimed.
+
+
+2026-11-04 source62 owner-scoped reconciliation review: separate failed-prestart
+destruction from historical carrier ctime without repinning or changing runtime
+start/admission. Exact original HOLD-reason pairs, all other stamp/digest fields,
+current full-read stability, source/config/seed/key/root/lease/export and actor
+guards remain. Independent source review found no issue. Actual canonical
+read-only probes reject20 invalid carrier/start/access/partial-delete cases;
+four malformed markers and an actual metadata race during hashing also reject.
+The complete real49 cleanup qualification passes; actual normal RM/absence
+still must be observed under the separate exact owner approval.
+
+
+2026-11-04 M1-15/16 source review: replace rejected root/UID0 Lima bootstrap
+with genuine plmctl1000/private privileged control and original OCI User; require
+ABI2 assets, bounded stock-agent CIDATA, pinned provider config-file authority,
+exact actual CLI-create output admission, no-force actor/session custody and
+absence-before-release failed-prestart recovery. Independent guest/asset/worker/
+native reviews cover their source slices, not native qualification. Actual C44/
+asset44/worker45 and source51 affected751/15skip evidence is recorded above.
+The pre-delete additional-root directory check now precedes Lima's possible
+disk-unlock side effect; isolated consumer/unknown-entry cases were blocked
+without removing them and actual held root was read-only verified unused.
+Six scoped modules passed Ruff57; final formatter0.16.0 preserves their Python
+ASTs. The new portable asset test is explicitly classified in existing oci-guest;
+special/native gates are unchanged. Source60 classification failure is retained,
+source61 actual manifest check and final894/15skip selection passed. Actual
+credential-free read-only browser navigation and ordinary server Ctrl-C exit0
+were observed; native console/session lifetime remains unverified.
+Carrier-ctime cause remains unproven after component55, full-stamp/HOLD policy
+remains intact and case49 has not been deleted or booted. No new consumer, host
+install, publication, deployment or cloud/GPU operation is authorized here.
+
+
+2026-11-04 M1-10 v2 lower-only whiteout review: canonical reducer now applies
+marker effects ancestor-first independent of archive position, deletion dominates
+opacity, suppressed descendants retained for later recreation, and recreated
+directories stay opaque across file/type churn. Repeated unresolved forward
+hardlinks now register after prior-node cancellation. The OS reader no longer
+interprets physical markers a second time and relies solely on the canonical
+table. Source24 focused1057 and privileged 2-case canonical SquashFS/OverlayFS
+proof passed with normal unmount/loop release. Four impacted lanes on source24
+runtime are recorded separately when settled. Inherited parent-directory metadata
+(upper child without explicit parent dir masking lower 123:456/0710 with
+synthetic 0:0/0755) remains an open P1 blocker with parent-aware recipe binding
+required; M1-09/10 stay unchecked and no VZ root/access is claimed.
+
+
+2026-11-04 M1-09 filesystem-boundary review: reviewed acquisition/native typed
+snapshots, exact ARM cold reconstruction, ordered occurrence/recipe identity,
+unchanged amd64 wire/serialization and legacy KVM/recovery pre-effect guards.
+Independent reconstruction audit found no blockers. The separate CLI audit
+found a real discovery-budget gap; the repair threads one absolute deadline
+through version, dependency probes and capability verification, retaining
+default behavior and identity. Its read-only closure found no remaining issue.
+Source20 focused1164 and four impacted lanes7642/20skipped/142warnings passed.
+Real source17 cold conversion and source17/20 warm CLI reuse preserved five
+layer receipts; verified artifact/unsquashfs and expired-no-spawn/real discovery
+smokes passed. Earlier fixture/sandbox/cache-label failures are retained.
+Source qualification/execution admission and VZ root/access remain separate.
+M1-10 still has a reproduced v1 whiteout ordering/recreated-directory fidelity
+defect; this source review does not declare full filesystem or M1 completion.
+
+
+2026-11-04 M1-05–07 local-build review: reviewed full-context/external-Dockerfile
+handoff, original Ubuntu ARM descriptor/DiffID retention, actual C/package fixture,
+BuildKit-native ignore selection/key/lifetime and optional cacheless solve state.
+Source13 focused553 and six actual product CLI cases passed. Source14 only
+formats the implementation and strengthens an unchanged-context identity test;
+lint/format passed; two independent read-only source audits found no blockers.
+Four impacted lanes settled7598pass/20skip/1offline-backend-cache failure; the
+exact wheel-build/install node passed separately after assigning the preexisting
+verified cache. The initial full run is retained as failed, not relabelled green.
+Earlier invalid policy-field, read-only daemon temp/runc and ruff-cache setup
+failures are retained. No runtime/profile/publication architecture gate changed;
+M1-04 and host-source opt-in mounting remain open, no new VZ consumer was created.
+
+
+2026-11-03 M1-04 source-qualification review: source08 proved actual official
+Ubuntu ARM OS/profile lookup but independent review found late acquisition caps,
+unrelated runtime cleanup and synthetic-ancestor preallocation. Controlled
+before/after cases changed oversized552960byte carrier acceptance at131072budget
+to pre-staging rejection; retained runtime quarantine/marker changed from removed
+to preserved; requested entry-cap4 changed82synthetic constructions before
+rejection to5bounded constructions with at most4retained table entries.
+Source11 focused778 and impacted four lanes7560/20skipped passed; actual Linux
+and sandboxed Darwin source CLI returned Ubuntu24.04 and no execution authority.
+Original graph/digest/DiffID and OS-file content were preserved. Independent
+reader/reducer review and alternative read-only intake/state audits closed their
+source findings; the configured reviewer's followup failed429 and model override
+was disabled, so no unavailable signoff/Astra role is claimed.
+Initial invalid-index and stale config-creation fixtures were corrected without
+relaxing product admission. Full Hub, container/deployment, ARM materialization,
+native VZ/SSH/supervisor and execution-preflight remain unproved or unimplemented;
+the M1-04 checkbox stays open. Source-only qualification is a working feature,
+not a substitute for the required runtime consumer.
+
+2026-11-03 M1-03 source-policy review: reviewed canonical source normalization,
+owner-only config preservation, cache/retained/Docker adoption, mandatory BuildKit
+metadata/solve fencing, every-node version qualification, current-policy pipe
+lifecycle, final payload/catalog commit placement and recovered Hub publication.
+Independent local-build, run-source, channel-lifecycle and publication reviews
+closed their concrete blockers. Root affected1301/2skipped passed on source06;
+Hub1670/2skipped passed with one sparse-file node blocked by the sandbox's64MiB
+file cap, then that exact node passed separately under a9GiB logical file limit
+(8192physical bytes). Source07 changes only a remote-artifact test fixture;
+product/runtime and all Hub tests are byte/mode identical. Real final CLI,
+arm64 BuildKit local-stage COPY/OCI and loopback Hub HTTP/SQL proofs passed.
+BuildKit0.34.1 rejected future-stage COPY itself, not by source policy; supported
+prior-stage name/ordinal copies produced the exact expected file. Actual pipe
+revocation retained the committed prefix and withheld the later payload/receipt.
+Final lane/guard receipts and bounded resource state live in the M1 handoff.
+These are not container build/deployment, Keystone, image acquisition or VZ
+actual-root proof; the reviewed M1-01/02 designs remain unimplemented.
+
+2026-11-03 SDK publication/native review: reviewed canonical manifests, physical
+and logical identities, visibility/reuse ceilings, common worker/local registration,
+private staging and legacy-route boundaries, descriptor-pinned Ceph namespace
+publication, finite issuer/process custody, carrier/guest envelope closure,
+original-caller async admission, shared grant high-water history and uncertain
+terminal commits. Rejected path-only MDS isolation using Ceph's documented raw
+RADOS boundary before implementing consumer credentials. Local real
+SquashFS/HTTP/SQLite SDK smoke exercised seven images, three unique payloads,
+visibility discovery, private-runtime-preserving local extension and common
+worker registration. Focused1597/8 passed; independent focused source reviews
+closed concrete carrier/import/bounds/mount/upload/custody/expiry findings.
+No container deployment, real Ceph isolation or new cloud/native/GPU proof is
+implied; final source/package and remaining checks are recorded in the handoff.
+
+
+2026-11-02 worktree consolidation review: retained committed7962b18 lineage,
+ported original expiry/no-send repairs without reverting prepared-root and paired
+capacity rules, and integrated the local SDK/Manila experimental checkpoint.
+Independent review of cloud result/cleanup, SSH isolation, bounded evidence,
+native tunnel admission/key-file preservation and scoped cancellation closed
+concrete findings. The caught TERM handler, unlike SIG_IGN, preserves child
+termination semantics. Reviewed late boot correction keeps DHCP CIDR/gateway
+binding while using seed-bound authenticated DNS, not advertised DHCP resolvers.
+Portable9567/228, fullHub1426/7 and final affected620results have distinct source
+boundaries in testing/handoff; no deployed or native-root/GPU claim is added.
+
+2026-11-02 bulk Glance/one-shot review: the exact06PUT was authenticated but
+ended with an empty chunk-size line/400 after client abandonment. Historical
+reset versus write-timeout cause is not uniquely established; available local
+proxy files predate the interval. Real SDK backpressure reproduces the same
+ConnectFailure/partial body under a short metadata timeout, while scoped waits
+complete one PUT. Real metadata503 reproduced a hidden second POST. The new
+factory session disables every mutation replay route, rejects3xx and preserves
+read discovery; uploads use deadline-bound scalar waits with no shared-state
+mutation. Safe cause/progress diagnostics, observation-only deleting intents,
+durable volume image origin and unreaped-client recovery refusal preserve
+failure/custody gates. Host-runtime passed2666/1skipped; no source-image/kernel/probe
+change or live root/GPU qualification is implied by these portable results.
+
+2026-11-02 pre-Nova diagnostic review: concurrent autonomous Python package
+replacement overlapped the first recovery carrier's source copy. Exact stderr
+was lost, so retain fail-closed copy guards and preserve that failed tree rather
+than claim a guest-boot diagnosis. Builder transport output now has private
+bounded redaction/no-clobber persistence; transport exit remains unconfirmed
+remote custody. Privacy and custody reviews closed;814selected tests passed
+with3skipped, and real nonzero-child diagnostic smoke passed. Native root/GPU
+acceptance is still separate and no updater policy or package was changed by us.
+
+2026-11-02 explicit native recovery review: preserved failed-run/preparation and
+ordered absence-history digests replace no state or spent ledger. Fresh provider
+absence and stopped predecessor service gate a new immutable preparation generation.
+No automatic attempt is admitted under a grant that already failed. A cleanup
+reserve stays inside the original allocation; CPU budget overruns are failed
+prerequisites even after acknowledgment. Independent review found and corrected
+bundle/DNS drift and recovered-overrun GPU admission; the latter has a failing-
+before regression. No kernel/driver, protected stage-1, Hub or CI change is made.
+Local checks and SDK loopback evidence are separate from native-root acceptance.
+
+2026-11-02 failed native CPU follow-through: the one admitted CPU run was cleaned
+without an authenticated root result; GPU was not submitted. Nova create-event
+success and controller enrollment do not prove guest boot. Final enrolled=false
+is revocation state, not evidence that enrollment never occurred. Console bytes
+were lost at deletion; retained interpreter/file/module checks and current network
+admission do not diagnose the guest failure. The local-only successor fixes that
+evidence-loss path before any future separately authorized execution. The executed
+worker package and spent grant remain unchanged; there is no retry, state reset,
+driver mutation, Hub/CI topology change or GPU qualification.
+
+Native candidate follow-through: reviewed modules separately own carrier assembly,
+initramfs root transition, loopback mTLS enrollment/results and SDK lifecycle.
+Kernel6.8.0-147/NVIDIA580.178.04 preparation is separate from workload layers and
+does not load a worker/compute-host driver. The original CUDA manifest/config and
+all ten layers stay unchanged. One verified and cleaned native CPU case gates GPU;
+the GPU probe additionally uses original-image cudart/cuBLAS, not only injected
+driver code. Explicit grant counts, prepared Cinder roots, no-replay intents,
+TERM-only holds, source `.prior` preservation and provider absence bound effects.
+No protected local stage-1, Hub schema/authentication or CI topology change is made.
+Review and portable checks do not establish native boot or GPU qualification.
+
+2026-11-01 registry-intake review: optional synchronous per-layer materializer/cache
+callbacks preserve existing return contracts and deadlines while durably recording
+prefixes. Worker direct pinned pulls, unique blob reuse and ordered provenance
+journals replace no Dockerfile or upstream image configuration. `CloudEnv.pull`
+uses a durable bound intake intent and never automatically upgrades/replays a
+worker. Tests include the real cache/store serialization boundary because graph
+and manifest digests and serialized receipt fields are distinct. Native CephFS
+root/NVIDIA integration remains an explicitly unsatisfied acceptance requirement;
+no fallback chroot or CPU result is counted toward it.
+
+2026-11-01 local-first SDK/Manila review: isolated `cloud_env.py` orchestrates
+named-cloud OpenStack lifecycle and guest transport; `cloud_layer_worker.py`
+reuses the existing OCI conversion pipeline on a Nova worker and publishes
+CephFS-backed layers. `cloud_cli.py` owns CLI dispatch, with focused behavioral
+tests assigned to the host-runtime lane. This is a scoped local execution path,
+not a Hub authentication change or authoritative-metadata migration. Review
+identified partial-create/replay, cleanup-absence, concurrent publication and
+exit-status hazards; corrective source and local checks are separate from the
+earlier successful CPU live package-use evidence. No CI topology, schema,
+production deployment, GPU or publication change is included.
 
 2026-10-31 prepared-volume provider-contract review: Cinder accepted the actual
 80GiB root POST202, but rejected detailed inventory's `project_id` query400;
@@ -2125,13 +3924,64 @@ guest mount tables, overlay upper/work state, native config, homes or caches.
 This does not turn writable ext4 into a clustered filesystem or add automatic
 provider provisioning. Fresh multi-instance evidence is recorded separately.
 
+2026-11-07 M1 closure: `spec.md` records M1-01…M1-28 checked and M1 completion
+declared (35/108; receipts `M1-27-comparison-final527.json` and
+`M1-28-gate-application530.json`) for the local Lima VZ arm64 development
+environment (L0/L1/R1/local S1), one host (n=1), no attestation, OpenStack
+shelve/unshelve deferred to M4. This document now records the native VZ OCI-root
+backend in the Code map, Runtime flows and Status table, names the separate
+Ubuntu 24.04 arm64 Lima VZ profile wherever OCI-root was described as Linux amd64
+KVM only, and labels superseded M1 checkpoint statements as historical.
+
+2026-11-07/08 M2 merge-worktree source (`0.3.12` candidate, lineage `0.3.11.dev0`
+never published; uncommitted, unreleased, undeployed): Hub DB-authoritative
+publication quota with admin and self-service routes, `ppi_v1_` image API keys,
+anonymous `public` reads with a per-client limiter and `ANONYMOUS_LIST_LIMIT = 20`,
+the optional `oci-root` source closure, `linux/arm64` oci-root manifests, and the
+client `published push|pull|status` with catalog schema v2. The client replay was
+redesigned to credential-owned attempts (receipt 538). Owner decision receipts
+533, 535 and 537 and receipts 536–538 are in the handoff; receipt 537 (2026-11-08)
+fixes physical storage as Hub-known stored blob bytes per storage namespace
+(cloud-side Glance raw conversion and Cinder usage excluded), charges every
+oci-root manifest layer including original OCI base layers, and keeps the paid
+seeds as proposed. Dependency change: the Hub package now depends on the same
+checkout's `palimpsest-client==0.3.12` and the API process imports client modules
+(`image_manifest`, `image_source_policy`/`registry`, `buildkit` parsers,
+`cloud_env`/`nova_native_cloud`/`ceph_path_access`); recipe/BuildKit execution
+stays in the worker's isolated `hub_builder`/`hub_image_builder` children.
+
+2026-11-08 reviews of that source. Merge-integrity review (independent): no
+merge-induced code defect; four lost v0.3.11 release fixes were restored
+(openstacksdk dev extra in `pyproject.toml`/`uv.lock`/Hub `uv.lock`;
+`nova_bootstrap_service` `server_bind` override and test; Kolla
+`palimpsest_build_worker_work_path` with `docs/install.md` and test; OCI worker
+protocol descendant-ready flake fix); one P3 fixed (store listing/preview marks
+digests referenced by pulled Hub images as not deletable,
+`deletion_blockers.published`). Whole-surface M2 security review (independent):
+no P0/P1; one P2 fixed (anonymous list cap); accepted P3 items are listed in the
+M2 section. Architecture review: found that `credential_free_subprocess_environment`
+passed `PALIMPSEST_IMAGE_KEY` to Docker/Buildx/mksquashfs/helper children (fixed;
+all three credential variables are now removed) and that a pull with a failed
+local source registration still claimed runnable (fixed: `runnable: false`, no
+run hint, `source_registration_error` and message). Verification levels:
+test-passed only in a scrubbed macOS environment (synthetic Keystone, SQLite);
+`tests/unit/test_hub_publish.py` has 72 cases; the 77-check isolated real-Hub
+harness and the 11-check GiB boundary script passed on the final code (re-run after
+the last code edit), and their counts and source digest are recorded in
+docs/development-handoff.md. Not live-verified. Open: live
+Hub/Keystone/Afterglow OAuth, Kolla rollout with
+`palimpsest_api_forwarded_allow_ips`, MySQL/MariaDB quota SQL, Manila/CephFS
+closure copying, Linux-only tests, a real `plm run` of a pulled image on a
+separate state root, a second Apple Silicon device, and commit/release/deploy
+approvals.
+
 <!-- architecture-review:start -->
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "4dd8d0c867e044117397743d7c1025e9336f8ba6666f16b09d605e834bab984b",
-  "reviewed_at": "2026-10-31T19:32:59Z",
-  "summary": "Cinder contract repair: original-project detailed inventory without rejected project_id query; partial POST UUID is only an exact-detail selector, full owner/markers/size/image/unattached proof before binding; durable uncertainty/no replay and schema/expiry unchanged. Independent authority+SDK reviews clean. Target22 pass, instances267 pass5skip15.62s, fullHub1416 pass7skip340.58s, actual Python3.12 SDK3.3 loopback POST/detail/unfiltered recovery old-fail/new-pass smoke. Historical initial POST exception remains unproven; no new deployment/GPU claim."
+  "source_sha256": "81d91b884af6f890771b6c6127a2fd23532fbbf4f4fbb891a41a13dc99cfd5d8",
+  "reviewed_at": "2026-11-07T16:54:44Z",
+  "summary": "Reviewed the merged 0.3.12 candidate source: primary dev WIP (native-role cutover, previously reviewed) + M1 Lima VZ arm64 native root work + M2 Hub image publication (quotas, ppi_v1_ image keys, anonymous public reads capped at 20 per page, OCI source-closure publication, arm64 oci-root manifests) and client published push/pull/status with credential-owned replay and catalog schema v2. Independent reviews 2026-11-08: whole-surface M2 security review (no P0/P1, one P2 fixed), merge-integrity review (no merge-induced defect; four lost v0.3.11 release fixes restored), architecture-document review (12 blockers and 14 nits fixed; PALIMPSEST_IMAGE_KEY now removed from tool child environments), plus six client replay review rounds. Test-passed only in scrubbed macOS runs (test_hub_publish 72 cases, Hub M2 files 113, real-Hub loopback harness 77/77, GiB boundary script 11/11, synthetic Keystone and SQLite); not live-verified: no live Hub/Keystone/Afterglow OAuth, Kolla rollout, MariaDB, Manila/CephFS, Linux-only tests, pulled-image plm run or second Apple Silicon device. The stamp covers source review only, not CI or deployment."
 }
 ```
 <!-- architecture-review:end -->
@@ -2139,7 +3989,7 @@ provider provisioning. Fresh multi-instance evidence is recorded separately.
 ## Glossary
 
 - **Cloud-image runtime**: bootable `qcow2`/`raw` base와 `/opt/layers/merged` application overlay를 사용하는 기존 실행 경계.
-- **OCI-root**: OCI image graph에서 파생한 lower layers와 writable ext4 upper를 조립해 guest 실제 `/`를 만드는 Linux amd64 경계.
+- **OCI-root**: OCI image graph에서 파생한 lower layers와 writable ext4 upper를 조립해 guest 실제 `/`를 만드는 경계. Linux amd64 KVM profile과 별도 Darwin arm64 Lima VZ의 Ubuntu 24.04 arm64 profile이 있다.
 - **CAS**: Content-Addressed Storage. local `ArtifactStore`/`SourceCAS`와 Hub filesystem blob store는 서로 다른 CAS authority다.
 - **DiffID**: compressed OCI layer를 풀었을 때의 uncompressed content digest. compressed descriptor digest와 다르다.
 - **Derived recipe/cache key**: source layer, policy, normalizer, packer toolchain을 묶어 재사용 가능성을 식별하는 `DerivedSquashFSKey`.

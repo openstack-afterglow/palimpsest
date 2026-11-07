@@ -65,8 +65,7 @@ async def read_actor(request: Request, namespace: str):
 
 async def package_writer(request: Request, namespace: str):
     actor = await read_actor(request, namespace)
-    if actor.key_id is None and actor.admin_context is None:
-        raise registry.RegistryError(401, "AUTH_REQUIRED", "package key or human system administrator required")
+    registry.require_action(actor.actions, "packages:write")
     return actor
 
 
@@ -225,7 +224,7 @@ async def start_upload(
 
 @router.get("/projects/{namespace}/uploads/{upload_id}")
 async def upload_status(
-    namespace: str, upload_id: str, package: str = Query(...), actor: registry.Actor = Depends(package_writer)
+    namespace: str, upload_id: str, package: str = Query(...), actor: registry.Actor = Depends(read_actor)
 ):
     return await registry.upload_status(actor, namespace, package, upload_id, "package")
 
@@ -258,7 +257,7 @@ async def finalize_upload(
 
 @router.delete("/projects/{namespace}/uploads/{upload_id}", status_code=204)
 async def abort_upload(
-    namespace: str, upload_id: str, package: str = Query(...), actor: registry.Actor = Depends(package_writer)
+    namespace: str, upload_id: str, package: str = Query(...), actor: registry.Actor = Depends(read_actor)
 ):
     await registry.abort_upload(actor, namespace, package, upload_id, "package")
     return Response(status_code=204)
@@ -297,14 +296,14 @@ async def cache_archive(
 
 @router.post("/projects/{namespace}/cache/uploads", status_code=201)
 async def start_cache_upload(
-    namespace: str, body: CacheUploadStart, package: str = Query(...), actor: registry.Actor = Depends(key_actor)
+    namespace: str, body: CacheUploadStart, package: str = Query(...), actor: registry.Actor = Depends(read_actor)
 ):
     return await registry.start_upload(actor, namespace, package, body, "cache")
 
 
 @router.get("/projects/{namespace}/cache/uploads/{upload_id}")
 async def cache_upload_status(
-    namespace: str, upload_id: str, package: str = Query(...), actor: registry.Actor = Depends(key_actor)
+    namespace: str, upload_id: str, package: str = Query(...), actor: registry.Actor = Depends(read_actor)
 ):
     return await registry.upload_status(actor, namespace, package, upload_id, "cache")
 
@@ -315,7 +314,7 @@ async def append_cache_upload(
     upload_id: str,
     request: Request,
     package: str = Query(...),
-    actor: registry.Actor = Depends(key_actor),
+    actor: registry.Actor = Depends(read_actor),
 ):
     offset = await registry.append_upload(actor, namespace, package, upload_id, "cache", request)
     return Response(status_code=204, headers={"Upload-Offset": str(offset)})
@@ -328,7 +327,7 @@ async def finalize_cache_upload(
     response: Response,
     body: EmptyBody,
     package: str = Query(...),
-    actor: registry.Actor = Depends(key_actor),
+    actor: registry.Actor = Depends(read_actor),
 ):
     result, changed = await registry.finalize_upload(actor, namespace, package, upload_id, "cache")
     response.status_code = 201 if changed else 200
@@ -337,7 +336,7 @@ async def finalize_cache_upload(
 
 @router.delete("/projects/{namespace}/cache/uploads/{upload_id}", status_code=204)
 async def abort_cache_upload(
-    namespace: str, upload_id: str, package: str = Query(...), actor: registry.Actor = Depends(key_actor)
+    namespace: str, upload_id: str, package: str = Query(...), actor: registry.Actor = Depends(read_actor)
 ):
     await registry.abort_upload(actor, namespace, package, upload_id, "cache")
     return Response(status_code=204)

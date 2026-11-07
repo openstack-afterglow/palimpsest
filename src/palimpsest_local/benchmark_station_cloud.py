@@ -535,6 +535,8 @@ class StationCloud:
                 self.cloud._remaining(1)
                 self.cloud._scope()
                 validate_station(self.config)
+                # Scope/validation can outlive either allocation limit.
+                self.cloud.budget.check_allocation(self.cloud.deadline)
             except Exception:
                 # No Cinder request occurred. Keep the original VM explicitly
                 # cleanable, rather than inventing an ambiguous data request.
@@ -798,7 +800,11 @@ class StationCloud:
                         data_volume_absent=True,
                         no_data_request=True,
                         server_absent=deleted.get("server_absent", True),
-                        boot_volume_absent=deleted.get("boot_volume_absent"),
+                        boot_volume_absent=(
+                            True
+                            if deleted.get("phase") == "aborted-before-request"
+                            else deleted.get("boot_volume_absent")
+                        ),
                     )
                     self._save(value)
                     return value

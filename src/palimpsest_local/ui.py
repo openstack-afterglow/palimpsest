@@ -70,6 +70,9 @@ class _LoopbackHTTPServer(ThreadingHTTPServer):
     URL was printed. The dashboard never uses the resolved server name.
     """
 
+    daemon_threads = False
+    block_on_close = True
+
     def server_bind(self) -> None:
         socketserver.TCPServer.server_bind(self)
         host, port = self.server_address[:2]
@@ -95,6 +98,8 @@ def build_handler(
     consoles = ConsoleManager(exec_owners=exec_owners)
 
     class DashboardHandler(BaseHTTPRequestHandler):
+        timeout = 15.0
+
         @staticmethod
         def close_transports() -> None:
             exec_owners.stop_admitting()
@@ -740,7 +745,6 @@ def serve(
     server = _LoopbackHTTPServer(
         ("127.0.0.1", port), build_handler(roots, token=token, origin=f"http://127.0.0.1:{port}", read_only=read_only)
     )
-    server.daemon_threads = True
     actual_port = server.server_address[1]
 
     if port == 0:

@@ -648,6 +648,7 @@ def test_remote_detail_preserves_root_to_leaf_dependencies_and_layer_only_downlo
 @pytest.mark.parametrize("architecture", ["amd64", "arm64"])
 def test_oci_download_receipt_resolves_declared_root_and_selected_config(tmp_path, monkeypatch, architecture):
     roots = _roots(tmp_path)
+    intake_fixtures._allow_image_sources(tmp_path, ("docker.io", "library", "service"), config_dir=roots.config)
     payload, root, manifests = intake_fixtures._platform_archive()
     selected = next(item for item in manifests if item["platform"]["architecture"] == architecture)
     executable = tmp_path / "skopeo"

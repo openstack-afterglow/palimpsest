@@ -6,6 +6,11 @@ can use configured Docker authentication and custom CAs, but still passes only
 verified local archive bytes into the runtime. Neither a registry nor Docker's
 mutable image store becomes runtime authority.
 
+First configure the exact [upstream source policy](registries.md#upstream-image-source-admission).
+Missing/empty rules deny images; the examples below require explicit rules for
+`ghcr.io/nginx/nginx-unprivileged` and `quay.io/prometheus/busybox`. A registry
+profile or allowed host alone does not grant repository permission.
+
 ```sh
 palimpsest oci pull ghcr.io/nginx/nginx-unprivileged:stable-alpine \
   --output ./nginx.oci.tar
@@ -21,6 +26,73 @@ selecting the amd64 image. It snapshots the graph through the private source CAS
 and publishes the archive at mode `0600` only after verification. The JSON
 result distinguishes the copied archive's root descriptor from the selected
 platform manifest digest.
+
+## Original-source OS/profile qualification
+
+Unreleased source includes a separate, non-launching inspection operation:
+
+```sh
+palimpsest oci qualify ./ubuntu-arm64.oci.tar \
+  --manifest sha256:<original-root-or-index-digest> \
+  --platform linux/arm64 --backend lima-vz \
+  --maximum-bytes 268435456 --timeout 120
+```
+
+The input is a local original OCI archive or layout. An omitted pin requires
+one unambiguous root and immediately fixes its digest; it never selects by
+filename/tag or substitutes a cloud image. Current selection is exactly
+Ubuntu24.04/arm64 with a reviewed direct-linux VZ source profile. Missing,
+malformed or unsupported actual OS data, architecture/digest mismatch and
+unqualified effective-filesystem semantics fail explicitly; no force/risk flag
+can bypass them. The complete original layer occurrences remain intact.
+
+Actual `/etc/os-release` takes precedence; fallback to `/usr/lib/os-release`
+is allowed only when absent, not from a dangling/invalid preferred file. Safe
+image-root symlinks and same-layer hardlink payload occurrences are resolved
+without extracting paths or running a shell. The parser follows the
+[os-release data format](https://www.freedesktop.org/software/systemd/man/latest/os-release.html),
+requiring explicit ID/VERSION_ID and rejecting duplicate keys or shell syntax.
+Cross-layer hardlinks and whiteout-after-same-layer-visible conflicts are
+unsupported admission subsets; broader conversion fidelity remains separate.
+
+`--maximum-bytes` independently bounds the whole plain-tar carrier before
+staging, logical layout intake and cumulative OS-reader decompression including
+origin-layer replay. Layout accounting includes marker/index and distinct
+selected blobs even in warm CAS; unselected layout files are not copied.
+Each pass must fit, not their sum. Other bounded metadata/entry/path/link limits
+and one cooperative deadline apply. Metadata accounting is not a hard RSS cap.
+
+The command uses the configured existing source CAS but does not initialize
+runtime roots, retry runtime-deletion quarantines, repair permissions or create
+an absent config tree. Output binds original graph, actual OS-file bytes and
+profile; `execution_admitted: false` is intentional. Revalidation recomputes
+from CAS, not a caller-supplied receipt. No current VZ runtime consumes this
+qualification yet, so M1-04 remains open. This command does not widen the
+amd64-only public `oci pull`, existing native execution or Hub publication
+profiles. Generic filesystem conversion is the separate operation below.
+
+## Explicit ARM filesystem materialization
+
+On Linux with the verified SquashFS toolchain, `oci materialize SOURCE
+--platform linux/arm64 [--manifest DIGEST]` converts the complete selected local
+archive/layout through existing SourceCAS, hard workers and OCIStore. The
+default remains `linux/amd64` and its native snapshot/identity path is unchanged.
+ARM intake preserves secure original path spelling and shares the requested
+deadline with conversion. No registry fetch, cloud-base substitution or
+flattened root is introduced.
+
+The filesystem receipt binds original root/manifest/config, platform/process,
+every ordered compressed descriptor/DiffID and store-qualified derived
+occurrence. Repeated ordinals remain distinct even when immutable bytes dedupe.
+Materialization is not execution admission or a durable runtime lease. Legacy
+KVM plan and persisted-root preparation reject ARM before lease/volume/run
+effects; Hub/SDK publication and `run` defaults are not widened.
+
+Actual source17 CLI conversion preserved all five original fixture layers;
+cold results and a subsequent warm invocation had identical per-layer receipts.
+Verified artifact streams inspected with `unsquashfs` retained exact C/input/
+stdout/report, ARM ELF, numeric ownership/mode and the original OS symlink.
+This is not actual OverlayFS `/`, VZ boot/SSH or complete M1-10 whiteout fidelity.
 
 ## Permanent shared layer cache
 
@@ -77,6 +149,11 @@ Known immutable roots and explicit `pull REF --offline` use verified cached
 content without registry/tool access. A failed online refresh never silently
 falls back to a stale tag. Valid recipe hits skip decompression and packing;
 integrity hashing remains required, so reuse is not a zero-I/O operation.
+
+Current configured source policy is checked even on these offline/pinned hits.
+The cache's private `config` child is not a separate policy authority; API callers
+pass the validated operator snapshot explicitly, and the CLI loads the actual
+main configuration before opening an acquisition path.
 
 The atomic `state/layer-cache.json` catalog records a stable cache identity,
 neutral image/platform/descriptor/DiffID records, reference bindings, derived

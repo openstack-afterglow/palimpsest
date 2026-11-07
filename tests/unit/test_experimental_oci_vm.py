@@ -27,8 +27,11 @@ def test_forced_selection_is_distinct_and_native_selection_stays_strict(architec
         platforms.select_backend(architecture, host=host, runtime_kind="oci-root", force_architecture=True)
         == "lima-qemu-oci"
     )
-    with pytest.raises(ArtifactValidationError, match="native OCI-root requires"):
-        platforms.select_backend(architecture, host=host, runtime_kind="oci-root")
+    if architecture == "arm64":
+        assert platforms.select_backend(architecture, host=host, runtime_kind="oci-root") == "lima-vz"
+    else:
+        with pytest.raises(ArtifactValidationError, match="native OCI-root requires"):
+            platforms.select_backend(architecture, host=host, runtime_kind="oci-root")
     with pytest.raises(ArtifactValidationError, match="only for local OCI"):
         platforms.select_backend(architecture, host=host, force_architecture=True)
     with pytest.raises(ArtifactValidationError, match="consent"):

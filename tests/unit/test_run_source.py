@@ -68,6 +68,13 @@ def roots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> state.StatePaths:
             },
         ),
     )
+    intake_fixtures._allow_image_sources(
+        tmp_path,
+        ("docker.io", "library", "service"),
+        ("alpha.example.com", "team", "service"),
+        ("beta.example.com", "team", "service"),
+        config_dir=result.config,
+    )
     return result
 
 
@@ -110,7 +117,13 @@ def docker(roots: state.StatePaths, monkeypatch: pytest.MonkeyPatch) -> SimpleNa
     def export(reference, output, _roots, **kwargs):
         assert kwargs["docker_config_dir"] == Path(os.environ["DOCKER_CONFIG"])
         events.append(("export", reference))
-        return _receipt(reference, output)
+        canonical = registry_intake.resolve_image_reference(
+            reference,
+            registry_intake.default_registry_config(),
+            registry_alias=None if registry_intake._has_explicit_registry(reference) else "docker",
+            environment={},
+        ).canonical
+        return _receipt(canonical, output)
 
     monkeypatch.setattr(run_source, "run_docker_command", inspect)
     monkeypatch.setattr(run_source, "export_docker_image_to_oci_archive", export)
@@ -339,6 +352,9 @@ def test_invalid_inspection_identity_does_not_authorize_pull(roots, monkeypatch,
 
 
 def test_temporary_authority_profile_does_not_collide_with_user_alias(roots, docker, monkeypatch):
+    intake_fixtures._allow_image_sources(
+        roots.config.parent, ("new.example.com", "team", "service"), config_dir=roots.config
+    )
     config = load_registry_config(roots)
     config = run_source.add_profile(
         config, RegistryProfile(alias="run-explicit", endpoint="user.example.com", namespace="private")
@@ -399,7 +415,10 @@ def test_genuine_docker_absence_diagnostics_are_misses(roots, docker, diagnostic
 
 
 @pytest.mark.parametrize("architecture", ["amd64", "arm64"])
-def test_forced_darwin_docker_cache_acquisition_retains_consumable_platform(roots, tmp_path, monkeypatch, architecture):
+@pytest.mark.parametrize("acquisition", ["docker-daemon", "oci-registry"])
+def test_forced_darwin_upstream_acquisition_retains_consumable_platform(
+    roots, tmp_path, monkeypatch, architecture, acquisition
+):
     archives = {arch: intake_fixtures._platform_archive(architectures=(arch,)) for arch in ("amd64", "arm64")}
     _payload, root, manifests = archives[architecture]
     executable = tmp_path / "skopeo"
@@ -411,6 +430,8 @@ def test_forced_darwin_docker_cache_acquisition_retains_consumable_platform(root
     monkeypatch.setattr(run_source, "detect_host", lambda: HostPlatform("Darwin", "aarch64"))
 
     def inspect(argv, **_kwargs):
+        if acquisition == "oci-registry":
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr=f"No such image: {argv[-1]}")
         return subprocess.CompletedProcess(argv, 0, stdout=json.dumps([{"Id": "sha256:" + "a" * 64}]), stderr="")
 
     def copy(argv, archive, _staging, **_kwargs):
@@ -427,11 +448,12 @@ def test_forced_darwin_docker_cache_acquisition_retains_consumable_platform(root
     monkeypatch.setattr(
         run_source, "export_docker_image_to_oci_archive", registry_intake.export_docker_image_to_oci_archive
     )
+    monkeypatch.setattr(run_source, "pull_registry_oci_archive", registry_intake.pull_registry_oci_archive)
     reference = "docker.io/library/service:stable"
     resolved = run_source.resolve_run_source(
         roots, reference, platform="linux/" + architecture, force_architecture=True, backend="lima-qemu-oci"
     )
-    assert resolved.source_type == "docker-daemon"
+    assert resolved.source_type == acquisition
     assert resolved.manifest_digest == root["digest"]
     # Both declared-root package resolution and acquisition config verification are real.
     with snapshot_package(resolved.target, manifest=resolved.manifest_digest) as package:
@@ -444,6 +466,30 @@ def test_forced_darwin_docker_cache_acquisition_retains_consumable_platform(root
     assert retained.platform == "linux/" + architecture
     assert retained.root_digest == root["digest"]
     assert retained.manifest_digest == manifests[0]["digest"]
+    lookups = (reference, retained.root_digest, retained.manifest_digest, retained.archive_digest)
+    for query in lookups:
+        reused = run_source.resolve_run_source(roots, query, runtime_kind="oci-root")
+        assert reused.source_type == "retained-source"
+        assert reused.target == resolved.target
+
+    intake_fixtures._allow_image_sources(tmp_path, config_dir=roots.config)
+    before = {path: path.read_bytes() for path in (roots.state / "sources").rglob("*") if path.is_file()}
+
+    def unexpected_effect(*_args, **_kwargs):
+        pytest.fail("revoked retained source reached runtime discovery, Docker, or registry")
+
+    monkeypatch.setattr(run_source, "preflight_oci_capabilities", unexpected_effect)
+    monkeypatch.setattr(run_source, "run_docker_command", unexpected_effect)
+    monkeypatch.setattr(run_source, "export_docker_image_to_oci_archive", unexpected_effect)
+    monkeypatch.setattr(run_source, "pull_registry_oci_archive", unexpected_effect)
+    for query in lookups:
+        with pytest.raises(RegistryIntakeError):
+            run_source.resolve_run_source(roots, query, runtime_kind="oci-root")
+    assert {path: path.read_bytes() for path in (roots.state / "sources").rglob("*") if path.is_file()} == before
+    # Explicit archive inputs do not claim an upstream publisher identity.
+    local = run_source.resolve_run_source(roots, str(resolved.target), runtime_kind="oci-root")
+    assert local.source_type == "local-file"
+    assert local.target == resolved.target
 
 
 @pytest.mark.parametrize("direct_cache_lookup", [False, True])
@@ -458,3 +504,245 @@ def test_native_darwin_docker_cache_keeps_native_preflight(roots, docker, monkey
         else:
             run_source.resolve_run_source(roots, reference)
     assert docker.events == ([("inspect", reference)] if direct_cache_lookup else [])
+
+
+@pytest.mark.parametrize("reference", ["service", "docker.io/library/service:stable"])
+@pytest.mark.parametrize("policy_state", ["absent", "empty", "other-repository"])
+@pytest.mark.parametrize("docker_available", [False, True])
+def test_run_cannot_adopt_denied_docker_store_image(
+    roots, docker, monkeypatch, reference, policy_state, docker_available
+):
+    # A generic Docker pull may have populated the daemon independently; that
+    # local hit must not turn denied upstream adoption into a local-artifact run.
+    docker.images[reference] = "sha256:" + "a" * 64
+    if policy_state == "absent":
+        (roots.config / "config.toml").unlink()
+    else:
+        rules = (("docker.io", "library", "other"),) if policy_state == "other-repository" else ()
+        intake_fixtures._allow_image_sources(roots.config.parent, *rules, config_dir=roots.config)
+    if not docker_available:
+        monkeypatch.setattr(run_source.shutil, "which", lambda _name: None)
+
+    def unexpected_effect(*_args, **_kwargs):
+        pytest.fail("source denial fell through to acquisition or output retention")
+
+    monkeypatch.setattr(run_source, "acquire_remote_oci_source", unexpected_effect)
+    monkeypatch.setattr(run_source, "_retain_archive", unexpected_effect)
+    with pytest.raises(RegistryIntakeError):
+        run_source.resolve_run_source(roots, reference, force_architecture=True)
+    assert docker.events == []
+    assert not (roots.state / "sources").exists()
+
+
+def test_later_denied_docker_candidate_is_checked_before_any_inspection(roots, docker):
+    intake_fixtures._allow_image_sources(
+        roots.config.parent, ("docker.io", "library", "service"), config_dir=roots.config
+    )
+    docker.images["service"] = "sha256:" + "a" * 64
+    with pytest.raises(RegistryIntakeError):
+        run_source.find_docker_daemon_source(
+            roots, ["service", "beta.example.com/team/service:latest"], force_architecture=True
+        )
+    assert docker.events == []
+    assert not (roots.state / "sources").exists()
+
+
+@pytest.mark.parametrize("local_kind", ["archive", "layout", "digest"])
+def test_empty_policy_preserves_explicit_local_artifact_inputs(roots, tmp_path, local_kind):
+    intake_fixtures._allow_image_sources(tmp_path, config_dir=roots.config)
+    if local_kind == "archive":
+        path = tmp_path / "local.oci.tar"
+        path.write_bytes(intake_fixtures._platform_archive(architectures=("amd64",))[0])
+        query, expected = str(path), path.resolve()
+    elif local_kind == "layout":
+        path = _layout(tmp_path / "local-layout", native=False)
+        query, expected = str(path), path.resolve()
+    else:
+        query = expected = _cloud_tag(roots)
+    resolved = run_source.resolve_run_source(roots, query)
+    assert resolved.target == expected
+    assert resolved.source_type == ("cloud-store" if local_kind == "digest" else "local-file")
+
+
+@pytest.mark.parametrize("options", [{"plain_http": True}, {"tls_skip_verify": True}])
+def test_run_daemon_adoption_checks_operator_transport_policy_before_inspect(roots, docker, options):
+    config = load_registry_config(roots)
+    profile = RegistryProfile("beta", "beta.example.com", namespace="team", **options)
+    save_registry_config(roots, run_source.add_profile(config, profile, replace_existing=True))
+    reference = "beta.example.com/team/service:latest"
+    docker.images[reference] = "sha256:" + "a" * 64
+    with pytest.raises(RegistryIntakeError, match="verified OCI HTTPS"):
+        run_source.resolve_run_source(roots, reference, force_architecture=True)
+    assert docker.events == []
+    assert not (roots.state / "sources").exists()
+
+
+@pytest.mark.parametrize("force_architecture", [False, True])
+def test_unmatched_forced_oci_digest_is_a_local_miss_before_admission_or_transport(
+    roots, monkeypatch, force_architecture
+):
+    digest = "sha256:" + "d" * 64
+    intake_fixtures._allow_image_sources(roots.config.parent, config_dir=roots.config)
+
+    def unexpected_effect(*_args, **_kwargs):
+        pytest.fail("bare local digest reached upstream admission, runtime discovery, or acquisition")
+
+    monkeypatch.setattr(run_source, "admit_image_source", unexpected_effect)
+    monkeypatch.setattr(run_source, "preflight_oci_capabilities", unexpected_effect)
+    monkeypatch.setattr(run_source, "find_docker_daemon_source", unexpected_effect)
+    monkeypatch.setattr(run_source, "acquire_remote_oci_source", unexpected_effect)
+    with pytest.raises(StateError, match="local OCI digest is not retained"):
+        run_source.resolve_run_source(
+            roots,
+            digest,
+            runtime_kind="oci-root",
+            registry_alias="missing",
+            force_architecture=force_architecture,
+        )
+    assert not (roots.state / "sources").exists()
+
+
+def test_direct_daemon_lookup_does_not_invent_upstream_identity_for_bare_digest(roots, docker, monkeypatch):
+    digest = "sha256:" + "d" * 64
+    docker.images[digest] = digest
+    monkeypatch.setattr(
+        run_source, "admit_image_source", lambda *_a, **_kw: pytest.fail("bare digest reached upstream admission")
+    )
+    with pytest.raises(StateError, match="bare digests identify local artifacts"):
+        run_source.find_docker_daemon_source(roots, [digest], force_architecture=True)
+    assert docker.events == []
+    assert not (roots.state / "sources").exists()
+
+
+@pytest.mark.parametrize("transport", ["docker-daemon", "oci-registry"])
+def test_native_source_acquisition_preserves_busy_quarantine_without_wait_or_transport_replay(
+    roots, tmp_path, monkeypatch, transport
+):
+    import fcntl
+    import time
+
+    from palimpsest_local import vz_native_runtime as native
+
+    home = tmp_path / "pinned-native-home"
+    home.mkdir(mode=0o700)
+    custody = home / "_palimpsest-native"
+    custody.mkdir(mode=0o700)
+    value = {"lima_home": str(home), "expires_unix": int(time.time()) + 3600}
+    config_path = tmp_path / "native-host.json"
+    config_path.write_bytes(native._json(value))
+    config_path.chmod(0o600)
+    _, digest, stamp = native._file(config_path, private=True, limit=native._MAX_JSON)
+    home_info = home.stat()
+    config = native.VZHostConfig(config_path, digest, tuple(stamp), value, {}, {}, (home_info.st_dev, home_info.st_ino))
+    monkeypatch.setattr(native.VZHostConfig, "from_environment", classmethod(lambda _cls: config))
+    monkeypatch.setattr(run_source, "select_backend", lambda *_a, **_kw: "lima-vz")
+    quarantine = roots.run_deletions / ("locked-acquisition-" + "a" * 32)
+    quarantine.mkdir(mode=0o700)
+    artifact = quarantine / "artifact"
+    artifact.write_bytes(b"pending committed deletion")
+    before = artifact.stat()
+    calls = []
+
+    def assert_custody_owned():
+        holder = os.open(custody / "lock", os.O_RDWR)
+        try:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(holder)
+
+    def preflight(*_args, **_kwargs):
+        assert_custody_owned()
+        calls.append("preflight")
+
+    def inspect(argv, **kwargs):
+        assert_custody_owned()
+        calls.append("inspect")
+        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps([{"Id": "sha256:" + "c" * 64}]), stderr="")
+
+    def acquire(reference, output, _roots, **kwargs):
+        assert_custody_owned()
+        assert (custody / "active.json").is_file()
+        assert artifact.read_bytes() == b"pending committed deletion"
+        assert artifact.stat().st_ino == before.st_ino
+        assert kwargs["acquisition_deadline"].remaining(30) > 0
+        calls.append(transport)
+        return _receipt(reference, output)
+
+    monkeypatch.setattr(native, "preflight_pinned_lima", preflight)
+    monkeypatch.setattr(run_source, "preflight_oci_capabilities", preflight)
+    monkeypatch.setattr(run_source, "run_docker_command", inspect)
+    monkeypatch.setattr(
+        run_source,
+        "export_docker_image_to_oci_archive" if transport == "docker-daemon" else "pull_registry_oci_archive",
+        acquire,
+    )
+    # A regression to the unbounded flock branch must fail before entering the
+    # kernel, since this process already owns the same lock through another fd.
+    flock = fcntl.flock
+    locked_identity = [None]
+
+    def reject_blocking_run_lock(fd, operation):
+        opened = os.fstat(fd)
+        if (
+            operation & fcntl.LOCK_EX
+            and not operation & fcntl.LOCK_NB
+            and (opened.st_dev, opened.st_ino) == locked_identity[0]
+        ):
+            pytest.fail("source custody attempted a blocking run mutex")
+        return flock(fd, operation)
+
+    monkeypatch.setattr(state.fcntl, "flock", reject_blocking_run_lock)
+    # Bounded-but-waiting regressions must also fail on their first wait.
+    monkeypatch.setattr(state.time, "sleep", lambda _delay: pytest.fail("source custody waited on a run mutex"))
+    with state._new_run_name_lock(roots, "locked-acquisition"):
+        held_lock = (roots.locks / "locked-acquisition.lock").stat()
+        locked_identity[0] = (held_lock.st_dev, held_lock.st_ino)
+        with run_source._external_acquisition_scope(
+            platform="linux/arm64",
+            backend="lima-vz",
+            force_architecture=False,
+            timeout_seconds=60,
+            no_force=False,
+        ) as (no_force, remaining, deadline):
+            if transport == "docker-daemon":
+                result = run_source.find_docker_daemon_source(
+                    roots,
+                    ["service:v1"],
+                    platform="linux/arm64",
+                    backend="lima-vz",
+                    no_force=no_force,
+                    timeout_seconds=remaining,
+                    acquisition_deadline=deadline,
+                )
+            else:
+                result = run_source.acquire_remote_oci_source(
+                    roots,
+                    "service:v1",
+                    registry_alias="alpha",
+                    platform="linux/arm64",
+                    backend="lima-vz",
+                    no_force=no_force,
+                    timeout_seconds=remaining,
+                    acquisition_deadline=deadline,
+                )
+            assert result.source_type == transport
+            assert result.target.read_bytes() == b"retained test archive"
+        assert artifact.read_bytes() == b"pending committed deletion"
+        after = artifact.stat()
+        assert (after.st_dev, after.st_ino, after.st_ctime_ns, after.st_mode, after.st_nlink) == (
+            before.st_dev,
+            before.st_ino,
+            before.st_ctime_ns,
+            before.st_mode,
+            before.st_nlink,
+        )
+    locked_identity[0] = None
+    assert calls == ["preflight", *(["inspect"] if transport == "docker-daemon" else []), "preflight", transport]
+    assert not (custody / "active.json").exists()
+    assert not list(custody.glob("hold-*.json")) and not list(custody.glob("*.actor.json"))
+    with native.source_acquisition_custody(config):
+        pass
+    # The skipped committed deletion remains eligible for ordinary later cleanup.
+    state.init_resolved_roots(roots)
+    assert not quarantine.exists()

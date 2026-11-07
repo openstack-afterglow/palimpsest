@@ -5,6 +5,7 @@ import builtins
 import copy
 import json
 import stat
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -141,9 +142,13 @@ class Provider:
 
 class Adapter:
     def __init__(self, config, output, event, *, connection, purpose):
+        from palimpsest_local.benchmark_scenarios import ResourceBudget
+
         assert purpose == "station"
         self.config, self.connection = config, connection
         self.operations = output / "cloud-operations"
+        self.budget = ResourceBudget(config, output)
+        self.deadline = time.monotonic() + config.get("deadline_seconds", 7200)
         self.operations.mkdir(mode=0o700)
         self.fail_prepare = False
 
@@ -356,6 +361,35 @@ def test_expired_allocation_after_vm_readiness_never_creates_data_and_vm_is_clea
     assert [call[0] for call in provider.calls] == ["create-vm", "delete-vm-boot"]
 
 
+@pytest.mark.parametrize("expired", ["approval", "deadline"])
+def test_data_create_rechecks_limits_after_station_validation(station, monkeypatch, expired):
+    instance, provider = station
+    expiry = module.datetime.fromisoformat(instance.config["approval"]["expires_at"].replace("Z", "+00:00"))
+    clock = SimpleNamespace(wall=expiry.timestamp() - 10, monotonic=instance.cloud.deadline - 10)
+    monkeypatch.setattr(module.time, "time", lambda: clock.wall)
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock.monotonic)
+    original_validate = module.validate_station
+
+    def slow_validation(config, **kwargs):
+        original_validate(config, **kwargs)
+        if instance.path.exists() and _read(instance.path)["phase"] == "create-data-intent":
+            if expired == "approval":
+                clock.wall = expiry.timestamp()
+            else:
+                clock.monotonic = instance.cloud.deadline
+
+    monkeypatch.setattr(module, "validate_station", slow_validation)
+    with pytest.raises(ArtifactValidationError, match="approval expired|scenario deadline"):
+        instance.create()
+    receipt = _read(instance.path)
+    assert receipt["phase"] == "create-station-intent"
+    assert receipt["server_id"] == "server-one" and receipt["boot_volume_id"] == "boot-one"
+    assert not receipt.get("data_volume_id")
+    assert [call[0] for call in provider.calls] == ["create-vm"]
+    assert instance.cleanup()["phase"] == "absent"
+    assert [call[0] for call in provider.calls] == ["create-vm", "delete-vm-boot"]
+
+
 @pytest.fixture
 def admission_station(config, tmp_path, monkeypatch):
     # Exercise real ScenarioCloud placement ordering and durable budget state;
@@ -452,6 +486,40 @@ def test_pre_request_controller_rejection_cleanup_releases_only_live_slot_not_cu
     assert instance.cleanup()["phase"] == "absent"
     rows = list(_read(instance.cloud.budget.path)["reservations"].values())
     assert len(rows) == 1 and rows[0]["released"] is True
+    with pytest.raises(ArtifactValidationError, match="budget exhausted"):
+        instance.cloud.budget.reserve("another-role", 20)
+    assert not provider.calls
+
+
+def test_expired_nova_create_is_cleaned_as_unallocated_station(admission_station, monkeypatch):
+    instance, provider = admission_station
+    instance.cloud._image_at_request = {}
+    monkeypatch.setattr(instance.cloud, "_placement", lambda: None)
+    monkeypatch.setattr(instance.cloud, "_userdata", lambda *args: "#cloud-config\n{}")
+    clock = SimpleNamespace(now=instance.cloud.deadline - 10)
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock.now)
+
+    def delayed_image(identity):
+        clock.now = instance.cloud.deadline
+        return {"id": identity, "status": "active"}
+
+    provider.image.get_image = delayed_image
+    provider.network = SimpleNamespace(
+        get_network=lambda identity: {"id": identity, "project_id": "project-one"},
+        get_security_group=lambda identity: {"id": identity, "project_id": "project-one"},
+    )
+    provider.compute.fetch_flavor_extra_specs = lambda flavor: flavor
+    provider.compute.create_server = lambda **kwargs: provider.calls.append(("create-vm", kwargs))
+    with pytest.raises(ArtifactValidationError, match="scenario deadline"):
+        instance.create()
+    assert _read(instance.path)["phase"] == "create-station-intent"
+    assert not provider.calls
+    row = next(iter(_read(instance.cloud.budget.path)["reservations"].values()))
+    assert row["released"] is True and row["server_id"] is None
+    result = instance.cleanup()
+    assert result["phase"] == "absent" and result["no_data_request"] is True
+    assert result["server_absent"] is result["boot_volume_absent"] is result["data_volume_absent"] is True
+    assert instance.cleanup() == result
     with pytest.raises(ArtifactValidationError, match="budget exhausted"):
         instance.cloud.budget.reserve("another-role", 20)
     assert not provider.calls

@@ -3,7 +3,7 @@
 
 This file is generated from `palimpsest_local.cli.build_parser`. It inventories every command, positional, option, choice, and parser default. For behavior, examples, and runtime restrictions, read [the usage guide](usage.md). Every command except raw `docker` pass-through accepts automatic `-h`/`--help`.
 
-Coverage: **142 command paths**, **359 positional/option definitions** (excluding automatic `-h/--help`).
+Coverage: **160 command paths**, **433 positional/option definitions** (excluding automatic `-h/--help`).
 
 ## `palimpsest`
 
@@ -12,10 +12,10 @@ Coverage: **142 command paths**, **359 positional/option definitions** (excludin
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest [-h] [--url URL] [--version] {cloud,benchmark,image,layer,bundle,oci,build,registry,login,logout,pull,push,tag,images,history,rmi,save,load,docker,run,compose,ps,volumes,networks,volume,inspect,logs,shell,exec,start,stop,rm,commit,web,store,completion} ...
+usage: palimpsest [-h] [--url URL] [--version] {cloud,benchmark,image,published,layer,bundle,oci,build,registry,login,logout,pull,push,tag,images,history,rmi,save,load,docker,run,compose,ps,volumes,networks,volume,inspect,logs,shell,exec,start,stop,rm,commit,web,store,completion} ...
 ```
 
-Subcommands: `cloud`, `benchmark`, `image`, `layer`, `bundle`, `oci`, `build`, `registry`, `login`, `logout`, `pull`, `push`, `tag`, `images`, `history`, `rmi`, `save`, `load`, `docker`, `run`, `compose`, `ps`, `volumes`, `networks`, `volume`, `inspect`, `logs`, `shell`, `exec`, `start`, `stop`, `rm`, `commit`, `web`, `store`, `completion`.
+Subcommands: `cloud`, `benchmark`, `image`, `published`, `layer`, `bundle`, `oci`, `build`, `registry`, `login`, `logout`, `pull`, `push`, `tag`, `images`, `history`, `rmi`, `save`, `load`, `docker`, `run`, `compose`, `ps`, `volumes`, `networks`, `volume`, `inspect`, `logs`, `shell`, `exec`, `start`, `stop`, `rm`, `commit`, `web`, `store`, `completion`.
 
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
@@ -29,10 +29,10 @@ Subcommands: `cloud`, `benchmark`, `image`, `layer`, `bundle`, `oci`, `build`, `
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest cloud [-h] {build-user-data,build,instance,launch-batch,assets,prepare-runtime,registry-worker} ...
+usage: palimpsest cloud [-h] {build-user-data,build,instance,launch-batch,assets,prepare-runtime,registry-worker,env,dockerfile-build,image-pull,layer-run,native} ...
 ```
 
-Subcommands: `build-user-data`, `build`, `instance`, `launch-batch`, `assets`, `prepare-runtime`, `registry-worker`.
+Subcommands: `build-user-data`, `build`, `instance`, `launch-batch`, `assets`, `prepare-runtime`, `registry-worker`, `env`, `dockerfile-build`, `image-pull`, `layer-run`, `native`.
 
 ### `palimpsest cloud build-user-data`
 
@@ -322,6 +322,207 @@ usage: palimpsest cloud registry-worker [-h] --cache-root CACHE_ROOT --jobs-root
 | `--jobs-root` | Path | required | Existing private directory for durable worker intent, error and success receipts. |
 | `--assets-root` | Path | required | Existing project-bound cloud asset catalog directory beside canonical retained payloads. |
 | `request` | Path | required | Validated internal OCI acquisition request JSON; executed in the worker instance. |
+
+### `palimpsest cloud env`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest cloud env [-h] {up,status,down} ...
+```
+
+Subcommands: `up`, `status`, `down`.
+
+### `palimpsest cloud env up`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest cloud env up [-h] --cloud CLOUD --network NETWORK --external-network EXTERNAL_NETWORK --image IMAGE --worker-flavor WORKER_FLAVOR [--worker-boot-gib WORKER_BOOT_GIB] [--share-gib SHARE_GIB] [--share-type SHARE_TYPE] [--ssh-cidr SSH_CIDR] [--security-group SECURITY_GROUP] [--dns DNS] name
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `name` | string | required | environment name ([a-z0-9-], at most 31 characters) |
+| `--cloud` | string | required | clouds.yaml cloud name |
+| `--network` | string | required | tenant network name or ID for the VMs |
+| `--external-network` | string | required | network providing floating IPs |
+| `--image` | string | required | Ubuntu 24.04 cloud image name or ID |
+| `--worker-flavor` | string | required | Nova flavor for the build worker |
+| `--worker-boot-gib` | int | `80` | worker boot volume size in GiB |
+| `--share-gib` | int | `50` | Manila CephFS share size in GiB |
+| `--share-type` | string | `'cephfs'` | Manila share type with the CEPHFS protocol |
+| `--ssh-cidr` | string; repeatable | `[]` | allowed SSH source CIDR for an owned group |
+| `--security-group` | string | `None` | reuse an existing project security group (not modified or deleted) |
+| `--dns` | string; repeatable | `[]` | guest DNS server override (repeatable) |
+
+### `palimpsest cloud env status`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest cloud env status [-h] name
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `name` | string | required | environment name |
+
+### `palimpsest cloud env down`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest cloud env down [-h] name
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `name` | string | required | environment name |
+
+### `palimpsest cloud dockerfile-build`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest cloud dockerfile-build [-h] [-f FILE] -t TAG [--timeout TIMEOUT] name context
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `name` | string | required | environment name |
+| `context` | Path | required | build context directory |
+| `-f`, `--file` | Path | `None` | Dockerfile (default CONTEXT/Dockerfile) |
+| `-t`, `--tag` | string | required | image name recorded in the share and environment |
+| `--timeout` | float | `3600` | worker build deadline in seconds |
+
+### `palimpsest cloud image-pull`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest cloud image-pull [-h] -t TAG [--timeout TIMEOUT] name reference
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `name` | string | required | environment name |
+| `reference` | string | required | fully qualified registry/repository@sha256:digest |
+| `-t`, `--tag` | string | required | immutable image name in the share |
+| `--timeout` | float | `3600` | worker acquisition and conversion deadline in seconds |
+
+### `palimpsest cloud layer-run`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest cloud layer-run [-h] --flavor FLAVOR [--boot-gib BOOT_GIB] [--keep] [--no-verify] name tag command [command ...]
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `name` | string | required | environment name |
+| `tag` | string | required | image name from a previous dockerfile-build |
+| `--flavor` | string | required | Nova flavor for the consumer VM |
+| `--boot-gib` | int | `20` | consumer boot volume size in GiB |
+| `--keep` | flag | `False` | retain the consumer VM and its read-only access |
+| `--no-verify` | flag | `False` | skip in-guest SHA-256 verification of each layer |
+| `command` | string (one or more) | required | command run inside the assembled layer root |
+
+### `palimpsest cloud native`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest cloud native [-h] {prepare,run,status,cleanup} ...
+```
+
+Subcommands: `prepare`, `run`, `status`, `cleanup`.
+
+### `palimpsest cloud native prepare`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest cloud native prepare [-h] --grant GRANT --config CONFIG name [tag]
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `name` | string | required | existing project-bound cloud environment name |
+| `tag` | string (optional) | `None` | existing registry receipt for exact-image grants; omitted only for explicit project-scope preparation |
+| `--grant` | Path | required | owned mode-0600 approval JSON permitting preparation |
+| `--config` | Path | required | owned mode-0600 JSON with explicit source/service choices, bundle/runtime/probe paths and DNS |
+
+### `palimpsest cloud native run`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest cloud native run [-h] --grant GRANT --phase {cpu,gpu} --timeout TIMEOUT [--keep] name tag command [command ...]
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `name` | string | required | existing prepared cloud environment name |
+| `tag` | string | required | digest-bound original registry image receipt name |
+| `--grant` | Path | required | owned mode-0600 run+cleanup approval with cumulative budgets and exact flavor IDs |
+| `--phase` | one of: `cpu`, `gpu` | required | CPU native-root gate or subsequent GPU computation proof |
+| `--timeout` | int | required | maximum allocation/result window in seconds from Nova POST; preparation uses the outer grant expiry |
+| `--keep` | flag | `False` | retain successful idle PID1 consumer only with allow_retained approval; exact cleanup remains required |
+| `command` | string (one or more) | required | explicit OCI Cmd override, preserving original Entrypoint; use -- before workload options |
+
+### `palimpsest cloud native status`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest cloud native status [-h] [--run-id RUN_ID] name
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `name` | string | required | existing cloud environment name |
+| `--run-id` | string | `None` | exact native run ID; omit to list all retained run summaries |
+
+### `palimpsest cloud native cleanup`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest cloud native cleanup [-h] --grant GRANT [--stop-service] name [run_id]
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `name` | string | required | existing cloud environment name; worker and share are preserved |
+| `run_id` | string (optional) | `None` | exact recorded run ID; omit only for service-only --stop-service |
+| `--grant` | Path | required | original bounded cleanup-tail grant or separately approved cleanup-only recovery grant |
+| `--stop-service` | flag | `False` | also stop the exact owned bootstrap unit with TERM only, after all consumers are cleaned |
 
 ## `palimpsest benchmark`
 
@@ -895,6 +1096,74 @@ usage: palimpsest image load [-h] [-i INPUT_PATH] [--platform PLATFORM] [-q]
 | `--platform` | string; repeatable | `[]` | Docker image platform to load (repeatable) |
 | `-q`, `--quiet` | flag | `False` | suppress Docker progress |
 
+## `palimpsest published`
+
+[Behavior, restrictions, and examples](usage.md#hub-cloud-images-layers-and-bundles).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest published [-h] {push,pull,status} ...
+```
+
+Subcommands: `push`, `pull`, `status`.
+
+### `palimpsest published push`
+
+[Behavior, restrictions, and examples](usage.md#hub-cloud-images-layers-and-bundles).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest published push [-h] --name NAME [--visibility {private,internal,public}] [--os-family OS_FAMILY] [--os-version OS_VERSION] [--state-root STATE_ROOT] [--image-key-file IMAGE_KEY_FILE] [--no-source] [--confirm-public] [--allow-insecure-http] image
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `image` | string | required | local catalog image id (sha256:...) |
+| `--name` | string | required | Hub image name; one name is one image in its scope |
+| `--visibility` | one of: `private`, `internal`, `public` | `'private'` | Hub audience: private (you), internal (your project) or public (anonymous read); default: private |
+| `--os-family` | string | `'unknown'` | actual OS family recorded in the manifest |
+| `--os-version` | string | `'unknown'` | actual OS version recorded in the manifest |
+| `--state-root` | Path | `None` | state root containing the local image (default: the configured state root) |
+| `--image-key-file` | Path | `None` | owner-only file containing one image API key (ppi_v1_...) |
+| `--no-source` | flag | `False` | publish SquashFS layers and metadata only, without the OCI source closure (not runnable after pull) |
+| `--confirm-public` | flag | `False` | required with --visibility public: anyone can then read the image and its config environment values |
+| `--allow-insecure-http` | flag | `False` | allow sending credentials over plain http:// to a non-loopback Hub |
+
+### `palimpsest published pull`
+
+[Behavior, restrictions, and examples](usage.md#hub-cloud-images-layers-and-bundles).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest published pull [-h] [--name NAME] --state-root STATE_ROOT [--image-key-file IMAGE_KEY_FILE] [--anonymous] [--allow-insecure-http] image_id
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `image_id` | string | required | Hub published image id (UUID) |
+| `--name` | string | `None` | require the Hub image to have this name |
+| `--state-root` | Path | required | explicit state root receiving the payloads and catalog row |
+| `--image-key-file` | Path | `None` | owner-only file containing one image API key (ppi_v1_...) |
+| `--anonymous` | flag | `False` | ignore configured credentials and read a public image anonymously |
+| `--allow-insecure-http` | flag | `False` | allow sending credentials over plain http:// to a non-loopback Hub |
+
+### `palimpsest published status`
+
+[Behavior, restrictions, and examples](usage.md#hub-cloud-images-layers-and-bundles).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest published status [-h] [--state-root STATE_ROOT]
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `--state-root` | Path | `None` | state root to inspect (default: the configured state root) |
+
 ## `palimpsest layer`
 
 [Behavior, restrictions, and examples](usage.md#hub-cloud-images-layers-and-bundles).
@@ -1073,10 +1342,10 @@ usage: palimpsest bundle unpack [-h] --output OUTPUT archive
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest oci [-h] {init-runtime,pull,materialize,cache,root-proof,exec-status,network,exec-record,resource-status,root-volumes,root-volume} ...
+usage: palimpsest oci [-h] {init-runtime,pull,qualify,materialize,cache,root-proof,exec-status,network,exec-record,resource-status,root-volumes,root-volume} ...
 ```
 
-Subcommands: `init-runtime`, `pull`, `materialize`, `cache`, `root-proof`, `exec-status`, `network`, `exec-record`, `resource-status`, `root-volumes`, `root-volume`.
+Subcommands: `init-runtime`, `pull`, `qualify`, `materialize`, `cache`, `root-proof`, `exec-status`, `network`, `exec-record`, `resource-status`, `root-volumes`, `root-volume`.
 
 ### `palimpsest oci init-runtime`
 
@@ -1109,6 +1378,25 @@ usage: palimpsest oci pull [-h] --output OUTPUT [--platform {linux/amd64}] [--ti
 | `--platform` | one of: `linux/amd64` | `'linux/amd64'` | Select an OCI platform. |
 | `--timeout` | float | `300.0` | Materializer timeout in seconds; must be positive and finite. |
 
+### `palimpsest oci qualify`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest oci qualify [-h] [--manifest MANIFEST] --platform {linux/arm64} --backend {lima-vz} [--timeout TIMEOUT] [--maximum-bytes MAXIMUM_BYTES] source
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `source` | Path | required | original local OCI archive or layout |
+| `--manifest` | string | `None` | pin an exact root descriptor or original top-level index digest |
+| `--platform` | one of: `linux/arm64` | required | Select an OCI platform. |
+| `--backend` | one of: `lima-vz` | required | Select or automatically detect the runtime backend. |
+| `--timeout` | float | `300.0` | total cooperative deadline in seconds |
+| `--maximum-bytes` | int | `8589934592` | maximum acquisition bytes and OS-reader uncompressed work, including selected-layer replay (default: 8 GiB) |
+
 ### `palimpsest oci materialize`
 
 [Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
@@ -1116,14 +1404,14 @@ usage: palimpsest oci pull [-h] --output OUTPUT [--platform {linux/amd64}] [--ti
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest oci materialize [-h] [--manifest MANIFEST] [--platform {linux/amd64}] [--packer PACKER] [--timeout TIMEOUT] [--output OUTPUT] source
+usage: palimpsest oci materialize [-h] [--manifest MANIFEST] [--platform {linux/amd64,linux/arm64}] [--packer PACKER] [--timeout TIMEOUT] [--output OUTPUT] source
 ```
 
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
 | `source` | Path | required | Local OCI archive or image-layout source. |
 | `--manifest` | string | `None` | pin a root descriptor; required when the local index is ambiguous |
-| `--platform` | one of: `linux/amd64` | `'linux/amd64'` | Select an OCI platform. |
+| `--platform` | one of: `linux/amd64`, `linux/arm64` | `'linux/amd64'` | Select an OCI platform. |
 | `--packer` | Path | `/usr/bin/mksquashfs` | Absolute SquashFS packer executable (verified before use). |
 | `--timeout` | float | `300.0` | Materializer timeout in seconds; must be positive and finite. |
 | `--output` | Path | `None` | New file for the canonical materialization receipt; stdout if omitted. |
@@ -1686,7 +1974,7 @@ usage: palimpsest docker ...
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest run [-h] [--name NAME] [--registry REGISTRY] [--layer LAYER] [--volume NAME:/guest/path[:ro]] [--memory MEMORY] [--vcpus VCPUS] [--network NETWORK] [-p [HOST_IP:]HOST_PORT:GUEST_PORT[/tcp|/udp]] [--backend {auto,kvm,lima-vz,lima-krunkit,libvirt-hvf,lima-qemu-oci}] [--runtime-kind {cloud-image,oci-root}] [-d] [--manifest MANIFEST] [--user USER] [--platform {linux/amd64,linux/arm64}] [--force-architecture] [--vm-image VM_IMAGE] [--vm-image-digest VM_IMAGE_DIGEST] [--root-retention {delete,retain}] [--root-volume ROOT_VOLUME] image_or_bundle [-- COMMAND [ARG...]]
+usage: palimpsest run [-h] [--name NAME] [--registry REGISTRY] [--layer LAYER] [--volume NAME:/guest/path[:ro]] [--memory MEMORY] [--vcpus VCPUS] [--network NETWORK] [-p [HOST_IP:]HOST_PORT:GUEST_PORT[/tcp|/udp]] [--backend {auto,kvm,lima-vz,lima-krunkit,libvirt-hvf,lima-qemu-oci}] [--runtime-kind {cloud-image,oci-root}] [-d] [--manifest MANIFEST] [--user USER] [--platform {linux/amd64,linux/arm64}] [--force-architecture] [--vm-image VM_IMAGE] [--vm-image-digest VM_IMAGE_DIGEST] [--root-retention {delete,retain}] [--root-volume ROOT_VOLUME] [--mode {dev,prod}] [--restart {no,unless-stopped}] [--mount-source DIRECTORY:/guest/path[:ro]] image_or_bundle [-- COMMAND [ARG...]]
 ```
 
 | Argument | Value | Parser default | Description |
@@ -1711,6 +1999,9 @@ usage: palimpsest run [-h] [--name NAME] [--registry REGISTRY] [--layer LAYER] [
 | `--vm-image-digest` | string | `None` | SHA-256 of the local experimental carrier disk |
 | `--root-retention` | one of: `delete`, `retain` | `None` | OCI writable-root removal policy (default: delete) |
 | `--root-volume` | string | `None` | reuse an explicitly retained OCI writable-root UUID |
+| `--mode` | one of: `dev`, `prod` | `None` | native VZ lifecycle mode (default: dev) |
+| `--restart` | one of: `no`, `unless-stopped` | `None` | native VZ workload restart policy (default: no in dev, unless-stopped in prod) |
+| `--mount-source` | _parse_run_source_mount; repeatable | `[]` | explicitly share a directory within the current project with native VZ; default source stays in layers |
 
 For a local OCI-root image, a literal `--` followed by a nonempty command replaces the image Cmd while preserving its Entrypoint. The suffix is literal exec argv, not shell syntax.
 
@@ -2092,10 +2383,10 @@ usage: palimpsest web [-h] [--port PORT] [--no-browser] [--allow-control]
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest store [-h] {show,ls,check,rm,move,set} ...
+usage: palimpsest store [-h] {show,catalog,ls,check,rm,move,set} ...
 ```
 
-Subcommands: `show`, `ls`, `check`, `rm`, `move`, `set`.
+Subcommands: `show`, `catalog`, `ls`, `check`, `rm`, `move`, `set`.
 
 ### `palimpsest store show`
 
@@ -2110,6 +2401,20 @@ usage: palimpsest store show [-h] [--format {table,json}]
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
 | `--format` | one of: `table`, `json` | `'table'` | output format (default: table) |
+
+### `palimpsest store catalog`
+
+[Behavior, restrictions, and examples](usage.md#local-store-and-ui).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest store catalog [-h] [--refresh]
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `--refresh` | flag | `False` | refresh selected-root metadata without live VM reconciliation |
 
 ### `palimpsest store ls`
 

@@ -215,7 +215,7 @@ async function artifactDownload(row, target = "artifact-message") {
 }
 async function deleteArtifact(row) {
   const version = connectionVersion, check = guard(version);
-  const confirmation = window.prompt(`Administrator deletion: type the exact name and digest below. Children block deletion.\n${row.name} ${row.blob_digest}`);
+  const confirmation = window.prompt(`Project registration deletion: type the exact name and digest below. Children block deletion; shared catalogs require system authority.\n${row.name} ${row.blob_digest}`);
   if (confirmation !== `${row.name} ${row.blob_digest}`) return;
   try {
     check();
@@ -269,7 +269,7 @@ async function listArtifacts(page = null) {
 async function listBuilds() {
   const version = connectionVersion, requestVersion = ++buildVersion, check = guard(version), container = $("build-list");
   try {
-    if (!identity?.capabilities.build) return empty(container, "Build access requires system-administrator authority.");
+    if (!identity?.capabilities.inventory) return empty(container, "Build status requires current project read authority.");
     const rows = await json("/builds?limit=50");
     check(); if (requestVersion !== buildVersion) return;
     container.replaceChildren();

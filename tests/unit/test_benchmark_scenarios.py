@@ -48,6 +48,10 @@ def config(tmp_path):
             "direct_private": True,
         },
         "images": {"torch-cpu": "docker.io/pytorch/pytorch@sha256:" + "a" * 64},
+        "image_metadata": {
+            name: {"os_family": "fixture-os", "os_version": "1"}
+            for name in ("cuda", "torch-cpu", "torch-cuda", "tensorflow-cpu", "tensorflow-cuda", "k3s")
+        },
         "resources": {"max_creates": 2, "max_live": 1, "max_boot_gib": 40},
         "approval": {
             "id": "bounded-authority",
@@ -344,7 +348,7 @@ def test_failed_api_consumer_keeps_its_Hub_identity_visible_without_server_id(tm
     monkeypatch.setattr(scenarios, "_environment_context", lambda _: _cached_context())
 
     class Cloud:
-        def __init__(self, config, output, event, budget, observation_only):
+        def __init__(self, config, output, event, budget, observation_only, deadline):
             assert observation_only is True
             self.connection = object()
 
@@ -352,13 +356,19 @@ def test_failed_api_consumer_keeps_its_Hub_identity_visible_without_server_id(tm
             pytest.fail("API lane cannot allocate an SDK baseline VM")
 
     class Hub:
+        def _json_request(self, method, path):
+            assert (method, path) == ("GET", "/policy/capabilities")
+            return {"service": "palimpsest", "actions": ["packages:write", "packages:manage"]}
+
         def import_registry_image(self, request):
             return {"id": "image-job", "status": "queued"}
 
         def get_image_job(self, identity):
             return {"id": "image-job", "status": "complete", "output_digests": ["sha256:" + "a" * 64]}
 
-        def create_instance(self, request):
+        def create_instance(self, request, *, before_send=None):
+            if before_send is not None:
+                before_send()
             self.request = request
             return {"id": "retained-Hub-instance", "server_id": None, "status": "uncertain"}
 
@@ -646,6 +656,7 @@ def _api_scenario_model(tmp_path, monkeypatch, method="api-import"):
     class Model:
         def __init__(self):
             self.images = []
+            self.creates = []
             self.provider_deletes = 0
             self.delete_journals = []
             self.row = None
@@ -660,6 +671,13 @@ def _api_scenario_model(tmp_path, monkeypatch, method="api-import"):
             self.volume_deletes = 0
             self.lose_volume_delete = False
             self.volume_delete_effect = True
+            self.policy = {"service": "palimpsest", "actions": ["packages:write", "packages:manage"]}
+            self.policy_reads = 0
+
+        def _json_request(self, method, path):
+            assert (method, path) == ("GET", "/policy/capabilities")
+            self.policy_reads += 1
+            return copy.deepcopy(self.policy)
 
         def import_registry_image(self, request):
             self.images.append(request)
@@ -670,7 +688,10 @@ def _api_scenario_model(tmp_path, monkeypatch, method="api-import"):
         def get_image_job(self, identity):
             return {"id": identity, "status": "complete"}
 
-        def create_instance(self, request):
+        def create_instance(self, request, *, before_send=None):
+            if before_send is not None:
+                before_send()
+            self.creates.append(copy.deepcopy(request))
             self.row = {
                 "id": "consumer",
                 "request_id": request["request_id"],
@@ -772,7 +793,109 @@ def _scenario_reservations(value):
     from pathlib import Path
 
     ledger = Path(value["approval"]["ledger_root"]) / (value["approval"]["id"] + ".json")
+    if not ledger.exists():
+        return []
     return list(json.loads(ledger.read_text())["reservations"].values())
+
+
+@pytest.mark.parametrize("method", ["api-import", "api-cold-warm"])
+@pytest.mark.parametrize(
+    "policy",
+    [
+        {"service": "palimpsest", "actions": ["packages:write"]},
+        {"service": "palimpsest", "actions": ["packages:manage"]},
+        {"service": "palimpsest", "actions": ["packages:read"]},
+        {"service": "palimpsest", "capabilities": ["palimpsest-publish_editor"]},
+        {"service": "palimpsest", "actions": "packages:write packages:manage"},
+        {"service": "another", "actions": ["packages:write", "packages:manage"]},
+        None,
+    ],
+)
+def test_api_authority_preflight_denies_before_images_intents_and_budget(tmp_path, monkeypatch, method, policy):
+    value, output, model, cloud = _api_scenario_model(tmp_path, monkeypatch, method)
+    model.policy = policy
+    result = run_scenario(value, output, cloud_factory=cloud)
+    assert result["status"] == "failed"
+    assert model.policy_reads == 1
+    assert not model.images and not model.creates
+    assert _scenario_reservations(value) == []
+    assert not list(output.glob("*-intent.json"))
+
+
+def test_api_authority_is_refreshed_before_consumer_reservation(tmp_path, monkeypatch):
+    value, output, model, cloud = _api_scenario_model(tmp_path, monkeypatch)
+    original = model.get_image_job
+
+    def revoke_management(identity):
+        model.policy["actions"].remove("packages:manage")
+        return original(identity)
+
+    monkeypatch.setattr(model, "get_image_job", revoke_management)
+    result = run_scenario(value, output, cloud_factory=cloud)
+    assert result["status"] == "failed"
+    assert model.images and not model.creates
+    assert _scenario_reservations(value) == []
+    assert not list(output.glob("*-consumer*-intent.json"))
+
+
+@pytest.mark.parametrize("cleanup_action", ["packages:manage", "packages:manage_own"])
+def test_api_original_caller_cleanup_action_allows_owned_consumer_lifecycle(tmp_path, monkeypatch, cleanup_action):
+    value, output, model, cloud = _api_scenario_model(tmp_path, monkeypatch)
+    model.policy["actions"] = ["packages:write", cleanup_action]
+    result = run_scenario(value, output, cloud_factory=cloud)
+    assert result["status"] == "success"
+    assert len(model.creates) == 1 and model.provider_deletes == 1
+    assert model.absence_checks == [("original-server", "original-boot")]
+    assert all(row["released"] for row in _scenario_reservations(value))
+
+
+def test_api_policy_transport_failure_has_no_authority_fallback(tmp_path, monkeypatch):
+    value, output, model, cloud = _api_scenario_model(tmp_path, monkeypatch)
+
+    def unavailable(*args):
+        raise ConnectionError("isolated policy transport unavailable")
+
+    monkeypatch.setattr(model, "_json_request", unavailable)
+    result = run_scenario(value, output, cloud_factory=cloud)
+    assert result["status"] == "failed"
+    assert not model.images and not model.creates
+    assert _scenario_reservations(value) == []
+    assert not list(output.glob("*-intent.json"))
+
+
+def test_fixed_hub_execution_smoke_denies_missing_cleanup_before_mutations_and_budget(tmp_path, monkeypatch):
+    import importlib.util
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    path = Path(__file__).resolve().parents[2] / "scripts/smoke_hub_execution.py"
+    spec = importlib.util.spec_from_file_location("hub_execution_smoke", path)
+    smoke = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(smoke)
+    value = config(tmp_path)
+    value["schema"] = "palimpsest.hub-execution-smoke-config.v1"
+    value["approval"]["allowed_scenarios"] = ["hub-execution-smoke"]
+    value["smoke"] = {
+        "image_reference": "docker.io/library/alpine@sha256:" + "a" * 64,
+        "os_family": "fixture-os",
+        "os_version": "1",
+        "layer_file": str(tmp_path / "must-not-open"),
+    }
+    calls = []
+
+    class Member:
+        def _json_request(self, method, route):
+            calls.append((method, route))
+            return {"service": "palimpsest", "actions": ["packages:write"]}
+
+    monkeypatch.setattr(smoke, "ScenarioCloud", lambda *a, **kw: SimpleNamespace(connection=object()))
+    monkeypatch.setattr(smoke, "_hub", lambda *a: Member())
+    output = tmp_path / "smoke"
+    result = smoke.run(value, output)
+    assert result["status"] == "failed" and result["consumer_creations"] == 0
+    assert calls == [("GET", "/policy/capabilities")]
+    assert _scenario_reservations(value) == []
+    assert not list(output.glob("*-intent.json"))
 
 
 @pytest.mark.parametrize("first_delete", ["normal", "cleanup"])
@@ -930,6 +1053,536 @@ def test_image_submission_rechecks_expiry_after_durable_intent(tmp_path, monkeyp
     assert scenarios.cleanup_scenario(output)["status"] == "success"
 
 
+def _api_expiry_clock(value, monkeypatch):
+    from datetime import datetime
+
+    from palimpsest_local import benchmark_scenarios as scenarios
+
+    value["deadline_seconds"] = 60
+    value["approval"]["expires_at"] = datetime.fromtimestamp(1100, UTC).isoformat()
+    clock = [1000.0]
+    monkeypatch.setattr(scenarios.time, "time", lambda: clock[0])
+    monkeypatch.setattr(scenarios.time, "monotonic", lambda: clock[0] - 1000)
+    return clock
+
+
+@pytest.mark.parametrize("expired", ["approval", "deadline"])
+@pytest.mark.parametrize("reservation_kind", ["single", "sequential-pair", "simultaneous-pair"])
+def test_budget_reserve_rechecks_expiration_inside_lock(tmp_path, monkeypatch, expired, reservation_kind):
+    from contextlib import contextmanager
+
+    value = config(tmp_path)
+    clock = _api_expiry_clock(value, monkeypatch)
+    budget = ResourceBudget(value, tmp_path)
+    locked = budget._locked
+
+    @contextmanager
+    def delayed_lock():
+        with locked() as ledger:
+            clock[0] = 1101 if expired == "approval" else 1061
+            yield ledger
+
+    monkeypatch.setattr(budget, "_locked", delayed_lock)
+    with pytest.raises(ArtifactValidationError, match=expired):
+        if reservation_kind == "single":
+            budget.reserve("consumer", 20, deadline=60)
+        else:
+            budget.reserve_pair(
+                ["consumer1", "consumer2"],
+                20,
+                deadline=60,
+                simultaneous=reservation_kind == "simultaneous-pair",
+            )
+    assert not budget.path.exists()
+
+
+@pytest.mark.parametrize("expired", ["approval", "deadline"])
+def test_terminal_image_get_expiration_prevents_consumer_reservation(tmp_path, monkeypatch, expired):
+    from palimpsest_local import benchmark_scenarios as scenarios
+
+    value, output, model, cloud = _api_scenario_model(tmp_path, monkeypatch)
+    clock = _api_expiry_clock(value, monkeypatch)
+
+    def delayed_image(identity):
+        clock[0] = 1101 if expired == "approval" else 1061
+        return {"id": identity, "status": "complete"}
+
+    monkeypatch.setattr(model, "get_image_job", delayed_image)
+    result = run_scenario(value, output, cloud_factory=cloud)
+    assert result["status"] == "failed"
+    assert result["phase"] == "held-no-replay"
+    assert expired in result["issues"][-1]["message"]
+    assert model.creates == []
+    assert (output / "r1-image-result.json").exists()
+    assert not (output / "r1-consumer1-reservation.json").exists()
+    assert not ResourceBudget(value, output).path.exists()
+    assert scenarios.cleanup_scenario(output)["status"] == "success"
+
+
+@pytest.mark.parametrize("index", [1, 2])
+@pytest.mark.parametrize("expired", ["approval", "deadline"])
+@pytest.mark.parametrize("stage", ["intent", "token", "client"])
+def test_consumer_expiration_before_send_is_durable_and_cleanup_safe(tmp_path, monkeypatch, index, expired, stage):
+    from types import SimpleNamespace
+
+    from palimpsest_local import benchmark_scenarios as scenarios
+    from palimpsest_local import hub as hub_module
+
+    real_hub = scenarios._hub
+    value, output, model, cloud = _api_scenario_model(tmp_path, monkeypatch, "api-reuse")
+    clock = _api_expiry_clock(value, monkeypatch)
+    role = "r1-consumer" + str(index)
+    intent = output / (role + "-intent.json")
+    original_intents = []
+    write = scenarios.atomic_write_json
+
+    def expire():
+        clock[0] = 1101 if expired == "approval" else 1061
+
+    def capture_intent(path, row):
+        write(path, row)
+        if path == intent:
+            original_intents.append(path.read_bytes())
+            if stage == "intent":
+                expire()
+
+    monkeypatch.setattr(scenarios, "atomic_write_json", capture_intent)
+    if stage != "intent":
+        # Exercise the real _hub factory, including token and client preparation.
+        def token():
+            if stage == "token" and intent.exists():
+                expire()
+            return "original-caller-token"
+
+        def client(*args, **kwargs):
+            if stage == "client" and intent.exists():
+                expire()
+            return model
+
+        class AuthenticatedCloud(cloud):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.connection = SimpleNamespace(session=SimpleNamespace(get_token=token))
+
+        monkeypatch.setattr(hub_module, "HubClient", client)
+        monkeypatch.setattr(scenarios, "_hub", real_hub)
+        cloud = AuthenticatedCloud
+
+    result = run_scenario(value, output, cloud_factory=cloud)
+    assert result["status"] == "failed"
+    assert result["phase"] == "held-no-replay"
+    assert expired in result["issues"][-1]["message"]
+    assert len(model.creates) == index - 1
+    assert intent.read_bytes() == original_intents[0]
+    assert not (output / (role + "-accepted.json")).exists()
+    certificate = json.loads((output / (role + "-not-sent.json")).read_text())
+    spec = json.loads(intent.read_text())
+    reservation = json.loads((output / (role + "-reservation.json")).read_text())["id"]
+    assert certificate == scenarios._unsent_consumer_identity(value, role, spec, reservation)
+    rows = _scenario_reservations(value)
+    assert len(rows) == index
+    assert sum(row["boot_gib"] for row in rows) == 20 * index
+    assert all(row["released"] for row in rows)
+    assert next(row for row in rows if row["role"] == role)["server_id"] is None
+
+    # No client/list/get is permitted for the certified unsent consumer. For
+    # reuse, only the previously accepted original consumer may be reconciled.
+    looked_up = []
+    get = model.get_instance
+
+    def original_instance(identity):
+        looked_up.append(identity)
+        return get(identity)
+
+    def cleanup_client(*args):
+        if index == 1:
+            pytest.fail("certified no-call cleanup must not prepare a Hub client")
+        return model
+
+    monkeypatch.setattr(model, "get_instance", original_instance)
+    monkeypatch.setattr(scenarios, "_hub", cleanup_client)
+    cleaned = scenarios.cleanup_scenario(output)
+    assert cleaned["status"] == "success"
+    assert len(cleaned["deleted"]) == index - 1
+    assert looked_up == (["consumer"] if index == 2 else [])
+    assert len(model.creates) == index - 1
+    assert _scenario_reservations(value) == rows
+    assert intent.read_bytes() == original_intents[0]
+    clock[0] = 1000
+    with pytest.raises(ArtifactValidationError, match="role consumed"):
+        ResourceBudget(value, output).reserve(role, 20)
+
+
+def test_consumer_no_call_certificate_failure_retains_live_reservation(tmp_path, monkeypatch):
+    from palimpsest_local import benchmark_scenarios as scenarios
+
+    value, output, model, cloud = _api_scenario_model(tmp_path, monkeypatch)
+    clock = _api_expiry_clock(value, monkeypatch)
+    write = scenarios.atomic_write_json
+
+    def fail_certificate(path, row):
+        if path.name == "r1-consumer1-not-sent.json":
+            raise OSError("durable certificate unavailable")
+        write(path, row)
+        if path.name == "r1-consumer1-intent.json":
+            clock[0] = 1061
+
+    monkeypatch.setattr(scenarios, "atomic_write_json", fail_certificate)
+    result = run_scenario(value, output, cloud_factory=cloud)
+    assert result["phase"] == "held-no-replay"
+    assert model.creates == []
+    assert (output / "r1-consumer1-intent.json").exists()
+    assert not (output / "r1-consumer1-not-sent.json").exists()
+    assert not _scenario_reservations(value)[0]["released"]
+
+
+def test_uncertain_certificate_fsync_never_releases_until_verified(tmp_path, monkeypatch):
+    import os
+
+    from palimpsest_local import benchmark_scenarios as scenarios
+    from palimpsest_local import state
+
+    value, output, model, cloud = _api_scenario_model(tmp_path, monkeypatch)
+    clock = _api_expiry_clock(value, monkeypatch)
+    certificate = output / "r1-consumer1-not-sent.json"
+    original_write = scenarios.atomic_write_json
+    original_sync_directory = state.fsync_directory
+    interrupted = False
+
+    def expire_after_intent(path, row):
+        original_write(path, row)
+        if path.name == "r1-consumer1-intent.json":
+            clock[0] = 1061
+
+    def fail_after_certificate_replace(path):
+        nonlocal interrupted
+        if certificate.exists() and not interrupted:
+            interrupted = True
+            raise OSError("certificate directory fsync failed after replacement")
+        original_sync_directory(path)
+
+    monkeypatch.setattr(scenarios, "atomic_write_json", expire_after_intent)
+    monkeypatch.setattr(state, "fsync_directory", fail_after_certificate_replace)
+    assert run_scenario(value, output, cloud_factory=cloud)["phase"] == "held-no-replay"
+    assert interrupted and certificate.exists() and not _scenario_reservations(value)[0]["released"]
+    monkeypatch.setattr(scenarios, "atomic_write_json", original_write)
+    monkeypatch.setattr(state, "fsync_directory", original_sync_directory)
+    original_fsync = os.fsync
+    certificate_inode = certificate.stat().st_ino
+
+    def fail_certificate_fsync(fd):
+        if os.fstat(fd).st_ino == certificate_inode:
+            raise OSError("certificate file fsync still fails")
+        return original_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", fail_certificate_fsync)
+    monkeypatch.setattr(scenarios, "_hub", lambda *args: pytest.fail("no-call cleanup must not query Hub"))
+    with pytest.raises(OSError, match="certificate file fsync"):
+        scenarios.cleanup_scenario(output)
+    assert not _scenario_reservations(value)[0]["released"]
+    monkeypatch.setattr(os, "fsync", original_fsync)
+    assert scenarios.cleanup_scenario(output)["status"] == "success"
+    assert _scenario_reservations(value)[0]["released"] and model.creates == []
+
+
+@pytest.mark.parametrize(
+    "change", ["certificate-symlink", "certificate-hardlink", "certificate-mode", "dangling-acceptance"]
+)
+def test_unsent_cleanup_rejects_unsafe_or_conflicting_evidence(tmp_path, monkeypatch, change):
+    import os
+
+    from palimpsest_local import benchmark_scenarios as scenarios
+
+    value, output, model, cloud = _api_scenario_model(tmp_path, monkeypatch)
+    clock = _api_expiry_clock(value, monkeypatch)
+    original_write = scenarios.atomic_write_json
+    original_release = ResourceBudget.release_unbound
+
+    def expire_after_intent(path, row):
+        original_write(path, row)
+        if path.name == "r1-consumer1-intent.json":
+            clock[0] = 1061
+
+    def interrupted_release(*args):
+        raise OSError("release interrupted")
+
+    monkeypatch.setattr(scenarios, "atomic_write_json", expire_after_intent)
+    monkeypatch.setattr(ResourceBudget, "release_unbound", interrupted_release)
+    assert run_scenario(value, output, cloud_factory=cloud)["phase"] == "held-no-replay"
+    monkeypatch.setattr(scenarios, "atomic_write_json", original_write)
+    monkeypatch.setattr(ResourceBudget, "release_unbound", original_release)
+    certificate = output / "r1-consumer1-not-sent.json"
+    assert certificate.exists() and not _scenario_reservations(value)[0]["released"]
+    if change == "certificate-symlink":
+        target = output / "original-certificate.json"
+        certificate.rename(target)
+        certificate.symlink_to(target.name)
+    elif change == "certificate-hardlink":
+        os.link(certificate, output / "other-certificate.json")
+    elif change == "certificate-mode":
+        certificate.chmod(0o644)
+    else:
+        (output / "r1-consumer1-accepted.json").symlink_to("missing-acceptance.json")
+    monkeypatch.setattr(scenarios, "_hub", lambda *args: pytest.fail("unsafe certificate must not query Hub"))
+    with pytest.raises((OSError, ArtifactValidationError)):
+        scenarios.cleanup_scenario(output)
+    assert not _scenario_reservations(value)[0]["released"] and model.creates == []
+
+
+@pytest.mark.parametrize("change", ["spec", "reservation", "certificate"])
+def test_consumer_no_call_cleanup_rejects_changed_identity(tmp_path, monkeypatch, change):
+    from palimpsest_local import benchmark_scenarios as scenarios
+
+    value, output, model, cloud = _api_scenario_model(tmp_path, monkeypatch)
+    clock = _api_expiry_clock(value, monkeypatch)
+    write = scenarios.atomic_write_json
+    ledger = ResourceBudget(value, output).path
+
+    def expire_after_intent(path, row):
+        if path == ledger and (output / "r1-consumer1-not-sent.json").exists():
+            raise ArtifactValidationError("release ledger persistence interrupted after durable no-call certificate")
+        write(path, row)
+        if path.name == "r1-consumer1-intent.json":
+            clock[0] = 1061
+
+    monkeypatch.setattr(scenarios, "atomic_write_json", expire_after_intent)
+    assert run_scenario(value, output, cloud_factory=cloud)["phase"] == "held-no-replay"
+    assert (output / "r1-consumer1-not-sent.json").exists()
+    assert not (output / "r1-consumer1-accepted.json").exists()
+    assert not _scenario_reservations(value)[0]["released"]
+    monkeypatch.setattr(scenarios, "atomic_write_json", write)
+    name = {"spec": "intent", "reservation": "reservation", "certificate": "not-sent"}[change]
+    path = output / ("r1-consumer1-" + name + ".json")
+    original = path.read_bytes()
+    row = json.loads(original)
+    row["request_id" if change != "reservation" else "id"] = "changed-original-identity"
+    write(path, row)
+    monkeypatch.setattr(scenarios, "_hub", lambda *args: pytest.fail("no-call must not query Hub"))
+    with pytest.raises(ArtifactValidationError, match="unsent API.*identity changed"):
+        scenarios.cleanup_scenario(output)
+    assert not _scenario_reservations(value)[0]["released"]
+    path.write_bytes(original)
+    assert scenarios.cleanup_scenario(output)["status"] == "success"
+    assert scenarios.cleanup_scenario(output)["status"] == "success"
+    assert _scenario_reservations(value)[0]["released"]
+    assert model.creates == []
+
+
+@pytest.mark.parametrize("response", ["lost", "late"])
+def test_consumer_expiration_after_transport_keeps_original_identity_and_reservation(tmp_path, monkeypatch, response):
+
+    value, output, model, cloud = _api_scenario_model(tmp_path, monkeypatch)
+    clock = _api_expiry_clock(value, monkeypatch)
+    create = model.create_instance
+
+    def sent(request, *, before_send=None):
+        admitted = create(request, before_send=before_send)
+        clock[0] = 1101
+        if response == "lost":
+            raise ArtifactValidationError("approval expired after transport began; outcome uncertain")
+        return admitted
+
+    monkeypatch.setattr(model, "create_instance", sent)
+    result = run_scenario(value, output, cloud_factory=cloud)
+    assert result["phase"] == "held-no-replay"
+    assert len(model.creates) == 1
+    assert not _scenario_reservations(value)[0]["released"]
+    assert not (output / "r1-consumer1-not-sent.json").exists()
+    accepted = output / "r1-consumer1-accepted.json"
+    assert accepted.exists() == (response == "late")
+    if response == "late":
+        assert json.loads(accepted.read_text())["id"] == "consumer"
+        assert result["issues"][-1]["retained_hub_instances"][0]["instance_id"] == "consumer"
+
+
+def test_late_terminal_delete_observation_still_reconciles_original_absence(tmp_path, monkeypatch):
+
+    value, output, model, cloud = _api_scenario_model(tmp_path, monkeypatch)
+    clock = _api_expiry_clock(value, monkeypatch)
+    get = model.get_instance
+
+    def late_deleted(identity):
+        row = get(identity)
+        if row["status"] == "deleted":
+            clock[0] = 1061
+        return row
+
+    monkeypatch.setattr(model, "get_instance", late_deleted)
+    result = run_scenario(value, output, cloud_factory=cloud)
+    assert result["status"] == "success"
+    assert model.absence_checks == [("original-server", "original-boot")]
+    assert _scenario_reservations(value)[0]["released"]
+    assert json.loads((output / "r1-consumer1-deleted.json").read_text())["id"] == "consumer"
+
+
+@pytest.mark.parametrize("expired", ["approval", "deadline"])
+def test_reuse_rechecks_expiration_before_second_consumer_reservation(tmp_path, monkeypatch, expired):
+    value, output, model, cloud = _api_scenario_model(tmp_path, monkeypatch, "api-reuse")
+    clock = _api_expiry_clock(value, monkeypatch)
+    absent = cloud.verify_absent
+
+    def expired_after_first_delete(self, server_id, boot_volume_id, **kwargs):
+        absent(self, server_id, boot_volume_id, **kwargs)
+        clock[0] = 1101 if expired == "approval" else 1061
+
+    monkeypatch.setattr(cloud, "verify_absent", expired_after_first_delete)
+    result = run_scenario(value, output, cloud_factory=cloud)
+    assert result["phase"] == "held-no-replay"
+    assert expired in result["issues"][-1]["message"]
+    assert len(model.creates) == 1
+    rows = _scenario_reservations(value)
+    assert len(rows) == 1 and rows[0]["released"]
+    assert not (output / "r1-consumer2-reservation.json").exists()
+    assert not (output / "r1-consumer2-intent.json").exists()
+
+
+@pytest.mark.parametrize("expired", ["approval", "deadline"])
+@pytest.mark.parametrize("stage", ["serialization", "request"])
+def test_consumer_transport_guard_rechecks_after_request_preparation(tmp_path, monkeypatch, expired, stage):
+    from types import SimpleNamespace
+
+    from palimpsest_local import benchmark_scenarios as scenarios
+    from palimpsest_local import hub as hub_module
+
+    value, output, model, cloud = _api_scenario_model(tmp_path, monkeypatch)
+    clock = _api_expiry_clock(value, monkeypatch)
+    transport = hub_module.HubClient("https://hub.example", "original-caller-token")
+    transport._opener = SimpleNamespace(open=lambda *a, **kw: pytest.fail("expired create reached transport"))
+    active = [None]
+    dumps = hub_module.json.dumps
+    request = hub_module.urllib.request.Request
+
+    def expire():
+        clock[0] = 1101 if expired == "approval" else 1061
+
+    def delayed_json(payload, *args, **kwargs):
+        result = dumps(payload, *args, **kwargs)
+        if stage == "serialization" and payload is active[0]:
+            expire()
+        return result
+
+    def delayed_request(url, *args, **kwargs):
+        result = request(url, *args, **kwargs)
+        if stage == "request" and url.endswith("/instances"):
+            expire()
+        return result
+
+    def prepare(request, *, before_send=None):
+        active[0] = request
+        return transport.create_instance(request, before_send=before_send)
+
+    monkeypatch.setattr(hub_module.json, "dumps", delayed_json)
+    monkeypatch.setattr(hub_module.urllib.request, "Request", delayed_request)
+    monkeypatch.setattr(model, "create_instance", prepare)
+    result = run_scenario(value, output, cloud_factory=cloud)
+    assert result["phase"] == "held-no-replay"
+    assert expired in result["issues"][-1]["message"]
+    assert model.creates == []
+    assert not (output / "r1-consumer1-accepted.json").exists()
+    assert (output / "r1-consumer1-intent.json").exists()
+    assert (output / "r1-consumer1-not-sent.json").exists()
+    assert _scenario_reservations(value)[0]["released"]
+    monkeypatch.setattr(scenarios, "_hub", lambda *a: pytest.fail("certified no-call must not query Hub"))
+    assert scenarios.cleanup_scenario(output)["status"] == "success"
+
+
+def test_runner_passes_original_deadline_through_slow_cloud_preflight(tmp_path, monkeypatch):
+    from palimpsest_local import benchmark_scenarios as scenarios
+
+    value = config(tmp_path)
+    clock = _api_expiry_clock(value, monkeypatch)
+    monkeypatch.setattr(scenarios, "_environment_context", lambda _: _cached_context())
+    seen_deadlines = []
+
+    class Cloud:
+        def __init__(self, config, output, event, *, budget, deadline):
+            seen_deadlines.append(deadline)
+            self.budget, self.deadline = budget, deadline
+            clock[0] = 1030
+
+        def create(self, role):
+            clock[0] = 1061
+            self.budget.reserve(role, 20, deadline=self.deadline)
+            pytest.fail("expired original runner deadline reached SDK create")
+
+        def resources(self):
+            return []
+
+    result = run_scenario(value, tmp_path / "run", cloud_factory=Cloud)
+    assert seen_deadlines == [60]
+    assert result["phase"] == "held-no-replay"
+    assert "deadline" in result["issues"][-1]["message"]
+    assert not ResourceBudget(value, tmp_path).path.exists()
+
+
+def test_consumer_no_call_release_commits_with_identity_validation_under_one_lock(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+
+    from palimpsest_local import benchmark_scenarios as scenarios
+
+    value = config(tmp_path)
+    budget = ResourceBudget(value, tmp_path)
+    role, spec = "r1-consumer1", {"request_id": "original-request"}
+    reservation = budget.reserve(role, 20)
+    scenarios.atomic_write_json(
+        tmp_path / (role + "-not-sent.json"),
+        scenarios._unsent_consumer_identity(value, role, spec, reservation),
+    )
+    locked = budget._locked
+    entries = []
+
+    @contextmanager
+    def observe_unlock():
+        with locked() as ledger:
+            entries.append(True)
+            yield ledger
+            # Validation and capacity release must commit before another actor
+            # can acquire the lock and bind this previously unbound reservation.
+            assert ledger["reservations"][reservation]["released"]
+
+    monkeypatch.setattr(budget, "_locked", observe_unlock)
+    scenarios._release_unsent_consumer(value, tmp_path, role, spec, budget, reservation)
+    assert entries == [True]
+    assert _scenario_reservations(value)[0]["released"]
+
+
+@pytest.mark.parametrize("changed", ["missing", "job", "role", "bound"])
+def test_unbound_release_rejects_changed_original_reservation(tmp_path, changed):
+    value = config(tmp_path)
+    budget = ResourceBudget(value, tmp_path)
+    reservation = budget.reserve("original-role", 20)
+    role = "original-role"
+    if changed == "missing":
+        reservation = "unknown-reservation"
+    elif changed == "job":
+        foreign = copy.deepcopy(value)
+        foreign["job_id"] = "another-job"
+        budget = ResourceBudget(foreign, tmp_path)
+    elif changed == "role":
+        role = "another-role"
+    else:
+        budget.bind(reservation, "accepted-server")
+    with pytest.raises(ArtifactValidationError, match="original unbound reservation changed"):
+        budget.release_unbound(reservation, role)
+    assert not _scenario_reservations(value)[0]["released"]
+
+
+def test_unbound_release_is_idempotent_without_refunding_cumulative_or_role_budget(tmp_path):
+    value = config(tmp_path)
+    budget = ResourceBudget(value, tmp_path)
+    first = budget.reserve("first", 20)
+    budget.release_unbound(first, "first")
+    budget.release_unbound(first, "first")
+    with pytest.raises(ArtifactValidationError, match="role consumed"):
+        budget.reserve("first", 20)
+    second = budget.reserve("second", 20)
+    budget.release_unbound(second, "second")
+    with pytest.raises(ArtifactValidationError, match="budget exhausted"):
+        budget.reserve("third", 20)
+    assert len(_scenario_reservations(value)) == 2
+    assert sum(row["boot_gib"] for row in _scenario_reservations(value)) == 40
+
+
 def _cold_warm_model(tmp_path, monkeypatch):
     from palimpsest_local import benchmark_scenarios as scenarios
 
@@ -948,9 +1601,10 @@ def _cold_warm_model(tmp_path, monkeypatch):
         clock[0] += 40
         return {"id": "image-job", "status": "queued"}
 
-    def consumer(request):
-        model.creates.append(request)
-        index = len(model.creates)
+    def consumer(request, *, before_send=None):
+        if before_send is not None:
+            before_send()
+        index = len(model.creates) + 1
         clock[0] += 10 if index == 1 else 5
         create(request)
         suffix = "1" if model.reused_resources else str(index)
@@ -1064,14 +1718,17 @@ def test_pair_expired_before_create_is_no_call_not_uncertain(tmp_path, monkeypat
     result = run_scenario(value, output, cloud_factory=cloud)
     assert result["status"] == "failed" and model.creates == []
     assert result["resources"][-1]["effect"] == "no-call"
-    assert not (output / "r1-consumer1-submission.json").exists()
+    assert json.loads((output / "r1-consumer1-submission.json").read_text())["effect"] == "no-call"
+    assert (output / "r1-consumer1-not-sent.json").exists()
     assert result["issues"][-1]["retained_hub_instances"] == []
 
 
 def test_pair_lost_create_response_is_uncertain_and_never_replayed(tmp_path, monkeypatch):
     value, output, model, cloud, _ = _cold_warm_model(tmp_path, monkeypatch)
 
-    def lost_response(request):
+    def lost_response(request, *, before_send=None):
+        if before_send is not None:
+            before_send()
         model.creates.append(request)
         raise RuntimeError("lost accepted response")
 
@@ -1117,8 +1774,8 @@ def test_gpu_pair_forwards_profile_and_tf_cold_includes_external_context(tmp_pat
     }
     create = model.create_instance
 
-    def gpu_consumer(request):
-        create(request)
+    def gpu_consumer(request, *, before_send=None):
+        create(request, before_send=before_send)
         model.row.update(gpu_profile="qualified-gpu", gpu=profile)
         return dict(model.row)
 
@@ -1246,8 +1903,9 @@ def test_nonpaired_no_call_consumer_releases_unused_live_slot_without_adoption(t
     result = run_scenario(value, output, cloud_factory=cloud)
     assert result["status"] == "failed" and model.creates == [] and len(model.images) == 1
     assert result["resources"][-1]["effect"] == "no-call"
-    assert not (output / "r1-consumer1-submission.json").exists()
-    assert not _scenario_reservations(value)[0]["released"]
+    assert json.loads((output / "r1-consumer1-submission.json").read_text())["effect"] == "no-call"
+    assert (output / "r1-consumer1-not-sent.json").exists()
+    assert _scenario_reservations(value)[0]["released"]
     assert scenarios.cleanup_scenario(output)["status"] == "success"
     assert _scenario_reservations(value)[0]["released"]
     assert len(_scenario_reservations(value)) == 1
@@ -1336,7 +1994,9 @@ def _api_cluster_model(tmp_path, monkeypatch):
             }
         }
 
-    def create(spec):
+    def create(spec, *, before_send=None):
+        if before_send is not None:
+            before_send()
         model.creates.append(dict(spec))
         index = len(model.creates)
         role = "agent" if spec.get("cluster_server_id") else "server"
@@ -1526,8 +2186,8 @@ def test_api_cluster_pair_timeout_covers_create_reads_and_sealed_proof(tmp_path,
     )
     provider_reads = []
 
-    def slow_create(spec):
-        row = create(spec)
+    def slow_create(spec, *, before_send=None):
+        row = create(spec, before_send=before_send)
         if stage == "server-create" and not spec.get("cluster_server_id"):
             clock[0] += 60  # The original server call takes 70 seconds against a 60-second pair limit.
         return row
@@ -1583,8 +2243,8 @@ def test_api_cluster_prepared_pair_gets_fresh_bounded_deployment_window(
     monkeypatch.setattr(benchmark_scenario_cloud, "ScenarioCloud", cloud)
     create = model.create_instance
 
-    def prepared_server(spec):
-        row = create(spec)
+    def prepared_server(spec, *, before_send=None):
+        row = create(spec, before_send=before_send)
         if len(model.creates) == 3:
             clock[0] += extra_seconds
         return row
@@ -1905,8 +2565,8 @@ def test_generic_cleanup_volume_only_never_creates_and_advances_exact_delete_onc
     # Slow Cinder has not certified volume_ready during the normal run.
     create = model.create_instance
 
-    def preparing(spec):
-        create(spec)
+    def preparing(spec, *, before_send=None):
+        create(spec, before_send=before_send)
         model.row["provider_phase"] = "volume_preparing"
         return dict(model.row)
 
@@ -2052,8 +2712,8 @@ def test_terminal_prepared_root_cleanup_requires_positive_no_nova_certificate(
     create = model.create_instance
     provider_reads = []
 
-    def failed_root(spec):
-        create(spec)
+    def failed_root(spec, *, before_send=None):
+        create(spec, before_send=before_send)
         model.row.update(
             status="error",
             provider_phase="uncertain",
@@ -2124,3 +2784,95 @@ def test_terminal_prepared_root_cleanup_requires_positive_no_nova_certificate(
     absence = json.loads((output / "r1-consumer1-absence.json").read_text())
     assert absence["server_absent"] == "not_created" and absence["boot_volume_absent"] is True
     assert _scenario_reservations(value)[0]["released"]
+
+
+@pytest.mark.parametrize("method", ["api-cold-warm", "api-cluster"])
+@pytest.mark.parametrize("index", [1, 2])
+@pytest.mark.parametrize("stage", ["intent", "serialization", "request"])
+def test_paired_consumer_final_guard_preserves_original_pair_and_no_call_cleanup(
+    tmp_path, monkeypatch, method, index, stage
+):
+    from types import SimpleNamespace
+
+    from palimpsest_local import benchmark_scenario_cloud
+    from palimpsest_local import benchmark_scenarios as scenarios
+    from palimpsest_local import hub as hub_module
+
+    factory = _api_cluster_model if method == "api-cluster" else _cold_warm_model
+    value, output, model, cloud, clock = factory(tmp_path, monkeypatch)
+    value["repetitions"] = 1
+    monkeypatch.setattr(benchmark_scenario_cloud, "ScenarioCloud", cloud)
+    role = "r1-consumer" + str(index)
+    original_create = model.create_instance
+    write, dumps, request = scenarios.atomic_write_json, hub_module.json.dumps, hub_module.urllib.request.Request
+    active = [None]
+    transport = hub_module.HubClient("https://hub.example", "original-caller-token")
+    transport._opener = SimpleNamespace(open=lambda *a, **kw: pytest.fail("expired pair reached HTTP transport"))
+
+    def expire():
+        clock[0] += 10000
+
+    def journal(path, row):
+        write(path, row)
+        if stage == "intent" and path.name == role + "-intent.json":
+            expire()
+
+    def serialize(payload, *args, **kwargs):
+        result = dumps(payload, *args, **kwargs)
+        if stage == "serialization" and active[0] is not None and payload is active[0]:
+            expire()
+        return result
+
+    def construct(url, *args, **kwargs):
+        result = request(url, *args, **kwargs)
+        if stage == "request" and url.endswith("/instances"):
+            expire()
+        return result
+
+    def create(spec, *, before_send=None):
+        if spec["name"].startswith("pal-bench-" + role + "-"):
+            active[0] = spec
+            return transport.create_instance(spec, before_send=before_send)
+        return original_create(spec, before_send=before_send)
+
+    monkeypatch.setattr(scenarios, "atomic_write_json", journal)
+    monkeypatch.setattr(hub_module.json, "dumps", serialize)
+    monkeypatch.setattr(hub_module.urllib.request, "Request", construct)
+    model.create_instance = create
+    result = run_scenario(value, output, cloud_factory=cloud)
+    assert result["phase"] == "held-no-replay" and len(model.creates) == index - 1
+    spec = json.loads((output / (role + "-intent.json")).read_text())
+    reservation = json.loads((output / (role + "-reservation.json")).read_text())["id"]
+    certificate = json.loads((output / (role + "-not-sent.json")).read_text())
+    assert certificate == scenarios._unsent_consumer_identity(value, role, spec, reservation)
+    assert not (output / (role + "-accepted.json")).exists()
+    rows = _scenario_reservations(value)
+    assert len(rows) == 2 and sum(row["boot_gib"] for row in rows) == 40
+    unsent = next(row for row in rows if row["role"] == role)
+    assert unsent["released"] and unsent["server_id"] is None
+    assert scenarios.cleanup_scenario(output)["status"] == "success"
+    assert all(row["released"] for row in _scenario_reservations(value))
+    assert len(model.creates) == index - 1
+    with pytest.raises(ArtifactValidationError, match="role consumed"):
+        # Expiry does not erase either cumulative reservation or its role.
+        clock[0] = 1000
+        ResourceBudget(value, output).reserve(role, 20)
+
+
+@pytest.mark.parametrize("suffix", ["-intent.json", "-submission.json", "-accepted.json", "-not-sent.json"])
+def test_unused_pair_slot_with_dangling_create_evidence_stays_reserved(tmp_path, monkeypatch, suffix):
+    from palimpsest_local import benchmark_scenarios as scenarios
+
+    value, output, model, cloud, _ = _cold_warm_model(tmp_path, monkeypatch)
+
+    def unavailable_image(identity):
+        raise RuntimeError("original image observation unavailable")
+
+    model.get_image_job = unavailable_image
+    assert run_scenario(value, output, cloud_factory=cloud)["phase"] == "held-no-replay"
+    assert model.creates == []
+    (output / ("r1-consumer1" + suffix)).symlink_to("missing-original-create-evidence.json")
+    with pytest.raises((OSError, ArtifactValidationError)):
+        scenarios.cleanup_scenario(output)
+    assert len(_scenario_reservations(value)) == 2
+    assert all(not row["released"] for row in _scenario_reservations(value))

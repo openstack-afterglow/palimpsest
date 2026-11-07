@@ -21,14 +21,11 @@ from keystoneclient import exceptions as ks_exceptions
 from pydantic import SecretStr
 
 from palimpsest_hub.config import get_settings, validate_keystone_id
-from palimpsest_hub.policy import (
-    allowed_actions,
-    capabilities_for,
-)
+from palimpsest_hub.policy import allowed_actions
 
 _logger = logging.getLogger(__name__)
 
-_HUMAN_AUTH_METHODS = frozenset({"password", "token", "totp", "oidc", "saml2", "mapped"})
+_HUMAN_AUTH_METHODS = frozenset({"password", "token", "totp", "openid", "oidc", "saml2", "mapped"})
 _REDUCED_TOKEN_MARKERS = frozenset(
     {
         "OS-TRUST:trust",
@@ -380,73 +377,6 @@ def get_token_info(token_info: dict[str, Any] = Depends(require_token)) -> dict[
     return token_info
 
 
-def _personal_project_owner(client, user_id, project_id, user, project, directory, assignments):
-    """Resolve personal authority from fresh native extras, domains and provenance."""
-    if _value(project, "afterglow_personal_user_id") != user_id:
-        return False
-    domains = {}
-    for resource in (user, project):
-        domain_id = validate_keystone_id(_value(resource, "domain_id"))
-        if domain_id not in domains:
-            domain = client.domains.get(domain_id)
-            if _value(domain, "id") != domain_id or _value(domain, "enabled") is not True:
-                return False
-            domains[domain_id] = domain
-    domain = domains[_value(project, "domain_id")]
-    kind = (
-        domain.get("afterglow_domain_kind", "personal")
-        if isinstance(domain, dict)
-        else getattr(domain, "afterglow_domain_kind", "personal")
-    )
-    if _value(domain, "name") != "Personal" or kind != "personal":
-        return False
-    members = directory[1].get("member", ())
-    if len(members) != 1 or directory[0][members[0]]["name"] != "member":
-        return False
-    member = members[0]
-    if not _effective_role_names([member], directory) <= {"member", "reader"}:
-        return False
-    permitted = {member, *directory[1].get("reader", ())}
-    raw = _identity_collection(
-        client,
-        "/role_assignments?"
-        + urlencode(
-            {
-                "scope.project.id": project_id,
-                "include_names": "true",
-            }
-        ),
-        "role_assignments",
-    )
-
-    def direct(row, role_ids):
-        scope, links = row.get("scope"), row.get("links", {})
-        return (
-            isinstance(scope, dict)
-            and set(scope) == {"project"}
-            and scope["project"].get("id") == project_id
-            and row.get("user", {}).get("id") == user_id
-            and "group" not in row
-            and row.get("role", {}).get("id") in role_ids
-            and isinstance(links, dict)
-            and "membership" not in links
-            and "OS-INHERIT:inherited_to" not in row
-            and (
-                not links.get("assignment")
-                or links["assignment"].rstrip("/").endswith(f"/projects/{project_id}/users/{user_id}/roles/{member}")
-            )
-        )
-
-    effective = [row for row in assignments if row.get("scope", {}).get("project", {}).get("id") == project_id]
-    return (
-        bool(raw)
-        and all(direct(row, {member}) for row in raw)
-        and bool(effective)
-        and all(direct(row, permitted) for row in effective)
-        and any(row.get("role", {}).get("id") == member for row in effective)
-    )
-
-
 def validate_package_owner(user_id: str, project_id: str, *, allow_empty: bool = False) -> dict[str, Any]:
     """Recheck current owner authority; neither a token nor cached membership is minted."""
     settings = get_settings()
@@ -483,6 +413,21 @@ def validate_package_owner(user_id: str, project_id: str, *, allow_empty: bool =
             raise HTTPException(status_code=503, detail="Keystone identity response ownership is invalid")
         if _value(user, "enabled") is not True or _value(project, "enabled") is not True:
             raise HTTPException(status_code=403, detail="Package owner or project is disabled")
+        # Enabled native home/project domains are a credential boundary, not
+        # personal-project provenance or a role-derived authority fallback.
+        for domain_id in dict.fromkeys(
+            validate_keystone_id(_value(resource, "domain_id")) for resource in (user, project)
+        ):
+            try:
+                domain = client.domains.get(domain_id)
+            except ks_exceptions.NotFound:
+                raise HTTPException(status_code=503, detail="Native identity domain is unavailable") from None
+            if _value(domain, "id") != domain_id:
+                raise HTTPException(status_code=503, detail="Native identity domain ownership is invalid")
+            if _value(domain, "enabled") is False:
+                raise HTTPException(status_code=403, detail="Package owner or project domain is disabled")
+            if _value(domain, "enabled") is not True:
+                raise HTTPException(status_code=503, detail="Native identity domain enabled state is unavailable")
         roles: set[str] = set()
         directory = _role_directory(client)
         if _system_role_names(client, user_id, directory) & {"admin", "manager", "service"}:
@@ -516,9 +461,7 @@ def validate_package_owner(user_id: str, project_id: str, *, allow_empty: bool =
                 roles.update(effective)
         if not roles:
             raise HTTPException(status_code=403, detail="Current native project membership is required")
-        personal_owner = _personal_project_owner(client, user_id, project_id, user, project, directory, assignments)
-        actions = allowed_actions(roles, project_id, user_id, personal_project_owner=personal_owner)
-        capabilities = capabilities_for(actions)
+        actions = allowed_actions(roles, project_id, user_id)
         if not actions and not allow_empty:
             raise HTTPException(status_code=403, detail="Current Palimpsest service authority is required")
         return {
@@ -528,11 +471,9 @@ def validate_package_owner(user_id: str, project_id: str, *, allow_empty: bool =
             "project_name": _value(project, "name") or "",
             "project_domain_id": _value(project, "domain_id") or "",
             "roles": sorted(roles),
-            "package_capabilities": capabilities,
             "package_actions": actions,
-            "can_write": "palimpsest-publish_editor" in capabilities,
+            "can_write": "packages:write" in actions,
             "role_directory": directory,
-            "personal_project_owner": personal_owner,
         }
     except HTTPException:
         raise
@@ -573,21 +514,17 @@ async def get_package_member_info(
         token_roles,
         token_info["project_id"],
         token_info["user_id"],
-        personal_project_owner=owner.get("personal_project_owner") is True and "member" in token_roles,
     )
     if owner["user_id"] != token_info["user_id"] or owner["project_id"] != token_info["project_id"]:
         raise HTTPException(status_code=403, detail="Package owner does not match original token identity")
     actions = token_actions & owner["package_actions"]
-    capabilities = capabilities_for(actions)
     if not actions and not allow_empty:
         raise HTTPException(status_code=403, detail="Current Palimpsest service authority is required")
     return {
         **token_info,
         "current_roles": owner["roles"],
-        "package_capabilities": capabilities,
         "package_actions": actions,
-        "personal_project_owner": owner.get("personal_project_owner") is True and "member" in token_roles,
-        "can_write": "palimpsest-publish_editor" in capabilities,
+        "can_write": "packages:write" in actions,
     }
 
 
@@ -712,7 +649,6 @@ def _package_admin_context(token_info: dict[str, Any]) -> dict[str, Any]:
         "is_package_system_admin": True,
         "target_project_id": target,
         "package_actions": actions,
-        "package_capabilities": capabilities_for(actions),
         "target_project_name": _value(project, "name") or "",
     }
 
@@ -730,6 +666,31 @@ async def get_package_manager_info(token_info: dict[str, Any] = Depends(require_
     if token_info.get("is_system_admin"):
         return await asyncio.to_thread(_package_admin_context, token_info)
     return await get_package_member_info(token_info=token_info)
+
+
+def credential_headers(request: Request) -> tuple[str | None, str | None]:
+    """Return (Authorization, X-Auth-Token); presenting both is ambiguous and never downgraded."""
+    authorization = request.headers.get("authorization")
+    token = request.headers.get("x-auth-token")
+    if authorization is not None and token is not None:
+        raise HTTPException(status_code=401, detail="Choose an original Keystone token or a bearer key, not both")
+    return authorization, token
+
+
+async def original_token_info(request: Request) -> dict[str, Any]:
+    """Validate the request's own X-Auth-Token exactly like `require_token`."""
+    _, token = credential_headers(request)
+    return await require_token(request, x_auth_token=token, x_project_id=request.headers.get("x-project-id"))
+
+
+async def original_human_member(
+    request: Request, _token_scheme: str | None = Security(keystone_token_header)
+) -> dict[str, Any]:
+    """Current human project member from an original Keystone token; bearer keys are refused."""
+    authorization, _ = credential_headers(request)
+    if authorization is not None:
+        raise HTTPException(status_code=401, detail="An original Keystone member token is required")
+    return await get_package_member_info(token_info=await original_token_info(request))
 
 
 def require_admin(token_info: dict[str, Any] = Depends(require_token)) -> dict[str, Any]:

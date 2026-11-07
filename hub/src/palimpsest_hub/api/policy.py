@@ -17,6 +17,5 @@ async def capabilities(token_info: dict = Depends(require_token)):
         member = await get_package_member_info(token_info, allow_empty=True)
     return {
         "service": "palimpsest",
-        "capabilities": sorted(member["package_capabilities"]),
         "actions": sorted(member["package_actions"]),
     }

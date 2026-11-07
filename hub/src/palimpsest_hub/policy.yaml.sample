@@ -1,11 +1,19 @@
 # Project-local rules. Scope, current identity, key attenuation and ownership are not overridable.
-"packages:inventory": "personal_project_owner:True or role:admin or role:palimpsest_admin or role:palimpsest_editor or role:palimpsest_user or role:palimpsest_reader or role:palimpsest-inventory_reader or role:palimpsest-download_user or role:palimpsest-publish_editor or role:palimpsest-keys_editor or role:palimpsest-keys_admin"
-"packages:read": "personal_project_owner:True or role:admin or role:palimpsest_admin or role:palimpsest_editor or role:palimpsest_user or role:palimpsest-download_user"
-"packages:write": "personal_project_owner:True or role:admin or role:palimpsest_admin or role:palimpsest_editor or role:palimpsest-publish_editor"
-"cache:read": "personal_project_owner:True or role:admin or role:palimpsest_admin or role:palimpsest_editor or role:palimpsest_user or role:palimpsest-download_user"
-"cache:write": "personal_project_owner:True or role:admin or role:palimpsest_admin or role:palimpsest_editor or role:palimpsest-publish_editor"
-"keys:issue": "personal_project_owner:True or role:admin or role:palimpsest_admin or role:palimpsest_editor or role:palimpsest-keys_editor"
-"keys:list": "personal_project_owner:True or role:admin or role:palimpsest_admin or role:palimpsest_editor or role:palimpsest-keys_editor or role:palimpsest-keys_admin"
-"keys:revoke": "personal_project_owner:True or role:admin or role:palimpsest_admin or role:palimpsest-keys_admin"
+# Existing native reader < member < manager tiers include all lower-tier actions.
+"packages:inventory": "role:reader or role:member or role:manager or role:admin"
+"packages:read": "role:reader or role:member or role:manager or role:admin"
+"packages:write": "role:member or role:manager or role:admin"
+"packages:delete": "role:manager or role:admin"
+"packages:manage": "role:manager or role:admin"
+# Self cleanup additionally requires exact original creator/project ownership.
+"packages:manage_own": "role:member or role:manager or role:admin"
+"cache:read": "role:reader or role:member or role:manager or role:admin"
+"cache:write": "role:member or role:manager or role:admin"
+"keys:issue": "role:manager or role:admin"
+"keys:list": "role:reader or role:member or role:manager or role:admin"
+"keys:revoke": "role:manager or role:admin"
+# Original Keystone token only; never another owner's key or bearer-key control.
+"keys:revoke_own": "role:reader or role:member or role:manager or role:admin"
+# A project admin/manager is not a system administrator. This check additionally
+# requires independently verified fresh human system:all admin authority.
 "system:manage": "role:admin"
-"packages:delete": "personal_project_owner:True or role:admin"

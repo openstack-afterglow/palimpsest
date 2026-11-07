@@ -15,42 +15,40 @@ from palimpsest_hub.config import get_settings
 
 DEFAULT_POLICY_FILE = "/etc/palimpsest/policy.yaml"
 _LOCK = RLock()
-# Capability names are presentation labels, never synthesized Keystone role claims.
-CAPABILITY_ACTIONS = {
-    "palimpsest-inventory_reader": "packages:inventory",
-    "palimpsest-download_user": "packages:read",
-    "palimpsest-publish_editor": "packages:write",
-    "palimpsest-keys_editor": "keys:issue",
-    "palimpsest-keys_admin": "keys:revoke",
-}
-_READ = "role:admin or role:palimpsest_admin or role:palimpsest_editor or role:palimpsest_user"
-_WRITE = "role:admin or role:palimpsest_admin or role:palimpsest_editor"
-_INVENTORY = (
-    _READ
-    + " or role:palimpsest_reader or role:palimpsest-inventory_reader or role:palimpsest-download_user or role:palimpsest-publish_editor or role:palimpsest-keys_editor or role:palimpsest-keys_admin"
-)
+_READ = "role:reader or role:member or role:manager or role:admin"
+_WRITE = "role:member or role:manager or role:admin"
+_MANAGE = "role:manager or role:admin"
 _CHECKS = {
-    "packages:inventory": _INVENTORY,
-    "packages:read": _READ + " or role:palimpsest-download_user",
-    "packages:write": _WRITE + " or role:palimpsest-publish_editor",
-    "cache:read": _READ + " or role:palimpsest-download_user",
-    "cache:write": _WRITE + " or role:palimpsest-publish_editor",
-    "keys:issue": _WRITE + " or role:palimpsest-keys_editor",
-    "keys:list": _WRITE + " or role:palimpsest-keys_editor or role:palimpsest-keys_admin",
-    "keys:revoke": "role:admin or role:palimpsest_admin or role:palimpsest-keys_admin",
+    "packages:inventory": _READ,
+    "packages:read": _READ,
+    "packages:write": _WRITE,
+    "cache:read": _READ,
+    "cache:write": _WRITE,
+    "keys:issue": _MANAGE,
+    "keys:list": _READ,
+    "keys:revoke": _MANAGE,
+    "keys:revoke_own": _READ,
     "system:manage": "role:admin",
-    "packages:delete": "role:admin",
+    "packages:delete": _MANAGE,
+    "packages:manage": _MANAGE,
+    "packages:manage_own": _WRITE,
 }
 ACTIONS = tuple(sorted(_CHECKS))
 KEY_ACTIONS = frozenset({"packages:inventory", "packages:read", "packages:write", "cache:read", "cache:write"})
 SYSTEM_ACTIONS = frozenset({"system:manage"})
+READ_ACTIONS = frozenset({"packages:inventory", "packages:read", "cache:read", "keys:list", "keys:revoke_own"})
+WRITE_ACTIONS = frozenset({"packages:write", "cache:write", "packages:manage_own"})
+MANAGE_ACTIONS = frozenset({"packages:delete", "packages:manage", "keys:issue", "keys:revoke"})
+PROJECT_READ_ROLES = frozenset({"reader", "member", "manager", "admin"})
+PROJECT_WRITE_ROLES = frozenset({"member", "manager", "admin"})
+PROJECT_MANAGE_ROLES = frozenset({"manager", "admin"})
 
 
 def list_rules():
     return [
         policy.RuleDefault(
             name,
-            check if name in SYSTEM_ACTIONS else "personal_project_owner:True or " + check,
+            check,
             description=("System-only " if name in SYSTEM_ACTIONS else "Project-local ")
             + name
             + "; native ownership and credential limits always apply.",
@@ -120,23 +118,25 @@ def get_enforcer():
     return _enforcer(settings.oslo_policy_policy_file, tuple(settings.oslo_policy_policy_dirs))
 
 
-def allowed_actions(
-    roles, project_id: str, user_id: str = "", *, system_admin: bool = False, personal_project_owner: bool = False
-) -> frozenset[str]:
-    """Evaluate exact trusted global roles; no service grade-to-leaf expansion."""
+def allowed_actions(roles, project_id: str, user_id: str = "", *, system_admin: bool = False) -> frozenset[str]:
+    """Evaluate exact current native roles; personal metadata is not an authority fallback."""
     if not project_id:
         return frozenset()
-    actions = tuple(
-        action
-        for action in ACTIONS
-        if (system_admin or action not in SYSTEM_ACTIONS)
-        and (action != "packages:delete" or system_admin or personal_project_owner is True)
-    )
+    roles = frozenset(roles)
+    ceiling = set()
+    if roles & PROJECT_READ_ROLES:
+        ceiling.update(READ_ACTIONS)
+    if roles & PROJECT_WRITE_ROLES:
+        ceiling.update(WRITE_ACTIONS)
+    if roles & PROJECT_MANAGE_ROLES:
+        ceiling.update(MANAGE_ACTIONS)
+    if system_admin:
+        ceiling.update(SYSTEM_ACTIONS)
+    actions = tuple(action for action in ACTIONS if action in ceiling)
     creds = {
         "roles": list(roles),
         "project_id": project_id,
         "user_id": user_id,
-        "personal_project_owner": personal_project_owner is True,
     }
     return _evaluate_actions(actions, {"project_id": project_id, "user_id": user_id}, creds)
 
@@ -159,7 +159,3 @@ def _evaluate_actions(actions, target, creds):
             # Never retain partially loaded rules or a cached malformed file after failure.
             _enforcer.cache_clear()
             raise HTTPException(status_code=503, detail="Palimpsest authorization policy unavailable") from None
-
-
-def capabilities_for(actions) -> frozenset[str]:
-    return frozenset(label for label, action in CAPABILITY_ACTIONS.items() if action in actions)

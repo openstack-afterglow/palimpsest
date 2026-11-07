@@ -16,7 +16,7 @@ import time
 import tomllib
 import uuid
 from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
@@ -25,7 +25,7 @@ from types import MappingProxyType
 from typing import Any
 
 from .digest import normalize_digest
-from .errors import StateError
+from .errors import RuntimeBusyError, StateError
 from .runtime_types import (
     ALLOWED_RUNTIME_STATUSES,
     DispatchKey,
@@ -43,11 +43,12 @@ _TAG_RE = re.compile(r"^[a-z0-9][a-z0-9.+\-]{0,63}$")
 _STATUSES = {"creating", "defined", "starting", "running", "stopping", "stopped", "removed", "failed"}
 _MAX_RUN_LEDGER_BYTES = 1024 * 1024
 _MAX_LIFECYCLE_REVISION = 2**63 - 1
+RUN_OBSERVATION_TIMEOUT_SECONDS = 5.0
 
 _PROC_LOCKS_MAX_BYTES = 1024 * 1024
 
 
-class RunLockTimeoutError(StateError):
+class RunLockTimeoutError(RuntimeBusyError):
     """A bounded run-lock acquisition expired; holder identity is best effort."""
 
     def __init__(self, holder_pid: int | None = None) -> None:
@@ -58,6 +59,30 @@ class RunLockTimeoutError(StateError):
         if holder_pid is not None:
             message += f"; holder-pid={holder_pid}"
         super().__init__(message)
+
+
+@dataclass(slots=True)
+class RunObservationWaitBudget:
+    """Request-local, sequential allowance charged only for mutex contention."""
+
+    remaining_seconds: float = RUN_OBSERVATION_TIMEOUT_SECONDS
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.remaining_seconds) not in (int, float)
+            or not math.isfinite(self.remaining_seconds)
+            or not 0 <= self.remaining_seconds <= RUN_OBSERVATION_TIMEOUT_SECONDS
+        ):
+            raise StateError("invalid observation wait allowance")
+
+    def seconds_left(self, started_at: float) -> float:
+        return min(
+            self.remaining_seconds,
+            max(0.0, started_at + self.remaining_seconds - max(started_at, time.monotonic())),
+        )
+
+    def charge_wait(self, started_at: float) -> None:
+        self.remaining_seconds = self.seconds_left(started_at)
 
 
 def _parse_linux_flock_holder(content: bytes, lock_device: int, lock_inode: int) -> int | None:
@@ -120,6 +145,15 @@ class RunLedgerSnapshot:
 class StatePaths:
     config: Path
     state: Path
+
+    @property
+    def catalog(self) -> Path:
+        """Private relational discovery metadata, never a payload authority."""
+        return self.state / "catalog-v1"
+
+    @property
+    def metadata_db(self) -> Path:
+        return self.catalog / "metadata.sqlite3"
 
     @property
     def store(self) -> Path:
@@ -448,6 +482,10 @@ def _toml_format_value(val: Any) -> str:
         return str(val)
     elif isinstance(val, str):
         return json.dumps(val)
+    elif isinstance(val, (list, tuple)):
+        return "[" + ", ".join(_toml_format_value(item) for item in val) + "]"
+    elif isinstance(val, dict):
+        return "{" + ", ".join(f"{json.dumps(key)} = {_toml_format_value(item)}" for key, item in val.items()) + "}"
     else:
         raise TypeError(f"Unsupported TOML value type: {type(val)}")
 
@@ -561,7 +599,85 @@ def init_roots(environment: dict[str, str] | None = None) -> StatePaths:
     return init_resolved_roots(resolve_roots(environment))
 
 
-def init_resolved_roots(roots: StatePaths) -> StatePaths:
+def init_source_roots(roots: StatePaths) -> StatePaths:
+    """Initialize the configured source CAS, without runtime roots, locks or cleanup."""
+    if not isinstance(roots, StatePaths):
+        raise TypeError("source initialization requires resolved StatePaths")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        with ExitStack() as stack:
+            canonical: dict[str, Path] = {}
+            for role, path in (("state", roots.state), ("config", roots.config)):
+                if not path.is_absolute() or not path.name or ".." in path.parts:
+                    raise StateError("source state authority must be an absolute child directory")
+                # As in the runtime namespace, configured ancestors can include
+                # system aliases (for example macOS /var). Never resolve the
+                # selected state/config component or any source-CAS component.
+                if role == "state":
+                    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                canonical[role] = path.parent.resolve(strict=False) / path.name
+                try:
+                    parent_fd = os.open(canonical[role].parent, flags)
+                except FileNotFoundError:
+                    if role == "config":
+                        continue
+                    raise
+                stack.callback(os.close, parent_fd)
+                try:
+                    directory_fd = stack.enter_context(
+                        _source_only_directory(parent_fd, path.name, private=role != "state", create=role == "state")
+                    )
+                except FileNotFoundError:
+                    if role == "config":
+                        continue
+                    raise
+                if role == "state":
+                    state_fd = directory_fd
+            runtime_fd = stack.enter_context(_source_only_directory(state_fd, "runtime-packs", private=True))
+            stack.enter_context(_source_only_directory(runtime_fd, "oci-source-v1", private=True))
+            return StatePaths(config=canonical["config"], state=canonical["state"])
+    except OSError as exc:
+        raise StateError("cannot initialize source state authority") from exc
+
+
+@contextmanager
+def _source_only_directory(parent_fd: int, name: str, *, private: bool, create: bool = True) -> Iterator[int]:
+    """Create or pin an owned child, preserving existing traversal permissions."""
+    if create:
+        try:
+            os.mkdir(name, 0o700, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+        except FileExistsError:
+            pass
+    directory_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent_fd)
+    try:
+        opened = os.fstat(directory_fd)
+        visible = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        mode = stat_module.S_IMODE(opened.st_mode)
+        if (
+            not stat_module.S_ISDIR(opened.st_mode)
+            or opened.st_uid != os.geteuid()
+            or _identity(opened) != _identity(visible)
+            or (mode != 0o700 if private else bool(mode & 0o022))
+        ):
+            raise StateError("source state directory is not owner-bound and private")
+        yield directory_fd
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        held = os.fstat(directory_fd)
+        if (
+            _identity(current) != _identity(opened)
+            or _identity(held) != _identity(opened)
+            or current.st_mode != opened.st_mode
+            or held.st_mode != opened.st_mode
+            or current.st_uid != opened.st_uid
+            or held.st_uid != opened.st_uid
+        ):
+            raise StateError("source state directory authority changed")
+    finally:
+        os.close(directory_fd)
+
+
+def init_resolved_roots(roots: StatePaths, *, _run_lock_deadline: float | None = None) -> StatePaths:
     """Initialize exactly one previously resolved root authority without re-reading config."""
 
     if not isinstance(roots, StatePaths):
@@ -590,7 +706,7 @@ def init_resolved_roots(roots: StatePaths) -> StatePaths:
         ):
             _initialize_private_root(directory, protected)
     # This cleanup acquires run locks; never nest it under the shared lock.
-    _retry_run_deletion_quarantines(roots)
+    _retry_run_deletion_quarantines(roots, lock_deadline=_run_lock_deadline)
     return roots
 
 
@@ -1359,12 +1475,27 @@ class _NewRunNameLock:
 
 
 @contextmanager
-def _new_run_name_lock(roots: StatePaths, name: str, *, lock_timeout: float | None = None) -> Iterator[_NewRunNameLock]:
+def _new_run_name_lock(
+    roots: StatePaths,
+    name: str,
+    *,
+    lock_timeout: float | None = None,
+    lock_deadline: float | None = None,
+    observation_budget: RunObservationWaitBudget | None = None,
+) -> Iterator[_NewRunNameLock]:
     if lock_timeout is not None and (
         type(lock_timeout) not in {int, float} or not math.isfinite(lock_timeout) or lock_timeout <= 0
     ):
         raise StateError("invalid run lock timeout")
+    if lock_deadline is not None and (
+        type(lock_deadline) not in {int, float} or not math.isfinite(lock_deadline) or lock_deadline < 0
+    ):
+        raise StateError("invalid run lock deadline")
+    if observation_budget is not None and not isinstance(observation_budget, RunObservationWaitBudget):
+        raise StateError("invalid observation wait allowance")
     deadline = None if lock_timeout is None else time.monotonic() + lock_timeout
+    if lock_deadline is not None:
+        deadline = lock_deadline if deadline is None else min(deadline, lock_deadline)
     locks_fd = _open_readonly_no_follow(roots.locks, directory=True)
     if locks_fd is None:
         raise StateError("cannot securely lock new run name")
@@ -1415,21 +1546,32 @@ def _new_run_name_lock(roots: StatePaths, name: str, *, lock_timeout: float | No
             or _identity(lock_open) != _identity(lock_entry)
         ):
             raise StateError("cannot securely lock new run name")
+        waited_at = None
         try:
-            if deadline is None:
-                fcntl.flock(lock_fd, fcntl.LOCK_EX)
-            else:
-                while True:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise RunLockTimeoutError(_linux_flock_holder_pid(lock_fd))
-                    try:
-                        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                        break
-                    except BlockingIOError:
-                        time.sleep(min(0.01, remaining))
-        except OSError:
-            raise StateError("cannot securely lock new run name") from None
+            try:
+                if deadline is None and observation_budget is None:
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                else:
+                    while True:
+                        if observation_budget is None and lock_deadline is None and time.monotonic() >= deadline:
+                            raise RunLockTimeoutError(_linux_flock_holder_pid(lock_fd))
+                        try:
+                            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            break
+                        except BlockingIOError:
+                            if waited_at is None:
+                                waited_at = time.monotonic()
+                            remaining = float("inf") if deadline is None else deadline - time.monotonic()
+                            if observation_budget is not None:
+                                remaining = min(remaining, observation_budget.seconds_left(waited_at))
+                            if remaining <= 0:
+                                raise RunLockTimeoutError(_linux_flock_holder_pid(lock_fd)) from None
+                            time.sleep(min(0.01, remaining))
+            except OSError:
+                raise StateError("cannot securely lock new run name") from None
+        finally:
+            if observation_budget is not None and waited_at is not None:
+                observation_budget.charge_wait(waited_at)
         current = _safe_stat(filename, directory_fd=locks_fd)
         current_locks = _safe_stat(roots.locks)
         if (
@@ -1460,12 +1602,14 @@ def reserve_new_run(
     roots: StatePaths,
     name: str,
     dispatch_key: DispatchKey,
+    *,
+    _lock_deadline: float | None = None,
 ) -> Iterator[NewRunReservation]:
     """Exclusively reserve and pin one new run directory for its full create."""
     if not isinstance(dispatch_key, DispatchKey):
         raise StateError("new run reservation requires a DispatchKey")
     rpaths = _new_run_paths(roots, name)
-    with _new_run_name_lock(roots, name) as name_lock:
+    with _new_run_name_lock(roots, name, lock_deadline=_lock_deadline) as name_lock:
         runs_fd = _open_readonly_no_follow(roots.runs, directory=True)
         if runs_fd is None:
             raise StateError("cannot securely reserve new run")
@@ -2143,7 +2287,7 @@ def _restore_quarantined_run(
             pass
 
 
-def _retry_run_deletion_quarantines(roots: StatePaths) -> None:
+def _retry_run_deletion_quarantines(roots: StatePaths, *, lock_deadline: float | None = None) -> None:
     """Best-effort cleanup for run trees whose logical deletion already committed."""
     deletions_fd: int | None = None
     try:
@@ -2164,7 +2308,7 @@ def _retry_run_deletion_quarantines(roots: StatePaths) -> None:
             ):
                 continue
             try:
-                with _new_run_name_lock(roots, run_name):
+                with _new_run_name_lock(roots, run_name, lock_deadline=lock_deadline):
                     entry = _safe_stat(name, directory_fd=deletions_fd)
                     if entry is None or not stat_module.S_ISDIR(entry.st_mode) or entry.st_uid != os.geteuid():
                         continue
@@ -2318,10 +2462,14 @@ def locked_existing_run(
     expected: ExistingRunRecord | None = None,
     expected_snapshot: RunLedgerSnapshot | None = None,
     lock_timeout: float | None = None,
+    lock_deadline: float | None = None,
+    observation_budget: RunObservationWaitBudget | None = None,
 ) -> Iterator[ExistingRunMutation]:
     """Lock first, then pin and re-read one existing run mutation authority."""
     paths = _new_run_paths(roots, name)
-    with _new_run_name_lock(roots, name, lock_timeout=lock_timeout) as name_lock:
+    with _new_run_name_lock(
+        roots, name, lock_timeout=lock_timeout, lock_deadline=lock_deadline, observation_budget=observation_budget
+    ) as name_lock:
         runs_fd = _open_readonly_no_follow(roots.runs, directory=True)
         if runs_fd is None:
             raise StateError("cannot securely open existing runs")
@@ -2533,6 +2681,7 @@ def _read_pinned_run_payloads(
     name: str,
     *,
     expected_directory: os.stat_result | None = None,
+    require_private: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     directory_fd = _open_readonly_no_follow(name, directory_fd=runs_fd, directory=True)
     if directory_fd is None:
@@ -2543,13 +2692,21 @@ def _read_pinned_run_payloads(
             raise StateError("cannot securely read run ledger")
         if not stat_module.S_ISDIR(directory_before.st_mode):
             raise StateError("cannot securely read run ledger")
+        if require_private and (
+            directory_before.st_uid != os.geteuid() or stat_module.S_IMODE(directory_before.st_mode) != 0o700
+        ):
+            raise StateError("run observation directory is not owned and private")
         if expected_directory is not None and (directory_before.st_dev, directory_before.st_ino) != (
             expected_directory.st_dev,
             expected_directory.st_ino,
         ):
             raise StateError("run ledger changed during read")
-        raw_owner = _read_pinned_json_object(directory_fd, "owner.json")
-        raw_state = _read_pinned_json_object(directory_fd, "state.json")
+        if require_private:
+            raw_owner = _decode_exact_json_object(_read_exact_private_file(directory_fd, "owner.json"))
+            raw_state = _decode_exact_json_object(_read_exact_private_file(directory_fd, "state.json"))
+        else:
+            raw_owner = _read_pinned_json_object(directory_fd, "owner.json")
+            raw_state = _read_pinned_json_object(directory_fd, "state.json")
         directory_after = _safe_fstat(directory_fd)
         current_directory = _safe_stat(name, directory_fd=runs_fd)
         if (
@@ -2719,7 +2876,27 @@ def snapshot_from_runtime_observation(
     return snapshot
 
 
-def read_run_dispatch_record(roots: StatePaths, name: str) -> ExistingRunRecord:
+def read_run_dispatch_record(
+    roots: StatePaths,
+    name: str,
+    *,
+    lock_deadline: float | None = None,
+    observation_budget: RunObservationWaitBudget | None = None,
+) -> ExistingRunRecord:
+    """Read durable identity; live callers may cooperate with the existing run lock."""
+    if not isinstance(name, str) or _NAME_RE.fullmatch(name) is None:
+        raise StateError("invalid run name")
+    if lock_deadline is None and observation_budget is None:
+        return _read_run_dispatch_record(roots, name)
+    with locked_existing_run(
+        roots, name, lock_deadline=lock_deadline, observation_budget=observation_budget
+    ) as authority:
+        record = _read_run_dispatch_record(roots, name)
+        authority.verify_binding()
+        return record
+
+
+def _read_run_dispatch_record(roots: StatePaths, name: str) -> ExistingRunRecord:
     """Read and normalize only the durable identity fields used for dispatch.
 
     This reader is intentionally side-effect-free.  Legacy mutable state is
@@ -2762,8 +2939,97 @@ def read_run_ledger_snapshot(roots: StatePaths, name: str) -> RunLedgerSnapshot:
         _close_noerror(runs_fd)
 
 
+@dataclass(frozen=True, slots=True)
+class _RunObservationBinding:
+    """Directory-only flight identity; never a ledger or transport authority."""
+
+    roots: StatePaths
+    directories: tuple[tuple[Path, int, tuple[int, int, int, int]], ...]
+    names: tuple[str, ...]
+    entries: tuple[tuple[str, tuple[int, int, int, int]], ...]
+
+    @property
+    def key(self) -> tuple[Any, ...]:
+        return (
+            str(self.roots.config.resolve()),
+            str(self.roots.state.resolve()),
+            tuple((str(path), identity) for path, _fd, identity in self.directories),
+            self.entries,
+            self.names,
+        )
+
+    def verify_roots(self) -> None:
+        for path, descriptor, identity in self.directories:
+            opened = _safe_fstat(descriptor)
+            visible = _safe_stat(path)
+            if (
+                opened is None
+                or visible is None
+                or not stat_module.S_ISDIR(opened.st_mode)
+                or not stat_module.S_ISDIR(visible.st_mode)
+                or opened.st_uid != os.geteuid()
+                or visible.st_uid != os.geteuid()
+                or stat_module.S_IMODE(opened.st_mode) & 0o022
+                or stat_module.S_IMODE(visible.st_mode) & 0o022
+                or (_identity(opened) + (opened.st_mode, opened.st_uid)) != identity
+                or (_identity(visible) + (visible.st_mode, visible.st_uid)) != identity
+            ):
+                raise StateError("run observation directory binding changed")
+
+    def verify(self) -> None:
+        self.verify_roots()
+        for name, identity in self.entries:
+            visible = _safe_stat(name, directory_fd=self.directories[2][1])
+            if (
+                visible is None
+                or not stat_module.S_ISDIR(visible.st_mode)
+                or (_identity(visible) + (visible.st_mode, visible.st_uid)) != identity
+            ):
+                raise StateError("run observation directory binding changed")
+        try:
+            if tuple(sorted(os.listdir(self.directories[2][1]))) != self.names:
+                raise StateError("run observation enumeration changed")
+        except OSError:
+            raise StateError("cannot securely enumerate run observation binding") from None
+
+
+@contextmanager
+def _pinned_run_observation_binding(roots: StatePaths) -> Iterator[_RunObservationBinding | None]:
+    """Pin before mutable reads, without creating roots or acquiring run locks.
+
+    Unavailable/non-owner-private trees keep their existing reconciliation path,
+    but cannot join another caller's observation. Only the three root descriptors
+    remain open; per-run identity is revalidated alongside the complete ledger.
+    """
+    with ExitStack() as stack:
+        directories: list[tuple[Path, int, tuple[int, int, int, int]]] = []
+        try:
+            for path in (roots.config, roots.state, roots.runs):
+                descriptor = stack.enter_context(pinned_owner_directory(path))
+                assert descriptor is not None
+                info = os.fstat(descriptor)
+                directories.append((path, descriptor, _identity(info) + (info.st_mode, info.st_uid)))
+            names = tuple(sorted(os.listdir(directories[2][1])))
+            entries: list[tuple[str, tuple[int, int, int, int]]] = []
+            for name in names:
+                if _NAME_RE.fullmatch(name) is None:
+                    raise StateError("invalid run observation entry")
+                with pinned_owner_directory(roots.runs / name) as descriptor:
+                    assert descriptor is not None
+                    info = os.fstat(descriptor)
+                    entries.append((name, _identity(info) + (info.st_mode, info.st_uid)))
+            binding = _RunObservationBinding(roots, tuple(directories), names, tuple(entries))
+            binding.verify()
+        except (OSError, StateError):
+            binding = None
+        yield binding
+
+
 def enumerate_run_snapshots(
     roots: StatePaths,
+    *,
+    lock_deadline: float | None = None,
+    observation_budget: RunObservationWaitBudget | None = None,
 ) -> tuple[tuple[RunLedgerSnapshot, ...], tuple[RunAggregationError, ...]]:
     """Return deterministic pinned ledger payloads for later safe projection."""
     try:
@@ -2820,13 +3086,47 @@ def enumerate_run_snapshots(
                 continue
             record: ExistingRunRecord | None = None
             try:
-                raw_owner, raw_state = _read_pinned_run_payloads(
-                    runs_fd,
-                    raw_name,
-                    expected_directory=entry_stat,
+                with (
+                    locked_existing_run(
+                        roots, raw_name, lock_deadline=lock_deadline, observation_budget=observation_budget
+                    )
+                    if lock_deadline is not None or observation_budget is not None
+                    else nullcontext()
+                ) as authority:
+                    raw_owner, raw_state = _read_pinned_run_payloads(
+                        runs_fd,
+                        raw_name,
+                        expected_directory=entry_stat,
+                    )
+                    record = _normalize_run_dispatch_record(raw_name, raw_owner, raw_state)
+                    if authority is not None:
+                        authority.verify_binding()
+                    snapshots.append(_snapshot_from_payloads(raw_name, raw_owner, raw_state))
+            except RunLockTimeoutError:
+                # No ledger read occurred before acquisition timed out. Make
+                # one strict metadata read for an explicitly unobserved row;
+                # this is never live authority or a retry of a failed read.
+                try:
+                    parent = _safe_fstat(runs_fd)
+                    if parent is None or parent.st_uid != os.geteuid() or stat_module.S_IMODE(parent.st_mode) != 0o700:
+                        raise StateError("run observation root is not owned and private")
+                    raw_owner, raw_state = _read_pinned_run_payloads(
+                        runs_fd, raw_name, expected_directory=entry_stat, require_private=True
+                    )
+                    record = _normalize_run_dispatch_record(raw_name, raw_owner, raw_state)
+                    snapshots.append(_snapshot_from_payloads(raw_name, raw_owner, raw_state))
+                except (RecursionError, StateError, TypeError, ValueError):
+                    pass
+                errors.append(
+                    RunAggregationError(
+                        raw_name,
+                        None,
+                        RuntimeOperation.PS,
+                        None if record is None else record.dispatch_key,
+                        "runtime-busy",
+                        "run observation is busy",
+                    )
                 )
-                record = _normalize_run_dispatch_record(raw_name, raw_owner, raw_state)
-                snapshots.append(_snapshot_from_payloads(raw_name, raw_owner, raw_state))
             except (RecursionError, StateError, TypeError, ValueError):
                 errors.append(
                     RunAggregationError(
@@ -2923,8 +3223,23 @@ class PinnedRunConsole:
         self.position += len(content)
         return content
 
-    def current_status(self) -> str:
+    def current_status(self, *, observation_budget: RunObservationWaitBudget | None = None) -> str:
         """Revalidate the exact run and console binding at a follow EOF."""
+        if observation_budget is None:
+            return self._current_status()
+        try:
+            # The name mutex also fences deletion. Unlike locked_existing_run,
+            # this permits the pinned console's exact-directory-absent terminal.
+            with _new_run_name_lock(self.roots, self.record.name, observation_budget=observation_budget):
+                return self._current_status()
+        except RunLockTimeoutError:
+            # No ledger/provider observation was admitted. A pinned follower
+            # may keep draining its original descriptor after this pure busy.
+            raise
+        except StateError:
+            self._fail(LogErrorCategory.RUN_CHANGED)
+
+    def _current_status(self) -> str:
         runs_current = _safe_stat(self.roots.runs)
         if (
             runs_current is None
@@ -2950,8 +3265,18 @@ class PinnedRunConsole:
             self._fail(LogErrorCategory.RUN_CHANGED)
         self._console_size()
         try:
-            raw_owner = _read_pinned_json_object(self.run_fd, "owner.json")
-            raw_state = _read_pinned_json_object(self.run_fd, "state.json")
+            if self.record.dispatch_key == DispatchKey(RuntimeKind.OCI_ROOT, RuntimeBackend.LIMA_VZ):
+                raw_owner, raw_state = _read_pinned_run_payloads(
+                    self.runs_fd,
+                    self.record.name,
+                    expected_directory=self.run_metadata,
+                    require_private=True,
+                )
+            else:
+                # Legacy boot producers may atomically publish sibling files
+                # without taking the run mutex; retain their per-file checks.
+                raw_owner = _read_pinned_json_object(self.run_fd, "owner.json")
+                raw_state = _read_pinned_json_object(self.run_fd, "state.json")
             current = _normalize_run_dispatch_record(self.record.name, raw_owner, raw_state)
             status = raw_state.get("status")
         except (RecursionError, StateError, TypeError, ValueError):
@@ -3017,7 +3342,35 @@ def _open_pinned_private_file(directory_fd: int, filename: str) -> tuple[int, by
         raise
 
 
-def open_pinned_run_console(roots: StatePaths, expected: ExistingRunRecord) -> PinnedRunConsole:
+def open_pinned_run_console(
+    roots: StatePaths, expected: ExistingRunRecord, *, observation_budget: RunObservationWaitBudget | None = None
+) -> PinnedRunConsole:
+    """Pin an exact console; live callers can share their bounded wait allowance."""
+    if observation_budget is None:
+        return _open_pinned_run_console(roots, expected)
+    source = None
+    try:
+        with locked_existing_run(
+            roots, expected.name, expected=expected, observation_budget=observation_budget
+        ) as authority:
+            source = _open_pinned_run_console(roots, expected)
+            authority.verify_binding()
+        return source
+    except RunLockTimeoutError:
+        if source is not None:
+            source.close()
+        raise LogStreamError(LogErrorCategory.READ_FAILED) from None
+    except LogStreamError:
+        if source is not None:
+            source.close()
+        raise
+    except StateError:
+        if source is not None:
+            source.close()
+        raise LogStreamError(LogErrorCategory.RUN_CHANGED) from None
+
+
+def _open_pinned_run_console(roots: StatePaths, expected: ExistingRunRecord) -> PinnedRunConsole:
     """Pin one exact owner/state/console chain without following special files."""
     descriptors: list[int] = []
     try:

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import threading
+import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 
 from . import state
+from .errors import PalimpsestError, RuntimeBusyError
 from .runtime_types import (
     ExistingRunRecord,
     LogCursor,
@@ -24,13 +26,21 @@ from .runtime_types import (
 
 _CHUNK_SIZE = 64 * 1024
 _FOLLOW_POLL_SECONDS = 0.05
+_REFRESH_POLL_SECONDS = 0.5
 _TERMINAL_STATUSES = frozenset({"stopped", "removed", "failed", "exited"})
 
 
 class RetainedConsoleLogStream:
     """Single-consumer byte stream over one pinned console inode."""
 
-    def __init__(self, source: state.PinnedRunConsole, mode: LogMode) -> None:
+    def __init__(
+        self,
+        source: state.PinnedRunConsole,
+        mode: LogMode,
+        *,
+        refresh: Callable[[state.RunObservationWaitBudget], None] | None = None,
+        observation_budget: state.RunObservationWaitBudget | None = None,
+    ) -> None:
         if not isinstance(source, state.PinnedRunConsole):
             raise TypeError("retained console stream requires a pinned source")
         if not isinstance(mode, LogMode):
@@ -46,6 +56,9 @@ class RetainedConsoleLogStream:
         self._cursor_position = 0
         self._stream_sequence = 0
         self._last_observed_at: datetime | None = None
+        self._refresh = refresh
+        self._observation_budget = observation_budget
+        self._next_refresh = time.monotonic() + _REFRESH_POLL_SECONDS
 
     @property
     def record(self) -> ExistingRunRecord:
@@ -94,6 +107,9 @@ class RetainedConsoleLogStream:
                 yield self._terminal(LogTerminalCategory.CANCELLED)
                 return
             while True:
+                if self._cancelled.is_set():
+                    yield self._terminal(LogTerminalCategory.CANCELLED)
+                    return
                 try:
                     content = self._source.read(_CHUNK_SIZE, snapshot=self._mode is LogMode.SNAPSHOT)
                 except LogStreamError as exc:
@@ -114,14 +130,28 @@ class RetainedConsoleLogStream:
                     continue
                 if self._mode is LogMode.SNAPSHOT:
                     try:
-                        self._source.current_status()
+                        if self._observation_budget is not None:
+                            self._source.current_status(observation_budget=self._observation_budget)
+                        else:
+                            self._source.current_status()
+                    except state.RunLockTimeoutError:
+                        yield self._terminal(LogTerminalCategory.ERROR, error=LogErrorCategory.READ_FAILED)
+                        return
                     except LogStreamError as exc:
                         yield self._terminal(LogTerminalCategory.ERROR, error=exc.category)
                         return
                     yield self._terminal(LogTerminalCategory.SNAPSHOT_COMPLETE)
                     return
+                budget = state.RunObservationWaitBudget() if self._observation_budget is not None else None
                 try:
-                    status = self._source.current_status()
+                    if budget is None:
+                        status = self._source.current_status()
+                    else:
+                        status = self._source.current_status(observation_budget=budget)
+                except state.RunLockTimeoutError:
+                    # A busy name mutex leaves the original FD usable, but
+                    # admits no refresh for this EOF observation.
+                    status = None
                 except LogStreamError as exc:
                     yield self._terminal(LogTerminalCategory.ERROR, error=exc.category)
                     return
@@ -150,6 +180,25 @@ class RetainedConsoleLogStream:
                         continue
                     yield self._terminal(LogTerminalCategory.RUN_TERMINAL, status=status)
                     return
+                if status is not None and self._refresh is not None and time.monotonic() >= self._next_refresh:
+                    if self._cancelled.is_set():
+                        yield self._terminal(LogTerminalCategory.CANCELLED)
+                        return
+                    try:
+                        self._refresh(budget)
+                    except RuntimeBusyError:
+                        # No provider request was admitted by this mutex
+                        # acquisition. Do not repeat any other refresh failure.
+                        self._next_refresh = time.monotonic() + _REFRESH_POLL_SECONDS
+                    except (PalimpsestError, OSError):
+                        yield self._terminal(LogTerminalCategory.ERROR, error=LogErrorCategory.READ_FAILED)
+                        return
+                    else:
+                        self._next_refresh = time.monotonic() + _REFRESH_POLL_SECONDS
+                        if self._cancelled.is_set():
+                            yield self._terminal(LogTerminalCategory.CANCELLED)
+                            return
+                        continue
                 if self._cancelled.wait(_FOLLOW_POLL_SECONDS):
                     yield self._terminal(LogTerminalCategory.CANCELLED)
                     return
@@ -176,5 +225,20 @@ def open_retained_console_stream(
     roots: state.StatePaths,
     record: ExistingRunRecord,
     mode: LogMode,
+    *,
+    refresh: Callable[[state.RunObservationWaitBudget], None] | None = None,
+    observation_budget: state.RunObservationWaitBudget | None = None,
 ) -> RetainedConsoleLogStream:
-    return RetainedConsoleLogStream(state.open_pinned_run_console(roots, record), mode)
+    if refresh is not None and observation_budget is None:
+        observation_budget = state.RunObservationWaitBudget()
+    if refresh is not None:
+        try:
+            refresh(observation_budget)
+        except (PalimpsestError, OSError):
+            raise LogStreamError(LogErrorCategory.READ_FAILED) from None
+    return RetainedConsoleLogStream(
+        state.open_pinned_run_console(roots, record, observation_budget=observation_budget),
+        mode,
+        refresh=refresh if mode is LogMode.FOLLOW else None,
+        observation_budget=observation_budget,
+    )

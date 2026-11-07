@@ -1,11 +1,50 @@
 # Environment benchmarks and experiment controller
 
+Consolidation expiry contract (2026-11-02): reservation and final transport guards
+use the original scenario/approval deadline. Only identity-bound durable no-send
+proof releases an unbound live slot; creation roles and cumulative GiB stay spent.
+Unknown POST/DELETE outcomes remain HOLD, never replay/refund. Prepared Cinder
+roots survive a proven Nova no-call until exact owned cleanup and provider404.
+
 Owner policy (2026-10-29): use one retained4vCPU/8192MiB OpenStack calibration VM
 with a dedicated500GiB Cinder disk. During active experiments, measure Internet
 download/upload at30–60minute intervals (default60minutes), not per workload.
 Both providers run from that same VM in one timestamped cohort; keep each result
 and their equal-weight mean. Missing directions remain N/A. Historical data is
 never retroactively qualified by a later or differently located sample.
+
+Owner lifecycle policy (2026-11-02): run one test case, preserve its evidence,
+delete its consumer VM and exclusive disposable boot volume, and verify provider
+404 before starting the next case. GPU test consumers are strictly one at a time
+across native, SDK, API and resident-controller entry points, not one per queue.
+Cleanup failure or an unknown provider effect blocks further allocation; do not
+retry a deletion blindly or refund cumulative reservations. Remove completed
+test helpers instead of accumulating idle workers. Explicitly retained station
+storage/access/measurement dependencies and the single currently needed shared
+build worker are separate infrastructure, not additional test consumers; preserve
+their recorded ownership/dependencies when reconciling cleanup. Never delete an
+unattributed VM or another user's resource merely because it appears nearby.
+Current API benchmark and fixed `scripts/smoke_hub_execution.py` qualification
+requires an original project token with `packages:write` and either
+`packages:manage` or `packages:manage_own`. Existing member self-cleanup authority
+is sufficient only for consumers created by that actual caller and their
+exclusive disposable boot volumes; never another private creator's resource.
+They read `GET /v1/policy/capabilities` before API work and again before consumer
+reservations/intents; malformed/unavailable authority or missing admission/
+cleanup action fails closed. Package keys cannot supply cleanup authority.
+This preflight grants no budget and does not freeze future authorization.
+Run one approved case, preserve evidence, delete its exact consumer/exclusive
+boot disk, and prove provider absence before the next case. Revoked cleanup
+authority is HOLD: no replacement, system/service fallback or uncertain replay.
+
+The existing native/scenario loops gate their own consumers, but their separate
+locks are not a project-wide GPU admission fence. Keep one operator/executor for
+the whole campaign and check preceding exact server/boot absence before every
+new case; parallel direct entry points are outside this serial workflow. The
+historical `scripts/benchmark_nova_gpu.py` intentionally retains boot/data disks,
+so it cannot be used unchanged as proof of this disposable-boot policy. An
+intentional separately approved CPU k3s server/agent pair remains one cluster
+case; dispose of every member before advancing to the next case.
 
 ## Commands
 

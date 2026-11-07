@@ -19,6 +19,8 @@ from pathlib import Path
 
 from .benchmark_reporting import _safe_text, render_report
 from .errors import ArtifactValidationError
+from .layer_cache import _directory, _private_directory, _stable
+from .oci_image import strict_json_object
 from .state import atomic_write_json
 
 SCHEMA = "palimpsest.benchmark-scenario.v1"
@@ -327,12 +329,12 @@ class ResourceBudget:
         if deadline is not None and time.monotonic() >= deadline:
             raise ArtifactValidationError("scenario deadline before allocation")
 
-    def reserve(self, role, boot_gib):
+    def reserve(self, role, boot_gib, deadline=None):
         _integer(boot_gib, 1, 32768, "reserved boot GiB")
         if not isinstance(role, str) or not _NAME.fullmatch(role):
             raise ArtifactValidationError("bounded creation role required")
         with self._locked() as value:
-            self.check_allocation()
+            self.check_allocation(deadline)
             rows = list(value["reservations"].values())
             own = [r for r in rows if r["job_id"] == self.config["job_id"]]
             if any(r["role"] == role for r in own):
@@ -359,11 +361,11 @@ class ResourceBudget:
             }
             return identity
 
-    def reserve_pair(self, roles, boot_gib, *, simultaneous=False):
+    def reserve_pair(self, roles, boot_gib, *, simultaneous=False, deadline=None):
         """Consume cumulative slots and hold the pair's required live capacity atomically."""
         _integer(boot_gib, 1, 32768, "reserved boot GiB")
         with self._locked() as value:
-            self.check_allocation()
+            self.check_allocation(deadline)
             rows = list(value["reservations"].values())
             own = [row for row in rows if row["job_id"] == self.config["job_id"]]
             if len(roles) != 2 or len(set(roles)) != 2 or any(not _NAME.fullmatch(role) for role in roles):
@@ -436,6 +438,18 @@ class ResourceBudget:
             row = value["reservations"][identity]
             if row["job_id"] != self.config["job_id"]:
                 raise ArtifactValidationError("reservation belongs to another run")
+            row["released"] = True
+
+    def release_unbound(self, identity, role):
+        """Release a certified no-call role only while its reservation remains unbound."""
+        with self._locked() as value:
+            row = value["reservations"].get(identity, {})
+            if (
+                row.get("job_id") != self.config["job_id"]
+                or row.get("role") != role
+                or row.get("server_id") is not None
+            ):
+                raise ArtifactValidationError("original unbound reservation changed; no budget release")
             row["released"] = True
 
     def reserve_aux(self, kind, role):
@@ -568,6 +582,100 @@ def _hub(config, connection):
         context.load_verify_locations(cafile=config["hub"]["ca_file"])
     client._opener = urllib.request.build_opener(_NoRedirectHandler(), urllib.request.HTTPSHandler(context=context))
     return client
+
+
+def _require_hub_lifecycle(client):
+    """Require both admission and cleanup authority before spending a VM slot."""
+    policy = client._json_request("GET", "/policy/capabilities")
+    actions = policy.get("actions") if isinstance(policy, dict) else None
+    if (
+        not isinstance(policy, dict)
+        or policy.get("service") != "palimpsest"
+        or not isinstance(actions, list)
+        or any(not isinstance(action, str) for action in actions)
+        or "packages:write" not in actions
+        or not {"packages:manage", "packages:manage_own"}.intersection(actions)
+    ):
+        raise ArtifactValidationError(
+            "Hub benchmark requires current packages:write and packages:manage or packages:manage_own for cleanup"
+        )
+
+
+def _unsent_consumer_identity(config, role, spec, reservation):
+    return {
+        "job_id": config["job_id"],
+        "config_sha256": _digest(config),
+        "role": role,
+        "request_id": spec["request_id"],
+        "spec_sha256": _digest(spec),
+        "reservation_id": reservation,
+    }
+
+
+def _release_unsent_consumer(config, output, role, spec, budget, reservation):
+    """Release only a durably certified pre-transport refusal, never an uncertain call."""
+    if not isinstance(role, str) or not _NAME.fullmatch(role):
+        raise ArtifactValidationError("invalid unsent API consumer role")
+    with _directory(Path(output)) as directory:
+        _private_directory(directory)
+        try:
+            os.stat(role + "-accepted.json", dir_fd=directory, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise ArtifactValidationError(
+                "original unsent API create identity changed; retain reservation, never replay"
+            )
+        name = role + "-not-sent.json"
+        descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=directory)
+        with os.fdopen(descriptor, "rb") as stream:
+            before = os.fstat(stream.fileno())
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_uid != os.geteuid()
+                or before.st_nlink != 1
+                or stat.S_IMODE(before.st_mode) != 0o600
+                or before.st_size > 65536
+            ):
+                raise ArtifactValidationError("unsafe unsent API create certificate")
+            payload = stream.read(65537)
+            if (
+                len(payload) != before.st_size
+                or _stable(before) != _stable(os.fstat(stream.fileno()))
+                or _stable(before) != _stable(os.stat(name, dir_fd=directory, follow_symlinks=False))
+            ):
+                raise ArtifactValidationError("unsent API create certificate changed during verification")
+            recorded = strict_json_object(payload, "unsent API create certificate")
+            if recorded != _unsent_consumer_identity(config, role, spec, reservation):
+                raise ArtifactValidationError(
+                    "original unsent API create identity changed; retain reservation, never replay"
+                )
+            # A previous rename may have succeeded before a directory-fsync
+            # failure. Make the exact validated file and directory durable first.
+            os.fsync(stream.fileno())
+            os.fsync(directory)
+    budget.release_unbound(reservation, role)
+
+
+def _consumer_send_guard(config, output, role, spec, budget, reservation, deadline, record, *, fence=None):
+    def before_send():
+        try:
+            if fence is not None:
+                fence()
+            budget.check_allocation(deadline)
+        except ArtifactValidationError:
+            # Only the pre-transport guard can certify no call. A failed opener
+            # or late response leaves the original reservation uncertain.
+            atomic_write_json(
+                output / (role + "-not-sent.json"),
+                _unsent_consumer_identity(config, role, spec, reservation),
+            )
+            _release_unsent_consumer(config, output, role, spec, budget, reservation)
+            record["effect"] = "no-call"
+            atomic_write_json(output / (role + "-submission.json"), record)
+            raise
+
+    return before_send
 
 
 def _wait(get, terminal, deadline, event, kind):
@@ -907,7 +1015,8 @@ def _run_api_cluster(config, output, prefix, measurement, state, cloud, budget, 
 
     roles = [prefix + "-consumer1", prefix + "-consumer2"]
     fence()
-    reservations = budget.reserve_pair(roles, config["placement"]["boot_gib"], simultaneous=True)
+    _require_hub_lifecycle(_hub(config, cloud.connection))
+    reservations = budget.reserve_pair(roles, config["placement"]["boot_gib"], simultaneous=True, deadline=deadline)
     for role in roles:
         journal(role + "-reservation.json", {"id": reservations[role], "role": role, "call_tracking": True})
     cold = not retained
@@ -1020,6 +1129,7 @@ def _run_api_cluster(config, output, prefix, measurement, state, cloud, budget, 
     for index, role in enumerate(roles):
         reservation = reservations[role]
         fence()
+        _require_hub_lifecycle(_hub(config, cloud.connection))
         budget.activate(reservation, pair_deadline)
         spec = {
             key: value
@@ -1044,7 +1154,7 @@ def _run_api_cluster(config, output, prefix, measurement, state, cloud, budget, 
             spec.update(source_instance_id=members[0]["id"], cluster_server_id=members[0]["id"])
         else:
             spec["image_job_id"] = job["id"]
-        journal(role + "-intent.json", spec)
+        atomic_write_json(output / (role + "-intent.json"), spec)
         event("consumer-create-started", {"role": role, "request_id": spec["request_id"]})
         record = dict(
             origin="api", role=role, request_id=spec["request_id"], reservation_id=reservation, effect="no-call"
@@ -1053,15 +1163,13 @@ def _run_api_cluster(config, output, prefix, measurement, state, cloud, budget, 
         client = _hub(config, cloud.connection)
         record["effect"] = "uncertain-no-replay"
         atomic_write_json(output / (role + "-submission.json"), record)
-        try:
-            fence()
-        except ArtifactValidationError:
-            record["effect"] = "no-call"
-            atomic_write_json(output / (role + "-submission.json"), record)
-            raise
+        before_send = _consumer_send_guard(
+            config, output, role, spec, budget, reservation, pair_deadline, record, fence=fence
+        )
+        before_send()
         live.append(record)
         consumer_start = (time.monotonic(), time.time())
-        admitted = client.create_instance(spec)
+        admitted = client.create_instance(spec, before_send=before_send)
         atomic_write_json(output / (role + "-accepted.json"), admitted)
         record.update(instance_id=admitted["id"], server_id=admitted.get("server_id"), effect="accepted")
         originals.append(admitted)
@@ -1285,12 +1393,14 @@ def _run_scenario(config, output, *, cloud_factory=None, connection=None):
     try:
         event("preflight", {"config_sha256": state["config_sha256"]})
         budget = ResourceBudget(config, output)
-        kwargs = {"budget": budget}
+        kwargs = {"budget": budget, "deadline": deadline}
         if config["method"].startswith("api-"):
             kwargs["observation_only"] = True
         if connection is not None:
             kwargs["connection"] = connection
         cloud = (cloud_factory or ScenarioCloud)(config, output, event, **kwargs)
+        if config["method"].startswith("api-"):
+            _require_hub_lifecycle(_hub(config, cloud.connection))
         for repetition in range(config.get("repetitions", 1)):
             if _source_identity()["files"] != state["runner_source"]["files"]:
                 raise ArtifactValidationError("runner source changed during this run")
@@ -1431,10 +1541,15 @@ def _run_scenario(config, output, *, cloud_factory=None, connection=None):
                 )
             else:
                 client = _hub(config, cloud.connection)
+                _require_hub_lifecycle(client)
                 identity = str(uuid.uuid5(uuid.NAMESPACE_URL, config["job_id"] + ":" + prefix + ":image"))
                 paired = config["method"] == "api-cold-warm"
                 pair_roles = [prefix + "-consumer" + str(index + 1) for index in range(2)]
-                pair_reservations = budget.reserve_pair(pair_roles, config["placement"]["boot_gib"]) if paired else {}
+                pair_reservations = (
+                    budget.reserve_pair(pair_roles, config["placement"]["boot_gib"], deadline=deadline)
+                    if paired
+                    else {}
+                )
                 for role, reservation in pair_reservations.items():
                     atomic_write_json(
                         output / (role + "-reservation.json"), {"id": reservation, "role": role, "call_tracking": True}
@@ -1516,6 +1631,7 @@ def _run_scenario(config, output, *, cloud_factory=None, connection=None):
                     "image-status",
                 )
                 atomic_write_json(output / (prefix + "-image-result.json"), job)
+                budget.check_allocation(deadline)
                 acquisition_finish = (time.monotonic(), time.time())
                 measurement["acquisition_build"] = _boundary(image_start, acquisition_finish, strict=paired)
                 measurement["image_submission"].update(effect="complete", image_job_id=job["id"])
@@ -1523,11 +1639,12 @@ def _run_scenario(config, output, *, cloud_factory=None, connection=None):
                 measurement["consumers"] = []
                 for index in range(2 if config["method"] in {"api-reuse", "api-cold-warm"} else 1):
                     role = prefix + "-consumer" + str(index + 1)
+                    _require_hub_lifecycle(_hub(config, cloud.connection))
                     if paired:
                         reservation = pair_reservations[role]
                         budget.activate(reservation, deadline)
                     else:
-                        reservation = budget.reserve(role, config["placement"]["boot_gib"])
+                        reservation = budget.reserve(role, config["placement"]["boot_gib"], deadline=deadline)
                         atomic_write_json(
                             output / (role + "-reservation.json"),
                             {"id": reservation, "role": role, "call_tracking": True},
@@ -1556,22 +1673,24 @@ def _run_scenario(config, output, *, cloud_factory=None, connection=None):
                         "effect": "no-call",
                     }
                     state["resources"].append(resource_record)
-                    budget.check_allocation(deadline)
                     call_client = _hub(config, cloud.connection)
-                    if _source_identity()["files"] != state["runner_source"]["files"]:
-                        raise ArtifactValidationError("runner source changed before consumer creation; no call")
-                    budget.check_allocation(deadline)
                     resource_record["effect"] = "uncertain-no-replay"
                     atomic_write_json(output / (role + "-submission.json"), resource_record)
-                    try:
-                        budget.check_allocation(deadline)
-                    except ArtifactValidationError:
-                        resource_record["effect"] = "no-call"
-                        atomic_write_json(output / (role + "-submission.json"), resource_record)
-                        raise
+                    before_send = _consumer_send_guard(
+                        config,
+                        output,
+                        role,
+                        spec,
+                        budget,
+                        reservation,
+                        deadline,
+                        resource_record,
+                        fence=lambda: _check_runner_source(state),
+                    )
+                    before_send()
                     hub_live.append(resource_record)
                     consumer_start = (time.monotonic(), time.time())
-                    admitted = call_client.create_instance(spec)
+                    admitted = call_client.create_instance(spec, before_send=before_send)
                     atomic_write_json(output / (role + "-accepted.json"), admitted)
                     resource_record.update(
                         instance_id=admitted["id"],
@@ -1787,24 +1906,27 @@ def _cleanup_scenario(output, *, connection=None):
     for resource in reversed(cloud.resources()):
         cloud.delete(resource)
         deleted.append({"origin": "sdk", "server_id": resource.get("server_id")})
+    unused = []
     for path in sorted(output.glob("r*-consumer*-reservation.json")):
         reservation = json.loads(path.read_text())
         role = path.name.removesuffix("-reservation.json")
-        if not reservation.get("call_tracking") or (output / (role + "-intent.json")).exists():
+        intent = output / (role + "-intent.json")
+        if intent.is_symlink():
+            raise ArtifactValidationError("unsafe original API intent; retain pair reservations")
+        if not reservation.get("call_tracking") or intent.exists():
             continue
-        if any((output / (role + suffix)).exists() for suffix in ("-submission.json", "-accepted.json")):
+        if any(
+            (output / (role + suffix)).exists() or (output / (role + suffix)).is_symlink()
+            for suffix in ("-submission.json", "-accepted.json", "-not-sent.json")
+        ):
             raise ArtifactValidationError("create evidence without original intent; retain reservation")
-        with budget._locked() as ledger:
-            original = ledger["reservations"].get(reservation.get("id"), {})
-            if (
-                reservation.get("role") != role
-                or original.get("role") != role
-                or original.get("job_id") != config["job_id"]
-                or original.get("server_id") is not None
-            ):
-                raise ArtifactValidationError("original API no-call reservation identity changed; retain reservation")
-        budget.release(reservation["id"])
-        event("consumer-no-call", {"role": role, "reservation_id": reservation["id"]})
+        if reservation.get("role") != role:
+            raise ArtifactValidationError("original API no-call reservation identity changed; retain reservation")
+        unused.append((role, reservation["id"]))
+    # Validate every slot's create evidence before returning any pair capacity.
+    for role, reservation in unused:
+        budget.release_unbound(reservation, role)
+        event("consumer-no-call", {"role": role, "reservation_id": reservation})
     intents = sorted(output.glob("r*-consumer*-intent.json"))
     if config["method"] == "api-cluster":
         # In every pair consumer2 is the agent; never remove its join server first.
@@ -1815,20 +1937,17 @@ def _cleanup_scenario(output, *, connection=None):
         reservation_row = json.loads((output / (role + "-reservation.json")).read_text())
         if reservation_row.get("role") != role:
             raise ArtifactValidationError("original API delete reservation role changed; no budget release")
-        submission_path = output / (role + "-submission.json")
-        submission = json.loads(submission_path.read_text()) if submission_path.exists() else None
-        no_call = submission is not None and submission.get("effect") == "no-call"
-        if no_call and (
-            submission.get("request_id") != spec["request_id"]
-            or submission.get("role") != role
-            or submission.get("reservation_id") != reservation_row["id"]
-            or (output / (role + "-accepted.json")).exists()
-        ):
-            raise ArtifactValidationError("original API no-call disposition changed; retain reservation")
-        if no_call or (reservation_row.get("call_tracking") and submission is None):
-            budget.release(reservation_row["id"])
+        certificate = output / (role + "-not-sent.json")
+        if certificate.exists() or certificate.is_symlink():
+            _release_unsent_consumer(config, output, role, spec, budget, reservation_row["id"])
             event("consumer-no-call", {"role": role, "request_id": spec["request_id"]})
             continue
+        submission_path = output / (role + "-submission.json")
+        submission = json.loads(submission_path.read_text()) if submission_path.exists() else None
+        if (submission is not None and submission.get("effect") == "no-call") or (
+            reservation_row.get("call_tracking") and submission is None
+        ):
+            raise ArtifactValidationError("original API no-call lacks durable certificate; retain reservation")
         accepted = output / (role + "-accepted.json")
         client = _hub(config, cloud.connection)
         if accepted.exists():

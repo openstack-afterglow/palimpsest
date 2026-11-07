@@ -39,6 +39,7 @@ from .hub_builder import (
     _save,
     cleanup_build,
 )
+from .image_source_policy import ImageSourcePolicy, image_source_policy_from_dict
 from .layer_cache import LayerCache
 from .oci_image import strict_json_object
 from .oci_materializer import OCIHardWorkerError
@@ -51,6 +52,7 @@ from .oci_worker_protocol import (
     OCI_WORKER_IO_CODES,
     OCI_WORKER_IO_ERRNOS,
 )
+from .registry import RegistryError
 from .registry_intake import resolve_anonymous_reference
 
 DEFAULT_HOSTS = ("docker.io", "registry-1.docker.io", "ghcr.io", "quay.io")
@@ -273,21 +275,30 @@ def extract_context(archive: Path, target: Path, *, maximum_bytes: int, maximum_
         path.chmod(mode)
 
 
-def source_policy(hosts) -> dict:
-    # DENY any registry authority outside the exact operator allowlist. Local
-    # sources are supplied solely by buildctl's two explicit --local bindings.
-    allowed = "|".join(re.escape(host) for host in hosts)
+def source_policy(policy: ImageSourcePolicy, hosts) -> dict:
+    # Retain the executor's existing non-image source fence while applying the
+    # shared exact registry/namespace/repository selectors to image sources.
+    if not policy.rules or any(rule.registry not in hosts for rule in policy.rules):
+        raise ValueError("image source policy is unconfigured or outside registry hosts")
     return {
         "version": 1,
         "rules": [
             {"action": "DENY", "selector": {"identifier": "*"}},
             {"action": "ALLOW", "selector": {"identifier": "local://*"}},
-            {
-                "action": "ALLOW",
-                "selector": {"identifier": f"^docker-image://({allowed})/[^\\s]+$", "match_type": "REGEX"},
-            },
+            *policy.buildkit_policy()["rules"],
         ],
     }
+
+
+def manifest_source_policy(manifest: dict) -> ImageSourcePolicy:
+    try:
+        policy = image_source_policy_from_dict(manifest.get("source_policy"))
+        if policy.digest != manifest.get("source_policy_digest"):
+            raise ValueError("image source policy digest mismatch")
+        source_policy(policy, manifest["registry_hosts"])
+        return policy
+    except RegistryError:
+        raise ValueError("invalid image source policy") from None
 
 
 def _worker_limits(root: Path) -> None:
@@ -518,6 +529,7 @@ def _require_overlayfs(directory: Path, deadline: float, log_directory: Path) ->
 
 
 def _buildkit(manifest: dict, directory: Path, deadline: float, log_directory: Path) -> Path:
+    admitted_policy = manifest_source_policy(manifest)
     # Native snapshots recursively copy the accumulated root at each layer.
     # Require overlayfs, never auto/native fallback or a larger job deadline.
     _require_overlayfs(directory, deadline, log_directory)
@@ -540,7 +552,7 @@ def _buildkit(manifest: dict, directory: Path, deadline: float, log_directory: P
     # Client-supplied context cannot replace the admitted Dockerfile.
     (definition / "Dockerfile").write_text(manifest["request"]["dockerfile"])
     policy = directory / "source-policy.json"
-    _save(policy, source_policy(manifest["registry_hosts"]))
+    _save(policy, source_policy(admitted_policy, manifest["registry_hosts"]))
     group = Path(manifest["_execution_cgroup"])
     config = directory / "buildkitd.toml"
     cgroup_parent = "/" + str(group.relative_to(Path("/sys/fs/cgroup")))
@@ -672,10 +684,14 @@ def _hash(path: Path) -> str:
     return "sha256:" + digest.hexdigest()
 
 
-def materialized_result(materialized: dict, directory: Path, maximum: int) -> dict:
+def materialized_result(materialized: dict, directory: Path, maximum: int, publication: dict | None = None) -> dict:
     receipt = materialized["receipt"]
     paths = materialized["blob_paths"]
-    if not 0 < len(paths) <= MAX_LAYERS or len(paths) != len(receipt["results"]):
+    if (
+        not 0 < len(paths) <= MAX_LAYERS
+        or len(paths) != len(receipt["results"])
+        or len(paths) != len(receipt["layers"])
+    ):
         raise ValueError("invalid materialized layer count")
     config_descriptor = materialized["image"]["config_descriptor"]
     # Use the retained path returned by LayerCache rather than a second CAS layout.
@@ -732,6 +748,42 @@ def materialized_result(materialized: dict, directory: Path, maximum: int) -> di
             outgoing.flush()
             os.fsync(outgoing.fileno())
         result["layers"].append({"digest": digest, "size_bytes": size})
+    from .image_manifest import manifest_from_result
+
+    options = publication or {}
+    request = options.get("request", {})
+    enriched = {
+        **result,
+        "layers": [
+            {
+                **layer,
+                "source": {
+                    "conversion": receipt["results"][ordinal],
+                    "oci_layer": receipt["layers"][ordinal],
+                },
+            }
+            for ordinal, layer in enumerate(result["layers"])
+        ],
+    }
+    enriched["source"] = {
+        **result["source"],
+        "metadata": {
+            "materialization": receipt,
+            "image": materialized["image"],
+            "source_policy": options.get("source_policy"),
+            "source_policy_digest": options.get("source_policy_digest"),
+        },
+    }
+    if options.get("kind") == "registry" and request.get("reference"):
+        enriched["source"]["reference"] = request["reference"]
+    enriched["source"]["diff_ids"] = [layer["diff_id"] for layer in receipt["layers"]]
+    result["manifest"] = manifest_from_result(
+        enriched,
+        os_family=request.get("os_family", "unknown"),
+        os_version=request.get("os_version", "unknown"),
+        source_kind="local" if options.get("kind") == "dockerfile" else "registry",
+        metadata=request.get("metadata", {}),
+    )
     return result
 
 
@@ -740,6 +792,13 @@ def run_image(manifest: dict, directory: Path) -> dict:
         raise RuntimeError("image execution requires root Linux amd64 service VM")
     if manifest["platform"] != "linux/amd64" or manifest["run_network"] not in ("none", "default"):
         raise ValueError("unsupported image execution policy")
+    policy = manifest_source_policy(manifest)
+    if manifest["kind"] == "registry":
+        reference = normalize_reference(manifest["request"]["reference"], manifest["registry_hosts"])
+        try:
+            policy.admit(resolve_anonymous_reference(reference))
+        except RegistryError:
+            raise ValueError("image source is not allowed by operator policy") from None
     # Acquisition and materialization intentionally create independent sessions.
     # Fence the ENTIRE credential-free execution before any tool can spawn;
     # setsid cannot escape cgroup membership. The HTTPS worker and separate
@@ -769,8 +828,9 @@ def run_image(manifest: dict, directory: Path) -> dict:
             root.mkdir(mode=0o700)
             cache = LayerCache(root, initialize=True)
             if manifest["kind"] == "registry":
-                reference = normalize_reference(manifest["request"]["reference"], manifest["registry_hosts"])
-                imported = cache.pull(reference, timeout_seconds=max(0.001, deadline - time.monotonic()))
+                imported = cache.pull(
+                    reference, source_policy=policy, timeout_seconds=max(0.001, deadline - time.monotonic())
+                )
             elif manifest["kind"] == "dockerfile":
                 archive = _buildkit(manifest, scratch, deadline, directory)
                 imported = cache.import_source(archive)
@@ -784,7 +844,7 @@ def run_image(manifest: dict, directory: Path) -> dict:
                 timeout_seconds=remaining,
                 pack_profile=SquashFSPackProfile.SERVICE_IMAGE,
             )
-            result = materialized_result(materialized, directory, maximum)
+            result = materialized_result(materialized, directory, maximum, manifest)
     _save(directory / "result.json", result)
     return result
 

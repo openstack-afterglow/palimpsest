@@ -17,6 +17,7 @@ import pytest
 
 from palimpsest_local import cli, registry_intake, state
 from palimpsest_local.errors import ArtifactValidationError, PalimpsestError
+from palimpsest_local.image_source_policy import ImageSourcePolicy, ImageSourceRule
 from palimpsest_local.oci_provenance import (
     OCI_IMAGE_CONFIG_MEDIA_TYPE,
     OCI_IMAGE_INDEX_MEDIA_TYPE,
@@ -25,6 +26,126 @@ from palimpsest_local.oci_provenance import (
 )
 from palimpsest_local.registry_intake import RegistryIntakeError
 from palimpsest_local.state import StatePaths
+
+
+def _allow_image_sources(tmp_path: Path, *rules: tuple[str, str, str], config_dir: Path | None = None) -> None:
+    config = config_dir if config_dir is not None else tmp_path / "config"
+    config.mkdir(mode=0o700, exist_ok=True)
+    content = '[image_sources]\nschema_version = 1\npublisher_policy = "registry-namespace"\n'
+    if not rules:
+        content += "rules = []\n"
+    for registry, namespace, repository in rules:
+        content += (
+            "[[image_sources.rules]]\n"
+            f"registry = {json.dumps(registry)}\n"
+            f"namespace = {json.dumps(namespace)}\n"
+            f"repository = {json.dumps(repository)}\n"
+        )
+    path = config / "config.toml"
+    path.write_text(content, encoding="utf-8")
+    path.chmod(0o600)
+
+
+@pytest.mark.parametrize(
+    "transport", ["anonymous-archive", "anonymous-layout", "authenticated-archive", "docker-export"]
+)
+@pytest.mark.parametrize(
+    "reference,configured",
+    [
+        ("quay.io/acme/demo:v1", False),
+        ("quay.io/acme/demo-extra:v1", True),
+        ("quay.io/acme/demo/nested:v1", True),
+        ("quay.io/acme-lookalike/demo:v1", True),
+        ("quay.io/unknown/demo:v1", True),
+        ("quay.io.lookalike.test/acme/demo:v1", True),
+    ],
+)
+def test_upstream_source_denial_has_no_acquisition_effect(tmp_path, monkeypatch, transport, reference, configured):
+    if configured:
+        _allow_image_sources(tmp_path, ("quay.io", "acme", "demo"))
+    roots = StatePaths(tmp_path / "config", tmp_path / "state")
+    output = tmp_path / "output" / "image.tar"
+    output.parent.mkdir(mode=0o700)
+
+    def unexpected_effect(*_args, **_kwargs):
+        pytest.fail("denied source reached acquisition or credential staging")
+
+    monkeypatch.setattr(registry_intake, "_run_bounded_copy", unexpected_effect)
+    monkeypatch.setattr(registry_intake, "_stage_docker_auth", unexpected_effect)
+    monkeypatch.setattr(registry_intake, "run_docker_command", unexpected_effect)
+    with pytest.raises(RegistryIntakeError):
+        if transport == "anonymous-layout":
+            registry_intake.pull_anonymous_oci_layout(reference, roots, skopeo=tmp_path / "missing-skopeo")
+        else:
+            pull = {
+                "anonymous-archive": registry_intake.pull_anonymous_oci_archive,
+                "authenticated-archive": registry_intake.pull_registry_oci_archive,
+                "docker-export": registry_intake.export_docker_image_to_oci_archive,
+            }[transport]
+            pull(reference, output, roots, skopeo=tmp_path / "missing-skopeo")
+    assert list(output.parent.iterdir()) == []
+    assert not roots.state.exists()
+    if not configured:
+        assert not roots.config.exists()
+
+
+@pytest.mark.parametrize("transport", ["anonymous-archive", "anonymous-layout", "authenticated-archive"])
+def test_policy_file_disappearing_during_admission_is_a_safe_acquisition_rejection(tmp_path, monkeypatch, transport):
+    _allow_image_sources(tmp_path, ("quay.io", "acme", "demo"))
+    roots = StatePaths(tmp_path / "config", tmp_path / "state")
+    real_stat = os.stat
+
+    def vanished_config(path, *args, **kwargs):
+        if path == "config.toml" and kwargs.get("dir_fd") is not None:
+            raise FileNotFoundError("private-policy-path-must-not-escape")
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", vanished_config)
+    with pytest.raises(RegistryIntakeError) as caught:
+        if transport == "anonymous-layout":
+            registry_intake.pull_anonymous_oci_layout("quay.io/acme/demo:v1", roots, skopeo=tmp_path / "missing-skopeo")
+        else:
+            pull = (
+                registry_intake.pull_anonymous_oci_archive
+                if transport == "anonymous-archive"
+                else registry_intake.pull_registry_oci_archive
+            )
+            pull("quay.io/acme/demo:v1", tmp_path / "image.tar", roots, skopeo=tmp_path / "missing-skopeo")
+    assert "private-policy-path" not in str(caught.value)
+    assert not (tmp_path / "image.tar").exists()
+    assert not roots.state.exists()
+
+
+@pytest.mark.parametrize("persisted", [False, True])
+@pytest.mark.parametrize("options", [{"plain_http": True}, {"tls_skip_verify": True}])
+def test_authenticated_source_rejects_insecure_selected_profile_before_effect(
+    tmp_path, monkeypatch, persisted, options
+):
+    from palimpsest_local.registry import RegistryProfile, add_profile, default_registry_config, render_registry_config
+
+    _allow_image_sources(tmp_path, ("quay.io", "acme", "demo"))
+    roots = StatePaths(tmp_path / "config", tmp_path / "state")
+    profile = RegistryProfile("upstream", "quay.io", **options)
+    if persisted:
+        path = roots.config / "registries.toml"
+        path.write_text(render_registry_config(add_profile(default_registry_config(), profile)), encoding="utf-8")
+        path.chmod(0o600)
+
+    def unexpected_effect(*_args, **_kwargs):
+        pytest.fail("insecure profile reached acquisition or credential staging")
+
+    monkeypatch.setattr(registry_intake, "_run_bounded_copy", unexpected_effect)
+    monkeypatch.setattr(registry_intake, "_stage_docker_auth", unexpected_effect)
+    with pytest.raises(RegistryIntakeError, match="verified OCI HTTPS"):
+        registry_intake.pull_registry_oci_archive(
+            "quay.io/acme/demo:v1",
+            tmp_path / "image.tar",
+            roots,
+            profile=None if persisted else profile,
+            skopeo=tmp_path / "missing-skopeo",
+        )
+    assert not (tmp_path / "image.tar").exists()
+    assert not roots.state.exists()
 
 
 def test_parser_exposes_explicit_oci_pull_surface():
@@ -291,6 +412,7 @@ def test_group_writable_output_parent_is_rejected(tmp_path: Path):
 
 
 def test_pull_verifies_before_nonoverwriting_publish(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    _allow_image_sources(tmp_path, ("quay.io", "acme", "demo"))
     output_parent = tmp_path / "output"
     output_parent.mkdir(mode=0o700)
     state = tmp_path / "state"
@@ -349,6 +471,7 @@ def test_pull_verifies_before_nonoverwriting_publish(monkeypatch: pytest.MonkeyP
 
 
 def test_failed_verification_never_publishes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    _allow_image_sources(tmp_path, ("quay.io", "acme", "demo"))
     output_parent = tmp_path / "output"
     output_parent.mkdir(mode=0o700)
     executable = tmp_path / "skopeo"
@@ -382,6 +505,7 @@ def test_failed_verification_never_publishes(monkeypatch: pytest.MonkeyPatch, tm
 
 
 def test_real_invalid_oci_archive_never_publishes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    _allow_image_sources(tmp_path, ("quay.io", "acme", "demo"))
     output_parent = tmp_path / "output"
     output_parent.mkdir(mode=0o700)
     state = tmp_path / "state"
@@ -404,6 +528,7 @@ def test_real_invalid_oci_archive_never_publishes(monkeypatch: pytest.MonkeyPatc
 
 
 def test_publish_race_never_overwrites_competing_output(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    _allow_image_sources(tmp_path, ("quay.io", "acme", "demo"))
     output_parent = tmp_path / "output"
     output_parent.mkdir(mode=0o700)
     state = tmp_path / "state"
@@ -441,6 +566,7 @@ def test_publish_race_never_overwrites_competing_output(monkeypatch: pytest.Monk
 
 
 def test_source_cas_failure_never_publishes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    _allow_image_sources(tmp_path, ("registry.internal", "acme", "demo"))
     output_parent = tmp_path / "output"
     output_parent.mkdir(mode=0o700)
     executable = tmp_path / "skopeo"
@@ -470,6 +596,7 @@ def test_source_cas_failure_never_publishes(monkeypatch: pytest.MonkeyPatch, tmp
 def test_swapped_output_parent_does_not_publish_and_cleans_owned_staging(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ):
+    _allow_image_sources(tmp_path, ("registry.internal", "acme", "demo"))
     output_parent = tmp_path / "output"
     output_parent.mkdir(mode=0o700)
     moved_parent = tmp_path / "moved"
@@ -588,6 +715,7 @@ def test_classify_skopeo_error_distinguishes_missing_auth_tls_network():
 def test_export_docker_image_missing_raises_not_found(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     import subprocess
 
+    _allow_image_sources(tmp_path, ("docker.io", "library", "myapp"))
     roots = StatePaths(tmp_path / "config", tmp_path / "state")
     fake_skopeo = tmp_path / "skopeo"
     fake_skopeo.write_bytes(b"tool")
@@ -716,6 +844,7 @@ def _platform_archive(*, architectures=("amd64", "arm64"), indexed=True, bad_dif
 @pytest.mark.parametrize("architecture", ["amd64", "arm64"])
 @pytest.mark.parametrize("pin", ["tag", "index", "child"])
 def test_selected_platform_is_verified_and_retained(tmp_path, monkeypatch, anonymous, architecture, pin):
+    _allow_image_sources(tmp_path, ("registry.example.com", "team", "app"))
     payload, root, manifests = _platform_archive(
         architectures=(architecture,) if pin == "child" else ("amd64", "arm64"),
         indexed=pin != "child",
@@ -741,6 +870,13 @@ def test_selected_platform_is_verified_and_retained(tmp_path, monkeypatch, anony
     docker_cfg = tmp_path / "docker"
     docker_cfg.mkdir()
     (docker_cfg / "config.json").write_text("{}", encoding="utf-8")
+    if anonymous:
+
+        def unexpected_auth_lookup(*_args, **_kwargs):
+            pytest.fail("anonymous source admission consulted registry or credential configuration")
+
+        monkeypatch.setattr(registry_intake, "load_registry_config", unexpected_auth_lookup)
+        monkeypatch.setattr(registry_intake, "resolve_docker_config_dir", unexpected_auth_lookup)
     pull_kw = {"docker_config_dir": docker_cfg} if not anonymous else {}
     receipt = pull(
         "registry.example.com/team/app" + suffix,
@@ -779,6 +915,7 @@ def test_unsupported_acquisition_platform_rejects_before_copy(tmp_path, monkeypa
 
 @pytest.mark.parametrize("failure", ["mismatch", "ambiguous", "diffid", "pin"])
 def test_failed_selected_platform_verification_never_publishes(tmp_path, monkeypatch, failure):
+    _allow_image_sources(tmp_path, ("registry.example.com", "team", "app"))
     payload, _root, _manifests = _platform_archive(
         architectures=("amd64",)
         if failure == "mismatch"
@@ -817,6 +954,7 @@ def test_failed_selected_platform_verification_never_publishes(tmp_path, monkeyp
 
 
 def test_docker_export_rejects_config_disagreeing_with_requested_platform(tmp_path, monkeypatch):
+    _allow_image_sources(tmp_path, ("docker.io", "library", "service"))
     payload, _root, _manifests = _platform_archive(architectures=("arm64",), config_architecture="amd64")
     executable = tmp_path / "skopeo"
     executable.write_bytes(b"tool")
@@ -880,6 +1018,13 @@ def _cached_image(layout: Path, label: str) -> tuple[dict, dict]:
 
 
 def _cached_roots(tmp_path: Path) -> tuple[StatePaths, Path]:
+    _allow_image_sources(
+        tmp_path,
+        ("quay.io", "acme", "first"),
+        ("quay.io", "acme", "second"),
+        ("quay.io", "acme", "app"),
+        ("quay.io", "acme", "next"),
+    )
     roots = StatePaths(tmp_path / "config", tmp_path / "state")
     roots.oci_source_cas.parent.mkdir(parents=True, mode=0o700)
     executable = tmp_path / "skopeo"
@@ -896,6 +1041,31 @@ def _stub_layout_inspection(monkeypatch, source_for_reference):
         return registry_intake.Descriptor(root["mediaType"], root["digest"], root["size"]), payload
 
     monkeypatch.setattr(registry_intake, "_inspect_anonymous_root", inspect)
+
+
+def test_retained_layout_cannot_bypass_revoked_source_policy(tmp_path, monkeypatch):
+    roots, executable = _cached_roots(tmp_path)
+    manifest, _layer = _cached_image(roots.oci_source_cas, "retained")
+    before = {
+        path.relative_to(roots.oci_source_cas): (path.read_bytes(), path.stat().st_ino)
+        for path in roots.oci_source_cas.rglob("*")
+        if path.is_file()
+    }
+    _allow_image_sources(tmp_path, ("quay.io", "acme", "first"))
+
+    def unexpected_transfer(*_args, **_kwargs):
+        pytest.fail("revoked source reached upstream inspection or transfer")
+
+    monkeypatch.setattr(registry_intake, "_inspect_anonymous_root", unexpected_transfer)
+    monkeypatch.setattr(registry_intake, "_run_bounded_copy", unexpected_transfer)
+    with pytest.raises(RegistryIntakeError):
+        registry_intake.pull_anonymous_oci_layout(f"quay.io/acme/app@{manifest['digest']}", roots, skopeo=executable)
+    after = {
+        path.relative_to(roots.oci_source_cas): (path.read_bytes(), path.stat().st_ino)
+        for path in roots.oci_source_cas.rglob("*")
+        if path.is_file()
+    }
+    assert after == before
 
 
 def test_layout_pulls_deduplicate_different_images_without_archive_or_cas_reimport(tmp_path, monkeypatch):
@@ -1113,3 +1283,132 @@ def test_new_pinned_index_reuses_known_child_without_rewriting_sealed_manifest(t
     assert pinned.root_digest == digest and pinned.manifest_digest == first.manifest_digest
     assert (roots.oci_source_cas / "blobs/sha256" / first.root_digest.split(":")[1]).stat().st_ino == inode
     assert (roots.oci_source_cas / "blobs/sha256" / digest.split(":")[1]).read_bytes() == payload
+
+
+@pytest.mark.parametrize("source_policy", [ImageSourcePolicy(), "invalid-policy"])
+def test_docker_export_explicit_policy_denial_precedes_all_effects(tmp_path, monkeypatch, source_policy):
+    # An explicit immutable job policy is authoritative even if operator config
+    # currently allows the repository.
+    _allow_image_sources(tmp_path, ("docker.io", "library", "service"))
+    roots = StatePaths(tmp_path / "config", tmp_path / "state")
+
+    def unexpected_effect(*_args, **_kwargs):
+        pytest.fail("unadmitted Docker export reached a daemon, tool, or output")
+
+    monkeypatch.setattr(registry_intake, "run_docker_command", unexpected_effect)
+    monkeypatch.setattr(registry_intake, "_run_bounded_copy", unexpected_effect)
+    monkeypatch.setattr(registry_intake, "_stage_and_publish_oci_archive", unexpected_effect)
+    with pytest.raises(RegistryIntakeError):
+        registry_intake.export_docker_image_to_oci_archive(
+            "service:stable",
+            tmp_path / "image.tar",
+            roots,
+            skopeo=tmp_path / "missing-skopeo",
+            source_policy=source_policy,
+        )
+    assert not roots.state.exists()
+    assert not (tmp_path / "image.tar").exists()
+
+
+@pytest.mark.parametrize("policy_source", ["configured", "explicit"])
+@pytest.mark.parametrize("reference", ["service:stable", "docker.io/library/service:stable"])
+def test_allowed_docker_export_verifies_graph_and_retains_docker_identity(
+    tmp_path, monkeypatch, policy_source, reference
+):
+    from palimpsest_local.registry import (
+        RegistryProfile,
+        add_profile,
+        default_registry_config,
+        save_registry_config,
+        use_profile,
+    )
+
+    roots = state.init_resolved_roots(StatePaths(tmp_path / "config", tmp_path / "state"))
+    # The Docker daemon's short name must not be attributed to this unrelated
+    # operator-selected default registry.
+    save_registry_config(
+        roots,
+        use_profile(
+            add_profile(default_registry_config(), RegistryProfile("private", "private.example.com", namespace="team")),
+            "private",
+        ),
+    )
+    policy = ImageSourcePolicy((ImageSourceRule("docker.io", "library", "service"),))
+    if policy_source == "configured":
+        _allow_image_sources(tmp_path, ("docker.io", "library", "service"))
+    payload, root, manifests = _platform_archive(architectures=("amd64",))
+    executable = tmp_path / "skopeo"
+    executable.write_bytes(b"tool")
+    events = []
+
+    def inspect(argv, **_kwargs):
+        events.append(("inspect", argv[-1]))
+        return SimpleNamespace(returncode=0, stdout="[]", stderr="")
+
+    def copy(argv, archive, _staging, **_kwargs):
+        events.append(("save" if "save" in argv else "convert", None))
+        archive.write_bytes(b"docker save bytes" if "save" in argv else payload)
+
+    monkeypatch.setattr(registry_intake, "run_docker_command", inspect)
+    monkeypatch.setattr(registry_intake, "_run_bounded_copy", copy)
+    receipt = registry_intake.export_docker_image_to_oci_archive(
+        reference,
+        tmp_path / "image.tar",
+        roots,
+        skopeo=executable,
+        source_policy=policy if policy_source == "explicit" else None,
+    )
+    assert receipt.reference == "docker.io/library/service:stable"
+    assert receipt.root_digest == root["digest"]
+    assert receipt.manifest_digest == manifests[0]["digest"]
+    assert receipt.output.read_bytes() == payload
+    assert events == [("inspect", reference), ("save", None), ("convert", None)]
+
+
+@pytest.mark.parametrize("options", [{"plain_http": True}, {"tls_skip_verify": True}])
+def test_docker_export_cannot_bypass_insecure_operator_profile(tmp_path, monkeypatch, options):
+    from palimpsest_local.registry import RegistryProfile, add_profile, default_registry_config, render_registry_config
+
+    _allow_image_sources(tmp_path, ("quay.io", "acme", "demo"))
+    roots = StatePaths(tmp_path / "config", tmp_path / "state")
+    profile = RegistryProfile("upstream", "quay.io", **options)
+    config_path = roots.config / "registries.toml"
+    config_path.write_text(render_registry_config(add_profile(default_registry_config(), profile)), encoding="utf-8")
+    config_path.chmod(0o600)
+
+    def unexpected_effect(*_args, **_kwargs):
+        pytest.fail("insecure Docker adoption reached inspection or output")
+
+    monkeypatch.setattr(registry_intake, "run_docker_command", unexpected_effect)
+    monkeypatch.setattr(registry_intake, "_stage_and_publish_oci_archive", unexpected_effect)
+    with pytest.raises(RegistryIntakeError, match="verified OCI HTTPS"):
+        registry_intake.export_docker_image_to_oci_archive(
+            "quay.io/acme/demo:v1", tmp_path / "image.tar", roots, skopeo=tmp_path / "missing-skopeo"
+        )
+    assert not roots.state.exists()
+    assert not (tmp_path / "image.tar").exists()
+
+
+@pytest.mark.parametrize("source_policy", [None, ImageSourcePolicy()])
+def test_direct_docker_export_rejects_bare_local_id_without_inventing_publisher(tmp_path, monkeypatch, source_policy):
+    # Even an invented matching rule must not reclassify a local image ID as
+    # docker.io/library/sha256:<tag>.
+    _allow_image_sources(tmp_path, ("docker.io", "library", "sha256"))
+    roots = StatePaths(tmp_path / "config", tmp_path / "state")
+
+    def unexpected_effect(*_args, **_kwargs):
+        pytest.fail("local Docker ID reached upstream policy, daemon inspection, or output staging")
+
+    monkeypatch.setattr(registry_intake, "_admit_upstream_source", unexpected_effect)
+    monkeypatch.setattr(registry_intake, "run_docker_command", unexpected_effect)
+    monkeypatch.setattr(registry_intake, "_stage_and_publish_oci_archive", unexpected_effect)
+    with pytest.raises(RegistryIntakeError, match="bare Docker image IDs are local artifacts"):
+        registry_intake.export_docker_image_to_oci_archive(
+            "sha256:" + "d" * 64,
+            tmp_path / "image.tar",
+            roots,
+            skopeo=tmp_path / "missing-skopeo",
+            source_policy=source_policy,
+        )
+    assert not roots.state.exists()
+    assert not (tmp_path / "image.tar").exists()

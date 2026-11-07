@@ -1979,6 +1979,7 @@ async def test_legacy_upload_remains_private_to_its_original_member(tmp_path: Pa
         return {"project_id": "shared-project", "user_id": request.headers["x-owner"]}
 
     app.dependency_overrides[hub_api._legacy_writer] = identity
+    app.dependency_overrides[hub_api._upload_reader] = identity
     try:
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
             owner = await client.get(f"/v1/uploads/{upload_id}", headers={"X-Owner": "owner"})
@@ -2031,7 +2032,7 @@ async def test_me_http_success_and_auth_errors_are_not_cacheable(monkeypatch):
     async def current_member(token_info):
         if state["status"] != 200:
             raise HTTPException(status_code=state["status"], detail="Current authority unavailable")
-        return {**token_info, "package_capabilities": frozenset({"palimpsest-inventory_reader"})}
+        return {**token_info, "package_actions": frozenset({"packages:inventory"})}
 
     monkeypatch.setattr(hub_api, "get_package_manager_info", current_member)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://fixture") as client:
@@ -2060,41 +2061,74 @@ async def test_me_http_success_and_auth_errors_are_not_cacheable(monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("system_admin", "leaves", "expected"),
+    ("system_admin", "actions", "expected"),
     [
         (
             False,
-            {"palimpsest-publish_editor"},
-            {"inventory": False, "download": False, "upload": True, "delete": False, "build": False},
+            {"packages:write"},
+            {"inventory": False, "download": False, "upload": True, "delete": False, "build": True},
         ),
         (
             False,
-            {"palimpsest-download_user"},
+            {"packages:read"},
             {"inventory": False, "download": True, "upload": False, "delete": False, "build": False},
         ),
         (False, set(), {"inventory": False, "download": False, "upload": False, "delete": False, "build": False}),
-        (True, set(), {"inventory": False, "download": False, "upload": False, "delete": True, "build": True}),
+        (True, set(), {"inventory": False, "download": False, "upload": False, "delete": False, "build": False}),
         (
             True,
-            {"palimpsest-publish_editor"},
-            {"inventory": False, "download": False, "upload": True, "delete": True, "build": True},
+            {"packages:write"},
+            {"inventory": False, "download": False, "upload": True, "delete": False, "build": True},
         ),
     ],
 )
-async def test_me_capabilities_do_not_infer_extra_authority(monkeypatch, system_admin, leaves, expected):
+async def test_me_capabilities_do_not_infer_extra_authority(monkeypatch, system_admin, actions, expected):
 
     async def current_member(token_info):
         return {
             **token_info,
-            "package_capabilities": frozenset(leaves),
             "is_package_system_admin": system_admin,
-            "package_actions": {"system:manage"} if system_admin else set(),
+            "package_actions": set(actions) | ({"system:manage"} if system_admin else set()),
         }
 
     monkeypatch.setattr(hub_api, "get_package_manager_info", current_member)
     identity = {"user_id": "member", "project_id": "alpha", "roles": ["admin"], "is_system_admin": system_admin}
     context = await hub_api.get_hub_identity(identity)
     assert context["capabilities"] == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", ["reader", "member", "manager", "admin"])
+async def test_me_projects_standard_management_actions_not_system_flag(monkeypatch, tmp_path, role):
+    from palimpsest_hub import policy as native_policy
+
+    policy_file = tmp_path / "policy.yaml"
+    policy_file.write_text("{}\n")
+    policy_settings = SimpleNamespace(
+        oslo_policy_policy_file=str(policy_file),
+        oslo_policy_policy_dirs=(),
+    )
+    monkeypatch.setattr(native_policy, "get_settings", lambda: policy_settings)
+    actions = native_policy.allowed_actions([role], "alpha")
+
+    async def current_member(token_info):
+        return {
+            **token_info,
+            "package_actions": actions,
+            "is_package_system_admin": False,
+        }
+
+    monkeypatch.setattr(hub_api, "get_package_manager_info", current_member)
+    identity = {"user_id": "project-human", "project_id": "alpha", "roles": [role], "is_system_admin": False}
+    value = await hub_api.get_hub_identity(identity)
+    assert value["is_system_admin"] is False
+    assert value["capabilities"] == {
+        "inventory": True,
+        "download": True,
+        "upload": role != "reader",
+        "delete": role in {"manager", "admin"},
+        "build": role != "reader",
+    }
 
 
 @pytest.mark.asyncio
@@ -2236,17 +2270,14 @@ async def test_declared_digest_shortcut_requires_inventory_and_write_only_repeat
         await session.commit()
 
     async def writer():
-        capabilities = {"palimpsest-publish_editor"}
-        if inventory:
-            capabilities.add("palimpsest-inventory_reader")
         return {
             "project_id": "alpha",
             "user_id": "publisher",
-            "package_capabilities": frozenset(capabilities),
             "package_actions": {"packages:write", "packages:inventory"} if inventory else {"packages:write"},
         }
 
     app.dependency_overrides[hub_api._legacy_writer] = writer
+    app.dependency_overrides[hub_api._upload_reader] = writer
     try:
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://fixture") as client:
             response = await client.post("/v1/uploads", json={"digest": digest})
@@ -2678,7 +2709,6 @@ async def test_layer_arch_survives_upload_short_circuit_filter_pagination_and_bu
         return {
             "project_id": request.headers.get("x-project-id", "alpha"),
             "user_id": "member",
-            "package_capabilities": {"palimpsest-inventory_reader"},
             "package_actions": {"packages:inventory", "packages:write", "packages:read"},
         }
 
@@ -2904,7 +2934,13 @@ async def test_explicit_admin_native_upload_publish_read_bundle_delete_uses_targ
         "is_package_system_admin": True,
         "target_project_id": "selected-project",
         "target_project_name": "Selected Project",
-        "package_actions": {"packages:inventory", "packages:read", "packages:write", "system:manage"},
+        "package_actions": {
+            "packages:inventory",
+            "packages:read",
+            "packages:write",
+            "packages:delete",
+            "system:manage",
+        },
     }
     original = dict(admin)
 
@@ -2915,7 +2951,6 @@ async def test_explicit_admin_native_upload_publish_read_bundle_delete_uses_targ
         return info
 
     app.dependency_overrides[hub_api.get_package_manager_info] = identity
-    app.dependency_overrides[hub_api.require_admin] = identity
     monkeypatch.setattr(hub_api, "revalidate_package_admin", recheck)
     hidden = _put_blob(store, b"foreign private bytes")
     public = _put_blob(store, b"foreign published bytes")
@@ -3030,11 +3065,12 @@ async def test_me_preserves_original_identity_and_reports_explicit_admin_target(
             **token_info,
             "is_package_system_admin": True,
             "target_project_name": "Selected",
-            "package_actions": {"system:manage"},
-            "package_capabilities": {
-                "palimpsest-inventory_reader",
-                "palimpsest-download_user",
-                "palimpsest-publish_editor",
+            "package_actions": {
+                "packages:inventory",
+                "packages:read",
+                "packages:write",
+                "packages:delete",
+                "system:manage",
             },
         }
 

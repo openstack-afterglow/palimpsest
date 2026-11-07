@@ -32,9 +32,9 @@ def _units(names: str) -> tuple[str, ...]:
 PORTABLE_FILES = {
     "core-cli": _units("""
         afterglow_tracking architecture_guard bundle_unpack cli_contract cli_project cli_reference cli_registry completion
-        cli_volumes
+        cli_volumes native_root_source_cli
         development_package_workflow native_kvm_openstack openstack_system_runner package_native_afterglow publish_development_package
-        host_journal host_inventory inventory linux_install log_stream metrics packaging refs runtime_dispatch runtime_facade
+        host_journal host_inventory inventory local_catalog linux_install log_stream metrics packaging refs runtime_dispatch runtime_facade
         registry_intake run_source sandbox_policy state test_lanes ui console web_job_client web_operations
     """)
     + (
@@ -48,26 +48,28 @@ PORTABLE_FILES = {
     "host-runtime": _units("""
         cloud_runtime cloud_runtime_arch cloudinit_guest experimental_oci_vm kvm_contract lima pci_preflight
         named_volumes retained_instances oci_volume_policy nova_build nova_metrics
+        cloud_env cloud_layers cloud_layer_worker
+        nova_bootstrap_service nova_boot_carrier nova_ceph_boot nova_cuda_probe nova_native_cloud
         environment_benchmark benchmark_workflow benchmark_openstack benchmark_reporting
         benchmark_scenarios benchmark_scenario_cloud benchmark_scenario_peer benchmark_scenario_workloads
         benchmark_tensorflow_context
         benchmark_station_cli benchmark_station_cloud benchmark_station_disk benchmark_station_measurements
-        platforms process_session project project_adapter project_runtime project_volumes oci_host
+        platforms process_session darwin_process project project_adapter project_runtime project_volumes oci_host
         oci_run_request oci_run_adapter oci_public_cli oci_resource_status oci_docker_hub_cli_live_contract
         oci_docker_hub_services_live_contract oci_ml_cpu_live_contract oci_network oci_network_live_contract
         oci_exec_cli_live_contract oci_stdio_cli_live_contract
     """),
     "build-registry": _units(
-        "build buildkit docker_hub hub_builder hub_image_builder hub_contract registry packages package_credentials remote_artifacts"
+        "build buildkit docker_hub hub_builder hub_image_builder hub_publish hub_contract image_source_policy registry packages package_credentials remote_artifacts"
     ),
     "oci-store": _units("""
         oci_changeset oci_convert_security oci_converter_first_pass oci_image oci_root_volume_inventory
         oci_layout oci_metrics oci_provenance oci_source oci_store oci_store_handoff layer_cache
-        oci_worker_protocol nova_assets registry_worker
+        oci_worker_protocol nova_assets registry_worker native_root_source oci_os_release
     """),
     "oci-guest": _units("""
         oci_control_protocol oci_control_protocol_v2 oci_fs_fixtures
-        oci_guest_filesystems oci_guest_stage1 oci_initramfs oci_process
+        oci_guest_filesystems oci_guest_stage1 oci_initramfs oci_process vz_runtime_assets
         oci_stage1_kvm_proof oci_stage1_qualification oci_stage1_transport oci_guest_exec
         oci_guest_transition oci_exec_pipe_ownership oci_console_ofd_live_contract main_output_pump
         main_console_sink main_console_sink_callsites main_output_pipes main_output_terminate
@@ -128,6 +130,11 @@ SPECIAL_FILES = {
             "hub_api",
             "image_exports",
             "image_jobs",
+            "image_jobs_quota",
+            "image_keys",
+            "image_quota",
+            "image_source_closure",
+            "public_images",
             "image_executor",
             "instances",
             "execution_boundaries",
@@ -241,6 +248,8 @@ MIXED = {
             test_layer_filesystem_semantics
             test_hard_worker_materializes_then_reuses_a_local_oci_layer
             test_hard_worker_materializes_all_ordered_image_occurrences_cold_then_warm
+            test_canonical_materialized_filesystem_fidelity
+            test_same_leaf_under_distinct_parent_metadata_has_isolated_cold_and_warm_artifacts
             test_erofs_reference_retains_timestamp_failure
             test_capture_releases_store_and_journal_despite_peer_namespace
         """.split()
@@ -252,7 +261,7 @@ MIXED = {
             test_tar_translation_same_layer_whiteout_overridden_by_real_target
             test_tar_translation_file_to_directory_transition_synthesizes_parents
             test_tar_translation_forward_hardlink_emitted_after_target test_tar_translation_leaf_fixture_structure
-            test_translated_fixture_bytes_remain_exact test_verify_merged_tree_pure_unit_tests
+            test_verify_merged_tree_pure_unit_tests
             test_build_layer_filesystem_cleanup_on_failure
             test_build_layer_filesystem_atomically_publishes_from_private_staging
             test_build_layer_filesystem_refuses_output_symlink_inserted_during_pack

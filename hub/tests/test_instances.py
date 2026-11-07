@@ -6,10 +6,13 @@ exercise GUEST_RUNNER with real SquashFS/OverlayFS and an HTTPS callback.
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import copy
 import hashlib
 import json
 from datetime import UTC, datetime, timedelta
+from threading import Event
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -24,6 +27,7 @@ from palimpsest_hub.api import hub, instances
 from palimpsest_hub.auth import get_os_conn
 from palimpsest_hub.instance_models import PalimpsestHubInstance
 from palimpsest_hub.models import Base, PalimpsestHubLayer, RuntimeBlobReference
+from palimpsest_hub.native_models import PalimpsestNativeInstance
 from palimpsest_hub.services import instances as service
 from palimpsest_hub.services.hub_store import (
     MEDIA_TYPE_LAYER_SQUASHFS,
@@ -272,7 +276,9 @@ async def instance_hub(tmp_path, monkeypatch):
             "user_id": request.headers.get("X-User", USER),
             "token": "fixture-original-human-token",
             "package_actions": set(
-                request.headers.get("X-Actions", "packages:write,packages:inventory,packages:read").split(",")
+                request.headers.get(
+                    "X-Actions", "packages:write,packages:inventory,packages:read,packages:manage"
+                ).split(",")
             ),
             "is_system_admin": False,
         }
@@ -285,13 +291,24 @@ async def instance_hub(tmp_path, monkeypatch):
         await hub._legacy_writer(actor)
         return actor
 
+    async def controller(request: Request):
+        return await hub._instance_controller(await actor(request))
+
+    async def control(actor, conn, row):
+        service.request_project(actor, conn)
+        service.require_instance_control(actor, row)
+        return actor
+
     app.dependency_overrides[hub._legacy_writer] = actor
     app.dependency_overrides[hub._legacy_inventory] = actor
+    app.dependency_overrides[hub._instance_controller] = controller
+    app.dependency_overrides[instances.get_package_manager_info] = actor
     app.dependency_overrides[get_os_conn] = conn
     monkeypatch.setattr(instances, "_factory_or_503", lambda: factory)
     monkeypatch.setattr(instances, "_store_or_503", lambda: store)
     monkeypatch.setattr(instances, "get_settings", lambda: settings)
     monkeypatch.setattr(service, "fresh_writer", fresh)
+    monkeypatch.setattr(service, "fresh_instance_controller", control)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="https://hub.example.test") as client:
         yield SimpleNamespace(
             client=client, provider=provider, factory=factory, store=store, settings=settings, clock=clock
@@ -537,23 +554,41 @@ async def test_explicit_image_job_derives_ordered_repeated_stack_and_default_run
 
 
 @pytest.mark.asyncio
-async def test_unobserved_create_never_reallocates_or_falsely_settles_delete(instance_hub):
+@pytest.mark.parametrize("provider_error", [TimeoutError("provider outcome unknown"), HTTPException(403, "denied")])
+async def test_unobserved_create_never_reallocates_or_falsely_settles_delete(instance_hub, provider_error):
     h = instance_hub
+    h.settings.palimpsest_hub_max_instances_per_project = 1
 
     def lost_without_observation(**kwargs):
         h.provider.creates.append(kwargs)
-        raise TimeoutError("provider outcome unknown")
+        h.clock.now += timedelta(seconds=h.settings.palimpsest_hub_instance_bootstrap_ttl_seconds)
+        raise provider_error
 
     h.provider.create_server = lost_without_observation
     body = request_body()
     created = (await create_and_advance(h, json=body)).json()
-    assert created["status"] == "uncertain"
+    assert created["status"] == "uncertain" and created["error_code"] == "provider_create_uncertain"
+    volume_id = created["boot_volume_id"]
+    async with h.factory() as session:
+        row = await session.get(PalimpsestHubInstance, created["id"])
+        assert row.server_id is None and row.boot_volume_id == volume_id and row.capability_hash is not None
+        assert service.preparation(row)["server_create_attempted"] is True
     path = "/v1/instances/" + created["id"]
     assert (await h.client.get(path)).json()["status"] == "uncertain"
     assert (await h.client.delete(path)).json()["status"] == "deleting"
     assert (await h.client.get(path)).json()["status"] == "deleting"
     assert (await create_and_advance(h, json=body)).json()["id"] == created["id"]
     assert len(h.provider.creates) == 1
+    assert h.provider.volume_deletes == [] and set(h.provider.volumes_by_id) == {volume_id}
+    assert (await h.client.post("/v1/instances", json=request_body())).status_code == 429
+    async with h.factory() as session:
+        row = await session.get(PalimpsestHubInstance, created["id"])
+        assert row.status == "deleting" and row.error_code == "provider_create_uncertain"
+        assert row.server_id is None and row.boot_volume_id == volume_id and row.capability_hash is None
+        refs = await session.scalars(
+            select(RuntimeBlobReference.digest).where(RuntimeBlobReference.resource_id == row.id)
+        )
+        assert set(refs) == {BASE, DIGEST}
 
 
 @pytest.mark.asyncio
@@ -1032,9 +1067,9 @@ async def test_definite_preallocation_failure_retains_reason_and_can_release_quo
     assert (await create_and_advance(h, json=request_body())).status_code == 429
     assert (await h.client.delete(path, headers={"X-Actions": "packages:read"})).status_code == 403
     assert (await create_and_advance(h, json=request_body())).status_code == 429
-    # Restored write authority can discard only the proven unallocated intent;
+    # Restored manager authority can discard only the proven unallocated intent;
     # read authority is deliberately not required for lifecycle cleanup.
-    deleted = await h.client.delete(path, headers={"X-Actions": "packages:write"})
+    deleted = await h.client.delete(path, headers={"X-Actions": "packages:write,packages:manage"})
     assert deleted.status_code == 202 and deleted.json()["status"] == "deleted"
     assert deleted.json()["error_code"] == reason
     assert (await h.client.get(path)).json()["error_code"] == reason
@@ -3399,3 +3434,1881 @@ async def test_unknown_or_attempted_history_never_authorizes_serverless_cinder_d
         async with h.factory() as session:
             row = await session.get(PalimpsestHubInstance, item["id"])
             assert row.status == "deleting" and row.boot_volume_id == volume_id and row.server_id is None
+
+
+async def assert_expired_nova_root_cleanup(h, item, body, monkeypatch):
+    """No Nova call is not no allocation: only exact Cinder404 frees capacity."""
+    volume_id = item["boot_volume_id"]
+    path = "/v1/instances/" + item["id"]
+    assert h.provider.creates == h.provider.deletes == []
+    assert len(h.provider.volume_creates) == 1 and set(h.provider.volumes_by_id) == {volume_id}
+    async with h.factory() as session:
+        row = await session.get(PalimpsestHubInstance, item["id"])
+        assert row.status == "error" and row.error_code == "create_bootstrap_expired"
+        assert row.server_id is None and row.boot_volume_id == volume_id and row.capability_hash is None
+        assert row.created_by == USER and row.project_id == PROJECT
+        state = service.preparation(row)
+        assert state["phase"] == "nova_not_attempted" and state["terminal"] is True
+        assert state["server_create_attempted"] is False and state["volume_create_attempted"] is True
+        service.checked_prepared_volume(row, h.provider.volumes_by_id[volume_id], image_required=True)
+        refs = await session.scalars(
+            select(RuntimeBlobReference.digest).where(RuntimeBlobReference.resource_id == row.id)
+        )
+        assert set(refs) == {BASE, DIGEST}
+
+    def unexpected_server_read(*args, **kwargs):
+        raise AssertionError("Definite Nova no-call must not require server inventory")
+
+    monkeypatch.setattr(h.provider, "servers", unexpected_server_read)
+    monkeypatch.setattr(h.provider, "get_server", unexpected_server_read)
+    for _ in range(2):
+        observed = await h.client.get(path)
+        assert observed.status_code == 200 and observed.json()["error_code"] == "create_bootstrap_expired"
+        assert observed.json()["server_create_attempted"] is False
+    repeated = await h.client.post("/v1/instances", json=body)
+    assert repeated.status_code == 202 and repeated.json()["id"] == item["id"]
+    assert (await advance_instance(h, item)).status_code == 409
+    assert (await h.client.post("/v1/instances", json=request_body())).status_code == 429
+    assert (await h.client.delete(path, headers={"X-Actions": "packages:read"})).status_code == 403
+    deleting = await h.client.delete(path, headers={"X-Actions": "packages:write,packages:manage"})
+    assert deleting.status_code == 202 and deleting.json()["status"] == "deleting"
+    assert h.provider.volume_deletes == []
+    ready = await h.client.get(path)
+    assert ready.status_code == 200 and ready.json()["provider_phase"] == "delete_volume_ready"
+    # A successful DELETE reply without actual absence is not settlement.
+    monkeypatch.setattr(h.provider, "delete_volume", lambda identity: h.provider.volume_deletes.append(identity))
+    disposed = await advance_instance(h, ready.json(), operation="delete-volume")
+    assert disposed.status_code == 202 and h.provider.volume_deletes == [volume_id]
+    assert (await h.client.get(path)).json()["status"] == "deleting"
+    assert (await h.client.post("/v1/instances", json=request_body())).status_code == 429
+    h.provider.volumes_by_id.pop(volume_id)
+    settled = await h.client.get(path)
+    assert settled.status_code == 200 and settled.json()["status"] == "deleted"
+    assert volume_id not in h.provider.volumes_by_id and not h.provider.servers_by_id
+    assert (await h.client.delete(path)).json()["status"] == "deleted"
+    assert (await h.client.post("/v1/instances", json=body)).json()["status"] == "deleted"
+    assert h.provider.creates == h.provider.deletes == [] and h.provider.volume_deletes == [volume_id]
+    async with h.factory() as session:
+        refs = await session.scalars(
+            select(RuntimeBlobReference.digest).where(RuntimeBlobReference.resource_id == item["id"])
+        )
+        assert set(refs) == {BASE, DIGEST}
+    replacement = await h.client.post("/v1/instances", json=request_body())
+    assert replacement.status_code == 202 and replacement.json()["boot_volume_id"] != volume_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["final-authority", "executor-queue"])
+@pytest.mark.parametrize("fractional", [False, True], ids=["sql-expired", "guest-floor-expired"])
+async def test_final_nova_deadline_proves_no_call_but_retains_prepared_root(
+    instance_hub, monkeypatch, boundary, fractional
+):
+    h = instance_hub
+    h.settings.palimpsest_hub_max_instances_per_project = 1
+    h.clock.now = h.clock.now.replace(microsecond=500000)
+    body = request_body()
+    accepted = await h.client.post("/v1/instances", json=body)
+    assert accepted.status_code == 202 and accepted.json()["provider_phase"] == "volume_ready"
+    item = accepted.json()
+    async with h.factory() as session:
+        row = await session.get(PalimpsestHubInstance, item["id"])
+        expires = service.aware(row.capability_expires_at)
+    floor = datetime.fromtimestamp(int(expires.timestamp()), UTC)
+    final_time = floor + timedelta(microseconds=250000) if fractional else expires
+    original_authority = service.payload_authority
+    original_run_blocking = service.run_blocking
+    dispatched = False
+    authority_expired = False
+
+    async def authority(actor, conn, session=None, spec=None):
+        nonlocal authority_expired
+        result = await original_authority(actor, conn, session, spec)
+        if boundary == "final-authority" and spec["_boot_prepare"]["phase"] == "nova_create_uncertain":
+            h.clock.now = final_time
+            authority_expired = True
+        return result
+
+    async def dispatch(fn, *args, **kwargs):
+        nonlocal dispatched
+        if fn.__name__ == "create_server":
+            assert not h.provider.creates
+            dispatched = True
+            if boundary == "executor-queue":
+                h.clock.now = final_time
+        return await original_run_blocking(fn, *args, **kwargs)
+
+    monkeypatch.setattr(service, "payload_authority", authority)
+    monkeypatch.setattr(service, "run_blocking", dispatch)
+    failed = await advance_instance(h, item)
+    assert failed.status_code == 202 and failed.json()["error_code"] == "create_bootstrap_expired", failed.text
+    assert authority_expired is (boundary == "final-authority")
+    assert dispatched is (boundary == "executor-queue" or fractional)
+    if fractional:
+        assert floor <= h.clock.now < expires
+    await assert_expired_nova_root_cleanup(h, item, body, monkeypatch)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_at", ["queued-provider", "expired-commit"])
+async def test_cancelled_expired_nova_durably_preserves_no_call_and_prepared_root(instance_hub, monkeypatch, cancel_at):
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    h = instance_hub
+    h.settings.palimpsest_hub_max_instances_per_project = 1
+    h.clock.now = h.clock.now.replace(microsecond=500000)
+    body = request_body()
+    accepted = await h.client.post("/v1/instances", json=body)
+    assert accepted.status_code == 202 and accepted.json()["provider_phase"] == "volume_ready"
+    item = accepted.json()
+    worker_started = asyncio.Event()
+    commit_started = asyncio.Event()
+    release_thread = Event()
+    release_commit = asyncio.Event()
+    original_run_blocking = service.run_blocking
+    original_commit = AsyncSession.commit
+
+    async def delayed_dispatch(fn, *args, **kwargs):
+        if fn.__name__ != "create_server":
+            return await original_run_blocking(fn, *args, **kwargs)
+        if cancel_at == "expired-commit":
+            h.clock.now += timedelta(hours=2)
+            return await original_run_blocking(fn, *args, **kwargs)
+        loop = asyncio.get_running_loop()
+
+        def blocked():
+            loop.call_soon_threadsafe(worker_started.set)
+            if not release_thread.wait(5):
+                raise RuntimeError("test did not release provider worker")
+            return fn(*args, **kwargs)
+
+        return await original_run_blocking(blocked)
+
+    async def delayed_commit(session):
+        if any(
+            isinstance(row, PalimpsestHubInstance)
+            and row.id == item["id"]
+            and row.error_code == "create_bootstrap_expired"
+            for row in session.identity_map.values()
+        ):
+            commit_started.set()
+            await release_commit.wait()
+        return await original_commit(session)
+
+    monkeypatch.setattr(service, "run_blocking", delayed_dispatch)
+    monkeypatch.setattr(AsyncSession, "commit", delayed_commit)
+    request = asyncio.create_task(advance_instance(h, item))
+    try:
+        if cancel_at == "queued-provider":
+            await asyncio.wait_for(worker_started.wait(), timeout=5)
+            h.clock.now += timedelta(hours=2)
+            request.cancel()
+            await asyncio.sleep(0)
+            request.cancel()
+            release_thread.set()
+        await asyncio.wait_for(commit_started.wait(), timeout=5)
+        request.cancel()
+        await asyncio.sleep(0)
+        request.cancel()
+    finally:
+        release_thread.set()
+        release_commit.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(request, timeout=5)
+    await assert_expired_nova_root_cleanup(h, item, body, monkeypatch)
+
+
+@pytest.fixture
+async def native_hub(instance_hub, tmp_path, monkeypatch):
+    from palimpsest_local.image_manifest import manifest_digest, normalize_manifest
+
+    from palimpsest_hub.api import native_instances as native_api
+    from palimpsest_hub.services import native_instances as native_service
+    from palimpsest_hub.services import published_images
+
+    operator_paths, original_execute = native_service._operator_paths, native_service._execute
+    storage_admission = native_service._published_storage_admission
+
+    h = instance_hub
+    native_payload = PAYLOAD.ljust(128, b"\0")
+    native_digest = "sha256:" + hashlib.sha256(native_payload).hexdigest()
+    h.store.blob_path(native_digest).write_bytes(native_payload)
+    manifest = normalize_manifest(
+        {
+            "schema": "palimpsest.image-manifest.v1",
+            "mode": "oci-root",
+            "platform": "linux/amd64",
+            "os_family": "ubuntu",
+            "os_version": "22.04",
+            "source": {"kind": "local"},
+            "runtime": {
+                "entrypoint": [],
+                "cmd": [],
+                "env": ["PRIVATE=do-not-project"],
+                "working_dir": "/",
+                "user": "0",
+            },
+            "layers": [{"digest": native_digest, "size_bytes": len(native_payload)}],
+        }
+    )
+    share_id = str(uuid4())
+    scope_key = "user-" + hashlib.sha256(USER.encode()).hexdigest()[:32]
+    binding = {
+        "kind": "manila-namespace-v1",
+        "share_id": share_id,
+        "base_export": "10.0.0.1:6789:/share",
+        "export": "10.0.0.1:6789:/share/cas/" + scope_key,
+        "root": "blobs/sha256",
+        "scope_key": scope_key,
+        "fs_name": "cephfs",
+        "data_pool": "cephfs_data",
+        "namespace": "pal-" + hashlib.sha256(share_id.encode()).hexdigest()[:24] + "-" + scope_key,
+    }
+    profile = {
+        "enabled": True,
+        "root": str(tmp_path / "private"),
+        "environment": "prepared",
+        "grant_path": str(tmp_path / "approval.json"),
+        "project_id": PROJECT,
+        "user_id": USER,
+        "manifest_digest": manifest_digest(manifest),
+        "share_id": binding["share_id"],
+        "export": binding["base_export"],
+        "ceph_fs_name": binding["fs_name"],
+        "ceph_data_pool": binding["data_pool"],
+        "publication_root": str(h.store.root),
+    }
+    from pathlib import Path
+
+    Path(profile["root"]).mkdir(mode=0o700)
+    (Path(profile["root"]) / profile["environment"]).mkdir(mode=0o700)
+    from palimpsest_local.cloud_env import SCHEMA, CloudEnv
+
+    prepared = CloudEnv(profile["environment"], root=Path(profile["root"]))
+    prepared.state = {
+        "schema": SCHEMA,
+        "name": prepared.name,
+        "project_id": PROJECT,
+        "user_id": USER,
+        "native": {"preparation": {"config": {"dns": ["8.8.8.8", "8.8.4.4"]}}},
+    }
+    prepared.save()
+    h.settings.palimpsest_hub_native_profiles = {"approved": profile}
+    published = {
+        "id": str(uuid4()),
+        "manifest_digest": manifest_digest(manifest),
+        "manifest": manifest,
+        "nodes": manifest["layers"],
+        "leaf_id": manifest["layers"][-1]["id"],
+        "storage_binding": binding,
+        "project_id": PROJECT,
+        "created_by": USER,
+        "visibility": "private",
+    }
+    from palimpsest_hub.image_models import PalimpsestHubPublishedImage
+
+    async with h.factory() as session:
+        session.add(
+            PalimpsestHubPublishedImage(
+                id=published["id"],
+                project_id=PROJECT,
+                created_by=USER,
+                request_id=str(uuid4()),
+                name="local",
+                manifest_digest=published["manifest_digest"],
+                manifest_json=manifest,
+                leaf_id=published["leaf_id"],
+                storage_binding_json=binding,
+            )
+        )
+        await session.commit()
+
+    async def resolve(factory, identity, actor):
+        assert factory is h.factory and identity == published["id"]
+        assert actor["project_id"] == PROJECT and actor["user_id"] == USER
+        return published
+
+    monkeypatch.setattr(published_images, "resolve_image", resolve)
+
+    def verify_storage(store, profile, image):
+        from palimpsest_local.cloud_env import CloudEnvError
+
+        if (
+            binding["kind"] != "manila-namespace-v1"
+            or binding["share_id"] != profile["share_id"]
+            or binding["base_export"] != profile["export"]
+        ):
+            raise CloudEnvError("synthetic namespace binding mismatch")
+
+    monkeypatch.setattr(native_service, "_verify_published_storage", verify_storage)
+    monkeypatch.setattr(native_service, "_published_storage_admission", lambda *args: None)
+    monkeypatch.setattr(
+        native_service,
+        "_operator_paths",
+        lambda profile: {
+            "grant_id": "explicit-fixture",
+            "project_id": PROJECT,
+            "environment": profile["environment"],
+            "source_digest": profile["manifest_digest"],
+            "allow_retained": True,
+            "allow_path_scoped_ceph": True,
+            "expires_unix": int(datetime.now(UTC).timestamp()) + 3600,
+        },
+    )
+    monkeypatch.setattr(native_api, "_factory_or_503", lambda: h.factory)
+    monkeypatch.setattr(native_api, "_store_or_503", lambda: h.store)
+    monkeypatch.setattr(native_api, "get_settings", lambda: h.settings)
+    h.provider._afterglow_token = "fixture-original-human-token"
+    from palimpsest_hub import auth as native_auth
+
+    def fresh_token(token, project):
+        return {"token": token, "project_id": project, "user_id": USER}
+
+    async def fresh_manager(token_info):
+        return {**token_info, "package_actions": ["packages:write", "packages:read", "packages:manage"]}
+
+    async def fresh_connection(token_info):
+        assert token_info["token"] == h.provider._afterglow_token
+        yield h.provider
+
+    monkeypatch.setattr(native_service, "validate_token", fresh_token)
+    monkeypatch.setattr(native_auth, "get_package_manager_info", fresh_manager)
+    monkeypatch.setattr(native_auth, "get_os_conn", fresh_connection)
+    h.client._transport.app.include_router(native_api.router, prefix="/v1")
+    calls = []
+    server_id = str(uuid4())
+
+    def execute(profile, actor, conn, checkpoint, run_id, image, request, approval_digest, deleting):
+        assert conn is h.provider and actor["token"] == conn._afterglow_token
+        assert image["id"] == published["id"] and image["manifest"] == manifest
+        calls.append((run_id, deleting))
+        checkpoint(
+            {
+                "native": {
+                    "runs": {
+                        run_id: {
+                            "run_id": run_id,
+                            "status": "cleaned" if deleting or not request["keep"] else "retained",
+                            "server_id": server_id,
+                            "verified_result": {"command": {"exit_code": 0}},
+                        }
+                    },
+                    "grants": {"explicit-fixture": {"used": {"cpu_servers": 1}}},
+                },
+                "resources": {},
+            }
+        )
+
+    monkeypatch.setattr(native_service, "_execute", execute)
+    body = {
+        "request_id": str(uuid4()),
+        "name": "native",
+        "image_id": published["id"],
+        "profile": "approved",
+        "timeout": 120,
+        "command": ["/bin/true"],
+        "keep": True,
+    }
+    return SimpleNamespace(
+        h=h,
+        body=body,
+        calls=calls,
+        service=native_service,
+        binding=binding,
+        profile=profile,
+        operator_paths=operator_paths,
+        original_execute=original_execute,
+        published=published,
+        digest=native_digest,
+        storage_admission=storage_admission,
+    )
+
+
+async def test_native_api_has_durable_hub_image_refs_and_idempotent_retained_lifecycle(native_hub):
+    n = native_hub
+    response = await n.h.client.post("/v1/native-instances", json=n.body)
+    assert response.status_code == 202, response.text
+    item = response.json()
+    assert item["status"] == "creating" and item["image_id"] == n.body["image_id"]
+    assert (await n.h.client.get("/v1/native-instances/" + item["id"])).json()["status"] == "retained"
+    assert "PRIVATE" not in response.text and "do-not-project" not in response.text
+    retry = await n.h.client.post("/v1/native-instances", json=n.body)
+    assert retry.json()["id"] == item["id"] and len(n.calls) == 1
+    async with n.h.factory() as session:
+        row = await session.get(PalimpsestNativeInstance, item["id"])
+        assert row.created_by == USER and row.project_id == PROJECT
+        assert row.spec_json["published"]["manifest"]["source"] == {"kind": "local"}
+        refs = (
+            await session.scalars(
+                select(RuntimeBlobReference.digest).where(
+                    RuntimeBlobReference.resource_kind == "native-instance",
+                    RuntimeBlobReference.resource_id == item["id"],
+                )
+            )
+        ).all()
+        assert refs == [n.digest]
+    deletion = await n.h.client.delete("/v1/native-instances/" + item["id"])
+    assert deletion.json()["status"] == "deleting" and len(n.calls) == 2
+    assert (await n.h.client.delete("/v1/native-instances/" + item["id"])).json()["status"] == "deleted"
+    assert len(n.calls) == 2
+
+
+async def test_native_api_unknown_create_is_held_and_never_replayed(native_hub, monkeypatch):
+    n = native_hub
+
+    def uncertain(profile, actor, conn, checkpoint, run_id, image, request, approval_digest, deleting):
+        n.calls.append((run_id, deleting))
+        checkpoint(
+            {
+                "native": {"runs": {run_id: {"status": "creating"}}, "grants": {}},
+                "resources": {"native_servers": {run_id: {"id": None, "status": "creating"}}},
+            }
+        )
+        raise TimeoutError("provider create outcome unknown")
+
+    monkeypatch.setattr(n.service, "_execute", uncertain)
+    first = await n.h.client.post("/v1/native-instances", json=n.body)
+    assert first.status_code == 202 and first.json()["status"] == "creating"
+    assert (await n.h.client.get("/v1/native-instances/" + first.json()["id"])).json()["status"] == "held"
+    again = await n.h.client.post("/v1/native-instances", json=n.body)
+    assert again.json()["id"] == first.json()["id"] and len(n.calls) == 1
+    second = await n.h.client.post("/v1/native-instances", json={**n.body, "request_id": str(uuid4())})
+    assert second.status_code == 409 and len(n.calls) == 1
+
+
+async def test_native_public_get_and_list_never_invoke_runtime_or_publish_results(native_hub, monkeypatch):
+    n = native_hub
+    item = (await n.h.client.post("/v1/native-instances", json=n.body)).json()
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("observation path cannot execute or reconcile native state")
+
+    monkeypatch.setattr(n.service, "_execute", forbidden)
+    before = len(n.calls)
+    assert (await n.h.client.get("/v1/native-instances/" + item["id"])).json()["status"] == "retained"
+    assert len((await n.h.client.get("/v1/native-instances")).json()) == 1
+    assert (await n.h.client.get("/v1/native-instances/" + item["id"], headers={"X-User": OTHER})).status_code == 404
+    assert len(n.calls) == before
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("profile", "inactive"),
+        ("image_path", "/caller/image.json"),
+        ("grant_path", "/caller/approval.json"),
+        ("keep", "true"),
+        ("command", []),
+    ],
+)
+async def test_native_api_rejects_caller_paths_and_implicit_approval(native_hub, field, value):
+    n = native_hub
+    response = await n.h.client.post("/v1/native-instances", json={**n.body, field: value})
+    assert response.status_code in {422, 503}
+    assert n.calls == []
+
+
+def test_native_sql_uncertainty_closes_original_caller_adapter_without_cloud_fallback(tmp_path):
+    from palimpsest_local.cloud_env import CloudEnvError
+
+    from palimpsest_hub.services.native_instances import _CallerEnvironment
+
+    env = object.__new__(_CallerEnvironment)
+    env.state, env.sql_held = {}, False
+    env.profile = {"root": str(tmp_path), "environment": "private"}
+    (tmp_path / "private").mkdir(mode=0o700)
+
+    def uncertain(state):
+        raise RuntimeError("SQL commit disposition unknown")
+
+    env.checkpoint = uncertain
+    with pytest.raises(RuntimeError, match="SQL commit"):
+        env._checkpoint()
+    assert env.sql_held
+    sentinel = tmp_path / "private" / "hub-sql-hold.json"
+    assert json.loads(sentinel.read_text())["status"] == "hold"
+    assert sentinel.stat().st_mode & 0o777 == 0o600
+    with pytest.raises(CloudEnvError, match="no further effects"):
+        env._authenticate("never-use-clouds-yaml")
+
+
+async def test_native_driver_cancellation_drains_before_releasing_pending_lifecycle(native_hub, monkeypatch):
+    n = native_hub
+    started, release = Event(), Event()
+
+    def driver(profile, actor, conn, checkpoint, run_id, image, request, approval_digest, deleting):
+        n.calls.append((run_id, deleting))
+        checkpoint(
+            {
+                "native": {"runs": {run_id: {"status": "retained", "server_id": str(uuid4())}}, "grants": {}},
+                "resources": {},
+            }
+        )
+        started.set()
+        assert release.wait(5), "test must drain native driver custody"
+
+    monkeypatch.setattr(n.service, "_execute", driver)
+    request = asyncio.create_task(n.h.client.post("/v1/native-instances", json=n.body))
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        pending = (await n.h.client.get("/v1/native-instances")).json()[0]
+        assert pending["status"] == "creating"
+        deletion = await n.h.client.delete("/v1/native-instances/" + pending["id"])
+        assert deletion.status_code == 409
+        retry = await n.h.client.post("/v1/native-instances", json=n.body)
+        assert retry.json()["id"] == pending["id"] and len(n.calls) == 1
+        request.cancel()
+        await asyncio.sleep(0)
+        assert not request.done()
+    finally:
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(request, timeout=5)
+    settled = (await n.h.client.get("/v1/native-instances/" + pending["id"])).json()
+    assert settled["status"] == "retained"
+
+
+async def test_native_api_create_defaults_to_retained_but_requires_explicit_operator_retention(native_hub, monkeypatch):
+    n = native_hub
+    from palimpsest_hub.api.native_instances import NativeInstanceRequest
+
+    body = {key: value for key, value in n.body.items() if key != "keep"}
+    assert NativeInstanceRequest.model_validate(body).keep is True
+    monkeypatch.setattr(
+        n.service,
+        "_operator_paths",
+        lambda profile: {
+            "grant_id": "no-retention",
+            "project_id": PROJECT,
+            "environment": profile["environment"],
+            "source_digest": profile["manifest_digest"],
+            "expires_unix": int(datetime.now(UTC).timestamp()) + 3600,
+        },
+    )
+    response = await n.h.client.post("/v1/native-instances", json=body)
+    assert response.status_code == 409 and n.calls == []
+
+
+@pytest.mark.parametrize("mismatch", ["local-store", "other-share", "other-actor", "expired-approval"])
+async def test_native_api_never_falls_back_on_storage_identity_or_grant_failure(native_hub, monkeypatch, mismatch):
+    n = native_hub
+    headers = {}
+    if mismatch == "local-store":
+        n.binding["kind"] = "local"
+    elif mismatch == "other-share":
+        n.profile["share_id"] = str(uuid4())
+    elif mismatch == "other-actor":
+        headers["X-User"] = OTHER
+    else:
+        monkeypatch.setattr(
+            n.service,
+            "_operator_paths",
+            lambda profile: {
+                "project_id": PROJECT,
+                "environment": profile["environment"],
+                "source_digest": profile["manifest_digest"],
+                "expires_unix": 1,
+                "allow_retained": True,
+            },
+        )
+    response = await n.h.client.post("/v1/native-instances", json=n.body, headers=headers)
+    assert response.status_code in {403, 409} and n.calls == []
+
+
+async def test_native_sql_unknown_intent_cannot_disappear_or_be_adopted_on_resume(native_hub):
+    n = native_hub
+    from palimpsest_local.cloud_env import CloudEnvError
+
+    item = (await n.h.client.post("/v1/native-instances", json=n.body)).json()
+    actor = {"project_id": PROJECT, "user_id": USER}
+    async with n.h.factory() as session:
+        row = await session.get(PalimpsestNativeInstance, item["id"])
+        profile_digest, run_id = row.profile_digest, row.run_id
+        run = row.journal_json["run"]
+        row.journal_json = {
+            "run": run,
+            "resources": {"native_servers": {"id": None, "status": "creating"}},
+            "grant": {},
+        }
+        await session.commit()
+    state = {"native": {"runs": {run_id: run}, "grants": {}}, "resources": {}}
+    with pytest.raises(CloudEnvError, match="disappeared"):
+        await n.service._checkpoint(n.h.factory, item["id"], actor, profile_digest, state, resuming=True)
+    state["resources"] = {"native_servers": {run_id: {"id": str(uuid4()), "status": "confirmed"}}}
+    with pytest.raises(CloudEnvError, match="never adopt"):
+        await n.service._checkpoint(n.h.factory, item["id"], actor, profile_digest, state, resuming=True)
+
+
+def test_native_result_projection_excludes_manifest_credentials_and_arbitrary_output():
+    from palimpsest_hub.services.native_instances import _result_projection
+
+    result = {
+        "source": {"manifest": {"runtime": {"env": ["SECRET=private"]}}},
+        "root": {"filesystem": "overlay", "pid1": 1, "ceph_secret": "private"},
+        "checks": {"provider_readonly_errno": 13, "layers": [{"sha256": "a" * 64, "size": 128}]},
+        "command": {"exit_code": 0, "uid": 1000, "gid": 1001, "stdout": "SECRET=private"},
+        "gpu": {"enabled": False, "enrollment": {"secret": "private"}},
+        "plan": {"client_key": "private"},
+    }
+    safe = _result_projection(result)
+    assert safe["root"] == {"filesystem": "overlay", "pid1": 1}
+    assert safe["command"] == {"exit_code": 0, "uid": 1000, "gid": 1001}
+    assert "private" not in json.dumps(safe) and "SECRET" not in json.dumps(safe)
+    assert _result_projection({"command": [], "gpu": [], "checks": []}) == {}
+
+
+async def test_native_sql_checkpoint_never_refunds_operator_grant_budget(native_hub):
+    n = native_hub
+    from palimpsest_local.cloud_env import CloudEnvError
+
+    item = (await n.h.client.post("/v1/native-instances", json=n.body)).json()
+    async with n.h.factory() as session:
+        row = await session.get(PalimpsestNativeInstance, item["id"])
+        run, run_id, profile_digest = row.journal_json["run"], row.run_id, row.profile_digest
+    state = {
+        "native": {"runs": {run_id: run}, "grants": {"explicit-fixture": {"used": {"cpu_servers": 0}}}},
+        "resources": {},
+    }
+    with pytest.raises(CloudEnvError, match="no budget refund"):
+        await n.service._checkpoint(
+            n.h.factory, item["id"], {"project_id": PROJECT, "user_id": USER}, profile_digest, state
+        )
+
+
+def test_native_sql_hold_sentinel_fences_a_fresh_process_before_any_operation(tmp_path):
+    from palimpsest_local.cloud_env import CloudEnvError
+
+    from palimpsest_hub.services.native_instances import _hold, _operator_paths
+
+    root, publication, grant = tmp_path / "private", tmp_path / "payloads", tmp_path / "grant.json"
+    root.mkdir(mode=0o700)
+    (root / "prepared").mkdir(mode=0o700)
+    publication.mkdir()
+    grant.write_text('{"grant_id":"explicit"}')
+    grant.chmod(0o600)
+    profile = {
+        "root": str(root),
+        "environment": "prepared",
+        "publication_root": str(publication),
+        "grant_path": str(grant),
+    }
+    assert _operator_paths(profile)["grant_id"] == "explicit"
+    _hold(profile)
+    with pytest.raises(CloudEnvError, match="explicit operator reconciliation"):
+        _operator_paths(profile)
+
+
+async def test_native_visible_terminal_commit_with_lost_ack_cannot_admit_second_consumer(native_hub, monkeypatch):
+    n = native_hub
+    from pathlib import Path
+
+    grant = {
+        "grant_id": "explicit-fixture",
+        "project_id": PROJECT,
+        "environment": n.profile["environment"],
+        "source_digest": n.profile["manifest_digest"],
+        "allow_retained": True,
+        "allow_path_scoped_ceph": True,
+        "expires_unix": int(datetime.now(UTC).timestamp()) + 3600,
+    }
+    grant_path = Path(n.profile["grant_path"])
+    grant_path.write_text(json.dumps(grant))
+    grant_path.chmod(0o600)
+    monkeypatch.setattr(n.service, "_operator_paths", n.operator_paths)
+    committed, release = asyncio.Event(), asyncio.Event()
+    original_commit = n.service._commit_settlement
+
+    async def lost_ack(factory, actor, identity, held):
+        await original_commit(factory, actor, identity, held)
+        committed.set()
+        await release.wait()
+        raise RuntimeError("terminal COMMIT acknowledgement lost")
+
+    monkeypatch.setattr(n.service, "_commit_settlement", lost_ack)
+    first = asyncio.create_task(n.h.client.post("/v1/native-instances", json={**n.body, "keep": False}))
+    try:
+        await asyncio.wait_for(committed.wait(), timeout=5)
+        visible = (await n.h.client.get("/v1/native-instances")).json()[0]
+        assert visible["status"] == "deleted"  # COMMIT is visible before acknowledgement.
+        pending = Path(n.profile["root"]) / n.profile["environment"] / "hub-settlement-pending.json"
+        assert pending.exists()
+        second = await n.h.client.post("/v1/native-instances", json={**n.body, "request_id": str(uuid4())})
+        assert second.status_code == 409 and len(n.calls) == 1
+    finally:
+        release.set()
+        accepted = await asyncio.wait_for(first, timeout=5)
+        assert accepted.status_code == 202
+    assert pending.exists()
+    assert pending.with_name("hub-sql-hold.json").exists()
+
+
+async def test_native_completed_consumer_budget_survives_private_journal_rollback(native_hub, monkeypatch):
+    n = native_hub
+    first = await n.h.client.post("/v1/native-instances", json={**n.body, "keep": False})
+    assert first.json()["status"] == "creating"
+    assert (await n.h.client.get("/v1/native-instances/" + first.json()["id"])).json()["status"] == "deleted"
+
+    def rolled_back(profile, actor, conn, checkpoint, run_id, image, request, approval_digest, deleting):
+        # The actual adapter performs this checkpoint before its first provider
+        # observation/effect; model the restored pre-A private grant ledger.
+        checkpoint(
+            {"native": {"runs": {}, "grants": {"explicit-fixture": {"used": {"cpu_servers": 0}}}}, "resources": {}}
+        )
+        raise AssertionError("rolled-back budget must never reach a provider effect")
+
+    monkeypatch.setattr(n.service, "_execute", rolled_back)
+    second = await n.h.client.post("/v1/native-instances", json={**n.body, "request_id": str(uuid4())})
+    assert second.status_code == 202 and second.json()["status"] == "creating"
+    assert (await n.h.client.get("/v1/native-instances/" + second.json()["id"])).json()["status"] == "held"
+    assert len(n.calls) == 1
+
+
+async def test_native_rechecks_durable_hold_after_waiting_for_environment_lock(native_hub, monkeypatch):
+    n = native_hub
+    import fcntl
+    import os
+    from contextlib import contextmanager
+    from pathlib import Path
+
+    from palimpsest_local.cloud_env import CloudEnvError
+
+    directory = Path(n.profile["root"]) / n.profile["environment"]
+    grant_path = Path(n.profile["grant_path"])
+    grant_path.write_text("{}")
+    grant_path.chmod(0o600)
+    monkeypatch.setattr(n.service, "_operator_paths", n.operator_paths)
+    original_lock = n.service._operation_lock
+    waiting = Event()
+
+    @contextmanager
+    def signaled_lock(profile):
+        waiting.set()
+        with original_lock(profile) as parent:
+            yield parent
+
+    monkeypatch.setattr(n.service, "_operation_lock", signaled_lock)
+    lock = os.open(directory / "operation.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    driver = asyncio.create_task(
+        asyncio.to_thread(
+            n.original_execute, n.profile, {}, None, None, "native-" + "1" * 32, {}, {}, "unreached", False
+        )
+    )
+    try:
+        assert await asyncio.to_thread(waiting.wait, 5)
+        n.service._hold(n.profile)
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        os.close(lock)
+    with pytest.raises(CloudEnvError, match="uncertainty sentinel"):
+        await asyncio.wait_for(driver, timeout=5)
+
+
+@pytest.mark.parametrize("case", ["oversized", "metadata-key", "descriptor-key", "command"])
+async def test_native_consumer_bounds_reject_before_sql_intent_or_driver(native_hub, case):
+    n = native_hub
+    from palimpsest_local.image_manifest import manifest_digest, normalize_manifest
+
+    manifest = n.published["manifest"]
+    if case == "oversized":
+        manifest["metadata"] = {str(index): "x" * 16384 for index in range(16)}
+    elif case == "metadata-key":
+        manifest["metadata"] = {"x" * 129: "valid publication, invalid bootstrap key"}
+    elif case == "descriptor-key":
+        manifest["layers"][0]["source"] = {"annotations": {"x" * 129: "valid descriptor metadata"}}
+    else:
+        n.body["command"] = ["x" * 8193]
+    n.published["manifest"] = normalize_manifest(manifest)
+    n.published["manifest_digest"] = manifest_digest(manifest)
+    n.profile["manifest_digest"] = n.published["manifest_digest"]
+    response = await n.h.client.post("/v1/native-instances", json=n.body)
+    assert response.status_code in {409, 422}, response.text
+    assert n.calls == []
+    assert n.h.provider.creates == n.h.provider.volume_creates == []
+    async with n.h.factory() as session:
+        assert (await session.scalars(select(PalimpsestNativeInstance))).all() == []
+        refs = (
+            await session.scalars(
+                select(RuntimeBlobReference).where(RuntimeBlobReference.resource_kind == "native-instance")
+            )
+        ).all()
+        assert refs == []
+
+
+@pytest.mark.parametrize("prior_journal", [None, [], "", 0, False, {"grant": []}, {"resources": None}])
+async def test_native_prior_sql_json_null_is_empty_but_other_corruption_holds(native_hub, prior_journal):
+    n = native_hub
+    from palimpsest_local.cloud_env import CloudEnvError
+
+    first = (await n.h.client.post("/v1/native-instances", json={**n.body, "keep": False})).json()
+    async with n.h.factory() as session:
+        previous = await session.get(PalimpsestNativeInstance, first["id"])
+        previous.journal_json = prior_journal
+        await session.commit()
+    second = (await n.h.client.post("/v1/native-instances", json={**n.body, "request_id": str(uuid4())})).json()
+    assert second["status"] == "creating"
+    terminal = (await n.h.client.get("/v1/native-instances/" + second["id"])).json()
+    assert terminal["status"] == ("retained" if prior_journal is None else "held")
+    if prior_journal is None:
+        assert len(n.calls) == 2
+    else:
+        with pytest.raises(CloudEnvError, match="corrupt; HOLD"):
+            n.service._journal(prior_journal)
+
+
+async def test_native_exact_delete_reloads_large_private_journal_after_two_successful_runs(native_hub, monkeypatch):
+    n = native_hub
+    import copy
+    from pathlib import Path
+
+    from palimpsest_local.cloud_env import SCHEMA, CloudEnv, CloudEnvError
+    from palimpsest_local.nova_native_cloud import _private_json
+
+    initial = CloudEnv(n.profile["environment"], root=Path(n.profile["root"]))
+    initial.state = {
+        "schema": SCHEMA,
+        "name": initial.name,
+        "cloud": "unused-original-caller-only",
+        "project_id": PROJECT,
+        "user_id": USER,
+        "resources": {},
+        "history": [],
+        "native": {
+            "preparation": {"config": {"dns": ["8.8.8.8"]}},
+            "runs": {},
+            "grants": {
+                "explicit-fixture": {
+                    "digest": "fixture-approval",
+                    "used": {"cpu_servers": 0},
+                    "gpu_seconds": 0,
+                }
+            },
+        },
+    }
+    initial.save()
+    expected_servers, deleted_servers, observed_prior_runs = {}, [], []
+
+    def driver(profile, actor, conn, checkpoint, run_id, image, request, approval_digest, deleting):
+        env = n.service._CallerEnvironment(profile, actor, conn, checkpoint)
+        runs = env.state["native"]["runs"]
+        if deleting:
+            # This lookup must use the newly opened actual journal, not SQL's
+            # projection, a cached state, a reconstructed run, or a new grant.
+            assert env.state_path.stat().st_size > 1024 * 1024
+            record = env.state["resources"]["native_servers"][run_id]
+            assert record["id"] == expected_servers[run_id]
+            deleted_servers.append(record["id"])
+            del env.state["resources"]["native_servers"][run_id]
+            env.state["history"].append(
+                {
+                    "kind": "native_servers",
+                    "role": run_id,
+                    "resource": record,
+                    "absent_at": 1234567890,
+                }
+            )
+            runs[run_id]["status"] = "cleaned"
+            env.save()
+            return
+        observed_prior_runs.append(len(runs))
+        server_id = str(uuid4())
+        expected_servers[run_id] = server_id
+        env.state["native"]["grants"]["explicit-fixture"]["used"]["cpu_servers"] += 1
+        runs[run_id] = {
+            "run_id": run_id,
+            "status": "retained" if request["keep"] else "cleaned",
+            "server_id": server_id,
+            "outcome": "success",
+            "command": request["command"],
+            "keep": request["keep"],
+            "plan": {"image": copy.deepcopy(image["manifest"])},
+            "verified_result": {"command": {"exit_code": 0}, "chunks": ["x" * 65536] * 9},
+        }
+        if request["keep"]:
+            env.state["resources"].setdefault("native_servers", {})[run_id] = {
+                "id": server_id,
+                "status": "confirmed",
+            }
+        else:
+            deleted_servers.append(server_id)
+            env.state["history"].append(
+                {
+                    "kind": "native_servers",
+                    "role": run_id,
+                    "resource": {"id": server_id},
+                    "absent_at": 1234567890,
+                }
+            )
+        env.save()
+
+    monkeypatch.setattr(n.service, "_execute", driver)
+    for _ in range(2):
+        response = await n.h.client.post(
+            "/v1/native-instances", json={**n.body, "request_id": str(uuid4()), "keep": False}
+        )
+        assert response.status_code == 202 and response.json()["status"] == "creating", response.text
+        assert (await n.h.client.get("/v1/native-instances/" + response.json()["id"])).json()["status"] == "deleted"
+    assert initial.state_path.stat().st_size > 1024 * 1024
+    with pytest.raises(CloudEnvError, match="owned private"):
+        _private_json(initial.state_path)  # Grant/config limits remain unchanged.
+    retained = await n.h.client.post("/v1/native-instances", json={**n.body, "request_id": str(uuid4())})
+    assert retained.status_code == 202 and retained.json()["status"] == "creating", retained.text
+    assert (await n.h.client.get("/v1/native-instances/" + retained.json()["id"])).json()["status"] == "retained"
+    response = await n.h.client.delete("/v1/native-instances/" + retained.json()["id"])
+    assert response.status_code == 202 and response.json()["status"] == "deleting", response.text
+    assert (await n.h.client.get("/v1/native-instances/" + retained.json()["id"])).json()["status"] == "deleted"
+    assert observed_prior_runs == [0, 1, 2]
+    reread = n.service._CallerEnvironment(n.profile, {}, None, None).state
+    assert len(reread["native"]["runs"]) == 3 and len(reread["history"]) == 3
+    assert reread["native"]["grants"]["explicit-fixture"]["used"]["cpu_servers"] == 3
+    assert reread["resources"]["native_servers"] == {}
+    assert deleted_servers == list(expected_servers.values())
+
+
+async def test_native_nine_prepared_resolvers_rejected_before_sql_intent_or_driver(native_hub):
+    n = native_hub
+    from pathlib import Path
+
+    from palimpsest_local.cloud_env import CloudEnv
+
+    env = CloudEnv(n.profile["environment"], root=Path(n.profile["root"]))
+    env.state["native"]["preparation"]["config"]["dns"] = [f"10.0.0.{index}" for index in range(1, 10)]
+    env.save()
+    response = await n.h.client.post("/v1/native-instances", json=n.body)
+    assert response.status_code == 409, response.text
+    assert n.calls == [] and n.h.provider.creates == n.h.provider.volume_creates == []
+    async with n.h.factory() as session:
+        assert (await session.scalars(select(PalimpsestNativeInstance))).all() == []
+        assert (
+            await session.scalars(
+                select(RuntimeBlobReference).where(RuntimeBlobReference.resource_kind == "native-instance")
+            )
+        ).all() == []
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "foreign-project",
+        "digest-not-null",
+        "fixed-profile",
+        "gpu-limit",
+        "gpu-flavor",
+        "gpu-seconds",
+        "gpu-request",
+    ],
+)
+def test_native_project_image_approval_rejects_scope_expansion_before_effects(case):
+    from palimpsest_local.cloud_env import CloudEnvError
+
+    from palimpsest_hub.services.native_instances import _approval_source
+
+    profile = {"project_id": PROJECT, "manifest_digest": None}
+    approval = {
+        "project_id": PROJECT,
+        "source_project_id": PROJECT,
+        "source_digest": None,
+        "limits": {"gpu_servers": 0},
+        "flavors": {"gpu": None},
+        "max_gpu_seconds": 0,
+    }
+    phase = "cpu"
+    if case == "foreign-project":
+        approval["source_project_id"] = OTHER
+    elif case == "digest-not-null":
+        approval["source_digest"] = "sha256:" + "a" * 64
+    elif case == "fixed-profile":
+        profile["manifest_digest"] = "sha256:" + "a" * 64
+    elif case == "gpu-limit":
+        approval["limits"]["gpu_servers"] = 1
+    elif case == "gpu-flavor":
+        approval["flavors"]["gpu"] = str(uuid4())
+    elif case == "gpu-seconds":
+        approval["max_gpu_seconds"] = 1
+    elif case == "gpu-request":
+        phase = "gpu"
+    with pytest.raises(CloudEnvError):
+        _approval_source(profile, approval, phase, "sha256:" + "b" * 64)
+
+
+def test_native_project_image_approval_does_not_rewrite_grant_for_new_digests():
+    from palimpsest_hub.services.native_instances import _approval_source
+
+    profile = {"project_id": PROJECT, "manifest_digest": None}
+    approval = {
+        "project_id": PROJECT,
+        "source_project_id": PROJECT,
+        "source_digest": None,
+        "limits": {"gpu_servers": 0},
+        "flavors": {"gpu": None},
+        "max_gpu_seconds": 0,
+    }
+    original = json.dumps(approval, sort_keys=True)
+    for digest in ("sha256:" + "a" * 64, "sha256:" + "b" * 64):
+        _approval_source(profile, approval, "cpu", digest)
+    assert json.dumps(approval, sort_keys=True) == original
+
+
+async def test_native_published_requires_explicit_namespace_permission_before_sql_intent(native_hub, monkeypatch):
+    n = native_hub
+    monkeypatch.setattr(
+        n.service,
+        "_operator_paths",
+        lambda profile: {
+            "grant_id": "old-manila-approval",
+            "project_id": PROJECT,
+            "environment": profile["environment"],
+            "source_digest": profile["manifest_digest"],
+            "allow_retained": True,
+            "expires_unix": int(datetime.now(UTC).timestamp()) + 3600,
+        },
+    )
+    response = await n.h.client.post("/v1/native-instances", json=n.body)
+    assert response.status_code == 409 and n.calls == []
+    async with n.h.factory() as session:
+        assert (await session.scalars(select(PalimpsestNativeInstance))).all() == []
+
+
+@pytest.mark.parametrize(
+    "visibility,source_project,source_user",
+    [
+        ("private", OTHER, USER),
+        ("internal", PROJECT, OTHER),
+        ("public", OTHER, OTHER),
+    ],
+)
+async def test_native_namespace_manager_receives_original_target_and_authorized_source_scope(
+    native_hub,
+    monkeypatch,
+    visibility,
+    source_project,
+    source_user,
+):
+    from palimpsest_local import ceph_path_access
+    from palimpsest_local.cloud_env import CloudEnvError
+
+    n = native_hub
+    issued = []
+    from palimpsest_hub.services.ceph_scoped_store import namespace_for, scope_for
+
+    n.published.update(project_id=source_project, created_by=source_user, visibility=visibility)
+    scope = scope_for({"project_id": source_project, "user_id": source_user}, visibility, n.profile["share_id"])
+    n.binding.update(
+        scope_key=scope,
+        export=n.profile["export"] + "/cas/" + scope,
+        namespace=namespace_for(n.profile["share_id"], scope),
+    )
+
+    class Manager:
+        def __init__(self, env, configuration, binding):
+            self.env, self.configuration, self.binding = env, configuration, binding
+            self.preflight_called = False
+
+        def preflight(self):
+            self.preflight_called = True
+
+        def issue(self, role):
+            issued.append(role)
+            return {"id": "synthetic-ceph-client", "type": "ceph-path"}
+
+        def access(self, role):
+            assert role in issued
+            return {
+                "export": self.binding["export"],
+                "access_to": "synthetic-ceph-client",
+                "access_key": "synthetic-private-key",
+                "fs_name": self.binding["fs_name"],
+            }
+
+        def revoke(self, role):
+            issued.remove(role)
+
+    monkeypatch.setattr(ceph_path_access, "CephPathAccessManager", Manager)
+    env = n.service._CallerEnvironment(n.profile, {}, None, None)
+    n.storage_admission(n.profile, {"allow_path_scoped_ceph": True}, env, n.published)
+    assert env._native_capability_manager.preflight_called
+    assert env._native_capability_manager.configuration["fs_name"] == n.profile["ceph_fs_name"]
+    env._native_authorize = lambda: None
+    env.grant("native-synthetic", "ro")
+    env.state.setdefault("resources", {}).setdefault("access_rules", {})["native-synthetic"] = {
+        "provider": "ceph-namespace-v1",
+        "binding": n.binding,
+    }
+    credential = env.native_ceph_access({"run_id": "native-synthetic"})
+    assert credential == {
+        "export": n.binding["export"],
+        "name": "synthetic-ceph-client",
+        "secret": "synthetic-private-key",
+        "fs_name": n.binding["fs_name"],
+    }
+    with pytest.raises(CloudEnvError):
+        env.grant("native-rw", "rw")
+    env._revoke("native-synthetic")
+    assert issued == []
+    assert env.state["project_id"] == PROJECT
+    assert env._native_capability_manager.binding["scope_key"] == scope
+    for field in ("export", "namespace", "data_pool", "fs_name"):
+        changed = copy.deepcopy(n.published)
+        changed["storage_binding"][field] += "-foreign"
+        with pytest.raises(CloudEnvError):
+            n.storage_admission(n.profile, {"allow_path_scoped_ceph": True}, env, changed)
+
+
+async def test_native_asgi_sends_pending_202_before_driver_and_uses_fresh_closed_connections(native_hub, monkeypatch):
+    from palimpsest_hub import auth as native_auth
+
+    n = native_hub
+    started, release = Event(), Event()
+    opened, closed = [], []
+    server_id = str(uuid4())
+    response_sent = asyncio.get_running_loop().create_future()
+
+    async def fresh_connection(token_info):
+        conn = Provider()
+        conn._afterglow_token = token_info["token"]
+        opened.append(conn)
+        try:
+            yield conn
+        finally:
+            closed.append(conn)
+
+    def driver(profile, actor, conn, checkpoint, run_id, image, request, approval_digest, deleting):
+        assert conn is not n.h.provider and conn in opened
+        n.calls.append((run_id, deleting))
+        if not deleting:
+            started.set()
+            assert release.wait(5), "protocol test must release native driver custody"
+        checkpoint(
+            {
+                "native": {
+                    "runs": {
+                        run_id: {
+                            "run_id": run_id,
+                            "status": "cleaned" if deleting else "retained",
+                            "server_id": server_id,
+                            "keep": True,
+                        }
+                    },
+                    "grants": {},
+                },
+                "resources": {},
+            }
+        )
+
+    app = n.h.client._transport.app
+
+    async def observed(scope, receive, send):
+        status, body = None, bytearray()
+
+        async def captured(message):
+            nonlocal status
+            if message["type"] == "http.response.start":
+                status = message["status"]
+            elif message["type"] == "http.response.body":
+                body.extend(message.get("body", b""))
+                if not message.get("more_body", False) and not response_sent.done():
+                    response_sent.set_result((status, bytes(body)))
+            await send(message)
+
+        await app(scope, receive, captured)
+
+    monkeypatch.setattr(native_auth, "get_os_conn", fresh_connection)
+    monkeypatch.setattr(n.service, "_execute", driver)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=observed),
+        base_url="http://test",
+        headers=n.h.client.headers,
+    ) as client:
+        request = asyncio.create_task(client.post("/v1/native-instances", json=n.body))
+        try:
+            status, body = await asyncio.wait_for(response_sent, 5)
+            pending = json.loads(body)
+            assert status == 202 and pending["status"] == "creating"
+            assert await asyncio.to_thread(started.wait, 5)
+            assert not request.done()
+            current = (await n.h.client.get("/v1/native-instances/" + pending["id"])).json()
+            assert current["status"] == "creating"
+            duplicate = await n.h.client.post("/v1/native-instances", json=n.body)
+            assert duplicate.json()["id"] == pending["id"] and duplicate.json()["status"] == "creating"
+            assert len(n.calls) == len(opened) == 1 and closed == []
+            assert (await n.h.client.delete("/v1/native-instances/" + pending["id"])).status_code == 409
+        finally:
+            release.set()
+            await asyncio.wait_for(request, 5)
+    assert closed == opened
+    assert (await n.h.client.get("/v1/native-instances/" + pending["id"])).json()["status"] == "retained"
+    deletion = await n.h.client.delete("/v1/native-instances/" + pending["id"])
+    assert deletion.status_code == 202 and deletion.json()["status"] == "deleting"
+    assert (await n.h.client.get("/v1/native-instances/" + pending["id"])).json()["status"] == "deleted"
+    assert len(opened) == len(closed) == len(n.calls) == 2
+    async with n.h.factory() as session:
+        row = await session.get(PalimpsestNativeInstance, pending["id"])
+        assert "fixture-original-human-token" not in json.dumps(row.spec_json)
+
+
+@pytest.mark.parametrize("failure", ["expired-token", "changed-user", "lost-membership"])
+async def test_native_background_fresh_authority_failure_holds_without_connection_or_effects(
+    native_hub,
+    monkeypatch,
+    failure,
+):
+    from palimpsest_hub import auth as native_auth
+
+    n = native_hub
+
+    def refresh(token, project):
+        if failure == "expired-token":
+            raise HTTPException(401, "expired")
+        return {"token": token, "project_id": project, "user_id": OTHER if failure == "changed-user" else USER}
+
+    async def membership(token_info):
+        return {**token_info, "package_actions": []}
+
+    async def forbidden_connection(token_info):
+        raise AssertionError("invalid fresh authority must not open an OpenStack connection")
+        yield
+
+    monkeypatch.setattr(n.service, "validate_token", refresh)
+    monkeypatch.setattr(native_auth, "get_os_conn", forbidden_connection)
+    if failure == "lost-membership":
+        monkeypatch.setattr(native_auth, "get_package_manager_info", membership)
+    response = await n.h.client.post("/v1/native-instances", json=n.body)
+    assert response.status_code == 202 and response.json()["status"] == "creating"
+    assert (await n.h.client.get("/v1/native-instances/" + response.json()["id"])).json()["status"] == "held"
+    assert n.calls == [] and n.h.provider.creates == n.h.provider.volume_creates == []
+
+
+async def test_native_delete_asgi_sends_pending_before_exact_cleanup_and_never_reschedules(native_hub, monkeypatch):
+    n = native_hub
+    created = (await n.h.client.post("/v1/native-instances", json=n.body)).json()
+    identity = created["id"]
+    async with n.h.factory() as session:
+        row = await session.get(PalimpsestNativeInstance, identity)
+        run = copy.deepcopy(row.journal_json["run"])
+        grants = copy.deepcopy(row.journal_json["grant"])
+    started, release = Event(), Event()
+    sent = asyncio.get_running_loop().create_future()
+
+    def cleanup(profile, actor, conn, checkpoint, run_id, image, request, approval_digest, deleting):
+        assert deleting and run_id == run["run_id"]
+        n.calls.append((run_id, deleting))
+        started.set()
+        assert release.wait(5)
+        checkpoint({"native": {"runs": {run_id: {**run, "status": "cleaned"}}, "grants": grants}, "resources": {}})
+
+    app = n.h.client._transport.app
+
+    async def observed(scope, receive, send):
+        status = None
+
+        async def captured(message):
+            nonlocal status
+            if message["type"] == "http.response.start":
+                status = message["status"]
+            elif message["type"] == "http.response.body" and not message.get("more_body", False) and not sent.done():
+                sent.set_result((status, json.loads(message["body"])))
+            await send(message)
+
+        await app(scope, receive, captured)
+
+    monkeypatch.setattr(n.service, "_execute", cleanup)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=observed),
+        base_url="http://test",
+        headers=n.h.client.headers,
+    ) as client:
+        deletion = asyncio.create_task(client.delete("/v1/native-instances/" + identity))
+        try:
+            status, pending = await asyncio.wait_for(sent, 5)
+            assert status == 202 and pending["status"] == "deleting"
+            assert await asyncio.to_thread(started.wait, 5)
+            assert not deletion.done()
+            assert (await n.h.client.get("/v1/native-instances/" + identity)).json()["status"] == "deleting"
+            assert (await n.h.client.delete("/v1/native-instances/" + identity)).status_code == 409
+            assert len(n.calls) == 2
+        finally:
+            release.set()
+            await asyncio.wait_for(deletion, 5)
+    assert (await n.h.client.get("/v1/native-instances/" + identity)).json()["status"] == "deleted"
+    assert (await n.h.client.delete("/v1/native-instances/" + identity)).json()["status"] == "deleted"
+    assert len(n.calls) == 2
+
+
+async def test_native_background_never_overwrites_a_terminal_row(native_hub, monkeypatch):
+    n = native_hub
+    created = (await n.h.client.post("/v1/native-instances", json={**n.body, "keep": False})).json()
+    identity = created["id"]
+    async with n.h.factory() as session:
+        row = await session.get(PalimpsestNativeInstance, identity)
+        assert row.status == "deleted"
+        digest = row.profile_digest
+    calls = list(n.calls)
+    original = {"project_id": PROJECT, "user_id": USER, "token": n.h.provider._afterglow_token}
+    await n.service._background_run(n.h.factory, n.h.settings, original, identity, digest, False)
+    await n.service._commit_settlement(n.h.factory, original, identity, True)
+    assert (await n.h.client.get("/v1/native-instances/" + identity)).json()["status"] == "deleted"
+    assert n.calls == calls
+
+
+async def test_real_native_delete_skips_new_image_admission_for_legacy_run(native_hub, monkeypatch):
+    n = native_hub
+    from unittest.mock import Mock
+
+    role = "native-" + "1" * 32
+    approval = {
+        "grant_id": "historical-cleanup",
+        "source_digest": n.profile["manifest_digest"],
+        "project_id": PROJECT,
+        "environment": n.profile["environment"],
+        "actions": ["cleanup"],
+    }
+
+    class Environment:
+        def __init__(self, profile, actor, conn, checkpoint):
+            self.state = {"cloud": "original"}
+
+        def _authenticate(self, cloud):
+            assert cloud == "original"
+
+        def _confirmed(self, kind, name):
+            assert (kind, name) == ("shares", "layers")
+            return {"id": n.profile["share_id"], "export": n.profile["export"]}
+
+    cleanup = Mock(return_value={"status": "cleaned"})
+
+    class Controller:
+        def __init__(self, env):
+            self.state = {"runs": {role: {"source_digest": approval["source_digest"]}}}
+            self.cleanup = cleanup
+
+    monkeypatch.setattr(n.service, "_CallerEnvironment", Environment)
+    monkeypatch.setattr(n.service, "NativeCloud", Controller)
+    monkeypatch.setattr(n.service, "_operator_paths", lambda profile: approval)
+    monkeypatch.setattr(
+        n.service,
+        "_published_storage_admission",
+        Mock(
+            side_effect=AssertionError("cleanup must not require new namespace/run admission"),
+        ),
+    )
+    published = {**n.published, "storage_binding": {"kind": "manila"}}
+    result = n.original_execute(
+        n.profile,
+        {},
+        n.h.provider,
+        lambda state: None,
+        role,
+        published,
+        {"phase": "cpu"},
+        n.service._digest(approval),
+        True,
+    )
+    assert result == {"status": "cleaned"}
+    from pathlib import Path
+
+    cleanup.assert_called_once_with(grant_path=Path(n.profile["grant_path"]), run_id=role)
+
+
+def test_native_legacy_access_cleanup_dispatches_to_original_manila_path(monkeypatch):
+    from unittest.mock import Mock
+
+    from palimpsest_local.cloud_env import CloudEnv
+
+    from palimpsest_hub.services.native_instances import _CallerEnvironment
+
+    env = object.__new__(_CallerEnvironment)
+    env.state = {"resources": {"access_rules": {"native-old": {"id": "old-manila-rule", "access_to": "old"}}}}
+    legacy = Mock()
+    monkeypatch.setattr(CloudEnv, "_revoke", legacy)
+    env._revoke("native-old")
+    legacy.assert_called_once_with("native-old")
+
+
+async def test_worker_published_payload_remains_consumable_without_private_result_leak(instance_hub, monkeypatch):
+    from palimpsest_local.image_manifest import manifest_from_result
+
+    from palimpsest_hub.image_models import PalimpsestHubImageJob, PalimpsestHubPublicationPayload
+    from palimpsest_hub.services import published_images
+
+    h = instance_hub
+    payload = b"hsqs-new-worker-contract"
+    digest = "sha256:" + hashlib.sha256(payload).hexdigest()
+    source = h.store.root / "new-worker-output"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_bytes(payload)
+    h.store.publish_verified(source, h.store.inspect_file(source, max_bytes=len(payload)))
+    runtime = {
+        "entrypoint": ["/bin/sh"],
+        "cmd": ["-c", "echo private"],
+        "env": ["PRIVATE_ENV=value"],
+        "working_dir": "/",
+        "user": "0",
+    }
+    manifest = manifest_from_result(
+        {
+            "layers": [{"digest": digest, "size_bytes": len(payload)}],
+            "runtime": runtime,
+            "source": {},
+        },
+        os_family="fixture-os",
+        os_version="1",
+        source_kind="local",
+    )
+    monkeypatch.setattr(published_images, "get_settings", lambda: SimpleNamespace())
+    job_id, job_request = str(uuid4()), str(uuid4())
+    async with h.factory() as session:
+        session.add(
+            PalimpsestHubPublicationPayload(
+                project_id=PROJECT,
+                created_by=USER,
+                blob_digest=digest,
+                size_bytes=len(payload),
+            )
+        )
+        await session.commit()
+        await published_images.register_image(
+            session,
+            h.store,
+            {"project_id": PROJECT, "user_id": USER},
+            job_request,
+            "worker-private",
+            manifest,
+            image_id=job_id,
+            require_staged=True,
+        )
+        session.add(
+            PalimpsestHubImageJob(
+                id=job_id,
+                project_id=PROJECT,
+                created_by=USER,
+                request_id=job_request,
+                name="worker-private",
+                kind="dockerfile",
+                request_digest=digest,
+                request_json={},
+                status="complete",
+                output_digests=[digest],
+                result_json={"layers": manifest["layers"], "source": {}, "runtime": runtime, "manifest": manifest},
+            )
+        )
+        await session.commit()
+    request = request_body(command=[])
+    request.update(layer_digests=[], image_job_id=job_id)
+    response = await create_and_advance(h, json=request)
+    assert response.status_code == 202, response.text
+    item = response.json()
+    assert item["mode"] == "oci-chroot"
+    assert guest_spec(h.provider)["runtime"]["env"] == ["PRIVATE_ENV=value"]
+    assert guest_spec(h.provider)["command"] == ["/bin/sh", "-c", "echo private"]
+    outsider = "e" * 32
+    h.provider._afterglow_user_id = outsider
+    headers = {"X-User": outsider}
+    assert (await h.client.get("/v1/instances/" + item["id"], headers=headers)).status_code == 404
+    visible = await h.client.get("/v1/instances", headers=headers)
+    assert all(row["id"] != item["id"] for row in visible.json())
+    retry = await h.client.post("/v1/instances", json=request, headers=headers)
+    assert retry.status_code == 404
+    fresh = await h.client.post("/v1/instances", json={**request, "request_id": str(uuid4())}, headers=headers)
+    assert fresh.status_code == 404
+    assert len(h.provider.creates) == len(h.provider.volume_creates) == 1
+
+
+async def test_withdrawn_self_cleanup_action_cannot_stop_delete_or_dispose_volume(instance_hub):
+    h = instance_hub
+    member = {"X-Actions": "packages:write,packages:inventory,packages:read"}
+    created = await create_and_advance(h, json=request_body(), headers=member)
+    assert created.status_code == 202
+    item = created.json()
+    path = "/v1/instances/" + item["id"]
+    assert (await h.client.post(path + "/stop", headers=member)).status_code == 403
+    assert (await h.client.delete(path, headers=member)).status_code == 403
+    # Even the alternate advance route must require manager authority for disposal.
+    disposal = await advance_instance(h, item, operation="delete-volume", headers=member)
+    assert disposal.status_code == 403
+    assert h.provider.stops == h.provider.deletes == h.provider.volume_deletes == []
+    assert (await h.client.post(path + "/stop")).status_code == 202
+    assert (await h.client.delete(path)).status_code == 202
+
+
+async def test_native_member_without_self_cleanup_action_cannot_delete_retained_consumer(native_hub):
+    n = native_hub
+    member = {"X-Actions": "packages:write,packages:inventory,packages:read"}
+    created = await n.h.client.post("/v1/native-instances", headers=member, json=n.body)
+    assert created.status_code == 202
+    path = "/v1/native-instances/" + created.json()["id"]
+    calls = list(n.calls)
+    assert (await n.h.client.delete(path, headers=member)).status_code == 403
+    assert n.calls == calls
+
+
+async def test_native_delete_background_withdrawn_cleanup_action_holds_without_effect(native_hub, monkeypatch):
+    from palimpsest_hub import auth
+
+    n = native_hub
+    item = (await n.h.client.post("/v1/native-instances", json=n.body)).json()
+    calls = list(n.calls)
+
+    async def current_member(token_info):
+        return {**token_info, "package_actions": {"packages:write", "packages:read"}}
+
+    monkeypatch.setattr(auth, "get_package_manager_info", current_member)
+    path = "/v1/native-instances/" + item["id"]
+    accepted = await n.h.client.delete(path)
+    assert accepted.status_code == 202
+    assert (await n.h.client.get(path)).json()["status"] == "held"
+    assert n.calls == calls
+
+
+@pytest.mark.parametrize("fence", ["missing", "revoked"])
+def test_native_effect_authentication_requires_current_action_fence(monkeypatch, fence):
+    from palimpsest_local.cloud_env import CloudEnvError
+
+    from palimpsest_hub.services import native_instances as native
+
+    env = object.__new__(native._CallerEnvironment)
+    env.actor = {"token": "original", "project_id": PROJECT}
+    env.caller, env.sql_held = object(), False
+    env.profile = {"project_id": PROJECT, "user_id": USER}
+    env.state = {"project_id": PROJECT, "user_id": USER}
+    observed = []
+
+    def checkpoint(state):
+        observed.append(state)
+
+    if fence == "revoked":
+
+        def deny():
+            raise CloudEnvError("current manager action revoked")
+
+        checkpoint.authorize_actor = deny
+    env.checkpoint = checkpoint
+    monkeypatch.setattr(native, "_scope", lambda *args: None)
+    monkeypatch.setattr(native, "validate_token", lambda *args: {"project_id": PROJECT, "user_id": USER})
+    with pytest.raises(CloudEnvError, match="action"):
+        env._authenticate("original")
+    assert observed == []
+
+
+@pytest.mark.parametrize("mismatch", [None, "request", "volume", "ownership"])
+async def test_project_manager_disposes_other_creators_recorded_prepared_root(instance_hub, mismatch):
+    h = instance_hub
+    creator = {"X-Actions": "packages:write,packages:inventory,packages:read"}
+    accepted = await h.client.post("/v1/instances", headers=creator, json=request_body())
+    assert accepted.status_code == 202
+    item = accepted.json()
+    identity, volume_id = item["id"], item["boot_volume_id"]
+    path = "/v1/instances/" + identity
+    original_markers = dict(h.provider.volumes_by_id[volume_id]["metadata"])
+    h.provider._afterglow_user_id = OTHER
+    manager = {"X-User": OTHER, "X-Actions": "packages:write,packages:manage,packages:inventory"}
+    # Creation stays creator-bound even when the other caller is a manager.
+    assert (await advance_instance(h, item, headers=manager)).status_code == 403
+    deleting = await h.client.delete(path, headers=manager)
+    assert deleting.status_code == 202 and deleting.json()["status"] == "deleting"
+    assert h.provider.volume_deletes == h.provider.creates == []
+    if mismatch == "request":
+        item = {**item, "request_id": str(uuid4())}
+    elif mismatch == "volume":
+        item = {**item, "boot_volume_id": str(uuid4())}
+    elif mismatch == "ownership":
+        h.provider.volumes_by_id[volume_id]["project_id"] = OTHER
+    disposed = await advance_instance(h, item, operation="delete-volume", headers=manager)
+    assert disposed.status_code == (409 if mismatch else 202), disposed.text
+    assert h.provider.volume_deletes == ([] if mismatch else [volume_id])
+    assert h.provider.creates == h.provider.deletes == []
+    if mismatch is None:
+        observed = await h.client.get(path, headers=manager)
+        assert observed.status_code == 200 and observed.json()["status"] == "deleted"
+    async with h.factory() as session:
+        row = await session.get(PalimpsestHubInstance, identity)
+        assert row.created_by == USER and row.project_id == PROJECT and row.boot_volume_id == volume_id
+        assert row.status == ("deleting" if mismatch else "deleted")
+    if mismatch:
+        assert h.provider.volumes_by_id[volume_id]["metadata"] == original_markers
+
+
+async def test_member_creator_cleans_private_instance_without_widening_other_manager_reach(instance_hub):
+    h = instance_hub
+    member = {"X-Actions": "packages:write,packages:inventory,packages:read,packages:manage_own"}
+    created = await create_and_advance(h, json=request_body(), headers=member)
+    assert created.status_code == 202
+    item = created.json()
+    path = "/v1/instances/" + item["id"]
+    async with h.factory() as session:
+        row = await session.get(PalimpsestHubInstance, item["id"])
+        row.spec_json = {**row.spec_json, "published_visibility": "private"}
+        await session.commit()
+    h.provider._afterglow_user_id = OTHER
+    for actions in ("packages:manage_own", "packages:manage"):
+        other = {"X-User": OTHER, "X-Actions": actions}
+        assert (await h.client.post(path + "/stop", headers=other)).status_code == 404
+        assert (await h.client.delete(path, headers=other)).status_code == 404
+    assert h.provider.stops == h.provider.deletes == []
+    h.provider._afterglow_user_id = USER
+    assert (await h.client.post(path + "/stop", headers=member)).status_code == 202
+    assert (await h.client.delete(path, headers=member)).status_code == 202
+    assert h.provider.stops == h.provider.deletes == [item["server_id"]]
+    assert h.provider.volumes_by_id == {}
+
+
+@pytest.mark.parametrize("write_allowed", [True, False])
+async def test_member_creator_disposes_only_own_exact_prepared_boot_root(instance_hub, write_allowed):
+    h = instance_hub
+    member = {"X-Actions": "packages:write,packages:inventory,packages:read,packages:manage_own"}
+    accepted = await h.client.post("/v1/instances", json=request_body(), headers=member)
+    assert accepted.status_code == 202
+    item = accepted.json()
+    path = "/v1/instances/" + item["id"]
+    if not write_allowed:
+        member = {"X-Actions": "packages:inventory,packages:read,packages:manage_own"}
+        assert (await advance_instance(h, item, headers=member)).status_code == 403
+    h.provider._afterglow_user_id = OTHER
+    other = {**member, "X-User": OTHER}
+    assert (await h.client.delete(path, headers=other)).status_code == 403
+    assert (await advance_instance(h, item, operation="delete-volume", headers=other)).status_code == 403
+    h.provider._afterglow_user_id = USER
+    assert (await h.client.delete(path, headers=member)).status_code == 202
+    assert h.provider.volume_deletes == []
+    disposed = await advance_instance(h, item, operation="delete-volume", headers=member)
+    assert disposed.status_code == 202
+    assert h.provider.volume_deletes == [item["boot_volume_id"]]
+    assert (await h.client.get(path, headers=member)).json()["status"] == "deleted"
+    async with h.factory() as session:
+        row = await session.get(PalimpsestHubInstance, item["id"])
+        assert row.created_by == USER and row.project_id == PROJECT
+
+
+@pytest.mark.parametrize("operation", ["stop", "delete"])
+async def test_creator_cleanup_action_withdrawal_before_effect_never_mutates_provider(
+    instance_hub, monkeypatch, operation
+):
+    h = instance_hub
+    member = {"X-Actions": "packages:write,packages:inventory,packages:read,packages:manage_own"}
+    item = (await create_and_advance(h, json=request_body(), headers=member)).json()
+    path = "/v1/instances/" + item["id"]
+    original = service.fresh_instance_controller
+    checks = 0
+
+    async def withdraw(actor, conn, row):
+        nonlocal checks
+        checks += 1
+        if checks == 2:
+            actor = {**actor, "package_actions": set(actor["package_actions"]) - {"packages:manage_own"}}
+        return await original(actor, conn, row)
+
+    monkeypatch.setattr(service, "fresh_instance_controller", withdraw)
+    response = await (
+        h.client.post(path + "/stop", headers=member) if operation == "stop" else h.client.delete(path, headers=member)
+    )
+    assert response.status_code == 403 and checks == 2
+    assert h.provider.stops == h.provider.deletes == h.provider.volume_deletes == []
+
+
+async def test_native_profile_bound_member_can_delete_own_retained_consumer(native_hub, monkeypatch):
+    from palimpsest_hub import auth
+
+    n = native_hub
+    actions = {"packages:write", "packages:read", "packages:inventory", "packages:manage_own"}
+
+    async def current_member(token_info):
+        return {**token_info, "package_actions": actions}
+
+    monkeypatch.setattr(auth, "get_package_manager_info", current_member)
+    member = {"X-Actions": ",".join(sorted(actions))}
+    accepted = await n.h.client.post("/v1/native-instances", json=n.body, headers=member)
+    assert accepted.status_code == 202
+    path = "/v1/native-instances/" + accepted.json()["id"]
+    calls = list(n.calls)
+    n.h.provider._afterglow_user_id = OTHER
+    assert (await n.h.client.delete(path, headers={**member, "X-User": OTHER})).status_code == 404
+    assert n.calls == calls
+    n.h.provider._afterglow_user_id = USER
+    assert (await n.h.client.delete(path, headers=member)).status_code == 202
+    assert (await n.h.client.get(path, headers=member)).json()["status"] == "deleted"
+    assert len(n.calls) == len(calls) + 1 and n.calls[-1][1] is True
+
+
+async def test_native_self_cleanup_fresh_effect_callback_cannot_reuse_withdrawn_action(native_hub, monkeypatch):
+    from palimpsest_hub import auth
+
+    n = native_hub
+    actions = {"packages:write", "packages:read", "packages:manage_own"}
+
+    async def current_member(token_info):
+        return {**token_info, "package_actions": actions}
+
+    monkeypatch.setattr(auth, "get_package_manager_info", current_member)
+    member = {"X-Actions": ",".join(sorted(actions))}
+    accepted = await n.h.client.post("/v1/native-instances", json=n.body, headers=member)
+    assert accepted.status_code == 202
+    path = "/v1/native-instances/" + accepted.json()["id"]
+    calls = list(n.calls)
+    original = service.fresh_instance_controller
+    withdrawn = False
+
+    async def authority(actor, conn, row):
+        if withdrawn:
+            actor = {**actor, "package_actions": set(actor["package_actions"]) - {"packages:manage_own"}}
+        return await original(actor, conn, row)
+
+    def driver(profile, actor, conn, checkpoint, *args):
+        nonlocal withdrawn
+        withdrawn = True
+        checkpoint.authorize_actor()
+        raise AssertionError("withdrawn self cleanup cannot reach a provider effect")
+
+    monkeypatch.setattr(service, "fresh_instance_controller", authority)
+    monkeypatch.setattr(n.service, "_execute", driver)
+    assert (await n.h.client.delete(path, headers=member)).status_code == 202
+    assert (await n.h.client.get(path, headers=member)).json()["status"] == "held"
+    assert n.calls == calls
+
+
+@pytest.mark.parametrize("operation,observation", [("stop", "server"), ("delete", "server"), ("delete", "volume")])
+async def test_creator_cleanup_rechecks_revocation_during_final_provider_observation(
+    instance_hub, monkeypatch, operation, observation
+):
+    h = instance_hub
+    member = {"X-Actions": "packages:write,packages:inventory,packages:read,packages:manage_own"}
+    item = (await create_and_advance(h, json=request_body(), headers=member)).json()
+    path = "/v1/instances/" + item["id"]
+    original_authority = service.fresh_instance_controller
+    original_observe = h.provider.get_server if observation == "server" else h.provider.get_volume
+    state = {"reads": 0, "revoked": False, "denied": False}
+
+    def observe(identity):
+        result = original_observe(identity)
+        state["reads"] += 1
+        # One observation binds the durable intent; the next is in the final
+        # effect section, after its first fresh authority check.
+        if state["reads"] == 2:
+            state["revoked"] = True
+        return result
+
+    async def authority(actor, conn, row):
+        if state["revoked"]:
+            state["denied"] = True
+            actor = {**actor, "package_actions": set(actor["package_actions"]) - {"packages:manage_own"}}
+        return await original_authority(actor, conn, row)
+
+    monkeypatch.setattr(h.provider, "get_server" if observation == "server" else "get_volume", observe)
+    monkeypatch.setattr(service, "fresh_instance_controller", authority)
+    response = await (
+        h.client.post(path + "/stop", headers=member) if operation == "stop" else h.client.delete(path, headers=member)
+    )
+    assert response.status_code == 403
+    assert state["reads"] == 2 and state["revoked"] and state["denied"]
+    assert h.provider.stops == h.provider.deletes == h.provider.volume_deletes == []
+    assert item["server_id"] in h.provider.servers_by_id
+    assert item["boot_volume_id"] in h.provider.volumes_by_id
+
+
+async def _published_job_image(h, monkeypatch, *, platform, stored_arch):
+    """A worker-published image whose single payload row was first labelled ``stored_arch``."""
+    from palimpsest_local.image_manifest import manifest_from_result, normalize_manifest
+
+    from palimpsest_hub.image_models import PalimpsestHubImageJob, PalimpsestHubPublicationPayload
+    from palimpsest_hub.services import published_images
+
+    payload = b"hsqs-platform-" + platform.encode()
+    digest = "sha256:" + hashlib.sha256(payload).hexdigest()
+    source = h.store.root / ("platform-output-" + platform.replace("/", "-"))
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_bytes(payload)
+    h.store.publish_verified(source, h.store.inspect_file(source, max_bytes=len(payload)))
+    runtime = {"entrypoint": ["/bin/sh"], "cmd": [], "env": [], "working_dir": "/", "user": "0"}
+    manifest = manifest_from_result(
+        {"layers": [{"digest": digest, "size_bytes": len(payload)}], "runtime": runtime, "source": {}},
+        os_family="fixture-os",
+        os_version="1",
+        source_kind="local",
+    )
+    if platform != manifest["platform"]:
+        manifest = normalize_manifest(
+            {**manifest, "platform": platform, "layers": [{"digest": digest, "size_bytes": len(payload)}]}
+        )
+    monkeypatch.setattr(published_images, "get_settings", lambda: SimpleNamespace())
+    job_id, job_request = str(uuid4()), str(uuid4())
+    async with h.factory() as session:
+        session.add(
+            PalimpsestHubLayer(
+                blob_digest=digest,
+                size_bytes=len(payload),
+                media_type=MEDIA_TYPE_LAYER_SQUASHFS,
+                arch=stored_arch,
+                config_digest="sha256:" + "0" * 64,
+                name="first-registrant",
+                kind="image-payload",
+                config_json={"instance_mode": "oci-layer"},
+            )
+        )
+        session.add(
+            PalimpsestHubPublicationPayload(
+                project_id=PROJECT, created_by=USER, blob_digest=digest, size_bytes=len(payload)
+            )
+        )
+        await session.commit()
+        await published_images.register_image(
+            session,
+            h.store,
+            {"project_id": PROJECT, "user_id": USER},
+            job_request,
+            "platform-image",
+            manifest,
+            image_id=job_id,
+            require_staged=True,
+        )
+        session.add(
+            PalimpsestHubImageJob(
+                id=job_id,
+                project_id=PROJECT,
+                created_by=USER,
+                request_id=job_request,
+                name="platform-image",
+                kind="dockerfile",
+                request_digest=digest,
+                request_json={},
+                status="complete",
+                output_digests=[digest],
+                result_json={"layers": manifest["layers"], "source": {}, "runtime": runtime, "manifest": manifest},
+            )
+        )
+        await session.commit()
+    return job_id
+
+
+async def test_amd64_image_is_not_rejected_for_a_payload_first_labelled_aarch64(instance_hub, monkeypatch):
+    h = instance_hub
+    job_id = await _published_job_image(h, monkeypatch, platform="linux/amd64", stored_arch="aarch64")
+    request = request_body(command=[])
+    request.update(layer_digests=[], image_job_id=job_id)
+    response = await create_and_advance(h, json=request)
+    assert response.status_code == 202, response.text
+    assert response.json()["mode"] == "oci-chroot"
+
+
+def _arm64_manifest_supported():
+    from palimpsest_local.image_manifest import manifest_from_result, normalize_manifest
+
+    layers = [{"digest": "sha256:" + "1" * 64, "size_bytes": 1}]
+    runtime = {"entrypoint": [], "cmd": [], "env": [], "working_dir": "/", "user": "0"}
+    manifest = manifest_from_result(
+        {"layers": layers, "runtime": runtime, "source": {}}, os_family="x", os_version="1", source_kind="local"
+    )
+    try:
+        normalize_manifest({**manifest, "platform": "linux/arm64", "layers": layers})
+    except ValueError:
+        return False
+    return True
+
+
+@pytest.mark.skipif(not _arm64_manifest_supported(), reason="manifest normalization does not accept linux/arm64")
+async def test_amd64_instance_path_still_refuses_arm64_images(instance_hub, monkeypatch):
+    h = instance_hub
+    # Even if the shared payload row says x86_64, the sealed image's platform decides.
+    job_id = await _published_job_image(h, monkeypatch, platform="linux/arm64", stored_arch="x86_64")
+    request = request_body(command=[])
+    request.update(layer_digests=[], image_job_id=job_id)
+    response = await create_and_advance(h, json=request)
+    assert response.status_code == 422
+    assert response.json()["detail"] == "Instance inputs must be x86_64 SquashFS runtime layers"
+    assert h.provider.creates == h.provider.volume_creates == []

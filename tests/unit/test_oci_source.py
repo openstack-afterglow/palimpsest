@@ -1406,11 +1406,22 @@ def test_local_archive_rejects_ambiguous_or_non_plain_members(tmp_path: Path, ki
         )
 
 
+@pytest.mark.parametrize("snapshot_kind", ["native-amd64", "acquisition-amd64", "acquisition-arm64"])
 def test_materialize_image_hard_preserves_every_occurrence_and_canonical_receipt(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, snapshot_kind: str
 ) -> None:
-    layout, manifest, _, _ = _direct_layout(tmp_path / "layout", repeated=True)
-    image = layout.source(manifest).snapshot(_ref(), SourceCAS(tmp_path / "source-cas"))
+    cas = SourceCAS(tmp_path / "source-cas")
+    if snapshot_kind == "native-amd64":
+        layout, manifest, _, _ = _direct_layout(tmp_path / "layout", repeated=True)
+        image = layout.source(manifest).snapshot(_ref(), cas)
+    else:
+        architecture = snapshot_kind.removeprefix("acquisition-")
+        layout, manifest, _, _ = _acquisition_layout(
+            tmp_path / "layout",
+            architecture=architecture,
+            repeated=True,
+        )
+        image = layout.source(manifest).snapshot_acquisition(_ref(), cas, platform=f"linux/{architecture}")
     calls: list[tuple[int, float]] = []
 
     def fake_materialize(selected, ordinal, **kwargs):
@@ -1438,6 +1449,10 @@ def test_materialize_image_hard_preserves_every_occurrence_and_canonical_receipt
     assert payload["retention"] == "none"
     assert payload["root_descriptor"] == manifest.to_dict()
     assert payload["config_descriptor"] == image.config.descriptor.to_dict()
+    assert payload["platform"] == {"os": "linux", "architecture": image.image.platform.architecture}
+    assert receipt.process == image.image.config.process
+    assert not receipt.process.bootable
+    assert receipt.layer_diff_ids == image.image.config.diff_ids
     assert [layer["ordinal"] for layer in payload["layers"]] == [0, 1]
     assert payload["layers"][0]["compressed"] == payload["layers"][1]["compressed"]
     expected_digest = (
@@ -1446,6 +1461,32 @@ def test_materialize_image_hard_preserves_every_occurrence_and_canonical_receipt
     assert receipt.digest == expected_digest
     serialized = json.dumps(payload, sort_keys=True)
     assert os.fspath(tmp_path) not in serialized
+
+
+def test_native_and_acquisition_amd64_materialization_receipt_bytes_are_identical(tmp_path, monkeypatch):
+    layout, manifest, _, _ = _acquisition_layout(tmp_path / "layout", architecture="amd64", repeated=True)
+    cas = SourceCAS(tmp_path / "source-cas")
+    source = layout.source(manifest)
+    native = source.snapshot(_ref(), cas)
+    acquired = source.snapshot_acquisition(_ref(), cas, platform="linux/amd64")
+    monkeypatch.setattr(
+        oci_materializer,
+        "materialize_layer_hard",
+        lambda image, ordinal, **kwargs: _derived_result(image, ordinal),
+    )
+    receipts = [
+        oci_materializer.materialize_image_hard(
+            image,
+            source_cas_root=tmp_path / "source-cas",
+            roots=object(),
+            store=object(),
+            packer_path=Path("/usr/bin/mksquashfs"),
+            toolchain=object(),
+        )
+        for image in (native, acquired)
+    ]
+    assert canonical_json_bytes(receipts[0].to_dict()) == canonical_json_bytes(receipts[1].to_dict())
+    assert receipts[0].digest == receipts[1].digest
 
 
 def test_materialize_image_hard_stops_after_first_failed_occurrence(
@@ -1475,8 +1516,134 @@ def test_materialize_image_hard_stops_after_first_failed_occurrence(
     assert calls == [0, 1]
 
 
-def _acquisition_layout(root, *, architecture="arm64", plain=False, bad_diff_id=False, wire_payload=None):
-    raw = b"platform-independent layer bytes" * 32
+def test_materialize_image_hard_callbacks_precede_next_occurrence_under_same_deadline(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    layout, manifest, _, _ = _direct_layout(tmp_path / "layout", layer_payloads=(b"one", b"two", b"three"))
+    image = layout.source(manifest).snapshot(_ref(), SourceCAS(tmp_path / "source-cas"))
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(oci_materializer, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    events = []
+    callbacks = []
+    remaining = []
+
+    def materialize(selected, ordinal, **kwargs):
+        events.append(("materialize", ordinal))
+        remaining.append(kwargs["timeout_seconds"])
+        return _derived_result(selected, ordinal)
+
+    def on_layer(result):
+        events.append(("callback", result.receipt.ordinal))
+        callbacks.append(result)
+        clock.now += 1
+
+    monkeypatch.setattr(oci_materializer, "materialize_layer_hard", materialize)
+    receipt = oci_materializer.materialize_image_hard(
+        image,
+        source_cas_root=tmp_path / "source-cas",
+        roots=object(),
+        store=object(),
+        packer_path=Path("/usr/bin/mksquashfs"),
+        toolchain=object(),
+        timeout_seconds=10,
+        on_layer=on_layer,
+    )
+
+    assert events == [
+        ("materialize", 0),
+        ("callback", 0),
+        ("materialize", 1),
+        ("callback", 1),
+        ("materialize", 2),
+        ("callback", 2),
+    ]
+    assert remaining == [10, 9, 8]
+    assert tuple(callbacks) == receipt.results
+    assert all(callback is result for callback, result in zip(callbacks, receipt.results, strict=True))
+
+
+@pytest.mark.parametrize("fail_ordinal", [0, 2])
+def test_materialize_image_hard_propagates_callback_failure_without_later_or_final_success(
+    tmp_path, monkeypatch, fail_ordinal
+):
+    layout, manifest, _, _ = _direct_layout(tmp_path / "layout", layer_payloads=(b"one", b"two", b"three"))
+    image = layout.source(manifest).snapshot(_ref(), SourceCAS(tmp_path / "source-cas"))
+    events = []
+    injected = RuntimeError("publication failed")
+
+    def materialize(selected, ordinal, **kwargs):
+        events.append(("materialize", ordinal))
+        return _derived_result(selected, ordinal)
+
+    def on_layer(result):
+        events.append(("callback", result.receipt.ordinal))
+        if result.receipt.ordinal == fail_ordinal:
+            raise injected
+
+    monkeypatch.setattr(oci_materializer, "materialize_layer_hard", materialize)
+    with pytest.raises(RuntimeError) as caught:
+        oci_materializer.materialize_image_hard(
+            image,
+            source_cas_root=tmp_path / "source-cas",
+            roots=object(),
+            store=object(),
+            packer_path=Path("/usr/bin/mksquashfs"),
+            toolchain=object(),
+            on_layer=on_layer,
+        )
+
+    assert caught.value is injected
+    assert events == [
+        event for ordinal in range(fail_ordinal + 1) for event in (("materialize", ordinal), ("callback", ordinal))
+    ]
+
+
+@pytest.mark.parametrize("layer_count", [1, 3])
+def test_materialize_image_hard_callback_exhaustion_blocks_next_layer_and_final_success(
+    tmp_path, monkeypatch, layer_count
+):
+    from types import SimpleNamespace
+
+    layout, manifest, _, _ = _direct_layout(tmp_path / "layout", layer_payloads=(b"layer",) * layer_count)
+    image = layout.source(manifest).snapshot(_ref(), SourceCAS(tmp_path / "source-cas"))
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(oci_materializer, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    events = []
+
+    def materialize(selected, ordinal, **kwargs):
+        events.append(("materialize", ordinal))
+        return _derived_result(selected, ordinal)
+
+    def on_layer(result):
+        events.append(("callback", result.receipt.ordinal))
+        clock.now = 10
+
+    monkeypatch.setattr(oci_materializer, "materialize_layer_hard", materialize)
+    with pytest.raises(oci_materializer.OCIHardWorkerError, match="deadline expired"):
+        oci_materializer.materialize_image_hard(
+            image,
+            source_cas_root=tmp_path / "source-cas",
+            roots=object(),
+            store=object(),
+            packer_path=Path("/usr/bin/mksquashfs"),
+            toolchain=object(),
+            timeout_seconds=10,
+            on_layer=on_layer,
+        )
+
+    assert events == [("materialize", 0), ("callback", 0)]
+
+
+def _acquisition_layout(
+    root,
+    *,
+    architecture="arm64",
+    plain=False,
+    bad_diff_id=False,
+    wire_payload=None,
+    raw=b"platform-independent layer bytes" * 32,
+    repeated=False,
+):
     wire = raw if plain else gzip.compress(raw, mtime=0)
     layout, _manifest, _config, _layers = _direct_layout(root, layer_payloads=(wire,))
     layer = layout.add(
@@ -1489,7 +1656,8 @@ def _acquisition_layout(root, *, architecture="arm64", plain=False, bad_diff_id=
             "os": "linux",
             "rootfs": {
                 "type": "layers",
-                "diff_ids": ["sha256:" + ("0" * 64 if bad_diff_id else hashlib.sha256(raw).hexdigest())],
+                "diff_ids": ["sha256:" + ("0" * 64 if bad_diff_id else hashlib.sha256(raw).hexdigest())]
+                * (2 if repeated else 1),
             },
         },
         OCI_IMAGE_CONFIG_MEDIA_TYPE,
@@ -1499,7 +1667,7 @@ def _acquisition_layout(root, *, architecture="arm64", plain=False, bad_diff_id=
             "schemaVersion": 2,
             "mediaType": OCI_IMAGE_MANIFEST_MEDIA_TYPE,
             "config": config.to_dict(),
-            "layers": [layer.to_dict()],
+            "layers": [layer.to_dict()] * (2 if repeated else 1),
         },
         OCI_IMAGE_MANIFEST_MEDIA_TYPE,
     )
@@ -1546,6 +1714,7 @@ def test_acquisition_source_rejects_invalid_layer_bytes_and_diffids(tmp_path, fa
         tmp_path / "layout",
         bad_diff_id=failure == "diffid",
         wire_payload=wire,
+        raw=b"highly compressible bytes" * 1024,
     )
     if failure == "digest":
         path = layout.blobs / layer.digest.split(":")[1]
@@ -1566,7 +1735,7 @@ def test_acquisition_source_rejects_invalid_layer_bytes_and_diffids(tmp_path, fa
             _ref(manifest.digest),
             _cas(tmp_path),
             platform="linux/arm64",
-            maximum_bytes=64 if failure == "size" else 1024 * 1024,
+            maximum_bytes=2048 if failure == "size" else 1024 * 1024,
         )
 
 
@@ -1586,3 +1755,163 @@ def test_acquisition_source_rejects_conflicting_root_platform_declaration(tmp_pa
     (layout.root / "index.json").write_text(json.dumps(document))
     with pytest.raises(ArtifactValidationError, match="root platform must target exactly linux/arm64"):
         layout.source(manifest).snapshot_acquisition(_ref(manifest.digest), _cas(tmp_path), platform="linux/arm64")
+
+
+def _acquisition_layout_intake_bytes(layout, manifest, layer):
+    manifest_document = json.loads((layout.blobs / manifest.digest.removeprefix("sha256:")).read_bytes())
+    metadata_bytes = sum((layout.root / name).stat().st_size for name in ("oci-layout", "index.json"))
+    return metadata_bytes + manifest.size + manifest_document["config"]["size"] + layer.size
+
+
+@pytest.mark.parametrize("warm", [False, True])
+def test_acquisition_layout_rejects_selected_payload_before_copy_even_when_cached(tmp_path, warm):
+    layout, manifest, layer, _raw = _acquisition_layout(tmp_path / "layout", plain=True, raw=b"x" * 8192)
+    cas = _cas(tmp_path)
+    source = layout.source(manifest)
+    if warm:
+        source.snapshot_acquisition(None, cas, platform="linux/arm64")
+    events = []
+    bounded_source = layout.source(manifest, events.append)
+    with pytest.raises(ArtifactValidationError):
+        bounded_source.snapshot_acquisition(
+            None,
+            cas,
+            platform="linux/arm64",
+            maximum_bytes=_acquisition_layout_intake_bytes(layout, manifest, layer) - 1,
+        )
+    assert not any(event.digest == layer.digest for event in events)
+    target = _target(tmp_path / "source-cas", layer)
+    assert target.exists() is warm
+    if warm:
+        assert target.read_bytes() == b"x" * 8192
+    assert not list((tmp_path / "source-cas" / "blobs" / "sha256").glob(".source-tmp-*"))
+    assert (
+        _target(tmp_path / "source-cas", manifest).read_bytes()
+        == (layout.blobs / manifest.digest.removeprefix("sha256:")).read_bytes()
+    )
+
+
+@pytest.mark.parametrize("warm", [False, True])
+@pytest.mark.parametrize("repeated", [False, True])
+def test_acquisition_layout_exact_budget_charges_metadata_and_unique_selected_blobs(tmp_path, warm, repeated):
+    layout, manifest, layer, _raw = _acquisition_layout(tmp_path / "layout", raw=b"small layer", repeated=repeated)
+    unused = layout.add(b"unused" * 8192, OCI_LAYER_GZIP_MEDIA_TYPE)
+    cas = _cas(tmp_path)
+    if warm:
+        layout.source(manifest).snapshot_acquisition(None, cas, platform="linux/arm64")
+    events = []
+    result = layout.source(manifest, events.append).snapshot_acquisition(
+        None,
+        cas,
+        platform="linux/arm64",
+        maximum_bytes=_acquisition_layout_intake_bytes(layout, manifest, layer),
+    )
+    assert len(result.layers) == (2 if repeated else 1)
+    assert all(member.descriptor == layer for member in result.layers)
+    assert (
+        sum(event.stage == SnapshotStage.AFTER_INITIAL_FSTAT and event.digest == layer.digest for event in events) == 1
+    )
+    assert not _target(tmp_path / "source-cas", unused).exists()
+    assert (
+        _target(tmp_path / "source-cas", layer).read_bytes()
+        == (layout.blobs / layer.digest.removeprefix("sha256:")).read_bytes()
+    )
+
+
+@pytest.mark.parametrize("metadata_name", ["oci-layout", "index.json"])
+def test_acquisition_layout_rejects_metadata_budget_before_any_cas_copy(tmp_path, metadata_name):
+    layout, manifest, _layer, _raw = _acquisition_layout(tmp_path / "layout", raw=b"small")
+    marker_size = (layout.root / "oci-layout").stat().st_size
+    maximum_bytes = marker_size - 1
+    if metadata_name == "index.json":
+        maximum_bytes += (layout.root / "index.json").stat().st_size
+    events = []
+    cas = _cas(tmp_path)
+    with pytest.raises(ArtifactValidationError):
+        layout.source(manifest, events.append).snapshot_acquisition(
+            None, cas, platform="linux/arm64", maximum_bytes=maximum_bytes
+        )
+    assert all(event.digest is None for event in events)
+    assert list((tmp_path / "source-cas" / "blobs" / "sha256").iterdir()) == []
+
+
+def test_acquisition_layout_pinned_top_index_is_charged_once(tmp_path):
+    layout, manifest, layer, _raw = _acquisition_layout(tmp_path / "layout", raw=b"small")
+    index_path = layout.root / "index.json"
+    index_document = json.loads(index_path.read_bytes())
+    index_document["manifests"][0]["platform"] = {"os": "linux", "architecture": "arm64"}
+    index_path.write_bytes(json.dumps(index_document).encode())
+    index_bytes = (layout.root / "index.json").read_bytes()
+    index_digest = "sha256:" + hashlib.sha256(index_bytes).hexdigest()
+    result = LocalLayoutSource(layout.root, index_digest).snapshot_acquisition(
+        None,
+        _cas(tmp_path),
+        platform="linux/arm64",
+        maximum_bytes=_acquisition_layout_intake_bytes(layout, manifest, layer),
+    )
+    assert result.root.descriptor.digest == index_digest
+    assert result.manifest.descriptor == manifest
+    assert _target(tmp_path / "source-cas", result.root.descriptor).read_bytes() == index_bytes
+
+
+@pytest.mark.parametrize("oversized", ["selected", "unreferenced"])
+def test_acquisition_archive_rejects_complete_carrier_before_staging(tmp_path, monkeypatch, oversized):
+    layout, manifest, _layer, _raw = _acquisition_layout(
+        tmp_path / "layout", plain=True, raw=b"x" * 65536 if oversized == "selected" else b"small"
+    )
+    if oversized == "unreferenced":
+        layout.add(b"unreferenced" * 65536, OCI_LAYER_GZIP_MEDIA_TYPE)
+    archive = tmp_path / "image.tar"
+    _write_oci_archive(layout.root, archive)
+    staged = []
+    original_write = oci_source._write_archive_member
+
+    def record_stage(tar, member, target, **kwargs):
+        staged.append(member.name)
+        return original_write(tar, member, target, **kwargs)
+
+    monkeypatch.setattr(oci_source, "_write_archive_member", record_stage)
+    cas = _cas(tmp_path)
+    with pytest.raises(ArtifactValidationError):
+        LocalArchiveSource(archive, manifest.digest).snapshot_acquisition(
+            None, cas, platform="linux/arm64", maximum_bytes=16384
+        )
+    assert staged == []
+    assert list((tmp_path / "source-cas" / "blobs" / "sha256").iterdir()) == []
+
+
+def test_acquisition_archive_exact_carrier_budget_includes_unused_blobs_and_padding(tmp_path):
+    layout, manifest, layer, _raw = _acquisition_layout(tmp_path / "layout", raw=b"small", repeated=True)
+    unused = layout.add(b"unused" * 4096, OCI_LAYER_GZIP_MEDIA_TYPE)
+    archive = tmp_path / "image.tar"
+    _write_oci_archive(layout.root, archive)
+    carrier_bytes = archive.stat().st_size
+    cas = _cas(tmp_path)
+    source = LocalArchiveSource(archive, manifest.digest)
+    result = source.snapshot_acquisition(None, cas, platform="linux/arm64", maximum_bytes=carrier_bytes)
+    assert len(result.layers) == 2
+    assert result.layers[0] == result.layers[1]
+    assert _target(tmp_path / "source-cas", layer).exists()
+    assert not _target(tmp_path / "source-cas", unused).exists()
+    events = []
+    with pytest.raises(ArtifactValidationError):
+        LocalArchiveSource(archive, manifest.digest, events.append).snapshot_acquisition(
+            None, cas, platform="linux/arm64", maximum_bytes=carrier_bytes - 1
+        )
+    assert events == []
+
+
+def test_acquisition_decompression_budget_still_charges_repeated_occurrences(tmp_path):
+    raw = b"x" * 1024
+    layout, manifest, layer, _raw = _acquisition_layout(tmp_path / "layout", raw=raw, repeated=True)
+    maximum_bytes = max(len(raw), _acquisition_layout_intake_bytes(layout, manifest, layer))
+    assert maximum_bytes < 2 * len(raw)
+    cas = _cas(tmp_path)
+    with pytest.raises(ArtifactValidationError):
+        layout.source(manifest).snapshot_acquisition(None, cas, platform="linux/arm64", maximum_bytes=maximum_bytes)
+    # Compressed intake fits exactly once; the independent decompression pass
+    # rejects the second occurrence, not the shared CAS blob.
+    assert (
+        _target(tmp_path / "source-cas", layer).read_bytes()
+        == (layout.blobs / layer.digest.removeprefix("sha256:")).read_bytes()
+    )

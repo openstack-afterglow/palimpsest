@@ -14,8 +14,15 @@ from typing import Any
 
 from .artifact_store import ArtifactStoreError
 from .errors import ArtifactValidationError
-from .oci_converter import LayerIntakeError
-from .oci_packer import SQUASHFS_PACK_POLICY_ID, SquashFSPackError, SquashFSPackProfile
+from .oci_changeset import OCI_CHANGESET_NORMALIZATION_ID
+from .oci_converter import DEFAULT_LAYER_CONVERSION_LIMITS, LAYER_INTAKE_POLICY_ID, LayerIntakeError
+from .oci_packer import (
+    SQUASHFS_PACK_POLICY_ID,
+    SQUASHFS_PACKER_ARGV_CONTRACT_ID,
+    SQUASHFS_STRUCTURAL_VERIFIER_ID,
+    SquashFSPackError,
+    SquashFSPackProfile,
+)
 from .oci_provenance import ProvenanceSource
 from .oci_store import (
     DerivedLayerOccurrence,
@@ -23,6 +30,7 @@ from .oci_store import (
     MaterializationResult,
     OCIStoreError,
 )
+from .oci_tar_emitter import OCI_NORMALIZED_TAR_EMISSION_ID
 
 OCI_WORKER_REQUEST_SCHEMA = "palimpsest.oci-materialize-worker-request.v3"
 OCI_WORKER_RESPONSE_SCHEMA = "palimpsest.oci-materialize-worker-response.v4"
@@ -84,6 +92,8 @@ OCI_WORKER_EXCEPTION_CODES = {
         "oci-changeset-member oci-changeset-payload oci-changeset-input oci-whiteout-marker "
         "oci-whiteout-target oci-hardlink-self oci-hardlink-chain oci-hardlink-target "
         "oci-opaque-state oci-hardlink-group oci-hardlink-order "
+        "oci-prefix-layer-limit oci-prefix-timeout oci-prefix-limit oci-stage-context "
+        "oci-changeset-entry-limit oci-changeset-metadata-limit "
         "oci-expansion-limit oci-uncompressed-limit "
         "oci-codec oci-compressed-limit oci-device-metadata oci-diffid oci-gzip oci-gzip-trailing "
         "oci-header-limit oci-invalid-link oci-invalid-path oci-layer-timeout oci-limit-policy "
@@ -245,8 +255,11 @@ class OCIWorkerRequest:
     cpu_limit_seconds: int
     pack_profile: SquashFSPackProfile = SquashFSPackProfile.CANONICAL
     schema: str = OCI_WORKER_REQUEST_SCHEMA
+    no_force: bool = False
 
     def __post_init__(self) -> None:
+        if type(self.no_force) is not bool:
+            raise OCIWorkerProtocolError("request termination policy is invalid")
         object.__setattr__(self, "nonce", _canonical_uuid(self.nonce, "request.nonce"))
         object.__setattr__(self, "config_root", _path_input(self.config_root, "request.config_root"))
         object.__setattr__(self, "state_root", _path_input(self.state_root, "request.state_root"))
@@ -270,8 +283,21 @@ class OCIWorkerRequest:
             raise OCIWorkerProtocolError("request.source is invalid")
         if not isinstance(self.occurrence, DerivedLayerOccurrence):
             raise OCIWorkerProtocolError("request.occurrence is invalid")
-        if not isinstance(self.key, DerivedSquashFSKey) or not self.key.matches(self.occurrence):
+        if (
+            not isinstance(self.key, DerivedSquashFSKey)
+            or self.key.parent_chain_digest is None
+            or not self.key.matches(self.occurrence)
+        ):
             raise OCIWorkerProtocolError("request.key is invalid")
+        if (
+            self.key.intake_policy_id != LAYER_INTAKE_POLICY_ID
+            or self.key.intake_policy_fingerprint != DEFAULT_LAYER_CONVERSION_LIMITS.fingerprint
+            or self.key.normalization_contract_id != OCI_CHANGESET_NORMALIZATION_ID
+            or self.key.tar_emission_contract_id != OCI_NORMALIZED_TAR_EMISSION_ID
+            or self.key.packer_contract_id != SQUASHFS_PACKER_ARGV_CONTRACT_ID
+            or self.key.structural_verifier != SQUASHFS_STRUCTURAL_VERIFIER_ID
+        ):
+            raise OCIWorkerProtocolError("request.key contracts are unsupported")
         if not isinstance(self.key_digest, str) or self.key.digest != self.key_digest:
             raise OCIWorkerProtocolError("request.key_digest does not match the key")
         _identifier(self.key_digest.removeprefix("sha256:"), _SHA256_HEX_RE, "request.key_digest")
@@ -295,7 +321,7 @@ class OCIWorkerRequest:
             raise OCIWorkerProtocolError("OCI worker request schema is unsupported")
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        value = {
             "cpu_limit_seconds": self.cpu_limit_seconds,
             "expected_source_cas_id": self.expected_source_cas_id,
             "expected_store_id": self.expected_store_id,
@@ -310,6 +336,9 @@ class OCIWorkerRequest:
             "source": self.source.to_dict(),
             "source_cas": {"cas_id": self.expected_source_cas_id, "root": os.fspath(self.source_cas_root)},
         }
+        if self.no_force:
+            value["no_force"] = True
+        return value
 
     def to_json_bytes(self) -> bytes:
         return _canonical_json(self.to_dict())
@@ -335,6 +364,10 @@ class OCIWorkerRequest:
             "source",
             "source_cas",
         }
+        if isinstance(data, dict) and "no_force" in data:
+            if data["no_force"] is not True:
+                raise OCIWorkerProtocolError("optional request.no_force must be true")
+            fields.add("no_force")
         value = _exact_fields(data, fields, "OCI worker request")
         roots = _exact_fields(value["roots"], {"config", "state"}, "request.roots")
         source_cas = _exact_fields(value["source_cas"], {"cas_id", "root"}, "request.source_cas")
@@ -364,6 +397,7 @@ class OCIWorkerRequest:
             cpu_limit_seconds=value["cpu_limit_seconds"],
             pack_profile=pack_profile,
             schema=value["schema"],
+            no_force=value.get("no_force", False),
         )
 
     @classmethod

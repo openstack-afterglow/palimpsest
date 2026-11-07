@@ -7,6 +7,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import stat
 import uuid
 import xml.etree.ElementTree as ET
@@ -98,6 +99,43 @@ def _directory_removed(fd: int) -> bool:
             return True
         raise
     return (current.st_dev, current.st_ino) != (held.st_dev, held.st_ino)
+
+
+def lima_oci_runtime_kind(instance: dict[str, Any]) -> str | None:
+    """Reserve native OCI identities without adopting them or granting cleanup."""
+    name = instance.get("name")
+    reserved_name = isinstance(name, str) and re.fullmatch(r"plm-[0-9a-f]{12}", name) is not None
+    config = instance.get("config")
+    config = config if isinstance(config, dict) else {}
+    mounts = config.get("mounts")
+    native_mount = isinstance(mounts, list) and any(
+        isinstance(mount, dict) and mount.get("mountPoint") in ("/.palimpsest/seed", "/.palimpsest/lower-input")
+        for mount in mounts
+    )
+    images = config.get("images")
+    native_kernel = isinstance(images, list) and any(
+        isinstance(image, dict)
+        and isinstance(image.get("kernel"), dict)
+        and isinstance(image["kernel"].get("cmdline"), str)
+        and "plm.plan_sha256=" in image["kernel"]["cmdline"]
+        for image in images
+    )
+    if not (reserved_name or native_mount or native_kernel):
+        return None
+    try:
+        run_id = lima._instance_run_id(instance)
+        if (
+            reserved_name
+            and run_id is not None
+            and name == "plm-" + run_id.replace("-", "")[:12]
+            and lima._instance_vm_type(instance) == "vz"
+        ):
+            return "oci-root"
+    except PalimpsestError:
+        pass
+    # A reserved name or boot artifact is not ownership proof. Lost or changed
+    # markers must not turn retained native custody into generic force removal.
+    return "unknown"
 
 
 def lima_removal_identity(instance: dict[str, Any]) -> str | None:
@@ -224,6 +262,8 @@ def _remove_lima(
     current = lima._instance_info_or_none(name)
     if current is None or lima_removal_identity(current) != expected_identity:
         raise StateError("selected Lima VM identity changed; refresh before removing")
+    if ledger is None and lima_oci_runtime_kind(current) is not None:
+        raise StateError("native OCI Lima removal requires its original managed runtime")
     path = current["dir"]
     try:
         with _physical_directory(path) as fd:
@@ -233,6 +273,8 @@ def _remove_lima(
                 selected = lima._instance_info_or_none(name)
                 if selected is None or lima_removal_identity(selected) != expected_identity:
                     raise StateError("selected Lima VM identity changed; refresh before removing")
+                if ledger is None and lima_oci_runtime_kind(selected) is not None:
+                    raise StateError("native OCI Lima removal requires its original managed runtime")
                 linked = os.stat(selected["dir"], follow_symlinks=False)
                 if (pinned.st_dev, pinned.st_ino) != (linked.st_dev, linked.st_ino):
                     raise StateError("selected Lima VM directory changed; refresh before removing")

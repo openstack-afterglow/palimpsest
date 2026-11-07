@@ -354,7 +354,7 @@
     versionList.replaceChildren();
     for (const item of value.items) {
       const row = node("article", "", "row"), main = node("div", "", "row-main"), actions = node("div", "", "row-actions");
-      main.append(node("code", item.root_digest), node("p", `Pushed ${item.pushed_at} by ${item.pushed_by} · ${item.pushed_key_id === null ? "human system administrator" : `key ${item.pushed_key_id}`}`, "meta"),
+      main.append(node("code", item.root_digest), node("p", `Pushed ${item.pushed_at} by ${item.pushed_by} · ${item.pushed_key_id === null ? "original human token" : `key ${item.pushed_key_id}`}`, "meta"),
         node("p", `Original archive ${item.archive_size_bytes} bytes · ${item.archive_digest}`, "meta"),
         node("p", (item.platforms || []).map((platform) => `${platform.os}/${platform.architecture}${platform.variant ? `/${platform.variant}` : ""}`).join(", ") || "No platform descriptors", "meta"));
       actions.append(button("Version details", () => inspectVersion(packageName, item.root_digest), () => canRead()),
@@ -566,7 +566,7 @@
   const controlActions = node("div", "", "actions");
   controlActions.append(button("Refresh current project", refreshMember, () => !!memberConnection),
     button("Register namespace", registerNamespace, () => !!memberConnection && !memberConnection.identity.namespace && memberAllows("packages_write")),
-    button("List my keys", listKeys, () => !!memberConnection?.identity.namespace && (memberAllows("keys_issue") || memberAllows("keys_revoke"))));
+    button("List my keys", listKeys, () => !!memberConnection?.identity.namespace && memberAllows("keys_list")));
   controlSection.append(controlActions, status("native-control-message"));
   const issueForm = identified("form", "native-issue-form", "", "form-grid");
   const keyName = field(issueForm, "Key name", "native-issue-name", "text", true);

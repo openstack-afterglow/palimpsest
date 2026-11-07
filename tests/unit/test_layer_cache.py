@@ -18,6 +18,7 @@ import pytest
 from palimpsest_local import cli, layer_cache, registry_intake
 from palimpsest_local.artifact_store import ArtifactStore
 from palimpsest_local.errors import ArtifactValidationError
+from palimpsest_local.image_source_policy import ImageSourcePolicy, ImageSourceRule
 from palimpsest_local.layer_cache import LayerCache, LayerCacheError
 from palimpsest_local.oci_packer import SquashFSPackProfile
 from palimpsest_local.oci_provenance import (
@@ -84,6 +85,10 @@ def _layout(
 def _cache(root: Path) -> LayerCache:
     root.mkdir(mode=0o700)
     return LayerCache(root, initialize=True)
+
+
+def _policy() -> ImageSourcePolicy:
+    return ImageSourcePolicy((ImageSourceRule("registry.example.com", "team", "image"),))
 
 
 def _bytes(cache: LayerCache) -> dict[str, bytes]:
@@ -187,9 +192,57 @@ def test_immutable_pin_and_explicit_offline_never_call_skopeo(tmp_path, monkeypa
 
     monkeypatch.setattr(registry_intake, "pull_anonymous_oci_layout", forbidden)
     for offline in (False, True):
-        assert cache.pull(f"registry.example.com/team/image@{root}", offline=offline)["root_digest"] == root
+        assert (
+            cache.pull(f"registry.example.com/team/image@{root}", source_policy=_policy(), offline=offline)[
+                "root_digest"
+            ]
+            == root
+        )
     with pytest.raises(LayerCacheError, match="offline"):
-        cache.pull("registry.example.com/team/image:uncached", offline=True)
+        cache.pull("registry.example.com/team/image:uncached", source_policy=_policy(), offline=True)
+
+
+def test_revoked_source_cannot_reuse_retained_pin_or_mutate_its_catalog(tmp_path):
+    source, root, _compressed = _layout(tmp_path / "layout")
+    cache = _cache(tmp_path / "cache")
+    cache.import_source(source)
+    reference = f"registry.example.com/team/image@{root}"
+    assert cache.pull(reference, source_policy=_policy(), offline=True)["root_digest"] == root
+    catalog = cache.roots.state / "layer-cache.json"
+    before = catalog.read_bytes()
+    with pytest.raises(LayerCacheError, match="not allowed"):
+        cache.pull(reference, source_policy=ImageSourcePolicy(), offline=True)
+    assert catalog.read_bytes() == before
+    assert cache.inspect(root)["root_digest"] == root
+
+
+def test_revocation_during_retention_verification_preserves_original_consumer_catalog(tmp_path, monkeypatch):
+    import time
+
+    from palimpsest_local.image_policy_channel import PolicyPublicationHold, require_current_policy
+
+    source, root, _compressed = _layout(tmp_path / "layout")
+    cache = _cache(tmp_path / "cache")
+    cache.import_source(source)
+    catalog = cache.roots.state / "layer-cache.json"
+    before = catalog.read_bytes()
+    operator = [_policy()]
+    verified = cache._verified
+
+    def revoke_after_verified(*args, **kwargs):
+        result = verified(*args, **kwargs)
+        operator[0] = ImageSourcePolicy()
+        return result
+
+    monkeypatch.setattr(cache, "_verified", revoke_after_verified)
+    with pytest.raises(PolicyPublicationHold):
+        cache.retain(
+            root,
+            "consumer-one",
+            before_commit=lambda: require_current_policy(_policy(), lambda: operator[0], time.monotonic() + 30),
+        )
+    assert catalog.read_bytes() == before
+    assert LayerCache(cache.root).inspect(root)["consumer_ids"] == []
 
 
 @pytest.mark.parametrize("offline", [False, True])
@@ -210,7 +263,7 @@ def test_corrupt_immutable_reference_mapping_refuses_other_cached_root(tmp_path,
 
     monkeypatch.setattr(registry_intake, "pull_anonymous_oci_layout", forbidden)
     with pytest.raises(LayerCacheError, match="immutable reference"):
-        cache.pull(reference, offline=offline)
+        cache.pull(reference, source_policy=_policy(), offline=offline)
     with pytest.raises(LayerCacheError, match="immutable reference"):
         LayerCache(cache.root)
 
@@ -245,11 +298,11 @@ def test_mutable_tag_refresh_keeps_old_root_and_offline_reopens_saved_descriptor
 
     monkeypatch.setattr(registry_intake, "pull_anonymous_oci_layout", transfer)
     reference = "registry.example.com/team/image:stable"
-    assert cache.pull(reference)["root_digest"] == first
+    assert cache.pull(reference, source_policy=_policy())["root_digest"] == first
     cache.retain(first, "older-instance")
-    assert cache.pull(reference)["root_digest"] == second
+    assert cache.pull(reference, source_policy=_policy())["root_digest"] == second
     assert len(calls) == 2
-    assert LayerCache(cache.root).pull(reference, offline=True)["root_digest"] == second
+    assert LayerCache(cache.root).pull(reference, source_policy=_policy(), offline=True)["root_digest"] == second
     assert cache.inspect(first)["consumer_ids"] == ["older-instance"]
     assert len(calls) == 2
 
@@ -530,8 +583,8 @@ def test_real_materialization_reuses_recipe_after_reopen_and_changed_host_author
     alias.symlink_to(packer)
     monkeypatch.chdir(tmp_path)
     first = cache.materialize(root, packer_path=Path("relative-packer"), pack_profile=pack_profile)
-    assert [result["cache_result"] for result in first["receipt"]["results"]] == ["cold_miss", "warm_hit"]
-    assert len(first["derived"]) == 1
+    assert [result["cache_result"] for result in first["receipt"]["results"]] == ["cold_miss", "cold_miss"]
+    assert len(first["derived"]) == 2
     assert next(iter(first["derived"].values()))["key"]["pack_policy_fingerprint"] == pack_profile.policy.fingerprint
     assert first["blob_paths"][0] == first["blob_paths"][1]
     output = Path(first["blob_paths"][0])
@@ -578,7 +631,8 @@ def test_different_compressed_recipe_cannot_replace_retained_output(tmp_path, fa
     second_snapshot = LocalLayoutSource(two).snapshot(None, SourceCAS(cache.roots.oci_source_cas))
     first = DerivedLayerOccurrence.from_image(first_snapshot, 0)
     second = DerivedLayerOccurrence.from_image(second_snapshot, 0)
-    first_key, second_key = fixtures._key(first), fixtures._key(second)
+    first_key = fixtures._key(first, parent_digest=layer_cache.parent_chain_digest(first_snapshot, 0))
+    second_key = fixtures._key(second, parent_digest=layer_cache.parent_chain_digest(second_snapshot, 0))
     assert first_compressed != second_compressed
     assert first.diff_id == second.diff_id
     assert first_key.digest != second_key.digest
@@ -627,41 +681,116 @@ def test_different_compressed_recipe_cannot_replace_retained_output(tmp_path, fa
             assert blob.read_bytes() == damaged
 
 
-@pytest.mark.parametrize("pack_profile", [None, SquashFSPackProfile.SERVICE_IMAGE])
-def test_materialize_forwards_fixed_profile_and_remaining_deadline(tmp_path, monkeypatch, pack_profile):
-    from types import SimpleNamespace
+def _catalog_recipe(cache, snapshot, ordinal, *, legacy=False):
+    import test_oci_store as fixtures
+
+    from palimpsest_local.oci_store import DerivedLayerOccurrence, DerivedSquashFSKey
+
+    occurrence = DerivedLayerOccurrence.from_image(snapshot, ordinal)
+    key = fixtures._key(occurrence, parent_digest=layer_cache.parent_chain_digest(snapshot, ordinal))
+    receipt = cache._store.materialize(occurrence, key, fixtures._producer(occurrence, [], fixtures._squashfs()))
+    if legacy:
+        original_key = key
+        wire = key.to_dict()
+        wire["domain"] = "palimpsest.oci-derived-recipe.v1"
+        wire["normalization_contract_id"] = "palimpsest.oci-changeset-normalization.v2"
+        del wire["parent_chain_digest"]
+        key = DerivedSquashFSKey.from_dict(wire)
+        records = cache.roots.oci_derived_store / "records"
+        record = json.loads((records / receipt.record_digest.removeprefix("sha256:")).read_bytes())
+        record.update(key=key.to_dict(), key_digest=key.digest)
+        payload = json.dumps(record, sort_keys=True, separators=(",", ":")).encode()
+        record_digest = _sha(payload)
+        path = records / record_digest.removeprefix("sha256:")
+        path.write_bytes(payload)
+        path.chmod(0o400)
+        keys = cache.roots.oci_derived_store / "keys"
+        index = keys / key.digest.removeprefix("sha256:")
+        index.write_bytes(
+            json.dumps(
+                {"schema": wire["domain"], "key_digest": key.digest, "record_digest": record_digest},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        )
+        index.chmod(0o400)
+        # Only the historical recipe is available for cache lookup.
+        (keys / original_key.digest.removeprefix("sha256:")).unlink()
+    with cache._locked() as (fd, _):
+        catalog = cache._load(fd)
+        catalog["derived"][key.digest] = {
+            "key": key.to_dict(),
+            "key_digest": key.digest,
+            "compressed_digest": key.compressed_digest,
+            "diff_id": key.diff_id,
+            "image_digest": receipt.image_digest,
+            "image_size": receipt.image_size,
+        }
+        cache._save(fd, catalog)
+    return key, receipt
+
+
+def test_catalog_reads_only_advertise_exact_parent_context_without_minting_occurrences(tmp_path):
+    from palimpsest_local.oci_source import LocalLayoutSource
+
+    one, first_root, _ = _layout(tmp_path / "one")
+    two, second_root, _ = _layout(tmp_path / "two", repeat=True)
+    cache = _cache(tmp_path / "cache")
+    cache.import_source(one)
+    cache.import_source(two)
+    snapshot = LocalLayoutSource(two).snapshot(None, SourceCAS(cache.roots.oci_source_cas))
+    key, receipt = _catalog_recipe(cache, snapshot, 1)
+    occurrences = cache.roots.oci_derived_store / "occurrences"
+    before = {path.name: path.read_bytes() for path in occurrences.iterdir()}
+    assert LayerCache(cache.root).inspect(first_root)["derived_blob_paths"] == []
+    assert len(LayerCache(cache.root).inspect(second_root)["derived_blob_paths"]) == 1
+    cache.retain(first_root, "first")
+    cache.retain(second_root, "second")
+    cache.release("first")
+    cache.release("second")
+    assert {path.name: path.read_bytes() for path in occurrences.iterdir()} == before
+    assert cache._store.verify_cached_recipe(key) == (receipt.image_digest, receipt.image_size)
+
+
+def test_catalog_rejects_context_without_any_retained_parent_graph(tmp_path):
+    from dataclasses import replace
+
+    from palimpsest_local.oci_source import LocalLayoutSource
 
     source, root, _ = _layout(tmp_path / "layout")
     cache = _cache(tmp_path / "cache")
     cache.import_source(source)
-    packer = tmp_path / "packer"
-    packer.write_bytes(b"pinned-packer")
-    clock = SimpleNamespace(now=0.0)
-    monkeypatch.setattr(layer_cache, "time", SimpleNamespace(monotonic=lambda: clock.now))
-    selected = pack_profile or SquashFSPackProfile.CANONICAL
-    toolchain = object()
+    snapshot = LocalLayoutSource(source).snapshot(None, SourceCAS(cache.roots.oci_source_cas))
+    key, _receipt = _catalog_recipe(cache, snapshot, 0)
+    marker = cache.roots.state / "layer-cache.json"
+    catalog = json.loads(marker.read_bytes())
+    record = catalog["derived"].pop(key.digest)
+    forged = replace(key, parent_chain_digest="sha256:" + "1" * 64)
+    record.update(key=forged.to_dict(), key_digest=forged.digest)
+    catalog["derived"][forged.digest] = record
+    marker.write_text(json.dumps(catalog, sort_keys=True, separators=(",", ":")))
+    with pytest.raises(LayerCacheError, match="parent context"):
+        LayerCache(cache.root).inspect(root)
 
-    def discover(path, **kwargs):
-        assert path == packer.resolve()
-        assert kwargs["expected_packer_sha256"] == hashlib.sha256(b"pinned-packer").hexdigest()
-        assert kwargs["policy"] is selected.policy
-        clock.now += 12.5
-        return toolchain
 
-    class ObservedMaterialization(Exception):
-        pass
+def test_historical_catalog_is_readable_but_new_materialization_cannot_reuse_it(tmp_path, monkeypatch):
+    from palimpsest_local.oci_source import LocalLayoutSource
 
-    def materialize(snapshot, **kwargs):
-        assert kwargs["pack_profile"] is selected
-        assert kwargs["timeout_seconds"] == 287.5
-        assert kwargs["toolchain"] is toolchain
-        raise ObservedMaterialization
-
-    monkeypatch.setattr(layer_cache, "discover_squashfs_toolchain", discover)
-    monkeypatch.setattr(layer_cache, "materialize_image_hard", materialize)
-    arguments = {} if pack_profile is None else {"pack_profile": pack_profile}
-    with pytest.raises(ObservedMaterialization):
-        cache.materialize(root, packer_path=packer, timeout_seconds=300, **arguments)
+    cache, root, packer, _events, produced = _sequential_materialization_probe(tmp_path, monkeypatch, repeat=False)
+    snapshot = LocalLayoutSource(tmp_path / "layout").snapshot(None, SourceCAS(cache.roots.oci_source_cas))
+    key, receipt = _catalog_recipe(cache, snapshot, 0, legacy=True)
+    occurrences = cache.roots.oci_derived_store / "occurrences"
+    before = {path.name: path.read_bytes() for path in occurrences.iterdir()}
+    assert LayerCache(cache.root).inspect(root)["derived_blob_paths"] == []
+    cache.retain(root, "historical-consumer")
+    cache.release("historical-consumer")
+    assert {path.name: path.read_bytes() for path in occurrences.iterdir()} == before
+    assert cache._store.verify_cached_recipe(key) == (receipt.image_digest, receipt.image_size)
+    result = cache.materialize(root, packer_path=packer)
+    assert [item["cache_result"] for item in result["receipt"]["results"]] == ["cold_miss"]
+    assert produced == [0]
+    assert result["receipt"]["results"][0]["receipt"]["key_digest"] != key.digest
+    assert len(LayerCache(cache.root).inspect(root)["derived_blob_paths"]) == 1
 
 
 def test_materialize_pre_worker_expiry_preserves_coded_failure_summary(tmp_path, monkeypatch):
@@ -690,3 +819,154 @@ def test_materialize_pre_worker_expiry_preserves_coded_failure_summary(tmp_path,
     assert summary["code"] == "oci-worker-timeout"
     assert summary["stage"] == "materialization"
     assert summary["category"] == "OCIHardWorkerError"
+
+
+def _sequential_materialization_probe(tmp_path, monkeypatch, *, repeat=True, worker_failure=None):
+    import test_oci_store as fixtures
+
+    from palimpsest_local import oci_materializer
+    from palimpsest_local.oci_store import DerivedLayerOccurrence
+
+    source, root, _ = _layout(tmp_path / "layout", repeat=repeat)
+    cache = _cache(tmp_path / "cache")
+    cache.import_source(source)
+    packer = tmp_path / "packer"
+    packer.write_bytes(b"pinned-packer")
+    toolchain = fixtures._toolchain_capability()
+    monkeypatch.setattr(layer_cache, "discover_squashfs_toolchain", lambda *a, **k: toolchain)
+    events = []
+    produced = []
+
+    def materialize(selected, ordinal, **kwargs):
+        events.append(("materialize", ordinal))
+        if ordinal == worker_failure:
+            raise RuntimeError("conversion failed")
+        occurrence = DerivedLayerOccurrence.from_image(selected, ordinal)
+        return kwargs["store"].materialize_observed(
+            occurrence,
+            fixtures._key(occurrence, parent_digest=layer_cache.parent_chain_digest(selected, ordinal)),
+            fixtures._producer(occurrence, produced, fixtures._squashfs()),
+        )
+
+    monkeypatch.setattr(oci_materializer, "materialize_layer_hard", materialize)
+    return cache, root, packer, events, produced
+
+
+def test_materialize_commits_each_layer_before_callback_and_reuses_same_blob(tmp_path, monkeypatch):
+    import fcntl
+
+    from palimpsest_local.oci_store import DerivedLayerReceipt
+
+    cache, root, packer, events, produced = _sequential_materialization_probe(tmp_path, monkeypatch)
+    callbacks = []
+    marker = cache.roots.state / "layer-cache.json"
+
+    def on_layer(ordinal, blob_path, receipt):
+        events.append(("callback", ordinal))
+        # Reentry is forbidden: another independently opened lock cannot enter.
+        with (cache.root / ".layer-cache.lock").open("rb") as lock_probe:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(lock_probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert isinstance(blob_path, Path)
+        assert DerivedLayerReceipt.from_dict(receipt).ordinal == ordinal
+        assert _sha(blob_path.read_bytes()) == receipt["image_digest"]
+        committed = json.loads(marker.read_bytes())["derived"][receipt["key_digest"]]
+        assert committed["image_digest"] == receipt["image_digest"]
+        assert committed["image_size"] == receipt["image_size"]
+        callbacks.append((ordinal, blob_path, receipt))
+
+    result = cache.materialize(root, packer_path=packer, on_layer=on_layer)
+
+    assert events == [("materialize", 0), ("callback", 0), ("materialize", 1), ("callback", 1)]
+    assert produced == [0, 1]
+    assert [item[2] for item in callbacks] == [item["receipt"] for item in result["receipt"]["results"]]
+    assert [item["cache_result"] for item in result["receipt"]["results"]] == ["cold_miss", "cold_miss"]
+    assert callbacks[0][1] == callbacks[1][1]
+    assert result["blob_paths"] == [os.fspath(item[1]) for item in callbacks]
+    assert len(LayerCache(cache.root).inspect(root)["derived"]) == 2
+
+
+@pytest.mark.parametrize("failure", ["callback", "worker"])
+def test_materialize_failure_retains_committed_prefix_and_stops_next_layer(tmp_path, monkeypatch, failure):
+    cache, root, packer, events, produced = _sequential_materialization_probe(
+        tmp_path, monkeypatch, worker_failure=1 if failure == "worker" else None
+    )
+    injected = RuntimeError("publication failed")
+
+    def on_layer(ordinal, blob_path, receipt):
+        events.append(("callback", ordinal))
+        assert blob_path.exists()
+        assert receipt["ordinal"] == ordinal
+        if failure == "callback":
+            raise injected
+
+    with pytest.raises(RuntimeError) as caught:
+        cache.materialize(root, packer_path=packer, on_layer=on_layer)
+
+    if failure == "callback":
+        assert caught.value is injected
+        assert events == [("materialize", 0), ("callback", 0)]
+    else:
+        assert str(caught.value) == "conversion failed"
+        assert events == [("materialize", 0), ("callback", 0), ("materialize", 1)]
+    retained = LayerCache(cache.root).inspect(root)
+    assert len(retained["derived"]) == 1
+    assert len(retained["derived_blob_paths"]) == 1
+    assert produced == [0]
+    if failure == "callback":
+        events.clear()
+        retried = LayerCache(cache.root).materialize(root, packer_path=packer)
+        assert events == [("materialize", 0), ("materialize", 1)]
+        assert produced == [0, 1]
+        assert [item["cache_result"] for item in retried["receipt"]["results"]] == ["warm_hit", "cold_miss"]
+
+
+@pytest.mark.parametrize("repeat", [False, True])
+def test_materialize_callback_consumes_original_deadline_without_final_success(tmp_path, monkeypatch, repeat):
+    from types import SimpleNamespace
+
+    from palimpsest_local import oci_materializer
+
+    cache, root, packer, events, produced = _sequential_materialization_probe(tmp_path, monkeypatch, repeat=repeat)
+    clock = SimpleNamespace(now=0.0)
+    time_source = SimpleNamespace(monotonic=lambda: clock.now)
+    monkeypatch.setattr(layer_cache, "time", time_source)
+    monkeypatch.setattr(oci_materializer, "time", time_source)
+
+    def on_layer(ordinal, blob_path, receipt):
+        events.append(("callback", ordinal))
+        clock.now = 10.0
+
+    with pytest.raises(oci_materializer.OCIHardWorkerError, match="deadline expired"):
+        cache.materialize(root, packer_path=packer, timeout_seconds=10, on_layer=on_layer)
+
+    assert events == [("materialize", 0), ("callback", 0)]
+    assert produced == [0]
+    assert len(LayerCache(cache.root).inspect(root)["derived"]) == 1
+
+
+@pytest.mark.parametrize("fault", ["missing_callbacks", "different_results"])
+def test_materialize_requires_final_results_to_match_committed_sequence(tmp_path, monkeypatch, fault):
+    from dataclasses import replace
+
+    cache, root, packer, events, produced = _sequential_materialization_probe(tmp_path, monkeypatch)
+    materialize_image = layer_cache.materialize_image_hard
+
+    def inconsistent_materializer(*args, **kwargs):
+        if fault == "missing_callbacks":
+            kwargs.pop("on_layer")
+        receipt = materialize_image(*args, **kwargs)
+        if fault == "different_results":
+            return replace(
+                receipt, results=(replace(receipt.results[0], cache_result="warm_hit"), *receipt.results[1:])
+            )
+        return receipt
+
+    monkeypatch.setattr(layer_cache, "materialize_image_hard", inconsistent_materializer)
+    with pytest.raises(LayerCacheError, match="contradict the committed layer sequence"):
+        cache.materialize(root, packer_path=packer)
+
+    assert events == [("materialize", 0), ("materialize", 1)]
+    assert produced == [0, 1]
+    retained = LayerCache(cache.root).inspect(root)
+    assert len(retained["derived"]) == (0 if fault == "missing_callbacks" else 2)

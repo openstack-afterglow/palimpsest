@@ -520,13 +520,22 @@ def list_retained_instances(roots: state.StatePaths) -> list[dict[str, Any]]:
         ]
 
 
+def _artifact_reference_projection(roots: state.StatePaths) -> dict[str, list[str]]:
+    result: dict[str, list[str]] = {}
+    for rec in _records(roots):
+        for digest in _references(rec["topology"]):
+            result.setdefault(digest, []).append(f"retained-instance:{rec['identity']} ({rec['name']})")
+    return result
+
+
+def observe_artifact_references(roots: state.StatePaths) -> dict[str, list[str]]:
+    """Read discovery references without creating locks or granting deletion authority."""
+    return _artifact_reference_projection(roots)
+
+
 def artifact_references(roots: state.StatePaths) -> dict[str, list[str]]:
     with _lock(roots):
-        result: dict[str, list[str]] = {}
-        for rec in _records(roots):
-            for digest in _references(rec["topology"]):
-                result.setdefault(digest, []).append(f"retained-instance:{rec['identity']} ({rec['name']})")
-        return result
+        return _artifact_reference_projection(roots)
 
 
 def _references_archive(value: Any, directory: Path) -> bool:

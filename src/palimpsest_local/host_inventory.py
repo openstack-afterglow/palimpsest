@@ -309,7 +309,8 @@ def _observe_lima() -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[di
         backend = native_backend.value if native_backend is not None else "lima-qemu"
         instance_backend = backend
         run_id = _safe_instance_run_id(instance)
-        runtime_kind = "cloud-image" if run_id is not None else "external"
+        oci_runtime_kind = host_vm_control.lima_oci_runtime_kind(instance)
+        runtime_kind = oci_runtime_kind or ("cloud-image" if run_id is not None else "external")
         status = _safe_instance_status(instance)
 
         mem_raw = instance.get("memory") if instance.get("memory") is not None else config.get("memory")
@@ -371,7 +372,7 @@ def _observe_lima() -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[di
             "id": f"host:{instance_backend}:{name}",
             "name": name,
             "run_id": run_id,
-            "removal_identity": host_vm_control.lima_removal_identity(instance),
+            "removal_identity": (host_vm_control.lima_removal_identity(instance) if oci_runtime_kind is None else None),
             "backend": instance_backend,
             "runtime_kind": runtime_kind,
             "status": status,

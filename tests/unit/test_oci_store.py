@@ -97,7 +97,7 @@ from palimpsest_local.oci_root_volume import (
     oci_root_volume_label,
     release_oci_root_volume,
 )
-from palimpsest_local.oci_source import SourceCAS, SourceSnapshot
+from palimpsest_local.oci_source import SnapshottedOCIArchive, SourceCAS, SourceSnapshot
 from palimpsest_local.oci_stage1 import OCIStage1Plan
 from palimpsest_local.oci_store import (
     ArtifactLeaseOwner,
@@ -106,6 +106,7 @@ from palimpsest_local.oci_store import (
     MaterializationResult,
     OCIStore,
     OCIStoreError,
+    parent_chain_digest,
 )
 from palimpsest_local.runtime_types import (
     DispatchKey,
@@ -181,9 +182,10 @@ def _toolchain_capability() -> VerifiedSquashFSToolchain:
     return VerifiedSquashFSToolchain(_toolchain(), Path("/test/mksquashfs"), ())
 
 
-def _key(occurrence: DerivedLayerOccurrence) -> DerivedSquashFSKey:
+def _key(occurrence: DerivedLayerOccurrence, *, parent_digest: str = _digest("0")) -> DerivedSquashFSKey:
     return DerivedSquashFSKey.for_occurrence(
         occurrence,
+        parent_chain_digest=parent_digest,
         intake_policy_id=LAYER_INTAKE_POLICY_ID,
         intake_policy_fingerprint=DEFAULT_LAYER_CONVERSION_LIMITS.fingerprint,
         pack_policy_id=SQUASHFS_PACK_POLICY_ID,
@@ -208,6 +210,44 @@ def test_literal_backslash_intake_policy_has_a_distinct_cache_recipe() -> None:
     assert current.intake_policy_id == "palimpsest.oci-layer-intake.v2"
     assert current.digest != old.digest
     assert DerivedSquashFSKey.from_dict(old.to_dict()) == old
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"domain": "palimpsest.oci-derived-recipe.v99"},
+        {"domain": "palimpsest.oci-derived-recipe.v1"},
+        {"parent_chain_digest": None},
+        {"parent_chain_digest": True},
+        {"parent_chain_digest": "invalid"},
+        {"unexpected": "value"},
+    ],
+)
+def test_contextual_recipe_parser_rejects_invalid_versioned_fields(mutation) -> None:
+    wire = _key(_occurrence()).to_dict()
+    wire.update(mutation)
+    with pytest.raises(OCIStoreError):
+        DerivedSquashFSKey.from_dict(wire)
+
+
+def test_contextual_recipe_requires_prefix_and_legacy_parser_remains_read_only() -> None:
+    current = _key(_occurrence())
+    wire = current.to_dict()
+    wire["domain"] = "palimpsest.oci-derived-recipe.v1"
+    del wire["parent_chain_digest"]
+    legacy = DerivedSquashFSKey.from_dict(wire)
+    assert legacy.to_dict() == wire
+    assert legacy.parent_chain_digest is None
+    assert legacy.digest != current.digest
+    with pytest.raises(TypeError, match="parent_chain_digest"):
+        DerivedSquashFSKey.for_occurrence(
+            _occurrence(),
+            intake_policy_id=current.intake_policy_id,
+            intake_policy_fingerprint=current.intake_policy_fingerprint,
+            pack_policy_id=current.pack_policy_id,
+            pack_policy_fingerprint=current.pack_policy_fingerprint,
+            toolchain=_toolchain_capability(),
+        )
 
 
 def _receipts(occurrence: DerivedLayerOccurrence, image: bytes) -> tuple[LayerIntakeReceipt, PackedSquashFSReceipt]:
@@ -259,6 +299,50 @@ def _producer(occurrence: DerivedLayerOccurrence, calls: list[int], image: bytes
                 raise failure
 
     return produce
+
+
+def test_historical_recipe_record_and_lease_remain_readable_but_cannot_materialize(tmp_path: Path) -> None:
+    roots, store = _store(tmp_path)
+    occurrence = _occurrence()
+    current = _key(occurrence)
+    image = _squashfs()
+    produced = store.materialize(occurrence, current, _producer(occurrence, [], image))
+    record_path = roots.oci_derived_store / "records" / produced.record_digest.removeprefix("sha256:")
+    legacy_record = json.loads(record_path.read_bytes())
+    legacy_wire = current.to_dict()
+    legacy_wire["domain"] = "palimpsest.oci-derived-recipe.v1"
+    legacy_wire["normalization_contract_id"] = "palimpsest.oci-changeset-normalization.v2"
+    del legacy_wire["parent_chain_digest"]
+    legacy = DerivedSquashFSKey.from_dict(legacy_wire)
+    legacy_record["key"] = legacy.to_dict()
+    legacy_record["key_digest"] = legacy.digest
+    payload = canonical_json_bytes(legacy_record)
+    record_digest = f"sha256:{hashlib.sha256(payload).hexdigest()}"
+    # Install an immutable historical fixture, without a legacy writer path.
+    path = roots.oci_derived_store / "records" / record_digest.removeprefix("sha256:")
+    path.write_bytes(payload)
+    path.chmod(0o400)
+    index = roots.oci_derived_store / "keys" / legacy.digest.removeprefix("sha256:")
+    index.write_bytes(
+        canonical_json_bytes(
+            {"key_digest": legacy.digest, "record_digest": record_digest, "schema": legacy_wire["domain"]}
+        )
+    )
+    index.chmod(0o400)
+    with store._authority() as authority:
+        record, digest = store._record_from_index(authority, legacy)
+        receipt = store._occurrence_receipt(authority, occurrence, legacy, record, digest)
+    owner = ArtifactLeaseOwner(str(uuid.uuid4()), "historical", "root-layer")
+    with store.acquire_lease(receipt, owner) as lease:
+        assert b"".join(lease.chunks()) == image
+    calls: list[int] = []
+    with pytest.raises(OCIStoreError, match="read-only"):
+        store.materialize_observed(occurrence, legacy, _producer(occurrence, calls, image))
+    assert calls == []
+    new_prefix = _key(occurrence, parent_digest=_digest("1"))
+    result = store.materialize_observed(occurrence, new_prefix, _producer(occurrence, calls, image))
+    assert result.cache_result == "cold_miss"
+    assert calls == [0]
 
 
 def _process_materialize(
@@ -420,7 +504,7 @@ def test_warm_canonical_receipt_tamper_is_rebuilt_and_repaired(tmp_path: Path) -
         {
             "key_digest": key.digest,
             "record_digest": tampered_digest,
-            "schema": "palimpsest.oci-derived-recipe.v1",
+            "schema": key.to_dict()["domain"],
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -1260,7 +1344,7 @@ def test_dangling_canonical_recipe_index_is_repaired(tmp_path: Path) -> None:
     dangling = {
         "key_digest": key.digest,
         "record_digest": _digest("9"),
-        "schema": "palimpsest.oci-derived-recipe.v1",
+        "schema": key.to_dict()["domain"],
     }
     os.chmod(index, 0o600)
     index.write_bytes(json.dumps(dangling, sort_keys=True, separators=(",", ":")).encode())
@@ -1527,6 +1611,324 @@ def _image_materialization(store: OCIStore) -> OCIImageMaterializationReceipt:
         ),
         results=tuple(MaterializationResult(receipt, "warm_hit") for receipt in receipts),
     )
+
+
+def _acquired_store_graph(
+    tmp_path: Path,
+    *,
+    architecture: str = "arm64",
+    payloads: tuple[bytes, ...] = (b"original base bytes", b"original top bytes"),
+    layer_order: tuple[int, ...] = (0, 1, 0),
+    process_config: dict | None = None,
+):
+    from test_oci_source import Layout
+
+    roots, store = _store(tmp_path)
+    layout = Layout(tmp_path / "layout")
+    distinct = tuple(layout.add(payload, OCI_LAYER_MEDIA_TYPE) for payload in payloads)
+    layers = tuple(distinct[index] for index in layer_order)
+    diff_ids = tuple("sha256:" + hashlib.sha256(payload).hexdigest() for payload in payloads)
+    config = layout.add(
+        {
+            "architecture": architecture,
+            "os": "linux",
+            "config": process_config if process_config is not None else {"Cmd": ["/sbin/init"]},
+            "rootfs": {"type": "layers", "diff_ids": [diff_ids[index] for index in layer_order]},
+        },
+        OCI_IMAGE_CONFIG_MEDIA_TYPE,
+    )
+    manifest = layout.add(
+        {
+            "schemaVersion": 2,
+            "mediaType": OCI_IMAGE_MANIFEST_MEDIA_TYPE,
+            "config": config.to_dict(),
+            "layers": [layer.to_dict() for layer in layers],
+        },
+        OCI_IMAGE_MANIFEST_MEDIA_TYPE,
+    )
+    layout.top(manifest)
+    cas = SourceCAS(roots.oci_source_cas)
+    source = layout.source(manifest)
+    snapshot = source.snapshot_acquisition(None, cas, platform=f"linux/{architecture}")
+    return roots, store, cas, source, snapshot
+
+
+def test_parent_prefix_controls_cache_without_binding_config_or_future_layers(tmp_path: Path) -> None:
+    cases = (
+        ("original", (b"base", b"leaf", b"future"), {"Cmd": ["/one"]}),
+        ("parent", (b"changed base", b"leaf", b"future"), {"Cmd": ["/one"]}),
+        ("future", (b"base", b"leaf", b"changed future"), {"Cmd": ["/two"]}),
+    )
+    snapshots = [
+        _acquired_store_graph(tmp_path / name, payloads=payloads, layer_order=(0, 1, 2), process_config=config)[-1]
+        for name, payloads, config in cases
+    ]
+    _roots, store = _store(tmp_path / "consumer")
+    calls: list[int] = []
+    results = []
+    for snapshot in snapshots:
+        occurrence = DerivedLayerOccurrence.from_image(snapshot, 1)
+        key = _key(occurrence, parent_digest=parent_chain_digest(snapshot, 1))
+        results.append(store.materialize_observed(occurrence, key, _producer(occurrence, calls, _squashfs())))
+
+    assert len({snapshot.image.digest for snapshot in snapshots}) == 3
+    assert len({snapshot.binding_digest for snapshot in snapshots}) == 3
+    assert len({snapshot.image.layers[1].compressed for snapshot in snapshots}) == 1
+    assert [result.cache_result for result in results] == ["cold_miss", "cold_miss", "warm_hit"]
+    assert results[0].receipt.key_digest != results[1].receipt.key_digest
+    assert results[0].receipt.record_digest == results[2].receipt.record_digest
+    assert calls == [1, 1]
+    assert len({parent_chain_digest(snapshot, 0) for snapshot in snapshots}) == 1
+
+
+def test_parent_prefix_preserves_descriptor_order(tmp_path: Path) -> None:
+    snapshots = [
+        _acquired_store_graph(
+            tmp_path / str(index),
+            payloads=(b"first", b"second", b"leaf"),
+            layer_order=order,
+        )[-1]
+        for index, order in enumerate(((0, 1, 2), (1, 0, 2)))
+    ]
+    _roots, store = _store(tmp_path / "consumer")
+    results = []
+    calls: list[int] = []
+    for snapshot in snapshots:
+        occurrence = DerivedLayerOccurrence.from_image(snapshot, 2)
+        key = _key(occurrence, parent_digest=parent_chain_digest(snapshot, 2))
+        results.append(store.materialize_observed(occurrence, key, _producer(occurrence, calls, _squashfs())))
+
+    assert [result.cache_result for result in results] == ["cold_miss", "cold_miss"]
+    assert results[0].receipt.key_digest != results[1].receipt.key_digest
+    assert calls == [2, 2]
+
+
+@pytest.mark.parametrize("ordinal", [-1, 3, True, 0.0, "0", None])
+def test_parent_prefix_rejects_invalid_ordinal(tmp_path: Path, ordinal) -> None:
+    snapshot = _acquired_store_graph(tmp_path)[-1]
+    with pytest.raises(OCIStoreError):
+        parent_chain_digest(snapshot, ordinal)
+
+
+def _acquired_materialization(store: OCIStore, snapshot: SnapshottedOCIArchive):
+    occurrences = tuple(DerivedLayerOccurrence.from_image(snapshot, ordinal) for ordinal in range(len(snapshot.layers)))
+    calls: list[int] = []
+    # Synthetic filesystem bytes exercise contextual recipe separation and
+    # physical-byte deduplication, not the hard worker or native execution.
+    image = _squashfs()
+    results = tuple(
+        store.materialize_observed(
+            occurrence,
+            _key(occurrence, parent_digest=parent_chain_digest(snapshot, occurrence.ordinal)),
+            _producer(occurrence, calls, image),
+        )
+        for occurrence in occurrences
+    )
+    materialization = OCIImageMaterializationReceipt(
+        source_snapshot_binding_digest=snapshot.binding_digest,
+        source_image_digest=snapshot.image.digest,
+        root_descriptor=snapshot.root.descriptor,
+        manifest_digest=snapshot.manifest.descriptor.digest,
+        config_descriptor=snapshot.config.descriptor,
+        platform_os=snapshot.image.platform.os,
+        platform_architecture=snapshot.image.platform.architecture,
+        layer_descriptors=tuple(layer.compressed for layer in snapshot.image.layers),
+        layer_diff_ids=tuple(layer.diff_id for layer in snapshot.image.layers),
+        process=snapshot.image.config.process,
+        results=results,
+    )
+    return occurrences, materialization, calls
+
+
+@pytest.mark.parametrize("architecture", ["amd64", "arm64"])
+def test_acquisition_occurrences_preserve_original_order_repeats_and_physical_dedupe(
+    tmp_path: Path, architecture
+) -> None:
+    roots, store, cas, source, snapshot = _acquired_store_graph(tmp_path, architecture=architecture)
+    occurrences, materialization, calls = _acquired_materialization(store, snapshot)
+    receipts = tuple(result.receipt for result in materialization.results)
+
+    assert isinstance(snapshot, SnapshottedOCIArchive)
+    assert [occurrence.ordinal for occurrence in occurrences] == [0, 1, 2]
+    for ordinal, occurrence in enumerate(occurrences):
+        layer = snapshot.image.layers[ordinal]
+        assert occurrence.to_dict() == {
+            "compressed_digest": layer.compressed.digest,
+            "compressed_size": layer.compressed.size,
+            "diff_id": layer.diff_id,
+            "media_type": layer.compressed.media_type,
+            "ordinal": ordinal,
+            "source_image_digest": snapshot.image.digest,
+            "source_snapshot_binding_digest": snapshot.binding_digest,
+        }
+        assert DerivedLayerOccurrence.from_dict(occurrence.to_dict()) == occurrence
+    assert occurrences[0] != occurrences[2]
+    assert occurrences[0].source_recipe() == occurrences[2].source_recipe()
+    assert parent_chain_digest(snapshot, 0) != parent_chain_digest(snapshot, 2)
+    assert receipts[0].key_digest != receipts[2].key_digest
+    assert calls == [0, 1, 2]
+    assert [result.cache_result for result in materialization.results] == ["cold_miss", "cold_miss", "cold_miss"]
+    assert receipts[0].record_digest != receipts[2].record_digest
+    assert len({receipt.occurrence_digest for receipt in receipts}) == 3
+    assert len({receipt.image_digest for receipt in receipts}) == 1
+    assert len(list((roots.oci_source_cas / "blobs" / "sha256").iterdir())) == 4
+    assert len(list((roots.store / "blobs" / "sha256").glob("[0-9a-f]" * 64))) == 1
+    assert materialization.layer_descriptors == tuple(layer.descriptor for layer in snapshot.layers)
+    assert materialization.layer_diff_ids == tuple(occurrence.diff_id for occurrence in occurrences)
+    assert materialization.to_dict()["schema"] == "palimpsest.oci-image-materialization.v2"
+    store.validate_receipt_occurrences(receipts, occurrences)
+    if architecture == "amd64":
+        native = source.snapshot(None, cas)
+        assert native.to_dict() == snapshot.to_dict()
+        assert tuple(DerivedLayerOccurrence.from_image(native, ordinal) for ordinal in range(3)) == occurrences
+
+
+@pytest.mark.parametrize("ordinal", [-1, 3, True, 0.0, "0", None])
+def test_acquisition_occurrence_rejects_invalid_ordinal(tmp_path: Path, ordinal) -> None:
+    _roots, _store_value, _cas, _source, snapshot = _acquired_store_graph(tmp_path)
+    with pytest.raises(OCIStoreError, match="ordinal|occurrence"):
+        DerivedLayerOccurrence.from_image(snapshot, ordinal)
+
+
+def test_acquisition_occurrence_rejects_forged_types_and_snapshot_graphs(tmp_path: Path) -> None:
+    _roots, _store_value, _cas, _source, snapshot = _acquired_store_graph(tmp_path)
+    for forged in (
+        snapshot.image,
+        snapshot.to_dict(),
+        SimpleNamespace(image=snapshot.image, binding_digest=snapshot.binding_digest),
+    ):
+        with pytest.raises(OCIStoreError, match="snapshotted image occurrence is invalid"):
+            DerivedLayerOccurrence.from_image(forged, 0)
+    with pytest.raises(ArtifactValidationError, match="occurrence order"):
+        replace(snapshot, layers=(snapshot.layers[1], snapshot.layers[0], snapshot.layers[2]))
+    foreign_cas = SourceCAS(tmp_path / "foreign-source")
+    with pytest.raises(ArtifactValidationError, match="one source CAS"):
+        replace(
+            snapshot,
+            layers=(SourceSnapshot(snapshot.layers[0].descriptor, foreign_cas.identity), *snapshot.layers[1:]),
+        )
+
+
+def test_arm_receipts_reject_swapped_graphs_and_foreign_stores_without_leases(tmp_path: Path) -> None:
+    roots, store, _cas, _source, snapshot = _acquired_store_graph(tmp_path)
+    occurrences, materialization, _calls = _acquired_materialization(store, snapshot)
+    receipts = tuple(result.receipt for result in materialization.results)
+    with pytest.raises(OCIStoreError, match="out of order"):
+        store.validate_receipt_occurrences((receipts[1], receipts[0], receipts[2]), occurrences)
+    swapped_sources = (
+        replace(occurrences[1], ordinal=0),
+        replace(occurrences[0], ordinal=1),
+        occurrences[2],
+    )
+    with pytest.raises(OCIStoreError, match="occurrence binding is invalid"):
+        store.validate_receipt_occurrences(receipts, swapped_sources)
+    _other_roots, other_store = _store(tmp_path / "other-store")
+    with pytest.raises(OCIStoreError):
+        other_store.validate_receipt_occurrences(receipts, occurrences)
+    with pytest.raises(ArtifactValidationError, match="materialization order is invalid"):
+        replace(
+            materialization,
+            results=(materialization.results[1], materialization.results[0], materialization.results[2]),
+        )
+    foreign_receipt = replace(receipts[0], store_id=other_store.identity)
+    with pytest.raises(ArtifactValidationError, match="store binding is inconsistent"):
+        replace(
+            materialization,
+            results=(MaterializationResult(foreign_receipt, "warm_hit"), *materialization.results[1:]),
+        )
+    foreign_cas = SourceCAS(tmp_path / "foreign-source")
+    foreign_snapshot = replace(
+        snapshot,
+        root=SourceSnapshot(snapshot.root.descriptor, foreign_cas.identity),
+        manifest=SourceSnapshot(snapshot.manifest.descriptor, foreign_cas.identity),
+        config=SourceSnapshot(snapshot.config.descriptor, foreign_cas.identity),
+        layers=tuple(SourceSnapshot(layer.descriptor, foreign_cas.identity) for layer in snapshot.layers),
+    )
+    foreign_occurrences = tuple(DerivedLayerOccurrence.from_image(foreign_snapshot, ordinal) for ordinal in range(3))
+    with pytest.raises(OCIStoreError, match="occurrence binding is invalid"):
+        store.validate_receipt_occurrences(receipts, foreign_occurrences)
+    assert list((roots.oci_derived_store / "leases").iterdir()) == []
+    assert list((roots.oci_derived_store / "lease-sets").iterdir()) == []
+
+
+@pytest.mark.parametrize("empty_process", [False, True])
+@pytest.mark.parametrize("command_override", [None, ("/override",)])
+def test_arm_materialization_cannot_enter_legacy_boot_plan(
+    tmp_path: Path, monkeypatch, empty_process, command_override
+) -> None:
+    roots, store, _cas, _source, snapshot = _acquired_store_graph(tmp_path)
+    _occurrences, materialization, _calls = _acquired_materialization(store, snapshot)
+    if empty_process:
+        materialization = replace(materialization, process=OCIProcessSpec.empty())
+
+    def no_effect(*args, **kwargs):
+        pytest.fail("ARM materialization crossed the legacy boot-plan platform gate")
+
+    monkeypatch.setattr(store, "validate_receipt_occurrences", no_effect)
+    monkeypatch.setattr(store, "acquire_lease_set", no_effect)
+    run_id = str(uuid.uuid4())
+    with pytest.raises(OCIStoreError, match="require exactly linux/amd64"):
+        OCIBootPlanIntent(run_id, "arm-plan", materialization, command_override=command_override)
+    with pytest.raises(OCIStoreError, match="require exactly linux/amd64"):
+        prepare_oci_boot_plan(
+            materialization, run_id=run_id, run_name="arm-plan", store=store, command_override=command_override
+        )
+    assert list((roots.oci_derived_store / "leases").iterdir()) == []
+    assert list((roots.oci_derived_store / "lease-sets").iterdir()) == []
+
+
+@pytest.mark.parametrize("retained", [False, True])
+def test_arm_root_preparation_stops_before_ledger_leases_volume_or_commands(
+    tmp_path: Path, monkeypatch, retained
+) -> None:
+    roots, store, _cas, _source, snapshot = _acquired_store_graph(tmp_path)
+    _occurrences, materialization, _calls = _acquired_materialization(store, snapshot)
+
+    def no_effect(*args, **kwargs):
+        pytest.fail("ARM materialization crossed the legacy root-preparation platform gate")
+
+    monkeypatch.setattr(store, "validate_receipt_occurrences", no_effect)
+    monkeypatch.setattr(store, "acquire_lease_set", no_effect)
+    for name in ("new_oci_root_volume_id", "load_oci_root_volume", "claim_oci_root_volume"):
+        monkeypatch.setattr(oci_root_prepare_module, name, no_effect)
+    with reserve_new_run(roots, "arm-root", _oci_dispatch()) as reservation:
+        before = {path.relative_to(roots.state): path.read_bytes() for path in roots.state.rglob("*") if path.is_file()}
+        with pytest.raises(OCIStoreError, match="require exactly linux/amd64"):
+            prepare_oci_root_run(
+                reservation,
+                materialization,
+                store,
+                root_volume_size_bytes=_ROOT_VOLUME_SIZE,
+                retained_volume_id=str(uuid.uuid4()) if retained else None,
+                retention_policy="retain" if retained else "delete",
+                runner=no_effect,
+            )
+        after = {path.relative_to(roots.state): path.read_bytes() for path in roots.state.rglob("*") if path.is_file()}
+        assert after == before
+
+
+def test_legacy_root_transaction_rejects_arm_platform_even_with_consistent_hashes(tmp_path: Path) -> None:
+    _roots, store = _store(tmp_path)
+    intent = OCIBootPlanIntent(str(uuid.uuid4()), "legacy", _image_materialization(store))
+    plan = intent.to_dict()
+    plan["platform"] = {"os": "linux", "architecture": "arm64"}
+    graph = intent.lower_graph_dict()
+    graph["platform"] = plan["platform"]
+    graph_digest = "sha256:" + hashlib.sha256(canonical_json_bytes(graph)).hexdigest()
+    plan["lower_graph_digest"] = graph_digest
+    plan_digest = "sha256:" + hashlib.sha256(canonical_json_bytes(plan)).hexdigest()
+    with pytest.raises(StateError, match="requires exactly linux/amd64"):
+        OCIRootPreparationTransaction(
+            "resources-planned",
+            plan,
+            plan_digest,
+            _digest("a"),
+            str(uuid.uuid4()),
+            _ROOT_VOLUME_SIZE,
+            graph_digest,
+            "delete",
+            "delete",
+        )
 
 
 def test_boot_plan_is_path_free_ordered_and_recoverable(tmp_path: Path) -> None:

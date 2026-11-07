@@ -20,6 +20,7 @@ from typing import Any
 from . import (
     host_inventory,
     host_vm_control,
+    local_catalog,
     named_volumes,
     oci_network_status,
     oci_root_volume_inventory,
@@ -33,16 +34,22 @@ from . import (
 from .artifact_compatibility import ARCHITECTURES, artifact_arch, canonical_arch, check_artifact
 from .artifact_store import ArtifactStore, ArtifactStoreError
 from .digest import digest_file, require_digest
-from .errors import ArtifactValidationError, InvalidDigestError, StateError
+from .errors import ArtifactValidationError, InvalidDigestError, RuntimeBusyError, StateError
 from .hub import KIND_CLOUD_IMAGE, MEDIA_TYPE_LAYER_SQUASHFS
+from .oci_image import OCIImageRef, resolve_archive_image, resolve_image
 from .oci_layout import DISK_FORMAT_MEDIA_TYPES, ContentStore
-from .oci_store import OCIStore, OCIStoreError
+from .oci_materializer import OCIImageMaterializationReceipt
+from .oci_provenance import Descriptor, canonical_json_bytes
+from .oci_source import SnapshottedOCIArchive, SnapshottedOCIImage, SourceCAS, SourceSnapshot
+from .oci_store import DerivedLayerOccurrence, OCIStore, OCIStoreError
+from .package_reference import package_reference_path, read_package_reference
 from .remote_artifacts import HubConnection, RemoteArtifacts
 from .run_source import list_retained_oci_sources
 from .runtime_types import (
     ExpectedRunIdentity,
     LifecycleResult,
     ProcessCapabilityError,
+    RuntimeBackend,
     RuntimeCapabilityError,
     RuntimeKind,
 )
@@ -449,10 +456,96 @@ def _json_projection(value: Any) -> Any:
     return value
 
 
-def list_vms(roots: StatePaths, *, live: bool = True) -> dict[str, Any]:
+def _native_home_identity(snapshot: state.RunLedgerSnapshot) -> tuple[int, int] | None:
+    """Classify a fresh native snapshot's pinned namespace, not alias eligibility."""
+    if (
+        snapshot.record.dispatch_key.backend is not RuntimeBackend.LIMA_VZ
+        or snapshot.record.dispatch_key.runtime_kind is not RuntimeKind.OCI_ROOT
+    ):
+        return None
+    try:
+        runtime_dispatch._native_vz_plan(snapshot)
+        native = snapshot.state.get("vz_native")
+        if not isinstance(native, Mapping) or native.get("schema") != "palimpsest.vz-native-run.v1":
+            return None
+        pinned = native.get("host_authority")
+        identity = pinned.get("home_identity") if isinstance(pinned, Mapping) else None
+        if (
+            isinstance(identity, (tuple, list))
+            and len(identity) == 2
+            and all(type(value) is int and value >= 0 for value in identity)
+            and identity[1] > 0
+        ):
+            return tuple(identity)
+    except (StateError, KeyError, TypeError, ValueError):
+        pass
+    return None
+
+
+def _native_vm_alias(snapshot: state.RunLedgerSnapshot) -> tuple[str, tuple[int, int]] | None:
+    """Project a private alias from the same validated reconciliation snapshot."""
+    if (
+        snapshot.record.dispatch_key.backend is not RuntimeBackend.LIMA_VZ
+        or snapshot.record.dispatch_key.runtime_kind is not RuntimeKind.OCI_ROOT
+        or snapshot.state.get("status") not in {"running", "exited", "stopped"}
+    ):
+        return None
+    try:
+        if runtime_dispatch._native_vz_plan(snapshot) is None:
+            return None
+        observed = snapshot.state.get("vz_status")
+        main = observed.get("main") if isinstance(observed, Mapping) else None
+        if not isinstance(main, Mapping) or main.get("state") not in {"running", "exited", "absent", "not-started"}:
+            return None
+        native = snapshot.state["vz_native"]
+        home_identity = _native_home_identity(snapshot)
+        if home_identity is None:
+            return None
+        alias = "plm-" + snapshot.record.run_id.replace("-", "")[:12]
+        if native.get("instance") == alias and native.get("hold") is None:
+            return alias, home_identity
+    except (StateError, KeyError, TypeError, ValueError):
+        pass
+    return None
+
+
+def _lima_observation_namespace() -> tuple[int, int] | None:
+    """Match ambient observation to a pinned home without publishing its path."""
+    try:
+        home = os.path.realpath(os.environ.get("LIMA_HOME") or str(Path.home() / ".lima"))
+        info = os.stat(home, follow_symlinks=False)
+        if stat_module.S_ISDIR(info.st_mode):
+            return info.st_dev, info.st_ino
+    except (OSError, RuntimeError):
+        pass
+    return None
+
+
+def list_vms(
+    roots: StatePaths, *, live: bool = True, _observation_budget: state.RunObservationWaitBudget | None = None
+) -> dict[str, Any]:
     """Project selected runs and live host resources; ``live=False`` is ledger-only."""
     proj_index = _build_project_index(roots)
-    aggregation = runtime_dispatch.reconcile(roots=roots) if live else runtime_dispatch.ps(roots=roots)
+    native_bindings: dict[tuple[str, str, str], tuple[str, tuple[int, int]]] = {}
+    native_homes: dict[tuple[str, str, str], tuple[int, int]] = {}
+
+    def observe_snapshot(snapshot):
+        identity = (snapshot.record.name, snapshot.record.run_id, snapshot.state["status"])
+        home_identity = _native_home_identity(snapshot)
+        if home_identity is not None:
+            native_homes[identity] = home_identity
+        binding = _native_vm_alias(snapshot)
+        if binding is not None:
+            native_bindings[(snapshot.record.name, snapshot.record.run_id, snapshot.state["status"])] = binding
+
+    aggregation = (
+        runtime_dispatch.reconcile(
+            roots=roots, _snapshot_observer=observe_snapshot, _observation_budget=_observation_budget
+        )
+        if live
+        else runtime_dispatch.ps(roots=roots)
+    )
+    busy_names = {error.name for error in aggregation.errors if error.code == "runtime-busy"}
     warnings = [
         f"{error.entry_token}: {error.message}" if error.name is None else f"run '{error.name}': {error.message}"
         for error in aggregation.errors
@@ -478,6 +571,7 @@ def list_vms(roots: StatePaths, *, live: bool = True) -> dict[str, Any]:
                 "runtime_kind": summary.runtime_kind.value,
                 "backend": summary.backend.value,
                 "status": summary.status,
+                "runtime_status": summary.status,
                 "stale": summary.stale,
                 "base_digest": details["base_digest"],
                 "base_arch": details["base_arch"],
@@ -496,19 +590,69 @@ def list_vms(roots: StatePaths, *, live: bool = True) -> dict[str, Any]:
             }
         )
 
+    native_namespaces: dict[int, tuple[int, int]] = {}
+    observed_namespace = None
+
+    def foreign_native_observation(canonical, host):
+        return (
+            id(canonical) in native_namespaces
+            and host.get("source") == "host-backend"
+            and host["backend"] in platforms.LIMA_BACKENDS
+            and native_namespaces[id(canonical)] != observed_namespace
+        )
+
     if live:
+        native_aliases = {}
+        for vm in vms:
+            if vm["runtime_kind"] == "oci-root" and vm["backend"] == "lima-vz":
+                # Fresh native reconciliation already used the pinned provider/home.
+                # Ambient Lima discovery is supplementary, not its liveness authority.
+                if vm["runtime_status"] in {"running", "exited", "stopped"}:
+                    vm["status"] = "unknown"
+                identity = (vm["name"], vm["run_id"], vm["runtime_status"])
+                if vm["managed"] and not vm["stale"]:
+                    namespace = native_homes.get(identity)
+                    if namespace is not None:
+                        native_namespaces[id(vm)] = namespace
+                    binding = native_bindings.get(identity)
+                else:
+                    binding = None
+                if binding is not None:
+                    alias, _namespace = binding
+                    vm["status"] = "stopped" if vm["runtime_status"] == "stopped" else "running"
+                    native_aliases[(vm["backend"], alias, vm["run_id"])] = vm
         observed = host_inventory.observe()
+        observed_namespace = _lima_observation_namespace()
         warnings.extend(observed["warnings"])
         selected = {(vm["backend"], vm["name"], vm["run_id"]): vm for vm in vms}
         for host_vm in observed["vms"]:
             identity = (host_vm["backend"], host_vm["name"], host_vm.get("run_id"))
+            native_owned = native_aliases.get(identity)
+            if native_owned is not None and (
+                host_vm.get("runtime_kind") != "oci-root"
+                or host_vm.get("stale") is not False
+                or host_vm.get("source") != "host-backend"
+                or host_vm.get("managed") is not False
+                or native_namespaces[id(native_owned)] != observed_namespace
+            ):
+                native_owned = None
             owned = selected.get(identity) if identity[2] else None
+            if owned is not None and owned["runtime_kind"] == "oci-root" and owned["backend"] == "lima-vz":
+                owned = None
+            owned = native_owned or owned
             if owned is not None and owned["status"] != "removed":
-                # Libvirt domain enumeration cannot recover Palimpsest's published endpoints.
+                # Native OCI transport, endpoints and workload truth stay runtime-owned.
                 fields = ("status", "memory_mib", "vcpus")
-                if host_vm["backend"] in platforms.LIMA_BACKENDS:
+                if native_owned is None and host_vm["backend"] in platforms.LIMA_BACKENDS:
                     fields += ("ssh", "guest_ip", "ports")
                 for field in fields:
+                    # Ambient discovery may revoke liveness, never upgrade a pinned stop.
+                    if (
+                        field == "status"
+                        and native_owned is not None
+                        and (host_vm.get(field) == "running" and owned["status"] != "running")
+                    ):
+                        continue
                     if host_vm.get(field) is not None:
                         owned[field] = host_vm[field]
                 owned["source"] = "run-ledger+host-backend"
@@ -517,7 +661,7 @@ def list_vms(roots: StatePaths, *, live: bool = True) -> dict[str, Any]:
                     same_namespace = vm["backend"] == host_vm["backend"] or (
                         vm["backend"] in platforms.LIMA_BACKENDS and host_vm["backend"] in platforms.LIMA_BACKENDS
                     )
-                    if same_namespace and vm["name"] == host_vm["name"]:
+                    if same_namespace and vm["name"] == host_vm["name"] and not foreign_native_observation(vm, host_vm):
                         vm["managed"] = False
                         vm["stale"] = True
                 vms.append(host_vm)
@@ -527,13 +671,19 @@ def list_vms(roots: StatePaths, *, live: bool = True) -> dict[str, Any]:
         collision = any(
             other is not vm
             and other["name"] == vm["name"]
+            and not foreign_native_observation(vm, other)
             and (
                 other["backend"] == vm["backend"]
                 or (other["backend"] in platforms.LIMA_BACKENDS and vm["backend"] in platforms.LIMA_BACKENDS)
             )
             for other in vms
         )
-        vm["access"] = vm_access.capabilities(vm, live=live, collision=collision)
+        vm["access"] = vm_access.capabilities(
+            vm,
+            live=live,
+            collision=collision,
+            busy=vm["source"] in {"run-ledger", "run-ledger+host-backend"} and vm["name"] in busy_names,
+        )
         if vm.get("managed") is False and vm.get("source") == "host-backend":
             # Same-backend stale ledgers do not prevent identity-bound host removal.
             # Cross-Lima replacement is a backend identity conflict in one native namespace.
@@ -573,11 +723,28 @@ def list_vms(roots: StatePaths, *, live: bool = True) -> dict[str, Any]:
     return {"vms": vms, "warnings": unique_warnings}
 
 
-def get_vm(roots: StatePaths, name: str) -> dict[str, Any]:
-    res = list_vms(roots)
+def get_vm(
+    roots: StatePaths, name: str, *, _observation_budget: state.RunObservationWaitBudget | None = None
+) -> dict[str, Any]:
+    res = list_vms(roots, _observation_budget=_observation_budget)
     matches = [vm for vm in res["vms"] if vm["id"] == name or vm["name"] == name]
     if len(matches) == 1:
         return matches[0]
+    if any(vm.get("access", {}).get("reason") == "busy" for vm in matches):
+        raise RuntimeBusyError("VM observation is busy")
+    # A same-named observation from another Lima home is not this canonical ID.
+    # Same-namespace collisions have already revoked managed access in list_vms.
+    exact_native = [
+        vm
+        for vm in matches
+        if vm["id"] == name
+        and vm.get("managed") is True
+        and not vm.get("stale")
+        and vm["backend"] == "lima-vz"
+        and vm["runtime_kind"] == "oci-root"
+    ]
+    if len(exact_native) == 1 and all(vm is exact_native[0] or vm.get("source") == "host-backend" for vm in matches):
+        return exact_native[0]
     if matches:
         raise StateError(f"VM '{name}' is ambiguous across backend ownership identities")
     raise StateError(f"VM '{name}' not found")
@@ -608,7 +775,7 @@ def _vm_lifecycle_capabilities(row: dict[str, Any], *, live: bool = True, collis
         and row.get("id") == f"host:{row.get('backend')}:{row.get('name')}"
         and isinstance(row.get("removal_identity"), str)
         and bool(row["removal_identity"])
-        and row.get("runtime_kind") != "oci-root"
+        and row.get("runtime_kind") in {"external", "cloud-image"}
         and row.get("status") in {"running", "stopped", "paused", "failed"}
     )
     can_remove = eligible or host_removal
@@ -644,6 +811,8 @@ def _selected_vm_identity(
     if not isinstance(expected_run_id, str) or not expected_run_id:
         raise StateError("expected_run_id must be the selected VM UUID")
     row = get_vm(roots, identifier)
+    if row.get("access", {}).get("reason") == "busy":
+        raise RuntimeBusyError("VM observation is busy; try again when the current operation completes")
     if identifier != row["id"] or row.get("managed") is not True:
         raise StateError("VM lifecycle is forbidden for unmanaged inventory identities")
     if row.get("run_id") != expected_run_id:
@@ -759,6 +928,8 @@ def vm_metrics(
         access = vm_access.Access.resolve(roots, identifier, expected_run_id=expected_run_id)
         access.exec_owners = exec_owners
         return vm_access.metrics(access)
+    except RuntimeBusyError:
+        reason, message = "busy", "VM observation is busy; try again when the current operation completes"
     except vm_access.VMAccessError as exc:
         reason, message = exc.category, str(exc)
     except (RuntimeCapabilityError, ProcessCapabilityError):
@@ -801,9 +972,11 @@ def vm_logs(
     if type(tail) is not int or not 1 <= tail <= 5000:
         raise StateError("VM log tail must be between 1 and 5000 lines")
     try:
-        access = vm_access.Access.resolve(roots, identifier, expected_run_id=expected_run_id)
+        access = vm_access.Access.resolve(roots, identifier, expected_run_id=expected_run_id, purpose="logs")
         access.exec_owners = exec_owners
         return {"status": "available", **access.logs(tail)}
+    except RuntimeBusyError:
+        reason, message = "busy", "VM observation is busy; try again when the current operation completes"
     except vm_access.VMAccessError as exc:
         reason, message = exc.category, str(exc)
     except (RuntimeCapabilityError, ProcessCapabilityError):
@@ -820,56 +993,78 @@ def vm_logs(
     }
 
 
-def list_artifacts(
-    roots: StatePaths, *, arch: str | None = None, compatible: bool = False, requested_backend: str = "auto"
-) -> dict[str, Any]:
-    if arch is not None and arch not in ARCHITECTURES:
-        raise StateError("arch must be x86_64 or aarch64")
-    if requested_backend not in ("auto", *platforms.BACKENDS):
-        raise StateError("unsupported compatibility backend")
-    proj_index = _build_project_index(roots)
-    referenced_by: dict[str, dict[str, set[str]]] = {}
-    retained_metadata_valid = True
+def _catalog_index_files(directory: Path, warnings: set[str], warning: str) -> list[Path]:
+    """Observe one owner-bound index namespace without following directory aliases."""
     try:
-        retained_refs = retained_instances.artifact_references(roots)
+        with pinned_owner_directory(directory, missing_ok=True) as directory_fd:
+            if directory_fd is None:
+                return []
+            result = []
+            for filename in sorted(os.listdir(directory_fd)):
+                try:
+                    info = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
+                except OSError:
+                    warnings.add(warning)
+                    continue
+                if (
+                    not filename.endswith(".json")
+                    or not stat_module.S_ISREG(info.st_mode)
+                    or info.st_uid != os.geteuid()
+                    or info.st_mode & 0o022
+                    or info.st_nlink != 1
+                ):
+                    warnings.add(warning)
+                    continue
+                result.append(directory / filename)
+            return result
+    except (OSError, StateError):
+        warnings.add(warning)
+        return []
+
+
+def _collect_artifacts(
+    roots: StatePaths,
+    *,
+    catalog: Any,
+    runs: list[dict[str, Any]],
+    builds: list[tuple[Path, dict[str, Any]]],
+    warnings: set[str],
+) -> dict[str, Any]:
+    proj_index = {run["name"]: run["project"] for run in runs if run.get("project")}
+    referenced_by: dict[str, dict[str, set[str]]] = {}
+    retained_metadata_valid = not {_RUN_WARNING, _PROJECT_WARNING}.intersection(warnings)
+    try:
+        retained_refs = retained_instances.observe_artifact_references(roots)
     except _METADATA_ERRORS:
         retained_metadata_valid = False
         retained_refs = {}
+        warnings.add("Some retained instance metadata is unavailable or inconsistent")
+    published_valid = True
+    try:
+        published_references = _published_artifact_references(catalog.read_pulled_images())
+    except local_catalog.CatalogError:
+        published_valid = False
+        published_references = {}
+        warnings.add("Local catalog metadata is unavailable or inconsistent")
 
-    if roots.runs.exists():
-        for run_dir in roots.runs.iterdir():
-            if not run_dir.is_dir():
-                continue
-            name = run_dir.name
-            state_file = run_dir / "state.json"
-            if not state_file.is_file():
-                continue
-            try:
-                st = read_json(state_file)
-                base_d = st.get("base", {}).get("digest") or st.get("base_digest")
-                if base_d:
-                    ref_entry = referenced_by.setdefault(base_d, {"runs": set(), "projects": set()})
-                    ref_entry["runs"].add(name)
-                    if name in proj_index:
-                        ref_entry["projects"].add(proj_index[name])
-                for layer in st.get("layers", []):
-                    layer_d = layer.get("digest") if isinstance(layer, dict) else str(layer)
-                    if layer_d:
-                        ref_entry = referenced_by.setdefault(layer_d, {"runs": set(), "projects": set()})
-                        ref_entry["runs"].add(name)
-                        if name in proj_index:
-                            ref_entry["projects"].add(proj_index[name])
-            except Exception:
-                pass
+    for run in runs:
+        digests = [run.get("base_digest"), *(layer.get("digest") for layer in run["layers"])]
+        for digest in digests:
+            if digest:
+                ref_entry = referenced_by.setdefault(digest, {"runs": set(), "projects": set()})
+                ref_entry["runs"].add(run["name"])
+                if run["name"] in proj_index:
+                    ref_entry["projects"].add(proj_index[run["name"]])
 
     tags_by_digest: dict[str, list[dict[str, Any]]] = {}
-    if roots.tags.exists():
-        for tag_file in roots.tags.glob("*.json"):
-            try:
-                tag_rec = read_tag_record(roots, tag_file.stem)
-                tags_by_digest.setdefault(tag_rec.digest, []).append(dataclasses.asdict(tag_rec))
-            except Exception:
-                pass
+    for tag_file in _catalog_index_files(
+        roots.tags, warnings, "Some artifact tag metadata is unavailable or inconsistent"
+    ):
+        try:
+            tag_rec = read_tag_record(roots, tag_file.stem)
+            tags_by_digest.setdefault(tag_rec.digest, []).append(dataclasses.asdict(tag_rec))
+        except (*_METADATA_ERRORS, ArtifactValidationError, InvalidDigestError):
+            warnings.add("Some artifact tag metadata is unavailable or inconsistent")
 
     store = ContentStore(roots.store)
     artifacts: list[dict[str, Any]] = []
@@ -877,12 +1072,28 @@ def list_artifacts(
     layers: list[dict[str, Any]] = []
     unknown: list[dict[str, Any]] = []
 
-    if (roots.store / "metadata").exists():
-        for meta_file in sorted((roots.store / "metadata").glob("*.json")):
+    metadata_files = _catalog_index_files(
+        roots.store / "metadata", warnings, "Some content-store metadata is unavailable or inconsistent"
+    )
+    if metadata_files:
+        for meta_file in metadata_files:
             digest = f"sha256:{meta_file.stem}"
             try:
                 meta = store.read_metadata(digest)
-            except Exception:
+                if meta.get("kind") is not None and (not isinstance(meta["kind"], str) or not meta["kind"]):
+                    raise StateError("invalid content-store artifact kind")
+                if meta.get("size") is not None and (type(meta["size"]) is not int or meta["size"] < 0):
+                    raise StateError("invalid content-store artifact size")
+                for field in ("base_digest", "base_image_digest", "parent_digest"):
+                    if meta.get(field) is not None:
+                        require_digest(meta[field])
+                if "parent_digests" in meta:
+                    if not isinstance(meta["parent_digests"], list):
+                        raise StateError("invalid content-store artifact parents")
+                    for parent in meta["parent_digests"]:
+                        require_digest(parent)
+            except (*_METADATA_ERRORS, ArtifactValidationError, InvalidDigestError):
+                warnings.add("Some content-store metadata is unavailable or inconsistent")
                 continue
 
             kind = meta.get("kind")
@@ -894,17 +1105,21 @@ def list_artifacts(
             runs_refs = sorted(referenced_by.get(digest, {}).get("runs", set()))
             projs_refs = sorted(referenced_by.get(digest, {}).get("projects", set()))
             vols_refs = sorted(retained_refs.get(digest, []))
+            published_refs = sorted(published_references.get(digest, set()))
             ref_dict: dict[str, list[str]] = {
                 "runs": runs_refs,
                 "projects": projs_refs,
             }
             if vols_refs:
                 ref_dict["volumes"] = vols_refs
-            is_referenced = bool(runs_refs or projs_refs or vols_refs)
+            if published_refs:
+                ref_dict["published"] = published_refs
+            is_referenced = bool(runs_refs or projs_refs or vols_refs or published_refs)
             blockers = {
                 "runs": runs_refs,
                 "projects": projs_refs,
                 "volumes": vols_refs,
+                "published": published_refs,
             }
 
             art_record = {
@@ -922,10 +1137,12 @@ def list_artifacts(
                     or meta.get("media_type") == MEDIA_TYPE_LAYER_SQUASHFS
                 ),
                 "referenced_by": ref_dict,
-                "delete_supported": retained_metadata_valid and not is_referenced,
+                "delete_supported": retained_metadata_valid and published_valid and not is_referenced,
                 "delete_reason": "보존된 인스턴스 메타데이터를 확인할 수 없어 삭제가 차단되었습니다."
                 if not retained_metadata_valid
-                else "실행 중이거나 보존된 볼륨/인스턴스가 참조 중인 레이어/이미지는 삭제할 수 없습니다."
+                else "로컬 카탈로그를 확인할 수 없어 삭제가 차단되었습니다."
+                if not published_valid
+                else "실행 중이거나 보존된 볼륨/인스턴스 또는 pull한 게시 이미지가 참조 중인 레이어/이미지는 삭제할 수 없습니다."
                 if is_referenced
                 else None,
                 "deletion_blockers": blockers,
@@ -945,8 +1162,8 @@ def list_artifacts(
     artifacts_by_digest = {artifact["digest"]: artifact for artifact in artifacts}
     oci_images: dict[tuple[str, str], dict[str, Any]] = {}
     export_observations: dict[tuple[str | None, int | None], tuple[str, int | None]] = {}
-    for build_dir, rec in _build_records(roots):
-        build = _normalize_build_record(build_dir, rec)
+    for build_dir, rec in builds:
+        build = _normalize_build_record(build_dir, rec, warnings=warnings)
         if build["engine"] != "buildkit" or build["status"] != "success":
             continue
         runtime_digest = build["runtime_block_digest"]
@@ -1010,14 +1227,14 @@ def list_artifacts(
             image["output_oci_archive_digest"] = archive_digest
         elif availability == "unavailable" and image["availability"] == "missing":
             image["availability"] = availability
-    for retained in list_retained_oci_sources(roots):
+    for retained in list_retained_oci_sources(roots, warnings=warnings):
         key = (retained["digest_type"], retained["digest"])
         if key in oci_images:
             continue
         oci_images[key] = retained
         artifacts.append(retained)
         images.append(retained)
-    for retained in _retained_remote_artifacts(roots):
+    for retained in _retained_remote_artifacts(roots, warnings=warnings):
         key = (retained["digest_type"], retained["digest"])
         if key in oci_images:
             oci_images[key].setdefault("upload_source", retained["upload_source"])
@@ -1025,25 +1242,434 @@ def list_artifacts(
         oci_images[key] = retained
         artifacts.append(retained)
         images.append(retained)
+    for retained in _retained_package_artifacts(roots, warnings=warnings):
+        key = (retained["digest_type"], retained["digest"])
+        if key in oci_images:
+            oci_images[key].setdefault("package_references", []).extend(retained["package_references"])
+            continue
+        oci_images[key] = retained
+        matching_builds = [
+            _normalize_build_record(directory, record, warnings=warnings)
+            for directory, record in builds
+            if record.get("build_id", directory.name) == retained["package_references"][0]["build_id"]
+        ]
+        retained["builds"] = matching_builds
+        retained["build_ids"] = [build["build_id"] for build in matching_builds]
+        artifacts.append(retained)
+        images.append(retained)
+    return {"artifacts": artifacts, "images": images, "layers": layers, "unknown": unknown}
+
+
+def _empty_metadata_snapshot() -> dict[str, Any]:
+    return {
+        "observation": {
+            "catalog_id": None,
+            "revision": 0,
+            "captured_at": None,
+            "complete": False,
+            "warnings": [],
+            "scope": "selected-local-state",
+        },
+        "images": [],
+        "builds": [],
+        "runs": [],
+        "artifacts": {"artifacts": [], "images": [], "layers": [], "unknown": []},
+    }
+
+
+def _native_catalog_source(snapshot: state.RunLedgerSnapshot, plan: Mapping[str, Any]) -> dict[str, str]:
+    """Bind a run's source link using committed metadata, without reopening source blobs."""
+    wire = _json_projection(snapshot.state["vz_native"]["source_snapshot"])
+    qualification = _json_projection(snapshot.state["source_qualification"])
+    source = {
+        key: wire[key] for key in ("binding_digest", "cas_id", "config", "image_digest", "layers", "manifest", "root")
+    }
+    cas_id = source["cas_id"]
+    if not isinstance(cas_id, str) or re.fullmatch(r"source-cas-v1:[0-9a-f]{64}", cas_id) is None:
+        raise StateError("native VZ catalog source CAS binding is invalid")
+
+    def descriptor(member: Any) -> dict[str, Any]:
+        if not isinstance(member, dict) or set(member) != {"cas_id", "descriptor"} or member["cas_id"] != cas_id:
+            raise StateError("native VZ catalog source member binding is invalid")
+        parsed = Descriptor.from_dict(member["descriptor"]).to_dict()
+        if parsed != member["descriptor"]:
+            raise StateError("native VZ catalog source descriptor is not canonical")
+        return parsed
+
+    members = {
+        "cas_id": cas_id,
+        "config": descriptor(source["config"]),
+        "domain": "palimpsest.source-snapshot.v1",
+        "image_digest": require_digest(source["image_digest"]),
+        "layers": [descriptor(member) for member in source["layers"]],
+        "manifest": descriptor(source["manifest"]),
+        "root": descriptor(source["root"]),
+    }
+    binding = "sha256:" + hashlib.sha256(canonical_json_bytes(members)).hexdigest()
+    if (
+        source["binding_digest"] != binding
+        or snapshot.state.get("source_snapshot_binding_digest") != binding
+        or plan["source_snapshot_binding_digest"] != binding
+        or qualification["source_binding_digest"] != binding
+        or qualification["source"] != source
+        or snapshot.state.get("source_image_digest") != members["image_digest"]
+    ):
+        raise StateError("native VZ catalog observation has a changed source binding")
+    return {"source_image_digest": members["image_digest"], "source_binding_digest": binding}
+
+
+def _collect_catalog_runs(roots: StatePaths, warnings: set[str]) -> list[dict[str, Any]]:
+    """Project only durable UUID-bound ledgers, without runtime reconciliation."""
+    owners = _owners(_projects(roots, warnings), warnings)
+    try:
+        snapshots, errors = state.enumerate_run_snapshots(roots)
+    except _METADATA_ERRORS:
+        warnings.add(_RUN_WARNING)
+        return []
+    if errors:
+        warnings.add(_RUN_WARNING)
+    runs = []
+    for snapshot in snapshots:
+        summary, error = runtime_dispatch._project_or_error(
+            snapshot, operation=runtime_dispatch.RuntimeOperation.PS, stale=True
+        )
+        if error is not None or summary is None:
+            warnings.add(_RUN_WARNING)
+            continue
+        details = summary.details
+        try:
+            revision = state.lifecycle_revision(snapshot)
+            _run_artifact_digests(
+                {"base_digest": details["base_digest"] or None, "layers": _json_projection(details["layers"])}
+            )
+        except (StateError, InvalidDigestError):
+            warnings.add(_RUN_WARNING)
+            continue
+        source = {}
+        if summary.runtime_kind is RuntimeKind.OCI_ROOT and snapshot.state.get("oci_root") is not None:
+            from .oci_root_prepare import _transaction_from_snapshot
+
+            try:
+                transaction = _transaction_from_snapshot(snapshot)
+                source = {
+                    "source_image_digest": transaction.boot_plan["source_image_digest"],
+                    "source_binding_digest": transaction.boot_plan["source_snapshot_binding_digest"],
+                }
+            except (*_METADATA_ERRORS, ArtifactValidationError, InvalidDigestError):
+                warnings.add(_RUN_WARNING)
+        elif summary.runtime_kind is RuntimeKind.OCI_ROOT and summary.backend is RuntimeBackend.LIMA_VZ:
+            try:
+                plan = runtime_dispatch._native_vz_plan(snapshot)
+                # A pre-plan reservation has no committed image link, even if acquisition metadata exists.
+                if plan is not None:
+                    source = _native_catalog_source(snapshot, plan)
+            except (*_METADATA_ERRORS, ArtifactValidationError, InvalidDigestError):
+                warnings.add(_RUN_WARNING)
+        runs.append(
+            {
+                "name": summary.name,
+                "run_id": summary.run_id,
+                "runtime_kind": summary.runtime_kind.value,
+                "backend": summary.backend.value,
+                "status": summary.status,
+                "lifecycle_revision": revision,
+                **source,
+                "base_digest": details["base_digest"] or None,
+                "layers": _json_projection(details["layers"]),
+                "project": owners.get((summary.name, summary.run_id, summary.backend.value)),
+                "created_at": details["created_at"],
+                "updated_at": details["updated_at"],
+            }
+        )
+    return runs
+
+
+def _refresh_catalog(catalog: Any, roots: StatePaths) -> dict[str, Any]:
+    warnings: set[str] = set()
+
+    def admit(values, prepare, warning):
+        admitted = []
+        for value in values:
+            try:
+                admitted.append(prepare(value))
+            except local_catalog.CatalogError:
+                warnings.add(warning)
+        return admitted
+
+    if any(not image.get("source_binding_verified", True) for image in catalog.read_images()):
+        warnings.add("Some registered OCI source bindings are unavailable")
+    runs = admit(_collect_catalog_runs(roots, warnings), local_catalog.prepare_run_observation, _RUN_WARNING)
+    records = list(_build_records(roots, warnings=warnings))
+    builds = admit(
+        [_normalize_build_record(directory, record, warnings=warnings) for directory, record in records],
+        local_catalog.prepare_build_observation,
+        "Some build metadata is unavailable or inconsistent",
+    )
+    collected = _collect_artifacts(roots, catalog=catalog, runs=runs, builds=records, warnings=warnings)
+    categories = {id(value): category for category in ("images", "layers", "unknown") for value in collected[category]}
+    artifacts = {"artifacts": [], "images": [], "layers": [], "unknown": []}
+    for value in collected["artifacts"]:
+        try:
+            artifact = local_catalog.prepare_artifact_observation(value)
+        except local_catalog.CatalogError:
+            warnings.add("Some artifact metadata is unavailable or inconsistent")
+            continue
+        artifacts["artifacts"].append(artifact)
+        artifacts[categories[id(value)]].append(artifact)
+    if warnings:
+        for artifact in artifacts["artifacts"]:
+            artifact["delete_supported"] = False
+            artifact["delete_reason"] = "Incomplete local metadata prevents an artifact deletion preview"
+    final_categories = {
+        id(value): category for category in ("images", "layers", "unknown") for value in artifacts[category]
+    }
+    final_artifacts = {"artifacts": [], "images": [], "layers": [], "unknown": []}
+    for value in artifacts["artifacts"]:
+        try:
+            artifact = local_catalog.prepare_artifact_observation(value)
+        except local_catalog.CatalogError:
+            warnings.add("Some artifact metadata is unavailable or inconsistent")
+            continue
+        final_artifacts["artifacts"].append(artifact)
+        final_artifacts[final_categories[id(value)]].append(artifact)
+    artifacts = final_artifacts
+    catalog.replace_observation(
+        artifacts=artifacts,
+        builds=builds,
+        runs=runs,
+        warnings=sorted(warnings),
+        captured_at=state.utc_now_iso(),
+    )
+    observation = catalog.read_observation()
+    observation["scope"] = "selected-local-state"
+    return observation
+
+
+def refresh_metadata(roots: StatePaths, *, timeout_seconds: float = 5.0) -> dict[str, Any]:
+    """Capture selected state under the catalog mutex, before the SQL transaction."""
+    with local_catalog.open_catalog(roots, timeout_seconds=timeout_seconds) as catalog:
+        if catalog is None:
+            return _empty_metadata_snapshot()["observation"]
+        return _refresh_catalog(catalog, roots)
+
+
+def metadata_snapshot(roots: StatePaths, *, refresh: bool = False) -> dict[str, Any]:
+    """Read persistent facts without reconstructing them unless explicitly requested."""
+    with local_catalog.open_catalog(roots, create=refresh) as catalog:
+        if catalog is None:
+            return _empty_metadata_snapshot()
+        if refresh:
+            _refresh_catalog(catalog, roots)
+        result = catalog.read_snapshot()
+        result["observation"]["scope"] = "selected-local-state"
+        return result
+
+
+def catalog_images(roots: StatePaths, *, refresh: bool = True) -> list[dict[str, Any]]:
+    return metadata_snapshot(roots, refresh=refresh)["images"]
+
+
+def _registered_image_artifact(image: dict[str, Any]) -> dict[str, Any]:
+    """A registered graph is descriptive, not a source or runtime lease."""
+    return {
+        **image,
+        "digest": image["image_id"],
+        "digest_type": "source-image",
+        "kind": "oci-image",
+        "source": "local-catalog",
+        "name": image["manifest_descriptor"]["digest"],
+        "platform": f"{image['platform']['os']}/{image['platform']['architecture']}",
+        "arch": canonical_arch(image["platform"]["architecture"]),
+        "size_bytes": sum(layer["compressed"]["size"] for layer in image["layers"]),
+        "availability": "registered" if image.get("source_binding_verified", True) else "unavailable",
+        "editable": False,
+        "run_supported": False,
+        "run_limitation": "Registered metadata requires independent source, byte, and runtime validation",
+        "delete_supported": False,
+        "tags": [],
+        "referenced_by": {"runs": [], "projects": []},
+    }
+
+
+def list_artifacts(
+    roots: StatePaths, *, arch: str | None = None, compatible: bool = False, requested_backend: str = "auto"
+) -> dict[str, Any]:
+    if arch is not None and arch not in ARCHITECTURES:
+        raise StateError("arch must be x86_64 or aarch64")
+    if requested_backend not in ("auto", *platforms.BACKENDS):
+        raise StateError("unsupported compatibility backend")
+    snapshot = metadata_snapshot(roots, refresh=True)
+    result = snapshot["artifacts"]
+    for image in snapshot["images"]:
+        artifact = _registered_image_artifact(image)
+        result["artifacts"].append(artifact)
+        result["images"].append(artifact)
     host = platforms.detect_host()
-    local = {artifact["digest"]: artifact for artifact in artifacts if artifact.get("source") == "content-store"}
-    for artifact in artifacts:
+    local = {
+        artifact["digest"]: artifact for artifact in result["artifacts"] if artifact.get("source") == "content-store"
+    }
+    for artifact in result["artifacts"]:
         artifact["compatibility"] = check_artifact(
             artifact, lookup=local.__getitem__, host=host, requested_backend=requested_backend
         )
+    for category in ("artifacts", "images", "layers", "unknown"):
+        result[category] = [
+            artifact
+            for artifact in result[category]
+            if (arch is None or artifact_arch(artifact) == arch)
+            and (not compatible or artifact["compatibility"]["compatible"])
+        ]
+    result["client"] = {"system": host.system, "arch": host.machine}
+    result["observation"] = snapshot["observation"]
+    result["warnings"] = snapshot["observation"]["warnings"]
+    return result
 
-    def selected(artifact: dict[str, Any]) -> bool:
-        return (arch is None or artifact_arch(artifact) == arch) and (
-            not compatible or artifact["compatibility"]["compatible"]
+
+def _verified_catalog_image(roots: StatePaths, snapshot: SnapshottedOCIImage | SnapshottedOCIArchive) -> dict[str, Any]:
+    if not isinstance(snapshot, (SnapshottedOCIImage, SnapshottedOCIArchive)):
+        raise StateError("catalog registration requires a typed OCI source snapshot")
+    cas = SourceCAS.open_existing(roots.oci_source_cas, expected_cas_id=snapshot.cas_id)
+
+    def reader(descriptor):
+        return cas.read_metadata(SourceSnapshot(descriptor, cas.identity))
+
+    if isinstance(snapshot, SnapshottedOCIImage):
+        image = resolve_image(snapshot.image.reference, snapshot.root.descriptor, reader)
+    else:
+        image = resolve_archive_image(
+            snapshot.image.reference,
+            snapshot.root.descriptor,
+            reader,
+            platform=f"{snapshot.image.config.os}/{snapshot.image.config.architecture}",
         )
+    if image != snapshot.image:
+        raise StateError("catalog source snapshot does not match verified OCI metadata")
+    return _catalog_image_fact(snapshot)
 
+
+def _catalog_image_fact(snapshot: SnapshottedOCIImage | SnapshottedOCIArchive) -> dict[str, Any]:
+    image = snapshot.image
     return {
-        "artifacts": [artifact for artifact in artifacts if selected(artifact)],
-        "images": [artifact for artifact in images if selected(artifact)],
-        "layers": [artifact for artifact in layers if selected(artifact)],
-        "unknown": [artifact for artifact in unknown if selected(artifact)],
-        "client": {"system": host.system, "arch": host.machine},
+        "image_id": image.digest,
+        "reference": image.reference.to_dict(),
+        "root_descriptor": snapshot.root.descriptor.to_dict(),
+        "manifest_descriptor": image.manifest_descriptor.to_dict(),
+        "config_descriptor": image.config.descriptor.to_dict(),
+        "platform": {"os": image.config.os, "architecture": image.config.architecture},
+        "layers": [layer.to_dict() for layer in image.layers],
+        "source_binding_digest": snapshot.binding_digest,
+        "source_cas_id": snapshot.cas_id,
+        "source_kind": "oci-root",
+        "derived": [],
+        "materialization_complete": False,
     }
+
+
+def _rebind_catalog_sources(catalog: Any, roots: StatePaths) -> None:
+    """Reopen copied source metadata; never reuse an original CAS/store binding."""
+    for original in catalog.read_images():
+        root = original["root_descriptor"]
+        descriptor = Descriptor(root["mediaType"], root["digest"], root["size"])
+        reference = OCIImageRef(**original["reference"])
+        try:
+            cas = SourceCAS(roots.oci_source_cas, _create_missing=False)
+
+            def reader(member, source_cas=cas):
+                return source_cas.read_metadata(SourceSnapshot(member, source_cas.identity))
+
+            image = resolve_archive_image(
+                reference,
+                descriptor,
+                reader,
+                platform=f"{original['platform']['os']}/{original['platform']['architecture']}",
+            )
+        except (OSError, ArtifactValidationError, InvalidDigestError):
+            # Preserve the registered graph when its copied source metadata is unavailable.
+            continue
+        snapshot = SnapshottedOCIArchive(
+            image=image,
+            root=SourceSnapshot(descriptor, cas.identity),
+            manifest=SourceSnapshot(image.manifest_descriptor, cas.identity),
+            config=SourceSnapshot(image.config.descriptor, cas.identity),
+            layers=tuple(SourceSnapshot(layer.compressed, cas.identity) for layer in image.layers),
+        )
+        rebound = _catalog_image_fact(snapshot)
+        if any(
+            rebound[field] != original[field]
+            for field in (
+                "image_id",
+                "reference",
+                "root_descriptor",
+                "manifest_descriptor",
+                "config_descriptor",
+                "platform",
+                "layers",
+            )
+        ):
+            raise local_catalog.CatalogError("copied registered source graph is inconsistent")
+        try:
+            cas.verify_image(snapshot)
+        except (OSError, ArtifactValidationError, InvalidDigestError):
+            # Missing or corrupt layer bytes never establish a verified destination binding.
+            continue
+        catalog.register_image(rebound)
+
+
+def record_oci_source(
+    roots: StatePaths, snapshot: SnapshottedOCIImage | SnapshottedOCIArchive, *, timeout_seconds: float = 5.0
+) -> dict[str, Any]:
+    with local_catalog.open_catalog(roots, timeout_seconds=timeout_seconds) as catalog:
+        if catalog is None:
+            raise StateError("catalog registration requires existing local state")
+        image = _verified_catalog_image(roots, snapshot)
+        catalog.register_image(image)
+        return next(item for item in catalog.read_images() if item["image_id"] == image["image_id"])
+
+
+def record_oci_materialization(
+    roots: StatePaths,
+    snapshot: SnapshottedOCIImage | SnapshottedOCIArchive,
+    receipt: OCIImageMaterializationReceipt,
+    *,
+    timeout_seconds: float = 5.0,
+) -> dict[str, Any]:
+    with local_catalog.open_catalog(roots, timeout_seconds=timeout_seconds) as catalog:
+        if catalog is None:
+            raise StateError("catalog registration requires existing local state")
+        image = _verified_catalog_image(roots, snapshot)
+        if not isinstance(receipt, OCIImageMaterializationReceipt) or (
+            receipt.source_snapshot_binding_digest != snapshot.binding_digest
+            or receipt.source_image_digest != snapshot.image.digest
+            or receipt.root_descriptor != snapshot.root.descriptor
+            or receipt.manifest_digest != snapshot.manifest.descriptor.digest
+            or receipt.config_descriptor != snapshot.config.descriptor
+            or (receipt.platform_os, receipt.platform_architecture)
+            != (snapshot.image.config.os, snapshot.image.config.architecture)
+            or receipt.layer_descriptors != tuple(layer.compressed for layer in snapshot.image.layers)
+            or receipt.layer_diff_ids != tuple(layer.diff_id for layer in snapshot.image.layers)
+        ):
+            raise StateError("catalog materialization receipt does not match the verified source graph")
+        receipts = tuple(result.receipt for result in receipt.results)
+        occurrences = tuple(DerivedLayerOccurrence.from_image(snapshot, ordinal) for ordinal in range(len(receipts)))
+        with ExitStack() as stack:
+            for path in (
+                roots.store,
+                roots.store / "blobs",
+                roots.store / "blobs" / "sha256",
+                roots.store / "oci-artifact-locks-v1",
+                roots.oci_derived_store,
+                *(
+                    roots.oci_derived_store / name
+                    for name in ("records", "keys", "occurrences", "leases", "lease-sets", "locks")
+                ),
+            ):
+                stack.enter_context(pinned_owner_directory(path))
+            OCIStore(roots).validate_receipt_occurrences(receipts, occurrences)
+        image["derived"] = [item.to_dict() for item in receipts]
+        image["materialization_complete"] = True
+        catalog.register_image(image)
+        _refresh_catalog(catalog, roots)
+        return image
 
 
 def check_local_artifact(roots: StatePaths, reference: str, *, requested_backend: str = "auto") -> dict[str, Any]:
@@ -1056,7 +1682,52 @@ def check_local_artifact(roots: StatePaths, reference: str, *, requested_backend
     raise StateError("artifact is not present in the selected local inventory")
 
 
-def _retained_remote_artifacts(roots: StatePaths) -> Iterator[dict[str, Any]]:
+def _retained_package_artifacts(roots: StatePaths, *, warnings: set[str]) -> Iterator[dict[str, Any]]:
+    """Observe canonical native receipts; neither verify transports nor query a registry."""
+    warning = "Some native package reference metadata is unavailable or inconsistent"
+    try:
+        with pinned_owner_directory(roots.state.resolve() / "package-references", missing_ok=True) as directory_fd:
+            if directory_fd is None:
+                return
+            for filename in sorted(os.listdir(directory_fd)):
+                try:
+                    if re.fullmatch(r"[0-9a-f]{64}\.json", filename) is None:
+                        raise StateError("invalid native package reference entry")
+                    info = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
+                    if info.st_nlink != 1:
+                        raise StateError("invalid native package reference entry")
+                    payload = state._read_pinned_json_object(directory_fd, filename)
+                    reference = payload.get("reference")
+                    if not isinstance(reference, str) or package_reference_path(roots, reference).name != filename:
+                        raise StateError("native package reference filename does not match")
+                    record = read_package_reference(roots, reference)
+                    availability, _size = _local_export_observation(record.archive, record.archive_size_bytes)
+                    yield {
+                        "digest": record.root_digest,
+                        "digest_type": "oci-manifest",
+                        "kind": record.package_type,
+                        "source": "package-reference",
+                        "name": record.reference,
+                        "availability": availability,
+                        "editable": False,
+                        "delete_supported": False,
+                        "run_supported": False,
+                        "run_limitation": "Package receipt observations require independent transport and runtime validation",
+                        "size_bytes": record.archive_size_bytes,
+                        "output_oci_archive_size_bytes": record.archive_size_bytes,
+                        "output_oci_archive_digest": record.archive_digest,
+                        "output_oci_manifest_digest": record.root_digest,
+                        "package_references": [dataclasses.asdict(record)],
+                        "tags": [],
+                        "referenced_by": {"runs": [], "projects": []},
+                    }
+                except (*_METADATA_ERRORS, ArtifactValidationError, InvalidDigestError):
+                    warnings.add(warning)
+    except (OSError, StateError):
+        warnings.add(warning)
+
+
+def _retained_remote_artifacts(roots: StatePaths, *, warnings: set[str] | None = None) -> Iterator[dict[str, Any]]:
     """Project owner-bound receipts; observe files without rehashing archives."""
     try:
         with pinned_owner_directory(roots.state.resolve() / "remote-references", missing_ok=True) as directory_fd:
@@ -1064,33 +1735,35 @@ def _retained_remote_artifacts(roots: StatePaths) -> Iterator[dict[str, Any]]:
                 return
             for filename in sorted(os.listdir(directory_fd)):
                 if re.fullmatch(r"[0-9a-f]{64}\.json", filename) is None:
+                    if warnings is not None:
+                        warnings.add("Some remote artifact metadata is unavailable or inconsistent")
                     continue
                 try:
                     info = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
                     if info.st_uid != os.geteuid() or info.st_mode & 0o077 or info.st_nlink != 1:
-                        continue
+                        raise StateError("invalid remote artifact metadata")
                     record = state._read_pinned_json_object(directory_fd, filename)
                     if record.get("schema") != "palimpsest-remote-reference-v1" or record.get("kind") not in {
                         "oci-image",
                         "runtime-bundle",
                     }:
-                        continue
+                        raise StateError("invalid remote artifact metadata")
                     connection, reference = record.get("connection_id"), record.get("requested_reference")
                     if not isinstance(connection, str) or not isinstance(reference, str):
-                        continue
+                        raise StateError("invalid remote artifact metadata")
                     if hashlib.sha256((connection + "\0" + reference).encode()).hexdigest() + ".json" != filename:
-                        continue
+                        raise StateError("invalid remote artifact metadata")
                     archive_digest = require_digest(record.get("archive_digest"))
                     root_digest = require_digest(record.get("package_manifest"))
                     archive = record.get("archive")
                     if not isinstance(archive, str) or not Path(archive).is_absolute():
-                        continue
+                        raise StateError("invalid remote artifact metadata")
                     archive_path = Path(archive).parent.resolve() / Path(archive).name
                     if archive_path.parent not in {
                         roots.state.resolve() / "registry-artifacts",
                         roots.state.resolve() / "package-artifacts",
                     }:
-                        continue
+                        raise StateError("invalid remote artifact metadata")
                     availability, size = _local_export_observation(archive, None)
                     yield {
                         "digest": root_digest,
@@ -1114,9 +1787,13 @@ def _retained_remote_artifacts(roots: StatePaths) -> Iterator[dict[str, Any]]:
                         "referenced_by": {"runs": [], "projects": []},
                         "upload_source": {"kind": "remote", "connection_id": connection, "reference": reference},
                     }
-                except (OSError, ValueError, TypeError, StateError, ArtifactValidationError):
+                except (OSError, ValueError, TypeError, StateError, ArtifactValidationError, InvalidDigestError):
+                    if warnings is not None:
+                        warnings.add("Some remote artifact metadata is unavailable or inconsistent")
                     continue
     except (OSError, StateError):
+        if warnings is not None:
+            warnings.add("Some remote artifact metadata is unavailable or inconsistent")
         return
 
 
@@ -1174,21 +1851,63 @@ def _read_build_record(builds_fd: int, name: str) -> dict[str, Any]:
         os.close(build_fd)
 
 
-def _build_records(roots: StatePaths) -> Iterator[tuple[Path, dict[str, Any]]]:
+def _build_records(roots: StatePaths, *, warnings: set[str] | None = None) -> Iterator[tuple[Path, dict[str, Any]]]:
     """Read editable ledgers only through owner-bound directories and files."""
     try:
         with pinned_owner_directory(roots.state.resolve() / "builds", missing_ok=True) as builds_fd:
             if builds_fd is None:
                 return
             for name in sorted(os.listdir(builds_fd)):
+                if name == "outputs":
+                    # Public builds keep archive transports beside, not inside, ledger directories.
+                    try:
+                        with pinned_owner_directory(roots.state.resolve() / "builds" / name):
+                            pass
+                    except _METADATA_ERRORS:
+                        if warnings is not None:
+                            warnings.add("Some build output metadata is unavailable or inconsistent")
+                    continue
                 if BUILD_ID_RE.fullmatch(name) is None:
+                    if warnings is not None:
+                        warnings.add("Some build metadata is unavailable or inconsistent")
                     continue
                 build_dir = roots.state.resolve() / "builds" / name
                 try:
-                    yield build_dir, _read_build_record(builds_fd, name)
+                    record = _read_build_record(builds_fd, name)
+                    if warnings is not None and _build_record_semantic_digest(record) is None:
+                        warnings.add("Some build record source identities are unavailable")
+                    if warnings is not None:
+                        digest_fields = (
+                            "base_digest",
+                            "runtime_base_digest",
+                            "output_digest",
+                            "output_oci_manifest_digest",
+                            "output_oci_archive_digest",
+                            "runtime_block_digest",
+                            "recipe_sha256",
+                            "build_key",
+                            "context_digest",
+                            "dockerfile_digest",
+                        )
+                        invalid = any(
+                            record.get(field) is not None and _optional_digest(record[field]) is None
+                            for field in digest_fields
+                        )
+                        parents = record.get("parent_digests", [])
+                        invalid = (
+                            invalid
+                            or not isinstance(parents, list)
+                            or any(_optional_digest(parent) is None for parent in parents)
+                        )
+                        if invalid:
+                            warnings.add("Some build metadata is unavailable or inconsistent")
+                    yield build_dir, record
                 except (OSError, StateError, ArtifactValidationError):
-                    continue
+                    if warnings is not None:
+                        warnings.add("Some build metadata is unavailable or inconsistent")
     except (OSError, StateError):
+        if warnings is not None:
+            warnings.add("Some build metadata is unavailable or inconsistent")
         return
 
 
@@ -1197,7 +1916,17 @@ def _build_engine(rec: dict[str, Any]) -> str:
     return "buildkit" if engine == "buildkit" else "palimpsestfile"
 
 
-def _normalize_build_record(build_dir: Path, rec: dict[str, Any]) -> dict[str, Any]:
+def _build_record_semantic_digest(record: dict[str, Any]) -> str | None:
+    try:
+        payload = canonical_json_bytes(record)
+    except ArtifactValidationError:
+        return None
+    return "sha256:" + hashlib.sha256(b"palimpsest.local-build-record-observation.v1\0" + payload).hexdigest()
+
+
+def _normalize_build_record(
+    build_dir: Path, rec: dict[str, Any], *, warnings: set[str] | None = None
+) -> dict[str, Any]:
     schema_version = rec.get("schema_version", 1)
     engine = _build_engine(rec)
 
@@ -1208,7 +1937,21 @@ def _normalize_build_record(build_dir: Path, rec: dict[str, Any]) -> dict[str, A
     started_at = rec.get("started_at") if isinstance(rec.get("started_at"), str) else None
 
     duration_ms = None
-    timings_ms = rec.get("timings_ms") if isinstance(rec.get("timings_ms"), dict) else {}
+    raw_timings = rec.get("timings_ms")
+    timings_ms = {}
+    if raw_timings is not None:
+        if not isinstance(raw_timings, dict):
+            if warnings is not None:
+                warnings.add("Some build timing metadata is unavailable or inconsistent")
+        else:
+            for key, value in raw_timings.items():
+                try:
+                    name, timing = local_catalog.validate_catalog_timing(key, value)
+                    timings_ms[name] = timing
+                except local_catalog.CatalogError:
+                    if warnings is not None:
+                        warnings.add("Some build timing metadata is unavailable or inconsistent")
+    source_record_digest = _build_record_semantic_digest(rec)
 
     if schema_version == 1:
         if not started_at:
@@ -1222,7 +1965,7 @@ def _normalize_build_record(build_dir: Path, rec: dict[str, Any]) -> dict[str, A
                 pass
     else:
         total = timings_ms.get("total")
-        if type(total) in (int, float) and math.isfinite(total):
+        if type(total) is int or type(total) is float and math.isfinite(total):
             duration_ms = int(total)
         elif finished_at and started_at:
             try:
@@ -1240,13 +1983,21 @@ def _normalize_build_record(build_dir: Path, rec: dict[str, Any]) -> dict[str, A
             except Exception:
                 pass
 
-    output_tags = rec.get("output_tags")
-    if output_tags is None:
+    raw_output_tags = rec.get("output_tags")
+    if raw_output_tags is None:
         out_tag = rec.get("output_tag")
-        output_tags = [out_tag] if isinstance(out_tag, str) and out_tag else []
-    if not isinstance(output_tags, list):
-        output_tags = []
-    output_tags = [tag for tag in output_tags if isinstance(tag, str) and tag]
+        raw_output_tags = [] if out_tag is None else [out_tag]
+    if not isinstance(raw_output_tags, list):
+        if warnings is not None:
+            warnings.add("Some build output labels are unavailable or inconsistent")
+        raw_output_tags = []
+    output_tags = []
+    for tag in raw_output_tags:
+        try:
+            output_tags.append(local_catalog.validate_catalog_text(tag))
+        except local_catalog.CatalogError:
+            if warnings is not None:
+                warnings.add("Some build output labels are unavailable or inconsistent")
 
     manifest_digest = _optional_digest(rec.get("output_oci_manifest_digest"))
     archive_digest = _optional_digest(rec.get("output_oci_archive_digest"))
@@ -1266,6 +2017,12 @@ def _normalize_build_record(build_dir: Path, rec: dict[str, Any]) -> dict[str, A
     return {
         "build_id": build_id,
         "engine": engine,
+        "recipe_sha256": _optional_digest(rec.get("recipe_sha256")),
+        "build_key": _optional_digest(rec.get("build_key")),
+        "context_digest": _optional_digest(rec.get("context_digest")),
+        "dockerfile_digest": _optional_digest(rec.get("dockerfile_digest")),
+        "source_record_digest": source_record_digest,
+        "source_record_digest_kind": "canonical-json-semantic-v1" if source_record_digest is not None else None,
         "status": status,
         "started_at": started_at,
         "finished_at": finished_at,
@@ -1285,25 +2042,21 @@ def _normalize_build_record(build_dir: Path, rec: dict[str, Any]) -> dict[str, A
 
 
 def list_builds(roots: StatePaths, *, limit: int = 100) -> list[dict[str, Any]]:
-    items: list[dict[str, Any]] = []
-    for build_dir, rec in _build_records(roots):
-        items.append(_normalize_build_record(build_dir, rec))
-
-    items.sort(key=lambda b: b.get("started_at") or b.get("finished_at") or "", reverse=True)
-    return items[:limit]
+    with local_catalog.open_catalog(roots) as catalog:
+        if catalog is None:
+            return []
+        _refresh_catalog(catalog, roots)
+        return catalog.read_builds(limit=limit)
 
 
 def get_build(roots: StatePaths, build_id: str) -> dict[str, Any]:
     if not isinstance(build_id, str) or BUILD_ID_RE.fullmatch(build_id) is None:
         raise StateError(f"invalid build id: {build_id!r}")
-    build_dir = roots.state.resolve() / "builds" / build_id
-    try:
-        with pinned_owner_directory(build_dir.parent) as builds_fd:
-            assert builds_fd is not None
-            rec = _read_build_record(builds_fd, build_id)
-    except OSError:
-        raise StateError(f"build '{build_id}' not found or unsafe") from None
-    return _normalize_build_record(build_dir, rec)
+    with local_catalog.open_catalog(roots) as catalog:
+        if catalog is None:
+            raise StateError(f"build '{build_id}' not found")
+        _refresh_catalog(catalog, roots)
+        return catalog.get_build(build_id)
 
 
 def build_log(roots: StatePaths, build_id: str, *, tail: int = 400) -> str:
@@ -1388,6 +2141,29 @@ def tag_artifact(roots: StatePaths, digest: str, tag: str) -> dict[str, Any]:
             return dataclasses.asdict(committed)
 
 
+def _published_artifact_references(pulled: list[dict[str, Any]]) -> dict[str, set[str]]:
+    """Digest -> ``published:<hub image id>`` for every payload or closure blob a Hub pull keeps referenced."""
+    references: dict[str, set[str]] = {}
+    for item in pulled:
+        owner = "published:" + item["hub_image_id"]
+        for digest in (
+            *(layer["digest"] for layer in item["layers"]),
+            *(blob["digest"] for blob in item["source_closure"]),
+        ):
+            references.setdefault(digest, set()).add(owner)
+    return references
+
+
+def _published_artifact_blockers(roots: StatePaths, digest: str) -> set[str]:
+    """Hub-published pulls keep their SquashFS payloads and source-closure blobs referenced."""
+    try:
+        with local_catalog.open_catalog(roots, create=False) as catalog:
+            pulled = catalog.read_pulled_images() if catalog is not None else []
+    except local_catalog.CatalogError:
+        raise StateError("cannot prove artifact is unreferenced because catalog metadata is invalid") from None
+    return _published_artifact_references(pulled).get(digest, set())
+
+
 def remove_artifact(roots: StatePaths, digest: str, *, force: bool = False) -> dict[str, Any]:
     canonical_roots = StatePaths(config=roots.config.resolve(), state=roots.state.resolve())
     norm_digest = require_digest(digest)
@@ -1424,8 +2200,9 @@ def _remove_artifact_locked(roots: StatePaths, norm_digest: str, *, force: bool)
             "cannot prove artifact is unreferenced because retained instance metadata is invalid"
         ) from None
     retained_blockers = retained_refs.get(norm_digest, [])
+    published_blockers = _published_artifact_blockers(roots, norm_digest)
 
-    names = sorted(referencing_runs | referencing_projects | set(retained_blockers))
+    names = sorted(referencing_runs | referencing_projects | set(retained_blockers) | published_blockers)
     if names:
         raise StateError(f"{norm_digest} is still used by: " + ", ".join(names))
     removed_tags: list[tuple[str, str, tuple[int, int, int, int, int]]] = []
@@ -1588,6 +2365,9 @@ def set_state_root(roots: StatePaths, destination: Path) -> dict[str, Any]:
     if len(entries) > 0 and not has_store:
         raise StateError(f"state root destination is not empty and lacks a store directory: {destination}")
 
+    with local_catalog.open_catalog(StatePaths(config=roots.config, state=dest), create=False):
+        pass
+
     write_state_root(roots, dest)
     init_roots({"XDG_CONFIG_HOME": str(roots.config.parent)})
     return {
@@ -1605,6 +2385,8 @@ def move_state_root(roots: StatePaths, destination: Path, *, keep_source: bool =
     dest = Path(destination)
     if not dest.is_absolute():
         raise StateError(f"state root destination must be an absolute path: {destination}")
+    if dest.is_symlink():
+        raise StateError("state relocation destination must not be a symbolic link")
 
     if dest.exists():
         if not dest.is_dir():
@@ -1612,42 +2394,80 @@ def move_state_root(roots: StatePaths, destination: Path, *, keep_source: bool =
         if len(list(dest.iterdir())) > 0:
             raise StateError(f"destination directory is not empty: {dest}")
 
-    runs: list[str] = []
-    if roots.runs.exists():
-        runs = [d.name for d in roots.runs.iterdir() if d.is_dir()]
-    projects: list[str] = []
-    if roots.projects.exists():
-        projects = [d.name for d in roots.projects.iterdir() if d.is_dir()]
-
-    names = sorted(set(runs) | set(projects))
+    names: list[str] = []
+    for directory in (roots.runs, roots.projects):
+        with pinned_owner_directory(directory, missing_ok=True) as directory_fd:
+            if directory_fd is not None:
+                names.extend(os.listdir(directory_fd))
+    names = sorted(set(names))
     if names:
         raise StateError(
             "relocating the state root requires no runs and no projects; remove them first: " + ", ".join(names)
         )
 
+    old_root = roots.state.resolve()
+    if roots.config.resolve() == old_root or old_root in roots.config.resolve().parents:
+        raise StateError("state relocation source must not contain its configuration root")
+    dest = dest.resolve()
+    if old_root == dest or old_root in dest.parents or dest in old_root.parents:
+        raise StateError("source and destination state roots must not overlap")
     incoming = dest.parent / f"{dest.name}.incoming-{os.getpid()}"
-    if incoming.exists():
-        shutil.rmtree(incoming)
+    if incoming.exists() or incoming.is_symlink():
+        raise StateError("state relocation staging destination already exists")
 
-    old_root = roots.state
-    try:
-        shutil.copytree(old_root, incoming, symlinks=True)
-        fsync_directory(incoming.parent)
-
-        if dest.exists():
-            dest.rmdir()
-
-        os.replace(incoming, dest)
-    except Exception:
-        if incoming.exists():
-            shutil.rmtree(incoming, ignore_errors=True)
-        raise
-
-    write_state_root(roots, dest)
-    init_roots({"XDG_CONFIG_HOME": str(roots.config.parent)})
-
-    if not keep_source and old_root.exists() and old_root.resolve() != dest.resolve():
-        shutil.rmtree(old_root)
+    with local_catalog.quiesce_catalog(roots):
+        config_file = roots.config / "config.toml"
+        try:
+            original_config = config_file.read_bytes()
+        except FileNotFoundError:
+            original_config = None
+        published_identity: tuple[int, int] | None = None
+        incoming_identity: tuple[int, int] | None = None
+        switch_attempted = False
+        try:
+            incoming.mkdir(mode=0o700)
+            staging = incoming.stat(follow_symlinks=False)
+            incoming_identity = (staging.st_dev, staging.st_ino)
+            shutil.copytree(old_root, incoming, symlinks=True, dirs_exist_ok=True)
+            fsync_directory(incoming.parent)
+            if dest.exists():
+                dest.rmdir()
+            os.replace(incoming, dest)
+            published = dest.stat(follow_symlinks=False)
+            published_identity = (published.st_dev, published.st_ino)
+            destination_roots = StatePaths(config=roots.config, state=dest)
+            with local_catalog.open_catalog(destination_roots, create=False, _rebind_from=old_root) as catalog:
+                if catalog is not None:
+                    catalog.rebind_destination(source_state=old_root)
+                    _rebind_catalog_sources(catalog, destination_roots)
+            switch_attempted = True
+            write_state_root(roots, dest)
+        except Exception:
+            if incoming_identity is not None:
+                try:
+                    staging = incoming.stat(follow_symlinks=False)
+                    if (staging.st_dev, staging.st_ino) == incoming_identity:
+                        shutil.rmtree(incoming)
+                except FileNotFoundError:
+                    pass
+            unchanged_config = not switch_attempted
+            if switch_attempted:
+                try:
+                    unchanged_config = config_file.read_bytes() == original_config
+                except FileNotFoundError:
+                    unchanged_config = original_config is None
+                except OSError:
+                    unchanged_config = False
+            if published_identity is not None and unchanged_config:
+                try:
+                    published = dest.stat(follow_symlinks=False)
+                    if (published.st_dev, published.st_ino) == published_identity:
+                        shutil.rmtree(dest)
+                except FileNotFoundError:
+                    pass
+            raise
+        if not keep_source:
+            shutil.rmtree(old_root)
 
     return {
         "previous_root": str(old_root),
@@ -2155,7 +2975,7 @@ def list_networks(roots: StatePaths, *, vms_result: dict | None = None) -> dict[
     # so a projection refusal cannot become an empty network inventory.
     projected = {(vm["name"], vm["run_id"], vm["backend"], vm["runtime_kind"]) for vm in vms}
     unavailable_runs = []
-    oci_runs = {vm["name"]: (vm["run_id"], vm["backend"]) for vm in vms if vm["runtime_kind"] == "oci-root"}
+    oci_runs = {}
     try:
         snapshots, errors = state.enumerate_run_snapshots(roots)
         if errors:

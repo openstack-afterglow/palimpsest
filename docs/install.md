@@ -6,20 +6,48 @@ initial configuration, upgrades, and administrator-owned Linux deployment.
 Released installations use pinned published bytes; trusted local installation below uses the actual checkout's bytes.
 
 Palimpsest Local requires Python 3.11 or newer; Hub requires Python 3.12+.
-This release source prepares0.3.10 on published0.3.9
-(`5c0fef0604ca631bef40ed505a0d02d742ccba9a`). Root/Hub metadata, module versions,
+This source prepares unpublished candidate0.3.12 from the0.3.11 source lineage; this checkpoint does not verify publication, images or deployment for either version.
+SDK publication and native execution remain separately qualified. Root/Hub metadata, module versions,
 generated locks and Kolla image defaults move together. After formal publication,
 install exact client bytes with
-`uv tool install --python 3.11 palimpsest-client==0.3.10`, or install a trusted
+`uv tool install --python 3.11 palimpsest-client==0.3.12` once formally published, or install a trusted
 local checkout with `uv tool install --force --python 3.11 .`.
 A root wheel upgrade neither deploys Hub nor qualifies actual build/run behavior.
 Git/outbound GitHub HTTPS is needed only for VCS installation.
+The updated trusted checkout also installs `plm` into the same private tool or
+venv bin directory, targeting the identical CLI implementation as `palimpsest`.
+Help retains the canonical name. This alias must be checked against actual
+installed entrypoint bytes, not inferred for older published packages.
 
 **0.3.5 release and production:** retains the latest HTTPS-only private build plane and authorization while integrating distributed export ownership and local/client work. PyPI/GHCR publication and the controller1 Hub plus dedicated build-worker VM rollout completed on 2026-10-14; see [CI, publication and production receipts](testing.md#full-source-035-integration--local-verification), including evidence-based `claim_pending` recovery. Native KVM proof was NOT performed (repository-policy skip, as for 0.3.4); idle polling does not prove live recipe execution. Historical approval, deployment, publication and authentication receipts below retain their dated ref/resource boundary. The API never runs recipes; the CPU-only service VM receives verified HTTPS, a private keyfile and local scratch only. Follow the offline drain/schema/paired-storage restore checklist before any separately authorized rollout.
 
 Historical DMS Lab deployment receipts preserve private listen port `18021`, internal VIP port `8021` and public `https://palimpsest.dmslab.re.kr`; later0.3.7 receipts record the shared-CAS three-controller layout. Preserve actual current operator overrides rather than infer placement from old single-controller records or role defaults. Package pinning and image selection do not restart services. Verify public readiness and authenticated build/consumer behavior after a separately authorized Kolla rollout.
 
-Package references require a separate trusted `palimpsest_package_public_origin`; it was empty in the inspected runtime. For the Afterglow key-gateway deployment, use the approved `https://cloud.dmslab.re.kr` origin rather than inferring it from Hub Host or the internal transport. Verify nonempty exact protected IDs, current requester service leaves and original-token `/v1/projects/current` through Afterglow. Do not use admin/service credentials for package acceptance, grant ordinary users automatically, or claim health 200 proves authenticated reads/writes.
+Package references require a separate trusted `palimpsest_package_public_origin`; it was empty in the inspected runtime. For the Afterglow key-gateway deployment, use the approved `https://cloud.dmslab.re.kr` origin rather than inferring it from Hub Host or the internal transport. Verify nonempty exact protected IDs, current requester native project roles and original-token `/v1/projects/current` through Afterglow. Use ordinary project principals for tier acceptance, not service/system-admin bypasses; do not grant users automatically or claim health 200 proves authenticated reads/writes.
+
+### Unreleased exact upstream image-source policy
+
+Before deploying the source-policy cutover, configure the same explicit
+`palimpsest_image_source_policy` on API and image workers. It is a canonical
+`schema_version: 1`, `publisher_policy: registry-namespace`, exact
+registry/namespace/repository rule DTO; the Kolla default is empty and denies
+image intake. See [the complete local/Hub configuration](registries.md#upstream-image-source-admission).
+The existing registry-host list remains an additional transport ceiling, not
+permission for every image on those hosts.
+
+Image jobs bind the original server-selected snapshot/digest. A caller cannot
+provide that authority, and an identical request retry returns its existing
+receipt rather than replacing the snapshot with a later policy. A missing,
+contradictory or no-longer-current binding cannot authorize a new claim or
+publication. Historical completed receipts remain historical; do not invent
+policy provenance for queued/inflight legacy jobs, clear retained journals or
+replay work to get around a cutover hold.
+
+Coordinate API/worker policy rollout and preserve current pending-job custody.
+Worker publication recovery must independently apply its current policy even
+while an API still has an older setting; terminal settlement remains available.
+Source checks and isolated fixtures do not apply this configuration to a running
+service, migrate production data or authorize an operational rollout.
 
 ### Unreleased GPU and fixed k3s runtime profiles
 
@@ -66,6 +94,15 @@ Existing server-backed DELETE may still remove Nova. This change adds private
 versioned state to the existing instance spec JSON and uses `boot_volume_id`;
 no new database column or raw-token persistence is required. Preserve existing
 server-backed rows and uncertain journals rather than replaying old creates.
+Instance creation and `advance(operation="create-server")` require current
+`packages:write`. Stop, DELETE and `advance(operation="delete-volume")` admit
+`packages:manage` or member `packages:manage_own`, retaining exact original
+creator/project, native profile and exclusive boot-resource checks. The self
+action never reaches another private creator's VM or a package/layer/export.
+Before disposable API benchmark/smoke reservations, the original token must
+return `packages:write` and either cleanup action from
+`GET /v1/policy/capabilities`; malformed/unavailable authority stops before VM
+intent/allocation. This qualifies existing authority, never grants a role.
 See the [instance state and ownership contract](../ARCHITECTURE.md#instance-effects-guest-boundary-and-result-semantics).
 
 For the fixed k3s context, set explicit matching API/worker
@@ -243,13 +280,14 @@ do not authorize another rollout or native qualification.
    restore. Preserve unknown scratch/loops/jobs/Trusts; never replay them or
    delete volumes to force a clean start.
 4. **Apply reviewed schema offline.** Run the new pinned API image's
-   `palimpsest-hub-bootstrap` with approved private database/config inputs while
-   every writer remains stopped. Current bootstrap creates missing tables
-   (including `palimpsest_worker_leases`) and adds nullable build
-   `lease_expires_at` when absent; there is no migration ledger, ownership
-   backfill or legacy guest adoption. Empty-database smoke is not compatibility
-   proof for the actual existing schema. `reconfigure.yml` does **not** bootstrap;
-   `deploy`/`upgrade` do, but neither orchestrates the all-writer stop/backup.
+   `palimpsest-hub-bootstrap` with private database/config inputs while every
+   writer remains stopped.0.3.11 upgrades pre-publication image tables before
+   dependent FKs: historical jobs receive `visibility=internal`, and build
+   contexts use `(project_id,digest,created_by)` only when every original creator
+   is proven. Unknown creators stop before DDL; no owner/OS/catalog image is
+   invented. MariaDB DDL commits implicitly: recovery is paired SQL/CAS restore,
+   not transaction rollback or a blind bootstrap replay. `reconfigure` does not
+   bootstrap; `deploy`/`upgrade` do, but neither drains all old writers for you.
    Migration into a separate empty initialized database is a distinct operation;
    it copies durable rows, not blob bytes or transient maintenance leases.
 5. **Use the existing image-mode lifecycle.** After the approved operator wheel
@@ -262,6 +300,34 @@ do not authorize another rollout or native qualification.
    kolla-ansible reconfigure -i /etc/kolla/multinode --tags palimpsest \
      --limit dms-controller1 --skip-tags haproxy
    ```
+   A single-controller limit still needs facts for every inventory host used by
+   HA Sentinel address rendering. Do not override
+   `kolla_ansible_delegate_facts_hosts` with an empty list when the selected role
+   resolves cross-controller `kolla_address` values. Retain standard fact
+   delegation, or explicitly scope it to the exact reviewed Sentinel controller
+   hosts; for the three-controller placement above:
+
+   ```sh
+   -e '{"kolla_ansible_delegate_facts_hosts":["dms-controller1","dms-controller2","dms-controller3"]}'
+   ```
+
+   This changes read-only setup delegation, not the single-controller apply
+   limit. Verify the installed gather-facts play and unchanged Sentinel assertion
+   in the **same** Ansible process; separately preloading facts into a render
+   harness does not prove a limited reconfigure has them. Never disable Sentinel
+   coherence checks or change network interfaces to hide missing host facts.
+
+   A canonical reconfigure is not by itself a no-force-stop guarantee. The
+   Palimpsest role uses `community.docker.docker_container`; when replacing a
+   running image with no explicit stop timeout, its stop request permits Docker's
+   finite default grace and subsequent SIGKILL. If the approved operation forbids
+   forced running-process termination, first use a separately reviewed,
+   exact-container ordinary stop with indefinite grace, verify its normal exit
+   and prevent automatic restart, then let canonical Kolla perform replacement
+   and start. Retain healthy peer APIs and immutable before/stopped/after records;
+   an ambiguous stop is HOLD, never a second signal or forced removal. Changing
+   the module's stop timeout may also persist a different container setting and
+   is not an implicit permission to change the reviewed target configuration.
 
    Between pull and reconfigure, complete the offline schema gate above.
    The deployed aggregate does not target `palimpsest-build-worker`; use the
@@ -387,61 +453,39 @@ See [qualification boundaries](testing.md#published-031-verification).
    SQL/Redis/auth/CLI bytes, cleanup, restart persistence and restored reads/
    writes before reopening ingress. Health 200 proves only liveness.
 
-### Service-role provisioning prerequisite before reopening ingress
+### Standard project-role cutover
 
-The 0.3.1 release gates every legacy artifact write and
-`POST /v1/image-exports` on current `palimpsest-publish_editor`; the export
-worker rechecks it before Glance I/O. Plain existing `member`/`reader` grants
-are not service authority. Without an approved role-graph/assignment cutover,
-existing export consumers (including Afterglow requesters) return 403. The
-Palimpsest Kolla role registers the trustee and system reader only: it does
-**not** create these service roles, inference rules or requester grants.
+Current source uses existing standard native project roles, not separately assigned
+Palimpsest operation roles. Higher tiers include all lower-tier actions:
 
-The 0.3.1 preset-only preparation created global roles and inference edges
-without requester assignments; its read-only inventory found 106 ordinary
-memberships without service grades across 43 users/41 projects (104 enabled).
-This is historical cutover risk, not 106 exercised denied requests. On
-2026-10-13/14 an approved grant of three Palimpsest leaves to `test` in project
-`test` returned 204 for each; the owner later added Palimpsest roles to
-`pieroot`/`test` themselves. These observations do not authorize blanket grants
-or prove the 0.3.4 upload policy live. Review each requester's intended grade.
+| Existing project role | Default project authority |
+| --- | --- |
+| `reader` | Query/list visible metadata, manifests, content/cache downloads, build/instance status; list/revoke only its own keys using its original Keystone token |
+| `member` | Reader actions plus create/publish/upload/edit, build/export/instance admission and stop/delete of only its own consumers/exclusive boot volumes |
+| `manager` | Member actions plus authorized project management, package/layer/export deletion and own-key issuance; private creator and key-owner isolation still apply |
+| Project `admin` | At least manager project authority; never system/cross-project authority from that assignment alone |
 
-Before reopening ingress, the IAM/operator owner must explicitly approve and
-provision unique **global** roles with these exact names, then verify their
-immutable IDs and actual acyclic Keystone inference graph:
+Canonical `project_*` roles require actual current Keystone core-role implications;
+no local alias or token role claim is fabricated. Personal owner markers are not
+an authority fallback. Original-issued-role, key-action, private-user and exact
+project/owner ceilings still apply. Cancelling one's exact own upload remains part
+of create/edit, including package keys within their stored write scope; this is not
+project-wide deletion authority. Global catalogs and explicit logical-target
+administration require fresh human `system:all` admin, not project manager/admin.
 
-- Leaves: `palimpsest-inventory_reader`, `palimpsest-download_user`,
-  `palimpsest-publish_editor`, `palimpsest-keys_editor`,
-  `palimpsest-keys_admin`.
-- Documented parent grades: `palimpsest_reader`, `palimpsest_user`,
-  `palimpsest_editor`, `palimpsest_admin`.
-- Preset grade edges: `palimpsest_admin` → `palimpsest_editor` →
-  `palimpsest_user` → `palimpsest_reader`.
-- Preset grade-to-leaf edges: reader → inventory_reader; user → download_user;
-  editor → publish_editor and keys_editor; admin → keys_admin, using the full
-  exact names above.
-- Each non-reader leaf also implies `palimpsest_reader` through an actual
-  Keystone inference rule, supplying inventory without inventing download or
-  key-management authority. Role inference must not grant base membership.
+Do not provision service grades/leaves for this cutover. Existing native IDs,
+assignments and valid native implication paths are preserved; only the separately
+owned IAM retirement workflow may change old managed edges. Historical0.3.1
+service-role requirements and earlier grant receipts are not current prerequisites.
+The Kolla role still registers only the export trustee and separate system-reader
+validator; it does not grant requester project authority or delete old roles.
 
-Assign only the owner-approved grade or independent leaves to the intended
-requesting users/groups in each exact project, retaining separate baseline
-`member` (or inventory-only `reader`) authority. Existing export requesters need
-current publish capability and the delegated member role; artifact downloads
-separately need download capability. Do not grant every leaf to every tenant,
-assign the trustee to tenant projects, weaken the Hub gate or silently remove
-existing grants. If operators choose granular leaves or a different graph, it
-must still provide exactly the approved effective capabilities; the Hub never
-hardcodes parent expansion. Obtain a renewed original subject token after any
-assignment upgrade not represented in that token.
+Retain complete read-only role-directory/graph and effective-assignment access for
+the validator, fresh original token/current owner intersection, and finite export
+Trust roles (`member` by default; never `manager`, `admin` or `service`).
+Renew subjects after an upgrade absent from their issued role ceiling.
+No production IAM/config/deployment change is performed by this source migration.
 
-The system reader must be allowed to read the complete current roles,
-role-ID inference rules and effective assignments, including domain-role
-records referenced by the inference listing. Confirm current original-token
-and key-owner intersections, a real authorized export and denied plain-member
-write before reopening ingress. Record exact role/edge/assignment receipts and
-live Trust delete proof privately. This is an approval-requiring operator step,
-not an IAM mutation performed by source preparation.
 
 ## Package catalog
 
@@ -697,6 +741,7 @@ enable_palimpsest_hub_build_worker: "yes"
 palimpsest_build_worker_hub_origin: "https://palimpsest.dmslab.re.kr"
 palimpsest_build_worker_scratch_volume: palimpsest_build_worker_scratch
 palimpsest_build_worker_scratch_path: /var/lib/palimpsest/build-worker
+palimpsest_build_worker_work_path: "{{ palimpsest_build_worker_scratch_path }}"
 palimpsest_build_worker_timeout_seconds: 3600
 palimpsest_build_worker_max_blob_bytes: 107374182400
 palimpsest_build_worker_cpus: 2
@@ -704,6 +749,14 @@ palimpsest_build_worker_memory: 6g
 palimpsest_build_worker_pids_limit: 512
 palimpsest_build_worker_etc_hosts: {}
 ```
+
+`palimpsest_build_worker_scratch_path` is the persistent volume's container mount;
+`palimpsest_build_worker_work_path` selects the actual private journal directory
+inside it and defaults to that mount. Preserve an already qualified subdirectory
+explicitly, together with the original volume and mount. Before any worker apply,
+compare the fully rendered volume/mount/`PALIMPSEST_HUB_BUILD_WORK_PATH` tuple to
+the actual container; neither a fresh volume nor a legacy parent journal is a
+replacement for the current identified cursor. Never clear uncertainty to deploy.
 
 `palimpsest_build_worker_etc_hosts` optionally maps the exact origin hostname
 to an operator-verified reachable IP **inside the worker container only** when
@@ -1055,7 +1108,7 @@ Profiles live at `${XDG_CONFIG_HOME:-~/.config}/palimpsest/registries.toml`, sch
 
 Native profiles require `--api-base HTTPS_URL` on exactly the `endpoint` authority and optionally a one-component namespace. Native HTTPS verifies system trust plus absolute `--ca` files and refuses redirects; mirrors, plain HTTP, TLS-skip and Docker cache exporters are rejected. The helper entry is exactly `api_base.rstrip('/') + '/projects/' + namespace`; lookup checks that `credHelpers` entry then `credsStore`, never host-only entries or `auths`. Configure/install `docker-credential-HELPER` first. Native login verifies `/auth/me` before storing anything, uses the key's public UUID as `--username`, and accepts the secret only through stdin/prompt. Native `--namespace` selects the credential namespace. OCI profiles retain Docker's `DOCKER_CONFIG`/`~/.docker` credentials.
 
-An ordinary member first registers the operator-bound namespace and issues a secret-once exact-package/action-bound key through the native control API. Follow the complete [registry flow](registries.md#native-authentication-build-and-transfer), including conditional `cloud.dmslab.re.kr/openstack-afterglow/test:v1` usage only after binding the alias to the actual immutable project UUID. Native `push --input`/`--manifest` and `pull --output` transfer verified OCI-layout archives without loading Docker; local typed receipts and frozen exports live under `state/package-references/` and `state/package-artifacts/`, separate from runtime-layer tags. These new source paths and written tests are not deployment or executed acceptance evidence.
+An ordinary member-or-above first registers the operator-bound namespace; a manager-or-above then issues its own secret-once exact-package/action-bound key through the native control API. Key use retains current-owner and action attenuation, even after a downgrade to member. Follow the complete [registry flow](registries.md#native-authentication-build-and-transfer), including conditional `cloud.dmslab.re.kr/openstack-afterglow/test:v1` usage only after binding the alias to the actual immutable project UUID. Native `push --input`/`--manifest` and `pull --output` transfer verified OCI-layout archives without loading Docker; local typed receipts and frozen exports live under `state/package-references/` and `state/package-artifacts/`, separate from runtime-layer tags. These source paths and written tests are not deployment or executed acceptance evidence.
 
 ### Compose project identity
 
@@ -1101,6 +1154,11 @@ Optional settings and defaults:
 | `PALIMPSEST_HUB_PACKAGE_PUBLIC_ORIGIN` | Empty. Trusted HTTPS origin in canonical lower-case host/port form, with no credentials, path, query or fragment; other forms are rejected at startup. It is never inferred from the request Host. If empty, no package authority is advertised, and every native push fails closed with `503 HUB_UNAVAILABLE` before its tag is published. |
 | `PALIMPSEST_HUB_EXPORT_DELEGATED_ROLES` | `'["member"]'`; JSON array of the least global roles a deferred Glance export Trust delegates. Glance's default `download_image` policy requires `member`, even for images the project owns. The requester must currently hold each listed role in the target project. `admin`, `manager` and `service` are rejected at startup. |
 | `PALIMPSEST_HUB_EXPORT_DELEGATION_TTL_SECONDS` | `21600`, valid 900–86400; finite Trust lifetime. A queued export not started within it fails `delegation_expired`. |
+| `PALIMPSEST_HUB_ANONYMOUS_RATE_LIMIT_ENABLED` | `true`; anonymous `public` published-image reads are counted per client |
+| `PALIMPSEST_HUB_ANONYMOUS_RATE_LIMIT_REQUESTS` | `120`, valid 1–100000 requests per window per client; excess is 429 with `Retry-After` |
+| `PALIMPSEST_HUB_ANONYMOUS_RATE_LIMIT_WINDOW_SECONDS` | `60`, valid 1–3600; fixed window |
+| `PALIMPSEST_HUB_ANONYMOUS_RATE_LIMIT_MAX_CLIENTS` | `10000`, valid 16–1000000; bounded per-process counter table, oldest window evicted first |
+| `PALIMPSEST_HUB_IMAGE_KEY_MAX_ACTIVE_PER_USER` | `50`, valid 1–10000; unrevoked, unexpired `ppi_v1_` image keys one user may hold across projects (409 `image_key_limit`) |
 | `OS_READER_USER_DOMAIN_NAME` | `Default`; domain of the separate validation identity |
 | `OS_USER_DOMAIN_NAME` / `OS_PROJECT_DOMAIN_NAME` | `Default` |
 | `OS_REGION_NAME` | `RegionOne` |
@@ -1114,6 +1172,48 @@ does not introduce retries. A response timeout after a mutation or COMMIT leaves
 an uncertain outcome: preserve the original durable claim/publication receipt
 and use its existing authoritative settlement, never assume rollback or replay.
 The separate HTTPS-only build worker does not consume this database setting.
+
+### Published images: anonymous reads, image keys and quotas (merge-worktree source)
+
+These behaviours exist in the unreleased M2 merge source only; no deployment has
+them.
+
+- **Anonymous reads.** `public` published images are readable without any
+  credential through `GET /v1/published-images`, `GET /v1/published-images/{id}`
+  and `GET /v1/published-images/{id}/blobs/{digest}`. The anonymous projection
+  omits `created_by`, `storage_binding` and `project_id`. A request with a
+  present but invalid credential is 401, never served anonymously. Graph routes,
+  `GET /v1/image-quota/me`, key management and all writes still require a
+  credential. A public image's source-closure config blob, when published,
+  exposes its environment values to anonymous readers.
+- **Rate limit and proxies.** The limiter keys on uvicorn's resolved
+  `request.client.host`: the TCP peer, or the `X-Forwarded-For` client only when
+  uvicorn runs with `--proxy-headers` and the peer is in `FORWARDED_ALLOW_IPS`
+  (uvicorn default `127.0.0.1`). The Hub never parses forwarding headers itself.
+  Behind a proxy missing from that list, every anonymous caller shares the
+  proxy's bucket. IPv4-mapped IPv6 counts as IPv4; other IPv6 addresses are
+  grouped per /64. Counters are per API process, so the effective limit
+  multiplies by processes and controllers. The Kolla role already renders
+  `--proxy-headers` and now sets `FORWARDED_ALLOW_IPS` from
+  `palimpsest_api_forwarded_allow_ips` (default `"127.0.0.1"`, unchanged
+  behaviour); list the actual HAProxy source addresses there and never untrusted
+  networks. The rate-limit and image-key settings above are not exposed as Kolla
+  variables.
+- **Image API keys.** `POST/GET /v1/image-keys` and `DELETE
+  /v1/image-keys/{id}` accept only original human Keystone tokens. Keys carry
+  `images:read` and/or `images:publish`, last 1–90 days and are bound to the
+  issuing user and project; every use rechecks current membership. Package keys
+  (`ppk_v1_`) are rejected by image routes.
+- **Quotas.** Policies and tier assignments live in
+  `palimpsest_hub_image_quota_policies` and `palimpsest_hub_image_quota_tiers`;
+  the Hub inserts only missing seed rows, so administrator changes through
+  `/v1/admin/image-quota/...` persist. Lowering a limit never deletes images.
+  These tables, `palimpsest_image_keys` and `palimpsest_hub_image_source_blobs`
+  are created by bootstrap and copied by `migrate.py`. A development database
+  that already has quota tables without `max_source_bytes` is not upgraded in
+  place (those tables never shipped).
+- **Not verified here:** MySQL/MariaDB execution of the quota SQL, Kolla
+  deployment and live Keystone.
 
 ### Remote build worker settings
 
@@ -1132,7 +1232,7 @@ The separate HTTPS-only build worker does not consume this database setting.
 
 The `OS_USERNAME`/`OS_PASSWORD` service identity remains separate from the read-only validator. The validator authenticates itself with `system_scope="all"` and validates the **presented subject token** through Keystone's token-read API; it never exchanges that token for a new default-project token and never falls back to service/admin credentials. `X-Project-Id`, if supplied, is only an exact assertion against the original scope, not a re-scope request. Downstream caller-scoped OpenStack requests reuse the validated original token and catalog. A missing reader identity/policy response fails closed (503), invalid/expired tokens fail 401, and scope assertions fail 403.
 
-Operator-owned Keystone policy must let this reader call token validation (`tokens.validate`), `users.get`, `projects.get`, native domain/group reads and complete role-assignment collections. Every native package-key use freshly checks enabled owner/project, current authority and declared key ceilings. Ordinary member keys retain protected-owner and elevated `admin`/`manager`/`service` exclusions; independently issued human-admin keys retain explicit issuer provenance and fresh system-authority checks. A later owner promotion never upgrades an ordinary key. Missing/incomplete metadata fails closed; package keys cannot gain system management, key administration or OpenStack execution authority.
+Operator-owned Keystone policy must let this reader call token validation (`tokens.validate`), `users.get`, `projects.get`, native domain/group reads and complete role-assignment collections. Every native package-key use freshly checks enabled owner/project, current authority and declared key ceilings. Existing standard project manager authority permits bounded key issuance, not system administration; system-admin promotion, protected owners, service identities and reduced credentials retain their independent exclusions. Ordinary keys never acquire system authority, while explicitly issued human-admin keys retain issuer provenance and fresh system checks. Missing/incomplete metadata fails closed; package keys cannot gain project management/delete actions, key administration or OpenStack execution authority.
 
 The separate human system-administrator gate resolves complete raw exact-`system:all` user and current-group grants through the trusted unique-global role-ID implication graph; project-oriented effective expansion may omit these grants and is not evidence of their absence. Qualify raw user/group reads and immediate revocation with the dedicated reader. Tenant administrative/service grades never substitute for native system authority. Original `X-Project-Id` asserts caller scope; separate `X-Target-Project-Id` selects a verified logical management target without exchanging/re-scoping the original token. See [current credential contracts](project-package-registry.md#3-identity-and-authorization).
 
@@ -1168,7 +1268,7 @@ Reader provisioning in the 0.3.4 source uses `openstack.cloud.identity_user` and
 
 ### Deferred Glance export delegation
 
-`POST /v1/image-exports` keeps the original-token admission: Glance visibility is checked with the presented token, and current `palimpsest-publish_editor` authority comes from the validator. When the request needs new Glance work (not byte reuse), the Hub creates a Keystone Trust **with the requester's validated token**: trustor = requester, trustee = this service identity, project = the token's project, `impersonation=true`, only `PALIMPSEST_HUB_EXPORT_DELEGATED_ROLES`, and a finite expiry. Keystone's response must match exactly or the Trust is deleted and the request fails. The Hub stores the Trust ID, scope, roles and expiry in `palimpsest_image_export_delegations`. It never stores the requester's token or password. Keystone refuses trust creation from application-credential, OAuth1 and EC2 tokens. Application credentials are exempt only when the insecure `allow_insecure_application_credential_trust_escalation` option is set. Exports requested with such tokens fail `delegation_denied` (403); requesters need a password, OIDC or federated token.
+`POST /v1/image-exports` keeps the original-token admission: Glance visibility is checked with the presented token, and current native member-or-above `packages:write` authority comes from the validator. When the request needs new Glance work (not byte reuse), the Hub creates a Keystone Trust **with the requester's validated token**: trustor = requester, trustee = this service identity, project = the token's project, `impersonation=true`, only `PALIMPSEST_HUB_EXPORT_DELEGATED_ROLES`, and a finite expiry. Keystone's response must match exactly or the Trust is deleted and the request fails. The Hub stores the Trust ID, scope, roles and expiry in `palimpsest_image_export_delegations`. It never stores the requester's token or password. Keystone refuses trust creation from application-credential, OAuth1 and EC2 tokens. Application credentials are exempt only when the insecure `allow_insecure_application_credential_trust_escalation` option is set. Exports requested with such tokens fail `delegation_denied` (403); requesters need a password, OIDC or federated token.
 
 Before Glance I/O, the export worker re-reads the requester's current enabled user/project, publish authority and delegated role through the validator. It then authenticates `v3.Password(user_id=<trustee>, password, trust_id=...)` without project selectors. It verifies the trust token's ID, trustor, trustee, impersonated user, project, roles (no wider than current implications of the delegated roles) and expiry. Revoked, expired, swapped or legacy (pre-cutover, undelegated) exports fail terminally with `authorization_revoked`, `authorization_unavailable`, `delegation_revoked`, `delegation_expired`, `delegation_scope_mismatch` or `delegation_required`. There is no fallback to the service password scoped to the tenant. A new export always uses the current requester's own Trust. An earlier creator's delegation is retired, never reused.
 
@@ -1189,7 +1289,7 @@ The canonical Kolla role renders `palimpsest_export_delegated_roles` (default `[
 
 ### Hub service-local authorization policy
 
-Locally verified service-local policy: registered `oslo.policy` defaults replace required Keystone service-grade implication edges. Grade-only roles need no member/reader co-role; downstream provider credential prerequisites remain independent. Final Hub650, Kolla41, two real MariaDB/process cases and 370 actual multi-architecture Docker HTTP checks are recorded in [the scoped evidence checkpoint](testing.md#service-local-hub-policy-verification--2026-10-21). This is not production IAM/Kolla rollout qualification.
+The standard-role cutover uses registered `oslo.policy` defaults plus a mandatory native core-role ceiling. Policy overrides may deny/narrow project actions but cannot grant reader writes, member management/delete/key administration, or core authority to a custom-only principal. Historical service-local-policy counts below belong to their dated source, not this unverified three-tier cutover.
 
 The Hub reads this nonsecret section from `PALIMPSEST_CONFIG` (default `/etc/palimpsest/palimpsest.conf`), not the secret-bearing `/app/palimpsest.conf`:
 
@@ -1212,18 +1312,26 @@ uv run --frozen oslopolicy-sample-generator --config-file etc/palimpsest-policy-
 The standard sample generator comments default rules. Before installing a newly generated comment-only sample, uncomment the desired string rules or use `{}` for defaults; empty YAML documents are deliberately invalid. The shipped active sample is regression-checked against every registered default.
 
 Kolla mounts `{{ palimpsest_config_dir }}/policy` read-only at `/etc/palimpsest` into API and export worker. Its directory is 0755, nonsecret TOML/YAML 0644. The role initializes `{}` only when absent, preserving operator YAML; set `palimpsest_policy_source` only for deliberate managed replacement. Policy variables render the separate policy-only TOML. Put policy.d files beneath the mount or supply an explicit mount. Keep API/worker policy identical. Canonical images and nonroot policy reads were locally exercised; Kolla rollout remains unperformed.
+For this three-tier cutover, explicitly review and rebase any existing operator
+YAML against the new 13-action sample before a separately approved rollout.
+Preserve unrelated custom denies/conditions and backup the original file; do not
+copy the new sample over existing policy or assume a client upgrade migrates it.
+Kolla's initialize-only `force: false` behavior remains unchanged. Add deliberate
+`packages:manage`/`packages:manage_own` and `keys:revoke`/`keys:revoke_own`
+restrictions where appropriate. Replace stale operation-role requirements with
+standard tiers without uplifting self-actions into foreign/private authority.
 
 `policy.conf.j2` renders `{{ palimpsest_config_dir }}/policy/palimpsest.conf` as root:root 0644. Both services explicitly set `PALIMPSEST_CONFIG=/etc/palimpsest/palimpsest.conf`. Original `/app/palimpsest.conf` remains root:root 0640 and is never read by the default bridge. All four canonical API/worker architecture images were exercised as UID:GID1000:1000 against actual root-owned files: secret reads failed with PermissionError while policy-only TOML/YAML/policy.d enforcement succeeded, without runtime user/group overrides or relaxed secrets. The full root Kolla contract selection passed41; see linked receipts.
 
 Because standard oslo.policy role matching is case-insensitive, trusted global role binding uniqueness is checked by casefold before policy evaluation. Actual role names remain unchanged. Distinct `custom_policy_writer` and `Custom_Policy_Writer` IDs cannot borrow one another's YAML authority; the native real-engine HTTP regression covers the collision.
 
-Authenticated `GET /v1/policy/capabilities` returns `service: "palimpsest"` and sorted `capabilities`/`actions` using original-token/current-owner decisions; empty arrays are legitimate. It never exchanges tokens or returns file paths/credentials. Project actions are `packages:inventory`, `packages:read`, `packages:write`, `cache:read`, `cache:write`, `keys:issue`, `keys:list`, `keys:revoke`. Separately human-system-verified actions are `packages:delete` and `system:manage` (existing build/delete/legacy administration). Leaf capability names are UI labels, not minted native roles. `@` cannot bypass project/key/package/user ownership, reduced-credential restrictions or fresh human system-only gates.
+Authenticated `GET /v1/policy/capabilities` returns `service: "palimpsest"` and sorted `actions`; old operation-role labels are removed. Reader actions are `packages:inventory`, `packages:read`, `cache:read`, `keys:list`, `keys:revoke_own`; member adds `packages:write`, `cache:write`, `packages:manage_own`; manager adds `packages:delete`, `packages:manage`, `keys:issue`, `keys:revoke`. The own actions require the original Keystone token and freshly verified exact creator/key ownership: reader can revoke only its own keys, and member can stop/delete only its own consumers and exclusive boot volumes. They never authorize another private creator's VM, package/layer/export deletion, API-key management by a bearer key, or foreign-project access. Creator-only upload cancellation retains its package/cache write action and exact session/key ownership. `system:manage` still requires fresh human-system proof. Even `@` cannot bypass these tiers or ownership/credential fences.
 
 The following focused rerun commands cover actual loopback Uvicorn/Keystone SDK YAML reload, key ceilings and project/system constraints. The final complete Hub suite passed650 with two opt-in database skips; these subsets are not separately claimed as a final counted run:
 
 ```sh
 # From hub/
-uv run --frozen --extra dev pytest -q tests/test_auth.py -k 'native_policy or grade_and_exact_leaf or removed_service_edges'
+uv run --frozen --extra dev pytest -q tests/test_auth.py -k 'standard_native or legacy_only or native_policy or policy_allow'
 uv run --frozen --extra dev pytest -q tests/test_auth.py tests/test_packages.py tests/test_hub_api.py tests/test_builds.py tests/test_image_exports.py tests/test_export_delegation.py
 ```
 
@@ -1239,18 +1347,18 @@ done
 
 Each evidence directory must be new or empty. The driver retains its owned SQL/CAS evidence volumes and never contacts production; its SQLite/lifespan-off adapter is not canonical MariaDB/deployment proof. Historical image/HTTP counts are not results for the new policy engine.
 
-For a separately authorized disposable deployed Hub, using its trusted HTTPS origin and original grade-only human subject:
+For a separately authorized disposable deployed Hub, using its trusted HTTPS origin and original standard project human subject:
 
 ```sh
 curl --fail-with-body --silent --show-error "$HUB/v1/policy/capabilities" -H "X-Auth-Token: $SUBJECT" -H "X-Project-Id: $PROJECT_ID"
 curl --fail-with-body --silent --show-error "$HUB/v1/projects/current" -H "X-Auth-Token: $SUBJECT" -H "X-Project-Id: $PROJECT_ID"
 ```
 
-In that disposable policy only, grant `packages:write` and `keys:issue` to `role:palimpsest_reader`, deny `packages:inventory` with `!`, and repeat capability/key/upload requests: allowed publication must not require an inventory leaf. Deny `packages:write` and retain `cache:write`; an already-issued key must immediately lose package publication without losing its independently allowed cache action. Request an undelegated download or another package/namespace, remove current membership, or call `/v1/builds` as project `admin`: each must deny. Replace every registered rule with `!`: a still-authenticated member sees empty capability/action arrays. Never edit production policy/IAM to run these probes without separate authorization.
+In that disposable policy only, set `packages:write` and `keys:issue` to `"@"`: a reader must still be denied both. Deny `packages:inventory` with `!` for a member while retaining write: independently authorized publication need not require inventory. Deny `packages:write` and retain `cache:write`: a previously issued key must lose package publication without losing independently delegated cache action. Undelegated downloads, foreign package/namespace access and revoked membership must deny. A project member may admit a configured project build, but cannot claim its machine worker lease or read global admin catalogs. Replacing every registered rule with `!` yields empty current action arrays. Never edit production policy/IAM to run these probes without separate authorization.
 
 ### Deferred Glance export delegation
 
-`POST /v1/image-exports` keeps the original-token admission: Glance visibility is checked with the presented token, and current `palimpsest-publish_editor` authority comes from the validator. When the request needs new Glance work (not byte reuse), the Hub creates a Keystone Trust **with the requester's validated token**: trustor = requester, trustee = this service identity, project = the token's project, `impersonation=true`, only `PALIMPSEST_HUB_EXPORT_DELEGATED_ROLES`, and a finite expiry. Keystone's response must match exactly or the Trust is deleted and the request fails. The Hub stores the Trust ID, scope, roles and expiry in `palimpsest_image_export_delegations`. It never stores the requester's token or password. Keystone refuses trust creation from application-credential, OAuth1 and EC2 tokens. Application credentials are exempt only when the insecure `allow_insecure_application_credential_trust_escalation` option is set. Exports requested with such tokens fail `delegation_denied` (403); requesters need a password, OIDC or federated token.
+`POST /v1/image-exports` keeps the original-token admission: Glance visibility is checked with the presented token, and current native member-or-above `packages:write` authority comes from the validator. When the request needs new Glance work (not byte reuse), the Hub creates a Keystone Trust **with the requester's validated token**: trustor = requester, trustee = this service identity, project = the token's project, `impersonation=true`, only `PALIMPSEST_HUB_EXPORT_DELEGATED_ROLES`, and a finite expiry. Keystone's response must match exactly or the Trust is deleted and the request fails. The Hub stores the Trust ID, scope, roles and expiry in `palimpsest_image_export_delegations`. It never stores the requester's token or password. Keystone refuses trust creation from application-credential, OAuth1 and EC2 tokens. Application credentials are exempt only when the insecure `allow_insecure_application_credential_trust_escalation` option is set. Exports requested with such tokens fail `delegation_denied` (403); requesters need a password, OIDC or federated token.
 
 Before Glance I/O, the export worker re-reads the requester's current enabled user/project, publish authority and delegated role through the validator. It then authenticates `v3.Password(user_id=<trustee>, password, trust_id=...)` without project selectors. It verifies the trust token's ID, trustor, trustee, impersonated user, project, roles (no wider than current implications of the delegated roles) and expiry. Revoked, expired, swapped or legacy (pre-cutover, undelegated) exports fail terminally with `authorization_revoked`, `authorization_unavailable`, `delegation_revoked`, `delegation_expired`, `delegation_scope_mismatch` or `delegation_required`. There is no fallback to the service password scoped to the tenant. A new export always uses the current requester's own Trust. An earlier creator's delegation is retired, never reused.
 
@@ -1538,3 +1646,117 @@ See [platform compatibility](compatibility.md), [Linux storage and
 logging](linux-storage-logging.md), [registry intake](registry-intake.md),
 [Docker/OCI registry profiles](registries.md), [BuildKit workflow](buildkit-block-workflow.md),
 and the [command workflows](cli/workflows.md) for operational details.
+
+## SDK image/native integration: operator prerequisites
+
+The `0.3.12` candidate Hub distribution declares the exact matching client dependency.
+Checkout resolution uses `hub`'s explicit parent-path source; installed release
+bytes must match the same immutable tag and reviewed image digests. Paired wheel
+or local container checks do not establish production upgrade or native readiness.
+The canonical Docker builder includes API native helpers, SSH/OpenSSL and
+`ceph-common`; issuer provisioning and backend isolation remain operator gates.
+
+New catalog, user-owned staging, membership/visibility and native-intent tables
+are part of the0.3.11 schema. The reviewed offline bootstrap upgrades legacy
+image-job visibility as `internal` and known context creators; other populated
+ACL tables with missing owner/reuse facts require explicit reviewed mapping or
+quarantine. `create_all` alone is not an upgrade and historical jobs are not
+invented catalog images. Drain writers and prove paired SQL/CAS recovery first.
+
+All new execution profiles and namespace mounts default to inactive/unset.
+Manila publication requires the coherent settings
+`PALIMPSEST_HUB_PUBLICATION_MANILA_SHARE_ID`, `_EXPORT`, `_ROOT`, `_FS_NAME`
+and `_DATA_POOL` (the latter four share the same `PALIMPSEST_HUB_PUBLICATION_MANILA`
+prefix). The root must be the exact pre-mounted CephFS export, not a descendant
+or an ordinary directory. Kernel mount ID/device, export and explicit
+`fs`/`mds_namespace` selection are checked. Private staging remains outside it.
+Absence or mismatch never falls back to local storage for native execution.
+
+The publisher needs layout-setting permission (`p`) inside the approved share
+and write permission for its selected pool/namespaces. An ordinary Manila RW
+credential must not be assumed sufficient. New scope directories receive layout
+before payload creation; existing incompatible scope/file layouts are rejected,
+not migrated or rewritten automatically.
+
+Each `PALIMPSEST_HUB_NATIVE_PROFILES` entry binds:
+
+- exact original project/user, existing environment and private state root;
+- private original `grant_path`, share/base export and publication root;
+- optional exact `manifest_digest` (omit/null only for the explicit project-image
+  CPU grant, not an implicit wildcard);
+- `ceph_fs_name`, `ceph_data_pool`, dedicated `ceph_issuer_client`,
+  `ceph_conf_file` and `ceph_keyring_file`.
+
+Issuer files must be bounded, owned, private, no-follow regular files outside the
+exported payload tree. The manager rejects `client.admin`, bootstrap/default
+service identities and ambient credential fallback. Operator provisioning of the
+issuer's finite auth-command authority is separate from use of that authority:
+API startup never installs keys, expands caps, rotates a cluster key or prepares
+a native worker. Per-run keys allow only the selected MDS path and OSD namespace;
+global `tag cephfs data=...` consumer caps are not used.
+
+Kolla exposes `palimpsest_publication_manila_host_path` for the already-mounted
+publisher share and `palimpsest_native_operator_host_path` for private journals,
+approved grants and issuer files. The latter is mounted at
+`palimpsest_native_operator_container_path`; profile paths must use container
+locations and remain outside the exported root. These mounts must be deliberately
+pre-provisioned with the API UID/permissions; the role does not create a share or
+issuer principal. Native source/service preparation is an explicit operator
+operation. `cloud native prepare` may omit its tag only with the project-scoped
+CPU preparation grant. The original exact-image local proof path is separate.
+
+Before enabling this path, qualify: actual scope directory/file layouts,
+cross-scope path **and raw RADOS** read denial, provider-side write denial,
+actual-root identity and workload output, then exact VM/boot/port/carrier-image
+absence and Ceph auth absence. Auth removal alone does not establish immediate
+session eviction. Finish and clean each test consumer before the next; no old
+spent grant, retained VM or historical success provides a new allowance.
+
+The Kolla/container path, dedicated issuer setup, new cloud resources and native
+proof still require explicit final-source/resource approval. Current local
+source/package checks are not deployment or live multi-tenant isolation proof.
+
+Namespace-qualified **new** consumer keys do not revoke existing broad keys.
+Before activation, the operator must qualify the filesystem/data pool against
+other untrusted clients that may still have filesystem-wide data-tag or
+pool-wide read caps. If such clients exist, use an independently qualified
+dedicated backend/filesystem or obtain a separately approved owner migration;
+do not change foreign keys as a side effect of this feature. Cluster/service
+administrators and the trusted publisher/issuer remain outside consumer isolation.
+No current-cloud capability census or dedicated-backend qualification is implied
+by the local source tests.
+
+### Operator handoff for the observed backend
+
+Approved read-only observations found Ceph19.2.3/Squid, filesystem `manila`,
+data pool `manila_data` and existing worker/share resources still present. The
+existing root and original layer use the share's `fsvolumens_…` namespace, not
+the new visibility scopes. Its mount does not expose an explicit filesystem
+selection; the candidate intentionally refuses to infer the default. The exact
+worker key cannot read even its own auth record (exit13). These observations
+do not qualify layout-setting or auth-issuer authority.
+
+Before a live test, the operator must provide, without posting key material in
+chat or the repository:
+
+1. The approved backend/share identity and a pre-mounted root with an explicit
+   kernel-visible filesystem selection, plus a statement/evidence that other
+   untrusted clients cannot read its new namespaces with broader pool/tag caps.
+2. A publisher identity permitted to set the empty scope-directory layout and
+   write the intended pool/namespaces. Do not repurpose the retained worker rule
+   or rewrite existing layer layouts as an implicit migration.
+3. A dedicated issuer identity with reviewed auth-command authority, and private
+   minimal Ceph config/keyring paths owned by the executing API UID. Ordinary
+   global `ceph.conf` permissions or renaming an admin key are not qualification.
+4. The private profile/state/artifact preparation and separately approved
+   source-package, allocation/cleanup expiry and cumulative CPU/resource limits.
+   No new GPU allowance is requested by this feature.
+
+A run's key reads its selected **security scope** (personal, project, or public),
+not just one image within that scope. Do not treat it as confidentiality between
+mutually untrusted workloads sharing that audience. Neither that scope model nor
+auth-record deletion provides attestation or immediate eviction of a live client.
+
+The operator selected preparation outside this assistant's current read-only
+window. Until it is supplied and the exact deployment/test resources are
+approved, keep profiles inactive and report native warm-start acceptance pending.

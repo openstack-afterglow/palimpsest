@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import tarfile
@@ -42,6 +44,7 @@ from palimpsest_local.package_reference import (
     write_package_reference,
 )
 from palimpsest_local.package_source import snapshot_package
+from palimpsest_local.registry import load_registry_config, resolve_image_reference
 from palimpsest_local.state import init_roots, read_tag_record
 
 D_IMAGE = "sha256:" + "a" * 64
@@ -358,6 +361,23 @@ def _spec(
     return BuildKitSpec(**values)  # type: ignore[arg-type]
 
 
+def _allow_image_sources(roots, *sources: tuple[str, str, str]) -> None:
+    config = roots.config / "config.toml"
+    lines = [
+        "[image_sources]",
+        "schema_version = 1",
+        'publisher_policy = "registry-namespace"',
+        "rules = [",
+        *(
+            f'  {{registry = "{registry}", namespace = "{namespace}", repository = "{repository}"}},'
+            for registry, namespace, repository in sources
+        ),
+        "]",
+    ]
+    config.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    config.chmod(0o600)
+
+
 def test_context_digest_and_build_key_are_stable_and_input_sensitive(tmp_path: Path):
     spec = _spec(tmp_path)
 
@@ -377,6 +397,151 @@ def test_context_digest_and_build_key_are_stable_and_input_sensitive(tmp_path: P
     (spec.context / "app.txt").write_text("changed\n", encoding="utf-8")
     assert compute_context_digest(spec.context) != context_digest
     assert compute_build_key(spec) != key
+
+
+@pytest.mark.parametrize("overlay", [False, True])
+def test_external_dockerfile_ignore_changes_build_identity_without_context_changes(tmp_path: Path, overlay: bool):
+    spec = _spec(tmp_path)
+    external = tmp_path / "definitions" / "Custom.Dockerfile"
+    external.parent.mkdir()
+    external.write_bytes(spec.dockerfile.read_bytes())
+    spec = replace(spec, dockerfile=external)
+    (spec.context / ".dockerignore").write_bytes(b"fallback/**\n")
+    ignore = external.with_name(external.name + ".dockerignore")
+    ignore.write_bytes(b"private/**\n")
+    if overlay:
+        (spec.context / ".plmignore").write_bytes(b"!private/public.txt\n")
+    original_context = compute_context_digest(spec.context)
+    original_key = compute_build_key(spec)
+    ignore.write_bytes(b"private/**\nsecrets/**\n")
+    assert compute_context_digest(spec.context) == original_context
+    assert compute_build_key(spec) != original_key
+    # A present (even empty) specific ignore takes precedence over root rules.
+    ignore.write_bytes(b"")
+    selected_empty = compute_build_key(spec)
+    ignore.unlink()
+    assert compute_context_digest(spec.context) == original_context
+    assert compute_build_key(spec) != selected_empty
+
+
+def test_changed_ignore_between_inspection_and_open_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    path = tmp_path / ".plmignore"
+    path.write_bytes(b"private/**\n")
+    original_open = buildkit.os.open
+
+    def replace_before_open(source, *args, **kwargs):
+        replacement = tmp_path / "replacement"
+        replacement.write_bytes(b"public/**\n")
+        replacement.replace(path)
+        return original_open(source, *args, **kwargs)
+
+    monkeypatch.setattr(buildkit.os, "open", replace_before_open)
+    with pytest.raises(PalimpsestError):
+        buildkit._read_dockerignore(path)
+
+
+def test_definition_refuses_temporary_root_inside_context_without_writing_sources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    spec = _spec(tmp_path)
+    (spec.context / ".plmignore").write_bytes(b"private/**\n")
+    before = compute_context_digest(spec.context)
+    monkeypatch.setattr(buildkit.tempfile, "gettempdir", lambda: str(spec.context))
+    with pytest.raises(PalimpsestError):
+        with buildkit._local_dockerfile_definition(spec):
+            pytest.fail("temporary definition must not be created inside the source context")
+    assert compute_context_digest(spec.context) == before
+
+
+@pytest.mark.parametrize("role", ["root", "specific", "overlay"])
+@pytest.mark.parametrize("invalid", ["symlink", "dangling", "directory", "fifo", "utf8", "nul", "oversized"])
+def test_invalid_effective_ignore_fails_before_buildkit_or_cache(tmp_path: Path, role: str, invalid: str):
+    spec = _spec(tmp_path, offline=True, network="none")
+    path = {
+        "root": spec.context / ".dockerignore",
+        "specific": spec.dockerfile.with_name(spec.dockerfile.name + ".dockerignore"),
+        "overlay": spec.context / ".plmignore",
+    }[role]
+    if invalid in {"symlink", "dangling"}:
+        target = tmp_path / "outside-ignore"
+        if invalid == "symlink":
+            target.write_bytes(b"private/**\n")
+        path.symlink_to(target)
+    elif invalid == "directory":
+        path.mkdir()
+    elif invalid == "fifo":
+        os.mkfifo(path)
+    else:
+        path.write_bytes(
+            {
+                "utf8": b"\xff",
+                "nul": b"private\0/**\n",
+                "oversized": b"x" * (buildkit._MAX_DOCKERIGNORE_BYTES + 1),
+            }[invalid]
+        )
+    with pytest.raises(PalimpsestError):
+        compute_build_key(spec)
+    with pytest.raises(PalimpsestError):
+        with buildkit._local_dockerfile_definition(spec):
+            pytest.fail("invalid ignore reached a build definition")
+
+
+@pytest.mark.parametrize("failure", [None, "solve", "export", "promote"])
+@pytest.mark.parametrize("offline", [False, True])
+def test_plmignore_definition_lifetime_covers_export_and_failure_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str | None, offline: bool
+):
+    roots = init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    _allow_image_sources(roots)
+    spec = _spec(tmp_path, cache_mode="local", offline=offline, network="none" if offline else "default")
+    (spec.context / ".dockerignore").write_bytes(b"private/**")
+    (spec.context / ".plmignore").write_bytes(b"!private/public.txt\n")
+    source_digest = compute_context_digest(spec.context)
+
+    def source_identity(path: Path):
+        info = path.stat()
+        return info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns
+
+    source_stats = {path: source_identity(path) for path in spec.context.rglob("*")}
+    buildx = _SuccessfulBuildxRunner(spec)
+    definitions: list[Path] = []
+
+    def runner(argv, **kwargs):
+        if list(argv)[:3] == ["docker", "buildx", "build"]:
+            definition = Path(_option_values(list(argv), "--file")[0])
+            definitions.append(definition)
+            assert definition != spec.dockerfile
+            assert not definition.is_relative_to(spec.context)
+            if failure == "solve":
+                return subprocess.CompletedProcess(argv, 1, stdout="", stderr="deliberate solve failure")
+        return buildx(argv, **kwargs)
+
+    def on_export(_build_id, _manifest):
+        assert definitions[0].is_file()
+        if failure == "export":
+            raise RuntimeError("deliberate export failure")
+
+    promote = buildkit._promote_scope_cache
+
+    def on_promote(*args, **kwargs):
+        assert definitions[0].is_file()
+        if failure == "promote":
+            raise RuntimeError("deliberate promotion failure")
+        return promote(*args, **kwargs)
+
+    monkeypatch.setattr(buildkit, "_promote_scope_cache", on_promote)
+    if failure is None:
+        record = build_with_buildkit(spec, roots, runner=runner, on_oci_export=on_export)
+        assert record["build_key"] == compute_build_key(spec, builder_fingerprint=record["builder_fingerprint"])
+        assert str(definitions[0].parent) not in json.dumps(record)
+    else:
+        with pytest.raises((PalimpsestError, RuntimeError)):
+            build_with_buildkit(spec, roots, runner=runner, on_oci_export=on_export)
+    assert len(definitions) == 1
+    assert not definitions[0].parent.exists()
+    assert not list(roots.builds.rglob("*dockerignore"))
+    assert compute_context_digest(spec.context) == source_digest
+    assert {path: source_identity(path) for path in source_stats} == source_stats
 
 
 def test_build_key_includes_pinned_named_oci_context_digest(tmp_path: Path):
@@ -809,6 +974,9 @@ def test_offline_validation_rejects_remote_arg_and_external_frontend(tmp_path: P
         "#syntax=docker/dockerfile:1\nFROM scratch\n",
         "# syntax = docker/dockerfile:1\nFROM scratch\n",
         "\ufeff# syntax=docker/dockerfile:1\nFROM scratch\n",
+        "// syntax=docker/dockerfile:1\nFROM scratch\n",
+        '{"syntax":"docker/dockerfile:1"}\n',
+        "ARG BASE=ubuntu:24.04\nFROM ${BASE}\n",
         "# escape=`\nFROM scratch\nADD app.txt `\n https://example.invalid/archive.tar /opt/\n",
         "FROM scratch\nADD local.txt \\\n# benign\nhttps://example.invalid/a.tar /opt/\n",
         "FROM scratch\nADD local.txt \\\n\nhttps://example.invalid/a.tar /opt/\n",
@@ -828,7 +996,7 @@ def test_online_unpinned_sources_fail_before_buildx_preflight(tmp_path: Path, do
         calls.append([os.fspath(part) for part in argv])
         raise AssertionError("invalid online Dockerfile reached Buildx")
 
-    with pytest.raises(PalimpsestError, match="pinned|escape|checksum"):
+    with pytest.raises(PalimpsestError, match="pinned|escape|checksum|expanded"):
         build_with_buildkit(
             spec,
             init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")}),
@@ -843,10 +1011,13 @@ def test_online_unpinned_sources_fail_before_buildx_preflight(tmp_path: Path, do
     [
         f"FROM docker.io/library/ubuntu@{D_IMAGE}\n",
         f"# syntax=docker/dockerfile:1@{D_IMAGE}\nFROM scratch\n",
+        f"// syntax=docker/dockerfile:1@{D_IMAGE}\nFROM scratch\n",
     ],
 )
-def test_online_digest_pinned_sources_are_allowed(tmp_path: Path, dockerfile: str):
-    validate_online_dockerfile(_spec(tmp_path, dockerfile))
+def test_online_digest_pinned_sources_require_explicit_admission(tmp_path: Path, dockerfile: str):
+    roots = init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    _allow_image_sources(roots, ("docker.io", "library", "ubuntu"), ("docker.io", "docker", "dockerfile"))
+    validate_online_dockerfile(_spec(tmp_path, dockerfile), roots)
 
 
 @pytest.mark.parametrize("separator", ["\f", "\v", "\x85", "\u2028"])
@@ -859,8 +1030,12 @@ def test_non_lf_characters_cannot_hide_command_after_backslash(
     dockerfile = "FROM scratch\nRUN echo \\" + separator + "\nADD https://example.invalid/mutable /x\n"
     spec = _spec(tmp_path, dockerfile, offline=offline, network="none" if offline else "default")
 
+    roots = init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
     with pytest.raises(PalimpsestError):
-        (validate_offline_dockerfile if offline else validate_online_dockerfile)(spec)
+        if offline:
+            validate_offline_dockerfile(spec)
+        else:
+            validate_online_dockerfile(spec, roots)
 
 
 @pytest.mark.parametrize(
@@ -884,11 +1059,14 @@ def test_non_lf_characters_cannot_hide_command_after_backslash(
     ],
 )
 def test_online_external_sources_require_immutable_identity(tmp_path: Path, instruction: str):
+    roots = init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
     with pytest.raises(PalimpsestError):
-        validate_online_dockerfile(_spec(tmp_path, f"FROM scratch\n{instruction}\n"))
+        validate_online_dockerfile(_spec(tmp_path, f"FROM scratch\n{instruction}\n"), roots)
 
 
 def test_online_http_add_and_external_mount_allow_sha256_pins(tmp_path: Path):
+    roots = init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    _allow_image_sources(roots, ("docker.io", "library", "alpine"))
     validate_online_dockerfile(
         _spec(
             tmp_path,
@@ -898,8 +1076,167 @@ def test_online_http_add_and_external_mount_allow_sha256_pins(tmp_path: Path):
                 f"COPY --exclude=--from=seed --from=docker.io/library/alpine@{D_IMAGE} /bin/sh /bin/sh\n"
                 f"RUN --mount=type=bind,from=docker.io/library/alpine@{D_OTHER_IMAGE},target=/src true\n"
             ),
-        )
+        ),
+        roots,
     )
+
+
+@pytest.mark.parametrize("cache_mode", ["native", "local"])
+@pytest.mark.parametrize(
+    "dockerfile",
+    [
+        "FROM {source}\n",
+        "FROM scratch\nCOPY --from={source} /app /app\n",
+        "FROM scratch\nRUN --mount=type=bind,from={source},target=/src true\n",
+        "# syntax={source}\nFROM scratch\n",
+        "// syntax={source}\nFROM scratch\n",
+    ],
+)
+@pytest.mark.parametrize(
+    "source",
+    [
+        f"docker.io/library/ubuntu@{D_IMAGE}",
+        f"docker.io/library/ubuntu-extra@{D_IMAGE}",
+        f"docker.io/unknown/ubuntu@{D_IMAGE}",
+        f"docker.io/nvidia/cuda@{D_IMAGE}",
+        f"docker.io.evil.example/library/ubuntu@{D_IMAGE}",
+    ],
+)
+def test_unadmitted_sources_stop_before_builder_cache_and_staging(
+    tmp_path: Path, cache_mode: str, dockerfile: str, source: str
+):
+    roots = init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    # Even an exact configured repository requires an explicit rule; a digest
+    # or resemblance to the configured namespace is not publisher admission.
+    if source != f"docker.io/library/ubuntu@{D_IMAGE}":
+        _allow_image_sources(roots, ("docker.io", "library", "ubuntu"))
+    spec = _spec(
+        tmp_path,
+        dockerfile.format(source=source),
+        cache_mode=cache_mode,
+        output=tmp_path / "uncreated-output" / "image.tar",
+    )
+    runner = _SuccessfulBuildxRunner(spec)
+    before = set(roots.builds.iterdir())
+
+    class ForbiddenHub:
+        def __getattr__(self, name: str):
+            raise AssertionError(f"unadmitted source reached native cache operation {name}")
+
+    with pytest.raises(PalimpsestError, match="image_sources"):
+        build_with_buildkit(
+            spec,
+            roots,
+            hub_client=ForbiddenHub() if cache_mode == "native" else None,
+            cache_package=CACHE_PACKAGE if cache_mode == "native" else None,
+            runner=runner,
+        )
+    assert runner.calls == []
+    assert set(roots.builds.iterdir()) == before
+    assert not spec.output.parent.exists()
+
+
+@pytest.mark.parametrize(
+    "dockerfile",
+    [
+        "FROM {source}\n",
+        "FROM scratch\nCOPY --from={source} /app /app\n",
+        "FROM scratch\nRUN --mount=type=bind,from={source},target=/src true\n",
+        "# syntax={source}\nFROM scratch\n",
+        "// syntax={source}\nFROM scratch\n",
+    ],
+)
+@pytest.mark.parametrize("require_pins", [False, True])
+def test_exact_configured_sources_are_admitted_at_each_dockerfile_boundary(
+    tmp_path: Path, dockerfile: str, require_pins: bool
+):
+    roots = init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    _allow_image_sources(roots, ("docker.io", "nvidia", "cuda"))
+    source = f"nvidia/cuda@{D_IMAGE}" if require_pins else "nvidia/cuda:12.2.2-runtime-ubuntu22.04"
+    validate_online_dockerfile(_spec(tmp_path, dockerfile.format(source=source)), roots, require_pins=require_pins)
+
+
+@pytest.mark.parametrize("allow_docker", [False, True])
+def test_dockerfile_source_identity_ignores_package_registry_defaults_and_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, allow_docker: bool
+):
+    roots = init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    (roots.config / "registries.toml").write_text(
+        'schema_version = 1\ndefault = "corp"\n'
+        '[registries.docker]\nendpoint = "docker.io"\nnamespace = "library"\n'
+        '[registries.corp]\nendpoint = "registry.example.com"\nnamespace = "team"\n',
+        encoding="utf-8",
+    )
+    (roots.config / "registries.toml").chmod(0o600)
+    monkeypatch.setenv("PALIMPSEST_REGISTRY", "corp")
+    package_source = resolve_image_reference("ubuntu", load_registry_config(roots))
+    assert package_source.endpoint == "registry.example.com" and package_source.repository == "team/ubuntu"
+    selected = ("docker.io", "library", "ubuntu") if allow_docker else ("registry.example.com", "team", "ubuntu")
+    _allow_image_sources(roots, selected)
+    spec = _spec(tmp_path, f"FROM ubuntu@{D_IMAGE}\n", registry_profile="corp")
+    if allow_docker:
+        validate_online_dockerfile(spec, roots)
+    else:
+        with pytest.raises(PalimpsestError, match="image_sources"):
+            validate_online_dockerfile(spec, roots)
+
+
+@pytest.mark.parametrize("require_pins", [False, True])
+def test_online_verified_local_contexts_and_prior_stages_need_no_upstream_allowlist(tmp_path: Path, require_pins: bool):
+    roots = init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    layout = _write_minimal_oci_layout(tmp_path / "base-layout")
+    manifest_digest = _add_oci_descriptor(layout, b"verified local layer")
+    local = NamedOCIContext.parse(f"base={layout}@{manifest_digest}")
+    spec = _spec(
+        tmp_path,
+        "FROM base AS seed\nFROM seed AS reused\nFROM scratch\n"
+        "COPY --from=seed /app /app\n"
+        "RUN --mount=type=bind,from=base,target=/base --mount=type=bind,from=0,target=/zero true\n",
+        local_images=(local,),
+    )
+    validate_online_dockerfile(spec, roots, require_pins=require_pins)
+
+
+@pytest.mark.parametrize(
+    "instruction",
+    ["ADD https://example.invalid/archive.tar /app/", "ADD git@github.com:example/repository.git /src/"],
+)
+def test_local_cache_source_admission_does_not_expand_native_add_restrictions(tmp_path: Path, instruction: str):
+    roots = init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    _allow_image_sources(roots, ("docker.io", "library", "ubuntu"))
+    spec = _spec(tmp_path, f"FROM ubuntu@{D_IMAGE}\n{instruction}\n", cache_mode="local")
+    validate_online_dockerfile(spec, roots, require_pins=False)
+    with pytest.raises(PalimpsestError, match="checksum|remote Git"):
+        validate_online_dockerfile(spec, roots)
+    _allow_image_sources(roots)
+    with pytest.raises(PalimpsestError, match="image_sources"):
+        validate_online_dockerfile(spec, roots, require_pins=False)
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "ARG BASE=ubuntu:24.04\nFROM ${BASE} AS base\n",
+        'FROM scratch\nRUN --mount=type=bind,target="/src" true\n',
+    ],
+)
+def test_local_deferred_instruction_does_not_skip_later_literal_denial(tmp_path: Path, prefix: str):
+    roots = init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    spec = _spec(
+        tmp_path,
+        prefix + "COPY --from=docker.io/evil/base:latest /app /app\n",
+        cache_mode="local",
+        output=tmp_path / "uncreated" / "image.tar",
+    )
+    runner = _SuccessfulBuildxRunner(spec)
+    before = set(roots.builds.iterdir())
+
+    with pytest.raises(PalimpsestError, match="image_sources"):
+        build_with_buildkit(spec, roots, runner=runner)
+
+    assert runner.calls == []
+    assert set(roots.builds.iterdir()) == before
+    assert not spec.output.parent.exists()
 
 
 def test_offline_buildx_argv_uses_named_oci_context_network_none_and_local_cache(tmp_path: Path):
@@ -1324,6 +1661,125 @@ class _SuccessfulBuildxRunner:
         return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
 
 
+class _PolicyCheckingBuildxRunner(_SuccessfulBuildxRunner):
+    """Consume the real command environment/file for deferred image requests."""
+
+    def __init__(self, spec: BuildKitSpec, resolved_images: tuple[str, ...]):
+        super().__init__(spec)
+        self.resolved_images = resolved_images
+        self.loaded_policies: list[dict] = []
+
+    def __call__(self, argv, **kwargs):
+        if list(argv[:3]) == ["docker", "buildx", "build"]:
+            policy_path = kwargs["env"].get("EXPERIMENTAL_BUILDKIT_SOURCE_POLICY")
+            # A missing transport or ambient allow-all override models an
+            # unrestricted builder; deferred-denial tests must detect that.
+            policy = json.loads(Path(policy_path).read_text(encoding="utf-8")) if policy_path else {"rules": []}
+            self.loaded_policies.append(policy)
+            for image in self.resolved_images:
+                identifier = f"docker-image://{image}"
+                action = "ALLOW"
+                for rule in policy["rules"]:
+                    selector = rule["selector"]
+                    pattern = selector["identifier"]
+                    matches = (
+                        re.search(pattern, identifier) is not None
+                        if selector.get("match_type") == "REGEX"
+                        else fnmatch.fnmatchcase(identifier, pattern)
+                    )
+                    if matches:
+                        action = rule["action"]
+                if action == "DENY":
+                    self.calls.append(list(argv))
+                    return subprocess.CompletedProcess(argv, 1, stdout="", stderr=f"source policy denied {identifier}")
+        return super().__call__(argv, **kwargs)
+
+
+@pytest.mark.parametrize(
+    ("dockerfile", "resolved_images"),
+    [
+        ("ARG BASE=ubuntu:24.04\nFROM ${BASE}\n", ("docker.io/library/ubuntu:24.04",)),
+        ("# escape=`\nFROM ubuntu:24.04\nCOPY app.txt `\n /app\n", ("docker.io/library/ubuntu:24.04",)),
+        (
+            "FROM ubuntu:24.04\nRUN <<EOF\ncat <<'SQL'\nFROM users u\nSQL\nEOF\n",
+            ("docker.io/library/ubuntu:24.04",),
+        ),
+        ("FROM scratch\nCOPY <<EOF /query.sql\nFROM users u\nEOF\n", ()),
+        ('FROM --platform="linux/amd64" ubuntu:24.04\n', ("docker.io/library/ubuntu:24.04",)),
+        (
+            'FROM ubuntu:24.04\nRUN --mount=type=bind,from=ubuntu:24.04,target="/src path" true\n',
+            ("docker.io/library/ubuntu:24.04",),
+        ),
+    ],
+)
+def test_local_dynamic_and_extended_syntax_reaches_policy_bound_builder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dockerfile: str, resolved_images: tuple[str, ...]
+):
+    roots = init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    _allow_image_sources(roots, ("docker.io", "library", "ubuntu"), ("docker.io", "docker", "dockerfile"))
+    # This override would deny even the admitted requests if forwarded.
+    ambient = tmp_path / "ambient-deny.json"
+    ambient.write_text(json.dumps({"rules": [{"action": "DENY", "selector": {"identifier": "*"}}]}))
+    monkeypatch.setenv("EXPERIMENTAL_BUILDKIT_SOURCE_POLICY", str(ambient))
+    spec = _spec(tmp_path, dockerfile, cache_mode="local")
+    runner = _PolicyCheckingBuildxRunner(spec, resolved_images)
+
+    build_with_buildkit(spec, roots, runner=runner)
+
+    assert spec.output.exists()
+    assert runner.loaded_policies and runner.loaded_policies[0]["version"] == 1
+    assert any(command[:3] == ["docker", "buildx", "build"] for command in runner.calls)
+
+
+@pytest.mark.parametrize(
+    "dockerfile",
+    [
+        "FROM scratch\n# syntax=docker.io/evil/frontend:latest\n",
+        "# ordinary comment\n# syntax=docker.io/evil/frontend:latest\nFROM scratch\n",
+        "\n# syntax=docker.io/evil/frontend:latest\nFROM scratch\n",
+    ],
+)
+def test_local_inactive_frontend_comments_are_not_image_inputs(tmp_path: Path, dockerfile: str):
+    roots = init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    spec = _spec(tmp_path, dockerfile, cache_mode="local")
+    runner = _PolicyCheckingBuildxRunner(spec, ())
+
+    build_with_buildkit(spec, roots, runner=runner)
+
+    assert spec.output.exists()
+    assert runner.loaded_policies
+    # Keep the existing conservative native pinning contract unchanged.
+    with pytest.raises(PalimpsestError, match="pinned"):
+        validate_online_dockerfile(spec, roots)
+
+
+@pytest.mark.parametrize(
+    "dockerfile",
+    [
+        "ARG BASE=docker.io/evil/base:latest\nFROM ${BASE}\n",
+        "# escape=`\nFROM docker.io/evil/base:latest\n",
+        'FROM scratch\nRUN --mount=type=bind,from=docker.io/evil/base:latest,target="/src" true\n',
+        '{"syntax":"docker.io/evil/base:latest","custom":"frontend input"}\n',
+    ],
+)
+def test_deferred_upstream_denial_uses_snapshot_not_ambient_allow_all(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dockerfile: str
+):
+    roots = init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    _allow_image_sources(roots, ("docker.io", "library", "ubuntu"))
+    ambient = tmp_path / "ambient-allow.json"
+    ambient.write_text(json.dumps({"rules": [{"action": "ALLOW", "selector": {"identifier": "*"}}]}))
+    monkeypatch.setenv("EXPERIMENTAL_BUILDKIT_SOURCE_POLICY", str(ambient))
+    spec = _spec(tmp_path, dockerfile, cache_mode="local")
+    runner = _PolicyCheckingBuildxRunner(spec, ("docker.io/evil/base:latest",))
+
+    with pytest.raises(PalimpsestError, match="source policy denied"):
+        build_with_buildkit(spec, roots, runner=runner)
+
+    assert runner.loaded_policies
+    assert not spec.output.exists()
+
+
 def _write_cache_export(path: Path, marker: str) -> Path:
     path.mkdir(parents=True)
     (path / "index.json").write_text(json.dumps({"marker": marker}), encoding="utf-8")
@@ -1731,6 +2187,7 @@ def test_local_online_cache_is_warm_without_crossing_offline_or_platform_scopes(
     offline_pointer = (roots.build_cache / offline.cache_scope / "current.json").read_bytes()
 
     local = _spec(tmp_path, "FROM ubuntu:24.04\n", cache_mode="local", output=tmp_path / "local.oci.tar")
+    _allow_image_sources(roots, ("docker.io", "library", "ubuntu"))
     first = build_with_buildkit(local, roots, runner=_SuccessfulBuildxRunner(local))
     second_spec = replace(local, output=tmp_path / "warm.oci.tar")
     second = build_with_buildkit(second_spec, roots, runner=_SuccessfulBuildxRunner(second_spec))
@@ -1748,6 +2205,180 @@ def test_local_online_cache_is_warm_without_crossing_offline_or_platform_scopes(
     with pytest.raises(PalimpsestError):
         build_with_buildkit(mixed_spec, roots, hub_client=_NativeCache(), cache_package=CACHE_PACKAGE)
     assert set(roots.builds.iterdir()) == before and not mixed_spec.output.exists()
+
+
+@pytest.mark.parametrize("cache_mode", ["local", "native"])
+@pytest.mark.parametrize("export_shape", ["empty", "missing", "partial"])
+def test_cacheless_solve_preserves_prior_cache_and_native_requirement(
+    tmp_path: Path, cache_mode: str, export_shape: str
+):
+    roots = init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    _allow_image_sources(roots)
+    spec = _spec(tmp_path, cache_mode=cache_mode)
+    cache_options = {"hub_client": _NativeCache(), "cache_package": CACHE_PACKAGE} if cache_mode == "native" else {}
+    build_with_buildkit(spec, roots, runner=_SuccessfulBuildxRunner(spec), **cache_options)
+    pointers = {path: path.read_bytes() for path in roots.build_cache.rglob("current.json")}
+    buildx = _SuccessfulBuildxRunner(spec)
+
+    def without_cache_records(argv, **kwargs):
+        result = buildx(argv, **kwargs)
+        if list(argv)[:3] == ["docker", "buildx", "build"]:
+            destination = Path(_option_values(list(argv), "--cache-to")[0].split("dest=", 1)[1].split(",", 1)[0])
+            shutil.rmtree(destination)
+            if export_shape != "missing":
+                destination.mkdir()
+            if export_shape == "partial":
+                (destination / "incomplete").write_bytes(b"unfinished cache")
+        return result
+
+    if cache_mode == "local" and export_shape == "empty":
+        record = build_with_buildkit(spec, roots, runner=without_cache_records, **cache_options)
+        assert record["status"] == "success"
+        assert record["cache_exported"] is False
+        assert record["cache_archive_digest"] is None and record["bytes"]["cache_archive"] == 0
+        assert not (roots.builds / record["build_id"] / "buildkit-cache.tar").exists()
+    else:
+        with pytest.raises(PalimpsestError):
+            build_with_buildkit(spec, roots, runner=without_cache_records, **cache_options)
+    assert {path: path.read_bytes() for path in roots.build_cache.rglob("current.json")} == pointers
+
+
+@pytest.mark.parametrize("cache_mode", ["native", "local"])
+def test_revoked_image_source_cannot_reuse_a_warm_cache(tmp_path: Path, cache_mode: str):
+    roots = init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    _allow_image_sources(roots, ("docker.io", "library", "ubuntu"))
+    spec = _spec(tmp_path, f"FROM ubuntu@{D_IMAGE}\n", cache_mode=cache_mode)
+    cache = _NativeCache() if cache_mode == "native" else None
+    options = {"hub_client": cache, "cache_package": CACHE_PACKAGE} if cache is not None else {}
+    first = build_with_buildkit(spec, roots, runner=_SuccessfulBuildxRunner(spec), **options)
+    warm_spec = replace(spec, output=tmp_path / "warm.oci.tar")
+    warm = build_with_buildkit(warm_spec, roots, runner=_SuccessfulBuildxRunner(warm_spec), **options)
+    assert (first["cache_source"], warm["cache_source"]) == ("none", "local")
+    before_builds = set(roots.builds.iterdir())
+    cache_pointers = {path: path.read_bytes() for path in roots.build_cache.rglob("current.json")}
+
+    _allow_image_sources(roots)
+    denied = replace(spec, output=tmp_path / "denied" / "image.oci.tar")
+    runner = _SuccessfulBuildxRunner(denied)
+    with pytest.raises(PalimpsestError, match="image_sources"):
+        build_with_buildkit(denied, roots, runner=runner, **options)
+
+    assert runner.calls == []
+    assert set(roots.builds.iterdir()) == before_builds
+    assert {path: path.read_bytes() for path in cache_pointers} == cache_pointers
+    assert not denied.output.parent.exists()
+
+
+@pytest.mark.parametrize(
+    "buildx_version",
+    [
+        "github.com/docker/buildx v0.30.1 0123456789abcdef",
+        "github.com/docker/buildx v0.30.1-desktop.1 0123456789abcdef",
+    ],
+)
+def test_stable_buildx_and_desktop_client_versions_support_source_policy_transport(buildx_version: str):
+    buildkit._require_source_policy_transport(
+        {"buildx_version": buildx_version, "buildkit_versions": "v0.12.0,v0.32.2"}
+    )
+
+
+@pytest.mark.parametrize(
+    ("buildx_version", "buildkit_version"),
+    [
+        ("github.com/docker/buildx v0.10.0", BUILDKIT_VERSION),
+        ("github.com/docker/buildx v0.10.0-desktop.1 0123456789abcdef", BUILDKIT_VERSION),
+        ("github.com/docker/buildx v0.31.0-rc1 0123456789abcdef", BUILDKIT_VERSION),
+        ("unknown-client", BUILDKIT_VERSION),
+        (BUILDX_VERSION, "v0.10.6"),
+        (BUILDX_VERSION, "v0.11.0"),
+        (BUILDX_VERSION, "v0.11.6"),
+        (BUILDX_VERSION, "v0.32.2-dev"),
+        (BUILDX_VERSION, "v0.32.2\nBuildKit: v0.10.6"),
+    ],
+)
+def test_unestablished_source_policy_transport_fails_before_staging(
+    tmp_path: Path, buildx_version: str, buildkit_version: str
+):
+    roots = init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    _allow_image_sources(roots, ("docker.io", "library", "ubuntu"))
+    spec = _spec(tmp_path, "FROM ubuntu:24.04\n", cache_mode="local", output=tmp_path / "uncreated" / "image.oci.tar")
+
+    class UnsupportedBuilder(_SuccessfulBuildxRunner):
+        def __call__(self, argv, **kwargs):
+            if argv == ["docker", "buildx", "version"]:
+                self.calls.append(list(argv))
+                return subprocess.CompletedProcess(argv, 0, stdout=buildx_version + "\n", stderr="")
+            result = super().__call__(argv, **kwargs)
+            if argv == ["docker", "buildx", "inspect"]:
+                result.stdout = result.stdout.replace(BUILDKIT_VERSION, buildkit_version)
+            return result
+
+    before = set(roots.builds.iterdir())
+    with pytest.raises(PalimpsestError, match="source policy transport"):
+        build_with_buildkit(spec, roots, runner=UnsupportedBuilder(spec))
+    assert set(roots.builds.iterdir()) == before
+    assert not spec.output.parent.exists()
+
+
+@pytest.mark.parametrize(
+    "nodes",
+    [
+        "Name: node0\nStatus: running\nBuildKit: v0.32.2\nName: node1\nStatus: inactive\n",
+        "Name: node0\nBuildKit: v0.32.2\nName: node1\nStatus: running\n",
+        "Name: node0\nBuildKit: v0.32.2\nName: node1\nBuildKit: unknown\n",
+        "Name: node0\nBuildKit: v0.32.2\nName: node1\nBuildKit: v0.11.6\n",
+        "Name: node0\nBuildKit: v0.32.2\nBuildKit: v0.32.2\nName: node1\n",
+        "Name: node0\nStatus: inactive\nBuildKit: v0.32.2\n",
+        "",
+    ],
+)
+def test_every_selected_node_must_establish_metadata_policy_support_before_staging(tmp_path: Path, nodes: str):
+    roots = init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    spec = _spec(tmp_path, "FROM scratch\n", cache_mode="local", output=tmp_path / "uncreated" / "image.tar")
+
+    class MixedBuilder(_SuccessfulBuildxRunner):
+        def __call__(self, argv, **kwargs):
+            if argv == ["docker", "buildx", "inspect"]:
+                self.calls.append(list(argv))
+                return subprocess.CompletedProcess(
+                    argv, 0, stdout="Name: mixed\nDriver: docker-container\nNodes:\n" + nodes, stderr=""
+                )
+            return super().__call__(argv, **kwargs)
+
+    runner = MixedBuilder(spec)
+    before = set(roots.builds.iterdir())
+    with pytest.raises(PalimpsestError, match="source policy transport"):
+        build_with_buildkit(spec, roots, runner=runner)
+
+    assert set(roots.builds.iterdir()) == before
+    assert not spec.output.parent.exists()
+    assert all(
+        command in [["docker", "buildx", "inspect"], ["docker", "buildx", "version"]] for command in runner.calls
+    )
+
+
+def test_all_running_nodes_are_checked_even_when_versions_deduplicate():
+    calls: list[list[str]] = []
+
+    def runner(argv, **_kwargs):
+        calls.append(list(argv))
+        if argv == ["docker", "buildx", "inspect"]:
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout="Name: multi\nDriver: remote\nNodes:\n"
+                "Name: multi0\nStatus: running\nBuildKit version: v0.12.0\n"
+                "Name: multi1\nStatus: running\nBuildKit version: v0.12.0\n",
+                stderr="",
+            )
+        if argv == ["docker", "buildx", "version"]:
+            return subprocess.CompletedProcess(argv, 0, stdout="github.com/docker/buildx v0.11.0\n", stderr="")
+        raise AssertionError("preflight mutated the daemon")
+
+    environment: dict[str, str] = {}
+    preflight_buildx_oci_exporter(environment_out=environment, runner=runner)
+    buildkit._require_source_policy_transport(environment)
+    assert environment["buildkit_versions"] == "v0.12.0"
 
 
 def test_offline_build_never_calls_hub(tmp_path: Path):
@@ -2233,3 +2864,29 @@ def test_online_runtime_pack_hub_hit_skips_compaction_and_materializes_local_sta
         descriptor = json.load(archive.extractfile("palimpsest-cache.json"))
     assert descriptor["project_id"] == PROJECT_ID
     assert descriptor["package"] == CACHE_PACKAGE
+
+
+def test_build_record_retains_pre_solve_identity_when_context_changes_during_solve(tmp_path: Path):
+    roots = init_roots({"XDG_CONFIG_HOME": str(tmp_path / "config"), "XDG_STATE_HOME": str(tmp_path / "state")})
+    spec = _spec(tmp_path, offline=True, network="none")
+    before_context = compute_context_digest(spec.context)
+    before_dockerfile = digest_file(spec.dockerfile)
+    before_key = compute_build_key(spec, builder_fingerprint=_test_builder_fingerprint())
+    buildx = _SuccessfulBuildxRunner(spec)
+
+    def runner(argv, **kwargs):
+        if list(argv)[:3] == ["docker", "buildx", "build"]:
+            (spec.context / "app.txt").write_text("changed after the lookup scan\n", encoding="utf-8")
+            spec.dockerfile.write_text("FROM scratch\nCOPY app.txt /different-path\n", encoding="utf-8")
+        return buildx(argv, **kwargs)
+
+    record = build_with_buildkit(spec, roots, runner=runner)
+    persisted = json.loads((roots.builds / record["build_id"] / "record.json").read_text())
+    assert persisted["status"] == "success"
+    assert persisted["context_digest"] == before_context != compute_context_digest(spec.context)
+    assert persisted["dockerfile_digest"] == before_dockerfile != digest_file(spec.dockerfile)
+    assert (
+        persisted["build_key"]
+        == before_key
+        != compute_build_key(spec, builder_fingerprint=record["builder_fingerprint"])
+    )
