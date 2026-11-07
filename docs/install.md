@@ -6,11 +6,11 @@ initial configuration, upgrades, and administrator-owned Linux deployment.
 Released installations use pinned published bytes; trusted local installation below uses the actual checkout's bytes.
 
 Palimpsest Local requires Python 3.11 or newer; Hub requires Python 3.12+.
-This source prepares unpublished candidate0.3.12 from the0.3.11 source lineage; this checkpoint does not verify publication, images or deployment for either version.
+This source prepares unpublished candidate0.3.13 from the0.3.12 release lineage; this checkpoint does not verify publication, images or deployment for either version.
 SDK publication and native execution remain separately qualified. Root/Hub metadata, module versions,
 generated locks and Kolla image defaults move together. After formal publication,
 install exact client bytes with
-`uv tool install --python 3.11 palimpsest-client==0.3.12` once formally published, or install a trusted
+`uv tool install --python 3.11 palimpsest-client==0.3.13` once formally published, or install a trusted
 local checkout with `uv tool install --force --python 3.11 .`.
 A root wheel upgrade neither deploys Hub nor qualifies actual build/run behavior.
 Git/outbound GitHub HTTPS is needed only for VCS installation.
@@ -1649,7 +1649,7 @@ and the [command workflows](cli/workflows.md) for operational details.
 
 ## SDK image/native integration: operator prerequisites
 
-The `0.3.12` candidate Hub distribution declares the exact matching client dependency.
+The `0.3.13` candidate Hub distribution declares the exact matching client dependency.
 Checkout resolution uses `hub`'s explicit parent-path source; installed release
 bytes must match the same immutable tag and reviewed image digests. Paired wheel
 or local container checks do not establish production upgrade or native readiness.

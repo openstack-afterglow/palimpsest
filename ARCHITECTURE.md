@@ -3975,6 +3975,22 @@ closure copying, Linux-only tests, a real `plm run` of a pulled image on a
 separate state root, a second Apple Silicon device, and commit/release/deploy
 approvals.
 
+2026-11-08 release integration (0.3.13 candidate). The reviewed local line (dev
+7962b18 + M1 + M2, commit `f54a0d1`, which is also the lineage that production
+runs from approved source `1afca68`) was reconciled with the published 0.3.12
+release (`4905228`, never deployed to production) by applying only the 0.3.12
+delta on top of the local tree (merge base set to `6e4dff7`): numeric `X.Y.Z` tag
+triggers in `release.yml`/`hub-docker.yml`, `scripts/check_release_version.py`,
+the native-KVM tag regex, README/install version text and the 0.3.12 OpenSpec
+record are adopted; the 0.3.12 standard-role authority implementation (Hub
+`auth.py`, `policy.py`, API/service role code and their tests, smoke script) is
+replaced by the local thirteen-action cutover, and an independent comparison of
+the 0.3.12 behaviors against the local tree is recorded in the handoff.
+Metadata, locks and the Kolla image default move to 0.3.13; `ruff format` was
+applied to the 19 previously drifting files. The review stamp is recomputed from
+the committed tree (the previous working-tree stamp included an untracked file
+that CI never sees).
+
 <!-- architecture-review:start -->
 ```json
 {
