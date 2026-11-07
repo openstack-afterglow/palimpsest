@@ -120,7 +120,7 @@ EXPECTED_STAGE1_KVM_EVIDENCE_FILES = (
     "qemu-duplicate-lifecycle-name.bin",
 )
 
-_TAG_REF_RE = re.compile(r"^refs/tags/v[0-9A-Za-z._-]+$")
+_TAG_REF_RE = re.compile(r"^refs/tags/(?:v[0-9A-Za-z._-]+|(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))$")
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _RUN_NUMBER_RE = re.compile(r"^[1-9][0-9]{0,19}$")
