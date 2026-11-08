@@ -3995,13 +3995,15 @@ that CI never sees).
 
 2026-11-08 release 0.3.14 (GATE-01 follow-up). Two M2 review findings are fixed in source: the caller's quota view is served at `GET /v1/published-images/quota` (registered before the image-id route; the 0.3.13 path `/v1/image-quota/me` is removed without an alias), and staged-but-unregistered publication payloads have a per-user aggregate cap and expiry (`services/staged_payloads.py`). A staged payload counts as registered only when an image of the same project and user uses its digest, so foreign registrations neither free quota nor reveal that other bytes exist; re-staging a held digest is free; expiry also runs in export maintenance and is committed even when an upload is refused. Residual P3: the cap is evaluated after the request body is received, so a caller already over the cap can still upload up to one blob per request before the 413. An independent review of this change found and drove the fixes above; the review stamp covers source only.
 
+2026-11-08 release 0.3.15 (undeployed candidate). Enforces byte-exact `project_id` and `created_by` equality (`cast(..., LargeBinary)`) when registering publication payloads against published images and checking staged limits (`services/staged_payloads.py`) under case-insensitive SQL collations (such as SQLite NOCASE or MariaDB/MySQL default collations), preventing foreign casing variants from matching as own-images or freeing/claiming staged quota. Test limits and residuals: verified under synthetic SQLite NOCASE schema simulation in `hub/tests/test_staged_payload_limits.py`; live MariaDB reproduction was not executed in CI; existing database primary key collation collision risks remain if identity columns use case-insensitive collations. The architecture review stamp is unchanged; parent reviews and stamps after final source review.
+
 <!-- architecture-review:start -->
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "8a7453d893b33ff84290d55e52c09b2f5298e8e0625469f1b5ff52daf7771154",
-  "reviewed_at": "2026-11-08T11:29:40Z",
-  "summary": "Reviewed the 0.3.14 patch over 0.3.13: the caller's quota view moves to GET /v1/published-images/quota (clean cutover) and staged-but-unregistered publication payloads get a per-user aggregate cap and age-based expiry (own-image registration, sweep under the image mutex). Two independent read-only reviews; the second round found and drove fixes for scoped registration, mutex serialization, doc and lane gaps; no open P0/P1/P2 after fixes, with the post-body cap check recorded as a documented P3. Hub suite 1998 passed/7 skipped before the last small edits (a focused 286-test subset passed after). The stamp covers source review only and the change is not yet deployed."
+  "source_sha256": "4797b30493d1c4968901c141fc4fefef0ea250a4923916ccc6da41158de40977",
+  "reviewed_at": "2026-11-08T14:20:17Z",
+  "summary": "0.3.15 candidate: staged payload registration compares project_id/created_by byte-exactly under case-insensitive collations; reviewed source, formatting-only follow-up to the regression test, isolated SQLite NOCASE evidence, MariaDB not exercised"
 }
 ```
 <!-- architecture-review:end -->

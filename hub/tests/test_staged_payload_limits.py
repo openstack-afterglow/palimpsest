@@ -7,10 +7,17 @@ from datetime import UTC, datetime, timedelta
 import pytest
 import test_public_images
 from sqlalchemy import func, select, update
+from sqlalchemy.dialects.mysql import VARCHAR
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from test_public_images import ALICE, AMY, BOB, PROJECT_A, PROJECT_B, digest, human, publish, stage
 
-from palimpsest_hub.image_models import PalimpsestHubPublicationPayload
-from palimpsest_hub.models import RuntimeBlobReference
+from palimpsest_hub.image_models import (
+    PalimpsestHubImageMembership,
+    PalimpsestHubImageSourceBlob,
+    PalimpsestHubPublicationPayload,
+    PalimpsestHubPublishedImage,
+)
+from palimpsest_hub.models import Base, RuntimeBlobReference
 from palimpsest_hub.services import staged_payloads
 
 hub_images = test_public_images.hub_images
@@ -177,3 +184,79 @@ async def test_restaging_refreshes_the_age_so_an_in_progress_push_is_not_expired
     async with h.factory() as session:
         kept = set((await session.scalars(select(PalimpsestHubPublicationPayload.blob_digest))).all())
     assert digest(payload) in kept
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("image_project,image_user", [("project", "User"), ("Project", "user")])
+@pytest.mark.parametrize("source", [False, True])
+async def test_registration_requires_byte_exact_principal_under_nocase(
+    tmp_path, monkeypatch, image_project, image_user, source
+):
+    with monkeypatch.context() as schema:
+        for model in (PalimpsestHubPublishedImage, PalimpsestHubPublicationPayload):
+            for name, length in (("project_id", 64), ("created_by", 128)):
+                schema.setattr(model.__table__.c[name], "type", VARCHAR(length, collation="NOCASE"))
+        engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'staged-nocase.sqlite'}")
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    foreign_digest, own_digest = digest(b"foreign"), digest(b"own")
+    try:
+        async with factory() as session:
+            for image_id, project, user, blob in (
+                ("foreign", image_project, image_user, foreign_digest),
+                ("own", "Project", "User", own_digest),
+            ):
+                session.add(
+                    PalimpsestHubPublishedImage(
+                        id=image_id,
+                        project_id=project,
+                        created_by=user,
+                        request_id=image_id,
+                        name=image_id,
+                        manifest_digest=blob,
+                        manifest_json={},
+                        leaf_id=blob,
+                        storage_binding_json={},
+                    )
+                )
+                session.add(
+                    PalimpsestHubPublicationPayload(
+                        project_id="Project", created_by="User", blob_digest=blob, size_bytes=400
+                    )
+                )
+                if source:
+                    session.add(
+                        PalimpsestHubImageSourceBlob(
+                            image_id=image_id,
+                            role="manifest",
+                            ordinal=0,
+                            project_id=project,
+                            blob_digest=blob,
+                            size_bytes=400,
+                        )
+                    )
+                else:
+                    session.add(
+                        PalimpsestHubImageMembership(
+                            image_id=image_id, ordinal=0, project_id=project, node_id=blob, blob_digest=blob
+                        )
+                    )
+            await session.commit()
+        async with factory() as session:
+            with pytest.raises(staged_payloads.StagedQuotaExceeded) as refused:
+                await staged_payloads.enforce_staging_limits(
+                    session, "Project", "User", digest(b"new"), 201, max_bytes=600, ttl_seconds=3600
+                )
+            assert refused.value.detail["staged_bytes"] == 400
+            await session.execute(
+                update(PalimpsestHubPublicationPayload).values(
+                    created_at=(datetime.now(UTC) - timedelta(hours=2)).replace(tzinfo=None)
+                )
+            )
+            assert await staged_payloads.expire_staged_payloads(session, ttl_seconds=3600) == 1
+            await session.commit()
+            remaining = set((await session.scalars(select(PalimpsestHubPublicationPayload.blob_digest))).all())
+            assert remaining == {own_digest}
+    finally:
+        await engine.dispose()

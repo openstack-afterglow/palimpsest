@@ -13,7 +13,7 @@ import hashlib
 from datetime import UTC, datetime, timedelta
 
 from fastapi import HTTPException
-from sqlalchemy import and_, exists, func, select
+from sqlalchemy import LargeBinary, and_, cast, exists, func, select
 
 from palimpsest_hub.image_models import (
     PalimpsestHubImageMembership,
@@ -41,6 +41,8 @@ def _registered(row=PalimpsestHubPublicationPayload):
     own_image = and_(
         PalimpsestHubPublishedImage.project_id == row.project_id,
         PalimpsestHubPublishedImage.created_by == row.created_by,
+        cast(PalimpsestHubPublishedImage.project_id, LargeBinary) == cast(row.project_id, LargeBinary),
+        cast(PalimpsestHubPublishedImage.created_by, LargeBinary) == cast(row.created_by, LargeBinary),
     )
     layer = exists().where(
         PalimpsestHubImageMembership.blob_digest == row.blob_digest,

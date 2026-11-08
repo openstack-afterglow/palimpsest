@@ -7,7 +7,7 @@ New test files and their lanes (classified in `scripts/test_lanes.py`):
 | File | Lane | Covers |
 | --- | --- | --- |
 | `hub/tests/test_image_quota.py` | `hub` | seeds vs. DB authority, unique-name counts, distinct-digest chain/source bytes, policy/tier admin routes, `/v1/published-images/quota`, physical report, lowered limits |
-| `hub/tests/test_staged_payload_limits.py` | `hub` | per-user staged-but-unregistered payload byte cap (structured 413), expiry with `image-stage` reference release even on refusal, scoped registration (foreign registrations neither free quota nor leak existence), free re-staging, maintenance sweep |
+| `hub/tests/test_staged_payload_limits.py` | hub | per-user staged-but-unregistered payload byte cap (structured 413), expiry with image-stage reference release even on refusal, scoped registration with byte-exact project/user equality under CI SQL NOCASE collation (foreign casing neither frees quota nor leaks existence), free re-staging, maintenance sweep |
 | `hub/tests/test_image_jobs_quota.py` | `hub` | worker completion settling quota refusals as terminal job errors |
 | `hub/tests/test_image_source_closure.py` | `hub` | closure shape, manifest commitment, own-staging, OCI document coherence, duplicate keys, closure blob serving |
 | `hub/tests/test_image_keys.py` | `hub` | `ppi_v1_` issue/list/revoke, action ceilings, active-key cap, membership revalidation, `ppk_v1` refusal |
@@ -38,7 +38,7 @@ Silicon device. `FakeHub` in `tests/unit/test_hub_publish.py` routes before
 recording (stray local traffic is ignored), tracks staging per (project, user) and
 applies the real Hub's publish-only staging precheck before the request-id
 lookup; publish-only-key replay, credential-owned attempts and the staging sweep
-have regression tests there.
+have regression tests there. 0.3.15 is an undeployed candidate: the staged payload byte-exact principal registration fix is covered by simulated SQLite NOCASE tests in `hub/tests/test_staged_payload_limits.py`; live MariaDB reproduction was not executed in CI, and existing database primary key collation collision residuals remain when tables use case-insensitive collations for unique identity columns.
 
 macOS caveats: tests that spoof `sys.platform` to Linux can make `SourceCAS`
 issue Linux `openat2` syscall numbers and kill the interpreter on Darwin.
