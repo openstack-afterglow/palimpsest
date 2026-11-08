@@ -134,6 +134,7 @@ SPECIAL_FILES = {
             "image_keys",
             "image_quota",
             "image_source_closure",
+            "staged_payload_limits",
             "public_images",
             "image_executor",
             "instances",

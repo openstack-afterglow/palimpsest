@@ -141,7 +141,6 @@ def _execution_path(request: Request) -> bool:
         "/v1/published-images",
         "/v1/layer-nodes",
         "/v1/native-instances",
-        "/v1/image-quota",
         "/v1/admin/image-quota",
     )
     return any(path == root or path.startswith(root + "/") for root in roots)

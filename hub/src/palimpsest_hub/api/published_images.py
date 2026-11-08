@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Literal
@@ -36,7 +35,7 @@ from palimpsest_hub.image_models import (
     PalimpsestHubPublishedImage,
 )
 from palimpsest_hub.models import PalimpsestHubUpload, exact_identity
-from palimpsest_hub.services import image_keys, public_images
+from palimpsest_hub.services import image_keys, image_quota, public_images, staged_payloads
 from palimpsest_hub.services import published_images as service
 from palimpsest_hub.services.blob_references import retain_blob
 from palimpsest_hub.services.image_jobs import _receive, fresh_writer, now
@@ -261,6 +260,21 @@ async def stage_payload(digest: str, request: Request, actor: dict = Depends(ima
         sql_mutex(factory, service.IMAGE_MUTEX) as session,
     ):
         await _fresh_writer(actor)
+        settings = get_settings()
+        try:
+            await staged_payloads.enforce_staging_limits(
+                session,
+                project,
+                actor["user_id"],
+                digest,
+                size,
+                max_bytes=getattr(settings, "palimpsest_hub_staged_max_bytes", staged_payloads.DEFAULT_MAX_BYTES),
+                ttl_seconds=getattr(settings, "palimpsest_hub_staged_ttl_seconds", staged_payloads.DEFAULT_TTL_SECONDS),
+            )
+        except staged_payloads.StagedQuotaExceeded as refusal:
+            if refusal.removed:
+                await session.commit()
+            raise
         await _run_blocking(store.publish_verified, path, verified)
         row = await session.get(
             PalimpsestHubPublicationPayload,
@@ -274,11 +288,14 @@ async def stage_payload(digest: str, request: Request, actor: dict = Depends(ima
             )
         elif row.project_id != project or row.created_by != actor["user_id"] or row.size_bytes != size:
             raise HTTPException(status_code=409, detail="publication payload size conflicts")
+        else:
+            # Re-staging refreshes the age, so a push in progress never loses its payload to expiry.
+            row.created_at = now().replace(tzinfo=None)
         await retain_blob(
             session,
             digest,
             "image-stage",
-            hashlib.sha256((project + "\0" + actor["user_id"]).encode("utf-8")).hexdigest(),
+            staged_payloads.reference_id(project, actor["user_id"]),
         )
         await session.commit()
     return {"digest": digest, "size_bytes": size}
@@ -352,6 +369,16 @@ async def extension(request: Request, actor: dict = Depends(image_writer)):
         metadata=payload.metadata,
         recheck=lambda: _fresh_writer(actor),
     )
+
+
+@router.get("/published-images/quota", operation_id="get_my_image_quota")
+async def my_quota(actor: dict = Depends(image_graph_reader)):
+    """The caller's own quota view; registered before ``/published-images/{image_id}``."""
+    current = {"user_id": actor.get("user_id"), "project_id": package_target_project_id(actor)}
+    if not current["user_id"] or not current["project_id"]:
+        raise HTTPException(status_code=403, detail="authenticated image identity is required")
+    async with _factory_or_503()() as session:
+        return await image_quota.caller_usage(session, current)
 
 
 @router.get("/published-images/{image_id}", operation_id="get_published_image")

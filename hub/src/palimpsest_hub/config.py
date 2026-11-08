@@ -228,6 +228,9 @@ class Settings(DatabaseSettings):
     palimpsest_hub_local_path: str
     palimpsest_hub_max_blob_bytes: int = Field(default=107374182400, ge=1)
     palimpsest_hub_max_bundle_expanded_bytes: int = Field(default=107374182400, ge=1)
+    # Staged-but-unregistered publication payloads: per user and project aggregate bytes and idle lifetime.
+    palimpsest_hub_staged_max_bytes: int = Field(default=200 * 1024**3, ge=1)
+    palimpsest_hub_staged_ttl_seconds: int = Field(default=24 * 3600, ge=60)
     palimpsest_hub_max_blocking_operations: int = Field(default=2, ge=1, le=16)
     # The control plane admits remote builds only when a worker secret is configured.
     palimpsest_hub_build_worker_key: SecretStr = SecretStr("")

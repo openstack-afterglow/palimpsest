@@ -276,6 +276,14 @@ def describe_hub_error(
             f"Hub image {label} size limit exceeded: the image's distinct {kind} {sizes}. Reduce the image, "
             f"choose another visibility{hint}, or ask a Hub administrator for a larger tier."
         )
+    if status == 413 and code == "staged_payload_limit":
+        staged, limit = number("staged_bytes"), number("limit_bytes")
+        sizes = f" ({staged} of {limit} bytes in use)" if staged is not None and limit is not None else ""
+        return (
+            f"Hub refused to stage more payload bytes{sizes}: unpublished staged uploads count against a per-user "
+            "limit and expire after the Hub's retention period. Publish or wait for the staged payloads to expire, "
+            "or ask a Hub administrator to raise the limit."
+        )
     if status == 413:
         return "Hub refused the image because it exceeds the server's maximum image stack size (HTTP 413)."
     if status == 403:

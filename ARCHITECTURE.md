@@ -33,7 +33,7 @@ exactly these as a terminal job `error` instead of an uncertain worker halt.
 human system administrators (`require_admin`, `system:manage`), `GET
 /v1/admin/image-quota/policies`, `PUT .../policies/{tier}/{visibility}`, `GET|PUT
 .../tiers/{subject_kind}/{subject_id}`, `GET .../usage?subject_kind=&subject_id=`
-and `GET .../physical`. `GET /v1/image-quota/me` needs `packages:inventory` on a
+and `GET .../physical`. `GET /v1/published-images/quota` needs `packages:inventory` on a
 Keystone token or `images:read` on an image key; anonymous callers get 401 and
 publish-only keys 403. Lowering a policy or tier never deletes images.
 Known consequences: limits cap distinct names and per-image chain/source bytes,
@@ -2651,6 +2651,8 @@ Hub 요청 자원 상한은 다음이 전부다. 고정 상수는 배포 설정�
 | --- | --- | --- | --- |
 | `PALIMPSEST_HUB_MAX_BLOB_BYTES` | 설정, 기본 100GiB | `PATCH/PUT /v1/uploads`, bundle blob, export 승격 | 413 |
 | `PALIMPSEST_HUB_MAX_BUNDLE_EXPANDED_BYTES` | 설정, 기본 100GiB | `POST /v1/bundles/import` 확장 총량 | 413 |
+| `PALIMPSEST_HUB_STAGED_MAX_BYTES` | 설정, 기본 200GiB | `PUT /v1/published-images/blobs/{digest}`: 같은 project·user가 등록하지 않은 staged payload 합계(같은 digest 재stage는 무료) | 413 `staged_payload_limit` |
+| `PALIMPSEST_HUB_STAGED_TTL_SECONDS` | 설정, 기본 24시간(최소 60초) | 등록되지 않은 staged payload 만료: 같은 user의 다음 stage와 export maintenance가 행과 `image-stage` blob 참조를 제거(CAS 바이트는 직접 지우지 않음) | — |
 | `PALIMPSEST_HUB_MAX_BLOCKING_OPERATIONS` | 설정, 기본2 (1–16) | 모든 hash/copy/parse/fsync worker | 대기 |
 | bundle upload 원본 바이트 | 고정 64GiB | `POST /v1/bundles/import` 수신 | 413 |
 | bundle member 수 | 고정 4096 | bundle tar header scan | 413 |
@@ -3991,13 +3993,15 @@ applied to the 19 previously drifting files. The review stamp is recomputed from
 the committed tree (the previous working-tree stamp included an untracked file
 that CI never sees).
 
+2026-11-08 release 0.3.14 (GATE-01 follow-up). Two M2 review findings are fixed in source: the caller's quota view is served at `GET /v1/published-images/quota` (registered before the image-id route; the 0.3.13 path `/v1/image-quota/me` is removed without an alias), and staged-but-unregistered publication payloads have a per-user aggregate cap and expiry (`services/staged_payloads.py`). A staged payload counts as registered only when an image of the same project and user uses its digest, so foreign registrations neither free quota nor reveal that other bytes exist; re-staging a held digest is free; expiry also runs in export maintenance and is committed even when an upload is refused. Residual P3: the cap is evaluated after the request body is received, so a caller already over the cap can still upload up to one blob per request before the 413. An independent review of this change found and drove the fixes above; the review stamp covers source only.
+
 <!-- architecture-review:start -->
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "b5bfbaa2e719a8b09a115279cabec0bcfa7aed8c47d4c2d7fe2fff48a029ab66",
-  "reviewed_at": "2026-11-07T19:00:16Z",
-  "summary": "Reviewed the 0.3.13 line (local dev, native thirteen-action role cutover, M1 Lima VZ arm64 native root, M2 Hub image quotas/keys/anonymous public reads/OCI source closure/client published push-pull-status) reconciled with the published 0.3.12 release infrastructure; independent security, merge-integrity, architecture and release-gap reviews found no open P0/P1/P2 after fixes. Verification is test-passed and hosted-CI based; the 0.3.13 release was published and deployed to the three controllers with read-only live verification recorded in the handoff. The stamp is computed from the committed tree and covers source review only."
+  "source_sha256": "8a7453d893b33ff84290d55e52c09b2f5298e8e0625469f1b5ff52daf7771154",
+  "reviewed_at": "2026-11-08T11:29:40Z",
+  "summary": "Reviewed the 0.3.14 patch over 0.3.13: the caller's quota view moves to GET /v1/published-images/quota (clean cutover) and staged-but-unregistered publication payloads get a per-user aggregate cap and age-based expiry (own-image registration, sweep under the image mutex). Two independent read-only reviews; the second round found and drove fixes for scoped registration, mutex serialization, doc and lane gaps; no open P0/P1/P2 after fixes, with the post-body cap check recorded as a documented P3. Hub suite 1998 passed/7 skipped before the last small edits (a focused 286-test subset passed after). The stamp covers source review only and the change is not yet deployed."
 }
 ```
 <!-- architecture-review:end -->

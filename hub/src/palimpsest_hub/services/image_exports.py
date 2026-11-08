@@ -61,6 +61,8 @@ from palimpsest_hub.services.hub_store import (
     acquire_lock_by_polling,
     get_blob_store,
 )
+from palimpsest_hub.services.staged_payloads import DEFAULT_TTL_SECONDS as STAGED_TTL_DEFAULT
+from palimpsest_hub.services.staged_payloads import expire_staged_payloads
 from palimpsest_hub.services.worker_leases import LeaseLost, role_lease, run_blocking
 
 _logger = logging.getLogger(__name__)
@@ -1700,7 +1702,37 @@ async def _remove_stale_scratch(lease, entry: Path, max_age_seconds: int) -> Non
             await run_blocking(_remove_scratch_dir, entry)
 
 
+async def _expire_staged_payloads(lease) -> None:
+    """Drop idle unregistered publication staging so its blobs become collectable.
+
+    Runs under the same single-flight mutex as staging and publication, so a concurrent stage
+    can never lose a freshly written row or reference. The role lease is verified around each
+    batch instead of holding its row transaction across the mutex.
+    """
+    from palimpsest_hub.services.published_images import IMAGE_MUTEX
+    from palimpsest_hub.services.worker_leases import sql_mutex
+
+    try:
+        ttl = getattr(get_settings(), "palimpsest_hub_staged_ttl_seconds", STAGED_TTL_DEFAULT)
+        factory = get_session_factory()
+        if factory is None:
+            return
+        while True:
+            lease.ensure_owned()
+            async with sql_mutex(factory, IMAGE_MUTEX) as session:
+                removed = await expire_staged_payloads(session, ttl_seconds=ttl)
+                await session.commit()
+            lease.ensure_owned()
+            if not removed:
+                return
+    except LeaseLost:
+        raise
+    except Exception:
+        _logger.warning("Staged payload expiry failed")
+
+
 async def _run_export_maintenance(lease, max_age_seconds: int) -> None:
+    await _expire_staged_payloads(lease)
     try:
         blob_store = get_blob_store()
     except Exception:

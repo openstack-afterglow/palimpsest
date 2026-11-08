@@ -1,4 +1,4 @@
-"""Administrator image-quota policy and accounting, plus the caller's own quota view."""
+"""Administrator image-quota policy and accounting routes."""
 
 from __future__ import annotations
 
@@ -10,8 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from palimpsest_hub.api import hub
 from palimpsest_hub.api.hub import _factory_or_503
-from palimpsest_hub.api.published_images import image_graph_reader
-from palimpsest_hub.auth import package_target_project_id, require_admin
+from palimpsest_hub.auth import require_admin
 from palimpsest_hub.config import validate_keystone_id
 from palimpsest_hub.services import image_quota as service
 from palimpsest_hub.services import published_images
@@ -112,13 +111,3 @@ async def physical(_: dict = Depends(require_admin)):
         store = None  # Reported as null capacity, never guessed.
     async with _factory_or_503()() as session:
         return await service.physical_report(session, store, manila=manila)
-
-
-# Self-service lives outside /published-images/ (owned by the access slice) to avoid route ownership overlap.
-@router.get("/image-quota/me", operation_id="get_my_image_quota")
-async def my_quota(actor: dict = Depends(image_graph_reader)):
-    current = {"user_id": actor.get("user_id"), "project_id": package_target_project_id(actor)}
-    if not current["user_id"] or not current["project_id"]:
-        raise HTTPException(status_code=403, detail="authenticated image identity is required")
-    async with _factory_or_503()() as session:
-        return await service.caller_usage(session, current)
