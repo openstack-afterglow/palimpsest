@@ -37,6 +37,7 @@ from sqlalchemy import select
 from palimpsest_hub.auth import package_target_project_id, validate_token
 from palimpsest_hub.models import RuntimeBlobReference, exact_identity
 from palimpsest_hub.native_models import PalimpsestNativeInstance
+from palimpsest_hub.services import preflight
 from palimpsest_hub.services.hub_store import HubStoreError
 from palimpsest_hub.services.worker_leases import run_blocking, sql_mutex
 
@@ -785,6 +786,8 @@ async def create(factory, store, settings, actor, conn, request, *, background=N
             if existing.created_by != actor["user_id"] or existing.request_digest != fingerprint:
                 raise HTTPException(409, "Native request ID is already bound to another immutable request")
             return projection(existing)
+    # Replays above stay idempotent; a new native allocation needs the access preflight first.
+    preflight.require(conn, actor, preflight.PreflightNeed(shared_files=True), interface=settings.os_interface)
 
     profile = _profile(settings, request["profile"])
     project, user = _scope(actor, conn, profile)

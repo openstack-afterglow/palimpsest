@@ -69,6 +69,19 @@ class Provider:
         self.block_storage = self
         self._afterglow_project_id = PROJECT
         self._afterglow_user_id = USER
+        self.session = SimpleNamespace(get_endpoint=lambda service_type, interface=None: "https://endpoint.invalid")
+
+    def get_limits(self):
+        return SimpleNamespace(
+            absolute=SimpleNamespace(
+                instances=-1,
+                instances_used=0,
+                max_total_volumes=-1,
+                total_volumes_used=0,
+                max_total_volume_gigabytes=-1,
+                total_gigabytes_used=0,
+            )
+        )
 
     def get_image(self, image_id):
         return {
@@ -234,6 +247,7 @@ async def instance_hub(tmp_path, monkeypatch):
         palimpsest_hub_instance_cluster_profiles={},
         palimpsest_hub_build_worker_key=SecretStr("test-worker-secret-" + "x" * 32),
         palimpsest_hub_instance_ca_certificates=(),
+        os_interface="internal",
     )
     async with factory() as session:
         session.add_all(
@@ -369,6 +383,46 @@ async def test_create_idempotency_durable_snapshot_and_provider_active_not_ready
     assert bdm["delete_on_termination"] is True and bdm["source_type"] == "volume"
     assert bdm["uuid"] == item["boot_volume_id"]
     assert h.provider.volume_creates[0]["image_id"] == body["image_id"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("break_it", "status", "check"),
+    [
+        (
+            lambda p: setattr(p, "session", SimpleNamespace(get_endpoint=lambda service_type, interface=None: None)),
+            424,
+            "catalog",
+        ),
+        (
+            lambda p: setattr(
+                p, "get_limits", lambda: SimpleNamespace(absolute=SimpleNamespace(instances=1, instances_used=1))
+            ),
+            409,
+            "quota",
+        ),
+    ],
+)
+async def test_failed_preflight_returns_structured_4xx_and_allocates_nothing(instance_hub, break_it, status, check):
+    h = instance_hub
+    break_it(h.provider)
+    response = await create_and_advance(h, json=request_body())
+    assert response.status_code == status, response.text
+    detail = response.json()["detail"]
+    assert detail["code"] == "preflight_failed" and any(item["check"] == check for item in detail["failures"])
+    assert h.provider.creates == h.provider.volume_creates == []
+
+
+@pytest.mark.asyncio
+async def test_replay_of_an_existing_request_survives_a_later_quota_exhaustion(instance_hub):
+    h = instance_hub
+    body = request_body()
+    first = await create_and_advance(h, json=body)
+    assert first.status_code == 202, first.text
+    h.provider.get_limits = lambda: SimpleNamespace(absolute=SimpleNamespace(instances=1, instances_used=1))
+    again = await create_and_advance(h, json=body)
+    assert again.status_code == 202 and again.json()["id"] == first.json()["id"]
+    assert len(h.provider.creates) == 1
 
 
 @pytest.mark.asyncio
