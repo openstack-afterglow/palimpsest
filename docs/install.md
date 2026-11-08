@@ -1,5 +1,9 @@
 # Detailed installation and configuration guide
 
+## 0.3.14 transition note — 2026-11-08 (UTC)
+
+0.3.14 is a patch over 0.3.13: the caller's quota view moves from `GET /v1/image-quota/me` to `GET /v1/published-images/quota` (no alias, so any monitor or smoke check must use the new path and expect 404 on the old one), and Hub bounds staged-but-unregistered publication payloads. The new settings are `PALIMPSEST_HUB_STAGED_MAX_BYTES` (Kolla `palimpsest_hub_staged_max_bytes`, default 214748364800, sized for the largest chain plus source any tier allows) and `PALIMPSEST_HUB_STAGED_TTL_SECONDS` (Kolla `palimpsest_hub_staged_ttl_seconds`, default 86400); the export worker also needs the TTL to expire idle staging. There is no schema change, so no bootstrap run is required; use the 0.3.13 gate below (with the new path in step 6) for backup, writer stop and rollback.
+
 ## 0.3.13 transition gate — 2026-11-08 (UTC)
 
 This candidate contains the local reviewed line (SDK/publication source, native thirteen-action role cutover, M1 Lima VZ arm64 native root, M2 Hub image quotas/tiers, `ppi_v1_` image keys, anonymous public image reads, OCI source-closure publication) on top of the published 0.3.12 release infrastructure. Use the new immutable numeric `0.3.13` tag after exact-SHA CI and publication; published `0.3.12` is not reused. All three API/export cohorts and the separate HTTPS build-worker cohort must run the same reviewed release. Updating the operator wheel/default tag is not a rollout.
@@ -1160,6 +1164,8 @@ Optional settings and defaults:
 | `DATABASE_UNHEALTHY_SECONDS` | `30` seconds, valid 1–3600 |
 | `PALIMPSEST_HUB_MAX_BLOB_BYTES` | `107374182400` bytes (100 GiB), minimum 1 |
 | `PALIMPSEST_HUB_MAX_BUNDLE_EXPANDED_BYTES` | `107374182400` bytes (100 GiB), minimum 1; total expansion allowed for one imported bundle |
+| `PALIMPSEST_HUB_STAGED_MAX_BYTES` | `214748364800` bytes (200 GiB), minimum 1; per user and project aggregate of staged-but-unregistered publication payloads (a digest used by an image of the same project and user is registered and does not count); overflow returns 413 `staged_payload_limit` |
+| `PALIMPSEST_HUB_STAGED_TTL_SECONDS` | `86400`, minimum 60; unregistered staged payloads older than this are removed with their `image-stage` blob reference on the same user's next staging request and by export maintenance, so the bytes become collectable |
 | `PALIMPSEST_HUB_MAX_BLOCKING_OPERATIONS` | `2`, valid 1–16; process-wide concurrent hash/copy/parse workers |
 | `PALIMPSEST_HUB_BUILD_WORKER_KEY` | Empty: build admission returns 503 `isolated build worker is not configured`. For remote builds, `SecretStr` of 32–4096 printable non-space ASCII characters; provision privately and match the worker keyfile. |
 | `PALIMPSEST_HUB_BUILD_TIMEOUT_SECONDS` | `3600`, valid 60–3600; fixes the claim deadline at `started_at + timeout`; expiry is terminal `worker_interrupted`, never replay. |
@@ -1196,7 +1202,7 @@ them.
   and `GET /v1/published-images/{id}/blobs/{digest}`. The anonymous projection
   omits `created_by`, `storage_binding` and `project_id`. A request with a
   present but invalid credential is 401, never served anonymously. Graph routes,
-  `GET /v1/image-quota/me`, key management and all writes still require a
+  `GET /v1/published-images/quota`, key management and all writes still require a
   credential. A public image's source-closure config blob, when published,
   exposes its environment values to anonymous readers.
 - **Rate limit and proxies.** The limiter keys on uvicorn's resolved

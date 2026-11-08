@@ -1,7 +1,7 @@
 ---
 # Palimpsest kolla role defaults
 
-palimpsest_image_tag: "0.3.13"
+palimpsest_image_tag: "0.3.14"
 palimpsest_image_namespace: "ghcr.io/openstack-afterglow"
 palimpsest_api_image: "{{ palimpsest_image_namespace }}/palimpsest-hub-api"
 palimpsest_worker_image: "{{ palimpsest_image_namespace }}/palimpsest-hub-worker"
@@ -155,6 +155,8 @@ palimpsest_policy_dirs: []
 palimpsest_policy_source: ""
 palimpsest_hub_max_blob_bytes: 107374182400
 palimpsest_hub_max_bundle_expanded_bytes: 107374182400
+palimpsest_hub_staged_max_bytes: 214748364800
+palimpsest_hub_staged_ttl_seconds: 86400
 palimpsest_hub_max_blocking_operations: 2
 
 palimpsest_public_haproxy_enabled: false
@@ -235,6 +237,8 @@ palimpsest_hub_api_service:
     PALIMPSEST_HUB_LOCAL_PATH: "{{ palimpsest_hub_path }}"
     PALIMPSEST_HUB_MAX_BLOB_BYTES: "{{ palimpsest_hub_max_blob_bytes | string }}"
     PALIMPSEST_HUB_MAX_BUNDLE_EXPANDED_BYTES: "{{ palimpsest_hub_max_bundle_expanded_bytes | string }}"
+    PALIMPSEST_HUB_STAGED_MAX_BYTES: "{{ palimpsest_hub_staged_max_bytes | string }}"
+    PALIMPSEST_HUB_STAGED_TTL_SECONDS: "{{ palimpsest_hub_staged_ttl_seconds | string }}"
     PALIMPSEST_HUB_MAX_BLOCKING_OPERATIONS: "{{ palimpsest_hub_max_blocking_operations | string }}"
     PALIMPSEST_HUB_REGISTRY_HOSTS: "{{ palimpsest_registry_hosts | to_json }}"
     PALIMPSEST_HUB_IMAGE_SOURCE_POLICY: "{{ palimpsest_image_source_policy | to_json }}"
@@ -338,6 +342,7 @@ palimpsest_hub_worker_service:
     PALIMPSEST_HUB_PACKAGE_FORBIDDEN_USER_IDS: "{{ palimpsest_package_forbidden_user_ids | to_json }}"
     PALIMPSEST_HUB_LOCAL_PATH: "{{ palimpsest_hub_path }}"
     PALIMPSEST_HUB_MAX_BLOB_BYTES: "{{ palimpsest_hub_max_blob_bytes | string }}"
+    PALIMPSEST_HUB_STAGED_TTL_SECONDS: "{{ palimpsest_hub_staged_ttl_seconds | string }}"
     OS_AUTH_URL: "{{ palimpsest_keystone_auth_url }}"
     OS_USERNAME: "{{ palimpsest_keystone_user }}"
     OS_PROJECT_NAME: "{{ palimpsest_service_project_name }}"

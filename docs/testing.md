@@ -6,7 +6,8 @@ New test files and their lanes (classified in `scripts/test_lanes.py`):
 
 | File | Lane | Covers |
 | --- | --- | --- |
-| `hub/tests/test_image_quota.py` | `hub` | seeds vs. DB authority, unique-name counts, distinct-digest chain/source bytes, policy/tier admin routes, `/v1/image-quota/me`, physical report, lowered limits |
+| `hub/tests/test_image_quota.py` | `hub` | seeds vs. DB authority, unique-name counts, distinct-digest chain/source bytes, policy/tier admin routes, `/v1/published-images/quota`, physical report, lowered limits |
+| `hub/tests/test_staged_payload_limits.py` | `hub` | per-user staged-but-unregistered payload byte cap (structured 413), expiry with `image-stage` reference release even on refusal, scoped registration (foreign registrations neither free quota nor leak existence), free re-staging, maintenance sweep |
 | `hub/tests/test_image_jobs_quota.py` | `hub` | worker completion settling quota refusals as terminal job errors |
 | `hub/tests/test_image_source_closure.py` | `hub` | closure shape, manifest commitment, own-staging, OCI document coherence, duplicate keys, closure blob serving |
 | `hub/tests/test_image_keys.py` | `hub` | `ppi_v1_` issue/list/revoke, action ceilings, active-key cap, membership revalidation, `ppk_v1` refusal |

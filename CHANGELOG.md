@@ -4,6 +4,26 @@ All notable changes to Palimpsest Local are documented here.
 
 ## [Unreleased]
 
+## [0.3.14] - 2026-11-08 (UTC)
+
+### Changed
+
+- The caller's own image quota view moves from `GET /v1/image-quota/me` to
+  `GET /v1/published-images/quota` (clean cutover, no alias). The admin routes under
+  `/v1/admin/image-quota/` are unchanged.
+- Staged-but-unregistered publication payloads are bounded per user and project: an aggregate
+  byte cap (`PALIMPSEST_HUB_STAGED_MAX_BYTES`, default 200 GiB, Kolla `palimpsest_hub_staged_max_bytes`)
+  rejects the overflowing upload with 413 and the structured code `staged_payload_limit`
+  (`limit_bytes`, `staged_bytes`; the client prints an actionable message). Payloads older than
+  `PALIMPSEST_HUB_STAGED_TTL_SECONDS` (default 24 h, Kolla `palimpsest_hub_staged_ttl_seconds`) that no image of the same project and user uses
+  are removed together with their `image-stage` blob reference, on that user's next staging request
+  (committed even when the upload is refused) and by export maintenance under the image mutex, so the
+  bytes become collectable. Expiry is age-based, measured from the latest stage (re-staging refreshes it). A payload counts as
+  registered only when an image published by the same project and user uses its digest; another
+  project's or user's registration neither frees quota nor reveals that the bytes exist. Re-staging a
+  held digest is free. CAS bytes are never deleted by this path. The cap is evaluated after the request
+  body is received (documented residual).
+
 ## [0.3.13] - 2026-11-08 (UTC; published to PyPI/GHCR and deployed to the three DMS Lab controllers)
 
 Supersedes the 0.3.12 release candidate below: this version keeps 0.3.12's SDK publication and

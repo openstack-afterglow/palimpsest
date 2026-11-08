@@ -508,7 +508,7 @@ async def test_openapi_declares_keystone_token_and_image_key_schemes(hub_images)
         ("/v1/published-images/blobs/{digest}", "put"),
         ("/v1/published-images/extensions", "post"),
         ("/v1/layer-nodes/{node_id}", "get"),
-        ("/v1/image-quota/me", "get"),
+        ("/v1/published-images/quota", "get"),
     ):
         security = schema["paths"][path][method]["security"]
         assert {"KeystoneToken": []} in security and {"ImageKey": []} in security, (path, method)
@@ -523,13 +523,15 @@ async def test_image_key_reads_own_quota_view_through_real_dependency(hub_images
     await publish(h, b"hsqs-quota-view", human(ALICE, ALPHA), visibility="private", name="quota")
     reader = await bearer(h, ALICE, ALPHA, ["images:read"])
     publisher = await bearer(h, ALICE, ALPHA, ["images:publish"])
-    by_key = await h.client.get("/v1/image-quota/me", headers=reader)
+    by_key = await h.client.get("/v1/published-images/quota", headers=reader)
     assert by_key.status_code == 200, by_key.text
-    by_token = await h.client.get("/v1/image-quota/me", headers=human(ALICE, ALPHA))
+    by_token = await h.client.get("/v1/published-images/quota", headers=human(ALICE, ALPHA))
     assert by_token.status_code == 200 and by_key.json() == by_token.json()
-    assert (await h.client.get("/v1/image-quota/me", headers=publisher)).status_code == 403
-    assert (await h.client.get("/v1/image-quota/me")).status_code == 401
-    assert (await h.client.get("/v1/image-quota/me", headers={"Authorization": "Bearer junk"})).status_code == 401
+    assert (await h.client.get("/v1/published-images/quota", headers=publisher)).status_code == 403
+    assert (await h.client.get("/v1/published-images/quota")).status_code == 401
+    assert (
+        await h.client.get("/v1/published-images/quota", headers={"Authorization": "Bearer junk"})
+    ).status_code == 401
 
 
 @pytest.fixture

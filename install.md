@@ -1,16 +1,16 @@
 # Install Palimpsest
 
 Palimpsest requires Python 3.11 or newer. This source prepares
-[`palimpsest-client 0.3.13`](https://pypi.org/project/palimpsest-client/0.3.13/)
-(2026-11-08 UTC release candidate; 0.3.12 was the previous candidate); publication and deployment are separate. After publication, install exact bytes in isolation:
+[`palimpsest-client 0.3.14`](https://pypi.org/project/palimpsest-client/0.3.14/)
+(2026-11-08 UTC release candidate; 0.3.13 was the previous release); publication and deployment are separate. After publication, install exact bytes in isolation:
 
 ```sh
-uv tool install --python 3.11 "palimpsest-client==0.3.13"
+uv tool install --python 3.11 "palimpsest-client==0.3.14"
 palimpsest --version
 
 # Or use pip, without changing system Python:
 python3.11 -m venv .venv
-.venv/bin/python -m pip install "palimpsest-client==0.3.13"
+.venv/bin/python -m pip install "palimpsest-client==0.3.14"
 .venv/bin/palimpsest --version
 ```
 
@@ -125,7 +125,7 @@ Repository tags also drive GHCR image tags for
 `ghcr.io/openstack-afterglow/palimpsest-hub-worker` and
 `ghcr.io/openstack-afterglow/palimpsest-hub-build-worker`; image tags follow the
 repository tag, not the independently versioned Hub wheel. The released Kolla
-role defaults to Hub image tag `0.3.13`; verify exact reviewed API/export/build-worker
+role defaults to Hub image tag `0.3.14`; verify exact reviewed API/export/build-worker
 digests and platform manifests before any future deployment.
 Root publication requires trusted tag artifact checks and protected PyPI
 publisher gates. Native policy permits only enabled/success or explicitly

@@ -151,6 +151,7 @@ async def quota(tmp_path, monkeypatch):
 async def admin_client(quota):
     app = FastAPI()
     app.include_router(image_admin.router, prefix="/v1")
+    app.include_router(published_images_api.router, prefix="/v1")
     state = {"admin": True}
 
     async def token(request: Request):
@@ -404,12 +405,12 @@ async def test_downgrade_preserves_images_reports_over_limit_and_rejects_new_nam
         "over_limit_source_bytes": False,
         "over_limit": True,
     }
-    me = await admin_client.client.get("/v1/image-quota/me")
+    me = await admin_client.client.get("/v1/published-images/quota")
     assert me.status_code == 200
     assert me.json()["user_tier"] == "free" and me.json()["project_tier"] == "free"
     assert [item["visibility"] for item in me.json()["scopes"]] == ["private", "public", "internal"]
     assert me.json()["scopes"][0]["over_limit"] is True
-    other = await admin_client.client.get("/v1/image-quota/me", headers={"X-User": U2})
+    other = await admin_client.client.get("/v1/published-images/quota", headers={"X-User": U2})
     assert other.json()["scopes"][0]["unique_names"] == 0
     assert await quota.count_images() == 2
 
@@ -825,7 +826,7 @@ async def test_quota_routes_are_no_store_through_the_real_app(quota):
         transport = httpx.ASGITransport(app=main.app)
         async with httpx.AsyncClient(transport=transport, base_url="http://quota.test") as client:
             for path in (
-                "/v1/image-quota/me",
+                "/v1/published-images/quota",
                 "/v1/admin/image-quota/policies",
                 f"/v1/admin/image-quota/usage?subject_kind=user&subject_id={U1}",
                 "/v1/admin/image-quota/tiers/user/bad%20id",
@@ -833,6 +834,8 @@ async def test_quota_routes_are_no_store_through_the_real_app(quota):
                 response = await client.get(path)
                 assert response.status_code in (200, 422), (path, response.status_code)
                 assert response.headers["cache-control"] == "no-store", path
+            # The pre-0.3.14 path is gone (clean cutover); "quota" is not captured by the image-id route.
+            assert (await client.get("/v1/image-quota/me")).status_code == 404
     finally:
         main.app.dependency_overrides.pop(published_images_api.image_graph_reader, None)
         main.app.dependency_overrides.pop(auth.require_admin, None)

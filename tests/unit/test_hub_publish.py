@@ -1069,6 +1069,12 @@ def test_unrecorded_final_status_names_the_hub_image_and_rerun_reconciles(tmp_pa
             "http_413:image_source_size_limit",
         ),
         (
+            413,
+            {"code": "staged_payload_limit", "limit_bytes": 100, "staged_bytes": 90},
+            ["stage more payload bytes", "90 of 100 bytes", "expire"],
+            "http_413:staged_payload_limit",
+        ),
+        (
             422,
             [{"loc": ["body", "name"], "msg": "String should match pattern", "type": "string_pattern_mismatch"}],
             ["HTTP 422", "name: String should match pattern"],
