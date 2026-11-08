@@ -144,6 +144,9 @@ SPECIAL_FILES = {
             "upload_limits",
             "packages",
             "package_contents",
+            "preflight",
+            "git_source",
+            "session_lifecycle",
         )
     ),
 }
