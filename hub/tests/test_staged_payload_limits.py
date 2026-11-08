@@ -228,8 +228,12 @@ async def test_registration_requires_byte_exact_principal_under_nocase(
                 if source:
                     session.add(
                         PalimpsestHubImageSourceBlob(
-                            image_id=image_id, role="manifest", ordinal=0, project_id=project,
-                            blob_digest=blob, size_bytes=400,
+                            image_id=image_id,
+                            role="manifest",
+                            ordinal=0,
+                            project_id=project,
+                            blob_digest=blob,
+                            size_bytes=400,
                         )
                     )
                 else:
