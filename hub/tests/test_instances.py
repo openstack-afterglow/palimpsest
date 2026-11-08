@@ -414,6 +414,24 @@ async def test_failed_preflight_returns_structured_4xx_and_allocates_nothing(ins
 
 
 @pytest.mark.asyncio
+async def test_preflight_network_calls_never_run_on_the_event_loop_thread(instance_hub):
+    import threading
+
+    h = instance_hub
+    loop_thread = threading.get_ident()
+    seen = []
+    endpoint = h.provider.session.get_endpoint
+    limits = h.provider.get_limits
+    h.provider.session.get_endpoint = lambda service_type, interface=None: (
+        seen.append(threading.get_ident()) or endpoint(service_type, interface)
+    )
+    h.provider.get_limits = lambda: seen.append(threading.get_ident()) or limits()
+    created = await create_and_advance(h, json=request_body())
+    assert created.status_code == 202, created.text
+    assert len(seen) >= 6 and loop_thread not in seen
+
+
+@pytest.mark.asyncio
 async def test_replay_of_an_existing_request_survives_a_later_quota_exhaustion(instance_hub):
     h = instance_hub
     body = request_body()

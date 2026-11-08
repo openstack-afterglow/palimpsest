@@ -488,8 +488,12 @@ async def create(factory, store, settings, actor, conn, req):
                 raise HTTPException(409, "request_id is already bound to a different immutable request")
             return projection(old)
         # Replays above stay idempotent; only a new allocation needs the access preflight.
-        preflight.require(
-            conn, actor, preflight.PreflightNeed(volume_gib=req["boot_gib"]), interface=settings.os_interface
+        await run_blocking(
+            preflight.require,
+            conn,
+            actor,
+            preflight.PreflightNeed(volume_gib=req["boot_gib"]),
+            interface=settings.os_interface,
         )
         source = (
             await owned(session, req["source_instance_id"], project, actor["user_id"])

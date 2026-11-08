@@ -787,7 +787,9 @@ async def create(factory, store, settings, actor, conn, request, *, background=N
                 raise HTTPException(409, "Native request ID is already bound to another immutable request")
             return projection(existing)
     # Replays above stay idempotent; a new native allocation needs the access preflight first.
-    preflight.require(conn, actor, preflight.PreflightNeed(shared_files=True), interface=settings.os_interface)
+    await run_blocking(
+        preflight.require, conn, actor, preflight.PreflightNeed(shared_files=True), interface=settings.os_interface
+    )
 
     profile = _profile(settings, request["profile"])
     project, user = _scope(actor, conn, profile)
