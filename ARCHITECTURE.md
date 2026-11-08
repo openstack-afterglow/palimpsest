@@ -4001,9 +4001,9 @@ that CI never sees).
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "ac25e34aaf9127d50661423e2f47fe6338d5bfe5e3ea03531250c833b8571b5e",
-  "reviewed_at": "2026-11-08T14:16:52Z",
-  "summary": "0.3.15 candidate: staged payload registration compares project_id/created_by byte-exactly under case-insensitive collations; reviewed source with isolated SQLite NOCASE evidence, MariaDB not exercised"
+  "source_sha256": "4797b30493d1c4968901c141fc4fefef0ea250a4923916ccc6da41158de40977",
+  "reviewed_at": "2026-11-08T14:20:17Z",
+  "summary": "0.3.15 candidate: staged payload registration compares project_id/created_by byte-exactly under case-insensitive collations; reviewed source, formatting-only follow-up to the regression test, isolated SQLite NOCASE evidence, MariaDB not exercised"
 }
 ```
 <!-- architecture-review:end -->
