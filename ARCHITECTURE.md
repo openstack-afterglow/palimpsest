@@ -1,5 +1,13 @@
 # Palimpsest Architecture
 
+## M4 CPU slices: access preflight, Git source admission, session lifecycle — 2026-11-09 source
+
+Source-reviewed by the author only; test-passed on hosted CI and the Hub scrubbed-environment suite, not released, deployed or live-verified.
+
+- `palimpsest_hub.services.preflight` runs read-only checks under the caller's own token before any allocation: token project scope, the caller's policy action, service-catalog endpoints for compute, network, image and volumev3 (plus shared-file-system for the native path) and compute/block-storage quotas. Every failure is reported together as a structured `preflight_failed` response (403 scope/policy, 424 catalog, 409 quota); unreadable limits fail closed. `services/instances.py` and `services/native_instances.py` call it through `run_blocking` (the checks are network calls and must not run on the event loop) after the idempotent replay lookup, so an existing request still replays after a later quota exhaustion. It checks access and headroom only; it does not reserve resources, so a later allocation can still fail.
+- `palimpsest_hub.services.git_source` admits a pinned Git build source: https only, no userinfo/query/fragment/IP literal, a 40-hex revision, an operator host allow-list (default deny), every resolved address public (loopback, private, link-local including the metadata address, CGNAT and multicast refused), the first resolved address pinned for the connection, redirects disabled, `GIT_ALLOW_PROTOCOL` limited, `.git` removed and byte/file/symlink limits enforced. It is a library only: no API route, build-worker step or private-credential resolution calls it yet, and `credential_ref` is an opaque name, never a secret.
+- `palimpsest_hub.services.session_lifecycle` is a pure state machine for the delayed dev-instance shelve: shelve is due only after the full grace period with no open session, any connect cancels it and invalidates earlier claims, an observation failure is not a disconnect, one claim wins per due period, and a connect during an in-flight shelve requires an unshelve after it settles. No service, SSH/console observer or provider call uses it yet.
+
 ## M2 Hub image publication, quotas, image keys and anonymous public reads — 2026-11-07/08 merge-worktree source
 
 **Independently reviewed merge-worktree source (whole-surface security review,
@@ -4001,9 +4009,9 @@ that CI never sees).
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "4797b30493d1c4968901c141fc4fefef0ea250a4923916ccc6da41158de40977",
-  "reviewed_at": "2026-11-08T14:20:17Z",
-  "summary": "0.3.15 candidate: staged payload registration compares project_id/created_by byte-exactly under case-insensitive collations; reviewed source, formatting-only follow-up to the regression test, isolated SQLite NOCASE evidence, MariaDB not exercised"
+  "source_sha256": "f88c7b56b0826be3964cc3eaf54d7d1c0219c202872f1fae2a04f53edfb36bd3",
+  "reviewed_at": "2026-11-08T17:12:26Z",
+  "summary": "Author review of M4 CPU slices (preflight gate off-loop, Git source admission library, session lifecycle machine); hosted CI and scrubbed Hub suite only, no live proof."
 }
 ```
 <!-- architecture-review:end -->

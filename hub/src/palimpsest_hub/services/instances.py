@@ -20,6 +20,7 @@ from palimpsest_hub.auth import package_target_project_id
 from palimpsest_hub.config import InstanceGpuProfile, Settings
 from palimpsest_hub.instance_models import PalimpsestHubInstance
 from palimpsest_hub.models import PalimpsestWorkerLease, exact_identity
+from palimpsest_hub.services import preflight
 from palimpsest_hub.services.blob_references import retain_blob
 from palimpsest_hub.services.hub_store import MEDIA_TYPE_LAYER_SQUASHFS
 from palimpsest_hub.services.instance_bootstrap import render_bootstrap
@@ -486,6 +487,14 @@ async def create(factory, store, settings, actor, conn, req):
             if old.request_digest != digest:
                 raise HTTPException(409, "request_id is already bound to a different immutable request")
             return projection(old)
+        # Replays above stay idempotent; only a new allocation needs the access preflight.
+        await run_blocking(
+            preflight.require,
+            conn,
+            actor,
+            preflight.PreflightNeed(volume_gib=req["boot_gib"]),
+            interface=settings.os_interface,
+        )
         source = (
             await owned(session, req["source_instance_id"], project, actor["user_id"])
             if req.get("source_instance_id")
