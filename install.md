@@ -1,16 +1,16 @@
 # Install Palimpsest
 
 Palimpsest requires Python 3.11 or newer. This source prepares
-[`palimpsest-client 0.3.14`](https://pypi.org/project/palimpsest-client/0.3.14/)
-(2026-11-08 UTC release candidate; 0.3.13 was the previous release); publication and deployment are separate. After publication, install exact bytes in isolation:
+[`palimpsest-client 0.3.15`](https://pypi.org/project/palimpsest-client/0.3.15/)
+(2026-11-08 UTC release candidate; 0.3.14 was the previous release); publication and deployment are separate. After publication, install exact bytes in isolation:
 
 ```sh
-uv tool install --python 3.11 "palimpsest-client==0.3.14"
+uv tool install --python 3.11 "palimpsest-client==0.3.15"
 palimpsest --version
 
 # Or use pip, without changing system Python:
 python3.11 -m venv .venv
-.venv/bin/python -m pip install "palimpsest-client==0.3.14"
+.venv/bin/python -m pip install "palimpsest-client==0.3.15"
 .venv/bin/palimpsest --version
 ```
 
@@ -28,7 +28,7 @@ upgrade does not publish or roll out Hub images.
 
 Publication, deployment-server package selection and actual running services are
 separate gates; use the [latest release/operator handoff](docs/development-handoff.md)
-for their exact receipts. Installing the0.3.13 client does not activate native
+for their exact receipts. Installing the 0.3.15 client does not activate native
 profiles, provision Ceph credentials, or deploy the matching Hub containers.
 
 Historical release `v0.3.5` followed protected-dev PR #24 and merge
@@ -124,9 +124,9 @@ Repository tags also drive GHCR image tags for
 `ghcr.io/openstack-afterglow/palimpsest-hub-api`,
 `ghcr.io/openstack-afterglow/palimpsest-hub-worker` and
 `ghcr.io/openstack-afterglow/palimpsest-hub-build-worker`; image tags follow the
-repository tag, not the independently versioned Hub wheel. The released Kolla
-role defaults to Hub image tag `0.3.14`; verify exact reviewed API/export/build-worker
-digests and platform manifests before any future deployment.
+repository tag, not the independently versioned Hub wheel. This candidate's Kolla
+role defaults to Hub image tag `0.3.15`; verify publication and exact reviewed
+API/export/build-worker digests and platform manifests before any deployment.
 Root publication requires trusted tag artifact checks and protected PyPI
 publisher gates. Native policy permits only enabled/success or explicitly
 disabled/skipped; disabled publication is **not native qualification**.

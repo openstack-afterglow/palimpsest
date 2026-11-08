@@ -1,5 +1,9 @@
 # Detailed installation and configuration guide
 
+## 0.3.15 transition note — 2026-11-08 (UTC; undeployed candidate)
+
+0.3.15 is a patch over 0.3.14: staged publication payload registration and limit checks enforce byte-exact `project_id` and `created_by` equality via binary SQL casts (`cast(..., LargeBinary)`) under case-insensitive SQL collations (such as SQLite NOCASE and MariaDB/MySQL default collations). Foreign casing variants can no longer match an image or free/claim staged quota. Test limits and residuals: verified under synthetic SQLite NOCASE schema simulation; live MariaDB reproduction was not executed in CI; existing database primary key collation collision risks remain if unique identity columns use case-insensitive collations. No schema change or bootstrap run is required. Follow the 0.3.13 transition gate below as amended by the 0.3.14 note, including `/v1/published-images/quota` in step 6. Writer drain, paired backup, build-worker rollout and rollback remain required. 0.3.15 is an undeployed candidate.
+
 ## 0.3.14 transition note — 2026-11-08 (UTC)
 
 0.3.14 is a patch over 0.3.13: the caller's quota view moves from `GET /v1/image-quota/me` to `GET /v1/published-images/quota` (no alias, so any monitor or smoke check must use the new path and expect 404 on the old one), and Hub bounds staged-but-unregistered publication payloads. The new settings are `PALIMPSEST_HUB_STAGED_MAX_BYTES` (Kolla `palimpsest_hub_staged_max_bytes`, default 214748364800, sized for the largest chain plus source any tier allows) and `PALIMPSEST_HUB_STAGED_TTL_SECONDS` (Kolla `palimpsest_hub_staged_ttl_seconds`, default 86400); the export worker also needs the TTL to expire idle staging. There is no schema change, so no bootstrap run is required; use the 0.3.13 gate below (with the new path in step 6) for backup, writer stop and rollback.
@@ -23,11 +27,11 @@ initial configuration, upgrades, and administrator-owned Linux deployment.
 Released installations use pinned published bytes; trusted local installation below uses the actual checkout's bytes.
 
 Palimpsest Local requires Python 3.11 or newer; Hub requires Python 3.12+.
-This source prepares unpublished candidate0.3.13 from the0.3.12 release lineage; this checkpoint does not verify publication, images or deployment for either version.
+This source prepares unpublished candidate 0.3.15 over 0.3.14; this checkpoint does not establish publication or deployment of 0.3.15.
 SDK publication and native execution remain separately qualified. Root/Hub metadata, module versions,
 generated locks and Kolla image defaults move together. After formal publication,
 install exact client bytes with
-`uv tool install --python 3.11 palimpsest-client==0.3.13` once formally published, or install a trusted
+`uv tool install --python 3.11 palimpsest-client==0.3.15` once formally published, or install a trusted
 local checkout with `uv tool install --force --python 3.11 .`.
 A root wheel upgrade neither deploys Hub nor qualifies actual build/run behavior.
 Git/outbound GitHub HTTPS is needed only for VCS installation.
@@ -1668,7 +1672,7 @@ and the [command workflows](cli/workflows.md) for operational details.
 
 ## SDK image/native integration: operator prerequisites
 
-The `0.3.13` candidate Hub distribution declares the exact matching client dependency.
+The `0.3.15` candidate Hub distribution declares the exact matching client dependency.
 Checkout resolution uses `hub`'s explicit parent-path source; installed release
 bytes must match the same immutable tag and reviewed image digests. Paired wheel
 or local container checks do not establish production upgrade or native readiness.
