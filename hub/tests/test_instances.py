@@ -3924,6 +3924,21 @@ async def test_native_api_has_durable_hub_image_refs_and_idempotent_retained_lif
     assert len(n.calls) == 2
 
 
+async def test_native_preflight_network_calls_never_run_on_the_event_loop_thread(native_hub):
+    import threading
+
+    n = native_hub
+    loop_thread = threading.get_ident()
+    seen = []
+    endpoint = n.h.provider.session.get_endpoint
+    n.h.provider.session.get_endpoint = lambda service_type, interface=None: (
+        seen.append(threading.get_ident()) or endpoint(service_type, interface)
+    )
+    response = await n.h.client.post("/v1/native-instances", json=n.body)
+    assert response.status_code == 202, response.text
+    assert seen and loop_thread not in seen
+
+
 async def test_native_api_unknown_create_is_held_and_never_replayed(native_hub, monkeypatch):
     n = native_hub
 
