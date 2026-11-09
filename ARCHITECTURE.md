@@ -4016,8 +4016,8 @@ that CI never sees).
 {
   "schema_version": 1,
   "source_sha256": "b1c2a6a56199149a698ec6a53d2ded624d18d121230b6282dda8a67ca574c463",
-  "reviewed_at": "2026-11-09T12:06:11Z",
-  "summary": "Record replay side-effect audit (docs only)"
+  "reviewed_at": "2026-11-09T12:42:04Z",
+  "summary": "Record M2-17 sweep observation 1 (docs only)"
 }
 ```
 <!-- architecture-review:end -->

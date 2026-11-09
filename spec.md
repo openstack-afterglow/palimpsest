@@ -25,6 +25,8 @@
 
 ### 재개용 실행 기록
 
+**M2-17 TTL sweep 1차 관측(2026-11-09 12:40Z, 영수증 593, 읽기 전용):** 대상 digest `sha256:cc1c8afe…`의 `image-stage` 참조 행은 1개로 남아 있다(생성 2026-11-08 12:32:47Z, 24시간 경과 후 8.6분). 전체 `image-stage` 행 50개, payload 행 50개 중 24시간을 넘긴 것은 49개이고 그중 미등록은 이 대상 1개뿐이다(나머지 49개는 게시 이미지가 쓰므로 설계상 유지). 컨트롤러 3대의 `palimpsest_hub_worker`·`api` 로그에 "Staged payload expiry failed"는 최근 6시간 0건이다. 결론: 이 시점에는 만료 제거를 관측하지 못했고 정비 주기는 아직 모른다. 13:45Z 2차 관측이 결정적이다. M2-17은 체크하지 않는다.
+
 **승인 경계 점검(2026-11-09, 영수증 595):** local-manila 소스 재생 중 이전 세션의 eval 셀을 필터가 충분하지 않은 상태에서 실제 HOME으로 실행했다(`subprocess`·`ssh`·`write_text`는 걸러지지 않았다). 운영 호스트 로그를 읽기 전용으로 확인한 결과 20:35 KST에 `wireguard-dmslab` ssh 로그인 8회(sudo 기록 없음)와 `dms-controller2` 로그인 3회가 있었고 sudo 명령은 `docker ps`·`docker logs --since 20m nova_scheduler`·nova-conductor 로그 `grep` 같은 읽기 전용뿐이었다. `dms-controller1·3`과 mac-mini에는 기록이 없다. 20:37 이후 2분 간격 `grep -c`는 내 프로세스가 아니다. sudo 없이 실행된 원격 셸 명령은 확인할 수 없고, 21개 ssh 셀이 모두 실행됐는지도 증명하지 못했다. 이후 재생은 네트워크 차단·쓰기 제한 샌드박스 또는 manila Path 읽기/쓰기 셀 허용 목록으로만 한다.
 
 **저장소 소실과 복구(2026-11-09 20:07경 소실, 20:45경 복구, 영수증 592):** 다른 에이전트가 `/Users/pieroot/code/palimpsest`와 모든 worktree를 실수로 삭제했다(소유자 확인). `origin/dev` `d71ec92`로 같은 경로에 새로 clone하고, 세션 기록에서 재생한 `spec.md`·핸드오프 편집(패치 `reconstruction-592-full.patch`, sha256 `fde99325…`)을 적용해 로컬 `dev`에 커밋 `872c4cd`로 두었다(미푸시). 체크 54/108을 재현했고 `check_architecture.py`는 통과했으며 `uv sync --frozen`으로 `.venv`·`hub/.venv`를 다시 만들어 import와 hub 테스트 1건을 확인했다. 복구하지 못한 것: 소실 전 로컬 커밋의 해시·이력, 마지막 `git status` 목록이 잘려 확인하지 못한 커밋 안 된 변경, gitignore된 `clouds.yaml`(소유자가 다시 제공해야 하며 다른 프로젝트의 사본은 복사하지 않았다), 삭제된 worktree(`palimpsest-m3pr-*` 등, 필요하면 `git worktree add`로 새로 만든다). 이 재구성본은 소유자 확인 전까지 정본으로 확정하지 않는다.
