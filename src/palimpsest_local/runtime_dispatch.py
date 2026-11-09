@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import os
 import re
 import secrets
 import threading
@@ -1198,6 +1199,9 @@ def shell(
     )
 
 
+EXPERIMENTAL_VZ_COMMIT = "PALIMPSEST_EXPERIMENTAL_VZ_COMMIT"
+
+
 def commit(
     name: str,
     tag: str,
@@ -1211,7 +1215,15 @@ def commit(
     state.validate_tag(tag)
     record = resolve_existing_run(name, roots=resolved_roots)
     _require_expected_identity(record, expected_identity)
-    adapter = _preflight_existing_adapter(record, RuntimeOperation.COMMIT, resolved_roots)
+    if (
+        record.dispatch_key == DispatchKey(RuntimeKind.OCI_ROOT, RuntimeBackend.LIMA_VZ)
+        and os.environ.get(EXPERIMENTAL_VZ_COMMIT) == "1"
+    ):
+        # Not advertised: no capability profile exists for native VZ commit until a live
+        # stop-capture-start proof is recorded, so the operator must opt in explicitly.
+        adapter = _native_vz_adapter()
+    else:
+        adapter = _preflight_existing_adapter(record, RuntimeOperation.COMMIT, resolved_roots)
     raw = adapter.commit(
         name,
         tag,

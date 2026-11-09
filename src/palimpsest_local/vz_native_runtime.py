@@ -22,6 +22,7 @@ import math
 import os
 import re
 import selectors
+import shutil
 import signal
 import socket
 import stat
@@ -36,6 +37,7 @@ from collections.abc import Mapping
 from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 from . import platforms
@@ -75,6 +77,7 @@ from .state import (
     init_resolved_roots,
     locked_existing_run,
     reserve_new_run,
+    validate_tag,
 )
 from .vz_lower_exports import (
     lima_vz_mount_tag,
@@ -4403,3 +4406,109 @@ def exec_session(
 
 def shell_session(name, *, roots, _expected_record, _observation_budget=None):
     return _session(name, roots=roots, expected=_expected_record, tty=True, _observation_budget=_observation_budget)
+
+
+# Platform-bound identity files the guest injects on every boot (guest/vz/platform.c): they are
+# never inherited by a commit, whatever the upper holds at those paths.
+_COMMIT_GENERATED_PLACEHOLDERS = ("etc/machine-id", "var/lib/dbus/machine-id", "etc/hostname", "etc/resolv.conf")
+
+
+def _commit_tool(variable, *, required):
+    """Resolve an e2fsprogs binary from an absolute, non-writable path named by the environment."""
+    from .oci_commit import CommitError
+
+    selected = os.environ.get(variable)
+    if not selected:
+        if required:
+            raise CommitError(
+                "commit-tool", f"{variable} must name the absolute path of the e2fsprogs binary used to read the upper"
+            )
+        return None
+    path = Path(selected)
+    try:
+        info = os.stat(path)
+    except OSError:
+        raise CommitError("commit-tool", f"{variable} does not name an existing file") from None
+    if (
+        not path.is_absolute()
+        or not stat.S_ISREG(info.st_mode)
+        or not os.access(path, os.X_OK)
+        or info.st_uid not in (0, os.geteuid())
+        or info.st_mode & 0o022
+    ):
+        raise CommitError("commit-tool", f"{variable} must be an absolute executable not writable by group or others")
+    return path
+
+
+def commit(name, tag, *, roots, _expected_record):
+    """Capture a stopped native VZ run's upper as a new OCI layout on top of its source image.
+
+    Read-only toward the run: the run's state, disk and provider are never changed. Only a
+    run that is exactly stopped, unheld and fully re-verified (the same checks removal uses)
+    is accepted.
+    """
+    from . import vz_commit
+    from .oci_commit import CommitError, admit_capture
+
+    validate_tag(tag)
+    debugfs = _commit_tool("PALIMPSEST_COMMIT_DEBUGFS", required=True)
+    e2fsck = _commit_tool("PALIMPSEST_COMMIT_E2FSCK", required=True)
+    with locked_existing_run(roots, name, expected=_expected_record) as authority:
+        config = _config_for(authority)
+        data = _data(authority)
+        native = data.get("vz_native", {})
+        admit_capture(instance_state=authority.snapshot.state["status"], source_hold=bool(native.get("hold")))
+        commits = roots.state / "oci-commits"
+        os.makedirs(commits, mode=0o700, exist_ok=True)
+        destination = commits / tag
+        if os.path.lexists(destination):
+            raise CommitError("commit-tag-exists", "a commit with this tag already exists; nothing was changed")
+        scratch = commits / (".scratch-" + os.urandom(8).hex())
+        os.mkdir(scratch, 0o700)
+        try:
+            with _custody(config) as custody:
+                data, _store, owner, _lease, _receipts, _export = _load_checked(
+                    authority, roots, config, custody, allow_expired=True, data=data
+                )
+                _retained_stopped_observation(authority, roots, config, custody, data)
+                snapshot = _reopen_source(roots, native["source_snapshot"], data["source_qualification"])
+                disk = load_vz_root_volume(roots, native["root_volume_id"], owner=owner)
+                cas = SourceCAS.open_existing(roots.oci_source_cas, expected_cas_id=snapshot.cas_id)
+
+                def stream(ordinal):
+                    @contextmanager
+                    def opener():
+                        with cas.lease_layer(snapshot, ordinal) as lease:
+                            yield lease.chunks()
+
+                    return opener
+
+                streams = {}
+                for ordinal, layer in enumerate(snapshot.layers):
+                    streams.setdefault(layer.descriptor.digest, stream(ordinal))
+                result = vz_commit.commit_stopped_disk(
+                    disk=disk.record.storage.directory / "datadisk",
+                    disk_size=disk.record.size_bytes,
+                    instance_state=authority.snapshot.state["status"],
+                    source_hold=bool(native.get("hold")),
+                    expected_binding={
+                        "run_id": authority.record.run_id,
+                        "root_volume_id": native["root_volume_id"],
+                        "root_graph_digest": native["plan"]["root_graph_digest"],
+                        "root_nonce": native["root_nonce"],
+                    },
+                    scratch_parent=scratch,
+                    debugfs=debugfs,
+                    destination=destination,
+                    parent_manifest_bytes=cas.read_metadata(snapshot.manifest),
+                    parent_config_bytes=cas.read_metadata(snapshot.config),
+                    parent_manifest_digest=snapshot.manifest.descriptor.digest,
+                    base_image_digest=snapshot.root.descriptor.digest,
+                    layer_streams=streams,
+                    created=datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    generated_placeholders=_COMMIT_GENERATED_PLACEHOLDERS,
+                    e2fsck=e2fsck,
+                )
+        finally:
+            shutil.rmtree(scratch, ignore_errors=False)
+    return {"tag": tag, **result, "source": "commit"}
