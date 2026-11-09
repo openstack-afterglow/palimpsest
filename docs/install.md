@@ -1,8 +1,8 @@
 # Detailed installation and configuration guide
 
-## 0.3.15 transition note — 2026-11-08 (UTC; undeployed candidate)
+## 0.3.15 transition note — 2026-11-08 (UTC; deployed 2026-11-09)
 
-0.3.15 is a patch over 0.3.14: staged publication payload registration and limit checks enforce byte-exact `project_id` and `created_by` equality via binary SQL casts (`cast(..., LargeBinary)`) under case-insensitive SQL collations (such as SQLite NOCASE and MariaDB/MySQL default collations). Foreign casing variants can no longer match an image or free/claim staged quota. Test limits and residuals: verified under synthetic SQLite NOCASE schema simulation; live MariaDB reproduction was not executed in CI; existing database primary key collation collision risks remain if unique identity columns use case-insensitive collations. No schema change or bootstrap run is required. Follow the 0.3.13 transition gate below as amended by the 0.3.14 note, including `/v1/published-images/quota` in step 6. Writer drain, paired backup, build-worker rollout and rollback remain required. 0.3.15 is an undeployed candidate.
+0.3.15 is a patch over 0.3.14: staged publication payload registration and limit checks enforce byte-exact `project_id` and `created_by` equality via binary SQL casts (`cast(..., LargeBinary)`) under case-insensitive SQL collations (such as SQLite NOCASE and MariaDB/MySQL default collations). Foreign casing variants can no longer match an image or free/claim staged quota. Test limits and residuals: verified under synthetic SQLite NOCASE schema simulation; live MariaDB reproduction was not executed in CI; existing database primary key collation collision risks remain if unique identity columns use case-insensitive collations. No schema change or bootstrap run is required. Follow the 0.3.13 transition gate below as amended by the 0.3.14 note, including `/v1/published-images/quota` in step 6. Writer drain, paired backup, build-worker rollout and rollback remain required. 0.3.15 was deployed to the DMS Lab controllers on 2026-11-09 following the gate below; the paired backup was taken but never restore-tested.
 
 ## 0.3.14 transition note — 2026-11-08 (UTC)
 
