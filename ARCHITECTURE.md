@@ -349,6 +349,17 @@ cleanup. Ordinary caller defaults remain unchanged. The existing registry
 initialization flock is still blocking. Guest exec timeout is solely its guest
 execution duration; host status actors keep their independent 40-second bound.
 
+An unlocked `session-*` SSH custody marker (its owning client died) stays HOLD by default
+("actor custody survived its owner"). The structured `exec`/`shell` session path (`_session`) may
+settle it: `_custody(orphan_markers=[...])` collects only markers whose recorded host SSH
+`actor_pid` no longer exists (a live or unrecorded/malformed actor, a read-only probe and a locked
+marker are unchanged), and the caller unlinks them under custody only after the authenticated
+guest status reports `user_sessions_known is True` and `user_session_count == 0`, the same
+condition as the in-process `hold_actor` release. A dead host actor alone never settles a marker:
+sshd may keep the guest command running. Other lifecycle operations (`stop`, `rm`, `commit`) still
+hold until such an `exec` settles it. Test-defined only (`test_vz_native_session_marker.py`); a live
+kill-client case on a real VM has not been re-run.
+
 Source247's expanded19-file lane passed1792/92.52s. Source248's seven changed
 nodes passed1079/21.74s and its final19-file lane passed1823/93.56s. Both
 independent source re-reviews closed findings; scoped lint/format pass.
@@ -4015,9 +4026,9 @@ that CI never sees).
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "b1c2a6a56199149a698ec6a53d2ded624d18d121230b6282dda8a67ca574c463",
-  "reviewed_at": "2026-11-09T13:48:16Z",
-  "summary": "Record final M2-17 sweep observation (docs only)"
+  "source_sha256": "d3bc6c64f1d044b766bc84f747c80adbaff9f1bae011fd96954742f035ddd17d",
+  "reviewed_at": "2026-11-09T14:07:47Z",
+  "summary": "Gate orphan SSH session marker settlement on proven-empty guest sessions"
 }
 ```
 <!-- architecture-review:end -->
