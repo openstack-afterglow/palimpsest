@@ -4003,7 +4003,7 @@ that CI never sees).
 
 2026-11-08 release 0.3.14 (GATE-01 follow-up). Two M2 review findings are fixed in source: the caller's quota view is served at `GET /v1/published-images/quota` (registered before the image-id route; the 0.3.13 path `/v1/image-quota/me` is removed without an alias), and staged-but-unregistered publication payloads have a per-user aggregate cap and expiry (`services/staged_payloads.py`). A staged payload counts as registered only when an image of the same project and user uses its digest, so foreign registrations neither free quota nor reveal that other bytes exist; re-staging a held digest is free; expiry also runs in export maintenance and is committed even when an upload is refused. Residual P3: the cap is evaluated after the request body is received, so a caller already over the cap can still upload up to one blob per request before the 413. An independent review of this change found and drove the fixes above; the review stamp covers source only.
 
-2026-11-08 release 0.3.15 (undeployed candidate). Enforces byte-exact `project_id` and `created_by` equality (`cast(..., LargeBinary)`) when registering publication payloads against published images and checking staged limits (`services/staged_payloads.py`) under case-insensitive SQL collations (such as SQLite NOCASE or MariaDB/MySQL default collations), preventing foreign casing variants from matching as own-images or freeing/claiming staged quota. Test limits and residuals: verified under synthetic SQLite NOCASE schema simulation in `hub/tests/test_staged_payload_limits.py`; live MariaDB reproduction was not executed in CI; existing database primary key collation collision risks remain if identity columns use case-insensitive collations. The architecture review stamp is unchanged; parent reviews and stamps after final source review.
+2026-11-08 release 0.3.15 (published and deployed to the production Hub on 2026-11-09, receipt 582). Enforces byte-exact `project_id` and `created_by` equality (`cast(..., LargeBinary)`) when registering publication payloads against published images and checking staged limits (`services/staged_payloads.py`) under case-insensitive SQL collations (such as SQLite NOCASE or MariaDB/MySQL default collations), preventing foreign casing variants from matching as own-images or freeing/claiming staged quota. Test limits and residuals: verified under synthetic SQLite NOCASE schema simulation in `hub/tests/test_staged_payload_limits.py`; live MariaDB reproduction was not executed in CI; existing database primary key collation collision risks remain if identity columns use case-insensitive collations. The architecture review stamp is unchanged; parent reviews and stamps after final source review.
 
 2026-11-08 M3 capture policy: logs, caches and `/tmp` upper content are included by default and `.plmignore` may drop them; the `/var/lib/dpkg` package database is always retained even when a `.plmignore` rule matches it and is reported in `CaptureReceipt.retained`. Mounted tmpfs and external volumes are not part of the upper. Catalog registration of an ARM commit needs the VZ worker materialize path, which this CPU-only slice does not exercise; `LayerCache.import_source` is linux/amd64 only.
 
@@ -4016,8 +4016,8 @@ that CI never sees).
 {
   "schema_version": 1,
   "source_sha256": "b1c2a6a56199149a698ec6a53d2ded624d18d121230b6282dda8a67ca574c463",
-  "reviewed_at": "2026-11-09T12:42:55Z",
-  "summary": "Sharpen M2-17 sweep conclusion (docs only)"
+  "reviewed_at": "2026-11-09T13:29:38Z",
+  "summary": "Fix stale 0.3.15 status text after independent re-review (docs only)"
 }
 ```
 <!-- architecture-review:end -->
