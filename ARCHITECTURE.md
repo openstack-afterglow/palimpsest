@@ -4027,7 +4027,7 @@ that CI never sees).
 {
   "schema_version": 1,
   "source_sha256": "d3bc6c64f1d044b766bc84f747c80adbaff9f1bae011fd96954742f035ddd17d",
-  "reviewed_at": "2026-11-09T13:45:03Z",
+  "reviewed_at": "2026-11-09T14:07:47Z",
   "summary": "Gate orphan SSH session marker settlement on proven-empty guest sessions"
 }
 ```
