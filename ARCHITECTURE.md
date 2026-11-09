@@ -349,13 +349,16 @@ cleanup. Ordinary caller defaults remain unchanged. The existing registry
 initialization flock is still blocking. Guest exec timeout is solely its guest
 execution duration; host status actors keep their independent 40-second bound.
 
-An unlocked `session-*` SSH custody marker (its owning client died) is settled, not held, only when
-it records a well-formed SSH `actor_pid` that no longer exists. A live actor, an unrecorded or
-malformed actor line and every read-only probe keep HOLD ("actor custody survived its owner"); a
-marker still locked by a live owner is skipped as before. Settlement unlinks only that marker under
-the namespace custody lock and fsyncs the directory; resource `hold-*` markers are never touched.
-Test-defined only (`test_vz_native_session_marker.py`); a live client-kill case on a real VM has
-not been re-run.
+An unlocked `session-*` SSH custody marker (its owning client died) stays HOLD by default
+("actor custody survived its owner"). The structured `exec`/`shell` session path (`_session`) may
+settle it: `_custody(orphan_markers=[...])` collects only markers whose recorded host SSH
+`actor_pid` no longer exists (a live or unrecorded/malformed actor, a read-only probe and a locked
+marker are unchanged), and the caller unlinks them under custody only after the authenticated
+guest status reports `user_sessions_known is True` and `user_session_count == 0`, the same
+condition as the in-process `hold_actor` release. A dead host actor alone never settles a marker:
+sshd may keep the guest command running. Other lifecycle operations (`stop`, `rm`, `commit`) still
+hold until such an `exec` settles it. Test-defined only (`test_vz_native_session_marker.py`); a live
+kill-client case on a real VM has not been re-run.
 
 Source247's expanded19-file lane passed1792/92.52s. Source248's seven changed
 nodes passed1079/21.74s and its final19-file lane passed1823/93.56s. Both
@@ -4023,9 +4026,9 @@ that CI never sees).
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "3a97961af3f7a768618aa9c42836f1a8cab7875c651d09932fc238c38c4f2f3d",
-  "reviewed_at": "2026-11-09T13:33:37Z",
-  "summary": "Record orphan session marker fix (docs)"
+  "source_sha256": "d3bc6c64f1d044b766bc84f747c80adbaff9f1bae011fd96954742f035ddd17d",
+  "reviewed_at": "2026-11-09T13:36:10Z",
+  "summary": "Gate orphan SSH session marker settlement on proven-empty guest sessions"
 }
 ```
 <!-- architecture-review:end -->

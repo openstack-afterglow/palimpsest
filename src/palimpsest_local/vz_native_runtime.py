@@ -544,9 +544,36 @@ def _dead_session_actor(marker_fd) -> bool:
     return False
 
 
+def _settle_orphan_markers(custody, names, status) -> None:
+    """Unlink dead-owner/dead-actor session markers only when the guest reports no user session.
+
+    Mirrors the in-process release (`hold_actor`): the status must be authenticated and report
+    `user_sessions_known is True` with `user_session_count == 0`. A live or unknown guest session
+    keeps HOLD even though the host SSH actor is gone (sshd may keep a guest command running).
+    """
+    if not names:
+        return
+    if status.get("user_sessions_known") is not True or status.get("user_session_count") != 0:
+        raise VZNativeHold("native VZ SSH actor custody survived its owner; guest user sessions are not proven gone")
+    for name in names:
+        (custody / name).unlink()
+    fd = _directory(custody)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 @contextmanager
 def _custody(
-    config, *, lock_timeout=0, lock_deadline=None, observation_budget=None, cleanup_hold=None, read_only_probe=False
+    config,
+    *,
+    lock_timeout=0,
+    lock_deadline=None,
+    observation_budget=None,
+    cleanup_hold=None,
+    read_only_probe=False,
+    orphan_markers=None,
 ):
     """Fence actors; only exact cleanup/stop settlement or pinned probes pass HOLD."""
     _require_native_custody_owner()
@@ -642,12 +669,11 @@ def _custody(
                     continue
                 if (visible.st_dev, visible.st_ino) != (actor.st_dev, actor.st_ino):
                     raise VZNativeHold("native VZ SSH custody marker changed")
-                if read_only_probe or not _dead_session_actor(actor_fd):
+                if orphan_markers is None or read_only_probe or not _dead_session_actor(actor_fd):
                     raise VZNativeHold("native VZ SSH actor custody survived its owner; reconciliation required")
-                # Owner gone (marker unlocked) and its recorded SSH actor is gone: no host actor holds this
-                # session. A live, unknown or unrecorded actor, and every read-only probe, stay HOLD.
-                os.unlink(name, dir_fd=fd)
-                os.fsync(fd)
+                # Owner gone and its recorded host SSH actor gone. Host-side death alone does not prove the guest
+                # user session ended, so the caller must pass the guest-side gate before settling these markers.
+                orphan_markers.append(name)
             finally:
                 os.close(actor_fd)
         yield root
@@ -4281,16 +4307,19 @@ def _session(
     # Waiting admits one command; it never resubmits an SSH or guest operation.
     with locked_existing_run(roots, name, expected=expected, observation_budget=_observation_budget) as authority:
         config = _config_for(authority)
+        orphans: list[str] = []
         with _custody(
             config,
             lock_timeout=RUN_OBSERVATION_TIMEOUT_SECONDS,
             observation_budget=_observation_budget,
+            orphan_markers=orphans,
         ) as custody:
             data, *_ = _load(authority, roots, config, custody)
             native = data["vz_native"]
             # Host preparation and this fixed-duration status actor do not spend
             # the guest execution timer or the shared mutex-contention allowance.
-            _validate_status(native, _control(config, native, "status", custody), handed_off=True)
+            status = _validate_status(native, _control(config, native, "status", custody), handed_off=True)
+            _settle_orphan_markers(custody, orphans, status)
             command = "plm-follow-v1" if follow else None
             if request is not None:
                 payload = _json({"argv": list(request.argv), "timeout_ms": request.timeout_ms})

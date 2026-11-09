@@ -42,19 +42,28 @@ def _owner(monkeypatch):
     monkeypatch.setattr(rt, "_require_native_custody_owner", lambda: None)
 
 
-def test_marker_of_a_dead_owner_and_dead_actor_is_settled_not_held(tmp_path):
+def test_default_custody_still_holds_a_marker_whose_owner_and_actor_died(tmp_path):
     path = _marker(tmp_path, actor_pid=_dead_pid())
-    with rt._custody(_config(tmp_path)) as root:
-        assert root == tmp_path / "_palimpsest-native"
-    assert not path.exists()
+    with pytest.raises(rt.VZNativeHold, match="survived its owner"):
+        with rt._custody(_config(tmp_path)):
+            pass
+    assert path.exists()
 
 
-def test_marker_whose_actor_still_runs_stays_held(tmp_path):
+def test_orphan_collection_returns_only_dead_actor_markers_and_keeps_them(tmp_path):
+    path = _marker(tmp_path, actor_pid=_dead_pid())
+    orphans: list[str] = []
+    with rt._custody(_config(tmp_path), orphan_markers=orphans):
+        pass
+    assert orphans == [path.name] and path.exists()
+
+
+def test_marker_whose_actor_still_runs_stays_held_even_when_collecting(tmp_path):
     process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
     try:
         path = _marker(tmp_path, actor_pid=process.pid)
         with pytest.raises(rt.VZNativeHold, match="survived its owner"):
-            with rt._custody(_config(tmp_path)):
+            with rt._custody(_config(tmp_path), orphan_markers=[]):
                 pass
         assert path.exists()
     finally:
@@ -62,18 +71,18 @@ def test_marker_whose_actor_still_runs_stays_held(tmp_path):
         process.wait()
 
 
-def test_marker_without_a_recorded_actor_stays_held(tmp_path):
+def test_marker_without_a_recorded_actor_stays_held_even_when_collecting(tmp_path):
     path = _marker(tmp_path)
     with pytest.raises(rt.VZNativeHold, match="survived its owner"):
-        with rt._custody(_config(tmp_path)):
+        with rt._custody(_config(tmp_path), orphan_markers=[]):
             pass
     assert path.exists()
 
 
-def test_read_only_probe_never_settles_a_marker(tmp_path):
+def test_read_only_probe_never_collects_a_marker(tmp_path):
     path = _marker(tmp_path, actor_pid=_dead_pid())
     with pytest.raises(rt.VZNativeHold):
-        with rt._custody(_config(tmp_path), read_only_probe=True):
+        with rt._custody(_config(tmp_path), read_only_probe=True, orphan_markers=[]):
             pass
     assert path.exists()
 
@@ -81,10 +90,39 @@ def test_read_only_probe_never_settles_a_marker(tmp_path):
 def test_marker_still_locked_by_a_live_owner_is_left_alone(tmp_path):
     path = _marker(tmp_path, actor_pid=os.getpid())
     owner_fd = os.open(path, os.O_RDWR)
+    orphans: list[str] = []
     try:
         fcntl.flock(owner_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        with rt._custody(_config(tmp_path)):
+        with rt._custody(_config(tmp_path), orphan_markers=orphans):
             pass
-        assert path.exists()
+        assert orphans == [] and path.exists()
     finally:
         os.close(owner_fd)
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        {"user_sessions_known": True, "user_session_count": 1},
+        {"user_sessions_known": False, "user_session_count": 0},
+        {"user_sessions_known": None},
+        {},
+    ],
+)
+def test_dead_host_actor_with_a_live_or_unknown_guest_session_stays_held(tmp_path, status):
+    path = _marker(tmp_path, actor_pid=_dead_pid())
+    with pytest.raises(rt.VZNativeHold, match="not proven gone"):
+        rt._settle_orphan_markers(tmp_path / "_palimpsest-native", [path.name], status)
+    assert path.exists()
+
+
+def test_dead_host_actor_with_a_proven_empty_guest_is_settled(tmp_path):
+    path = _marker(tmp_path, actor_pid=_dead_pid())
+    rt._settle_orphan_markers(
+        tmp_path / "_palimpsest-native", [path.name], {"user_sessions_known": True, "user_session_count": 0}
+    )
+    assert not path.exists()
+
+
+def test_no_orphans_needs_no_guest_proof(tmp_path):
+    rt._settle_orphan_markers(tmp_path, [], {})
