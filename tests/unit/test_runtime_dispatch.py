@@ -3393,6 +3393,67 @@ def test_commit_unavailable_routes_fail_before_any_adapter_effect(
     assert captured.value.operation is RuntimeOperation.COMMIT
 
 
+def _vz_oci_ledger(roots):
+    _write_ledger(
+        roots,
+        record={
+            "schema_version": 2,
+            "runtime_kind": "oci-root",
+            "backend": RuntimeBackend.LIMA_VZ.value,
+            "status": "stopped",
+        },
+    )
+
+
+def test_native_vz_commit_is_not_reachable_without_the_explicit_experimental_opt_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    roots = _roots(tmp_path)
+    _vz_oci_ledger(roots)
+    monkeypatch.delenv(runtime_dispatch.EXPERIMENTAL_VZ_COMMIT, raising=False)
+    monkeypatch.setattr(
+        runtime_dispatch,
+        "_native_vz_adapter",
+        lambda: pytest.fail("native VZ adapter reached without the opt-in"),
+    )
+    with pytest.raises(RuntimeCapabilityError) as captured:
+        runtime_dispatch.commit("demo", "captured", roots=roots)
+    assert captured.value.operation is RuntimeOperation.COMMIT
+
+
+def test_native_vz_commit_with_the_opt_in_routes_to_the_native_adapter_and_validates_its_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    roots = _roots(tmp_path)
+    _vz_oci_ledger(roots)
+    monkeypatch.setenv(runtime_dispatch.EXPERIMENTAL_VZ_COMMIT, "1")
+    calls = []
+
+    def commit(name, tag, *, roots, _expected_record):
+        calls.append((name, tag, _expected_record))
+        return {
+            "tag": tag,
+            "digest": "sha256:" + "c" * 64,
+            "size_bytes": 10,
+            "parent_digest": "sha256:" + "b" * 64,
+            "base_image_digest": "sha256:" + "a" * 64,
+            "source": "commit",
+        }
+
+    monkeypatch.setattr(runtime_dispatch, "_native_vz_adapter", lambda: SimpleNamespace(commit=commit))
+    result = runtime_dispatch.commit("demo", "captured", roots=roots)
+    assert isinstance(result, CommitResult) and result.digest == "sha256:" + "c" * 64
+    assert calls[0][2] == result.record
+    # A malformed receipt from the adapter is rejected, never trusted.
+    monkeypatch.setattr(
+        runtime_dispatch, "_native_vz_adapter", lambda: SimpleNamespace(commit=lambda *a, **k: {"tag": "x"})
+    )
+    with pytest.raises(state.StateError):
+        runtime_dispatch.commit("demo", "captured", roots=roots)
+
+
 def test_commit_missing_scp_fails_typed_preflight_before_adapter_or_guest_effect(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

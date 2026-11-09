@@ -626,6 +626,33 @@ These are selected design requirements only. Assets, root transition, genuine
 SSH/console, strict transport handoff, capture and lifecycle behavior require
 their own M1-16 onward implementation and live evidence.
 
+### Requirement: Commit captures a stopped, read-only upper as an OCI layer
+
+M3 selects the following contract; it is design plus CPU-level behavior until a separately approved native run proves it. A commit SHALL be admitted only for a run that is stopped (graceful, supervisor-acknowledged shutdown) and whose upper, platform-state sibling and lower export are all still owned by that run. The guest SHALL boot a platform-only capture mode: the upper is mounted read-only, no overlay, workload, control jail with user keys, or network access to the workload is started, and the guest streams the upper through the authenticated control session into host staging. A running run SHALL NOT be captured by default. Running capture is an explicit opt-in that requires a bounded filesystem freeze with a guaranteed thaw on every exit path, and SHALL be rejected when freeze or thaw cannot be acknowledged.
+
+The live upper SHALL NOT be modified, cleaned, renamed or truncated by capture. Every capture failure (admission, streaming, conversion, exclusion, digest, storage, cancellation) SHALL leave the source upper, its platform state, the lower export and the run record exactly as before capture and SHALL leave no catalog entry. Staging output is created exclusively, verified, then registered atomically; partial staging is removed only by the capture that created it.
+
+Capture converts overlay semantics to an OCI layer: a character device 0/0 becomes a `.wh.<name>` entry, an opaque directory (`trusted.overlay.opaque=y`) becomes a `.wh..wh..opq` marker, regular files, directories, symlinks, hardlinks, ownership, modes and non-overlay xattrs are preserved. Overlay `redirect`, `metacopy` and other `trusted.overlay.*` metadata other than `opaque` SHALL be rejected, as SHALL sockets and device nodes other than whiteouts. Entry paths SHALL be normalized, relative, free of `..` and bounded; ordering and mtimes are deterministic. The layer's uncompressed digest is its DiffID.
+
+Selection applies in this order: (1) the mandatory exclusion set, which always wins; (2) `.plmignore` patterns evaluated relative to the guest root `/` with Docker-ignore syntax, including `!` re-inclusion, applied only to what mandatory exclusion left; (3) default include. A `!` rule SHALL NOT re-include a mandatory exclusion. `.plmignore` for commit is read from the guest root `/.plmignore` inside the captured upper or lower view; it differs from the build `.plmignore`, which is relative to the build context. `.plmignore` affects only files first created or modified in this upper; it SHALL NOT remove, and SHALL NOT be reported as removing, files already present in a parent layer. Mounted external volumes, virtiofs shares and tmpfs are not part of the upper and SHALL NOT be captured.
+
+The mandatory exclusion set consists of the reserved `/.palimpsest` namespace; generated placeholders for the per-VM `/etc/machine-id`, `/var/lib/dbus/machine-id`, `/etc/hostname` and `/etc/resolv.conf` (and only a placeholder recorded as generated, not user content); `/etc/ssh/ssh_host_*`; `/var/lib/cloud`; and DHCP lease state. Identity paths that exist in a parent layer and would reappear in a new VM (SSH host keys, cloud-init state) SHALL be hidden by an explicit whiteout in the committed layer; files the platform binds over at runtime need no whiteout. Logs, caches and package databases are included by default. A policy table fixes this explicitly: `/var/log`, `/var/cache` and `/tmp` content is included only when written to the upper outside a tmpfs mount, and package databases (`/var/lib/dpkg`) are always included so installed packages stay consistent.
+
+The committed result SHALL be a normal catalog image: a new OCI manifest whose layers are the parent chain followed by the new layer, an image config that inherits the parent's runtime configuration (Entrypoint, Cmd, Env, User, WorkingDir) and appends the new DiffID and history, and a parent link to the source image and run. It SHALL be runnable and publishable through the existing materialize, run and `published push`/`pull` paths without a new Hub schema.
+
+#### Scenario: Stopped run is captured without touching its upper
+- **WHEN** a stopped run's upper contains a modified file, a deleted lower file, an opaque directory and a generated machine-id placeholder
+- **THEN** the committed layer contains the modified file, a `.wh.` entry for the deleted file, an opaque marker, and no machine-id placeholder
+- **AND** the source upper is byte-identical before and after
+
+#### Scenario: Re-inclusion cannot defeat mandatory exclusion
+- **WHEN** `.plmignore` contains `!etc/ssh/ssh_host_ed25519_key`
+- **THEN** that key is not captured and, if present in a parent layer, is hidden by a whiteout
+
+#### Scenario: Failure preserves the source
+- **WHEN** conversion rejects a `trusted.overlay.redirect` entry
+- **THEN** no staging output or catalog entry remains and the upper is unchanged
+
 ### Requirement: Evidence and operating authority remain scoped
 
 The initial proof profile is Ubuntu24.04/aarch64 on Lima VZ, not universal image support. Source-backed LinuxBootLoader and share APIs SHALL remain distinct from installed behavior and native proof. ARM assembly, kernel/filesystem support, projection fidelity, persistent resume, real SSH and two-consumer upper isolation SHALL be verified separately. Existing x86 stage1 and fresh-upper Nova helpers SHALL NOT be presented as ready-made ARM persistent-root implementations.

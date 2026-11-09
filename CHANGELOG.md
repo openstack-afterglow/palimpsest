@@ -4,6 +4,16 @@ All notable changes to Palimpsest Local are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- Experimental native VZ `commit` (opt-in `PALIMPSEST_EXPERIMENTAL_VZ_COMMIT=1`, not advertised as a
+  capability): a stopped, unheld Lima-VZ OCI-root instance's overlay upper is cloned (APFS
+  clonefile), read with e2fsprogs `debugfs`/`e2fsck` (`PALIMPSEST_COMMIT_DEBUGFS`,
+  `PALIMPSEST_COMMIT_E2FSCK`, required) and published as a new OCI layout on top of the original
+  image under `<state>/oci-commits/<tag>`. Platform-bound identity files are never inherited and the
+  source disk is never modified. Proven once live on one Apple-silicon host (three VMs); package
+  installs, `.plmignore` and Hub publication are not yet proven live.
+
 ## [0.3.15] - 2026-11-08 (UTC; undeployed candidate)
 
 ### Fixed
