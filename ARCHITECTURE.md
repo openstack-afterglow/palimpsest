@@ -4016,8 +4016,8 @@ that CI never sees).
 {
   "schema_version": 1,
   "source_sha256": "b1c2a6a56199149a698ec6a53d2ded624d18d121230b6282dda8a67ca574c463",
-  "reviewed_at": "2026-11-09T13:29:38Z",
-  "summary": "Fix stale 0.3.15 status text after independent re-review (docs only)"
+  "reviewed_at": "2026-11-09T13:29:59Z",
+  "summary": "Record M2-17 re-review verdict (docs only)"
 }
 ```
 <!-- architecture-review:end -->
