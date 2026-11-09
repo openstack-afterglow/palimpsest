@@ -25,7 +25,7 @@
 
 ### 재개용 실행 기록
 
-**M2-17 TTL sweep 1차 관측(2026-11-09 12:40Z, 영수증 593, 읽기 전용):** 대상 digest `sha256:cc1c8afe…`의 `image-stage` 참조 행은 1개로 남아 있다(생성 2026-11-08 12:32:47Z, 24시간 경과 후 8.6분). 전체 `image-stage` 행 50개, payload 행 50개 중 24시간을 넘긴 것은 49개이고 그중 미등록은 이 대상 1개뿐이다(나머지 49개는 게시 이미지가 쓰므로 설계상 유지). 컨트롤러 3대의 `palimpsest_hub_worker`·`api` 로그에 "Staged payload expiry failed"는 최근 6시간 0건이다. 결론: 이 시점에는 만료 제거를 관측하지 못했고 정비 주기는 아직 모른다. 13:45Z 2차 관측이 결정적이다. M2-17은 체크하지 않는다.
+**M2-17 TTL sweep 1차 관측(2026-11-09 12:40Z, 영수증 593, 읽기 전용):** 대상 digest `sha256:cc1c8afe…`의 `image-stage` 참조 행은 1개로 남아 있다(생성 2026-11-08 12:32:47Z, 24시간 경과 후 8.6분). 전체 `image-stage` 행 50개, payload 행 50개 중 24시간을 넘긴 것은 49개이고 그중 미등록은 이 대상 1개뿐이다(나머지 49개는 게시 이미지가 쓰므로 설계상 유지). 컨트롤러 3대의 `palimpsest_hub_worker`·`api` 로그에 "Staged payload expiry failed"는 최근 6시간 0건이다. 결론: 이 시점에는 만료 제거를 관측하지 못했고 정비 주기는 아직 모른다. 정비 주기는 코드로 확인했다: `hub/src/palimpsest_hub/worker.py`의 worker 루프가 `maint_interval = 3600.0`으로 시간당 1회 `run_export_maintenance`를 호출하고, 정비 안에서 `expire_staged_payloads`가 TTL(기본 24시간)을 넘긴 미등록 행과 `image-stage` 참조를 지운다. 컨트롤러 3대의 worker가 각자 시간당 1회 시도하므로 컷오프(12:32:47Z) 뒤 60분 안인 13:33Z까지 정비가 최소 한 번은 돌아야 하며, 13:45Z 관측이 결정적이다. M2-17은 체크하지 않는다.
 
 **승인 경계 점검(2026-11-09, 영수증 595):** local-manila 소스 재생 중 이전 세션의 eval 셀을 필터가 충분하지 않은 상태에서 실제 HOME으로 실행했다(`subprocess`·`ssh`·`write_text`는 걸러지지 않았다). 운영 호스트 로그를 읽기 전용으로 확인한 결과 20:35 KST에 `wireguard-dmslab` ssh 로그인 8회(sudo 기록 없음)와 `dms-controller2` 로그인 3회가 있었고 sudo 명령은 `docker ps`·`docker logs --since 20m nova_scheduler`·nova-conductor 로그 `grep` 같은 읽기 전용뿐이었다. `dms-controller1·3`과 mac-mini에는 기록이 없다. 20:37 이후 2분 간격 `grep -c`는 내 프로세스가 아니다. sudo 없이 실행된 원격 셸 명령은 확인할 수 없고, 21개 ssh 셀이 모두 실행됐는지도 증명하지 못했다. 이후 재생은 네트워크 차단·쓰기 제한 샌드박스 또는 manila Path 읽기/쓰기 셀 허용 목록으로만 한다.
 
