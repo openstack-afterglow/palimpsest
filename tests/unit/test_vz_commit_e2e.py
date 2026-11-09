@@ -281,12 +281,12 @@ def test_the_expected_binding_must_name_exactly_run_volume_graph_and_nonce(tmp_p
     assert raised.value.code == "binding-expected"
 
 
-def _real_parent(tmp_path):
+def _real_parent(tmp_path, layer_files=None):
     """A parent whose manifest names the real digest of its config bytes."""
     from contextlib import contextmanager
 
     layers, diff_ids, streams = [], [], {}
-    for files in ({"a": b"1"}, {"b": b"2"}):
+    for files in layer_files or ({"a": b"1"}, {"b": b"2"}):
         blob, layer = gzip_layer(_tar(files))
         layers.append({"mediaType": _MEDIA, "digest": layer.digest, "size": layer.size})
         diff_ids.append(layer.diff_id)
@@ -413,3 +413,53 @@ def test_the_committed_layout_is_accepted_by_the_run_source_path_with_the_parent
     assert snapshot.manifest.descriptor.digest == receipt["digest"]
     assert [item.descriptor.digest for item in snapshot.layers[:2]] == list(parent[3])
     assert len(snapshot.layers) == 3 and snapshot.image.config.architecture == "arm64"
+
+
+def _new_layer_names(layout, receipt):
+    manifest = json.loads((layout / "blobs" / "sha256" / receipt["digest"].split(":")[1]).read_text())
+    path = layout / "blobs" / "sha256" / manifest["layers"][-1]["digest"].split(":")[1]
+    with tarfile.open(path, mode="r:gz") as tar:
+        return tar.getnames()
+
+
+def test_identity_files_in_the_parent_are_hidden_by_whiteouts_in_the_new_layer(tmp_path, disk):
+    (tmp_path / "out").mkdir()
+    parent = _real_parent(
+        tmp_path,
+        (
+            {
+                "etc/ssh/ssh_host_rsa_key": b"PRIVATE",
+                "var/lib/cloud/instance/user-data": b"x",
+                "etc/hostname": b"parent\n",
+                "opt/app/kept.txt": b"stay",
+            },
+        ),
+    )
+    receipt = commit(tmp_path, disk, parent=parent, generated_placeholders=["etc/machine-id"])
+    names = _new_layer_names(tmp_path / "out" / "layout", receipt)
+    assert "etc/ssh/.wh.ssh_host_rsa_key" in names
+    assert "var/lib/.wh.cloud" in names
+    assert "opt/app/kept.txt" not in names and "opt/app/.wh.kept.txt" not in names
+
+
+def test_an_unclassified_parent_authorized_keys_fails_the_commit_closed(tmp_path, disk):
+    from palimpsest_local.oci_capture import CaptureError
+
+    parent = _real_parent(tmp_path, ({"home/user/.ssh/authorized_keys": b"ssh-ed25519 AAAA"},))
+    with pytest.raises(CaptureError) as raised:
+        commit(tmp_path, disk, parent=parent)
+    assert raised.value.code == "capture-provenance"
+    assert list((tmp_path / "scratch").iterdir()) == [] and not (tmp_path / "out" / "layout").exists()
+
+
+def test_parent_whiteouts_remove_paths_before_they_are_considered(tmp_path):
+    from palimpsest_local.vz_commit import parent_layer_paths
+
+    first = tmp_path / "l1"
+    second = tmp_path / "l2"
+    first.write_bytes(gzip_layer(_tar({"etc/ssh/ssh_host_rsa_key": b"k", "keep/a": b"1", "dir/x": b"1"}))[0])
+    second.write_bytes(
+        gzip_layer(_tar({"etc/ssh/.wh.ssh_host_rsa_key": b"", "dir/.wh..wh..opq": b"", "dir/y": b"2"}))[0]
+    )
+    manifest = {"layers": [{"digest": "d1"}, {"digest": "d2"}]}
+    assert parent_layer_paths(manifest, {"d1": first, "d2": second}) == {"keep/a", "dir/y"}

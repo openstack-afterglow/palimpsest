@@ -20,6 +20,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tarfile
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager
 from pathlib import Path
@@ -232,6 +233,39 @@ def _stage_parent_layers(
     return staged
 
 
+MAX_PARENT_PATHS = 5_000_000
+
+
+def parent_layer_paths(manifest: dict, blobs: Mapping[str, Path]) -> set[str]:
+    """Paths visible in the parent image after applying its layers in order (whiteouts honoured)."""
+    visible: set[str] = set()
+    for item in manifest.get("layers", ()):
+        try:
+            archive = tarfile.open(blobs[item["digest"]], mode="r|gz")
+        except (OSError, tarfile.TarError, KeyError):
+            raise CommitError("commit-parent", "a parent layer could not be read to list its paths") from None
+        with archive:
+            try:
+                for member in archive:
+                    name = os.path.normpath(member.name).lstrip("/")
+                    if name in (".", ""):
+                        continue
+                    directory, _, base = name.rpartition("/")
+                    if base == ".wh..wh..opq":
+                        prefix = directory + "/" if directory else ""
+                        visible = {path for path in visible if not path.startswith(prefix)} if prefix else set()
+                    elif base.startswith(".wh."):
+                        gone = (directory + "/" if directory else "") + base.removeprefix(".wh.")
+                        visible = {path for path in visible if path != gone and not path.startswith(gone + "/")}
+                    else:
+                        visible.add(name)
+                    if len(visible) > MAX_PARENT_PATHS:
+                        raise CommitError("commit-parent", "the parent image has too many paths to inspect")
+            except tarfile.TarError:
+                raise CommitError("commit-parent", "a parent layer is not a readable tar") from None
+    return visible
+
+
 def commit_stopped_disk(
     *,
     disk: Path,
@@ -285,6 +319,7 @@ def commit_stopped_disk(
         options = dict(capture_options or {})
         options.setdefault("generated_placeholders", tuple(generated_placeholders))
         options.setdefault("injected_placeholders", tuple(injected_placeholders))
+        options.setdefault("parent_paths", parent_layer_paths(manifest, blobs))
         committed, _receipt = capture_to_layout(
             disk=disk,
             disk_size=disk_size,
@@ -319,6 +354,7 @@ __all__ = [
     "capture_to_layout",
     "clonefile",
     "commit_stopped_disk",
+    "parent_layer_paths",
     "private_upper_clone",
     "verify_binding",
 ]
