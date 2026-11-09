@@ -14,12 +14,12 @@ All notable changes to Palimpsest Local are documented here.
   source disk is never modified. Proven once live on one Apple-silicon host (three VMs); package
   installs, `.plmignore` and Hub publication are not yet proven live.
 
-## [0.3.15] - 2026-11-08 (UTC; undeployed candidate)
+## [0.3.15] - 2026-11-08 (UTC; published; deployed to the three DMS Lab controllers and the dedicated build worker on 2026-11-09)
 
 ### Fixed
 
 - Enforce byte-exact `project_id` and `created_by` equality when registering staged publication payloads against published images and enforcing staging limits (`services/staged_payloads.py`). Binary SQL casts (`cast(..., LargeBinary)`) ensure that database engines or tables using case-insensitive SQL collations (such as CI SQLite NOCASE or MariaDB/MySQL default collations) cannot match differing casing variants as the same project or user. Foreign casing variants can no longer match an image, free staged quota, or reveal payload existence.
-- Test limits and residuals: 0.3.15 is an undeployed candidate. The fix is tested under simulated SQLite NOCASE schema collation in `hub/tests/test_staged_payload_limits.py`; live MariaDB reproduction was not executed in CI. Existing database primary key collation collision risks remain when tables use case-insensitive collations for unique identity columns.
+- Test limits and residuals: 0.3.15 was deployed on 2026-11-09 (writer drain, paired SQL/CAS backup, `reconfigure` onto the new digests; no restore test of that backup, no authenticated stage smoke on production yet). The fix is tested under simulated SQLite NOCASE schema collation in `hub/tests/test_staged_payload_limits.py`; live MariaDB reproduction was not executed in CI. Existing database primary key collation collision risks remain when tables use case-insensitive collations for unique identity columns.
 
 ## [0.3.14] - 2026-11-08 (UTC)
 
