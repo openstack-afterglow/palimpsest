@@ -4024,8 +4024,8 @@ that CI never sees).
 {
   "schema_version": 1,
   "source_sha256": "3a97961af3f7a768618aa9c42836f1a8cab7875c651d09932fc238c38c4f2f3d",
-  "reviewed_at": "2026-11-09T13:33:21Z",
-  "summary": "Settle an unlocked native VZ SSH session marker only when its recorded actor is gone"
+  "reviewed_at": "2026-11-09T13:33:37Z",
+  "summary": "Record orphan session marker fix (docs)"
 }
 ```
 <!-- architecture-review:end -->
