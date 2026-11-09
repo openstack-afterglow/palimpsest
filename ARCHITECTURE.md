@@ -349,6 +349,14 @@ cleanup. Ordinary caller defaults remain unchanged. The existing registry
 initialization flock is still blocking. Guest exec timeout is solely its guest
 execution duration; host status actors keep their independent 40-second bound.
 
+An unlocked `session-*` SSH custody marker (its owning client died) is settled, not held, only when
+it records a well-formed SSH `actor_pid` that no longer exists. A live actor, an unrecorded or
+malformed actor line and every read-only probe keep HOLD ("actor custody survived its owner"); a
+marker still locked by a live owner is skipped as before. Settlement unlinks only that marker under
+the namespace custody lock and fsyncs the directory; resource `hold-*` markers are never touched.
+Test-defined only (`test_vz_native_session_marker.py`); a live client-kill case on a real VM has
+not been re-run.
+
 Source247's expanded19-file lane passed1792/92.52s. Source248's seven changed
 nodes passed1079/21.74s and its final19-file lane passed1823/93.56s. Both
 independent source re-reviews closed findings; scoped lint/format pass.
@@ -4015,9 +4023,9 @@ that CI never sees).
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "b1c2a6a56199149a698ec6a53d2ded624d18d121230b6282dda8a67ca574c463",
-  "reviewed_at": "2026-11-09T12:42:55Z",
-  "summary": "Sharpen M2-17 sweep conclusion (docs only)"
+  "source_sha256": "3a97961af3f7a768618aa9c42836f1a8cab7875c651d09932fc238c38c4f2f3d",
+  "reviewed_at": "2026-11-09T13:33:21Z",
+  "summary": "Settle an unlocked native VZ SSH session marker only when its recorded actor is gone"
 }
 ```
 <!-- architecture-review:end -->

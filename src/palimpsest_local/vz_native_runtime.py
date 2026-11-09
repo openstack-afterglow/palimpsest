@@ -521,6 +521,29 @@ def _verify_custody_binding(root, directory_fd, lock_fd, expected_lock):
         raise VZNativeHold("native VZ custody binding is unavailable after acquisition") from error
 
 
+def _dead_session_actor(marker_fd) -> bool:
+    """True only when an unlocked session marker names an SSH actor pid that no longer exists."""
+    try:
+        raw = os.pread(marker_fd, 65537, 0)
+        if not raw or len(raw) > 65536:
+            return False
+        lines = raw.decode("utf-8").split("\n")
+        if len(lines) != 2:
+            return False
+        owner, actor = json.loads(lines[0]), json.loads(lines[1])
+        if owner.get("schema") != _SCHEMA or owner.get("operation") != "user-ssh" or actor.get("schema") != _SCHEMA:
+            return False
+        pid = actor.get("actor_pid")
+        if type(pid) is not int or pid <= 1:
+            return False
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except (OSError, ValueError):
+        return False
+    return False
+
+
 @contextmanager
 def _custody(
     config, *, lock_timeout=0, lock_deadline=None, observation_budget=None, cleanup_hold=None, read_only_probe=False
@@ -619,7 +642,12 @@ def _custody(
                     continue
                 if (visible.st_dev, visible.st_ino) != (actor.st_dev, actor.st_ino):
                     raise VZNativeHold("native VZ SSH custody marker changed")
-                raise VZNativeHold("native VZ SSH actor custody survived its owner; reconciliation required")
+                if read_only_probe or not _dead_session_actor(actor_fd):
+                    raise VZNativeHold("native VZ SSH actor custody survived its owner; reconciliation required")
+                # Owner gone (marker unlocked) and its recorded SSH actor is gone: no host actor holds this
+                # session. A live, unknown or unrecorded actor, and every read-only probe, stay HOLD.
+                os.unlink(name, dir_fd=fd)
+                os.fsync(fd)
             finally:
                 os.close(actor_fd)
         yield root
