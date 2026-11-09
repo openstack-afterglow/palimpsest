@@ -4015,9 +4015,9 @@ that CI never sees).
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "8411206e27cedd18e3fc00b4ee031ee267f25ba73414bc9c227684dab3108e16",
-  "reviewed_at": "2026-11-09T09:56:25Z",
-  "summary": "Author review: parent path listing wired into the VZ commit; identity hiding unit-tested only."
+  "source_sha256": "b1c2a6a56199149a698ec6a53d2ded624d18d121230b6282dda8a67ca574c463",
+  "reviewed_at": "2026-11-09T10:55:29Z",
+  "summary": "Add native preflight off-event-loop regression test (test-only)"
 }
 ```
 <!-- architecture-review:end -->
