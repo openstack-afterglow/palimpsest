@@ -40,6 +40,11 @@ files_modified:
 - Evidence: `test_cli_contract.py` 221 passed (cloud, published, compose-forwarding, gate tests); mutations dropping compose forwarding, the published `project_id`, and the gate each fail.
 - The global `--cloud` uses `dest="hub_cloud"` so `cloud env up --cloud NAME` (its own required flag) is not rejected by the gate; `test_cloud_env_up_keeps_its_own_cloud_flag_and_passes_the_hub_gate` covers it; dropping the dest fails it. `cloud env` tests: 185 passed. The top-level option scanner in `main()` skips `--cloud NAME` and `--cloud=NAME`, so `--cloud X run IMG -- cmd` keeps its command override (`test_global_cloud_flag_before_run_keeps_the_command_override`; removing the skip fails it). CI on `65568b7` failed Portable Linux (3/6), (4/6): `tests/unit/test_cli_project.py` and `test_project_adapter.py` monkeypatched `_compose_callbacks` with signatures that did not accept the new `cloud=` keyword. The stubs now take `**_kwargs`; a local run of only `test_cli_contract.py` had not covered them, so the full `tests/unit` run is the gate for this change.
 
+### M4-10 who-based session observer (2026-11-10, test-passed, M4-10 unchecked)
+- `hub/src/palimpsest_hub/services/session_observer.py`: `WhoSessionObserver` + `parse_who`. Failure, timeout (10 s default), non-text, malformed line → `ObservationError`; exception text is not copied.
+- Evidence: `hub/tests/test_session_observer.py` + `test_session_controller.py` + `test_session_lifecycle.py` 33 passed; malformed-line-skip mutation fails. Registered in `scripts/test_lanes.py` hub list.
+- Still open for M4-10: session state persistence, live SSH/console injection, operational Nova wiring, live verification. M4-11 trust follows receipt 583 scope.
+
 ## Reader/member/manager priority cutover — 2026-11-06, source264 in progress
 
 Owner explicitly added this alongside the continuing local M1 Goal: existing

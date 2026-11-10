@@ -4026,9 +4026,9 @@ that CI never sees).
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "faa11644b26dedf562b39bec245ae0ee7860bd199b033f9978cc1c6749027b20",
-  "reviewed_at": "2026-11-10T12:40:18Z",
-  "summary": "Compose test stubs accept cloud kwarg; handoff CI note"
+  "source_sha256": "f3af9b3b020af1a81516be6f8b73d3223ea5f3e9fc118cc99027298dbe373ed2",
+  "reviewed_at": "2026-11-10T12:57:43Z",
+  "summary": "M4-10 who-based SessionObserver slice (test-passed)"
 }
 ```
 <!-- architecture-review:end -->

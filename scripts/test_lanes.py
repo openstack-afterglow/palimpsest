@@ -149,6 +149,7 @@ SPECIAL_FILES = {
             "git_source",
             "session_lifecycle",
             "session_controller",
+            "session_observer",
             "nova_shelve_provider",
             "git_context",
             "git_staging",
