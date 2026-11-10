@@ -905,6 +905,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--cloud",
         dest="hub_cloud",
+        metavar="CLOUD",
         help="clouds.yaml cloud whose Keystone token and project authenticate Hub calls (overrides PALIMPSEST_TOKEN)",
     )
     parser.add_argument("--version", action="version", version=__version__, help="show the client version and exit")

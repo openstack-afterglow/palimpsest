@@ -4026,9 +4026,9 @@ that CI never sees).
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "10d2f759a82d445dceb9c70a73f1190f223d3210f707240039b38ee2f691f9a9",
-  "reviewed_at": "2026-11-10T12:17:45Z",
-  "summary": "--cloud dest split from cloud env up --cloud; regression test"
+  "source_sha256": "83d365498c641607cb43fb4bfa3c784c16593e2c58eadf17d91458f6e72f66ca",
+  "reviewed_at": "2026-11-10T12:18:04Z",
+  "summary": "metavar CLOUD for global --cloud"
 }
 ```
 <!-- architecture-review:end -->
