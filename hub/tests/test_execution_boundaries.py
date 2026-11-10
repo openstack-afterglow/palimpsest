@@ -27,6 +27,7 @@ from palimpsest_hub.main import app
     [
         ("/v1/instances", {"command": [{"private-input": "never-reflect-execution-secret"}]}),
         ("/v1/dockerfile-builds", {"dockerfile": {"private-input": "never-reflect-execution-secret"}}),
+        ("/v1/git-builds", {"repo_url": {"private-input": "never-reflect-execution-secret"}}),
         ("/v1/published-images", {"manifest": {"private-input": "never-reflect-execution-secret"}}),
         ("/v1/native-instances", {"command": [{"private-input": "never-reflect-execution-secret"}]}),
     ],
