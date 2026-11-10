@@ -12,7 +12,7 @@ Coverage: **162 command paths**, **444 positional/option definitions** (excludin
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest [-h] [--url URL] [--cloud CLOUD] [--version] {cloud,benchmark,image,published,layer,bundle,oci,build,registry,login,logout,pull,push,tag,images,history,rmi,save,load,docker,run,compose,ps,volumes,networks,volume,inspect,logs,shell,exec,start,stop,rm,commit,web,store,completion} ...
+usage: palimpsest [-h] [--url URL] [--cloud HUB_CLOUD] [--version] {cloud,benchmark,image,published,layer,bundle,oci,build,registry,login,logout,pull,push,tag,images,history,rmi,save,load,docker,run,compose,ps,volumes,networks,volume,inspect,logs,shell,exec,start,stop,rm,commit,web,store,completion} ...
 ```
 
 Subcommands: `cloud`, `benchmark`, `image`, `published`, `layer`, `bundle`, `oci`, `build`, `registry`, `login`, `logout`, `pull`, `push`, `tag`, `images`, `history`, `rmi`, `save`, `load`, `docker`, `run`, `compose`, `ps`, `volumes`, `networks`, `volume`, `inspect`, `logs`, `shell`, `exec`, `start`, `stop`, `rm`, `commit`, `web`, `store`, `completion`.
