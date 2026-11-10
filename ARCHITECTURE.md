@@ -4026,9 +4026,9 @@ that CI never sees).
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "faa11644b26dedf562b39bec245ae0ee7860bd199b033f9978cc1c6749027b20",
-  "reviewed_at": "2026-11-10T12:40:18Z",
-  "summary": "Compose test stubs accept cloud kwarg; handoff CI note"
+  "source_sha256": "951a65d9a7371e8214cae8a947fc1200ab41467f6bb957d21feaf655128f246d",
+  "reviewed_at": "2026-11-10T13:05:49Z",
+  "summary": "who observer: ps failure exits before end marker; canary removed"
 }
 ```
 <!-- architecture-review:end -->

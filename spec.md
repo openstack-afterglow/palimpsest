@@ -25,6 +25,8 @@
 
 ### 재개용 실행 기록
 
+**2026-11-10 M4-10 관측자 슬라이스 (test-passed, M4-10 미체크):** `WhoSessionObserver`(`services/session_observer.py`)가 주입된 `fetch(instance_id)`로 게스트 프로브(`GUEST_PROBE_COMMAND`: utmp 읽기 표식, `who`, `ps` 출력을 먼저 변수에 받아 실패 시 종료한 뒤 `sshd` 줄만 전달, 끝 표식)를 세션 집합으로 바꾼다. utmp 표식이나 끝 표식이 없으면, 실패·시간 초과(기본 10초)·비문자열·형식 오류는 모두 `ObservationError`(빈 집합 아님)다. 예외 본문은 옮기지 않는다. 자기 연결 제외는 아직 없다(셸브를 막는 방향으로 안전하며 남은 작업). 테스트 43 통과(관측자·컨트롤러·수명주기)(관측자·컨트롤러 연동 포함, 리스너·인증 전 줄 제외, `sshd-session:` 포함), 끝 표식·utmp 표식 검사 제거 변이 각 1 실패. 세션 제목 판별은 파서의 완전 일치 정규식 하나로 한다. 프로브는 `ps` 실패 시 끝 표식을 찍지 않는다. 셸 확인은 로컬 BSD에서만(게스트 GNU·실 SSH 미검증). 남은 M4-10 일: 세션 상태 영속화, 실 SSH/console 주입, 재접속 취소의 운영 Nova 연결, 실환경 검증. M4-11 trust는 영수증 583 승인 범위 안에서 구현 대기.
+
 **2026-11-10 M4-02 Hub cloud auth slice (test-passed, 미체크):** 최상위 `--cloud NAME`이 clouds.yaml의 Keystone 토큰과 `current_project_id`로 Hub를 호출하고 `X-Project-Id`를 보낸다(`cloud_cli.hub_credentials`, `cli.hub_client`). 적용 범위는 image/layer/bundle, published push|pull, run/build/compose의 Hub 경로이며, 그 외 명령은 `--cloud`를 거부한다(조용한 PALIMPSEST_TOKEN 대체 금지). 테스트 221 통과, compose 전달·published project_id·게이트 변이 각 1 실패. 실 Keystone·Hub 호출 없음, M4-02는 미체크.
 
 **2026-11-10 M4-08 CLI slice (test-passed, 미체크):** `palimpsest image git-build`(고정 SHA 요청, `--request-id`는 Hub 호출 전 UUID 검사)과 `palimpsest image git-job <id>`(빌드 커밋 조회)를 추가했다. 계약 테스트 3개 + `tests/unit/test_cli_contract.py` 207개 통과, `revision` 누락 변이 1 실패. 실 Hub 실행 없음, M4-08은 여전히 미체크(생성·상태·로그·SSH·보존·재개·삭제 계약 전체 미구현).
