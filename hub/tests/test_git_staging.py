@@ -284,3 +284,18 @@ async def test_a_credential_reference_is_refused_before_any_git_call(store, head
         await _stage(store, runner, credential_ref="deploy-key")
     assert info.value.code == "credential"
     assert runner.calls == []
+
+
+async def test_a_dockerignore_that_removes_the_dockerfile_is_refused(store, head):
+    runner = Runner(files={"Dockerfile": "FROM scratch\n", ".dockerignore": "Dockerfile\n"})
+    with pytest.raises(GitSourceError) as info:
+        await _stage(store, runner)
+    assert info.value.code == "dockerfile"
+    assert scratch_dirs(store) == []
+
+
+async def test_the_staged_result_reports_the_dockerfile_relative_to_the_context(store, head):
+    runner = Runner(files={"app/Dockerfile": "FROM scratch\n", "app/main.py": "y\n"})
+    result = await _stage(store, runner, context_subdir="app", dockerfile_path="app/Dockerfile")
+    assert result.dockerfile == "Dockerfile"
+    assert "Dockerfile" in tar_names(store, result.blob_digest)

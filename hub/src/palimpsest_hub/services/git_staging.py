@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import tarfile
 import tempfile
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -46,6 +47,7 @@ class StagedGitContext:
     entries: int
     revision: str
     host: str
+    dockerfile: str  # path inside the blob, relative to the build context
 
 
 def _real_dir_inside(checkout: Path, rel: str) -> Path:
@@ -57,12 +59,13 @@ def _real_dir_inside(checkout: Path, rel: str) -> Path:
     return path
 
 
-def _check_dockerfile(checkout: Path, context: Path, dockerfile_path: str) -> None:
+def _check_dockerfile(checkout: Path, context: Path, dockerfile_path: str) -> str:
     path = checkout / dockerfile_path
     if path.is_symlink() or not path.is_file():
         raise GitSourceError("dockerfile", "dockerfile_path must be a regular file in the checkout")
     if not path.resolve(strict=True).is_relative_to(context.resolve(strict=True)):
         raise GitSourceError("dockerfile", "dockerfile_path must lie inside the build context")
+    return path.resolve(strict=True).relative_to(context.resolve(strict=True)).as_posix()
 
 
 def _read_dockerignore(context: Path) -> list[str]:
@@ -75,10 +78,15 @@ def _read_dockerignore(context: Path) -> list[str]:
         raise ContextError(".dockerignore is not valid UTF-8") from None
 
 
-def _pack(context: Path, out: Path) -> tuple[str, int]:
+def _pack(context: Path, out: Path, dockerfile: str) -> tuple[str, int]:
     ignore = _read_dockerignore(context)
     with out.open("wb") as handle:
-        return write_context_tar(context, handle, ignore_lines=ignore)
+        digest, entries = write_context_tar(context, handle, ignore_lines=ignore)
+    with tarfile.open(out) as tar:
+        if dockerfile not in tar.getnames():
+            # Docker always sends the Dockerfile; a blob without it cannot build, so refuse here.
+            raise GitSourceError("dockerfile", ".dockerignore removes the Dockerfile from the context")
+    return digest, entries
 
 
 async def stage_git_context(
@@ -101,9 +109,9 @@ async def stage_git_context(
         checkout = scratch / "src"
         await run_blocking(git_source.fetch, pinned, checkout, runner=runner)
         context = await run_blocking(_real_dir_inside, checkout, request.context_subdir)
-        await run_blocking(_check_dockerfile, checkout, context, request.dockerfile_path)
+        dockerfile = await run_blocking(_check_dockerfile, checkout, context, request.dockerfile_path)
         tar_path = scratch / "context.tar"
-        digest, entries = await run_blocking(_pack, context, tar_path)
+        digest, entries = await run_blocking(_pack, context, tar_path, dockerfile)
         finalized = await run_blocking(store.promote_file, tar_path, max_bytes=max_context_bytes)
         if finalized.blob_digest != f"sha256:{digest}":
             raise GitSourceError("digest", "staged blob digest does not match the packed context")
@@ -113,6 +121,7 @@ async def stage_git_context(
             entries=entries,
             revision=pinned.revision,
             host=pinned.host,
+            dockerfile=dockerfile,
         )
     finally:
         await run_blocking(shutil.rmtree, scratch, True)
