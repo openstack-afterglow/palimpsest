@@ -4027,8 +4027,8 @@ that CI never sees).
 {
   "schema_version": 1,
   "source_sha256": "aed7b2de06fbe5e6aa06377c8ad85fc06327c1a755cd51f083b080312bee1b61",
-  "reviewed_at": "2026-11-10T06:25:47Z",
-  "summary": "Disable the global rate limiter in the image-job test fixture"
+  "reviewed_at": "2026-11-10T06:29:34Z",
+  "summary": "Merge dev (after #58) into staging branch"
 }
 ```
 <!-- architecture-review:end -->
