@@ -6,10 +6,11 @@ Symlinks are stored as links, never followed, and a link whose target leaves the
 refused. Special files (FIFOs, devices, sockets) are refused.
 
 Ignore rules come from `.dockerignore` lines. Supported: exact paths, `*`/`?` globs (matched
-with `fnmatch`, so `*` also crosses `/`: a broad pattern ignores more, which is the safe
-direction), and directory prefixes (ignoring `tmp` drops everything under `tmp/`). Negated
-rules (`!pattern`) are refused rather than guessed, and a pattern that climbs with `..` is
-refused.
+with `fnmatch`, where `*` also crosses `/`, so it can ignore more than Docker would), and
+directory prefixes (ignoring `tmp` drops everything under `tmp/`). Rules that Docker interprets
+differently are refused rather than guessed and fail closed: negated rules (`!pattern`), `**`
+(Docker's `**/` matches zero or more directories, so `**/.env` also covers a root `.env`, which
+`fnmatch` cannot express), and any rule that climbs with `..`.
 """
 
 from __future__ import annotations
@@ -47,6 +48,8 @@ def parse_ignore(lines: Sequence[str]) -> tuple[str, ...]:
             continue
         if line.startswith("!"):
             raise ContextError("negated ignore rules are not supported")
+        if "**" in line:
+            raise ContextError("'**' ignore rules are not supported; they could leave secrets in the context")
         line = line.removeprefix("./").strip("/")
         if not line or ".." in line.split("/"):
             raise ContextError("ignore rule must stay inside the context")

@@ -113,10 +113,23 @@ def test_negated_ignore_rules_are_refused_not_guessed():
         parse_ignore(["*.log", "!keep.log"])
 
 
+@pytest.mark.parametrize("rule", ["**/.env", "src/**/*.pem", "**"])
+def test_double_star_rules_are_refused_because_they_could_miss_root_secrets(rule):
+    with pytest.raises(ContextError, match="'\*\*'"):
+        parse_ignore([rule])
+
+
 @pytest.mark.parametrize("rule", ["../secret", "a/../../b"])
 def test_ignore_rules_cannot_climb_out_of_the_context(rule):
     with pytest.raises(ContextError):
         parse_ignore([rule])
+
+
+def test_a_root_level_secret_is_not_stored_when_the_rule_is_refused(tmp_path):
+    make_tree(tmp_path)
+    (tmp_path / ".env").write_text("SECRET=1\n")
+    with pytest.raises(ContextError):
+        build(tmp_path, ignore=["**/.env"])
 
 
 def test_a_root_that_is_not_a_directory_is_refused(tmp_path):
