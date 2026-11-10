@@ -3,7 +3,7 @@
 
 This file is generated from `palimpsest_local.cli.build_parser`. It inventories every command, positional, option, choice, and parser default. For behavior, examples, and runtime restrictions, read [the usage guide](usage.md). Every command except raw `docker` pass-through accepts automatic `-h`/`--help`.
 
-Coverage: **160 command paths**, **433 positional/option definitions** (excluding automatic `-h/--help`).
+Coverage: **162 command paths**, **443 positional/option definitions** (excluding automatic `-h/--help`).
 
 ## `palimpsest`
 
@@ -904,10 +904,46 @@ usage: palimpsest benchmark status [-h] --root ROOT job_id
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest image [-h] {ls,check,pull,verify,import,push,inspect,history,rm,save,load} ...
+usage: palimpsest image [-h] {git-build,git-job,ls,check,pull,verify,import,push,inspect,history,rm,save,load} ...
 ```
 
-Subcommands: `ls`, `check`, `pull`, `verify`, `import`, `push`, `inspect`, `history`, `rm`, `save`, `load`.
+Subcommands: `git-build`, `git-job`, `ls`, `check`, `pull`, `verify`, `import`, `push`, `inspect`, `history`, `rm`, `save`, `load`.
+
+### `palimpsest image git-build`
+
+[Behavior, restrictions, and examples](usage.md#hub-cloud-images-layers-and-bundles).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest image git-build [-h] --repo-url REPO_URL --revision REVISION [--dockerfile-path DOCKERFILE_PATH] [--context-subdir CONTEXT_SUBDIR] --request-id REQUEST_ID --name NAME --os-family OS_FAMILY --os-version OS_VERSION [--visibility {private,internal,public}]
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `--repo-url` | string | required | https Git URL on an allow-listed host |
+| `--revision` | string | required | full 40-character commit SHA |
+| `--dockerfile-path` | string | `'Dockerfile'` | Dockerfile path in the checkout |
+| `--context-subdir` | string | `'.'` | build context directory in the checkout |
+| `--request-id` | string | required | UUID; retrying the same request replays its job |
+| `--name` | string | required | image name (lowercase, digits, . + -) |
+| `--os-family` | string | required | operating-system family declared for the image |
+| `--os-version` | string | required | operating-system version declared for the image |
+| `--visibility` | one of: `private`, `internal`, `public` | `'private'` | image visibility on the Hub |
+
+### `palimpsest image git-job`
+
+[Behavior, restrictions, and examples](usage.md#hub-cloud-images-layers-and-bundles).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest image git-job [-h] job_id
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `job_id` | string | required | Hub image job id |
 
 ### `palimpsest image ls`
 

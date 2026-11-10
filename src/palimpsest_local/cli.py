@@ -876,13 +876,15 @@ def build_parser() -> argparse.ArgumentParser:
     image_git_build.add_argument("--context-subdir", default=".", help="build context directory in the checkout")
     image_git_build.add_argument("--request-id", required=True, help="UUID; retrying the same request replays its job")
     image_git_build.add_argument("--name", required=True, help="image name (lowercase, digits, . + -)")
-    image_git_build.add_argument("--os-family", required=True)
-    image_git_build.add_argument("--os-version", required=True)
-    image_git_build.add_argument("--visibility", choices=("private", "internal", "public"), default="private")
+    image_git_build.add_argument("--os-family", required=True, help="operating-system family declared for the image")
+    image_git_build.add_argument("--os-version", required=True, help="operating-system version declared for the image")
+    image_git_build.add_argument(
+        "--visibility", choices=("private", "internal", "public"), default="private", help="image visibility on the Hub"
+    )
     image_git_job = image_commands.add_parser(
         "git-job", help="show a Hub image job, including the commit a Git build used"
     )
-    image_git_job.add_argument("job_id")
+    image_git_job.add_argument("job_id", help="Hub image job id")
     image_ls = image_commands.add_parser(
         "ls",
         help="list boot images available from Hub (not local inventory)",

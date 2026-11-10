@@ -20,7 +20,7 @@ Do not treat these similarly named surfaces as interchangeable:
 
 | Surface | Examples | Backend and credentials |
 | --- | --- | --- |
-| Palimpsest Hub artifacts | `image ls`, `image pull`, `image push`, `layer ls/check/pack/pull/push`, `bundle *`, `published push/pull/status` | Native Palimpsest Hub `/v1`; `PALIMPSEST_TOKEN` for Hub operations (local `layer pack` needs none); `published` also accepts an image API key and anonymous public pulls |
+| Palimpsest Hub artifacts | `image ls`, `image pull`, `image push`, `image git-build`, `image git-job`, `layer ls/check/pack/pull/push`, `bundle *`, `published push/pull/status` | Native Palimpsest Hub `/v1`; `PALIMPSEST_TOKEN` for Hub operations (local `layer pack` needs none); `published` also accepts an image API key and anonymous public pulls |
 | Docker wrapper | `pull`, `push`, `tag`, `images`, `history`, `rmi`, `save`, `load`, and `image inspect/history/rm/save/load` | Installed Docker CLI and external OCI registries; Docker credentials |
 | Local OCI root | `oci pull`, `oci materialize`, `run ./image.oci.tar --runtime-kind oci-root` | Anonymous TLS registry acquisition into a verified local archive; private source CAS and Linux KVM runtime |
 | Permanent shared OCI cache | `oci cache --root PATH init/pull/import/materialize/retain/release/inspect` | Explicit private directory on pre-mounted persistent storage; anonymous verified TLS for pulls, current local CAS/materializer authority |
