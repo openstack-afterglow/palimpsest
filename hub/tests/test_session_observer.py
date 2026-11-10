@@ -7,7 +7,6 @@ import pytest
 from palimpsest_hub.services.session_controller import ObservationError, Outcome, SessionController
 from palimpsest_hub.services.session_observer import (
     GUEST_PROBE_COMMAND,
-    SSHD_SESSION_PATTERN,
     WhoSessionObserver,
     parse_who,
 )
@@ -164,5 +163,12 @@ def test_pty_sshd_session_is_counted():
     assert parse_who(_listing("sshd: ubuntu@pts/3")) == {"sshd: ubuntu@pts/3"}
 
 
-def test_probe_and_parser_share_one_session_pattern():
-    assert SSHD_SESSION_PATTERN in GUEST_PROBE_COMMAND
+def test_probe_refuses_to_print_the_end_marker_when_ps_fails():
+    # `out=$(ps ...) || exit 1` must precede the end marker; a failed ps can never be "no sessions".
+    guard = GUEST_PROBE_COMMAND.index("out=$(ps -eo args=) || exit 1")
+    assert guard < GUEST_PROBE_COMMAND.index("PALIMPSEST-END")
+
+
+def test_listing_cut_off_after_a_failed_ps_is_unknown_not_empty():
+    with pytest.raises(ObservationError):
+        parse_who("PALIMPSEST-UTMP-OK\n")

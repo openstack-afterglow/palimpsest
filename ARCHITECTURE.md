@@ -4026,9 +4026,9 @@ that CI never sees).
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "45ab3fc3afd154f8cd0632eafe3cd86404d2c40be2871903d183092d8f88eeb9",
-  "reviewed_at": "2026-11-10T13:04:02Z",
-  "summary": "who observer: session titles only, canary, sshd-session"
+  "source_sha256": "951a65d9a7371e8214cae8a947fc1200ab41467f6bb957d21feaf655128f246d",
+  "reviewed_at": "2026-11-10T13:05:49Z",
+  "summary": "who observer: ps failure exits before end marker; canary removed"
 }
 ```
 <!-- architecture-review:end -->

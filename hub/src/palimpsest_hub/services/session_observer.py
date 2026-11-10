@@ -22,13 +22,13 @@ END_MARKER = "PALIMPSEST-END"
 # A post-authentication session title: `sshd: user@pts/N|notty` (OpenSSH < 9.8) or
 # `sshd-session: user@pts/N|notty` (OpenSSH >= 9.8). The listener (`sshd: /usr/sbin/sshd -D
 # [listener] ...`) and pre-auth (`sshd: [accepted]`, `sshd: user [priv]`) titles do not match.
-SSHD_SESSION_PATTERN = r"sshd(-session)?: [^ ]+@(pts/[0-9]+|notty)"  # POSIX ERE and Python
+SSHD_SESSION_PATTERN = r"sshd(-session)?: [^ ]+@(pts/[0-9]+|notty)"
 SSHD_SESSION_RE = re.compile(SSHD_SESSION_PATTERN)
 GUEST_PROBE_COMMAND = (
     "if [ -r /run/utmp ] || [ -r /var/run/utmp ]; then echo PALIMPSEST-UTMP-OK; who || exit 1; fi; "
-    # Canary: the pattern must match a known session line before the listing is trusted.
-    f"printf 'sshd: canary@pts/0\\n' | grep -E '^{SSHD_SESSION_PATTERN}$' >/dev/null || exit 1; "
-    f"ps -eo args= | grep -E '^{SSHD_SESSION_PATTERN}$'; rc=$?; [ $rc -gt 1 ] && exit 1; "
+    # A failed `ps` exits before the end marker, so it can never read as "no sessions".
+    "out=$(ps -eo args=) || exit 1; "
+    "printf '%s\\n' \"$out\" | grep '^sshd' || true; "
     "echo PALIMPSEST-END"
 )
 
