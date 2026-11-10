@@ -4026,9 +4026,9 @@ that CI never sees).
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "a5ab5aafe9f42f637952a7018fe69f0642277ba08fa6505c2e2224d77a3d2dec",
-  "reviewed_at": "2026-11-10T12:19:19Z",
-  "summary": "global --cloud skipped by option scanner; run override test"
+  "source_sha256": "faa11644b26dedf562b39bec245ae0ee7860bd199b033f9978cc1c6749027b20",
+  "reviewed_at": "2026-11-10T12:40:18Z",
+  "summary": "Compose test stubs accept cloud kwarg; handoff CI note"
 }
 ```
 <!-- architecture-review:end -->
