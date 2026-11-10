@@ -4027,8 +4027,8 @@ that CI never sees).
 {
   "schema_version": 1,
   "source_sha256": "e30a5645b0a8df7486bd1deceaec83555d0cbf0cb26f265ad0117d180376d6f0",
-  "reviewed_at": "2026-11-10T08:14:57Z",
-  "summary": "M4-06 readback and M4-08 SDK build_git (merged slices)"
+  "reviewed_at": "2026-11-10T11:49:07Z",
+  "summary": "Handoff: add PRs 61-63 and new dev head"
 }
 ```
 <!-- architecture-review:end -->
