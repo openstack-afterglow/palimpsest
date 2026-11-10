@@ -2270,3 +2270,42 @@ async def test_a_git_host_outside_the_allow_list_is_refused_before_any_context_o
     async with images.factory() as session:
         assert (await session.scalars(select(PalimpsestHubImageJob))).all() == []
         assert (await session.scalars(select(PalimpsestHubBuildContext))).all() == []
+
+
+@pytest.mark.asyncio
+async def test_an_unconfigured_worker_refuses_before_any_git_call(images, monkeypatch):
+    images.settings.palimpsest_hub_git_allowed_hosts = ("github.com",)
+    images.settings.palimpsest_hub_build_worker_key = SecretStr("")
+    public_dns(monkeypatch)
+    fake = FakeGit({"Dockerfile": "FROM scratch\n"})
+    monkeypatch.setattr(git_source.subprocess, "run", fake)
+    response = await images.client.post("/v1/git-builds", headers=HUMAN, json=git_body())
+    assert response.status_code == 503
+    assert fake.calls == []
+
+
+@pytest.mark.asyncio
+async def test_an_empty_operator_policy_refuses_before_any_git_call(images, monkeypatch):
+    images.settings.palimpsest_hub_git_allowed_hosts = ("github.com",)
+    images.settings.palimpsest_hub_image_source_policy = ImageSourcePolicy().to_dict()
+    public_dns(monkeypatch)
+    fake = FakeGit({"Dockerfile": "FROM scratch\n"})
+    monkeypatch.setattr(git_source.subprocess, "run", fake)
+    response = await images.client.post("/v1/git-builds", headers=HUMAN, json=git_body())
+    assert response.status_code == 503
+    assert response.json()["detail"] == "image source policy is not configured"
+    assert fake.calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_context_rule_the_stager_refuses_is_a_422_with_its_reason(images, monkeypatch):
+    images.settings.palimpsest_hub_git_allowed_hosts = ("github.com",)
+    public_dns(monkeypatch)
+    fake = FakeGit({"Dockerfile": "FROM scratch\n", ".dockerignore": "*.log\n!keep.log\n"})
+    monkeypatch.setattr(git_source.subprocess, "run", fake)
+    response = await images.client.post("/v1/git-builds", headers=HUMAN, json=git_body())
+    assert response.status_code == 422
+    assert "negated" in response.json()["detail"]
+    async with images.factory() as session:
+        assert (await session.scalars(select(PalimpsestHubImageJob))).all() == []
+        assert (await session.scalars(select(PalimpsestHubBuildContext))).all() == []

@@ -299,3 +299,20 @@ async def test_the_staged_result_reports_the_dockerfile_relative_to_the_context(
     result = await _stage(store, runner, context_subdir="app", dockerfile_path="app/Dockerfile")
     assert result.dockerfile == "Dockerfile"
     assert "Dockerfile" in tar_names(store, result.blob_digest)
+
+
+async def test_a_missing_git_binary_is_a_fetch_refusal_not_a_server_error(store, head):
+    def no_git(args, *a, **kw):
+        raise FileNotFoundError("git")
+
+    with pytest.raises(GitSourceError) as info:
+        await stage_git_context(
+            request(),
+            allowed_hosts=["github.com"],
+            store=store,
+            max_context_bytes=10**6,
+            resolver=lambda h, p: PUBLIC,
+            runner=no_git,
+        )
+    assert info.value.code == "fetch"
+    assert scratch_dirs(store) == []

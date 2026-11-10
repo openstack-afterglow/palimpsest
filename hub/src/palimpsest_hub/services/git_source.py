@@ -187,7 +187,7 @@ def fetch(
         if head != source.revision:
             raise GitSourceError("revision", "fetched commit does not match the pinned revision")
         check_tree(dest, max_bytes=max_bytes, max_files=max_files)
-    except subprocess.SubprocessError as exc:
+    except (subprocess.SubprocessError, OSError) as exc:
         raise GitSourceError("fetch", f"git failed: {type(exc).__name__}") from None
     except GitSourceError:
         raise

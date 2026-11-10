@@ -17,6 +17,7 @@ from palimpsest_hub.config import get_settings
 from palimpsest_hub.image_models import PalimpsestHubImageJob
 from palimpsest_hub.models import exact_identity
 from palimpsest_hub.services import image_jobs as service
+from palimpsest_hub.rate_limit import limiter
 from palimpsest_hub.services.digest import normalize_digest
 from palimpsest_hub.services.git_source import GitBuildRequest
 
@@ -227,6 +228,7 @@ class GitDockerfileBuildRequest(GitBuildRequest):
     operation_id="create_git_dockerfile_build",
     openapi_extra=request_body(GitDockerfileBuildRequest),
 )
+@limiter.limit("6/hour")
 async def git_dockerfile_build(request: Request, token_info: dict = Depends(_legacy_writer)):
     req = await bounded_json(request, GitDockerfileBuildRequest, 64 * 1024)
     return service.serialize_job(await service.admit_git_dockerfile(req, token_info))

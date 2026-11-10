@@ -4026,9 +4026,9 @@ that CI never sees).
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "d2ed70d575fae0ea474440756a4abc73ab899b1535214845514e1086d6c17d48",
-  "reviewed_at": "2026-11-10T06:18:45Z",
-  "summary": "Document POST /v1/git-builds route and owned-context registration"
+  "source_sha256": "e1a160caa5cb740b1fa8fe2c7effae25db71d1dae3ccc01fe540eceea79a30d8",
+  "reviewed_at": "2026-11-10T06:23:10Z",
+  "summary": "Pre-fetch admission gates, package lock across git staging, rate limit, git in hub image"
 }
 ```
 <!-- architecture-review:end -->
