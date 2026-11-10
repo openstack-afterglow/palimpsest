@@ -4026,9 +4026,9 @@ that CI never sees).
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "9b8375d3c63464bb8ddea915b02683b97c54c167f19afcf9ba5a93b54406473b",
-  "reviewed_at": "2026-11-10T06:23:25Z",
-  "summary": "Pre-fetch admission gates, package lock across git staging, rate limit, git in hub image"
+  "source_sha256": "aed7b2de06fbe5e6aa06377c8ad85fc06327c1a755cd51f083b080312bee1b61",
+  "reviewed_at": "2026-11-10T06:25:47Z",
+  "summary": "Disable the global rate limiter in the image-job test fixture"
 }
 ```
 <!-- architecture-review:end -->

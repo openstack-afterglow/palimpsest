@@ -30,6 +30,7 @@ from palimpsest_hub.models import (
     PalimpsestHubLayerAccess,
     RuntimeBlobReference,
 )
+from palimpsest_hub.rate_limit import limiter
 from palimpsest_hub.services import git_source
 from palimpsest_hub.services import image_jobs as service
 from palimpsest_hub.services import published_images as publications
@@ -79,6 +80,7 @@ async def images(tmp_path, monkeypatch):
         palimpsest_hub_max_context_members=10000,
         palimpsest_hub_git_allowed_hosts=(),
     )
+    monkeypatch.setattr(limiter, "enabled", False)
     monkeypatch.setattr(hub, "get_session_factory", lambda: factory)
     monkeypatch.setattr(hub, "get_blob_store", lambda: store)
     for module in (hub, builds, image_jobs, service, publications, published_images):
