@@ -3287,3 +3287,17 @@ def test_cloud_env_up_keeps_its_own_cloud_flag_and_passes_the_hub_gate():
     assert args.cloud == "dms"
     assert args.hub_cloud is None
     cli._reject_unused_cloud(args)
+
+
+def test_global_cloud_flag_before_run_keeps_the_command_override(monkeypatch: pytest.MonkeyPatch):
+    captured = {}
+
+    def capture_and_stop(args, parser):
+        captured["command_override"] = getattr(args, "command_override", "unset")
+        captured["hub_cloud"] = args.hub_cloud
+        raise cli.PalimpsestError("stop after parse")
+
+    monkeypatch.setattr(cli, "_validate_args", capture_and_stop)
+    rc = cli.main(["--cloud", "dms", "run", "example:image", "--", "echo", "ok"])
+    assert rc != 0
+    assert captured == {"command_override": ("echo", "ok"), "hub_cloud": "dms"}

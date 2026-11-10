@@ -4024,6 +4024,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 command_index += 2
             elif argument.startswith("--url="):
                 command_index += 1
+            elif argument == "--cloud":
+                command_index += 2
+            elif argument.startswith("--cloud="):
+                command_index += 1
             else:
                 break
         command_args = raw_args[command_index:]

@@ -38,7 +38,7 @@ files_modified:
 - `--cloud NAME` (top-level) and `hub_credentials` in `cloud_cli.py` take a Keystone token and `current_project_id` from the clouds.yaml cloud and pass both to `HubClient(project_id=...)`, which sends `X-Project-Id`.
 - Covered: Hub-direct `image`/`layer`/`bundle` commands, `published push|pull` (Keystone token plus `HubClient(project_id=...)`), and `run`/`build`/`compose` when they reach Hub. `--cloud` on any other operation fails closed (`_reject_unused_cloud`), so no write falls back to `PALIMPSEST_TOKEN` silently.
 - Evidence: `test_cli_contract.py` 221 passed (cloud, published, compose-forwarding, gate tests); mutations dropping compose forwarding, the published `project_id`, and the gate each fail.
-- The global `--cloud` uses `dest="hub_cloud"` so `cloud env up --cloud NAME` (its own required flag) is not rejected by the gate; `test_cloud_env_up_keeps_its_own_cloud_flag_and_passes_the_hub_gate` covers it; dropping the dest fails it. `cloud env` tests: 185 passed.
+- The global `--cloud` uses `dest="hub_cloud"` so `cloud env up --cloud NAME` (its own required flag) is not rejected by the gate; `test_cloud_env_up_keeps_its_own_cloud_flag_and_passes_the_hub_gate` covers it; dropping the dest fails it. `cloud env` tests: 185 passed. The top-level option scanner in `main()` skips `--cloud NAME` and `--cloud=NAME`, so `--cloud X run IMG -- cmd` keeps its command override (`test_global_cloud_flag_before_run_keeps_the_command_override`; removing the skip fails it).
 
 ## Reader/member/manager priority cutover — 2026-11-06, source264 in progress
 
