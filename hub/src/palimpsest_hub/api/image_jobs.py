@@ -16,8 +16,8 @@ from palimpsest_hub.auth import package_target_project_id
 from palimpsest_hub.config import get_settings
 from palimpsest_hub.image_models import PalimpsestHubImageJob
 from palimpsest_hub.models import exact_identity
-from palimpsest_hub.services import image_jobs as service
 from palimpsest_hub.rate_limit import limiter
+from palimpsest_hub.services import image_jobs as service
 from palimpsest_hub.services.digest import normalize_digest
 from palimpsest_hub.services.git_source import GitBuildRequest
 
