@@ -4026,9 +4026,9 @@ that CI never sees).
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "951a65d9a7371e8214cae8a947fc1200ab41467f6bb957d21feaf655128f246d",
-  "reviewed_at": "2026-11-10T13:05:49Z",
-  "summary": "who observer: ps failure exits before end marker; canary removed"
+  "source_sha256": "3b9c3feed1eda3b2cc2322629d9e0ef97be5aa4fb2de8d48c7be405e4683c31a",
+  "reviewed_at": "2026-11-10T13:20:00Z",
+  "summary": "Rebase M4-11 policy slice on dev with M4-10 observer"
 }
 ```
 <!-- architecture-review:end -->
