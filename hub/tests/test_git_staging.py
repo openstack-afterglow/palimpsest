@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import subprocess
+import tarfile
 
 import pytest
 
@@ -17,9 +19,10 @@ PUBLIC = ["140.82.112.3"]
 class Runner:
     """Stands in for the git binary: `checkout` materialises files; every call is recorded."""
 
-    def __init__(self, files=None, fail_fetch=False):
+    def __init__(self, files=None, fail_fetch=False, links=None):
         self.files = files if files is not None else {"Dockerfile": "FROM scratch\n", "src/app.py": "x\n"}
         self.fail_fetch = fail_fetch
+        self.links = links or {}
         self.calls: list[list[str]] = []
 
     def __call__(self, args, cwd=None, **_):
@@ -33,6 +36,9 @@ class Runner:
                 target = cwd / rel
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(text)
+            for rel, target_path in self.links.items():
+                (cwd / rel).parent.mkdir(parents=True, exist_ok=True)
+                os.symlink(target_path, cwd / rel)
         return subprocess.CompletedProcess(args, 0, "", "")
 
 
@@ -190,3 +196,91 @@ async def test_a_context_over_the_byte_limit_is_refused_and_leaves_no_scratch_di
         )
     assert scratch_dirs(store) == []
     assert blobs(store) == before
+
+
+async def _stage(store, runner, **extra):
+    return await stage_git_context(
+        request(**extra),
+        allowed_hosts=["github.com"],
+        store=store,
+        max_context_bytes=10**6,
+        resolver=lambda h, p: PUBLIC,
+        runner=runner,
+    )
+
+
+def tar_names(store, digest):
+    with store.open_read(digest) as handle, tarfile.open(fileobj=handle) as tar:
+        return sorted(m.name for m in tar.getmembers())
+
+
+async def test_context_subdir_packs_only_that_directory(store, head):
+    runner = Runner(
+        files={"Dockerfile": "x\n", "app/Dockerfile": "FROM scratch\n", "app/main.py": "y\n", "other.txt": "z\n"}
+    )
+    result = await _stage(store, runner, context_subdir="app", dockerfile_path="app/Dockerfile")
+    names = tar_names(store, result.blob_digest)
+    assert "app/Dockerfile" not in names and "app/main.py" not in names
+    assert "Dockerfile" in names and "main.py" in names
+    assert "other.txt" not in names
+
+
+async def test_context_subdir_uses_its_own_dockerignore(store, head):
+    runner = Runner(
+        files={
+            "app/Dockerfile": "FROM scratch\n",
+            "app/tmp/junk": "x\n",
+            "app/.dockerignore": "tmp/\n",
+            "tmp/root-kept": "k\n",
+        }
+    )
+    result = await _stage(store, runner, context_subdir="app", dockerfile_path="app/Dockerfile")
+    names = tar_names(store, result.blob_digest)
+    assert not any(n.startswith("tmp") for n in names)
+
+
+async def test_a_context_subdir_that_is_missing_or_a_file_is_refused(store, head):
+    with pytest.raises(GitSourceError) as info:
+        await _stage(store, Runner(), context_subdir="nope")
+    assert info.value.code == "context"
+    with pytest.raises(GitSourceError) as info:
+        await _stage(store, Runner(files={"Dockerfile": "x\n", "app": "not a dir\n"}), context_subdir="app")
+    assert info.value.code == "context"
+    assert scratch_dirs(store) == []
+
+
+async def test_a_context_subdir_symlink_out_of_the_checkout_is_refused(store, head):
+    runner = Runner(links={"app": "/etc"})
+    with pytest.raises(GitSourceError) as info:
+        await _stage(store, runner, context_subdir="app")
+    assert info.value.code == "context"
+    assert scratch_dirs(store) == []
+
+
+async def test_a_missing_dockerfile_is_refused(store, head):
+    with pytest.raises(GitSourceError) as info:
+        await _stage(store, Runner(files={"src.txt": "x\n"}), dockerfile_path="Missing")
+    assert info.value.code == "dockerfile"
+    assert scratch_dirs(store) == []
+
+
+async def test_a_dockerfile_outside_the_context_is_refused(store, head):
+    runner = Runner(files={"Dockerfile": "FROM scratch\n", "app/main.py": "y\n"})
+    with pytest.raises(GitSourceError) as info:
+        await _stage(store, runner, context_subdir="app", dockerfile_path="Dockerfile")
+    assert info.value.code == "dockerfile"
+
+
+async def test_a_symlinked_dockerfile_is_refused(store, head):
+    runner = Runner(files={"real.txt": "FROM scratch\n"}, links={"Dockerfile": "real.txt"})
+    with pytest.raises(GitSourceError) as info:
+        await _stage(store, runner)
+    assert info.value.code == "dockerfile"
+
+
+async def test_a_credential_reference_is_refused_before_any_git_call(store, head):
+    runner = Runner()
+    with pytest.raises(GitSourceError) as info:
+        await _stage(store, runner, credential_ref="deploy-key")
+    assert info.value.code == "credential"
+    assert runner.calls == []
