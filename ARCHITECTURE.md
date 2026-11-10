@@ -4027,8 +4027,8 @@ that CI never sees).
 {
   "schema_version": 1,
   "source_sha256": "1e8c9e340e361ec3939c747846e3925deee1b449bf0d73328e6d0424843d8c7b",
-  "reviewed_at": "2026-11-10T07:10:35Z",
-  "summary": "Route /v1/git-builds through execution-path no-store; record CPU slices in handoff"
+  "reviewed_at": "2026-11-10T07:56:50Z",
+  "summary": "Correct handoff wording on empty-policy replay"
 }
 ```
 <!-- architecture-review:end -->
