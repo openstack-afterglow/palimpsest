@@ -41,6 +41,9 @@ from palimpsest_hub.models import exact_identity
 from palimpsest_hub.services import claim_recovery
 from palimpsest_hub.services.blob_references import retain_blob
 from palimpsest_hub.services.digest import compute_config_digest
+from palimpsest_hub.services.git_context import ContextError
+from palimpsest_hub.services.git_source import GitSourceError
+from palimpsest_hub.services.git_staging import GitStagingUnavailable, stage_git_context
 from palimpsest_hub.services.hub_store import HubStoreError
 from palimpsest_hub.services.published_images import IMAGE_MUTEX
 from palimpsest_hub.services.worker_leases import sql_mutex
@@ -176,13 +179,17 @@ def normalize_registry_reference(value: str, hosts=None) -> str:
     )
 
 
+def require_configured_policy(policy):
+    if not policy.rules:
+        raise HTTPException(status_code=503, detail="image source policy is not configured")
+
+
 def admit_sources(kind, payload, policy, hosts):
     """Early-check literal image inputs; BuildKit fences resolved dynamic inputs."""
 
     from palimpsest_local.registry import RegistryError, default_registry_config, resolve_image_reference
 
-    if not policy.rules:
-        raise HTTPException(status_code=503, detail="image source policy is not configured")
+    require_configured_policy(policy)
 
     def admit(reference):
         canonical = normalize_registry_reference(reference, hosts)
@@ -292,7 +299,8 @@ async def fresh_writer(token_info):
     return current
 
 
-async def admit(kind, payload, token_info):
+def _preflight(kind, payload):
+    """Cheap gates that must pass before any context, Git fetch or queue effect."""
     if not _valid_os_declarations(payload):
         raise HTTPException(
             status_code=422, detail="OS declarations must be nonblank, NUL-free and at most 128 UTF-8 bytes"
@@ -302,7 +310,11 @@ async def admit(kind, payload, token_info):
         raise HTTPException(status_code=503, detail="isolated image worker is not configured")
     if "source_policy" in payload or "source_policy_digest" in payload:
         raise HTTPException(status_code=422, detail="image source policy is operator-controlled")
-    policy = configured_image_source_policy(settings)
+    return settings, configured_image_source_policy(settings)
+
+
+async def admit(kind, payload, token_info):
+    settings, policy = _preflight(kind, payload)
     if kind == "registry":
         payload = {**payload, "reference": normalize_registry_reference(payload["reference"])}
     project = package_target_project_id(token_info)
@@ -515,6 +527,37 @@ async def receive(store, request, digest, size, deadline, *, context=False, squa
 _receive = asynccontextmanager(receive)
 
 
+async def register_context_blob(store, token_info, project, digest, size, *, created):
+    """Record ownership of a verified context blob; discard it again if registration never committed."""
+    commit_started = False
+    try:
+        async with sql_mutex(_factory_or_503(), "build-api:image:project:" + project) as session:
+            context = await session.get(
+                PalimpsestHubBuildContext,
+                {"project_id": project, "digest": digest, "created_by": token_info["user_id"]},
+            )
+            if context is not None and (
+                context.project_id != project
+                or context.created_by != token_info["user_id"]
+                or context.size_bytes != size
+            ):
+                raise HTTPException(status_code=409, detail="build context descriptor conflicts")
+            await fresh_writer(token_info)
+            if context is None:
+                session.add(
+                    PalimpsestHubBuildContext(
+                        project_id=project, digest=digest, size_bytes=size, created_by=token_info["user_id"]
+                    )
+                )
+            await retain_blob(session, digest, "context", digest)
+            commit_started = True
+            await session.commit()
+    except BaseException:
+        if created and not commit_started:
+            await _discard_unregistered_blob(store, _factory_or_503(), digest)
+        raise
+
+
 async def upload_context(request, token_info, digest, size):
     store = _store_or_503()
     project = package_target_project_id(token_info)
@@ -524,34 +567,48 @@ async def upload_context(request, token_info, digest, size):
         _locked_blob(store, digest),
     ):
         created = await _run_blocking(store.publish_verified, path, verified)
-        commit_started = False
-        try:
-            async with sql_mutex(_factory_or_503(), "build-api:image:project:" + project) as session:
-                context = await session.get(
-                    PalimpsestHubBuildContext,
-                    {"project_id": project, "digest": digest, "created_by": token_info["user_id"]},
-                )
-                if context is not None and (
-                    context.project_id != project
-                    or context.created_by != token_info["user_id"]
-                    or context.size_bytes != size
-                ):
-                    raise HTTPException(status_code=409, detail="build context descriptor conflicts")
-                await fresh_writer(token_info)
-                if context is None:
-                    session.add(
-                        PalimpsestHubBuildContext(
-                            project_id=project, digest=digest, size_bytes=size, created_by=token_info["user_id"]
-                        )
-                    )
-                await retain_blob(session, digest, "context", digest)
-                commit_started = True
-                await session.commit()
-        except BaseException:
-            if created and not commit_started:
-                await _discard_unregistered_blob(store, _factory_or_503(), digest)
-            raise
+        await register_context_blob(store, token_info, project, digest, size, created=created)
     return {"digest": digest, "size_bytes": size}
+
+
+async def admit_git_dockerfile(req, token_info):
+    """Stage a pinned Git checkout as an owned context, then admit a Dockerfile job for it."""
+    _, policy = _preflight("dockerfile", {"os_family": req.os_family, "os_version": req.os_version})
+    # Git fetch cannot be replayed from a receipt without a context digest, so refuse here, before
+    # any network effect, when the operator has no source policy (fail closed).
+    require_configured_policy(policy)
+    store = _store_or_503()
+    project = package_target_project_id(token_info)
+    async with _locked_file(store, lambda: store.acquire_package_lock("image-context:" + project, blocking=False)):
+        try:
+            staged = await stage_git_context(
+                req,
+                allowed_hosts=get_settings().palimpsest_hub_git_allowed_hosts,
+                store=store,
+                max_context_bytes=get_settings().palimpsest_hub_max_context_bytes,
+            )
+        except GitStagingUnavailable:
+            raise HTTPException(status_code=503, detail="git builds are not enabled on this Hub") from None
+        except GitSourceError as exc:
+            raise HTTPException(status_code=422, detail=f"git source rejected: {exc.code}") from None
+        except ContextError as exc:
+            raise HTTPException(status_code=422, detail=f"build context rejected: {exc}") from None
+        except HubStoreError:
+            raise HTTPException(status_code=422, detail="build context exceeds the byte limit") from None
+        async with _locked_blob(store, staged.blob_digest):
+            await register_context_blob(store, token_info, project, staged.blob_digest, staged.size_bytes, created=True)
+    payload = {
+        "request_id": str(req.request_id),
+        "name": req.name,
+        "dockerfile": staged.dockerfile_text,
+        "context_digest": staged.blob_digest,
+        "platform": "linux/amd64",
+        "os_family": req.os_family,
+        "os_version": req.os_version,
+        "metadata": req.metadata,
+        "visibility": req.visibility,
+    }
+    return await admit("dockerfile", payload, token_info)
 
 
 @asynccontextmanager

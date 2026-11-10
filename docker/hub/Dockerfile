@@ -23,7 +23,7 @@ WORKDIR /app/hub
 COPY --from=builder /app/hub/.venv /app/hub/.venv
 COPY hub/src/ ./src/
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl qemu-utils openssh-client openssl ca-certificates ceph-common \
+    && apt-get install -y --no-install-recommends curl git qemu-utils openssh-client openssl ca-certificates ceph-common \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --shell /usr/sbin/nologin palimpsest \
     && chown -R palimpsest:palimpsest /app \

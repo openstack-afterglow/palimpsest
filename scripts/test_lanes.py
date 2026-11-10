@@ -151,6 +151,7 @@ SPECIAL_FILES = {
             "session_controller",
             "nova_shelve_provider",
             "git_context",
+            "git_staging",
         )
     ),
 }
