@@ -25,6 +25,8 @@
 
 ### 재개용 실행 기록
 
+**2026-11-10 M4-10 Nova provider (test-passed, 미체크):** PR #56(`50e5891`) 병합 후 `services/nova_shelve_provider.py`의 `NovaShelveProvider`가 `ShelveProvider` 포트를 구현한다. 주입된 Nova 연결만 쓰고 자격증명은 고르지 않는다(M4-11). shelve는 SHELVED_OFFLOADED에서만 성공 확인, 이미 offload된 서버는 두 번째 shelve 없이 성공, 그 밖의 상태는 거부, SDK 오류·타임아웃은 SDK 메시지 없이 ProviderError. 모든 SDK 호출은 `run_blocking`. `hub/tests/test_nova_shelve_provider.py` 12개 통과, 변이 2건(상태 사전확인 제거 → 1 실패, 이벤트 루프 직접 호출 → 1 실패) 확인. 실제 Nova 호출·SSH 관측기·배포 연결은 아직 없어 M4-10은 체크하지 않는다. 체크 54/108 유지.
+
 **2026-11-10 소유자 답변과 M4-10 컨트롤러(test-passed, 미체크):** PR #54(고아 세션 마커 수정, `6246120`)와 #55를 병합했다. 소유자가 "다음 진행"을 지시하고 두 질문에 답했다: M4-05는 **API가 고정 SHA를 fetch해 build-context blob으로 저장**하는 방향(Dockerfile을 실제 빌드하는 워커 단계는 별도 필요, 아직 미구현), 우선순위는 **M4-10 먼저**. `hub/src/palimpsest_hub/services/session_controller.py`는 `SessionMachine`을 주입된 observer·provider·clock으로 구동한다(인스턴스별 락, 관측 실패는 단절·shelve 근거가 아님, claim 직후 두 번째 관측 재확인, shelve 실패 시 전체 grace 재시작, shelve 중 사용자 복귀 시 unshelve 1회·실패 시 다음 tick 재시도). `hub/tests/test_session_controller.py` 10개 + 기존 14개 통과, 변이 2건(재확인 제거 → 4 실패, 관측 실패를 빈 집합으로 처리 → 1 실패) 확인. 상태는 메모리에만 있고(재시작은 shelve를 늦출 뿐), 실제 SSH/console observer·Nova provider·영속화·M4-11 위임은 미구현이라 M4-10은 체크하지 않는다. 체크 54/108 유지.
 
 **M2-17 TTL sweep 최종 관측(2026-11-09 13:45Z, 영수증 598):** 대상 stage 행과 payload는 13:21:33Z 이후 13:46:39Z까지 매 샘플에서 0/0, 전체 payload 49로 유지돼 제거가 되돌려지지 않았다. 예약한 13:45Z 조회도 `0 49`를 냈다. 예약한 12:40Z 조회는 `ssh … Operation timed out`으로 실패했고 그 시각 값은 영수증 593(직접 실행)을 따른다. 어느 worker가 정비를 실행했는지는 관측하지 않았다. 남은 M2-17 조건은 증거 수준의 소유자 서면 수용 또는 수정, 영수증 581 처리, 재구성 `spec.md`의 정본 확정, 두 번째 stage 행 `87b60cf0…`의 만료 관찰(2026-11-10T11:24Z 이후) 또는 그 조건 삭제다.
