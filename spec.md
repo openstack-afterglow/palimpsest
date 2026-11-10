@@ -25,6 +25,8 @@
 
 ### 재개용 실행 기록
 
+**2026-11-10 M4-02 Hub cloud auth slice (test-passed, 미체크):** 최상위 `--cloud NAME`이 clouds.yaml의 Keystone 토큰과 `current_project_id`로 Hub를 호출하고 `X-Project-Id`를 보낸다(`cloud_cli.hub_credentials`, `cli.hub_client`). 적용 범위는 image/layer/bundle, published push|pull, run/build/compose의 Hub 경로이며, 그 외 명령은 `--cloud`를 거부한다(조용한 PALIMPSEST_TOKEN 대체 금지). 테스트 221 통과, compose 전달·published project_id·게이트 변이 각 1 실패. 실 Keystone·Hub 호출 없음, M4-02는 미체크.
+
 **2026-11-10 M4-08 CLI slice (test-passed, 미체크):** `palimpsest image git-build`(고정 SHA 요청, `--request-id`는 Hub 호출 전 UUID 검사)과 `palimpsest image git-job <id>`(빌드 커밋 조회)를 추가했다. 계약 테스트 3개 + `tests/unit/test_cli_contract.py` 207개 통과, `revision` 누락 변이 1 실패. 실 Hub 실행 없음, M4-08은 여전히 미체크(생성·상태·로그·SSH·보존·재개·삭제 계약 전체 미구현).
 
 **2026-11-10 M4-06 출처 조회 slice (test-passed, 미체크):** `GET /v1/image-jobs[/{id}]` 응답에 `git` 필드(repo_url, 고정 revision, context_subdir, dockerfile_path)를 추가했다(Git 빌드 작업만 값, 그 외와 worker 응답은 null). 테스트 `test_a_git_build_job_reads_back_the_commit_it_was_built_from`: 수정 전 `KeyError: 'git'`로 실패, 수정 후 통과. 변이(projection 제거 → 1 실패, 원복 후 통과), 관련 197개 통과. 빌드 결과·게시 이미지·인스턴스 연결·실패 로그 조회 전체 M4-06 체크는 아직 아님.

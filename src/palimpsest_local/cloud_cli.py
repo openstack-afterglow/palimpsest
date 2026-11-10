@@ -43,6 +43,20 @@ def _connect(cloud: str):
     return connection
 
 
+def hub_credentials(cloud: str) -> tuple[str, str]:
+    """Return a Keystone token and its project ID for Hub calls from one clouds.yaml cloud.
+
+    The project ID is returned so the caller can send it as X-Project-Id; Hub otherwise scopes the
+    caller to the user's default project.
+    """
+    connection = _connect(cloud)
+    token = connection.authorize()
+    project_id = connection.current_project_id
+    if not isinstance(token, str) or not token.strip() or not project_id:
+        raise PalimpsestError("clouds.yaml cloud did not yield a token and project for Hub")
+    return token, project_id
+
+
 def _controller(config: dict) -> NovaController:
     return NovaController(_connect(config["cloud"]), config["project_id"], Path(config["receipts"]))
 

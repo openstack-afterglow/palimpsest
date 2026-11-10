@@ -4026,9 +4026,9 @@ that CI never sees).
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "6b35c6081f542c1609a0cf9ce3173fdf2a9d3961fd79a80feb810f05e553dea1",
-  "reviewed_at": "2026-11-10T11:53:04Z",
-  "summary": "Regenerate CLI reference for git-build and git-job; usage row"
+  "source_sha256": "faa11644b26dedf562b39bec245ae0ee7860bd199b033f9978cc1c6749027b20",
+  "reviewed_at": "2026-11-10T12:40:18Z",
+  "summary": "Compose test stubs accept cloud kwarg; handoff CI note"
 }
 ```
 <!-- architecture-review:end -->
