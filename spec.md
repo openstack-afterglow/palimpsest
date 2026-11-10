@@ -25,6 +25,8 @@
 
 ### 재개용 실행 기록
 
+**2026-11-10 M4-05 Git staging 함수 (test-passed, 미체크, 라우트 미구현):** `services/git_staging.py`의 `stage_git_context`는 빈 허용 목록이면 DNS·Git 호출 전에 `GitStagingUnavailable`로 거부하고, 이어서 `validate`(https·허용 호스트·공인 주소), `fetch`(검증된 SHA, `.git` 제거), 결정적 tar(`.dockerignore` 반영), `store.promote_file`(digest 검증·바이트 상한)을 거치며, 모든 경로에서 임시 디렉터리를 지운다. `hub/tests/test_git_staging.py` 8개 통과, 변이 3건(허용 목록 가드 제거 → 1 실패, 사설 주소 검사 제거 → 13 실패, 임시 정리 제거 → 5 실패) 확인. **라우트 `POST /v1/git-contexts`는 아직 없다.** blob 소유 프로젝트·생성자 행 모델을 먼저 정해야 하므로 M4-05 라우트 항목은 미완 상태로 남긴다. 체크 54/108 유지.
+
 **2026-11-10 M4-05 결정적 build-context tar (test-passed, 미체크):** `services/git_context.py`의 `write_context_tar`는 검증된 checkout을 같은 트리면 같은 바이트·sha256이 나오는 tar로 만든다(정렬, mtime·uid·gid 0, 모드 0644/0755, symlink는 따라가지 않고 저장, 밖을 가리키는 symlink·FIFO·장치 거부, `.dockerignore`의 정확 일치·glob·디렉터리 접두 규칙, 부정(`!`)과 `..` 규칙은 거부). `hub/tests/test_git_context.py` 14개 통과, 변이 2건(symlink 탈출 검사 제거 → 2 실패, mtime 0 고정 제거 → 1 실패) 확인. 아직 라우트·stage 함수·SSRF 경계 연결과 워커 Dockerfile 빌드는 없어 M4-05는 체크하지 않는다. PR #57(#56 이후 Nova provider) 위에 쌓은 스택 PR이다.
 
 **2026-11-10 M4-10 Nova provider (test-passed, 미체크):** PR #56(`50e5891`) 병합 후 `services/nova_shelve_provider.py`의 `NovaShelveProvider`가 `ShelveProvider` 포트를 구현한다. 주입된 Nova 연결만 쓰고 자격증명은 고르지 않는다(M4-11). shelve는 SHELVED_OFFLOADED에서만 성공 확인, 이미 offload된 서버는 두 번째 shelve 없이 성공, 그 밖의 상태는 거부, SDK 오류·타임아웃은 SDK 메시지 없이 ProviderError. 모든 SDK 호출은 `run_blocking`. `hub/tests/test_nova_shelve_provider.py` 12개 통과, 변이 2건(상태 사전확인 제거 → 1 실패, 이벤트 루프 직접 호출 → 1 실패) 확인. 실제 Nova 호출·SSH 관측기·배포 연결은 아직 없어 M4-10은 체크하지 않는다. 체크 54/108 유지.
