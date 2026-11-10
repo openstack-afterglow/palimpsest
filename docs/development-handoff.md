@@ -34,6 +34,11 @@ files_modified:
 - Known open limits: private-Git credentials (`credential_ref`) refused; an identical `request_id` retry made while the operator source policy is empty gets 503 instead of its original receipt (the git route refuses before any git call; fail-closed); M4-10 observers, persistence and M4-11 Keystone delegation not built.
 - Pending owner approvals: M2-17 evidence-level acceptance; one remaining 587 native create for the M3-07/09 second-VM and kill-client proof; receipt 581 disposition; reconstructed `spec.md` canonical confirmation; stage row `87b60cf0…` expiry wait (not before 2026-11-10T11:24Z); local-manila read-only source approval and `clouds.yaml` re-provision; M4-05 private-Git credential scope; any production deploy of the Hub with these routes is not approved.
 
+### M4-02 Hub cloud auth slice (2026-11-10, test-passed, M4-02 unchecked)
+- `--cloud NAME` (top-level) and `hub_credentials` in `cloud_cli.py` take a Keystone token and `current_project_id` from the clouds.yaml cloud and pass both to `HubClient(project_id=...)`, which sends `X-Project-Id`.
+- Covered: Hub-direct commands and `_resolve_image_ref` / `_resolve_runtime_stack` from `image`, `layer`, `run`. Not covered: project compose callbacks (`_compose_callbacks`), which still use `PALIMPSEST_TOKEN`.
+- Evidence: `tests/unit/test_cli_contract.py` 218 passed (3 new cloud tests); mutation dropping `project_id` fails. No live Hub or Keystone call was made.
+
 ## Reader/member/manager priority cutover — 2026-11-06, source264 in progress
 
 Owner explicitly added this alongside the continuing local M1 Goal: existing

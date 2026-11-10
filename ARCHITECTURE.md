@@ -4026,9 +4026,9 @@ that CI never sees).
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "6b35c6081f542c1609a0cf9ce3173fdf2a9d3961fd79a80feb810f05e553dea1",
-  "reviewed_at": "2026-11-10T11:53:04Z",
-  "summary": "Regenerate CLI reference for git-build and git-job; usage row"
+  "source_sha256": "68ae868702d5d2ad429041481b70b94c925d5ceab3e8fbfbd227aabd4ccd3260",
+  "reviewed_at": "2026-11-10T12:09:39Z",
+  "summary": "Hub cloud auth via clouds.yaml (M4-02 CPU slice)"
 }
 ```
 <!-- architecture-review:end -->

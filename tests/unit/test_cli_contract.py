@@ -3157,3 +3157,55 @@ def test_cli_dispatch_image_git_job_shows_the_commit_the_build_used(monkeypatch:
     )
     assert cli.main(["image", "git-job", "job-1"]) == 0
     assert _GIT_SHA in capsys.readouterr().out
+
+
+class _FakeHubClient:
+    seen: list = []
+
+    def __init__(self, url, token, project_id=None, **kwargs):
+        _FakeHubClient.seen.append({"url": url, "token": token, "project_id": project_id})
+
+    def list_images(self, **kwargs):
+        return []
+
+
+def test_hub_cloud_flag_authenticates_with_the_clouds_token_and_its_project(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    monkeypatch.setenv("PALIMPSEST_URL", "http://localhost:8080")
+    monkeypatch.delenv("PALIMPSEST_TOKEN", raising=False)
+    _FakeHubClient.seen = []
+    monkeypatch.setattr("palimpsest_local.cli.HubClient", _FakeHubClient)
+    monkeypatch.setattr(
+        "palimpsest_local.cloud_cli.hub_credentials", lambda cloud: ("keystone-token", "project-uuid-1")
+    )
+    assert cli.main(["--cloud", "dms", "image", "ls"]) == 0
+    assert _FakeHubClient.seen == [
+        {"url": "http://localhost:8080", "token": "keystone-token", "project_id": "project-uuid-1"}
+    ]
+
+
+def test_hub_without_cloud_keeps_the_palimpsest_token_and_sends_no_project(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("PALIMPSEST_URL", "http://localhost:8080")
+    monkeypatch.setenv("PALIMPSEST_TOKEN", "env-token")
+    _FakeHubClient.seen = []
+    monkeypatch.setattr("palimpsest_local.cli.HubClient", _FakeHubClient)
+    assert cli.main(["image", "ls"]) == 0
+    assert _FakeHubClient.seen == [{"url": "http://localhost:8080", "token": "env-token", "project_id": None}]
+
+
+def test_hub_credentials_refuses_a_cloud_without_a_project(monkeypatch: pytest.MonkeyPatch):
+    from palimpsest_local import cloud_cli
+    from palimpsest_local.errors import PalimpsestError
+
+    class _NoProject:
+        def authorize(self):
+            return "keystone-token"
+
+        current_project_id = None
+
+    monkeypatch.setattr(cloud_cli, "_connect", lambda cloud: _NoProject())
+    with pytest.raises(PalimpsestError):
+        cloud_cli.hub_credentials("dms")

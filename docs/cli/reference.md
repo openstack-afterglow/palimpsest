@@ -3,7 +3,7 @@
 
 This file is generated from `palimpsest_local.cli.build_parser`. It inventories every command, positional, option, choice, and parser default. For behavior, examples, and runtime restrictions, read [the usage guide](usage.md). Every command except raw `docker` pass-through accepts automatic `-h`/`--help`.
 
-Coverage: **162 command paths**, **443 positional/option definitions** (excluding automatic `-h/--help`).
+Coverage: **162 command paths**, **444 positional/option definitions** (excluding automatic `-h/--help`).
 
 ## `palimpsest`
 
@@ -12,7 +12,7 @@ Coverage: **162 command paths**, **443 positional/option definitions** (excludin
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest [-h] [--url URL] [--version] {cloud,benchmark,image,published,layer,bundle,oci,build,registry,login,logout,pull,push,tag,images,history,rmi,save,load,docker,run,compose,ps,volumes,networks,volume,inspect,logs,shell,exec,start,stop,rm,commit,web,store,completion} ...
+usage: palimpsest [-h] [--url URL] [--cloud CLOUD] [--version] {cloud,benchmark,image,published,layer,bundle,oci,build,registry,login,logout,pull,push,tag,images,history,rmi,save,load,docker,run,compose,ps,volumes,networks,volume,inspect,logs,shell,exec,start,stop,rm,commit,web,store,completion} ...
 ```
 
 Subcommands: `cloud`, `benchmark`, `image`, `published`, `layer`, `bundle`, `oci`, `build`, `registry`, `login`, `logout`, `pull`, `push`, `tag`, `images`, `history`, `rmi`, `save`, `load`, `docker`, `run`, `compose`, `ps`, `volumes`, `networks`, `volume`, `inspect`, `logs`, `shell`, `exec`, `start`, `stop`, `rm`, `commit`, `web`, `store`, `completion`.
@@ -20,6 +20,7 @@ Subcommands: `cloud`, `benchmark`, `image`, `published`, `layer`, `bundle`, `oci
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
 | `--url` | string | `None` | Hub API URL (overrides PALIMPSEST_URL and config.toml) |
+| `--cloud` | string | `None` | clouds.yaml cloud whose Keystone token and project authenticate Hub calls (overrides PALIMPSEST_TOKEN) |
 | `--version` | flag | — | show the client version and exit |
 
 ## `palimpsest cloud`
