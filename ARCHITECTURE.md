@@ -4026,9 +4026,9 @@ that CI never sees).
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "f3af9b3b020af1a81516be6f8b73d3223ea5f3e9fc118cc99027298dbe373ed2",
-  "reviewed_at": "2026-11-10T12:57:43Z",
-  "summary": "M4-10 who-based SessionObserver slice (test-passed)"
+  "source_sha256": "9cd8b79fc977750dc142607a181b88bb86041b4494dcf36bb75fb95a554cdf86",
+  "reviewed_at": "2026-11-10T13:01:36Z",
+  "summary": "who observer protocol docs"
 }
 ```
 <!-- architecture-review:end -->

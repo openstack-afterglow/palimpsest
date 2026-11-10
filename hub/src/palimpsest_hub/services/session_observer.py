@@ -14,15 +14,37 @@ from palimpsest_hub.services.session_controller import ObservationError
 
 DEFAULT_TIMEOUT_SECONDS = 10.0
 
+# The guest probe must print both markers. UTMP_OK proves the login database was readable (an
+# OCI root without utmp lists nobody with exit 0); END proves the listing was not truncated.
+UTMP_MARKER = "PALIMPSEST-UTMP-OK"
+END_MARKER = "PALIMPSEST-END"
+GUEST_PROBE_COMMAND = (
+    "if [ -r /run/utmp ] || [ -r /var/run/utmp ]; then echo PALIMPSEST-UTMP-OK; who; fi; "
+    "ps -eo args= | grep '^sshd: ' | grep -v grep; "
+    "echo PALIMPSEST-END"
+)
+
 
 def parse_who(text: str) -> set[str]:
-    """Return one normalised identity per `who` line; blank lines are ignored."""
+    """Return one normalised identity per login line, or raise when the probe is not trustworthy.
+
+    Counted: `who` lines (pty logins) and `sshd: user@pts/N|notty` process lines (every sshd
+    session, including non-pty `ssh host cmd`, scp, rsync and forwards that never reach utmp).
+    """
     if not isinstance(text, str):
         raise ObservationError("session listing is not text")
+    lines = [" ".join(raw.split()) for raw in text.splitlines()]
+    lines = [line for line in lines if line]
+    if not lines or lines[-1] != END_MARKER or lines.count(END_MARKER) != 1:
+        raise ObservationError("session listing is truncated or missing its end marker")
+    if UTMP_MARKER not in lines:
+        raise ObservationError("login database was not readable")
     sessions: set[str] = set()
-    for raw in text.splitlines():
-        line = " ".join(raw.split())
-        if not line:
+    for line in lines[:-1]:
+        if line == UTMP_MARKER:
+            continue
+        if line.startswith("sshd: "):
+            sessions.add(line)
             continue
         if len(line.split(" ")) < 2:
             raise ObservationError("malformed session line")
@@ -54,4 +76,4 @@ class WhoSessionObserver:
         return parse_who(text)
 
 
-__all__ = ["DEFAULT_TIMEOUT_SECONDS", "WhoSessionObserver", "parse_who"]
+__all__ = ["DEFAULT_TIMEOUT_SECONDS", "GUEST_PROBE_COMMAND", "WhoSessionObserver", "parse_who"]

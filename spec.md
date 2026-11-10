@@ -25,7 +25,7 @@
 
 ### 재개용 실행 기록
 
-**2026-11-10 M4-10 관측자 슬라이스 (test-passed, M4-10 미체크):** `WhoSessionObserver`(`services/session_observer.py`)가 주입된 `fetch(instance_id)`로 게스트 `who` 출력을 세션 집합으로 바꾼다. 실패·시간 초과(기본 10초)·비문자열·형식 오류는 모두 `ObservationError`(빈 집합 아님)이고, 예외 본문은 옮기지 않는다. 테스트 33 통과(관측자 8, 컨트롤러 연동 2 포함), 형식 오류 무시 변이 1 실패. 남은 M4-10 일: 세션 상태 영속화, 실 SSH/console 주입, 재접속 취소의 운영 Nova 연결, 실환경 검증. M4-11 trust는 영수증 583 승인 범위 안에서 구현 대기.
+**2026-11-10 M4-10 관측자 슬라이스 (test-passed, M4-10 미체크):** `WhoSessionObserver`(`services/session_observer.py`)가 주입된 `fetch(instance_id)`로 게스트 프로브(`GUEST_PROBE_COMMAND`: utmp 읽기 표식, `who`, `sshd:` 프로세스, 끝 표식)를 세션 집합으로 바꾼다. utmp 표식이나 끝 표식이 없으면, 실패·시간 초과(기본 10초)·비문자열·형식 오류는 모두 `ObservationError`(빈 집합 아님)다. 예외 본문은 옮기지 않는다. 자기 연결 제외는 아직 없다(셸브를 막는 방향으로 안전하며 남은 작업). 테스트 24 통과(관측자·컨트롤러 연동 포함), 끝 표식·utmp 표식 검사 제거 변이 각 1 실패. 남은 M4-10 일: 세션 상태 영속화, 실 SSH/console 주입, 재접속 취소의 운영 Nova 연결, 실환경 검증. M4-11 trust는 영수증 583 승인 범위 안에서 구현 대기.
 
 **2026-11-10 M4-02 Hub cloud auth slice (test-passed, 미체크):** 최상위 `--cloud NAME`이 clouds.yaml의 Keystone 토큰과 `current_project_id`로 Hub를 호출하고 `X-Project-Id`를 보낸다(`cloud_cli.hub_credentials`, `cli.hub_client`). 적용 범위는 image/layer/bundle, published push|pull, run/build/compose의 Hub 경로이며, 그 외 명령은 `--cloud`를 거부한다(조용한 PALIMPSEST_TOKEN 대체 금지). 테스트 221 통과, compose 전달·published project_id·게이트 변이 각 1 실패. 실 Keystone·Hub 호출 없음, M4-02는 미체크.
 

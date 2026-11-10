@@ -5,7 +5,7 @@ import asyncio
 import pytest
 
 from palimpsest_hub.services.session_controller import ObservationError, Outcome, SessionController
-from palimpsest_hub.services.session_observer import WhoSessionObserver, parse_who
+from palimpsest_hub.services.session_observer import GUEST_PROBE_COMMAND, WhoSessionObserver, parse_who
 
 G = 300.0
 IID = "i-1"
@@ -25,17 +25,48 @@ def _fetch_raising(exc):
     return fetch
 
 
+def _listing(*lines):
+    return "\n".join(("PALIMPSEST-UTMP-OK", *lines, "PALIMPSEST-END")) + "\n"
+
+
 def test_parse_who_normalises_lines_and_ignores_blank_ones():
-    text = "pieroot   console  Nov 10 12:00 (:0)\n\n  pieroot ttys001 Nov 10 12:05 (host)\n"
+    text = _listing("pieroot   console  Nov 10 12:00 (:0)", "", "  pieroot ttys001 Nov 10 12:05 (host)")
     assert parse_who(text) == {
         "pieroot console Nov 10 12:00 (:0)",
         "pieroot ttys001 Nov 10 12:05 (host)",
     }
 
 
-def test_empty_listing_is_a_valid_no_session_observation():
-    observer = WhoSessionObserver(_fetch_returning(""))
+def test_non_pty_sshd_session_is_counted_even_though_utmp_never_lists_it():
+    text = _listing("sshd: ubuntu@notty")
+    assert parse_who(text) == {"sshd: ubuntu@notty"}
+
+
+def test_empty_listing_with_both_markers_is_a_valid_no_session_observation():
+    observer = WhoSessionObserver(_fetch_returning(_listing()))
     assert asyncio.run(observer.sessions(IID)) == set()
+
+
+def test_listing_without_the_end_marker_is_unknown_not_empty():
+    with pytest.raises(ObservationError):
+        parse_who("PALIMPSEST-UTMP-OK\n")
+
+
+def test_truncated_listing_without_end_marker_is_unknown_even_with_sessions():
+    with pytest.raises(ObservationError):
+        parse_who("PALIMPSEST-UTMP-OK\npieroot console Nov 10 12:00 (:0)\n")
+
+
+def test_missing_utmp_marker_is_unknown_not_an_empty_room():
+    # An OCI root without utmp: nothing is printed for `who`, and the end marker is there.
+    with pytest.raises(ObservationError, match="login database"):
+        parse_who("PALIMPSEST-END\n")
+
+
+def test_probe_command_prints_both_markers_and_checks_utmp_before_listing():
+    assert "PALIMPSEST-UTMP-OK" in GUEST_PROBE_COMMAND
+    assert GUEST_PROBE_COMMAND.rstrip().endswith("PALIMPSEST-END")
+    assert GUEST_PROBE_COMMAND.index("PALIMPSEST-UTMP-OK") < GUEST_PROBE_COMMAND.index("who")
 
 
 def test_a_line_without_a_user_and_tty_is_unknown_not_empty():
@@ -67,7 +98,7 @@ def test_hung_fetch_times_out_as_unknown():
 
 def test_non_positive_timeout_is_refused():
     with pytest.raises(ValueError):
-        WhoSessionObserver(_fetch_returning(""), timeout_seconds=0)
+        WhoSessionObserver(_fetch_returning(_listing()), timeout_seconds=0)
 
 
 class _Clock:
@@ -92,7 +123,7 @@ class _Provider:
 def test_controller_with_who_observer_shelves_only_after_a_clean_empty_listing():
     clock = _Clock()
     provider = _Provider()
-    observer = WhoSessionObserver(_fetch_returning(""))
+    observer = WhoSessionObserver(_fetch_returning(_listing()))
     controller = SessionController(observer, provider, clock, G)
     controller.register(IID)
     clock.now = G
