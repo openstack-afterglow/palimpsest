@@ -3091,3 +3091,69 @@ def test_materialization_keeps_committed_artifacts_when_catalog_sync_fails(tmp_p
         assert "sha256:" + hasher.hexdigest() == receipt.image_digest
     cas.verify_image(snapshot)
     assert roots.metadata_db.read_bytes() == damaged
+
+
+_GIT_SHA = "a" * 40
+_REQUEST_ID = "7d4c8b1e-2f3a-4b5c-8d9e-0f1a2b3c4d5e"
+
+
+def _git_build_argv(**overrides):
+    values = {
+        "--repo-url": "https://github.com/o/r.git",
+        "--revision": _GIT_SHA,
+        "--request-id": _REQUEST_ID,
+        "--name": "git-app",
+        "--os-family": "alpine",
+        "--os-version": "3",
+    }
+    values.update(overrides)
+    argv = ["image", "git-build"]
+    for key, value in values.items():
+        argv += [key, value]
+    return argv
+
+
+def test_cli_dispatch_image_git_build_posts_the_exact_pinned_request(monkeypatch: pytest.MonkeyPatch, capsys):
+    monkeypatch.setenv("PALIMPSEST_URL", "http://localhost:8080")
+    monkeypatch.setenv("PALIMPSEST_TOKEN", "test-token")
+    sent = []
+    monkeypatch.setattr(
+        "palimpsest_local.cli.HubClient.build_git",
+        lambda self, request: sent.append(request) or {"id": "job-1", "status": "queued"},
+    )
+    assert cli.main(_git_build_argv()) == 0
+    assert sent == [
+        {
+            "repo_url": "https://github.com/o/r.git",
+            "revision": _GIT_SHA,
+            "dockerfile_path": "Dockerfile",
+            "context_subdir": ".",
+            "request_id": _REQUEST_ID,
+            "name": "git-app",
+            "os_family": "alpine",
+            "os_version": "3",
+            "visibility": "private",
+        }
+    ]
+    assert '"job-1"' in capsys.readouterr().out
+
+
+def test_cli_image_git_build_refuses_a_non_uuid_request_id_before_any_hub_call(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("PALIMPSEST_URL", "http://localhost:8080")
+    monkeypatch.setenv("PALIMPSEST_TOKEN", "test-token")
+    monkeypatch.setattr(
+        "palimpsest_local.cli.HubClient.build_git",
+        lambda self, request: pytest.fail("hub called with a bad request id"),
+    )
+    assert cli.main(_git_build_argv(**{"--request-id": "not-a-uuid"})) != 0
+
+
+def test_cli_dispatch_image_git_job_shows_the_commit_the_build_used(monkeypatch: pytest.MonkeyPatch, capsys):
+    monkeypatch.setenv("PALIMPSEST_URL", "http://localhost:8080")
+    monkeypatch.setenv("PALIMPSEST_TOKEN", "test-token")
+    monkeypatch.setattr(
+        "palimpsest_local.cli.HubClient.get_image_job",
+        lambda self, job_id: {"id": job_id, "git": {"revision": _GIT_SHA, "repo_url": "https://github.com/o/r.git"}},
+    )
+    assert cli.main(["image", "git-job", "job-1"]) == 0
+    assert _GIT_SHA in capsys.readouterr().out
