@@ -3262,3 +3262,28 @@ def test_compose_stack_resolution_forwards_cloud_to_hub_image_lookup(monkeypatch
     captured["resolve_stack"](SimpleNamespace(name="svc", bundle=None, image="sha256:" + "b" * 64, layers=()))
     assert captured["kwargs"]["cloud"] == "dms"
     assert captured["explicit_url"] == "https://hub.example"
+
+
+def test_cloud_env_up_keeps_its_own_cloud_flag_and_passes_the_hub_gate():
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            "cloud",
+            "env",
+            "up",
+            "demo",
+            "--cloud",
+            "dms",
+            "--network",
+            "net",
+            "--external-network",
+            "ext",
+            "--image",
+            "img",
+            "--worker-flavor",
+            "flv",
+        ]
+    )
+    assert args.cloud == "dms"
+    assert args.hub_cloud is None
+    cli._reject_unused_cloud(args)

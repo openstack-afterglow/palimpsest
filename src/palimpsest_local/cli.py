@@ -395,7 +395,7 @@ _CLOUD_CONSUMERS = frozenset(
 
 
 def _reject_unused_cloud(args: argparse.Namespace) -> None:
-    if not getattr(args, "cloud", None):
+    if not getattr(args, "hub_cloud", None):
         return
     sub = getattr(args, f"{args.operation}_operation", None)
     if (args.operation, sub) not in _CLOUD_CONSUMERS:
@@ -453,12 +453,12 @@ def _run_published(args: argparse.Namespace, hub_publish) -> int:
         args.url or os.environ.get("PALIMPSEST_URL") or _configured_url(roots.config) or DEFAULT_HUB_URL
     )
     pulling = args.published_operation == "pull"
-    if args.cloud:
+    if args.hub_cloud:
         if getattr(args, "anonymous", False) or args.image_key_file is not None:
             raise PalimpsestError("--cloud cannot be combined with --anonymous or --image-key-file")
         from .cloud_cli import hub_credentials
 
-        token, project_id = hub_credentials(args.cloud)
+        token, project_id = hub_credentials(args.hub_cloud)
         credential = hub_publish.HubCredential("keystone", token)
         hub_publish.require_secure_transport(hub_url, credential, allow_insecure_http=args.allow_insecure_http)
         client = HubClient(hub_url, token, project_id=project_id)
@@ -904,6 +904,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--url", help="Hub API URL (overrides PALIMPSEST_URL and config.toml)")
     parser.add_argument(
         "--cloud",
+        dest="hub_cloud",
         help="clouds.yaml cloud whose Keystone token and project authenticate Hub calls (overrides PALIMPSEST_TOKEN)",
     )
     parser.add_argument("--version", action="version", version=__version__, help="show the client version and exit")
@@ -2451,7 +2452,7 @@ def _dispatch_compose(
             sys.stdout.write(canonical_project_json(project))
         return 0
 
-    callbacks = _compose_callbacks(project, environment, roots, store, args.url, cloud=args.cloud)
+    callbacks = _compose_callbacks(project, environment, roots, store, args.url, cloud=args.hub_cloud)
     if operation == "up":
         result = up_project(
             project,
@@ -3153,7 +3154,7 @@ def dispatch_args(args: argparse.Namespace) -> int:
             )
             return run_docker_passthrough(argv).returncode
         if img_op == "ls":
-            client = hub_client(args.url, args.cloud)
+            client = hub_client(args.url, args.hub_cloud)
             items = _hub_artifact_items(client, args, images=True)
             if args.format == "json":
                 print(json.dumps(items, indent=2))
@@ -3163,7 +3164,7 @@ def dispatch_args(args: argparse.Namespace) -> int:
                         "\t".join(str(item.get(key) or "-") for key in ("blob_digest", "name", "disk_format", "arch"))
                     )
         elif img_op == "check":
-            client = hub_client(args.url, args.cloud)
+            client = hub_client(args.url, args.hub_cloud)
             metadata = client.get_layer(require_digest(args.digest))
             if metadata.get("kind") != KIND_CLOUD_IMAGE:
                 raise PalimpsestError("image check requires a cloud-image digest")
@@ -3175,7 +3176,7 @@ def dispatch_args(args: argparse.Namespace) -> int:
                 request_id = str(uuid.UUID(args.request_id))
             except ValueError:
                 raise PalimpsestError("--request-id must be a UUID") from None
-            client = hub_client(args.url, args.cloud)
+            client = hub_client(args.url, args.hub_cloud)
             job = client.build_git(
                 {
                     "repo_url": args.repo_url,
@@ -3191,11 +3192,11 @@ def dispatch_args(args: argparse.Namespace) -> int:
             )
             print(json.dumps(job, indent=2))
         elif img_op == "git-job":
-            client = hub_client(args.url, args.cloud)
+            client = hub_client(args.url, args.hub_cloud)
             print(json.dumps(client.get_image_job(args.job_id), indent=2))
         elif img_op == "pull":
             norm_digest = require_digest(args.digest)
-            client = hub_client(args.url, args.cloud)
+            client = hub_client(args.url, args.hub_cloud)
             meta = client.get_layer(norm_digest)
             kind = meta.get("kind")
             if kind != KIND_CLOUD_IMAGE:
@@ -3245,7 +3246,7 @@ def dispatch_args(args: argparse.Namespace) -> int:
             image_arch = args.arch or known_arch
             if image_arch is None:
                 raise PalimpsestError("image architecture is unknown; specify --arch x86_64 or --arch aarch64")
-            client = hub_client(args.url, args.cloud)
+            client = hub_client(args.url, args.hub_cloud)
             metadata = {
                 "name": args.name,
                 "kind": KIND_CLOUD_IMAGE,
@@ -3271,7 +3272,7 @@ def dispatch_args(args: argparse.Namespace) -> int:
     elif op == "layer":
         lyr_op = args.layer_operation
         if lyr_op == "ls":
-            client = hub_client(args.url, args.cloud)
+            client = hub_client(args.url, args.hub_cloud)
             items = _hub_artifact_items(client, args, images=False)
             if args.format == "json":
                 print(json.dumps(items, indent=2))
@@ -3279,7 +3280,7 @@ def dispatch_args(args: argparse.Namespace) -> int:
                 for item in items:
                     print("\t".join(str(item.get(key) or "-") for key in ("blob_digest", "name", "kind", "arch")))
         elif lyr_op == "check":
-            client = hub_client(args.url, args.cloud)
+            client = hub_client(args.url, args.hub_cloud)
             metadata = client.get_layer(require_digest(args.digest))
             if metadata.get("kind") != "squashfs":
                 raise PalimpsestError("layer check requires a SquashFS digest")
@@ -3288,7 +3289,7 @@ def dispatch_args(args: argparse.Namespace) -> int:
             return 0 if result["compatible"] else 1
         elif lyr_op == "pull":
             norm_digest = require_digest(args.digest)
-            client = hub_client(args.url, args.cloud)
+            client = hub_client(args.url, args.hub_cloud)
             meta = client.get_layer(norm_digest)
             if meta.get("kind") != "squashfs" or meta.get("media_type") != MEDIA_TYPE_LAYER_SQUASHFS:
                 raise PalimpsestError(f"digest {norm_digest} is not a SquashFS layer")
@@ -3346,7 +3347,7 @@ def dispatch_args(args: argparse.Namespace) -> int:
                 write_tag_record(roots, record)
                 print(d)
         elif lyr_op == "push":
-            client = hub_client(args.url, args.cloud)
+            client = hub_client(args.url, args.hub_cloud)
             val = args.value
             tag_rec = None
             try:
@@ -3426,7 +3427,7 @@ def dispatch_args(args: argparse.Namespace) -> int:
     elif op == "bundle":
         bnd_op = args.bundle_operation
         if bnd_op == "pull":
-            client = hub_client(args.url, args.cloud)
+            client = hub_client(args.url, args.hub_cloud)
             norm_leaf = require_digest(args.leaf_digest)
             args.output.mkdir(parents=True, exist_ok=True)
             with tempfile.TemporaryDirectory() as tmpdir:
@@ -3455,7 +3456,7 @@ def dispatch_args(args: argparse.Namespace) -> int:
                 raise PalimpsestError(f"recipe file not found: {recipe_path}")
             recipe = parse_palimpsestfile(recipe_path)
             base_digest, layer_digests = verify_build_integrity(recipe, cli_base=args.base, cli_layers=args.layer)
-            base_ref = _resolve_image_ref(store, base_digest, args.url, cloud=args.cloud)
+            base_ref = _resolve_image_ref(store, base_digest, args.url, cloud=args.hub_cloud)
             parent_layers = _layer_refs_from_store(store, layer_digests, base_ref.digest)
             record = build_layer(
                 BuildSpec(
@@ -3558,12 +3559,12 @@ def dispatch_args(args: argparse.Namespace) -> int:
             output = args.output or (roots.builds / "outputs" / f"{safe_tag}-{timestamp}.oci.tar")
             with resolve_named_oci_contexts(args.local_image, roots) as local_images:
                 init_resolved_roots(roots)
-                runtime_client = hub_client(args.url, args.cloud) if not args.offline and args.runtime_tag else None
+                runtime_client = hub_client(args.url, args.hub_cloud) if not args.offline and args.runtime_tag else None
                 if args.runtime_base:
                     if args.offline:
                         runtime_base_ref = _image_ref_from_store(store, args.runtime_base)
                     else:
-                        runtime_base_ref = _resolve_image_ref(store, args.runtime_base, args.url, cloud=args.cloud)
+                        runtime_base_ref = _resolve_image_ref(store, args.runtime_base, args.url, cloud=args.hub_cloud)
                     target_arch = image_arch_for_platform(platform)
                     if runtime_base_ref.arch != target_arch:
                         raise PalimpsestError(
@@ -3776,7 +3777,7 @@ def dispatch_args(args: argparse.Namespace) -> int:
                 requested_backend=args.backend,
                 preflight_for_run=True,
                 run_network=network,
-                cloud=args.cloud,
+                cloud=args.hub_cloud,
             )
         run_spec = RunSpec(
             name=args.name,

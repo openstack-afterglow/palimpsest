@@ -4026,9 +4026,9 @@ that CI never sees).
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "da661a0266ba36e47ffa216b4b55ec5256e0f973df428f3ae21688426541fb28",
-  "reviewed_at": "2026-11-10T12:15:50Z",
-  "summary": "--cloud: fail-closed gate, compose and published honored (M4-02 slice)"
+  "source_sha256": "10d2f759a82d445dceb9c70a73f1190f223d3210f707240039b38ee2f691f9a9",
+  "reviewed_at": "2026-11-10T12:17:45Z",
+  "summary": "--cloud dest split from cloud env up --cloud; regression test"
 }
 ```
 <!-- architecture-review:end -->
