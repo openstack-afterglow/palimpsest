@@ -6,7 +6,7 @@ Source-reviewed by the author only; test-passed on hosted CI and the Hub scrubbe
 
 - `palimpsest_hub.services.preflight` runs read-only checks under the caller's own token before any allocation: token project scope, the caller's policy action, service-catalog endpoints for compute, network, image and volumev3 (plus shared-file-system for the native path) and compute/block-storage quotas. Every failure is reported together as a structured `preflight_failed` response (403 scope/policy, 424 catalog, 409 quota); unreadable limits fail closed. `services/instances.py` and `services/native_instances.py` call it through `run_blocking` (the checks are network calls and must not run on the event loop) after the idempotent replay lookup, so an existing request still replays after a later quota exhaustion. It checks access and headroom only; it does not reserve resources, so a later allocation can still fail.
 - `palimpsest_hub.services.git_source` admits a pinned Git build source: https only, no userinfo/query/fragment/IP literal, a 40-hex revision, an operator host allow-list (default deny), every resolved address public (loopback, private, link-local including the metadata address, CGNAT and multicast refused), the first resolved address pinned for the connection, redirects disabled, `GIT_ALLOW_PROTOCOL` limited, `.git` removed and byte/file/symlink limits enforced. It is a library only: no API route, build-worker step or private-credential resolution calls it yet, and `credential_ref` is an opaque name, never a secret.
-- `palimpsest_hub.services.session_lifecycle` is a pure state machine for the delayed dev-instance shelve: shelve is due only after the full grace period with no open session, any connect cancels it and invalidates earlier claims, an observation failure is not a disconnect, one claim wins per due period, and a connect during an in-flight shelve requires an unshelve after it settles. No service, SSH/console observer or provider call uses it yet.
+- `palimpsest_hub.services.session_lifecycle` is a pure state machine for the delayed dev-instance shelve: shelve is due only after the full grace period with no open session, any connect cancels it and invalidates earlier claims, an observation failure is not a disconnect, one claim wins per due period, and a connect during an in-flight shelve requires an unshelve after it settles. `palimpsest_hub.services.session_controller` drives it through injected observer, provider and clock ports under a per-instance lock: an unreadable observation never shelves or moves the timer, a claim is re-checked by a second fresh observation before the provider is called, a failed shelve restarts the full grace period, and a user present while shelved triggers one unshelve (failed unshelve retries next tick). The lock and claim are process-local, so concurrent-shelve protection holds only within one Hub process; a multi-worker deployment must use `sql_mutex` or the instance row lock first. State is in memory, so a restart only delays a shelve. No service, SSH/console observer, Nova provider, persistence or Keystone delegation (M4-11) uses it yet.
 
 ## M2 Hub image publication, quotas, image keys and anonymous public reads — 2026-11-07/08 merge-worktree source
 
@@ -4026,9 +4026,9 @@ that CI never sees).
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "d3bc6c64f1d044b766bc84f747c80adbaff9f1bae011fd96954742f035ddd17d",
-  "reviewed_at": "2026-11-09T14:07:47Z",
-  "summary": "Gate orphan SSH session marker settlement on proven-empty guest sessions"
+  "source_sha256": "e7931b4cd2c7f93e65db3c064dee032312d5aa125c013e86902fd673e71c9d38",
+  "reviewed_at": "2026-11-10T04:33:07Z",
+  "summary": "Add session controller driving the shelve state machine through observer/provider ports"
 }
 ```
 <!-- architecture-review:end -->
