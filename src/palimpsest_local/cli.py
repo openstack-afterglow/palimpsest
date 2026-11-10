@@ -22,6 +22,7 @@ import time
 import tomllib
 import tty
 import unicodedata
+import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -863,6 +864,25 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     image_commands = image.add_subparsers(dest="image_operation", required=True)
+    image_git_build = image_commands.add_parser(
+        "git-build",
+        help="submit a pinned Git checkout for a server-side Dockerfile build (Hub POST /git-builds)",
+        description="Build a Dockerfile from a pinned Git commit on the Hub. Only allow-listed hosts are used; "
+        "private-Git credentials are not supported yet.",
+    )
+    image_git_build.add_argument("--repo-url", required=True, help="https Git URL on an allow-listed host")
+    image_git_build.add_argument("--revision", required=True, help="full 40-character commit SHA")
+    image_git_build.add_argument("--dockerfile-path", default="Dockerfile", help="Dockerfile path in the checkout")
+    image_git_build.add_argument("--context-subdir", default=".", help="build context directory in the checkout")
+    image_git_build.add_argument("--request-id", required=True, help="UUID; retrying the same request replays its job")
+    image_git_build.add_argument("--name", required=True, help="image name (lowercase, digits, . + -)")
+    image_git_build.add_argument("--os-family", required=True)
+    image_git_build.add_argument("--os-version", required=True)
+    image_git_build.add_argument("--visibility", choices=("private", "internal", "public"), default="private")
+    image_git_job = image_commands.add_parser(
+        "git-job", help="show a Hub image job, including the commit a Git build used"
+    )
+    image_git_job.add_argument("job_id")
     image_ls = image_commands.add_parser(
         "ls",
         help="list boot images available from Hub (not local inventory)",
@@ -3083,6 +3103,29 @@ def dispatch_args(args: argparse.Namespace) -> int:
             result = check_artifact(metadata, lookup=client.get_layer, requested_backend=args.backend)
             print(json.dumps(result, indent=2))
             return 0 if result["compatible"] else 1
+        elif img_op == "git-build":
+            try:
+                request_id = str(uuid.UUID(args.request_id))
+            except ValueError:
+                raise PalimpsestError("--request-id must be a UUID") from None
+            client = HubClient(resolve_url(args.url), resolve_token())
+            job = client.build_git(
+                {
+                    "repo_url": args.repo_url,
+                    "revision": args.revision,
+                    "dockerfile_path": args.dockerfile_path,
+                    "context_subdir": args.context_subdir,
+                    "request_id": request_id,
+                    "name": args.name,
+                    "os_family": args.os_family,
+                    "os_version": args.os_version,
+                    "visibility": args.visibility,
+                }
+            )
+            print(json.dumps(job, indent=2))
+        elif img_op == "git-job":
+            client = HubClient(resolve_url(args.url), resolve_token())
+            print(json.dumps(client.get_image_job(args.job_id), indent=2))
         elif img_op == "pull":
             norm_digest = require_digest(args.digest)
             client = HubClient(resolve_url(args.url), resolve_token())
