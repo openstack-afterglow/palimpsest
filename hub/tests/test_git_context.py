@@ -137,3 +137,39 @@ def test_a_root_that_is_not_a_directory_is_refused(tmp_path):
     f.write_text("x")
     with pytest.raises(ContextError):
         build(f)
+
+
+def test_a_backslash_in_a_name_is_refused_because_the_worker_cannot_extract_it(tmp_path):
+    make_tree(tmp_path)
+    (tmp_path / "a\\b").write_text("x")
+    with pytest.raises(ContextError, match="cannot be extracted"):
+        build(tmp_path)
+
+
+def test_the_tar_round_trips_through_the_worker_extractor_with_the_same_tree(tmp_path):
+    from palimpsest_local.hub_image_builder import extract_context
+
+    src = tmp_path / "src"
+    src.mkdir()
+    make_tree(src)
+    (src / "run.sh").chmod(0o755)
+    os.symlink("src/app.py", src / "link.py")
+    archive = tmp_path / "context.tar"
+    with archive.open("wb") as handle:
+        write_context_tar(src, handle)
+    out = tmp_path / "out"
+    extract_context(archive, out, maximum_bytes=10**6, maximum_members=100)
+
+    def tree(root):
+        found = {}
+        for path in sorted(root.rglob("*")):
+            rel = path.relative_to(root).as_posix()
+            if path.is_symlink():
+                found[rel] = ("link", os.readlink(path))
+            elif path.is_dir():
+                found[rel] = ("dir", None)
+            else:
+                found[rel] = ("file", path.read_text(), bool(path.stat().st_mode & 0o100))
+        return found
+
+    assert tree(out) == tree(src)

@@ -264,13 +264,6 @@ async def test_a_missing_dockerfile_is_refused(store, head):
     assert scratch_dirs(store) == []
 
 
-async def test_a_dockerfile_outside_the_context_is_refused(store, head):
-    runner = Runner(files={"Dockerfile": "FROM scratch\n", "app/main.py": "y\n"})
-    with pytest.raises(GitSourceError) as info:
-        await _stage(store, runner, context_subdir="app", dockerfile_path="Dockerfile")
-    assert info.value.code == "dockerfile"
-
-
 async def test_a_symlinked_dockerfile_is_refused(store, head):
     runner = Runner(files={"real.txt": "FROM scratch\n"}, links={"Dockerfile": "real.txt"})
     with pytest.raises(GitSourceError) as info:
@@ -284,21 +277,6 @@ async def test_a_credential_reference_is_refused_before_any_git_call(store, head
         await _stage(store, runner, credential_ref="deploy-key")
     assert info.value.code == "credential"
     assert runner.calls == []
-
-
-async def test_a_dockerignore_that_removes_the_dockerfile_is_refused(store, head):
-    runner = Runner(files={"Dockerfile": "FROM scratch\n", ".dockerignore": "Dockerfile\n"})
-    with pytest.raises(GitSourceError) as info:
-        await _stage(store, runner)
-    assert info.value.code == "dockerfile"
-    assert scratch_dirs(store) == []
-
-
-async def test_the_staged_result_reports_the_dockerfile_relative_to_the_context(store, head):
-    runner = Runner(files={"app/Dockerfile": "FROM scratch\n", "app/main.py": "y\n"})
-    result = await _stage(store, runner, context_subdir="app", dockerfile_path="app/Dockerfile")
-    assert result.dockerfile == "Dockerfile"
-    assert "Dockerfile" in tar_names(store, result.blob_digest)
 
 
 async def test_a_missing_git_binary_is_a_fetch_refusal_not_a_server_error(store, head):
@@ -336,3 +314,49 @@ async def test_stale_scratch_from_a_dead_process_is_swept_while_live_and_foreign
     assert not dead.exists()
     assert live.exists()
     assert foreign.exists()
+
+
+async def test_a_dockerignore_that_drops_the_dockerfile_still_stages_the_inline_text(store, head):
+    runner = Runner(files={"Dockerfile": "FROM scratch\n", "keep.txt": "k\n", ".dockerignore": "Dockerfile\n"})
+    result = await _stage(store, runner)
+    assert result.dockerfile_text == "FROM scratch\n"
+    names = tar_names(store, result.blob_digest)
+    assert "Dockerfile" not in names and "keep.txt" in names
+
+
+async def test_a_dockerfile_outside_the_context_still_stages_because_the_worker_writes_it_inline(store, head):
+    runner = Runner(files={"Dockerfile": "FROM scratch\n", "app/main.py": "y\n"})
+    result = await _stage(store, runner, context_subdir="app", dockerfile_path="Dockerfile")
+    assert result.dockerfile_text == "FROM scratch\n"
+    assert tar_names(store, result.blob_digest) == ["main.py"]
+
+
+async def test_a_context_over_the_worker_member_limit_is_refused_before_publication(store, head):
+    before = blobs(store)
+    with pytest.raises(GitSourceError) as info:
+        await stage_git_context(
+            request(),
+            allowed_hosts=["github.com"],
+            store=store,
+            max_context_bytes=10**6,
+            max_members=1,
+            resolver=lambda h, p: PUBLIC,
+            runner=Runner(),
+        )
+    assert info.value.code == "context"
+    assert blobs(store) == before
+    assert scratch_dirs(store) == []
+
+
+async def test_a_context_over_the_worker_expanded_byte_limit_is_refused(store, head):
+    with pytest.raises(GitSourceError) as info:
+        await stage_git_context(
+            request(),
+            allowed_hosts=["github.com"],
+            store=store,
+            max_context_bytes=10**6,
+            max_expanded_bytes=4,
+            resolver=lambda h, p: PUBLIC,
+            runner=Runner(),
+        )
+    assert info.value.code == "context"

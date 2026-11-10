@@ -23,6 +23,8 @@ from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import BinaryIO
 
+MAX_NAME_BYTES = 4096
+
 
 class ContextError(ValueError):
     """The checkout cannot be turned into a build context; the reason is safe to report."""
@@ -75,6 +77,9 @@ def _walk(root: Path, patterns: Sequence[str], rel_dir: str = "") -> Iterator[tu
             raise ContextError("file name is not valid UTF-8") from None
         if _ignored(rel, patterns):
             continue
+        # The worker's extract_context refuses these; refuse at staging so the job fails here.
+        if "\\" in rel or len(rel.encode()) > MAX_NAME_BYTES:
+            raise ContextError("file name cannot be extracted by the build worker")
         yield rel, entry
         if entry.is_dir(follow_symlinks=False):
             yield from _walk(root, patterns, rel)

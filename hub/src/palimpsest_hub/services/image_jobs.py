@@ -622,6 +622,8 @@ async def admit_git_dockerfile(req, token_info):
                 allowed_hosts=get_settings().palimpsest_hub_git_allowed_hosts,
                 store=store,
                 max_context_bytes=get_settings().palimpsest_hub_max_context_bytes,
+                max_members=get_settings().palimpsest_hub_max_context_members,
+                max_expanded_bytes=get_settings().palimpsest_hub_max_context_expanded_bytes,
             )
         except GitStagingUnavailable:
             raise HTTPException(status_code=503, detail="git builds are not enabled on this Hub") from None
