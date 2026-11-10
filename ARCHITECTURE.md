@@ -4027,8 +4027,8 @@ that CI never sees).
 {
   "schema_version": 1,
   "source_sha256": "956b7435b9ede8eb7e8c0a56f43357e71f9fc06115d7f89bc314a6b6169a786d",
-  "reviewed_at": "2026-11-10T05:59:03Z",
-  "summary": "Refuse double-star dockerignore rules in deterministic context tar (fail closed)"
+  "reviewed_at": "2026-11-10T06:11:15Z",
+  "summary": "Merge dev into git-context branch; tar honours context rules"
 }
 ```
 <!-- architecture-review:end -->
