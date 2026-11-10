@@ -4026,9 +4026,9 @@ that CI never sees).
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "e30a5645b0a8df7486bd1deceaec83555d0cbf0cb26f265ad0117d180376d6f0",
-  "reviewed_at": "2026-11-10T11:49:07Z",
-  "summary": "Handoff: add PRs 61-63 and new dev head"
+  "source_sha256": "1266b3d8b68b2df799b341c45986205d045ca7c66b37ced3b6a433ee72f82546",
+  "reviewed_at": "2026-11-10T11:50:09Z",
+  "summary": "Batch: handoff 61-63, git-build CLI slice, SDK build_git"
 }
 ```
 <!-- architecture-review:end -->

@@ -25,6 +25,8 @@
 
 ### 재개용 실행 기록
 
+**2026-11-10 M4-08 CLI slice (test-passed, 미체크):** `palimpsest image git-build`(고정 SHA 요청, `--request-id`는 Hub 호출 전 UUID 검사)과 `palimpsest image git-job <id>`(빌드 커밋 조회)를 추가했다. 계약 테스트 3개 + `tests/unit/test_cli_contract.py` 207개 통과, `revision` 누락 변이 1 실패. 실 Hub 실행 없음, M4-08은 여전히 미체크(생성·상태·로그·SSH·보존·재개·삭제 계약 전체 미구현).
+
 **2026-11-10 M4-06 출처 조회 slice (test-passed, 미체크):** `GET /v1/image-jobs[/{id}]` 응답에 `git` 필드(repo_url, 고정 revision, context_subdir, dockerfile_path)를 추가했다(Git 빌드 작업만 값, 그 외와 worker 응답은 null). 테스트 `test_a_git_build_job_reads_back_the_commit_it_was_built_from`: 수정 전 `KeyError: 'git'`로 실패, 수정 후 통과. 변이(projection 제거 → 1 실패, 원복 후 통과), 관련 197개 통과. 빌드 결과·게시 이미지·인스턴스 연결·실패 로그 조회 전체 M4-06 체크는 아직 아님.
 **2026-11-10 M4-08 SDK 메서드 (test-passed, 미체크):** `HubClient.build_git`이 `POST /git-builds`(고정 SHA, Dockerfile·컨텍스트 경로 포함 요청)를 보낸다. 계약 테스트 `test_build_git_posts_the_pinned_request_to_the_git_builds_contract`는 경로·메서드·본문을 확인하고, 잘못된 경로 변이 시 1 실패, 원복 후 통과. **CLI는 아직 없다**: `palimpsest` 명령에는 Hub Dockerfile 빌드 명령이 없고 `build_dockerfile`은 벤치마크만 쓴다. 생성·상태·로그·SSH·보존·재개·삭제를 같은 계약으로 묶는 CLI 설계가 필요해 M4-08은 미체크.
 
