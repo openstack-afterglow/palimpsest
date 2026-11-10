@@ -24,6 +24,16 @@ files_modified:
 [ARCHITECTURE.md](../ARCHITECTURE.md), 실행 경계는 [testing.md](testing.md),
 세부 결과는 아래 링크된 문서와 source다.
 
+## M4 CPU slices, git-build route and handoff — 2026-11-10
+
+- Source of truth: `origin/dev` `b1865d6` (PR #60 squash), after PRs #54, #55, #56, #57, #58, #59, #60. Checked spec boxes remain 54/108.
+- Merged to `dev` (squash SHAs): #54 `6246120` orphaned SSH marker settlement (proven-empty guest gate); #55 `dcaa3c4` M2-17 final sweep observation (docs); #56 `50e5891` session controller (M4-10 slice); #57 `e381e81` Nova shelve provider (status-confirmed shelve, M4-10 slice); #58 `2aa8eec` deterministic build-context tar (M4-05 slice); #59 `4e4fd43` git staging + `POST /v1/git-builds` (M4-05 staging, route); #60 `b1865d6` git build provenance, pre-fetch `request_id` replay, stale `gitctx-*` sweep, worker extract limits, dockerfile/symlink containment (M4-05 follow-up).
+- Route fix after #60: `/v1/git-builds` added to `_execution_path` roots in `hub/src/palimpsest_hub/main.py` so responses carry `Cache-Control: no-store`. Test-first: the new `/v1/git-builds` case in `tests/test_execution_boundaries.py` failed on `KeyError: 'Cache-Control'` before the fix. The earlier claim that this root gap could echo the request body was wrong; `bounded_json` already returns the generic detail.
+- Test-passed (CPU, fakes at the process boundary): on the route-fix branch, `tests/test_execution_boundaries.py` 32 passed and `tests/test_image_jobs.py` 158 passed; earlier on the #60 branch the git staging, context, source and image-job focused set passed (244). ruff check and format, `scripts/test_lanes.py list --check` and `check_architecture` passed. Each PR's CI on its merged head reported 0 failures.
+- Live-verified: NOTHING for M4-05/M4-10. No real Git host, no deployed `/v1/git-builds`, no Nova shelve/unshelve, no SSH/console observer. Docker image build for the `git` package is CI-only (`hub-docker.yml`).
+- Known open limits: private-Git credentials (`credential_ref`) refused; `request_id` replay for an identical request still follows a fresh fetch when the owner's policy is empty (fail-closed 503); M4-10 observers, persistence and M4-11 Keystone delegation not built.
+- Pending owner approvals: M2-17 evidence-level acceptance; one remaining 587 native create for the M3-07/09 second-VM and kill-client proof; receipt 581 disposition; reconstructed `spec.md` canonical confirmation; stage row `87b60cf0…` expiry wait (not before 2026-11-10T11:24Z); local-manila read-only source approval and `clouds.yaml` re-provision; M4-05 private-Git credential scope; any production deploy of the Hub with these routes is not approved.
+
 ## Reader/member/manager priority cutover — 2026-11-06, source264 in progress
 
 Owner explicitly added this alongside the continuing local M1 Goal: existing

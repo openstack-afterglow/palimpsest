@@ -4026,9 +4026,9 @@ that CI never sees).
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "6222cbc062b14dc24f9419cd876163abb9f873cc36ae37cfaf40ab6f3282d794",
-  "reviewed_at": "2026-11-10T06:54:16Z",
-  "summary": "Contain dockerfile_path by resolved location; check symlinked directories in tree scan"
+  "source_sha256": "1e8c9e340e361ec3939c747846e3925deee1b449bf0d73328e6d0424843d8c7b",
+  "reviewed_at": "2026-11-10T07:10:35Z",
+  "summary": "Route /v1/git-builds through execution-path no-store; record CPU slices in handoff"
 }
 ```
 <!-- architecture-review:end -->

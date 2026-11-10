@@ -134,6 +134,7 @@ def _execution_path(request: Request) -> bool:
         "/v1/build-contexts",
         "/v1/registry-imports",
         "/v1/dockerfile-builds",
+        "/v1/git-builds",
         "/v1/image-jobs",
         "/v1/image-worker",
         "/v1/instances",
