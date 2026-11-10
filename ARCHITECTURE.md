@@ -4026,9 +4026,9 @@ that CI never sees).
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "3b9c3feed1eda3b2cc2322629d9e0ef97be5aa4fb2de8d48c7be405e4683c31a",
-  "reviewed_at": "2026-11-10T13:20:00Z",
-  "summary": "Rebase M4-11 policy slice on dev with M4-10 observer"
+  "source_sha256": "1c645a854034031c81b24c39ba3ac3b6429b0b677a27d7a9505018bc3f638cbd",
+  "reviewed_at": "2026-11-10T13:20:10Z",
+  "summary": "M4-11 TTL/rejected-trust fix on dev with M4-10 observer"
 }
 ```
 <!-- architecture-review:end -->

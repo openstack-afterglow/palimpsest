@@ -5,7 +5,7 @@ import asyncio
 import pytest
 
 from palimpsest_hub.services.session_controller import ProviderError
-from palimpsest_hub.services.shelve_delegation import TRUST_MARGIN_SECONDS, ShelveDelegation, ShelveTrust
+from palimpsest_hub.services.shelve_delegation import ShelveDelegation, ShelveTrust
 
 GRACE = 300.0
 SERVER = "srv-1"
@@ -84,7 +84,7 @@ def test_expired_trust_fails_closed_and_is_not_renewed_by_the_idle_path():
     clock = Clock()
     delegation, opened, _ = _make(clock)
     delegation.renew_on_user_request(_user_trust(clock))
-    clock.now += GRACE + TRUST_MARGIN_SECONDS
+    clock.now += GRACE
     with pytest.raises(ProviderError, match="missing or expired"):
         asyncio.run(delegation.shelve(SERVER))
     assert opened == []
@@ -107,7 +107,7 @@ def test_renewal_replaces_and_deletes_the_previous_trust_and_respects_the_ttl():
     clock.now += 10
     second = delegation.renew_on_user_request(_user_trust(clock))
     assert deleted == [first.trust_id]
-    assert second.expires_at - clock.now == GRACE + TRUST_MARGIN_SECONDS
+    assert second.expires_at - clock.now == GRACE
 
 
 def test_a_trust_longer_than_the_ttl_or_for_another_server_is_refused():
@@ -141,3 +141,11 @@ def test_retire_deletes_the_trust_and_refuses_further_shelve():
     with pytest.raises(ProviderError):
         asyncio.run(delegation.shelve(SERVER))
     assert opened == []
+
+
+def test_a_rejected_trust_is_deleted_instead_of_left_valid():
+    clock = Clock()
+    delegation, _, deleted = _make(clock)
+    with pytest.raises(ProviderError):
+        delegation.renew_on_user_request(_user_trust(clock, server="other"))
+    assert deleted == ["t-1000"]
