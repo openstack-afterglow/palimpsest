@@ -25,6 +25,7 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +35,8 @@ from palimpsest_hub.services.git_context import ContextError, write_context_tar
 from palimpsest_hub.services.git_source import GitBuildRequest, GitSourceError, default_resolver
 from palimpsest_hub.services.hub_store import LocalPathBlobStore
 from palimpsest_hub.services.worker_leases import run_blocking
+
+STALE_SCRATCH_SECONDS = 3600.0
 
 
 class GitStagingUnavailable(RuntimeError):
@@ -49,6 +52,24 @@ class StagedGitContext:
     host: str
     dockerfile: str  # path inside the blob, relative to the build context
     dockerfile_text: str  # the Dockerfile body, sent inline to the image job
+
+
+def sweep_stale_scratch(uploads_dir: Path, *, now: float, max_age: float = STALE_SCRATCH_SECONDS) -> int:
+    """Remove `gitctx-*` scratch trees left by a process that died mid-stage.
+
+    A live stage keeps its directory's mtime fresh by writing into it, so an hour without
+    activity means no live stage owns it. Anything else under `uploads/` is left alone.
+    """
+    if not uploads_dir.is_dir():
+        return 0
+    removed = 0
+    for entry in uploads_dir.iterdir():
+        if not entry.name.startswith("gitctx-") or entry.is_symlink() or not entry.is_dir():
+            continue
+        if now - entry.stat().st_mtime > max_age:
+            shutil.rmtree(entry, ignore_errors=True)
+            removed += 1
+    return removed
 
 
 def _real_dir_inside(checkout: Path, rel: str) -> Path:
@@ -120,6 +141,7 @@ async def stage_git_context(
     run = subprocess.run if runner is None else runner  # looked up at call time, not import time
     pinned = await run_blocking(git_source.validate, request, hosts, resolver=resolver)
     await run_blocking(lambda: store.uploads_dir.mkdir(parents=True, exist_ok=True))
+    await run_blocking(sweep_stale_scratch, store.uploads_dir, now=time.time())
     scratch = Path(await run_blocking(tempfile.mkdtemp, prefix="gitctx-", dir=store.uploads_dir))
     try:
         checkout = scratch / "src"

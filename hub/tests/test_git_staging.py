@@ -316,3 +316,23 @@ async def test_a_missing_git_binary_is_a_fetch_refusal_not_a_server_error(store,
         )
     assert info.value.code == "fetch"
     assert scratch_dirs(store) == []
+
+
+async def test_stale_scratch_from_a_dead_process_is_swept_while_live_and_foreign_dirs_stay(store, head):
+    import os
+    import time
+
+    old = time.time() - 7200
+    dead = store.uploads_dir / "gitctx-dead"
+    dead.mkdir()
+    (dead / "partial").write_text("x")
+    os.utime(dead, (old, old))
+    live = store.uploads_dir / "gitctx-live"
+    live.mkdir()
+    foreign = store.uploads_dir / "other-old"
+    foreign.mkdir()
+    os.utime(foreign, (old, old))
+    await _stage(store, Runner())
+    assert not dead.exists()
+    assert live.exists()
+    assert foreign.exists()
