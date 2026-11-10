@@ -571,6 +571,39 @@ async def upload_context(request, token_info, digest, size):
     return {"digest": digest, "size_bytes": size}
 
 
+async def _git_receipt_replay(req, token_info, project):
+    """Return the job already admitted for this request_id, or refuse a reused id; None if new.
+
+    Runs before any fetch, so an identical retry costs no network or DNS work.
+    """
+    async with _factory_or_503()() as session:
+        existing = await session.scalar(
+            select(PalimpsestHubImageJob).where(
+                exact_identity(PalimpsestHubImageJob.project_id, project),
+                PalimpsestHubImageJob.request_id == str(req.request_id),
+            )
+        )
+    if existing is None:
+        return None
+    stored = existing.request_json or {}
+    git = stored.get("git") or {}
+    same = (
+        existing.kind == "dockerfile"
+        and existing.created_by == token_info["user_id"]
+        and git.get("repo_url") == req.repo_url
+        and git.get("revision") == req.revision
+        and git.get("context_subdir") == req.context_subdir
+        and git.get("dockerfile_path") == req.dockerfile_path
+        and stored.get("name") == req.name
+        and stored.get("os_family") == req.os_family
+        and stored.get("os_version") == req.os_version
+        and stored.get("visibility") == req.visibility
+    )
+    if not same:
+        raise HTTPException(status_code=409, detail="request_id is already bound to another descriptor")
+    return existing
+
+
 async def admit_git_dockerfile(req, token_info):
     """Stage a pinned Git checkout as an owned context, then admit a Dockerfile job for it."""
     _, policy = _preflight("dockerfile", {"os_family": req.os_family, "os_version": req.os_version})
@@ -579,6 +612,9 @@ async def admit_git_dockerfile(req, token_info):
     require_configured_policy(policy)
     store = _store_or_503()
     project = package_target_project_id(token_info)
+    replayed = await _git_receipt_replay(req, token_info, project)
+    if replayed is not None:
+        return replayed
     async with _locked_file(store, lambda: store.acquire_package_lock("image-context:" + project, blocking=False)):
         try:
             staged = await stage_git_context(
@@ -586,6 +622,8 @@ async def admit_git_dockerfile(req, token_info):
                 allowed_hosts=get_settings().palimpsest_hub_git_allowed_hosts,
                 store=store,
                 max_context_bytes=get_settings().palimpsest_hub_max_context_bytes,
+                max_members=get_settings().palimpsest_hub_max_context_members,
+                max_expanded_bytes=get_settings().palimpsest_hub_max_context_expanded_bytes,
             )
         except GitStagingUnavailable:
             raise HTTPException(status_code=503, detail="git builds are not enabled on this Hub") from None
@@ -607,6 +645,12 @@ async def admit_git_dockerfile(req, token_info):
         "os_version": req.os_version,
         "metadata": req.metadata,
         "visibility": req.visibility,
+        "git": {
+            "repo_url": req.repo_url,
+            "revision": staged.revision,
+            "context_subdir": req.context_subdir,
+            "dockerfile_path": req.dockerfile_path,
+        },
     }
     return await admit("dockerfile", payload, token_info)
 

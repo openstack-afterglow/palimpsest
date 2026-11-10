@@ -2311,3 +2311,54 @@ async def test_a_context_rule_the_stager_refuses_is_a_422_with_its_reason(images
     async with images.factory() as session:
         assert (await session.scalars(select(PalimpsestHubImageJob))).all() == []
         assert (await session.scalars(select(PalimpsestHubBuildContext))).all() == []
+
+
+@pytest.mark.asyncio
+async def test_a_git_build_records_the_commit_it_was_built_from(images, monkeypatch):
+    images.settings.palimpsest_hub_git_allowed_hosts = ("github.com",)
+    public_dns(monkeypatch)
+    fake = FakeGit({"Dockerfile": "FROM scratch\nCOPY main.py /main.py\n", "main.py": "print('hi')\n"})
+    monkeypatch.setattr(git_source.subprocess, "run", fake)
+    response = await images.client.post("/v1/git-builds", headers=HUMAN, json=git_body())
+    assert response.status_code == 202, response.text
+    async with images.factory() as session:
+        job = (await session.scalars(select(PalimpsestHubImageJob))).one()
+    assert job.request_json["git"] == {
+        "repo_url": GIT_URL,
+        "revision": GIT_SHA,
+        "context_subdir": ".",
+        "dockerfile_path": "Dockerfile",
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_repeated_git_request_replays_its_job_without_fetching_again(images, monkeypatch):
+    images.settings.palimpsest_hub_git_allowed_hosts = ("github.com",)
+    public_dns(monkeypatch)
+    fake = FakeGit({"Dockerfile": "FROM scratch\nCOPY main.py /main.py\n", "main.py": "print('hi')\n"})
+    monkeypatch.setattr(git_source.subprocess, "run", fake)
+    body = git_body()
+    first = await images.client.post("/v1/git-builds", headers=HUMAN, json=body)
+    assert first.status_code == 202, first.text
+    calls_after_first = len(fake.calls)
+    second = await images.client.post("/v1/git-builds", headers=HUMAN, json=body)
+    assert second.status_code == 202, second.text
+    assert second.json() == first.json()
+    assert len(fake.calls) == calls_after_first
+
+
+@pytest.mark.asyncio
+async def test_a_request_id_reused_for_another_commit_is_refused_before_any_fetch(images, monkeypatch):
+    images.settings.palimpsest_hub_git_allowed_hosts = ("github.com",)
+    public_dns(monkeypatch)
+    fake = FakeGit({"Dockerfile": "FROM scratch\nCOPY main.py /main.py\n", "main.py": "print('hi')\n"})
+    monkeypatch.setattr(git_source.subprocess, "run", fake)
+    body = git_body()
+    first = await images.client.post("/v1/git-builds", headers=HUMAN, json=body)
+    assert first.status_code == 202, first.text
+    calls_after_first = len(fake.calls)
+    other = await images.client.post(
+        "/v1/git-builds", headers=HUMAN, json=git_body(request_id=body["request_id"], revision="b" * 40)
+    )
+    assert other.status_code == 409
+    assert len(fake.calls) == calls_after_first
