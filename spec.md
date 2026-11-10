@@ -26,6 +26,7 @@
 ### 재개용 실행 기록
 
 **2026-11-10 M4-06 출처 조회 slice (test-passed, 미체크):** `GET /v1/image-jobs[/{id}]` 응답에 `git` 필드(repo_url, 고정 revision, context_subdir, dockerfile_path)를 추가했다(Git 빌드 작업만 값, 그 외와 worker 응답은 null). 테스트 `test_a_git_build_job_reads_back_the_commit_it_was_built_from`: 수정 전 `KeyError: 'git'`로 실패, 수정 후 통과. 변이(projection 제거 → 1 실패, 원복 후 통과), 관련 197개 통과. 빌드 결과·게시 이미지·인스턴스 연결·실패 로그 조회 전체 M4-06 체크는 아직 아님.
+**2026-11-10 M4-08 SDK 메서드 (test-passed, 미체크):** `HubClient.build_git`이 `POST /git-builds`(고정 SHA, Dockerfile·컨텍스트 경로 포함 요청)를 보낸다. 계약 테스트 `test_build_git_posts_the_pinned_request_to_the_git_builds_contract`는 경로·메서드·본문을 확인하고, 잘못된 경로 변이 시 1 실패, 원복 후 통과. **CLI는 아직 없다**: `palimpsest` 명령에는 Hub Dockerfile 빌드 명령이 없고 `build_dockerfile`은 벤치마크만 쓴다. 생성·상태·로그·SSH·보존·재개·삭제를 같은 계약으로 묶는 CLI 설계가 필요해 M4-08은 미체크.
 
 **2026-11-10 경로 탈출 수정 (test-passed):** 리뷰 지적으로 확인: `_check_dockerfile`이 마지막 경로 요소만 보아 `d -> /etc`(컨텍스트 밖 symlink 디렉터리) 아래의 `dockerfile_path`를 읽을 수 있었다. 해결: (1) `dockerfile_path`의 resolve 결과가 체크아웃 안이어야 한다, (2) `check_tree`가 `os.walk`의 `dirs`에 든 symlink 디렉터리도 검사한다(`os.walk`는 symlink 디렉터리를 `names`가 아닌 `dirs`로 나열하고 내려가지 않는다). 테스트 3개 추가, 변이 2건(Dockerfile 포함 검사 제거 → 1 실패, 디렉터리 symlink 검사 제거 → 2 실패), 관련 244개 통과. PR #60에 포함하여 병합 전 재검토 대상이다.
 

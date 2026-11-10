@@ -4026,9 +4026,9 @@ that CI never sees).
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "dd581d4dae022e51d267edec119509adcbacd0b33ac18abf6327c3fb23bf550f",
-  "reviewed_at": "2026-11-10T07:58:45Z",
-  "summary": "Read back git build provenance on image-job responses (M4-06 slice)"
+  "source_sha256": "e30a5645b0a8df7486bd1deceaec83555d0cbf0cb26f265ad0117d180376d6f0",
+  "reviewed_at": "2026-11-10T08:14:57Z",
+  "summary": "M4-06 readback and M4-08 SDK build_git (merged slices)"
 }
 ```
 <!-- architecture-review:end -->

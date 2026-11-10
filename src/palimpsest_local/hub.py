@@ -600,6 +600,10 @@ class HubClient:
         """Submit Dockerfile text and an optional previously uploaded context digest."""
         return self._json_request("POST", "/dockerfile-builds", request)
 
+    def build_git(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Submit a pinned Git checkout (URL, full commit SHA, Dockerfile and context paths) for a server-side build."""
+        return self._json_request("POST", "/git-builds", request)
+
     def list_image_jobs(self, *, limit: int = 50) -> list[dict[str, Any]]:
         return self._json_request("GET", "/image-jobs", query={"limit": limit})
 

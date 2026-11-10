@@ -645,3 +645,16 @@ def test_sdk_extension_transfers_only_new_payload_and_never_reconstructs_private
     assert all(
         call[3]["query"]["project_id"] == "origin" and call[3]["query"]["image_id"] == "base-hub-id" for call in calls
     )
+
+
+def test_build_git_posts_the_pinned_request_to_the_git_builds_contract(monkeypatch):
+    client = HubClient("http://hub.invalid", "token")
+    sent = []
+    monkeypatch.setattr(
+        client,
+        "_json_request",
+        lambda method, path, body=None, **_: sent.append((method, path, body)) or {"id": "job-1"},
+    )
+    request = {"repo_url": "https://github.com/o/r.git", "revision": "a" * 40, "name": "git-app"}
+    assert client.build_git(request) == {"id": "job-1"}
+    assert sent == [("POST", "/git-builds", request)]
