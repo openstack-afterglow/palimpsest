@@ -5,6 +5,10 @@ provider, and a monotonic clock. One instance is processed at a time (per-instan
 and every provider call happens only after a fresh observation, so a user who reconnected
 after the grace period elapsed is never shelved.
 
+The per-instance lock and the claim are process-local: with more than one Hub worker or
+replica two controllers could each win a claim and both call shelve. Before this runs in
+more than one process, serialise through `sql_mutex` or the instance row lock (as
+`api/builds.py` does), not `asyncio.Lock`.
 State is in memory. After a process restart an instance gets a new machine whose grace
 period starts over, which can only delay a shelve, never cause an early one.
 

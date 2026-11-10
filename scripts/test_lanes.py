@@ -148,6 +148,7 @@ SPECIAL_FILES = {
             "preflight",
             "git_source",
             "session_lifecycle",
+            "session_controller",
         )
     ),
 }
