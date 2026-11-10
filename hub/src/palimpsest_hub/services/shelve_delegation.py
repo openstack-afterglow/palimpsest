@@ -18,9 +18,6 @@ from typing import Any
 from palimpsest_hub.services.nova_shelve_provider import NovaShelveProvider
 from palimpsest_hub.services.session_controller import ProviderError
 
-# Extra validity past the 5-minute grace period, so a shelve at the deadline still has a trust.
-TRUST_MARGIN_SECONDS = 60.0
-
 
 @dataclass(frozen=True)
 class ShelveTrust:
@@ -44,7 +41,8 @@ class ShelveDelegation:
         if grace_seconds <= 0:
             raise ValueError("grace_seconds must be positive")
         self._server_id = server_id
-        self._ttl = grace_seconds + TRUST_MARGIN_SECONDS
+        # Approved bound: a short TTL no longer than the 5-minute grace period.
+        self._ttl = grace_seconds
         self._clock = clock
         self._open = open_connection
         self._delete = delete_trust
@@ -55,6 +53,8 @@ class ShelveDelegation:
         """Replace the trust with one minted from the trustor's own request; the old trust is deleted."""
         created = create_trust(self._server_id, self._ttl)
         if created.server_id != self._server_id or created.expires_at > self._clock() + self._ttl:
+            with suppress(Exception):
+                self._delete(created)
             raise ProviderError("trust does not match the delegated server or exceeds the TTL")
         previous, self._trust = self._trust, created
         if previous is not None:
@@ -92,4 +92,4 @@ class ShelveDelegation:
         await self._provider(self._live_trust(instance_id)).unshelve(instance_id)
 
 
-__all__ = ["TRUST_MARGIN_SECONDS", "ShelveDelegation", "ShelveTrust"]
+__all__ = ["ShelveDelegation", "ShelveTrust"]

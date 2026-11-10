@@ -25,7 +25,7 @@
 
 ### 재개용 실행 기록
 
-**2026-11-10 M4-11 위임 정책 슬라이스 (test-passed, M4-11 미체크):** `ShelveDelegation`(`services/shelve_delegation.py`)이 한 서버에 대한 짧은 TTL trust 셸브/언셸브를 감싼다. 결정: (1) trust는 사용자 자신의 인증 요청에서만 만들고 갱신한다(`renew_on_user_request`), 유휴 셸브 경로는 생성·갱신하지 않는다. (2) 만료·누락·열기 실패는 모두 ProviderError로 닫히고 인스턴스는 유지된다. 서비스 계정 대체는 없다. (3) Keystone trust는 서버 한 개를 지정하지 못하므로 한 서버 제한은 Hub가 호출 전에 강제한다. TTL = 5분 유예 + 60초 여유. 한계: 사용자 API 요청 뒤 TTL이 지나면 셸브는 실패하고 다음 사용자 요청까지 대기한다(안전 방향). 테스트 8 통과, 서버 제한·만료 검사 제거 변이 각 1 실패. Keystone 실호출·운영 경로 연결 없음.
+**2026-11-10 M4-11 위임 정책 슬라이스 (test-passed, M4-11 미체크):** `ShelveDelegation`(`services/shelve_delegation.py`)이 한 서버에 대한 짧은 TTL trust 셸브/언셸브를 감싼다. 결정: (1) trust는 사용자 자신의 인증 요청에서만 만들고 갱신한다(`renew_on_user_request`), 유휴 셸브 경로는 생성·갱신하지 않는다. (2) 만료·누락·열기 실패는 모두 ProviderError로 닫히고 인스턴스는 유지된다. 서비스 계정 대체는 없다. (3) Keystone trust는 서버 한 개를 지정하지 못하므로 한 서버 제한은 Hub가 호출 전에 강제한다. TTL = 5분 유예와 같은 300초(승인 범위 '유예보다 길지 않은 짧은 TTL'). 거절된 trust는 즉시 삭제한다. 한계: 사용자 API 요청 뒤 TTL이 지나면 셸브는 실패하고 다음 사용자 요청까지 대기한다(안전 방향). **소유자 결정 필요(설계 충돌):** SSH 전용 세션은 trust를 갱신하지 않으므로 M4-12 자동 셸브가 주 흐름에서 도달하지 않는다. 승인된 짧은 TTL과 '인스턴스 수명으로 제한된 trust' 중 무엇을 택할지 소유자가 정해야 한다. 테스트 9 통과, 서버 제한·만료 검사·거절 trust 삭제 제거 변이 각 1 실패. Keystone 실호출·운영 경로 연결 없음.
 
 **2026-11-10 M4-02 Hub cloud auth slice (test-passed, 미체크):** 최상위 `--cloud NAME`이 clouds.yaml의 Keystone 토큰과 `current_project_id`로 Hub를 호출하고 `X-Project-Id`를 보낸다(`cloud_cli.hub_credentials`, `cli.hub_client`). 적용 범위는 image/layer/bundle, published push|pull, run/build/compose의 Hub 경로이며, 그 외 명령은 `--cloud`를 거부한다(조용한 PALIMPSEST_TOKEN 대체 금지). 테스트 221 통과, compose 전달·published project_id·게이트 변이 각 1 실패. 실 Keystone·Hub 호출 없음, M4-02는 미체크.
 

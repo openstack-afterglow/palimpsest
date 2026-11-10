@@ -4026,9 +4026,9 @@ that CI never sees).
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "1c28a7b1b88cb7d914be6f30d21e627eddf94972561c89b5677081181e19666c",
-  "reviewed_at": "2026-11-10T13:14:57Z",
-  "summary": "M4-11 shelve delegation policy slice (test-passed)"
+  "source_sha256": "f76cd9053b787f5304d4ec8ffa002af42d1540e145a4a70ef5c389bc03e0b283",
+  "reviewed_at": "2026-11-10T13:16:52Z",
+  "summary": "M4-11 TTL equals grace; rejected trust deleted; owner conflict noted"
 }
 ```
 <!-- architecture-review:end -->

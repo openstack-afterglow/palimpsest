@@ -7878,5 +7878,7 @@ The primary working tree and its local-only commits were removed from `/Users/pi
 
 ### M4-11 shelve delegation policy (2026-11-10, test-passed, M4-11 unchecked)
 - `hub/src/palimpsest_hub/services/shelve_delegation.py`: `ShelveDelegation`. Trust is created or renewed only from the trustor's own request (`renew_on_user_request`); the idle shelve path never mints or renews one. Missing, expired, out-of-scope server, or unopenable trust → `ProviderError`; instance stays up; no service-credential fallback. Keystone trust cannot bind one server, so the Hub refuses other server ids before any Nova call.
-- Limit: TTL is 5-minute grace + 60 s, so a shelve more than the TTL after the last user request fails closed until the user returns (accepted safe direction). No Keystone call, no production route wiring, no live verification.
-- Evidence: `hub/tests/test_shelve_delegation.py` 8 passed; one-server-limit and expiry-check removal mutations each fail.
+- TTL equals the 5-minute grace (approved bound: 'short TTL no longer than the grace period'); a rejected trust is deleted at once.
+- Limit: a shelve more than the TTL after the last user request fails closed until the user returns. **Owner decision (design conflict):** SSH-only sessions never renew the trust, so the automatic shelve path is unreachable in the main flow; choose between the approved short TTL and an instance-lifetime trust.
+- No Keystone call, no production route wiring, no live verification.
+- Evidence: `hub/tests/test_shelve_delegation.py` 9 passed; one-server-limit, expiry-check and rejected-trust-delete removal mutations each fail.
