@@ -4026,9 +4026,9 @@ that CI never sees).
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "e30a5645b0a8df7486bd1deceaec83555d0cbf0cb26f265ad0117d180376d6f0",
-  "reviewed_at": "2026-11-10T08:14:57Z",
-  "summary": "M4-06 readback and M4-08 SDK build_git (merged slices)"
+  "source_sha256": "6b35c6081f542c1609a0cf9ce3173fdf2a9d3961fd79a80feb810f05e553dea1",
+  "reviewed_at": "2026-11-10T11:53:04Z",
+  "summary": "Regenerate CLI reference for git-build and git-job; usage row"
 }
 ```
 <!-- architecture-review:end -->
