@@ -76,6 +76,16 @@ def iso(value):
     return value.replace(tzinfo=UTC).isoformat() if value is not None else None
 
 
+def _git_provenance(row):
+    """The commit a Git-built job was built from; None for every other job."""
+    if row.kind != "dockerfile":
+        return None
+    git = (row.request_json or {}).get("git")
+    if not isinstance(git, dict):
+        return None
+    return {key: git.get(key) for key in ("repo_url", "revision", "context_subdir", "dockerfile_path")}
+
+
 def serialize_job(row, *, worker=False):
     result = row.result_json if row.status == "complete" else None
     # Pre-publication-era completed jobs are historical execution receipts, not
@@ -107,6 +117,7 @@ def serialize_job(row, *, worker=False):
         "request_digest": row.request_digest,
         "output_digests": row.output_digests,
         "published_image_id": published_image_id,
+        "git": None if worker else _git_provenance(row),
         "result": result,
         "error_code": row.error_code,
         "created_at": iso(row.created_at),
