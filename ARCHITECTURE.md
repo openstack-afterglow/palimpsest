@@ -4026,8 +4026,8 @@ that CI never sees).
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "1d116a8f895dcb994193db09cc4e4485c706582d0820e3d873d72bc411e131f8",
-  "reviewed_at": "2026-11-10T05:58:27Z",
+  "source_sha256": "b9f79b9f87aa85414fa89112577ad88e7e9c199064e02d7ff251be95fd9a4ed3",
+  "reviewed_at": "2026-11-10T05:59:45Z",
   "summary": "Stage pinned git revisions as content-addressed build-context blobs (no route yet)"
 }
 ```
