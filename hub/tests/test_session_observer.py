@@ -5,7 +5,12 @@ import asyncio
 import pytest
 
 from palimpsest_hub.services.session_controller import ObservationError, Outcome, SessionController
-from palimpsest_hub.services.session_observer import GUEST_PROBE_COMMAND, WhoSessionObserver, parse_who
+from palimpsest_hub.services.session_observer import (
+    GUEST_PROBE_COMMAND,
+    SSHD_SESSION_PATTERN,
+    WhoSessionObserver,
+    parse_who,
+)
 
 G = 300.0
 IID = "i-1"
@@ -140,3 +145,24 @@ def test_controller_with_failing_who_observer_never_shelves():
     clock.now = G
     assert asyncio.run(controller.tick(IID)) is Outcome.OBSERVATION_FAILED
     assert provider.calls == []
+
+
+def test_real_listener_and_preauth_titles_are_not_sessions():
+    text = _listing(
+        "sshd: /usr/sbin/sshd -D [listener] 0 of 10-100 startups",
+        "sshd: [accepted]",
+        "sshd: ubuntu [priv]",
+    )
+    assert parse_who(text) == set()
+
+
+def test_openssh_9_8_session_title_is_counted():
+    assert parse_who(_listing("sshd-session: ubuntu@notty")) == {"sshd-session: ubuntu@notty"}
+
+
+def test_pty_sshd_session_is_counted():
+    assert parse_who(_listing("sshd: ubuntu@pts/3")) == {"sshd: ubuntu@pts/3"}
+
+
+def test_probe_and_parser_share_one_session_pattern():
+    assert SSHD_SESSION_PATTERN in GUEST_PROBE_COMMAND

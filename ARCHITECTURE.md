@@ -4026,9 +4026,9 @@ that CI never sees).
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "9cd8b79fc977750dc142607a181b88bb86041b4494dcf36bb75fb95a554cdf86",
-  "reviewed_at": "2026-11-10T13:01:36Z",
-  "summary": "who observer protocol docs"
+  "source_sha256": "45ab3fc3afd154f8cd0632eafe3cd86404d2c40be2871903d183092d8f88eeb9",
+  "reviewed_at": "2026-11-10T13:04:02Z",
+  "summary": "who observer: session titles only, canary, sshd-session"
 }
 ```
 <!-- architecture-review:end -->

@@ -8,6 +8,7 @@ empty set: an empty set reads as "no user" and could lead to a shelve.
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import Awaitable, Callable
 
 from palimpsest_hub.services.session_controller import ObservationError
@@ -18,9 +19,16 @@ DEFAULT_TIMEOUT_SECONDS = 10.0
 # OCI root without utmp lists nobody with exit 0); END proves the listing was not truncated.
 UTMP_MARKER = "PALIMPSEST-UTMP-OK"
 END_MARKER = "PALIMPSEST-END"
+# A post-authentication session title: `sshd: user@pts/N|notty` (OpenSSH < 9.8) or
+# `sshd-session: user@pts/N|notty` (OpenSSH >= 9.8). The listener (`sshd: /usr/sbin/sshd -D
+# [listener] ...`) and pre-auth (`sshd: [accepted]`, `sshd: user [priv]`) titles do not match.
+SSHD_SESSION_PATTERN = r"sshd(-session)?: [^ ]+@(pts/[0-9]+|notty)"  # POSIX ERE and Python
+SSHD_SESSION_RE = re.compile(SSHD_SESSION_PATTERN)
 GUEST_PROBE_COMMAND = (
-    "if [ -r /run/utmp ] || [ -r /var/run/utmp ]; then echo PALIMPSEST-UTMP-OK; who; fi; "
-    "ps -eo args= | grep '^sshd: ' | grep -v grep; "
+    "if [ -r /run/utmp ] || [ -r /var/run/utmp ]; then echo PALIMPSEST-UTMP-OK; who || exit 1; fi; "
+    # Canary: the pattern must match a known session line before the listing is trusted.
+    f"printf 'sshd: canary@pts/0\\n' | grep -E '^{SSHD_SESSION_PATTERN}$' >/dev/null || exit 1; "
+    f"ps -eo args= | grep -E '^{SSHD_SESSION_PATTERN}$'; rc=$?; [ $rc -gt 1 ] && exit 1; "
     "echo PALIMPSEST-END"
 )
 
@@ -43,8 +51,9 @@ def parse_who(text: str) -> set[str]:
     for line in lines[:-1]:
         if line == UTMP_MARKER:
             continue
-        if line.startswith("sshd: "):
-            sessions.add(line)
+        if line.startswith("sshd"):
+            if SSHD_SESSION_RE.fullmatch(line):
+                sessions.add(line)
             continue
         if len(line.split(" ")) < 2:
             raise ObservationError("malformed session line")
@@ -76,4 +85,10 @@ class WhoSessionObserver:
         return parse_who(text)
 
 
-__all__ = ["DEFAULT_TIMEOUT_SECONDS", "GUEST_PROBE_COMMAND", "WhoSessionObserver", "parse_who"]
+__all__ = [
+    "DEFAULT_TIMEOUT_SECONDS",
+    "GUEST_PROBE_COMMAND",
+    "SSHD_SESSION_PATTERN",
+    "WhoSessionObserver",
+    "parse_who",
+]
