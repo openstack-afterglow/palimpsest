@@ -369,6 +369,42 @@ def resolve_token() -> str:
     return token
 
 
+# Operations that consume --cloud. Conditional consumers (run, build, compose) use it only when they
+# reach Hub; everything else must reject it so a write never silently falls back to PALIMPSEST_TOKEN.
+_CLOUD_CONSUMERS = frozenset(
+    {
+        ("image", "ls"),
+        ("image", "check"),
+        ("image", "pull"),
+        ("image", "push"),
+        ("image", "git-build"),
+        ("image", "git-job"),
+        ("layer", "ls"),
+        ("layer", "check"),
+        ("layer", "pull"),
+        ("layer", "push"),
+        ("bundle", "pull"),
+        ("bundle", "verify"),
+        ("published", "push"),
+        ("published", "pull"),
+        ("run", None),
+        ("build", None),
+        ("compose", None),
+    }
+)
+
+
+def _reject_unused_cloud(args: argparse.Namespace) -> None:
+    if not getattr(args, "cloud", None):
+        return
+    sub = getattr(args, f"{args.operation}_operation", None)
+    if (args.operation, sub) not in _CLOUD_CONSUMERS:
+        raise PalimpsestError(
+            f"--cloud does not apply to {args.operation}{' ' + sub if sub else ''}; use it with image/layer/bundle/published Hub "
+            "commands, run, build, or compose"
+        )
+
+
 def hub_client(url: str | None, cloud: str | None = None) -> HubClient:
     """Build a Hub client from --cloud (clouds.yaml token and project) or from PALIMPSEST_TOKEN."""
     if cloud:
@@ -417,14 +453,24 @@ def _run_published(args: argparse.Namespace, hub_publish) -> int:
         args.url or os.environ.get("PALIMPSEST_URL") or _configured_url(roots.config) or DEFAULT_HUB_URL
     )
     pulling = args.published_operation == "pull"
-    credential = hub_publish.resolve_credential(
-        os.environ,
-        key_file=args.image_key_file,
-        allow_anonymous=pulling,
-        anonymous=pulling and args.anonymous,
-    )
-    hub_publish.require_secure_transport(hub_url, credential, allow_insecure_http=args.allow_insecure_http)
-    client = credential.client(hub_url)
+    if args.cloud:
+        if getattr(args, "anonymous", False) or args.image_key_file is not None:
+            raise PalimpsestError("--cloud cannot be combined with --anonymous or --image-key-file")
+        from .cloud_cli import hub_credentials
+
+        token, project_id = hub_credentials(args.cloud)
+        credential = hub_publish.HubCredential("keystone", token)
+        hub_publish.require_secure_transport(hub_url, credential, allow_insecure_http=args.allow_insecure_http)
+        client = HubClient(hub_url, token, project_id=project_id)
+    else:
+        credential = hub_publish.resolve_credential(
+            os.environ,
+            key_file=args.image_key_file,
+            allow_anonymous=pulling,
+            anonymous=pulling and args.anonymous,
+        )
+        hub_publish.require_secure_transport(hub_url, credential, allow_insecure_http=args.allow_insecure_http)
+        client = credential.client(hub_url)
     if pulling:
         result = hub_publish.pull_published_image(
             roots, args.image_id, client=client, hub_url=hub_url, expected_name=args.name
@@ -2295,6 +2341,7 @@ def _compose_callbacks(
     roots: StatePaths,
     store: ContentStore,
     explicit_url: str | None,
+    cloud: str | None = None,
 ):
     def resolve_stack(service: ServiceSpec) -> StackRef:
         target: str | Path
@@ -2310,6 +2357,7 @@ def _compose_callbacks(
             service.layers,
             explicit_url,
             preflight_for_run=True,
+            cloud=cloud,
         )
 
     return build_project_callbacks(project, roots, resolve_stack, environment=environment)
@@ -2403,7 +2451,7 @@ def _dispatch_compose(
             sys.stdout.write(canonical_project_json(project))
         return 0
 
-    callbacks = _compose_callbacks(project, environment, roots, store, args.url)
+    callbacks = _compose_callbacks(project, environment, roots, store, args.url, cloud=args.cloud)
     if operation == "up":
         result = up_project(
             project,
@@ -3992,6 +4040,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.operation == "run":
             args.command_override = command_override
         _validate_args(args, parser)
+        _reject_unused_cloud(args)
         if (
             args.operation == "completion"
             or args.operation == "cloud"

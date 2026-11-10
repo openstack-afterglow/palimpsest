@@ -4026,9 +4026,9 @@ that CI never sees).
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "68ae868702d5d2ad429041481b70b94c925d5ceab3e8fbfbd227aabd4ccd3260",
-  "reviewed_at": "2026-11-10T12:09:39Z",
-  "summary": "Hub cloud auth via clouds.yaml (M4-02 CPU slice)"
+  "source_sha256": "da661a0266ba36e47ffa216b4b55ec5256e0f973df428f3ae21688426541fb28",
+  "reviewed_at": "2026-11-10T12:15:50Z",
+  "summary": "--cloud: fail-closed gate, compose and published honored (M4-02 slice)"
 }
 ```
 <!-- architecture-review:end -->

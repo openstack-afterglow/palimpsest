@@ -25,7 +25,7 @@
 
 ### 재개용 실행 기록
 
-**2026-11-10 M4-02 Hub cloud auth slice (test-passed, 미체크):** 최상위 `--cloud NAME`이 clouds.yaml의 Keystone 토큰과 `current_project_id`로 Hub를 호출하고 `X-Project-Id`를 보낸다(`cloud_cli.hub_credentials`, `cli.hub_client`). 적용 범위는 image/layer/run의 Hub 직접 경로이며, 프로젝트 compose 콜백은 아직 `PALIMPSEST_TOKEN`을 쓴다. 테스트 218 통과, project_id 누락 변이 1 실패. 실 Keystone·Hub 호출 없음, M4-02는 미체크.
+**2026-11-10 M4-02 Hub cloud auth slice (test-passed, 미체크):** 최상위 `--cloud NAME`이 clouds.yaml의 Keystone 토큰과 `current_project_id`로 Hub를 호출하고 `X-Project-Id`를 보낸다(`cloud_cli.hub_credentials`, `cli.hub_client`). 적용 범위는 image/layer/bundle, published push|pull, run/build/compose의 Hub 경로이며, 그 외 명령은 `--cloud`를 거부한다(조용한 PALIMPSEST_TOKEN 대체 금지). 테스트 221 통과, compose 전달·published project_id·게이트 변이 각 1 실패. 실 Keystone·Hub 호출 없음, M4-02는 미체크.
 
 **2026-11-10 M4-08 CLI slice (test-passed, 미체크):** `palimpsest image git-build`(고정 SHA 요청, `--request-id`는 Hub 호출 전 UUID 검사)과 `palimpsest image git-job <id>`(빌드 커밋 조회)를 추가했다. 계약 테스트 3개 + `tests/unit/test_cli_contract.py` 207개 통과, `revision` 누락 변이 1 실패. 실 Hub 실행 없음, M4-08은 여전히 미체크(생성·상태·로그·SSH·보존·재개·삭제 계약 전체 미구현).
 

@@ -36,8 +36,8 @@ files_modified:
 
 ### M4-02 Hub cloud auth slice (2026-11-10, test-passed, M4-02 unchecked)
 - `--cloud NAME` (top-level) and `hub_credentials` in `cloud_cli.py` take a Keystone token and `current_project_id` from the clouds.yaml cloud and pass both to `HubClient(project_id=...)`, which sends `X-Project-Id`.
-- Covered: Hub-direct commands and `_resolve_image_ref` / `_resolve_runtime_stack` from `image`, `layer`, `run`. Not covered: project compose callbacks (`_compose_callbacks`), which still use `PALIMPSEST_TOKEN`.
-- Evidence: `tests/unit/test_cli_contract.py` 218 passed (3 new cloud tests); mutation dropping `project_id` fails. No live Hub or Keystone call was made.
+- Covered: Hub-direct `image`/`layer`/`bundle` commands, `published push|pull` (Keystone token plus `HubClient(project_id=...)`), and `run`/`build`/`compose` when they reach Hub. `--cloud` on any other operation fails closed (`_reject_unused_cloud`), so no write falls back to `PALIMPSEST_TOKEN` silently.
+- Evidence: `test_cli_contract.py` 221 passed (cloud, published, compose-forwarding, gate tests); mutations dropping compose forwarding, the published `project_id`, and the gate each fail.
 
 ## Reader/member/manager priority cutover — 2026-11-06, source264 in progress
 

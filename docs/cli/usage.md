@@ -11,7 +11,7 @@ palimpsest completion bash
 ```
 
 `--url` is a global Hub URL override. Hub commands resolve the URL in this order: `--url`, `PALIMPSEST_URL`, then `config.toml` (`url` or `[hub].url`). They require `PALIMPSEST_TOKEN`; do not put tokens in examples or configuration committed to source control. Registry wrapper commands reuse Docker's existing config and credential directory: `DOCKER_CONFIG` when set, otherwise `$HOME/.docker`.
-`--cloud NAME` authenticates Hub commands with the Keystone token and project of that `clouds.yaml` cloud instead of `PALIMPSEST_TOKEN`; the project ID is sent as `X-Project-Id` so Hub does not fall back to the user's default project. Project compose and `run` paths that resolve Hub images through project callbacks still use `PALIMPSEST_TOKEN` in this slice.
+`--cloud NAME` authenticates Hub commands with the Keystone token and project of that `clouds.yaml` cloud instead of `PALIMPSEST_TOKEN`; the project ID is sent as `X-Project-Id` so Hub does not fall back to the user's default project. `--cloud` applies to `image`/`layer`/`bundle` Hub commands, `published push|pull`, and `run`/`build`/`compose` when they reach Hub. Other commands reject it instead of ignoring it, so a write never silently falls back to `PALIMPSEST_TOKEN`. `--cloud` cannot be combined with `--anonymous` or `--image-key-file`.
 
 Options are parsed in the command position shown in the reference. `palimpsest docker ...` is special: everything after `docker` is passed to the Docker CLI. `palimpsest __complete` is an internal completion protocol, not a public command.
 

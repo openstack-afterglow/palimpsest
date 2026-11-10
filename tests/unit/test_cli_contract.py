@@ -1593,7 +1593,9 @@ def test_cli_compose_ps_aligns_long_names_and_preserves_json(
         ),
         ProjectServiceStatus("db", "db", "stopped"),
     )
-    monkeypatch.setattr(cli, "_compose_callbacks", lambda *_args: SimpleNamespace(inspect=lambda _name: None))
+    monkeypatch.setattr(
+        cli, "_compose_callbacks", lambda *_args, **_kwargs: SimpleNamespace(inspect=lambda _name: None)
+    )
     monkeypatch.setattr(cli, "project_ps", lambda *_args, **_kwargs: rows)
     argv = ["compose", "--project-directory", str(tmp_path), "ps"]
 
@@ -3209,3 +3211,54 @@ def test_hub_credentials_refuses_a_cloud_without_a_project(monkeypatch: pytest.M
     monkeypatch.setattr(cloud_cli, "_connect", lambda cloud: _NoProject())
     with pytest.raises(PalimpsestError):
         cloud_cli.hub_credentials("dms")
+
+
+def test_cloud_flag_is_refused_on_commands_that_never_contact_hub(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("PALIMPSEST_URL", "http://localhost:8080")
+    monkeypatch.setattr(
+        "palimpsest_local.cloud_cli.hub_credentials",
+        lambda cloud: pytest.fail("cloud credentials used for a non-Hub command"),
+    )
+    assert cli.main(["--cloud", "dms", "ps"]) != 0
+
+
+def test_published_push_with_cloud_uses_the_keystone_token_and_project(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    monkeypatch.setenv("PALIMPSEST_URL", "https://hub.example")
+    monkeypatch.setenv("PALIMPSEST_TOKEN", "env-token-must-not-be-used")
+    monkeypatch.delenv("PALIMPSEST_IMAGE_KEY", raising=False)
+    monkeypatch.setattr("palimpsest_local.cloud_cli.hub_credentials", lambda cloud: ("cloud-token", "project-uuid-9"))
+    seen = {}
+
+    def fake_publish(roots, image_id, *, client, **kwargs):
+        seen["token"] = client._token
+        seen["project_id"] = client._project_id
+        return {"status": "published"}
+
+    monkeypatch.setattr("palimpsest_local.hub_publish.publish_local_image", fake_publish)
+    rc = cli.main(
+        ["--cloud", "dms", "published", "push", "sha256:" + "a" * 64, "--name", "demo", "--state-root", str(tmp_path)]
+    )
+    assert rc == 0
+    assert seen == {"token": "cloud-token", "project_id": "project-uuid-9"}
+
+
+def test_compose_stack_resolution_forwards_cloud_to_hub_image_lookup(monkeypatch: pytest.MonkeyPatch):
+    from types import SimpleNamespace
+
+    captured = {}
+
+    def fake_build_project_callbacks(project, roots, resolve_stack, environment):
+        captured["resolve_stack"] = resolve_stack
+        return SimpleNamespace()
+
+    def fake_resolve_runtime_stack(store, target, layers, explicit_url, **kwargs):
+        captured["kwargs"] = kwargs
+        captured["explicit_url"] = explicit_url
+        return SimpleNamespace()
+
+    monkeypatch.setattr(cli, "build_project_callbacks", fake_build_project_callbacks)
+    monkeypatch.setattr(cli, "_resolve_runtime_stack", fake_resolve_runtime_stack)
+    cli._compose_callbacks(None, {}, None, None, "https://hub.example", cloud="dms")
+    captured["resolve_stack"](SimpleNamespace(name="svc", bundle=None, image="sha256:" + "b" * 64, layers=()))
+    assert captured["kwargs"]["cloud"] == "dms"
+    assert captured["explicit_url"] == "https://hub.example"
