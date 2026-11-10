@@ -4026,9 +4026,9 @@ that CI never sees).
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "1e8c9e340e361ec3939c747846e3925deee1b449bf0d73328e6d0424843d8c7b",
-  "reviewed_at": "2026-11-10T07:10:35Z",
-  "summary": "Route /v1/git-builds through execution-path no-store; record CPU slices in handoff"
+  "source_sha256": "5bc1c113f945354c006a46d590b6828969fc846c99996e4df5c9af828f318219",
+  "reviewed_at": "2026-11-10T07:59:38Z",
+  "summary": "Add HubClient.build_git for the pinned git-builds contract"
 }
 ```
 <!-- architecture-review:end -->
