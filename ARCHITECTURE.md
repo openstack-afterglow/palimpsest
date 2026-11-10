@@ -4026,9 +4026,9 @@ that CI never sees).
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "beef16f11396f6d6c349b95b90ebe85d824582c43dcc708f44403f4e2eb3ff68",
-  "reviewed_at": "2026-11-10T06:52:01Z",
-  "summary": "Enforce worker extract limits at staging; drop Dockerfile context refusals; round-trip contract test"
+  "source_sha256": "6222cbc062b14dc24f9419cd876163abb9f873cc36ae37cfaf40ab6f3282d794",
+  "reviewed_at": "2026-11-10T06:54:16Z",
+  "summary": "Contain dockerfile_path by resolved location; check symlinked directories in tree scan"
 }
 ```
 <!-- architecture-review:end -->

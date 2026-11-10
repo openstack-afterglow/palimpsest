@@ -115,6 +115,12 @@ def validate(
     return PinnedSource(request.repo_url, host, port, addresses[0], request.revision)
 
 
+def _refuse_escaping_link(path: Path, root: Path, base: Path) -> None:
+    target = (path.parent / os.readlink(path)).resolve()
+    if base != target and base not in target.parents:
+        raise GitSourceError("symlink", f"{path.relative_to(root)} points outside the checkout")
+
+
 def check_tree(root: Path, *, max_bytes: int = MAX_BYTES, max_files: int = MAX_FILES) -> tuple[int, int]:
     """Enforce size and file-count caps and refuse symlinks that escape the checkout."""
     total = files = 0
@@ -122,12 +128,15 @@ def check_tree(root: Path, *, max_bytes: int = MAX_BYTES, max_files: int = MAX_F
     for current, dirs, names in os.walk(root, followlinks=False):
         if ".git" in dirs:
             dirs.remove(".git")
+        # os.walk lists symlinks to directories under `dirs` and never descends them, so check both.
+        for name in dirs:
+            path = Path(current, name)
+            if path.is_symlink():
+                _refuse_escaping_link(path, root, base)
         for name in names:
             path = Path(current, name)
             if path.is_symlink():
-                target = (path.parent / os.readlink(path)).resolve()
-                if base != target and base not in target.parents:
-                    raise GitSourceError("symlink", f"{path.relative_to(root)} points outside the checkout")
+                _refuse_escaping_link(path, root, base)
                 continue
             files += 1
             total += path.stat().st_size

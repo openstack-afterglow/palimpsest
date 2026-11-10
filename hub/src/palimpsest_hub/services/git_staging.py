@@ -89,6 +89,9 @@ def _check_dockerfile(checkout: Path, dockerfile_path: str) -> None:
     path = checkout / dockerfile_path
     if path.is_symlink() or not path.is_file():
         raise GitSourceError("dockerfile", "dockerfile_path must be a regular file in the checkout")
+    # A symlinked parent directory can point outside the checkout; check the resolved location.
+    if not path.resolve(strict=True).is_relative_to(checkout.resolve(strict=True)):
+        raise GitSourceError("dockerfile", "dockerfile_path resolves outside the checkout")
 
 
 def _read_dockerignore(context: Path) -> list[str]:

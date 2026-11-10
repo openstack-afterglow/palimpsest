@@ -253,7 +253,8 @@ async def test_a_context_subdir_symlink_out_of_the_checkout_is_refused(store, he
     runner = Runner(links={"app": "/etc"})
     with pytest.raises(GitSourceError) as info:
         await _stage(store, runner, context_subdir="app")
-    assert info.value.code == "context"
+    # fetch-time check_tree refuses the escaping symlink before the context check runs
+    assert info.value.code == "symlink"
     assert scratch_dirs(store) == []
 
 
@@ -360,3 +361,19 @@ async def test_a_context_over_the_worker_expanded_byte_limit_is_refused(store, h
             runner=Runner(),
         )
     assert info.value.code == "context"
+
+
+def test_a_dockerfile_reached_through_a_symlinked_directory_outside_the_checkout_is_refused(tmp_path):
+    import os
+
+    from palimpsest_hub.services.git_staging import _check_dockerfile
+
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "Dockerfile").write_text("FROM scratch\n")
+    os.symlink(outside, checkout / "d")
+    with pytest.raises(GitSourceError) as info:
+        _check_dockerfile(checkout, "d/Dockerfile")
+    assert info.value.code == "dockerfile"
