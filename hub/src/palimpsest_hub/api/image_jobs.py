@@ -18,6 +18,7 @@ from palimpsest_hub.image_models import PalimpsestHubImageJob
 from palimpsest_hub.models import exact_identity
 from palimpsest_hub.services import image_jobs as service
 from palimpsest_hub.services.digest import normalize_digest
+from palimpsest_hub.services.git_source import GitBuildRequest
 
 router = APIRouter()
 
@@ -207,6 +208,28 @@ async def dockerfile_build(request: Request, token_info: dict = Depends(_legacy_
     if len(req.dockerfile.encode()) > 1024 * 1024:
         raise HTTPException(status_code=413, detail="Dockerfile exceeds byte limit")
     return service.serialize_job(await service.admit("dockerfile", req.model_dump(mode="json"), token_info))
+
+
+class GitDockerfileBuildRequest(GitBuildRequest):
+    """A pinned Git checkout plus the image declarations a Dockerfile job needs."""
+
+    request_id: UUID
+    name: str = Field(pattern=r"^[a-z0-9][a-z0-9.+-]{0,63}$")
+    os_family: str = Field(min_length=1, max_length=128)
+    os_version: str = Field(min_length=1, max_length=128)
+    metadata: dict = Field(default_factory=dict)
+    visibility: Literal["private", "internal", "public"] = "private"
+
+
+@router.post(
+    "/git-builds",
+    status_code=202,
+    operation_id="create_git_dockerfile_build",
+    openapi_extra=request_body(GitDockerfileBuildRequest),
+)
+async def git_dockerfile_build(request: Request, token_info: dict = Depends(_legacy_writer)):
+    req = await bounded_json(request, GitDockerfileBuildRequest, 64 * 1024)
+    return service.serialize_job(await service.admit_git_dockerfile(req, token_info))
 
 
 @router.get("/image-jobs", operation_id="list_image_jobs")

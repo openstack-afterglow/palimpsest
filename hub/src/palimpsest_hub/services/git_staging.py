@@ -48,6 +48,7 @@ class StagedGitContext:
     revision: str
     host: str
     dockerfile: str  # path inside the blob, relative to the build context
+    dockerfile_text: str  # the Dockerfile body, sent inline to the image job
 
 
 def _real_dir_inside(checkout: Path, rel: str) -> Path:
@@ -78,6 +79,19 @@ def _read_dockerignore(context: Path) -> list[str]:
         raise ContextError(".dockerignore is not valid UTF-8") from None
 
 
+MAX_DOCKERFILE_BYTES = 1024 * 1024
+
+
+def _read_dockerfile(checkout: Path, dockerfile_path: str) -> str:
+    path = checkout / dockerfile_path
+    if path.stat().st_size > MAX_DOCKERFILE_BYTES:
+        raise GitSourceError("dockerfile", "Dockerfile exceeds the byte limit")
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        raise GitSourceError("dockerfile", "Dockerfile is not valid UTF-8") from None
+
+
 def _pack(context: Path, out: Path, dockerfile: str) -> tuple[str, int]:
     ignore = _read_dockerignore(context)
     with out.open("wb") as handle:
@@ -96,20 +110,23 @@ async def stage_git_context(
     store: LocalPathBlobStore,
     max_context_bytes: int,
     resolver: Callable[[str, int], list[str]] = default_resolver,
-    runner=subprocess.run,
+    runner=None,
 ) -> StagedGitContext:
     hosts = tuple(allowed_hosts)
     if not hosts:
         raise GitStagingUnavailable("git staging has no allow-listed hosts")
     if request.credential_ref is not None:
         raise GitSourceError("credential", "credential_ref is not supported yet; refusing to fetch anonymously")
+    run = subprocess.run if runner is None else runner  # looked up at call time, not import time
     pinned = await run_blocking(git_source.validate, request, hosts, resolver=resolver)
+    await run_blocking(lambda: store.uploads_dir.mkdir(parents=True, exist_ok=True))
     scratch = Path(await run_blocking(tempfile.mkdtemp, prefix="gitctx-", dir=store.uploads_dir))
     try:
         checkout = scratch / "src"
-        await run_blocking(git_source.fetch, pinned, checkout, runner=runner)
+        await run_blocking(git_source.fetch, pinned, checkout, runner=run)
         context = await run_blocking(_real_dir_inside, checkout, request.context_subdir)
         dockerfile = await run_blocking(_check_dockerfile, checkout, context, request.dockerfile_path)
+        dockerfile_text = await run_blocking(_read_dockerfile, checkout, request.dockerfile_path)
         tar_path = scratch / "context.tar"
         digest, entries = await run_blocking(_pack, context, tar_path, dockerfile)
         finalized = await run_blocking(store.promote_file, tar_path, max_bytes=max_context_bytes)
@@ -122,6 +139,7 @@ async def stage_git_context(
             revision=pinned.revision,
             host=pinned.host,
             dockerfile=dockerfile,
+            dockerfile_text=dockerfile_text,
         )
     finally:
         await run_blocking(shutil.rmtree, scratch, True)

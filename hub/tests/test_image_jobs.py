@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import io
 import os
+import subprocess
 import tarfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -29,6 +30,7 @@ from palimpsest_hub.models import (
     PalimpsestHubLayerAccess,
     RuntimeBlobReference,
 )
+from palimpsest_hub.services import git_source
 from palimpsest_hub.services import image_jobs as service
 from palimpsest_hub.services import published_images as publications
 from palimpsest_hub.services.blob_references import blob_referenced
@@ -75,6 +77,7 @@ async def images(tmp_path, monkeypatch):
         palimpsest_hub_max_context_bytes=16 * 1024 * 1024,
         palimpsest_hub_max_context_expanded_bytes=256 * 1024 * 1024,
         palimpsest_hub_max_context_members=10000,
+        palimpsest_hub_git_allowed_hosts=(),
     )
     monkeypatch.setattr(hub, "get_session_factory", lambda: factory)
     monkeypatch.setattr(hub, "get_blob_store", lambda: store)
@@ -2175,3 +2178,95 @@ async def test_rel312_admin_target_publication_revalidates_original_token_scope(
     async with images.factory() as session:
         [row] = (await session.scalars(select(publications.PalimpsestHubPublishedImage))).all()
     assert row.project_id == "beta"
+
+
+GIT_SHA = "a" * 40
+GIT_URL = "https://github.com/o/r.git"
+
+
+def git_body(**extra):
+    body = {
+        "repo_url": GIT_URL,
+        "revision": GIT_SHA,
+        "dockerfile_path": "Dockerfile",
+        "context_subdir": ".",
+        "request_id": str(uuid4()),
+        "name": "git-app",
+        "os_family": "alpine",
+        "os_version": "3",
+    }
+    body.update(extra)
+    return body
+
+
+class FakeGit:
+    """Stands in for the git binary at the process boundary; every call is recorded."""
+
+    def __init__(self, files, head=GIT_SHA):
+        self.files = files
+        self.head = head
+        self.calls = []
+
+    def __call__(self, args, cwd=None, **_):
+        self.calls.append(list(args))
+        if args[1:2] == ["init"]:
+            (cwd / ".git").mkdir()
+        if "checkout" in args:
+            for rel, text in self.files.items():
+                target = cwd / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(text)
+        out = self.head + "\n" if args[1:3] == ["rev-parse", "HEAD"] else ""
+        return subprocess.CompletedProcess(args, 0, out, "")
+
+
+def public_dns(monkeypatch):
+    monkeypatch.setattr(
+        git_source.socket, "getaddrinfo", lambda host, port, **_: [(2, 1, 6, "", ("140.82.112.3", 443))]
+    )
+
+
+@pytest.mark.asyncio
+async def test_git_builds_stay_off_until_the_operator_allow_lists_a_host(images, monkeypatch):
+    fake = FakeGit({"Dockerfile": "FROM scratch\n"})
+    monkeypatch.setattr(git_source.subprocess, "run", fake)
+    response = await images.client.post("/v1/git-builds", headers=HUMAN, json=git_body())
+    assert response.status_code == 503
+    assert fake.calls == []
+    async with images.factory() as session:
+        assert (await session.scalars(select(PalimpsestHubImageJob))).all() == []
+        assert (await session.scalars(select(PalimpsestHubBuildContext))).all() == []
+
+
+@pytest.mark.asyncio
+async def test_a_pinned_git_checkout_registers_an_owned_context_and_admits_its_dockerfile(images, monkeypatch):
+    images.settings.palimpsest_hub_git_allowed_hosts = ("github.com",)
+    public_dns(monkeypatch)
+    fake = FakeGit({"Dockerfile": "FROM scratch\nCOPY main.py /main.py\n", "main.py": "print('hi')\n"})
+    monkeypatch.setattr(git_source.subprocess, "run", fake)
+    response = await images.client.post("/v1/git-builds", headers=HUMAN, json=git_body())
+    assert response.status_code == 202, response.text
+    async with images.factory() as session:
+        job = (await session.scalars(select(PalimpsestHubImageJob))).one()
+        context = (await session.scalars(select(PalimpsestHubBuildContext))).one()
+    assert job.kind == "dockerfile"
+    assert job.context_digest == context.digest
+    assert context.project_id == "alpha"
+    assert context.created_by == "caller"
+    assert images.store.exists(context.digest)
+    assert job.request_json["dockerfile"] == "FROM scratch\nCOPY main.py /main.py\n"
+
+
+@pytest.mark.asyncio
+async def test_a_git_host_outside_the_allow_list_is_refused_before_any_context_or_job(images, monkeypatch):
+    images.settings.palimpsest_hub_git_allowed_hosts = ("gitlab.example",)
+    public_dns(monkeypatch)
+    fake = FakeGit({"Dockerfile": "FROM scratch\n"})
+    monkeypatch.setattr(git_source.subprocess, "run", fake)
+    response = await images.client.post("/v1/git-builds", headers=HUMAN, json=git_body())
+    assert response.status_code == 422
+    assert "host-not-allowed" in response.text
+    assert fake.calls == []
+    async with images.factory() as session:
+        assert (await session.scalars(select(PalimpsestHubImageJob))).all() == []
+        assert (await session.scalars(select(PalimpsestHubBuildContext))).all() == []

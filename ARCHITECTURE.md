@@ -4026,9 +4026,9 @@ that CI never sees).
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "32b74b23058d7ccfe5d11aead56951c6e2633f4249e4a96bd9159554115f08f0",
-  "reviewed_at": "2026-11-10T06:03:59Z",
-  "summary": "Refuse dockerignore that removes the Dockerfile; report context-relative Dockerfile"
+  "source_sha256": "d2ed70d575fae0ea474440756a4abc73ab899b1535214845514e1086d6c17d48",
+  "reviewed_at": "2026-11-10T06:18:33Z",
+  "summary": "Add POST /v1/git-builds: stage pinned checkout, register owned context, admit dockerfile job"
 }
 ```
 <!-- architecture-review:end -->

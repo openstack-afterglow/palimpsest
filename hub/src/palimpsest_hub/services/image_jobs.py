@@ -41,6 +41,8 @@ from palimpsest_hub.models import exact_identity
 from palimpsest_hub.services import claim_recovery
 from palimpsest_hub.services.blob_references import retain_blob
 from palimpsest_hub.services.digest import compute_config_digest
+from palimpsest_hub.services.git_source import GitSourceError
+from palimpsest_hub.services.git_staging import GitStagingUnavailable, stage_git_context
 from palimpsest_hub.services.hub_store import HubStoreError
 from palimpsest_hub.services.published_images import IMAGE_MUTEX
 from palimpsest_hub.services.worker_leases import sql_mutex
@@ -515,6 +517,37 @@ async def receive(store, request, digest, size, deadline, *, context=False, squa
 _receive = asynccontextmanager(receive)
 
 
+async def register_context_blob(store, token_info, project, digest, size, *, created):
+    """Record ownership of a verified context blob; discard it again if registration never committed."""
+    commit_started = False
+    try:
+        async with sql_mutex(_factory_or_503(), "build-api:image:project:" + project) as session:
+            context = await session.get(
+                PalimpsestHubBuildContext,
+                {"project_id": project, "digest": digest, "created_by": token_info["user_id"]},
+            )
+            if context is not None and (
+                context.project_id != project
+                or context.created_by != token_info["user_id"]
+                or context.size_bytes != size
+            ):
+                raise HTTPException(status_code=409, detail="build context descriptor conflicts")
+            await fresh_writer(token_info)
+            if context is None:
+                session.add(
+                    PalimpsestHubBuildContext(
+                        project_id=project, digest=digest, size_bytes=size, created_by=token_info["user_id"]
+                    )
+                )
+            await retain_blob(session, digest, "context", digest)
+            commit_started = True
+            await session.commit()
+    except BaseException:
+        if created and not commit_started:
+            await _discard_unregistered_blob(store, _factory_or_503(), digest)
+        raise
+
+
 async def upload_context(request, token_info, digest, size):
     store = _store_or_503()
     project = package_target_project_id(token_info)
@@ -524,34 +557,45 @@ async def upload_context(request, token_info, digest, size):
         _locked_blob(store, digest),
     ):
         created = await _run_blocking(store.publish_verified, path, verified)
-        commit_started = False
-        try:
-            async with sql_mutex(_factory_or_503(), "build-api:image:project:" + project) as session:
-                context = await session.get(
-                    PalimpsestHubBuildContext,
-                    {"project_id": project, "digest": digest, "created_by": token_info["user_id"]},
-                )
-                if context is not None and (
-                    context.project_id != project
-                    or context.created_by != token_info["user_id"]
-                    or context.size_bytes != size
-                ):
-                    raise HTTPException(status_code=409, detail="build context descriptor conflicts")
-                await fresh_writer(token_info)
-                if context is None:
-                    session.add(
-                        PalimpsestHubBuildContext(
-                            project_id=project, digest=digest, size_bytes=size, created_by=token_info["user_id"]
-                        )
-                    )
-                await retain_blob(session, digest, "context", digest)
-                commit_started = True
-                await session.commit()
-        except BaseException:
-            if created and not commit_started:
-                await _discard_unregistered_blob(store, _factory_or_503(), digest)
-            raise
+        await register_context_blob(store, token_info, project, digest, size, created=created)
     return {"digest": digest, "size_bytes": size}
+
+
+async def admit_git_dockerfile(req, token_info):
+    """Stage a pinned Git checkout as an owned context, then admit a Dockerfile job for it."""
+    settings = get_settings()
+    store = _store_or_503()
+    project = package_target_project_id(token_info)
+    try:
+        staged = await stage_git_context(
+            req,
+            allowed_hosts=settings.palimpsest_hub_git_allowed_hosts,
+            store=store,
+            max_context_bytes=settings.palimpsest_hub_max_context_bytes,
+        )
+    except GitStagingUnavailable:
+        raise HTTPException(status_code=503, detail="git builds are not enabled on this Hub") from None
+    except GitSourceError as exc:
+        raise HTTPException(status_code=422, detail=f"git source rejected: {exc.code}") from None
+    except HubStoreError:
+        raise HTTPException(status_code=422, detail="build context exceeds the byte limit") from None
+    async with (
+        _locked_file(store, lambda: store.acquire_package_lock("image-context:" + project, blocking=False)),
+        _locked_blob(store, staged.blob_digest),
+    ):
+        await register_context_blob(store, token_info, project, staged.blob_digest, staged.size_bytes, created=True)
+    payload = {
+        "request_id": str(req.request_id),
+        "name": req.name,
+        "dockerfile": staged.dockerfile_text,
+        "context_digest": staged.blob_digest,
+        "platform": "linux/amd64",
+        "os_family": req.os_family,
+        "os_version": req.os_version,
+        "metadata": req.metadata,
+        "visibility": req.visibility,
+    }
+    return await admit("dockerfile", payload, token_info)
 
 
 @asynccontextmanager

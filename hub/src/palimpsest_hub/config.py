@@ -242,6 +242,8 @@ class Settings(DatabaseSettings):
     palimpsest_hub_max_context_bytes: int = Field(default=16 * 1024**2, ge=1, le=1024**3)
     palimpsest_hub_max_context_expanded_bytes: int = Field(default=256 * 1024**2, ge=1, le=32 * 1024**3)
     palimpsest_hub_max_context_members: int = Field(default=10000, ge=1, le=250000)
+    # Operator allow-list for Git staging; empty means the Git route is off and contacts nothing.
+    palimpsest_hub_git_allowed_hosts: tuple[str, ...] = ()
     palimpsest_hub_instance_bootstrap_ttl_seconds: int = Field(default=3600, ge=60, le=86400)
     palimpsest_hub_max_instances_per_project: int = Field(default=16, ge=1, le=1000)
     palimpsest_hub_instance_max_boot_gib: int = Field(default=256, ge=1, le=4096)
