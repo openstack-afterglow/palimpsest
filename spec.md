@@ -25,6 +25,8 @@
 
 ### 재개용 실행 기록
 
+**2026-11-10 M4-06 출처 조회 slice (test-passed, 미체크):** `GET /v1/image-jobs[/{id}]` 응답에 `git` 필드(repo_url, 고정 revision, context_subdir, dockerfile_path)를 추가했다(Git 빌드 작업만 값, 그 외와 worker 응답은 null). 테스트 `test_a_git_build_job_reads_back_the_commit_it_was_built_from`: 수정 전 `KeyError: 'git'`로 실패, 수정 후 통과. 변이(projection 제거 → 1 실패, 원복 후 통과), 관련 197개 통과. 빌드 결과·게시 이미지·인스턴스 연결·실패 로그 조회 전체 M4-06 체크는 아직 아님.
+
 **2026-11-10 경로 탈출 수정 (test-passed):** 리뷰 지적으로 확인: `_check_dockerfile`이 마지막 경로 요소만 보아 `d -> /etc`(컨텍스트 밖 symlink 디렉터리) 아래의 `dockerfile_path`를 읽을 수 있었다. 해결: (1) `dockerfile_path`의 resolve 결과가 체크아웃 안이어야 한다, (2) `check_tree`가 `os.walk`의 `dirs`에 든 symlink 디렉터리도 검사한다(`os.walk`는 symlink 디렉터리를 `names`가 아닌 `dirs`로 나열하고 내려가지 않는다). 테스트 3개 추가, 변이 2건(Dockerfile 포함 검사 제거 → 1 실패, 디렉터리 symlink 검사 제거 → 2 실패), 관련 244개 통과. PR #60에 포함하여 병합 전 재검토 대상이다.
 
 **2026-11-10 정정 (Dockerfile 거부 규칙 폐기):** 워커는 요청의 `dockerfile` 본문을 `definition/Dockerfile`에 직접 쓰고 컨텍스트의 Dockerfile을 읽지 않는다(`src/palimpsest_local/hub_image_builder.py`). 따라서 "`.dockerignore`가 Dockerfile을 제외하면 거부"와 "`dockerfile_path`가 컨텍스트 안이어야 함"은 근거 없는 과잉 차단이었고 제거했다. 남은 조건은 `dockerfile_path`가 체크아웃 안의 일반 파일이라는 것뿐이다. 같은 날 추가: 스테이징이 워커의 `extract_context` 한도(멤버 수 `max_context_members`, 펼친 바이트 합 `max_context_expanded_bytes`)를 422로 미리 거부하고, 백슬래시 또는 4096바이트 초과 이름도 거부한다. `write_context_tar` 출력을 실제 `extract_context`에 넣어 트리(디렉터리·모드·symlink·내용)가 같음을 확인하는 왕복 테스트를 추가했다. 변이 2건(멤버 한도 제거 → 2 실패, 백슬래시 거부 제거 → 1 실패), 관련 테스트 241개 통과.

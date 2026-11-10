@@ -2362,3 +2362,21 @@ async def test_a_request_id_reused_for_another_commit_is_refused_before_any_fetc
     )
     assert other.status_code == 409
     assert len(fake.calls) == calls_after_first
+
+
+@pytest.mark.asyncio
+async def test_a_git_build_job_reads_back_the_commit_it_was_built_from(images, monkeypatch):
+    images.settings.palimpsest_hub_git_allowed_hosts = ("github.com",)
+    public_dns(monkeypatch)
+    fake = FakeGit({"Dockerfile": "FROM scratch\nCOPY main.py /main.py\n", "main.py": "print('hi')\n"})
+    monkeypatch.setattr(git_source.subprocess, "run", fake)
+    created = await images.client.post("/v1/git-builds", headers=HUMAN, json=git_body())
+    assert created.status_code == 202, created.text
+    readback = await images.client.get(f"/v1/image-jobs/{created.json()['id']}", headers=HUMAN)
+    assert readback.status_code == 200, readback.text
+    assert readback.json()["git"] == {
+        "repo_url": GIT_URL,
+        "revision": GIT_SHA,
+        "context_subdir": ".",
+        "dockerfile_path": "Dockerfile",
+    }
