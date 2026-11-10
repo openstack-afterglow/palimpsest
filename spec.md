@@ -25,6 +25,8 @@
 
 ### 재개용 실행 기록
 
+**2026-11-10 M4-05 결정적 build-context tar (test-passed, 미체크):** `services/git_context.py`의 `write_context_tar`는 검증된 checkout을 같은 트리면 같은 바이트·sha256이 나오는 tar로 만든다(정렬, mtime·uid·gid 0, 모드 0644/0755, symlink는 따라가지 않고 저장, 밖을 가리키는 symlink·FIFO·장치 거부, `.dockerignore`의 정확 일치·glob·디렉터리 접두 규칙, 부정(`!`)과 `..` 규칙은 거부). `hub/tests/test_git_context.py` 14개 통과, 변이 2건(symlink 탈출 검사 제거 → 2 실패, mtime 0 고정 제거 → 1 실패) 확인. 아직 라우트·stage 함수·SSRF 경계 연결과 워커 Dockerfile 빌드는 없어 M4-05는 체크하지 않는다. PR #57(#56 이후 Nova provider) 위에 쌓은 스택 PR이다.
+
 **2026-11-10 M4-10 Nova provider (test-passed, 미체크):** PR #56(`50e5891`) 병합 후 `services/nova_shelve_provider.py`의 `NovaShelveProvider`가 `ShelveProvider` 포트를 구현한다. 주입된 Nova 연결만 쓰고 자격증명은 고르지 않는다(M4-11). shelve는 SHELVED_OFFLOADED에서만 성공 확인, 이미 offload된 서버는 두 번째 shelve 없이 성공, 그 밖의 상태는 거부, SDK 오류·타임아웃은 SDK 메시지 없이 ProviderError. 모든 SDK 호출은 `run_blocking`. `hub/tests/test_nova_shelve_provider.py` 12개 통과, 변이 2건(상태 사전확인 제거 → 1 실패, 이벤트 루프 직접 호출 → 1 실패) 확인. 실제 Nova 호출·SSH 관측기·배포 연결은 아직 없어 M4-10은 체크하지 않는다. 체크 54/108 유지.
 
 **2026-11-10 소유자 답변과 M4-10 컨트롤러(test-passed, 미체크):** PR #54(고아 세션 마커 수정, `6246120`)와 #55를 병합했다. 소유자가 "다음 진행"을 지시하고 두 질문에 답했다: M4-05는 **API가 고정 SHA를 fetch해 build-context blob으로 저장**하는 방향(Dockerfile을 실제 빌드하는 워커 단계는 별도 필요, 아직 미구현), 우선순위는 **M4-10 먼저**. `hub/src/palimpsest_hub/services/session_controller.py`는 `SessionMachine`을 주입된 observer·provider·clock으로 구동한다(인스턴스별 락, 관측 실패는 단절·shelve 근거가 아님, claim 직후 두 번째 관측 재확인, shelve 실패 시 전체 grace 재시작, shelve 중 사용자 복귀 시 unshelve 1회·실패 시 다음 tick 재시도). `hub/tests/test_session_controller.py` 10개 + 기존 14개 통과, 변이 2건(재확인 제거 → 4 실패, 관측 실패를 빈 집합으로 처리 → 1 실패) 확인. 상태는 메모리에만 있고(재시작은 shelve를 늦출 뿐), 실제 SSH/console observer·Nova provider·영속화·M4-11 위임은 미구현이라 M4-10은 체크하지 않는다. 체크 54/108 유지.

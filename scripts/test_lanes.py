@@ -150,6 +150,7 @@ SPECIAL_FILES = {
             "session_lifecycle",
             "session_controller",
             "nova_shelve_provider",
+            "git_context",
         )
     ),
 }
