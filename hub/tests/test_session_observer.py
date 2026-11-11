@@ -174,7 +174,7 @@ def test_probe_command_checks_utmp_before_who_and_prints_end_last():
 
 def test_probe_refuses_to_print_the_end_marker_when_ps_fails():
     # `out=$(ps ...) || exit 1` must precede the end marker; a failed ps can never be "no sessions".
-    guard = GUEST_PROBE_COMMAND.index("out=$(ps -eo pid=,ppid=,args=) || exit 1")
+    guard = GUEST_PROBE_COMMAND.index("out=$(ps -e -o pid= -o ppid= -o args=) || exit 1")
     assert guard < GUEST_PROBE_COMMAND.index("PALIMPSEST-END")
 
 
@@ -198,7 +198,26 @@ def test_real_probe_run_excludes_its_parent_session_and_counts_a_separate_one():
         other.stdin.close()
         other.wait(timeout=30)
     transcript = "PALIMPSEST-UTMP-OK\n" + probe_output
-    assert parse_who(transcript) == {f"sshd-session: ubuntu@notty (pid {other.pid})"}
+    sessions = parse_who(transcript)
+    # Other live sshd sessions may exist on the host; assert only the two facts under test.
+    assert any(f"(pid {other.pid})" in session for session in sessions)
+    assert not any(f"(pid {outer.pid})" in session for session in sessions)
+
+
+def test_probe_reduces_non_sshd_rows_to_pid_and_ppid_so_argv_never_leaves_the_guest():
+    # Run the real probe table against a process whose argv carries a secret-shaped token.
+    secret = "SECRET-TOKEN-VALUE"
+    env = {"PATH": os.environ["PATH"], "PROBE": session_observer._PROCESS_PART}
+    leak = subprocess.Popen(["/bin/cat", secret], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL)
+    try:
+        output = subprocess.run(
+            ["/bin/sh", "-c", env["PROBE"]], env=env, capture_output=True, text=True, timeout=30
+        ).stdout
+    finally:
+        leak.stdin.close()
+        leak.wait(timeout=30)
+    assert secret not in output
+    assert f"{leak.pid} " in output
 
 
 class _Clock:

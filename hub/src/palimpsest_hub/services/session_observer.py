@@ -1,6 +1,8 @@
 """Concrete session observer: guest login sessions from `who` and the process table.
 
 The command runner is injected (for example an exec through the instance's management path).
+The runner MUST be a non-pty exec: a pty session writes its own utmp line, which `who` then lists
+and counts, and the probe cannot exclude it, so such a session would block shelve indefinitely.
 Any failure, timeout, non-text result or malformed line is an `ObservationError`, never an
 empty set: an empty set reads as "no user" and could lead to a shelve.
 
@@ -30,14 +32,16 @@ END_MARKER = "PALIMPSEST-END"
 # [listener] ...`) and pre-auth (`sshd: [accepted]`, `sshd: user [priv]`) titles do not match.
 SSHD_SESSION_PATTERN = r"sshd(-session)?: [^ ]+@(pts/[0-9]+|notty)"
 SSHD_SESSION_RE = re.compile(SSHD_SESSION_PATTERN)
-PS_ROW_RE = re.compile(r"([0-9]+) ([0-9]+) (.+)")
+PS_ROW_RE = re.compile(r"([0-9]+) ([0-9]+)(?: (.+))?")
 # Split so the process-table part can be run locally against a real `sh` and `ps`.
 _UTMP_PART = "if [ -r /run/utmp ] || [ -r /var/run/utmp ]; then echo PALIMPSEST-UTMP-OK; who || exit 1; fi; "
 _PROCESS_PART = (
     "echo PALIMPSEST-SELF $$; "
     # A failed `ps` exits before the end marker, so it can never read as "no sessions".
-    "out=$(ps -eo pid=,ppid=,args=) || exit 1; "
-    "printf '%s\\n' \"$out\"; "
+    "out=$(ps -e -o pid= -o ppid= -o args=) || exit 1; "
+    # Only sshd rows keep their argv; every other row is reduced to pid and ppid, so guest
+    # command lines (which can carry tokens) never leave the guest.
+    "printf '%s\\n' \"$out\" | awk '{ if ($3 ~ /^sshd/) print; else print $1, $2 }'; "
     "echo PALIMPSEST-END"
 )
 GUEST_PROBE_COMMAND = _UTMP_PART + _PROCESS_PART
@@ -75,7 +79,7 @@ def parse_who(text: str) -> set[str]:
         match = PS_ROW_RE.fullmatch(line)
         if not match:
             raise ObservationError("malformed process line")
-        pid, ppid, args = int(match.group(1)), int(match.group(2)), match.group(3)
+        pid, ppid, args = int(match.group(1)), int(match.group(2)), match.group(3) or ""
         table[pid] = (ppid, args)
     if self_pid not in table:
         raise ObservationError("probe shell missing from the process table")
