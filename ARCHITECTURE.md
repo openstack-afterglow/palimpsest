@@ -4027,9 +4027,9 @@ that CI never sees).
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "1c645a854034031c81b24c39ba3ac3b6429b0b677a27d7a9505018bc3f638cbd",
-  "reviewed_at": "2026-11-10T13:22:12Z",
-  "summary": "ARCHITECTURE: observer probe, shelve delegation policy, --cloud path; remove stale no-observer claim"
+  "source_sha256": "93bbf8df2154069022b6e7868d54e32b37f8ad381f97aa4e3d70af9ecfc661e4",
+  "reviewed_at": "2026-11-11T10:40:50Z",
+  "summary": "Kolla 2026.1: container version label follows openstack_release; parametrized non-default lifecycle label regression; CHANGELOG"
 }
 ```
 <!-- architecture-review:end -->
