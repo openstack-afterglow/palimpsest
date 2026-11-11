@@ -41,7 +41,7 @@ _PROCESS_PART = (
     "out=$(ps -e -o pid= -o ppid= -o args=) || exit 1; "
     # Only sshd rows keep their argv; every other row is reduced to pid and ppid, so guest
     # command lines (which can carry tokens) never leave the guest.
-    "printf '%s\\n' \"$out\" | awk '{ if ($3 ~ /^sshd/) print; else print $1, $2 }'; "
+    "printf '%s\\n' \"$out\" | awk '{ if ($3 ~ /^sshd/) print; else print $1, $2 }' || exit 1; "
     "echo PALIMPSEST-END"
 )
 GUEST_PROBE_COMMAND = _UTMP_PART + _PROCESS_PART

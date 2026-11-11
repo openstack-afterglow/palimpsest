@@ -176,6 +176,9 @@ def test_probe_refuses_to_print_the_end_marker_when_ps_fails():
     # `out=$(ps ...) || exit 1` must precede the end marker; a failed ps can never be "no sessions".
     guard = GUEST_PROBE_COMMAND.index("out=$(ps -e -o pid= -o ppid= -o args=) || exit 1")
     assert guard < GUEST_PROBE_COMMAND.index("PALIMPSEST-END")
+    # The reducing awk stage must also fail closed: a truncated table must never reach the end marker.
+    awk_stage = GUEST_PROBE_COMMAND.index("awk '{ if ($3 ~ /^sshd/) print; else print $1, $2 }' || exit 1")
+    assert guard < awk_stage < GUEST_PROBE_COMMAND.index("PALIMPSEST-END")
 
 
 def test_real_probe_run_excludes_its_parent_session_and_counts_a_separate_one():
@@ -205,19 +208,20 @@ def test_real_probe_run_excludes_its_parent_session_and_counts_a_separate_one():
 
 
 def test_probe_reduces_non_sshd_rows_to_pid_and_ppid_so_argv_never_leaves_the_guest():
-    # Run the real probe table against a process whose argv carries a secret-shaped token.
+    # The holder must stay alive with the token in its argv (a `cat TOKEN` would exit at once
+    # on a missing file, leaving a zombie whose argv is empty, so the test would pass vacuously).
     secret = "SECRET-TOKEN-VALUE"
     env = {"PATH": os.environ["PATH"], "PROBE": session_observer._PROCESS_PART}
-    leak = subprocess.Popen(["/bin/cat", secret], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL)
+    holder = subprocess.Popen([f"holder {secret}"], executable="/bin/cat", stdin=subprocess.PIPE)
     try:
         output = subprocess.run(
             ["/bin/sh", "-c", env["PROBE"]], env=env, capture_output=True, text=True, timeout=30
         ).stdout
     finally:
-        leak.stdin.close()
-        leak.wait(timeout=30)
+        holder.stdin.close()
+        holder.wait(timeout=30)
+    assert f"{holder.pid} " in output
     assert secret not in output
-    assert f"{leak.pid} " in output
 
 
 class _Clock:

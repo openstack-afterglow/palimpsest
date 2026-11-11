@@ -4028,9 +4028,9 @@ that CI never sees).
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "01401f466085f466d872f3ca5721305e8f55c0d9b11d46c1317e1f3b66fd2160",
-  "reviewed_at": "2026-11-11T18:16:05Z",
-  "summary": "M4-10 probe: per-column -o ps, sshd-only argv, non-pty contract, real sh/ps tests; docs corrected"
+  "source_sha256": "10c7c92f614983c0a968ba870d17a44bd5a47a0e2db6085944ba5780d9f68dfb",
+  "reviewed_at": "2026-11-11T18:17:41Z",
+  "summary": "M4-10 probe: awk reduction fails closed; live-holder leak test verified by mutation"
 }
 ```
 <!-- architecture-review:end -->
