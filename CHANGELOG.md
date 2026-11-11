@@ -14,6 +14,13 @@ All notable changes to Palimpsest Local are documented here.
   source disk is never modified. Proven once live on one Apple-silicon host (three VMs); package
   installs, `.plmignore` and Hub publication are not yet proven live.
 
+### Fixed
+
+- Kolla role container label `kolla_version` now follows the target `openstack_release` instead of a
+  hardcoded `2025.2`, for Kolla-Ansible 2026.1 compatibility. Covered by the parametrized lifecycle
+  regression `test_container_version_label_follows_openstack_release` and the `tests/test_kolla_*.py`
+  set. Not deployed.
+
 ## [0.3.15] - 2026-11-08 (UTC; published; deployed to the three DMS Lab controllers and the dedicated build worker on 2026-11-09)
 
 ### Fixed
