@@ -45,6 +45,15 @@ files_modified:
 - Evidence: `hub/tests/test_session_observer.py` + `test_session_controller.py` + `test_session_lifecycle.py` pass (43 in the observer+controller+lifecycle run); end-marker and utmp-marker removal mutations each fail. Registered in `scripts/test_lanes.py` hub list.
 - Still open for M4-10: session state persistence, live SSH/console injection, operational Nova wiring, live verification. M4-11 trust follows receipt 583 scope.
 
+### M2-17 evidence-level disposition — 2026-11-12
+- The owner accepted the evidence limitations enumerated by the 2026-11-09 alternate review receipt 597: isolated rather than deployed proof for 413/200 GiB behavior, partial `m216-con6` exec output retention, no live evidence for staged-byte non-disclosure/body-413 behavior, and H4 paid-byte capacity beyond count-only verification.
+- This accepts the stated evidence level only; it does not convert missing live evidence into a live pass. The current Goal instruction names repository `spec.md` as the canonical checklist.
+- M2-17 remains unchecked. Receipt 581's unresolved operational details and current absence/expiry of stage row `87b60cf0…` have not been dispositioned or freshly observed. No provider query, deployment, resource mutation, or native VM creation was performed for this decision.
+
+### M4-10 probe correction — 2026-11-12 (PR #71, merged `e106480`)
+- Supersedes the 2026-11-10 observer wording above: the probe runs `ps -e -o pid= -o ppid= -o args=` (separate `-o` per column), keeps argv only for sshd rows, and sends only pid/ppid for all other processes. The parser excludes the probe shell's sshd ancestors, keys remaining sessions by PID, and rejects a missing shell row. The awk reduction stage fails closed (`|| exit 1`). `fetch` must use non-pty exec.
+- Local evidence: observer tests 24 passed, related Hub tests 57 passed; mutations removing ancestor exclusion and argv reduction were caught. PR #71 head `fcf59c2` CI: 19 pass, 2 Native KVM skips. BusyBox/Linux guest and real SSH transport remain unverified; M4-10 remains unchecked.
+
 ## Reader/member/manager priority cutover — 2026-11-06, source264 in progress
 
 Owner explicitly added this alongside the continuing local M1 Goal: existing
