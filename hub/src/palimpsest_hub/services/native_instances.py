@@ -63,6 +63,20 @@ def _profile(settings, name):
     return result
 
 
+def _native_preflight_need(approval, request):
+    boot_gib = approval.get("boot_gib")
+    flavors = approval.get("flavors")
+    flavor_id = flavors.get(request.get("phase")) if isinstance(flavors, dict) else None
+    if type(boot_gib) is not int or boot_gib <= 0 or not isinstance(flavor_id, str) or not flavor_id:
+        raise HTTPException(409, "Native operator grant lacks boot volume or flavor sizing")
+    return preflight.PreflightNeed(
+        shared_files=True,
+        volume_gib=boot_gib,
+        flavor_id=flavor_id,
+        ports=1,
+    )
+
+
 def _operator_paths(profile):
     publication = Path(profile["publication_root"])
     for field in ("root", "grant_path", "publication_root"):
@@ -594,6 +608,15 @@ def _execute(profile, actor, conn, checkpoint, identity, published, request, app
         _published_storage_admission(profile, _operator_paths(profile), env, published)
         approval = _operator_paths(profile)
         _approval_source(profile, approval, request["phase"], published["manifest_digest"])
+        settings = getattr(checkpoint, "settings", None)
+        if not deleting and settings is not None:
+            preflight.require(
+                conn,
+                actor,
+                _native_preflight_need(approval, request),
+                interface=settings.os_interface,
+                region_name=settings.os_region_name,
+            )
         env._native_authorize = getattr(checkpoint, "authorize", None)
         env._hub_published_image = {
             "project_id": profile["project_id"],
@@ -661,7 +684,7 @@ async def _settle(factory, actor, identity, profile, *, held=False):
     await run_blocking(_settle_locked, profile, commit)
 
 
-async def _run(factory, actor, conn, profile, row, deleting=False):
+async def _run(factory, actor, conn, profile, row, settings, deleting=False):
     loop = asyncio.get_running_loop()
     identity, run_id, spec, profile_digest = row.id, row.run_id, copy.deepcopy(row.spec_json), row.profile_digest
     first_checkpoint = True
@@ -694,6 +717,7 @@ async def _run(factory, actor, conn, profile, row, deleting=False):
     checkpoint.authorize_actor = check_actor
 
     checkpoint.authorize = authorize
+    checkpoint.settings = settings
 
     try:
         await run_blocking(
@@ -751,7 +775,7 @@ async def _background_run(factory, settings, original, identity, profile_digest,
         try:
             conn = await anext(connection)
             _scope(actor, conn, profile)
-            await _run(factory, actor, conn, profile, row, deleting=deleting)
+            await _run(factory, actor, conn, profile, row, settings, deleting=deleting)
         finally:
             await connection.aclose()
     except Exception:
@@ -786,10 +810,7 @@ async def create(factory, store, settings, actor, conn, request, *, background=N
             if existing.created_by != actor["user_id"] or existing.request_digest != fingerprint:
                 raise HTTPException(409, "Native request ID is already bound to another immutable request")
             return projection(existing)
-    # Replays above stay idempotent; a new native allocation needs the access preflight first.
-    await run_blocking(
-        preflight.require, conn, actor, preflight.PreflightNeed(shared_files=True), interface=settings.os_interface
-    )
+    # Replays stay idempotent; new requests validate operator grant before preflight.
 
     profile = _profile(settings, request["profile"])
     project, user = _scope(actor, conn, profile)
@@ -812,6 +833,15 @@ async def create(factory, store, settings, actor, conn, request, *, background=N
         _approval_source(profile, approval, request["phase"], published["manifest_digest"])
     except CloudEnvError:
         raise HTTPException(409, "Native original operator approval does not bind this image selection") from None
+    native_need = _native_preflight_need(approval, request)
+    await run_blocking(
+        preflight.require,
+        conn,
+        actor,
+        native_need,
+        interface=settings.os_interface,
+        region_name=settings.os_region_name,
+    )
     if published["manifest"]["mode"] != "oci-root" or published["manifest"]["platform"] != "linux/amd64":
         raise HTTPException(409, "Native execution requires an explicitly published linux/amd64 OCI-root manifest")
     try:
@@ -883,7 +913,7 @@ async def create(factory, store, settings, actor, conn, request, *, background=N
     if background is not None:
         _schedule(background, factory, settings, actor, profile, row)
         return projection(row)
-    return await _run(factory, actor, conn, profile, row)
+    return await _run(factory, actor, conn, profile, row, settings)
 
 
 async def delete(factory, settings, actor, conn, identity, *, background=None):
@@ -913,4 +943,4 @@ async def delete(factory, settings, actor, conn, identity, *, background=None):
     if background is not None:
         _schedule(background, factory, settings, actor, profile, row, deleting=True)
         return projection(row)
-    return await _run(factory, actor, conn, profile, row, deleting=True)
+    return await _run(factory, actor, conn, profile, row, settings, deleting=True)

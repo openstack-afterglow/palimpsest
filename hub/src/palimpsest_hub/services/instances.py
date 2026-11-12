@@ -492,8 +492,13 @@ async def create(factory, store, settings, actor, conn, req):
             preflight.require,
             conn,
             actor,
-            preflight.PreflightNeed(volume_gib=req["boot_gib"]),
+            preflight.PreflightNeed(
+                volume_gib=req["boot_gib"],
+                flavor_id=req["flavor_id"],
+                ports=1,
+            ),
             interface=settings.os_interface,
+            region_name=settings.os_region_name,
         )
         source = (
             await owned(session, req["source_instance_id"], project, actor["user_id"])
@@ -773,7 +778,7 @@ def fail_preparation(row, code, *, no_call=None):
         preparation_update(row, phase="nova_not_attempted", server_create_attempted=False)
 
 
-async def allocation_authority(session, row, actor, conn, settings, *, no_call=None):
+async def allocation_authority(session, row, actor, conn, settings, *, no_call, preflight_phase):
     """Revalidate after slow provider reads, without renewing the accepted expiry."""
     spec = row.spec_json
     try:
@@ -805,6 +810,37 @@ async def allocation_authority(session, row, actor, conn, settings, *, no_call=N
         if isinstance(exc, HTTPException):
             raise
         raise HTTPException(502, "Provider input validation unavailable") from None
+    try:
+        need = (
+            preflight.PreflightNeed(
+                instances=1,
+                volumes=1,
+                volume_gib=spec["boot_gib"],
+                flavor_id=spec["flavor_id"],
+                ports=1,
+            )
+            if preflight_phase == "volume"
+            else preflight.PreflightNeed(
+                instances=1,
+                volumes=0,
+                volume_gib=0,
+                flavor_id=spec["flavor_id"],
+                ports=1,
+            )
+        )
+        await run_blocking(
+            preflight.require,
+            conn,
+            actor,
+            need,
+            interface=settings.os_interface,
+            region_name=settings.os_region_name,
+        )
+    except HTTPException:
+        fail_preparation(row, "preflight_failed", no_call=no_call)
+        await session.commit()
+        raise
+    # Preflight errors retain their structured 4xx response.
     try:
         await payload_authority(actor, conn, session, spec)
     except HTTPException:
@@ -853,7 +889,9 @@ async def advance_prepared_boot(session, row, actor, conn, settings, *, allocate
         and "packages:write" in actor.get("package_actions", ())
     )
     if phase == "volume_not_attempted":
-        if not may_allocate or not await allocation_authority(session, row, actor, conn, settings):
+        if not may_allocate or not await allocation_authority(
+            session, row, actor, conn, settings, no_call="volume", preflight_phase="volume"
+        ):
             return
         preparation_update(row, phase="volume_create_uncertain", volume_create_attempted=True)
         row.status, row.error_code = "uncertain", "provider_volume_create_uncertain"
@@ -867,7 +905,9 @@ async def advance_prepared_boot(session, row, actor, conn, settings, *, allocate
                     preparation_update(row, delete_phase="absent", delete_ready=False)
                 await session.commit()
             return
-        if not await allocation_authority(session, row, actor, conn, settings, no_call="volume"):
+        if not await allocation_authority(
+            session, row, actor, conn, settings, no_call="volume", preflight_phase="volume"
+        ):
             return
         try:
             volume = await run_blocking(
@@ -932,7 +972,13 @@ async def advance_prepared_boot(session, row, actor, conn, settings, *, allocate
     await preparation_refence(session, row)
     if not can_continue_preparation(row, "nova_not_attempted"):
         return
-    if not launch or not may_allocate or not await allocation_authority(session, row, actor, conn, settings):
+    if (
+        not launch
+        or not may_allocate
+        or not await allocation_authority(
+            session, row, actor, conn, settings, no_call="server", preflight_phase="server"
+        )
+    ):
         return
     # Final volume observation precedes the final original-human fence.
     volume = await run_blocking(get_prepared_volume, conn, row)
@@ -993,7 +1039,7 @@ async def advance_prepared_boot(session, row, actor, conn, settings, *, allocate
         return
     # Reacquire cluster-source authority/lock, settings, human and payload after
     # the commit and potentially slow mutex wait; retain these locks through POST.
-    if not await allocation_authority(session, row, actor, conn, settings, no_call="server"):
+    if not await allocation_authority(session, row, actor, conn, settings, no_call="server", preflight_phase="server"):
         return
     bootstrap_expires_at = guest["expires_at"]
     create_not_sent = object()
