@@ -4033,9 +4033,9 @@ that CI never sees).
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "2ebb8c2c54f7d35ef139eb171cebf6ea342d45726ec7abd95d99912b04bee396",
-  "reviewed_at": "2026-11-12T14:45:43Z",
-  "summary": "Dev-instance idle auto-shelve: lifecycle ledger, guest reporter, worker tick, trust, resume/renew/connection"
+  "source_sha256": "7ad2178dccbcf170554638b005d4aa51533a919cc46b7ccb31cc683053978d2b",
+  "reviewed_at": "2026-11-12T15:04:36Z",
+  "summary": "Version 0.3.16 candidate: patch bump of distributions, locks, Hub module, Kolla image default; no behavior change"
 }
 ```
 <!-- architecture-review:end -->

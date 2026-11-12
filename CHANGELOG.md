@@ -4,6 +4,8 @@ All notable changes to Palimpsest Local are documented here.
 
 ## [Unreleased]
 
+## [0.3.16] - 2026-11-13 (UTC; candidate, not yet published or deployed)
+
 ### Added
 
 - `palimpsest instance ls|status|create|advance|stop|rm`: CLI over the existing Hub `/v1/instances`
