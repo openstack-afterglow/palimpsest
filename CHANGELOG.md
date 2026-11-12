@@ -6,6 +6,11 @@ All notable changes to Palimpsest Local are documented here.
 
 ### Added
 
+- `palimpsest instance ls|status|create|advance|stop|rm`: CLI over the existing Hub `/v1/instances`
+  endpoints (the same calls as `HubClient`). Arguments are validated before any credential lookup or Hub
+  call, and `--cloud` is accepted. Covered by `tests/unit/test_cli_contract.py` with a stubbed client;
+  not run against a real Hub or OpenStack. `status` shows the guest-reported stdout/stderr; the Hub has
+  no streaming log, SSH-info or resume endpoint, so those parts of the M4-08 contract are not available.
 - Experimental native VZ `commit` (opt-in `PALIMPSEST_EXPERIMENTAL_VZ_COMMIT=1`, not advertised as a
   capability): a stopped, unheld Lima-VZ OCI-root instance's overlay upper is cloned (APFS
   clonefile), read with e2fsprogs `debugfs`/`e2fsck` (`PALIMPSEST_COMMIT_DEBUGFS`,

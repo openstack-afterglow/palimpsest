@@ -251,6 +251,7 @@ GUIDE_ANCHORS = {
     "layer": "hub-cloud-images-layers-and-bundles",
     "published": "hub-cloud-images-layers-and-bundles",
     "bundle": "hub-cloud-images-layers-and-bundles",
+    "instance": "hub-instances",
     "registry": "registry-profiles-and-docker-wrapper-commands",
     "login": "registry-profiles-and-docker-wrapper-commands",
     "logout": "registry-profiles-and-docker-wrapper-commands",

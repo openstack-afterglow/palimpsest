@@ -3,7 +3,7 @@
 
 This file is generated from `palimpsest_local.cli.build_parser`. It inventories every command, positional, option, choice, and parser default. For behavior, examples, and runtime restrictions, read [the usage guide](usage.md). Every command except raw `docker` pass-through accepts automatic `-h`/`--help`.
 
-Coverage: **162 command paths**, **444 positional/option definitions** (excluding automatic `-h/--help`).
+Coverage: **169 command paths**, **468 positional/option definitions** (excluding automatic `-h/--help`).
 
 ## `palimpsest`
 
@@ -12,10 +12,10 @@ Coverage: **162 command paths**, **444 positional/option definitions** (excludin
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest [-h] [--url URL] [--cloud CLOUD] [--version] {cloud,benchmark,image,published,layer,bundle,oci,build,registry,login,logout,pull,push,tag,images,history,rmi,save,load,docker,run,compose,ps,volumes,networks,volume,inspect,logs,shell,exec,start,stop,rm,commit,web,store,completion} ...
+usage: palimpsest [-h] [--url URL] [--cloud CLOUD] [--version] {cloud,benchmark,image,published,instance,layer,bundle,oci,build,registry,login,logout,pull,push,tag,images,history,rmi,save,load,docker,run,compose,ps,volumes,networks,volume,inspect,logs,shell,exec,start,stop,rm,commit,web,store,completion} ...
 ```
 
-Subcommands: `cloud`, `benchmark`, `image`, `published`, `layer`, `bundle`, `oci`, `build`, `registry`, `login`, `logout`, `pull`, `push`, `tag`, `images`, `history`, `rmi`, `save`, `load`, `docker`, `run`, `compose`, `ps`, `volumes`, `networks`, `volume`, `inspect`, `logs`, `shell`, `exec`, `start`, `stop`, `rm`, `commit`, `web`, `store`, `completion`.
+Subcommands: `cloud`, `benchmark`, `image`, `published`, `instance`, `layer`, `bundle`, `oci`, `build`, `registry`, `login`, `logout`, `pull`, `push`, `tag`, `images`, `history`, `rmi`, `save`, `load`, `docker`, `run`, `compose`, `ps`, `volumes`, `networks`, `volume`, `inspect`, `logs`, `shell`, `exec`, `start`, `stop`, `rm`, `commit`, `web`, `store`, `completion`.
 
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
@@ -1200,6 +1200,120 @@ usage: palimpsest published status [-h] [--state-root STATE_ROOT]
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
 | `--state-root` | Path | `None` | state root to inspect (default: the configured state root) |
+
+## `palimpsest instance`
+
+[Behavior, restrictions, and examples](usage.md#hub-instances).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest instance [-h] {ls,status,create,advance,stop,rm} ...
+```
+
+Subcommands: `ls`, `status`, `create`, `advance`, `stop`, `rm`.
+
+### `palimpsest instance ls`
+
+[Behavior, restrictions, and examples](usage.md#hub-instances).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest instance ls [-h] [--limit LIMIT]
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `--limit` | int | `50` | maximum results (1-100; default: 50) |
+
+### `palimpsest instance status`
+
+[Behavior, restrictions, and examples](usage.md#hub-instances).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest instance status [-h] instance_id
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `instance_id` | string | required | Hub instance id |
+
+### `palimpsest instance create`
+
+[Behavior, restrictions, and examples](usage.md#hub-instances).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest instance create [-h] --request-id REQUEST_ID --name NAME --image-id IMAGE_ID --flavor-id FLAVOR_ID --network-id NETWORK_ID --boot-gib BOOT_GIB [--writable-gib WRITABLE_GIB] [--layer-digest LAYER_DIGEST] [--image-job-id IMAGE_JOB_ID] [--source-instance-id SOURCE_INSTANCE_ID] [--security-group-id SECURITY_GROUP_ID] [--gpu-profile GPU_PROFILE] [--cluster-profile CLUSTER_PROFILE] [--cluster-server-id CLUSTER_SERVER_ID] [--command-json COMMAND_JSON] [--readiness-json READINESS_JSON]
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `--request-id` | string | required | UUID; retrying the same request replays it |
+| `--name` | string | required | instance name |
+| `--image-id` | string | required | published Hub image id (UUID) |
+| `--flavor-id` | string | required | Nova flavor id |
+| `--network-id` | string | required | Neutron network id (UUID) |
+| `--boot-gib` | int | required | boot volume size in GiB |
+| `--writable-gib` | int | `None` | guest-private writable capacity in GiB |
+| `--layer-digest` | string; repeatable | `[]` | SHA-256 layer digest, in order (repeatable) |
+| `--image-job-id` | string | `None` | Hub image job id whose result selects the layer stack |
+| `--source-instance-id` | string | `None` | retained instance whose exact layer stack is reused |
+| `--security-group-id` | string; repeatable | `[]` | Neutron security group id (repeatable) |
+| `--gpu-profile` | string | `None` | operator-approved GPU profile name |
+| `--cluster-profile` | string | `None` | operator-approved cluster profile name |
+| `--cluster-server-id` | string | `None` | existing cluster server instance id |
+| `--command-json` | string | `None` | JSON array of strings: guest command argv |
+| `--readiness-json` | string | `None` | JSON array of strings: readiness probe argv |
+
+### `palimpsest instance advance`
+
+[Behavior, restrictions, and examples](usage.md#hub-instances).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest instance advance [-h] --operation {create-server,delete-volume} --request-id REQUEST_ID --boot-volume-id BOOT_VOLUME_ID instance_id
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `instance_id` | string | required | Hub instance id |
+| `--operation` | one of: `create-server`, `delete-volume` | required | the one provider effect to submit |
+| `--request-id` | string | required | UUID of the original create request |
+| `--boot-volume-id` | string | required | boot volume id reported by create/status |
+
+### `palimpsest instance stop`
+
+[Behavior, restrictions, and examples](usage.md#hub-instances).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest instance stop [-h] instance_id
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `instance_id` | string | required | Hub instance id |
+
+### `palimpsest instance rm`
+
+[Behavior, restrictions, and examples](usage.md#hub-instances).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest instance rm [-h] instance_id
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `instance_id` | string | required | Hub instance id |
 
 ## `palimpsest layer`
 
