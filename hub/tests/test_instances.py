@@ -481,6 +481,38 @@ async def test_quota_is_rechecked_before_server_post(instance_hub):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("fail_at", "stage"),
+    [(3, "after volume_create_uncertain commit"), (5, "after nova_create_uncertain commit")],
+)
+async def test_quota_exhausted_after_uncertain_commit_sends_no_provider_post(instance_hub, monkeypatch, fail_at, stage):
+    from fastapi import HTTPException
+
+    h = instance_hub
+    calls = []
+    real = service.preflight.require
+
+    def counted(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == fail_at:
+            raise HTTPException(409, {"code": "preflight_failed", "failures": []})
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(service.preflight, "require", counted)
+    accepted = await h.client.post("/v1/instances", json=request_body())
+    if fail_at == 3:
+        assert accepted.status_code == 409, (stage, accepted.text)
+        assert h.provider.volume_creates == [] and h.provider.creates == []
+        return
+    assert accepted.status_code == 202, accepted.text
+    response = await advance_instance(h, accepted.json())
+    assert response.status_code == 409, (stage, response.text)
+    assert len(calls) == fail_at
+    assert h.provider.creates == [] and h.provider.volume_deletes == []
+    assert len(h.provider.volumes_by_id) == 1
+
+
+@pytest.mark.asyncio
 async def test_replay_of_an_existing_request_survives_a_later_quota_exhaustion(instance_hub):
     h = instance_hub
     body = request_body()
@@ -4914,6 +4946,68 @@ async def test_native_background_never_overwrites_a_terminal_row(native_hub, mon
     await n.service._commit_settlement(n.h.factory, original, identity, True)
     assert (await n.h.client.get("/v1/native-instances/" + identity)).json()["status"] == "deleted"
     assert n.calls == calls
+
+
+async def test_real_native_execute_refuses_on_exhausted_quota_before_controller_run(native_hub, monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    import pytest
+
+    n = native_hub
+    approval = {
+        "grant_id": "explicit-fixture",
+        "boot_gib": 32,
+        "flavors": {"cpu": "small", "gpu": "small"},
+        "source_digest": n.profile["manifest_digest"],
+        "project_id": PROJECT,
+        "environment": n.profile["environment"],
+    }
+
+    class Environment:
+        def __init__(self, profile, actor, conn, checkpoint):
+            self.state = {"cloud": "original"}
+
+        def _authenticate(self, cloud):
+            pass
+
+        def _confirmed(self, kind, name):
+            return {"id": n.profile["share_id"], "export": n.profile["export"]}
+
+    run = Mock()
+
+    class Controller:
+        def __init__(self, env):
+            self.state = {"runs": {}}
+            self.run = run
+
+    monkeypatch.setattr(n.service, "_CallerEnvironment", Environment)
+    monkeypatch.setattr(n.service, "NativeCloud", Controller)
+    monkeypatch.setattr(n.service, "_operator_paths", lambda profile: approval)
+    monkeypatch.setattr(n.service, "_published_storage_admission", Mock())
+    monkeypatch.setattr(n.service, "_approval_source", Mock())
+    n.h.provider.get_limits = lambda: SimpleNamespace(
+        absolute=SimpleNamespace(
+            instances=-1, instances_used=0, total_cores=0, total_cores_used=0, total_ram=-1, total_ram_used=0
+        )
+    )
+    published = {**n.published, "storage_binding": {"kind": "manila"}}
+    checkpoint = SimpleNamespace(settings=n.h.settings)
+    request = {"phase": "cpu", "timeout": 60, "command": ["/bin/true"], "keep": True}
+    actor = {"project_id": PROJECT, "user_id": USER, "package_actions": ["packages:write"]}
+    with pytest.raises(n.service._PreflightRefused):
+        n.original_execute(
+            n.profile,
+            actor,
+            n.h.provider,
+            checkpoint,
+            "native-" + "2" * 32,
+            published,
+            request,
+            n.service._digest(approval),
+            False,
+        )
+    run.assert_not_called()
 
 
 async def test_real_native_delete_skips_new_image_admission_for_legacy_run(native_hub, monkeypatch):
