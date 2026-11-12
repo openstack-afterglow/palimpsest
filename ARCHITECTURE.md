@@ -4030,9 +4030,9 @@ that CI never sees).
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "5e3c29b86ae7f3525b7585abd4d50d754014110fc6d6565e976b863df5b9a174",
-  "reviewed_at": "2026-11-12T06:48:54Z",
-  "summary": "M4-03 preflight review fixes: native refusal terminal, flavor failure classification"
+  "source_sha256": "d66abfaadeacfd013a67a842236cca31be9a568423794920e8e09868945b20a7",
+  "reviewed_at": "2026-11-12T07:07:55Z",
+  "summary": "M4-03 follow-up tests: post-uncertain-commit quota rechecks and real native _execute refusal before controller.run; no behavior change"
 }
 ```
 <!-- architecture-review:end -->
