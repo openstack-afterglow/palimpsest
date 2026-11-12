@@ -11,7 +11,7 @@ palimpsest completion bash
 ```
 
 `--url` is a global Hub URL override. Hub commands resolve the URL in this order: `--url`, `PALIMPSEST_URL`, then `config.toml` (`url` or `[hub].url`). They require `PALIMPSEST_TOKEN`; do not put tokens in examples or configuration committed to source control. Registry wrapper commands reuse Docker's existing config and credential directory: `DOCKER_CONFIG` when set, otherwise `$HOME/.docker`.
-`--cloud NAME` authenticates Hub commands with the Keystone token and project of that `clouds.yaml` cloud instead of `PALIMPSEST_TOKEN`; the project ID is sent as `X-Project-Id` so Hub does not fall back to the user's default project. `--cloud` applies to `image`/`layer`/`bundle` Hub commands, `published push|pull`, and `run`/`build`/`compose` when they reach Hub. Other commands reject it instead of ignoring it, so a write never silently falls back to `PALIMPSEST_TOKEN`. `--cloud` cannot be combined with `--anonymous` or `--image-key-file`.
+`--cloud NAME` authenticates Hub commands with the Keystone token and project of that `clouds.yaml` cloud instead of `PALIMPSEST_TOKEN`; the project ID is sent as `X-Project-Id` so Hub does not fall back to the user's default project. `--cloud` applies to `image`/`layer`/`bundle` Hub commands, `published push|pull`, `instance` commands, and `run`/`build`/`compose` when they reach Hub. Other commands reject it instead of ignoring it, so a write never silently falls back to `PALIMPSEST_TOKEN`. `--cloud` cannot be combined with `--anonymous` or `--image-key-file`.
 
 Options are parsed in the command position shown in the reference. `palimpsest docker ...` is special: everything after `docker` is passed to the Docker CLI. `palimpsest __complete` is an internal completion protocol, not a public command.
 
@@ -22,6 +22,7 @@ Do not treat these similarly named surfaces as interchangeable:
 | Surface | Examples | Backend and credentials |
 | --- | --- | --- |
 | Palimpsest Hub artifacts | `image ls`, `image pull`, `image push`, `image git-build`, `image git-job`, `layer ls/check/pack/pull/push`, `bundle *`, `published push/pull/status` | Native Palimpsest Hub `/v1`; `PALIMPSEST_TOKEN` for Hub operations (local `layer pack` needs none); `published` also accepts an image API key and anonymous public pulls |
+| Hub instances | `instance ls/status/create/advance/stop/rm` | Native Palimpsest Hub `/v1/instances`; `PALIMPSEST_TOKEN` or `--cloud`. See [Hub instances](#hub-instances). |
 | Docker wrapper | `pull`, `push`, `tag`, `images`, `history`, `rmi`, `save`, `load`, and `image inspect/history/rm/save/load` | Installed Docker CLI and external OCI registries; Docker credentials |
 | Local OCI root | `oci pull`, `oci materialize`, `run ./image.oci.tar --runtime-kind oci-root` | Anonymous TLS registry acquisition into a verified local archive; private source CAS and Linux KVM runtime |
 | Permanent shared OCI cache | `oci cache --root PATH init/pull/import/materialize/retain/release/inspect` | Explicit private directory on pre-mounted persistent storage; anonymous verified TLS for pulls, current local CAS/materializer authority |
@@ -84,6 +85,26 @@ Credentials for `published`: `--image-key-file PATH` (owner-only file holding on
 palimpsest published push "$LOCAL_IMAGE_ID" --name app --os-family ubuntu --os-version 24.04
 palimpsest published pull "$HUB_IMAGE_ID" --state-root "$HOME/palimpsest-consumer/state" --anonymous
 palimpsest published status --state-root "$HOME/palimpsest-consumer/state"
+```
+
+### Hub instances
+
+`instance` drives the same Hub `/v1/instances` endpoints as `HubClient.create_instance`, `advance_instance`, `stop_instance` and `delete_instance`; it adds no server behavior.
+
+- `instance create` reserves the boot volume only. The server is created by a separate `instance advance INSTANCE_ID --operation create-server --request-id ... --boot-volume-id ...`, which binds the effect to the volume that `create`/`status` reported. `--operation delete-volume` releases a reserved volume that never got a server.
+- `instance status` is a point-in-time read. When the guest has reported a result, it contains `result.stdout` and `result.stderr` (each at most 8192 characters), `exit_code` and `error_code`; there is no streaming log endpoint.
+- `instance stop` stops the server and keeps the instance. `instance rm` is the only command that deletes an instance and its guest-private upper layer. Neither is retried automatically.
+- `instance ls --limit` accepts 1-100 (the Hub route maximum).
+- Local arguments (UUIDs, JSON argv arrays) are validated before any credential is read or Hub call is made. `--cloud` is accepted.
+- The Hub exposes no SSH-connection-info or resume route, so the CLI has none.
+
+```sh
+palimpsest instance create --request-id "$REQ" --name dev-box --image-id "$IMAGE" --flavor-id m1.small \
+  --network-id "$NET" --boot-gib 20 --layer-digest "$LAYER"
+palimpsest instance advance "$ID" --operation create-server --request-id "$REQ" --boot-volume-id "$VOL"
+palimpsest instance status "$ID"
+palimpsest instance stop "$ID"
+palimpsest instance rm "$ID"
 ```
 
 

@@ -3301,3 +3301,238 @@ def test_global_cloud_flag_before_run_keeps_the_command_override(monkeypatch: py
     rc = cli.main(["--cloud", "dms", "run", "example:image", "--", "echo", "ok"])
     assert rc != 0
     assert captured == {"command_override": ("echo", "ok"), "hub_cloud": "dms"}
+
+
+_INSTANCE_IMAGE = "11111111-1111-4111-8111-111111111111"
+_INSTANCE_NETWORK = "22222222-2222-4222-8222-222222222222"
+_INSTANCE_VOLUME = "33333333-3333-4333-8333-333333333333"
+_INSTANCE_ID = "44444444-4444-4444-8444-444444444444"
+
+
+def _instance_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PALIMPSEST_URL", "http://localhost:8080")
+    monkeypatch.setenv("PALIMPSEST_TOKEN", "test-token")
+
+
+def _instance_create_argv(**overrides):
+    values = {
+        "--request-id": _REQUEST_ID,
+        "--name": "dev-box",
+        "--image-id": _INSTANCE_IMAGE,
+        "--flavor-id": "m1.small",
+        "--network-id": _INSTANCE_NETWORK,
+        "--boot-gib": "20",
+        "--layer-digest": "sha256:" + "b" * 64,
+    }
+    values.update(overrides)
+    argv = ["instance", "create"]
+    for key, value in values.items():
+        argv += [key, value]
+    return argv
+
+
+def test_cli_instance_create_posts_only_the_selected_fields(monkeypatch: pytest.MonkeyPatch, capsys):
+    _instance_env(monkeypatch)
+    sent = []
+    monkeypatch.setattr(
+        "palimpsest_local.cli.HubClient.create_instance",
+        lambda self, request, **kwargs: sent.append(request) or {"id": _INSTANCE_ID, "status": "creating"},
+    )
+    argv = _instance_create_argv(**{"--command-json": '["/bin/true"]', "--writable-gib": "8"})
+    assert cli.main(argv) == 0
+    assert sent == [
+        {
+            "request_id": _REQUEST_ID,
+            "name": "dev-box",
+            "image_id": _INSTANCE_IMAGE,
+            "flavor_id": "m1.small",
+            "network_id": _INSTANCE_NETWORK,
+            "boot_gib": 20,
+            "writable_gib": 8,
+            "layer_digests": ["sha256:" + "b" * 64],
+            "command": ["/bin/true"],
+        }
+    ]
+    assert _INSTANCE_ID in capsys.readouterr().out
+
+
+def test_cli_instance_create_sends_every_optional_field_under_the_hub_names(monkeypatch: pytest.MonkeyPatch):
+    _instance_env(monkeypatch)
+    sent = []
+    monkeypatch.setattr(
+        "palimpsest_local.cli.HubClient.create_instance",
+        lambda self, request, **kwargs: sent.append(request) or {"id": _INSTANCE_ID},
+    )
+    group = "55555555-5555-4555-8555-555555555555"
+    job = "66666666-6666-4666-8666-666666666666"
+    cluster = "77777777-7777-4777-8777-777777777777"
+    argv = _instance_create_argv(
+        **{
+            "--layer-digest": "sha256:" + "c" * 64,
+            "--image-job-id": job,
+            "--security-group-id": group,
+            "--gpu-profile": "rtx",
+            "--cluster-profile": "k3s-agent",
+            "--cluster-server-id": cluster,
+            "--command-json": '["/bin/app", "--serve"]',
+            "--readiness-json": '["/bin/ready"]',
+        }
+    )
+    assert cli.main(argv) == 0
+    assert sent[0] == {
+        "request_id": _REQUEST_ID,
+        "name": "dev-box",
+        "image_id": _INSTANCE_IMAGE,
+        "flavor_id": "m1.small",
+        "network_id": _INSTANCE_NETWORK,
+        "boot_gib": 20,
+        "layer_digests": ["sha256:" + "c" * 64],
+        "image_job_id": job,
+        "security_group_ids": [group],
+        "gpu_profile": "rtx",
+        "cluster_profile": "k3s-agent",
+        "cluster_server_id": cluster,
+        "command": ["/bin/app", "--serve"],
+        "readiness_argv": ["/bin/ready"],
+    }
+    # source_instance_id is the remaining optional field; it replaces the layer stack on the Hub.
+    sent.clear()
+    source = "88888888-8888-4888-8888-888888888888"
+    argv = _instance_create_argv(**{"--source-instance-id": source})
+    assert cli.main([*argv[: argv.index("--layer-digest")], *argv[argv.index("--layer-digest") + 2 :]]) == 0
+    assert sent[0]["source_instance_id"] == source and "layer_digests" not in sent[0]
+
+
+_BAD_UUID = "not-a-uuid"
+_INSTANCE_BAD_CASES = [
+    (_instance_create_argv(**{"--request-id": _BAD_UUID}), "--request-id must be a UUID"),
+    (_instance_create_argv(**{"--image-id": _BAD_UUID}), "--image-id must be a UUID"),
+    (_instance_create_argv(**{"--network-id": _BAD_UUID}), "--network-id must be a UUID"),
+    (_instance_create_argv(**{"--security-group-id": _BAD_UUID}), "--security-group-id must be a UUID"),
+    (_instance_create_argv(**{"--image-job-id": _BAD_UUID}), "--image-job-id must be a UUID"),
+    (_instance_create_argv(**{"--command-json": '"/bin/true"'}), "--command-json must be a JSON array of strings"),
+    (_instance_create_argv(**{"--command-json": "[1]"}), "--command-json must be a JSON array of strings"),
+    (_instance_create_argv(**{"--command-json": "[" * 200000}), "--command-json must be a JSON array of strings"),
+    (_instance_create_argv(**{"--readiness-json": "not json"}), "--readiness-json must be a JSON array of strings"),
+    (["instance", "status", _BAD_UUID], "instance_id must be a UUID"),
+    (["instance", "stop", _BAD_UUID], "instance_id must be a UUID"),
+    (["instance", "rm", _BAD_UUID], "instance_id must be a UUID"),
+    (
+        [
+            "instance",
+            "advance",
+            _INSTANCE_ID,
+            "--operation",
+            "create-server",
+            "--request-id",
+            _BAD_UUID,
+            "--boot-volume-id",
+            _INSTANCE_VOLUME,
+        ],
+        "--request-id must be a UUID",
+    ),
+    (
+        [
+            "instance",
+            "advance",
+            _INSTANCE_ID,
+            "--operation",
+            "create-server",
+            "--request-id",
+            _REQUEST_ID,
+            "--boot-volume-id",
+            _BAD_UUID,
+        ],
+        "--boot-volume-id must be a UUID",
+    ),
+    (["instance", "ls", "--limit", "101"], "--limit must be between 1 and 100 for instance ls"),
+]
+
+
+@pytest.mark.parametrize(("argv", "message"), _INSTANCE_BAD_CASES)
+def test_cli_instance_rejects_malformed_arguments_before_any_credential_or_hub_call(
+    monkeypatch: pytest.MonkeyPatch, capsys, argv, message
+):
+    _instance_env(monkeypatch)
+    monkeypatch.setattr(
+        "palimpsest_local.cli.hub_client",
+        lambda *args, **kwargs: pytest.fail("credentials or Hub reached before local validation"),
+    )
+    assert cli.main(argv) == 1
+    assert message in capsys.readouterr().err
+
+
+def test_cli_instance_advance_binds_the_operation_to_the_reserved_volume(monkeypatch: pytest.MonkeyPatch, capsys):
+    _instance_env(monkeypatch)
+    sent = []
+    monkeypatch.setattr(
+        "palimpsest_local.cli.HubClient.advance_instance",
+        lambda self, instance_id, **kwargs: sent.append((instance_id, kwargs)) or {"status": "creating"},
+    )
+    argv = [
+        "instance",
+        "advance",
+        _INSTANCE_ID,
+        "--operation",
+        "create-server",
+        "--request-id",
+        _REQUEST_ID,
+        "--boot-volume-id",
+        _INSTANCE_VOLUME,
+    ]
+    assert cli.main(argv) == 0
+    assert sent == [
+        (
+            _INSTANCE_ID,
+            {"operation": "create-server", "request_id": _REQUEST_ID, "boot_volume_id": _INSTANCE_VOLUME},
+        )
+    ]
+    assert cli.main([*argv[:3], "--operation", "force-delete", *argv[5:]]) != 0
+    assert len(sent) == 1
+
+
+def test_cli_instance_stop_status_ls_and_rm_use_distinct_hub_calls(monkeypatch: pytest.MonkeyPatch, capsys):
+    _instance_env(monkeypatch)
+    calls = []
+    for name, result in (
+        ("list_instances", []),
+        ("get_instance", {"id": _INSTANCE_ID}),
+        ("stop_instance", {"status": "stopping"}),
+        ("delete_instance", {"status": "deleting"}),
+    ):
+        monkeypatch.setattr(
+            f"palimpsest_local.cli.HubClient.{name}",
+            lambda self, *args, _name=name, _result=result, **kwargs: calls.append((_name, args, kwargs)) or _result,
+        )
+    for argv in (
+        ["instance", "ls", "--limit", "5"],
+        ["instance", "status", _INSTANCE_ID],
+        ["instance", "stop", _INSTANCE_ID],
+        ["instance", "rm", _INSTANCE_ID],
+    ):
+        assert cli.main(argv) == 0
+    assert calls == [
+        ("list_instances", (), {"limit": 5}),
+        ("get_instance", (_INSTANCE_ID,), {}),
+        ("stop_instance", (_INSTANCE_ID,), {}),
+        ("delete_instance", (_INSTANCE_ID,), {}),
+    ]
+
+
+def test_cli_instance_commands_accept_the_cloud_flag(monkeypatch: pytest.MonkeyPatch):
+    _InstanceFakeClient.seen = []
+    monkeypatch.setattr("palimpsest_local.cli.HubClient", _InstanceFakeClient)
+    monkeypatch.setattr("palimpsest_local.cloud_cli.hub_credentials", lambda cloud: ("cloud-token", "p" * 32))
+    monkeypatch.delenv("PALIMPSEST_TOKEN", raising=False)
+    assert cli.main(["--cloud", "mycloud", "instance", "ls"]) == 0
+    assert _InstanceFakeClient.seen == [{"token": "cloud-token", "project_id": "p" * 32}]
+
+
+class _InstanceFakeClient:
+    seen: list = []
+
+    def __init__(self, url, token, project_id=None, **kwargs):
+        _InstanceFakeClient.seen.append({"token": token, "project_id": project_id})
+
+    def list_instances(self, **kwargs):
+        return []

@@ -387,6 +387,12 @@ _CLOUD_CONSUMERS = frozenset(
         ("bundle", "verify"),
         ("published", "push"),
         ("published", "pull"),
+        ("instance", "ls"),
+        ("instance", "status"),
+        ("instance", "create"),
+        ("instance", "advance"),
+        ("instance", "stop"),
+        ("instance", "rm"),
         ("run", None),
         ("build", None),
         ("compose", None),
@@ -400,8 +406,8 @@ def _reject_unused_cloud(args: argparse.Namespace) -> None:
     sub = getattr(args, f"{args.operation}_operation", None)
     if (args.operation, sub) not in _CLOUD_CONSUMERS:
         raise PalimpsestError(
-            f"--cloud does not apply to {args.operation}{' ' + sub if sub else ''}; use it with image/layer/bundle/published Hub "
-            "commands, run, build, or compose"
+            f"--cloud does not apply to {args.operation}{' ' + sub if sub else ''}; use it with image/layer/bundle/"
+            "published/instance Hub commands, run, build, or compose"
         )
 
 
@@ -1092,6 +1098,64 @@ def build_parser() -> argparse.ArgumentParser:
     published_status.add_argument(
         "--state-root", type=Path, help="state root to inspect (default: the configured state root)"
     )
+
+    instance = commands.add_parser(
+        "instance",
+        help="create and manage Hub-hosted OpenStack instances (the same service contract as the SDK)",
+        description=(
+            "Hub API instance lifecycle. create reserves the boot volume; advance submits the one explicit "
+            "provider effect bound to that volume (create-server or delete-volume); stop and rm act on the "
+            "instance's server and are never retried automatically. rm is the only command that deletes an "
+            "instance and its guest-private upper layer. Requires PALIMPSEST_TOKEN or --cloud."
+        ),
+    )
+    instance_commands = instance.add_subparsers(dest="instance_operation", required=True)
+    instance_ls = instance_commands.add_parser("ls", help="list Hub instances in the caller's project")
+    instance_ls.add_argument("--limit", type=int, default=50, help="maximum results (1-100; default: 50)")
+    instance_status = instance_commands.add_parser("status", help="show one Hub instance (point-in-time state)")
+    instance_status.add_argument("instance_id", help="Hub instance id")
+    instance_create = instance_commands.add_parser(
+        "create", help="request an instance and its boot volume (no server is created until advance)"
+    )
+    instance_create.add_argument("--request-id", required=True, help="UUID; retrying the same request replays it")
+    instance_create.add_argument("--name", required=True, help="instance name")
+    instance_create.add_argument("--image-id", required=True, help="published Hub image id (UUID)")
+    instance_create.add_argument("--flavor-id", required=True, help="Nova flavor id")
+    instance_create.add_argument("--network-id", required=True, help="Neutron network id (UUID)")
+    instance_create.add_argument("--boot-gib", required=True, type=int, help="boot volume size in GiB")
+    instance_create.add_argument("--writable-gib", type=int, help="guest-private writable capacity in GiB")
+    instance_create.add_argument(
+        "--layer-digest", action="append", default=[], help="SHA-256 layer digest, in order (repeatable)"
+    )
+    instance_create.add_argument("--image-job-id", help="Hub image job id whose result selects the layer stack")
+    instance_create.add_argument("--source-instance-id", help="retained instance whose exact layer stack is reused")
+    instance_create.add_argument(
+        "--security-group-id", action="append", default=[], help="Neutron security group id (repeatable)"
+    )
+    instance_create.add_argument("--gpu-profile", help="operator-approved GPU profile name")
+    instance_create.add_argument("--cluster-profile", help="operator-approved cluster profile name")
+    instance_create.add_argument("--cluster-server-id", help="existing cluster server instance id")
+    instance_create.add_argument("--command-json", help="JSON array of strings: guest command argv")
+    instance_create.add_argument("--readiness-json", help="JSON array of strings: readiness probe argv")
+    instance_advance = instance_commands.add_parser(
+        "advance", help="submit one explicit provider effect bound to the reserved boot volume"
+    )
+    instance_advance.add_argument("instance_id", help="Hub instance id")
+    instance_advance.add_argument(
+        "--operation",
+        dest="effect",
+        required=True,
+        choices=("create-server", "delete-volume"),
+        help="the one provider effect to submit",
+    )
+    instance_advance.add_argument("--request-id", required=True, help="UUID of the original create request")
+    instance_advance.add_argument("--boot-volume-id", required=True, help="boot volume id reported by create/status")
+    instance_stop = instance_commands.add_parser("stop", help="stop the instance's server (state is retained)")
+    instance_stop.add_argument("instance_id", help="Hub instance id")
+    instance_rm = instance_commands.add_parser(
+        "rm", help="explicitly delete an instance and its guest-private upper layer"
+    )
+    instance_rm.add_argument("instance_id", help="Hub instance id")
 
     layer = commands.add_parser("layer", help="list, pack, pull, publish, and export SquashFS layers")
     layer_commands = layer.add_subparsers(dest="layer_operation", required=True)
@@ -2622,8 +2686,92 @@ def _sync_completed_build_metadata(roots: StatePaths) -> None:
         raise PalimpsestError(f"Build output committed; local metadata synchronization failed: {exc}") from exc
 
 
+def _uuid_arg(value: str, flag: str) -> str:
+    try:
+        return str(uuid.UUID(value))
+    except ValueError:
+        raise PalimpsestError(f"{flag} must be a UUID") from None
+
+
+def _json_argv(value: str, flag: str) -> list[str]:
+    try:
+        parsed = json.loads(value)
+    except (ValueError, RecursionError):
+        raise PalimpsestError(f"{flag} must be a JSON array of strings") from None
+    if not isinstance(parsed, list) or not all(isinstance(item, str) for item in parsed):
+        raise PalimpsestError(f"{flag} must be a JSON array of strings")
+    return parsed
+
+
+def _instance_create_request(args: argparse.Namespace) -> dict:
+    request: dict = {
+        "request_id": _uuid_arg(args.request_id, "--request-id"),
+        "name": args.name,
+        "image_id": _uuid_arg(args.image_id, "--image-id"),
+        "flavor_id": args.flavor_id,
+        "network_id": _uuid_arg(args.network_id, "--network-id"),
+        "boot_gib": args.boot_gib,
+    }
+    if args.writable_gib is not None:
+        request["writable_gib"] = args.writable_gib
+    if args.layer_digest:
+        request["layer_digests"] = list(args.layer_digest)
+    for flag, key in (
+        ("image_job_id", "image_job_id"),
+        ("source_instance_id", "source_instance_id"),
+        ("cluster_server_id", "cluster_server_id"),
+    ):
+        value = getattr(args, flag)
+        if value is not None:
+            request[key] = _uuid_arg(value, "--" + flag.replace("_", "-"))
+    if args.security_group_id:
+        request["security_group_ids"] = [_uuid_arg(item, "--security-group-id") for item in args.security_group_id]
+    for flag in ("gpu_profile", "cluster_profile"):
+        if getattr(args, flag) is not None:
+            request[flag] = getattr(args, flag)
+    if args.command_json is not None:
+        request["command"] = _json_argv(args.command_json, "--command-json")
+    if args.readiness_json is not None:
+        request["readiness_argv"] = _json_argv(args.readiness_json, "--readiness-json")
+    return request
+
+
+def _dispatch_instance(args: argparse.Namespace) -> int:
+    op = args.instance_operation
+    # Validate every local argument before any credential lookup or Hub call.
+    request = _instance_create_request(args) if op == "create" else None
+    advance_ids = (
+        (_uuid_arg(args.request_id, "--request-id"), _uuid_arg(args.boot_volume_id, "--boot-volume-id"))
+        if op == "advance"
+        else None
+    )
+    instance_id = _uuid_arg(args.instance_id, "instance_id") if op not in ("ls", "create") else None
+    if op == "ls" and not 1 <= args.limit <= 100:
+        raise PalimpsestError("--limit must be between 1 and 100 for instance ls")
+    client = hub_client(args.url, args.hub_cloud)
+    if op == "ls":
+        result = client.list_instances(limit=args.limit)
+    elif op == "status":
+        result = client.get_instance(instance_id)
+    elif op == "create":
+        result = client.create_instance(request)
+    elif op == "advance":
+        request_id, boot_volume_id = advance_ids
+        result = client.advance_instance(
+            instance_id, operation=args.effect, request_id=request_id, boot_volume_id=boot_volume_id
+        )
+    elif op == "stop":
+        result = client.stop_instance(instance_id)
+    else:
+        result = client.delete_instance(instance_id)
+    print(json.dumps(result, indent=2))
+    return 0
+
+
 def dispatch_args(args: argparse.Namespace) -> int:
     op = args.operation
+    if op == "instance":
+        return _dispatch_instance(args)
     if op == "published":
         return _dispatch_published(args)
     if op == "benchmark":
