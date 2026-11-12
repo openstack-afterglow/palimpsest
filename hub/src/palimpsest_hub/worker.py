@@ -19,8 +19,22 @@ from palimpsest_hub.services.image_exports import (
     run_export_maintenance,
     validate_qemu_img_support,
 )
+from palimpsest_hub.services.instance_lifecycle import run_session_lifecycle
 
 logger = logging.getLogger(__name__)
+
+
+async def _session_lifecycle_loop(settings, stop_event: asyncio.Event) -> None:
+    """Idle auto-shelve passes run beside export work: a shelve can wait minutes on Nova."""
+    while not stop_event.is_set():
+        try:
+            await run_session_lifecycle(settings)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("Session lifecycle pass failed")
+        with suppress(TimeoutError):
+            await asyncio.wait_for(stop_event.wait(), timeout=float(settings.palimpsest_hub_session_tick_seconds))
 
 
 async def main() -> None:
@@ -63,6 +77,7 @@ async def main() -> None:
     last_delegation_cleanup = 0.0
     delegation_cleanup_interval = 60.0  # Retired requester Trusts are deleted promptly and retried durably
 
+    session_task = asyncio.create_task(_session_lifecycle_loop(settings, stop_event))
     try:
         while not stop_event.is_set():
             processed = False
@@ -91,6 +106,10 @@ async def main() -> None:
                 with suppress(TimeoutError):
                     await asyncio.wait_for(stop_event.wait(), timeout=2.0)
     finally:
+        stop_event.set()
+        session_task.cancel()
+        with suppress(asyncio.CancelledError, Exception):
+            await session_task
         logger.info("Palimpsest worker shutting down DB connection pool")
         await close_db()
 

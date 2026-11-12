@@ -3,7 +3,7 @@
 
 This file is generated from `palimpsest_local.cli.build_parser`. It inventories every command, positional, option, choice, and parser default. For behavior, examples, and runtime restrictions, read [the usage guide](usage.md). Every command except raw `docker` pass-through accepts automatic `-h`/`--help`.
 
-Coverage: **169 command paths**, **468 positional/option definitions** (excluding automatic `-h/--help`).
+Coverage: **172 command paths**, **473 positional/option definitions** (excluding automatic `-h/--help`).
 
 ## `palimpsest`
 
@@ -1208,10 +1208,10 @@ usage: palimpsest published status [-h] [--state-root STATE_ROOT]
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest instance [-h] {ls,status,create,advance,stop,rm} ...
+usage: palimpsest instance [-h] {ls,status,create,advance,stop,resume,renew,connection,rm} ...
 ```
 
-Subcommands: `ls`, `status`, `create`, `advance`, `stop`, `rm`.
+Subcommands: `ls`, `status`, `create`, `advance`, `stop`, `resume`, `renew`, `connection`, `rm`.
 
 ### `palimpsest instance ls`
 
@@ -1248,7 +1248,7 @@ usage: palimpsest instance status [-h] instance_id
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest instance create [-h] --request-id REQUEST_ID --name NAME --image-id IMAGE_ID --flavor-id FLAVOR_ID --network-id NETWORK_ID --boot-gib BOOT_GIB [--writable-gib WRITABLE_GIB] [--layer-digest LAYER_DIGEST] [--image-job-id IMAGE_JOB_ID] [--source-instance-id SOURCE_INSTANCE_ID] [--security-group-id SECURITY_GROUP_ID] [--gpu-profile GPU_PROFILE] [--cluster-profile CLUSTER_PROFILE] [--cluster-server-id CLUSTER_SERVER_ID] [--command-json COMMAND_JSON] [--readiness-json READINESS_JSON]
+usage: palimpsest instance create [-h] --request-id REQUEST_ID --name NAME --image-id IMAGE_ID --flavor-id FLAVOR_ID --network-id NETWORK_ID --boot-gib BOOT_GIB [--writable-gib WRITABLE_GIB] [--lifecycle {service,dev}] [--key-name KEY_NAME] [--layer-digest LAYER_DIGEST] [--image-job-id IMAGE_JOB_ID] [--source-instance-id SOURCE_INSTANCE_ID] [--security-group-id SECURITY_GROUP_ID] [--gpu-profile GPU_PROFILE] [--cluster-profile CLUSTER_PROFILE] [--cluster-server-id CLUSTER_SERVER_ID] [--command-json COMMAND_JSON] [--readiness-json READINESS_JSON]
 ```
 
 | Argument | Value | Parser default | Description |
@@ -1260,6 +1260,8 @@ usage: palimpsest instance create [-h] --request-id REQUEST_ID --name NAME --ima
 | `--network-id` | string | required | Neutron network id (UUID) |
 | `--boot-gib` | int | required | boot volume size in GiB |
 | `--writable-gib` | int | `None` | guest-private writable capacity in GiB |
+| `--lifecycle` | one of: `service`, `dev` | `None` | service (default), or dev with idle auto-shelve |
+| `--key-name` | string | `None` | existing Nova SSH keypair name owned by the caller |
 | `--layer-digest` | string; repeatable | `[]` | SHA-256 layer digest, in order (repeatable) |
 | `--image-job-id` | string | `None` | Hub image job id whose result selects the layer stack |
 | `--source-instance-id` | string | `None` | retained instance whose exact layer stack is reused |
@@ -1295,6 +1297,48 @@ Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
 usage: palimpsest instance stop [-h] instance_id
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `instance_id` | string | required | Hub instance id |
+
+### `palimpsest instance resume`
+
+[Behavior, restrictions, and examples](usage.md#hub-instances).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest instance resume [-h] instance_id
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `instance_id` | string | required | Hub instance id |
+
+### `palimpsest instance renew`
+
+[Behavior, restrictions, and examples](usage.md#hub-instances).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest instance renew [-h] instance_id
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `instance_id` | string | required | Hub instance id |
+
+### `palimpsest instance connection`
+
+[Behavior, restrictions, and examples](usage.md#hub-instances).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest instance connection [-h] instance_id
 ```
 
 | Argument | Value | Parser default | Description |

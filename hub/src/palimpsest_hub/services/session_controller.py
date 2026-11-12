@@ -22,7 +22,7 @@ Rules enforced here (the machine decides timing, this layer decides safety):
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from enum import StrEnum
 from typing import Protocol
 
@@ -64,13 +64,25 @@ class SessionController:
         provider: ShelveProvider,
         clock: Callable[[], float],
         grace_seconds: float = GRACE_SECONDS,
+        checkpoint: Callable[[str, SessionMachine], Awaitable[None]] | None = None,
     ) -> None:
         self._observer = observer
         self._provider = provider
         self._clock = clock
         self._grace = grace_seconds
+        # Persist the machine right after a shelve claim, before the provider is called, so a
+        # crash during the provider call leaves a durable SHELVING phase to recover from.
+        self._checkpoint = checkpoint
         self._machines: dict[str, SessionMachine] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+
+    def adopt(self, instance_id: str, machine: SessionMachine) -> None:
+        """Track an instance with a machine restored from durable state."""
+        self._machines[instance_id] = machine
+        self._locks.setdefault(instance_id, asyncio.Lock())
+
+    def machine(self, instance_id: str) -> SessionMachine:
+        return self._machines[instance_id]
 
     def register(self, instance_id: str) -> SessionMachine:
         """Start tracking a new instance; its grace period starts now."""
@@ -107,6 +119,8 @@ class SessionController:
             claim = machine.claim_shelve(now)
             if claim is None:
                 return Outcome.NOOP
+            if self._checkpoint is not None:
+                await self._checkpoint(instance_id, machine)
             return await self._shelve(instance_id, machine, claim)
 
     async def _recheck(self, instance_id: str, machine: SessionMachine) -> bool:

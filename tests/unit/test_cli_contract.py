@@ -3376,6 +3376,8 @@ def test_cli_instance_create_sends_every_optional_field_under_the_hub_names(monk
             "--cluster-server-id": cluster,
             "--command-json": '["/bin/app", "--serve"]',
             "--readiness-json": '["/bin/ready"]',
+            "--lifecycle": "dev",
+            "--key-name": "my-key",
         }
     )
     assert cli.main(argv) == 0
@@ -3394,6 +3396,8 @@ def test_cli_instance_create_sends_every_optional_field_under_the_hub_names(monk
         "cluster_server_id": cluster,
         "command": ["/bin/app", "--serve"],
         "readiness_argv": ["/bin/ready"],
+        "lifecycle": "dev",
+        "key_name": "my-key",
     }
     # source_instance_id is the remaining optional field; it replaces the layer stack on the Hub.
     sent.clear()
@@ -3417,6 +3421,9 @@ _INSTANCE_BAD_CASES = [
     (["instance", "status", _BAD_UUID], "instance_id must be a UUID"),
     (["instance", "stop", _BAD_UUID], "instance_id must be a UUID"),
     (["instance", "rm", _BAD_UUID], "instance_id must be a UUID"),
+    (["instance", "resume", _BAD_UUID], "instance_id must be a UUID"),
+    (["instance", "renew", _BAD_UUID], "instance_id must be a UUID"),
+    (["instance", "connection", _BAD_UUID], "instance_id must be a UUID"),
     (
         [
             "instance",
@@ -3536,3 +3543,69 @@ class _InstanceFakeClient:
 
     def list_instances(self, **kwargs):
         return []
+
+
+@pytest.mark.parametrize(
+    ("command", "method", "result"),
+    [
+        ("resume", "resume_instance", {"id": _INSTANCE_ID, "status": "resuming"}),
+        (
+            "renew",
+            "renew_instance_lifecycle",
+            {"instance_id": _INSTANCE_ID, "trust_expires_at": "2030-01-02T03:04:05Z"},
+        ),
+        (
+            "connection",
+            "instance_connection",
+            {"instance_id": _INSTANCE_ID, "addresses": [], "ssh": {"key_name": "my-key"}},
+        ),
+    ],
+)
+@pytest.mark.parametrize("cloud", [False, True])
+def test_cli_instance_lifecycle_commands_dispatch_json(
+    monkeypatch: pytest.MonkeyPatch, capsys, command, method, result, cloud
+):
+    _instance_env(monkeypatch)
+    calls = []
+    monkeypatch.setattr(
+        f"palimpsest_local.cli.HubClient.{method}",
+        lambda self, instance_id: calls.append(instance_id) or result,
+    )
+    prefix = []
+    if cloud:
+        monkeypatch.delenv("PALIMPSEST_TOKEN")
+        monkeypatch.setattr("palimpsest_local.cloud_cli.hub_credentials", lambda name: ("cloud-token", "p" * 32))
+        prefix = ["--cloud", "mycloud"]
+    assert cli.main([*prefix, "instance", command, _INSTANCE_ID]) == 0
+    assert calls == [_INSTANCE_ID]
+    assert json.loads(capsys.readouterr().out) == result
+
+
+def test_cli_instance_explicit_service_lifecycle_is_not_omitted(monkeypatch: pytest.MonkeyPatch):
+    _instance_env(monkeypatch)
+    sent = []
+    monkeypatch.setattr(
+        "palimpsest_local.cli.HubClient.create_instance",
+        lambda self, request, **kwargs: sent.append(request) or {"id": _INSTANCE_ID},
+    )
+    assert cli.main(_instance_create_argv(**{"--lifecycle": "service"})) == 0
+    assert sent[0]["lifecycle"] == "service"
+
+
+def test_cli_instance_lifecycle_completion_candidates():
+    from palimpsest_local import completion
+
+    parser = cli.build_parser()
+    assert set(completion.resolve_candidates(parser, ["instance", ""])) >= {
+        "ls",
+        "status",
+        "create",
+        "advance",
+        "stop",
+        "resume",
+        "renew",
+        "connection",
+        "rm",
+    }
+    assert set(completion.resolve_candidates(parser, ["instance", "create", "--"])) >= {"--lifecycle", "--key-name"}
+    assert completion.resolve_candidates(parser, ["instance", "create", "--lifecycle", ""]) == ["dev", "service"]

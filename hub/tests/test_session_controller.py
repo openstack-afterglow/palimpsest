@@ -176,3 +176,22 @@ async def test_concurrent_ticks_shelve_only_once():
     assert provider.calls == ["shelve"]
     assert results[0] is Outcome.SHELVED
     assert results[1] is Outcome.NOOP
+
+
+def test_adopted_machine_state_and_the_checkpoint_run_before_the_provider_call():
+    from palimpsest_hub.services.session_lifecycle import SessionMachine
+
+    seen = []
+
+    async def checkpoint(instance_id, machine):
+        seen.append((instance_id, machine.phase, list(provider.calls)))
+
+    provider = Provider()
+    clock = Clock()
+    controller = SessionController(Observer(set()), provider, clock, G, checkpoint=checkpoint)
+    controller.adopt(IID, SessionMachine(grace_seconds=G, grace_started=0.0))
+    clock.now = G
+    assert asyncio.run(controller.tick(IID)) is Outcome.SHELVED
+    # The durable claim (phase SHELVING) was recorded while no provider call had happened yet.
+    assert seen == [(IID, Phase.SHELVING, [])] and provider.calls == ["shelve"]
+    assert controller.machine(IID).phase is Phase.SHELVED

@@ -13,6 +13,57 @@ import json
 
 from palimpsest_hub.services.instance_cluster_runtime import CLUSTER_RUNTIME
 from palimpsest_hub.services.instance_gpu_runtime import GPU_RUNTIME
+from palimpsest_hub.services.session_observer import GUEST_PROBE_COMMAND
+
+SESSION_REPORTER = (
+    "import json, pathlib, subprocess, time, urllib.request\n"
+    f"PROBE = {GUEST_PROBE_COMMAND!r}\n"
+    + r"""
+CONFIG = pathlib.Path('/var/lib/palimpsest-instance/session.json')
+
+
+def run_once(cfg):
+    try:
+        result = subprocess.run(
+            ['/bin/sh', '-c', PROBE],
+            stdin=subprocess.DEVNULL, capture_output=True, timeout=10,
+        )
+        if result.returncode != 0 or len(result.stdout) > 65536:
+            return
+        probe = result.stdout.decode('utf-8')
+        request = urllib.request.Request(
+            cfg['origin'] + '/v1/instance-bootstrap/' + cfg['instance_id'] + '/sessions',
+            data=json.dumps({'probe': probe}).encode('utf-8'),
+            headers={
+                'Authorization': 'Bearer ' + cfg['capability'],
+                'Content-Type': 'application/json',
+            },
+            method='PUT',
+        )
+        with urllib.request.urlopen(request, timeout=15):
+            pass
+    except Exception:
+        # Failed observations must go stale, not become an empty session report.
+        pass
+
+
+def main():
+    while True:
+        interval = 30
+        try:
+            cfg = json.loads(CONFIG.read_text(encoding='utf-8'))
+            interval = max(10, min(120, int(cfg['interval_seconds'])))
+            run_once(cfg)
+        except Exception:
+            # Keep retrying without logging credentials or probe output.
+            pass
+        time.sleep(interval)
+
+
+if __name__ == '__main__':
+    main()
+"""
+)
 
 
 def render_runner(gpu: bool = False, cluster: bool = False) -> str:
@@ -476,9 +527,10 @@ WantedBy=multi-user.target
             "content": base64.b64encode(content.encode()).decode(),
         }
 
+    runner_spec = {key: value for key, value in spec.items() if key != "session_report"}
     payload = {
         "write_files": [
-            file("/var/lib/palimpsest-instance/spec.json", json.dumps(spec, separators=(",", ":"))),
+            file("/var/lib/palimpsest-instance/spec.json", json.dumps(runner_spec, separators=(",", ":"))),
             file(
                 "/var/lib/palimpsest-instance/runner.py",
                 render_runner(cluster=True)
@@ -489,6 +541,40 @@ WantedBy=multi-user.target
         ],
         "runcmd": [["systemctl", "daemon-reload"], ["systemctl", "enable", "--now", "palimpsest-instance.service"]],
     }
+    session_report = spec.get("session_report")
+    if isinstance(session_report, dict):
+        session_config = {
+            "origin": spec["origin"],
+            "instance_id": spec["instance_id"],
+            "capability": session_report["capability"],
+            "interval_seconds": session_report["interval_seconds"],
+        }
+        reporter_unit = """[Unit]
+Description=Palimpsest guest session reporter
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /var/lib/palimpsest-instance/session_reporter.py
+Restart=always
+RestartSec=10
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+[Install]
+WantedBy=multi-user.target
+"""
+        payload["write_files"].extend(
+            [
+                file("/var/lib/palimpsest-instance/session.json", json.dumps(session_config, separators=(",", ":"))),
+                file("/var/lib/palimpsest-instance/session_reporter.py", SESSION_REPORTER, "0700"),
+                file("/etc/systemd/system/palimpsest-session-reporter.service", reporter_unit, "0644"),
+            ]
+        )
+        payload["runcmd"].append(["systemctl", "enable", "--now", "palimpsest-session-reporter.service"])
     if spec.get("ca_certificates"):
         payload["ca_certs"] = {"trusted": spec["ca_certificates"]}
     return "#cloud-config\n" + json.dumps(payload, separators=(",", ":")) + "\n"
