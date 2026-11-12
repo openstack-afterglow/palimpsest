@@ -588,6 +588,10 @@ async def _checkpoint(factory, identity, actor, profile_digest, state, *, resumi
         await session.commit()
 
 
+class _PreflightRefused(CloudEnvError):
+    """Preflight failed before any native allocation; the intent ends without a HOLD."""
+
+
 def _execute(profile, actor, conn, checkpoint, identity, published, request, approval_digest, deleting):
     with _operation_lock(profile):
         # Recheck after flock: a competing terminal commit may have become
@@ -609,7 +613,9 @@ def _execute(profile, actor, conn, checkpoint, identity, published, request, app
         approval = _operator_paths(profile)
         _approval_source(profile, approval, request["phase"], published["manifest_digest"])
         settings = getattr(checkpoint, "settings", None)
-        if not deleting and settings is not None:
+        if settings is None:
+            raise CloudEnvError("native preflight settings missing; HOLD")
+        try:
             preflight.require(
                 conn,
                 actor,
@@ -617,6 +623,9 @@ def _execute(profile, actor, conn, checkpoint, identity, published, request, app
                 interface=settings.os_interface,
                 region_name=settings.os_region_name,
             )
+        except HTTPException as exc:
+            # Nothing was allocated and no native run exists yet: end terminally, never HOLD.
+            raise _PreflightRefused("native preflight refused before any allocation") from exc
         env._native_authorize = getattr(checkpoint, "authorize", None)
         env._hub_published_image = {
             "project_id": profile["project_id"],
@@ -638,13 +647,19 @@ def _execute(profile, actor, conn, checkpoint, identity, published, request, app
         )
 
 
-async def _commit_settlement(factory, actor, identity, held):
+async def _commit_settlement(factory, actor, identity, held, refused=False):
     async with factory() as session:
         row = await _owned(session, identity, actor)
         if row.status not in {"creating", "deleting"}:
             return
         run = _journal(row.journal_json).get("run") or {}
         status = run.get("status")
+        if refused:
+            row.status = "deleted"
+            row.error_code = "preflight_failed"
+            row.updated_at = datetime.now(UTC)
+            await session.commit()
+            return
         row.status = "held" if held else {"cleaned": "deleted", "retained": "retained"}.get(status, "held")
         row.error_code = "native_operation_held" if row.status == "held" else None
         row.updated_at = datetime.now(UTC)
@@ -675,11 +690,12 @@ def _settle_locked(profile, commit):
             raise
 
 
-async def _settle(factory, actor, identity, profile, *, held=False):
+async def _settle(factory, actor, identity, profile, *, held=False, refused=False):
     loop = asyncio.get_running_loop()
+    extra = (True,) if refused else ()
 
     def commit():
-        asyncio.run_coroutine_threadsafe(_commit_settlement(factory, actor, identity, held), loop).result()
+        asyncio.run_coroutine_threadsafe(_commit_settlement(factory, actor, identity, held, *extra), loop).result()
 
     await run_blocking(_settle_locked, profile, commit)
 
@@ -736,6 +752,8 @@ async def _run(factory, actor, conn, profile, row, settings, deleting=False):
         # run_blocking has drained the driver before reaching this branch.
         await _settle(factory, actor, identity, profile)
         raise
+    except _PreflightRefused:
+        await _settle(factory, actor, identity, profile, refused=True)
     except Exception:
         await _settle(factory, actor, identity, profile, held=True)
     else:

@@ -475,6 +475,9 @@ async def test_quota_is_rechecked_before_server_post(instance_hub):
     assert detail["code"] == "preflight_failed"
     assert any(entry["service"] == "compute" and "core quota" in entry["detail"] for entry in detail["failures"])
     assert len(h.provider.volume_creates) == 1 and h.provider.creates == []
+    assert h.provider.volume_deletes == [] and len(h.provider.volumes_by_id) == 1
+    row = (await h.client.get("/v1/instances/" + item["id"])).json()
+    assert row["error_code"] == "preflight_failed", row
 
 
 @pytest.mark.asyncio
@@ -4110,6 +4113,23 @@ async def test_native_driver_cancellation_drains_before_releasing_pending_lifecy
             await asyncio.wait_for(request, timeout=5)
     settled = (await n.h.client.get("/v1/native-instances/" + pending["id"])).json()
     assert settled["status"] == "retained"
+
+
+async def test_native_preflight_refusal_ends_terminally_and_frees_the_environment(native_hub, monkeypatch):
+    n = native_hub
+
+    def refused(profile, actor, conn, checkpoint, run_id, image, request, approval_digest, deleting):
+        n.calls.append((run_id, deleting))
+        raise n.service._PreflightRefused("native preflight refused before any allocation")
+
+    monkeypatch.setattr(n.service, "_execute", refused)
+    created = await n.h.client.post("/v1/native-instances", json=n.body)
+    assert created.status_code == 202
+    settled = (await n.h.client.get("/v1/native-instances/" + created.json()["id"])).json()
+    assert settled["status"] == "deleted" and settled["error_code"] == "preflight_failed"
+    # A refused intent holds no consumer slot: a fresh request is admitted, not blocked by HOLD.
+    second = await n.h.client.post("/v1/native-instances", json={**n.body, "request_id": str(uuid4())})
+    assert second.status_code == 202 and len(n.calls) == 2
 
 
 async def test_native_api_create_defaults_to_retained_but_requires_explicit_operator_retention(native_hub, monkeypatch):

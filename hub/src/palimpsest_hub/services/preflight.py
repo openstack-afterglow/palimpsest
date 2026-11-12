@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from fastapi import HTTPException
+from openstack import exceptions as openstack_exceptions
 
 REQUIRED_SERVICES = ("compute", "network", "image", "volumev3")
 SHARED_FILE_SERVICE = "shared-file-system"
@@ -237,13 +238,19 @@ def run(
                 if type(vcpus) is not int or vcpus <= 0 or type(ram) is not int or ram <= 0:
                     raise ValueError("flavor sizing missing")
                 flavor_size = (vcpus, ram)
-            except Exception as exc:
+            except (ValueError, openstack_exceptions.NotFoundException) as exc:
                 failures.append(
                     _failure(
                         "resource",
                         "compute",
                         f"requested flavor unavailable or unreadable: {type(exc).__name__}",
                         "select an available flavor with readable vCPU and RAM sizing",
+                    )
+                )
+            except Exception as exc:
+                failures.append(
+                    _failure(
+                        "quota", "compute", f"flavor lookup failed: {type(exc).__name__}", "check compute API access"
                     )
                 )
         failures.extend(_quota_failures(conn, need, project, flavor_size))

@@ -118,6 +118,22 @@ def test_failure_is_structured_and_nothing_is_allocated(conn, status, check, ser
     assert conn.allocations == []
 
 
+def test_transient_flavor_lookup_failure_is_not_reported_as_bad_input():
+    conn = FakeConn()
+
+    def unavailable(flavor_id):
+        raise TimeoutError("compute timeout")
+
+    conn.compute.get_flavor = unavailable
+    with pytest.raises(HTTPException) as raised:
+        allocate(conn)
+    failures = raised.value.detail["failures"]
+    assert raised.value.status_code == 409
+    assert not any(item["check"] == "resource" for item in failures)
+    assert any("flavor lookup failed: TimeoutError" in item["detail"] for item in failures)
+    assert conn.allocations == []
+
+
 def test_missing_policy_action_is_403_and_allocates_nothing():
     conn = FakeConn()
     with pytest.raises(HTTPException) as raised:
