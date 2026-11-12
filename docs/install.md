@@ -1,5 +1,9 @@
 # Detailed installation and configuration guide
 
+## 0.3.16 transition note — 2026-11-13 (UTC; candidate)
+
+0.3.16 is a patch over 0.3.15 and adds one table, `palimpsest_hub_instance_lifecycle`, for `lifecycle=dev` instances (idle auto-shelve). `kolla-ansible reconfigure` does not create it: run the new API image's `palimpsest-hub-bootstrap` once, offline, with every writer stopped and a paired SQL/CAS backup taken, before any dev instance is created. Existing (`service`) instances never touch the table and keep working without it. New optional settings `PALIMPSEST_HUB_SESSION_*` (see the Hub settings table) are not rendered by the Kolla role and default to a 7-day per-instance Trust, 30 s guest reports and a 120 s report age bound. The worker runs an extra `session-lifecycle` role task. Use the rollout gates below (writer drain, paired backup, no DB restore, no forced stop).
+
 ## 0.3.15 transition note — 2026-11-08 (UTC; deployed 2026-11-09)
 
 0.3.15 is a patch over 0.3.14: staged publication payload registration and limit checks enforce byte-exact `project_id` and `created_by` equality via binary SQL casts (`cast(..., LargeBinary)`) under case-insensitive SQL collations (such as SQLite NOCASE and MariaDB/MySQL default collations). Foreign casing variants can no longer match an image or free/claim staged quota. Test limits and residuals: verified under synthetic SQLite NOCASE schema simulation; live MariaDB reproduction was not executed in CI; existing database primary key collation collision risks remain if unique identity columns use case-insensitive collations. No schema change or bootstrap run is required. Follow the 0.3.13 transition gate below as amended by the 0.3.14 note, including `/v1/published-images/quota` in step 6. Writer drain, paired backup, build-worker rollout and rollback remain required. 0.3.15 was deployed to the DMS Lab controllers on 2026-11-09 following the gate below; the paired backup was taken but never restore-tested.
@@ -27,11 +31,11 @@ initial configuration, upgrades, and administrator-owned Linux deployment.
 Released installations use pinned published bytes; trusted local installation below uses the actual checkout's bytes.
 
 Palimpsest Local requires Python 3.11 or newer; Hub requires Python 3.12+.
-Version 0.3.15 is published (tag `0.3.15`, PyPI `palimpsest-client` 0.3.15) and was deployed to the production Hub on 2026-11-09; the pre-deploy SQL/CAS backup of that rollout is not restore-tested.
+Version 0.3.15 is published (tag `0.3.15`, PyPI `palimpsest-client` 0.3.15) and was deployed to the production Hub on 2026-11-09; the pre-deploy SQL/CAS backup of that rollout is not restore-tested. 0.3.16 is an unpublished, undeployed candidate until its tag, PyPI release and rollout are recorded in the handoff.
 SDK publication and native execution remain separately qualified. Root/Hub metadata, module versions,
 generated locks and Kolla image defaults move together. After formal publication,
 install exact client bytes with
-`uv tool install --python 3.11 palimpsest-client==0.3.15`, or install a trusted
+`uv tool install --python 3.11 palimpsest-client==0.3.16`, or install a trusted
 local checkout with `uv tool install --force --python 3.11 .`.
 A root wheel upgrade neither deploys Hub nor qualifies actual build/run behavior.
 Git/outbound GitHub HTTPS is needed only for VCS installation.
@@ -1675,7 +1679,7 @@ and the [command workflows](cli/workflows.md) for operational details.
 
 ## SDK image/native integration: operator prerequisites
 
-The `0.3.15` candidate Hub distribution declares the exact matching client dependency.
+The `0.3.16` candidate Hub distribution declares the exact matching client dependency.
 Checkout resolution uses `hub`'s explicit parent-path source; installed release
 bytes must match the same immutable tag and reviewed image digests. Paired wheel
 or local container checks do not establish production upgrade or native readiness.
