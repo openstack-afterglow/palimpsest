@@ -23,6 +23,7 @@ from palimpsest_hub.auth import get_os_conn, get_package_manager_info, package_t
 from palimpsest_hub.config import get_settings
 from palimpsest_hub.instance_models import PalimpsestHubInstance
 from palimpsest_hub.models import exact_identity
+from palimpsest_hub.services import instance_lifecycle as lifecycle
 from palimpsest_hub.services import instances as service
 from palimpsest_hub.services.digest import normalize_digest
 from palimpsest_hub.services.instance_cluster_runtime import (
@@ -41,6 +42,8 @@ class InstanceRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     request_id: UUID
     name: str = Field(pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$")
+    lifecycle: Literal["service", "dev"] = "service"
+    key_name: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9_. @-]{0,254}$")
     image_id: UUID
     flavor_id: str = Field(min_length=1, max_length=64, pattern=r"^[a-zA-Z0-9_.-]+$")
     gpu_profile: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
@@ -96,6 +99,8 @@ class InstanceRequest(BaseModel):
             raise ValueError("writable_gib must be smaller than boot_gib")
         if self.cluster_server_id and not self.cluster_profile:
             raise ValueError("cluster_server_id requires cluster_profile")
+        if self.lifecycle == "dev" and self.cluster_profile:
+            raise ValueError("lifecycle=dev excludes cluster_profile because guest user-data exceeds Nova's size limit")
         if self.cluster_profile and (self.gpu_profile or self.command or self.readiness_argv):
             raise ValueError("cluster_profile excludes GPU and caller-selected execution")
         return self
@@ -176,6 +181,26 @@ async def stop_instance(instance_id: UUID, actor: dict = Depends(_instance_contr
     return await service.action(_factory_or_503(), actor, conn, str(instance_id), "stop")
 
 
+@router.post("/instances/{instance_id}/resume", status_code=202, operation_id="resume_hub_instance")
+async def resume_instance(instance_id: UUID, actor: dict = Depends(_instance_controller), conn=Depends(get_os_conn)):
+    return await lifecycle.resume(_factory_or_503(), actor, conn, str(instance_id), get_settings())
+
+
+@router.post("/instances/{instance_id}/lifecycle/renew", operation_id="renew_hub_instance_lifecycle")
+async def renew_instance_lifecycle(
+    instance_id: UUID, actor: dict = Depends(_instance_controller), conn=Depends(get_os_conn)
+):
+    return await lifecycle.renew_trust(_factory_or_503(), actor, conn, str(instance_id), get_settings())
+
+
+@router.get("/instances/{instance_id}/connection", operation_id="get_hub_instance_connection")
+async def instance_connection(
+    instance_id: UUID, response: Response, actor: dict = Depends(_legacy_inventory), conn=Depends(get_os_conn)
+):
+    response.headers["Cache-Control"] = "no-store"
+    return await lifecycle.connection_info(_factory_or_503(), actor, conn, str(instance_id), get_settings())
+
+
 @router.delete("/instances/{instance_id}", status_code=202, operation_id="delete_hub_instance")
 async def delete_instance(instance_id: UUID, actor: dict = Depends(_instance_controller), conn=Depends(get_os_conn)):
     return await service.action(_factory_or_503(), actor, conn, str(instance_id), "delete")
@@ -186,6 +211,37 @@ def bearer(request):
     if not header.startswith("Bearer ") or not 32 <= len(header[7:]) <= 128:
         raise HTTPException(404, "Bootstrap capability not found or expired")
     return header[7:]
+
+
+class InstanceSessionReport(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    probe: str = Field(max_length=65536)
+
+
+@router.put(
+    "/instance-bootstrap/{instance_id}/sessions",
+    status_code=204,
+    operation_id="report_instance_sessions",
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "content": {"application/json": {"schema": InstanceSessionReport.model_json_schema()}},
+        }
+    },
+)
+async def report_instance_sessions(instance_id: UUID, request: Request):
+    token = bearer(request)
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > 6 * 65536 + 64:
+            raise HTTPException(413, "Guest session report exceeds byte limit")
+        body.extend(chunk)
+    try:
+        report = InstanceSessionReport.model_validate_json(bytes(body))
+    except ValueError:
+        raise HTTPException(422, "Invalid bounded guest session report") from None
+    await lifecycle.ingest_report(_factory_or_503(), str(instance_id), token, report.probe)
+    return Response(status_code=204, headers={"Cache-Control": "no-store"})
 
 
 @router.get("/instance-bootstrap/{instance_id}/layers/{digest}", operation_id="get_instance_bootstrap_layer")

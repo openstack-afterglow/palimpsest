@@ -136,3 +136,43 @@ def test_settling_or_unshelving_in_the_wrong_phase_is_an_error():
 def test_nonpositive_grace_is_rejected():
     with pytest.raises(ValueError):
         SessionMachine(grace_seconds=0)
+
+
+def test_a_machine_survives_a_json_round_trip_exactly():
+    machine = SessionMachine(grace_seconds=120.0)
+    machine.connect("a", 5.0)
+    machine.connect("b", 6.0)
+    machine.disconnect("a", 7.0)
+    machine.observation_failed(8.0)
+    restored = SessionMachine.from_state(machine.to_state())
+    assert restored == machine and restored.sessions == {"b"} and restored.phase is Phase.ACTIVE
+    idle = idle_machine()
+    assert SessionMachine.from_state(idle.to_state()).decide(100.0 + G) is Decision.SHELVE_DUE
+
+
+@pytest.mark.parametrize(
+    "broken",
+    [
+        {},
+        {"phase": "nonsense"},
+        {"sessions": "a"},
+        {"generation": True},
+        {"grace_started": "soon"},
+        {"grace_seconds": None},
+        {"reconnected_during_shelve": 1},
+    ],
+)
+def test_a_malformed_snapshot_is_refused_rather_than_guessed(broken):
+    state = {**SessionMachine().to_state(), **broken} if broken else {}
+    with pytest.raises(ValueError):
+        SessionMachine.from_state(state)
+
+
+def test_resume_of_a_userless_machine_starts_a_new_full_grace_only_when_given_the_time():
+    machine = SessionMachine(phase=Phase.SHELVED)
+    machine.unshelved(1000.0)
+    assert machine.phase is Phase.GRACE and machine.grace_started == 1000.0
+    assert machine.decide(1000.0 + G - 1) is Decision.WAIT and machine.decide(1000.0 + G) is Decision.SHELVE_DUE
+    bare = SessionMachine(phase=Phase.SHELVED)
+    bare.unshelved()
+    assert bare.grace_started is None and bare.decide(10**9) is Decision.WAIT

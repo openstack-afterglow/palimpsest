@@ -48,6 +48,8 @@ class Provider:
     def __init__(self):
         self.servers_by_id = {}
         self.volumes_by_id = {}
+        self.keypairs = {"laptop"}
+        self.keypair_lookups = []
         self.creates = []
         self.deletes = []
         self.volume_creates = []
@@ -106,6 +108,10 @@ class Provider:
 
     def get_flavor(self, flavor_id):
         return {"id": flavor_id, "ram": 1024, "disk": 0, "vcpus": 1, "is_public": True}
+
+    def find_keypair(self, name, ignore_missing=True):
+        self.keypair_lookups.append(name)
+        return {"name": name} if name in self.keypairs else None
 
     def fetch_flavor_extra_specs(self, flavor):
         return {**flavor, "extra_specs": {}}
@@ -1718,6 +1724,9 @@ async def test_cpu_request_digest_is_compatible_with_pre_gpu_api(instance_hub):
     expected.pop("gpu_profile")
     expected.pop("cluster_profile")
     expected.pop("cluster_server_id")
+    # Defaults of later opt-in fields must not change the pre-upgrade idempotency digest.
+    assert expected.pop("lifecycle") == "service"
+    assert expected.pop("key_name") is None
     response = await create_and_advance(h, json=body)
     assert response.status_code == 202, response.text
     async with h.factory() as session:

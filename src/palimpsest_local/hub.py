@@ -635,6 +635,15 @@ class HubClient:
     def stop_instance(self, instance_id: str) -> dict[str, Any]:
         return self._json_request("POST", "/instances/" + urllib.parse.quote(instance_id, safe="") + "/stop")
 
+    def resume_instance(self, instance_id: str) -> dict[str, Any]:
+        return self._json_request("POST", "/instances/" + urllib.parse.quote(instance_id, safe="") + "/resume")
+
+    def renew_instance_lifecycle(self, instance_id: str) -> dict[str, Any]:
+        return self._json_request("POST", "/instances/" + urllib.parse.quote(instance_id, safe="") + "/lifecycle/renew")
+
+    def instance_connection(self, instance_id: str) -> dict[str, Any]:
+        return self._json_request("GET", "/instances/" + urllib.parse.quote(instance_id, safe="") + "/connection")
+
     def delete_instance(self, instance_id: str) -> dict[str, Any]:
         return self._json_request("DELETE", "/instances/" + urllib.parse.quote(instance_id, safe=""))
 

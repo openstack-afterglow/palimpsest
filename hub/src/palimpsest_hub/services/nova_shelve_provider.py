@@ -61,6 +61,10 @@ class NovaShelveProvider:
             raise ProviderError("nova returned no server status")
         return status
 
+    async def server_status(self, server_id: str) -> str:
+        """Current Nova status (uppercase); used to settle a shelve whose outcome was unknown."""
+        return (await self._status(server_id)).upper()
+
     async def _await_status(self, server_id: str, target: str) -> None:
         deadline = self._clock() + self._timeout
         while True:

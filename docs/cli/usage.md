@@ -22,7 +22,7 @@ Do not treat these similarly named surfaces as interchangeable:
 | Surface | Examples | Backend and credentials |
 | --- | --- | --- |
 | Palimpsest Hub artifacts | `image ls`, `image pull`, `image push`, `image git-build`, `image git-job`, `layer ls/check/pack/pull/push`, `bundle *`, `published push/pull/status` | Native Palimpsest Hub `/v1`; `PALIMPSEST_TOKEN` for Hub operations (local `layer pack` needs none); `published` also accepts an image API key and anonymous public pulls |
-| Hub instances | `instance ls/status/create/advance/stop/rm` | Native Palimpsest Hub `/v1/instances`; `PALIMPSEST_TOKEN` or `--cloud`. See [Hub instances](#hub-instances). |
+| Hub instances | `instance ls/status/create/advance/stop/resume/renew/connection/rm` | Native Palimpsest Hub `/v1/instances`; `PALIMPSEST_TOKEN` or `--cloud`. See [Hub instances](#hub-instances). |
 | Docker wrapper | `pull`, `push`, `tag`, `images`, `history`, `rmi`, `save`, `load`, and `image inspect/history/rm/save/load` | Installed Docker CLI and external OCI registries; Docker credentials |
 | Local OCI root | `oci pull`, `oci materialize`, `run ./image.oci.tar --runtime-kind oci-root` | Anonymous TLS registry acquisition into a verified local archive; private source CAS and Linux KVM runtime |
 | Permanent shared OCI cache | `oci cache --root PATH init/pull/import/materialize/retain/release/inspect` | Explicit private directory on pre-mounted persistent storage; anonymous verified TLS for pulls, current local CAS/materializer authority |
@@ -89,20 +89,27 @@ palimpsest published status --state-root "$HOME/palimpsest-consumer/state"
 
 ### Hub instances
 
-`instance` drives the same Hub `/v1/instances` endpoints as `HubClient.create_instance`, `advance_instance`, `stop_instance` and `delete_instance`; it adds no server behavior.
+`instance` drives the same Hub `/v1/instances` endpoints as the matching `HubClient` methods; it adds no server behavior.
 
 - `instance create` reserves the boot volume only. The server is created by a separate `instance advance INSTANCE_ID --operation create-server --request-id ... --boot-volume-id ...`, which binds the effect to the volume that `create`/`status` reported. `--operation delete-volume` releases a reserved volume that never got a server.
+- `--lifecycle service` (default) never auto-shelves; use it for workloads. `--lifecycle dev` is a development VM: five minutes without an observed guest login session triggers shelve, even after its command/service reaches `ready`. Stale, missing or unparseable guest reports are unknown observations, not idle; they restart the grace timer. Dev lifecycle excludes cluster profiles.
+- `--key-name` must name an existing Nova SSH keypair owned by the caller; the Hub passes it to Nova at server creation.
 - `instance status` is a point-in-time read. When the guest has reported a result, it contains `result.stdout` and `result.stderr` (each at most 8192 characters), `exit_code` and `error_code`; there is no streaming log endpoint.
-- `instance stop` stops the server and keeps the instance. `instance rm` is the only command that deletes an instance and its guest-private upper layer. Neither is retried automatically.
+- `instance stop` retains the instance; on a shelved instance it returns 409 (`resume it before stopping`). `instance rm` alone deletes the instance and its guest-private upper layer. Neither is retried automatically.
 - `instance ls --limit` accepts 1-100 (the Hub route maximum).
 - Local arguments (UUIDs, JSON argv arrays) are validated before any credential is read or Hub call is made. `--cloud` is accepted.
-- The Hub exposes no SSH-connection-info or resume route, so the CLI has none.
+- `instance resume ID` unshelves using the caller's token, but guest processes do not survive shelve. Only the base VM boots from the preserved boot volume (including the writable layer file); the runner does not restart the layer overlay or command. Status becomes `resumed`, not `ready`.
+- The idle-shelve delegation trust lasts seven days by default and is replaced by `create`, `resume` and `instance renew ID`. Only the creating owner can replace it; a project manager can resume without replacing the trust. When it lapses, auto-shelve silently stops and the instance keeps running. `resume` and `renew` return 409 for service instances; neither is retried automatically.
+- `instance connection ID` returns server id, status, provider status, addresses and key name. `ssh.port=22` is an unverified default; SSH user and host keys are unknown (`null`).
 
 ```sh
 palimpsest instance create --request-id "$REQ" --name dev-box --image-id "$IMAGE" --flavor-id m1.small \
   --network-id "$NET" --boot-gib 20 --layer-digest "$LAYER"
 palimpsest instance advance "$ID" --operation create-server --request-id "$REQ" --boot-volume-id "$VOL"
 palimpsest instance status "$ID"
+palimpsest instance connection "$ID"
+palimpsest instance renew "$ID"
+palimpsest instance resume "$ID"
 palimpsest instance stop "$ID"
 palimpsest instance rm "$ID"
 ```

@@ -9,8 +9,18 @@ All notable changes to Palimpsest Local are documented here.
 - `palimpsest instance ls|status|create|advance|stop|rm`: CLI over the existing Hub `/v1/instances`
   endpoints (the same calls as `HubClient`). Arguments are validated before any credential lookup or Hub
   call, and `--cloud` is accepted. Covered by `tests/unit/test_cli_contract.py` with a stubbed client;
-  not run against a real Hub or OpenStack. `status` shows the guest-reported stdout/stderr; the Hub has
-  no streaming log, SSH-info or resume endpoint, so those parts of the M4-08 contract are not available.
+  not run against a real Hub or OpenStack. `status` shows the guest-reported stdout/stderr; there is no
+  streaming log endpoint.
+- Hub dev-instance idle auto-shelve: `palimpsest instance create --lifecycle dev [--key-name NAME]`,
+  `instance resume|renew|connection`. A `dev` instance keeps an owner-minted Keystone Trust (default 7
+  days, renewed by `create`, `resume`, `renew`), reports guest login sessions through a hardened guest
+  service, and is shelved by the worker after 5 minutes with no observed session. Missing, stale or
+  unparseable guest reports are unknown, never idle; a crash or unconfirmed Nova wait is settled from
+  Nova's real status; an expired trust means no shelve. `resume` unshelves with the caller's own token and
+  boots only the base VM (the layer overlay and command are not restarted; processes do not survive;
+  status `resumed`). New table `palimpsest_hub_instance_lifecycle` (offline `palimpsest-hub-bootstrap`
+  before dev instances; `migrate` copies it). New settings `PALIMPSEST_HUB_SESSION_*`. `service` instances
+  (the default) are unchanged. Covered by fake-Nova/Keystone tests only; not verified on a real cloud.
 - Experimental native VZ `commit` (opt-in `PALIMPSEST_EXPERIMENTAL_VZ_COMMIT=1`, not advertised as a
   capability): a stopped, unheld Lima-VZ OCI-root instance's overlay upper is cloned (APFS
   clonefile), read with e2fsprogs `debugfs`/`e2fsck` (`PALIMPSEST_COMMIT_DEBUGFS`,
@@ -18,6 +28,11 @@ All notable changes to Palimpsest Local are documented here.
   image under `<state>/oci-commits/<tag>`. Platform-bound identity files are never inherited and the
   source disk is never modified. Proven once live on one Apple-silicon host (three VMs); package
   installs, `.plmignore` and Hub publication are not yet proven live.
+
+### Removed
+
+- `services/shelve_delegation.py` (short-TTL trust per shelve, never wired): superseded by the
+  instance-lifetime trust above.
 
 ### Fixed
 

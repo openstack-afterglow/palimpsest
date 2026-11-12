@@ -269,6 +269,16 @@ class Settings(DatabaseSettings):
     # `download_image` policy requires `member` even for project-owned images.
     palimpsest_hub_export_delegated_roles: tuple[str, ...] = ("member",)
     palimpsest_hub_export_delegation_ttl_seconds: int = Field(default=21600, ge=900, le=86400)
+    # Dev-instance idle auto-shelve (lifecycle="dev"): the Hub holds one requester-created
+    # Keystone Trust per instance with these non-administrative roles. The trust is finite and
+    # renewed only by the owner's own requests; an expired trust makes shelve fail closed.
+    palimpsest_hub_session_delegated_roles: tuple[str, ...] = ("member",)
+    palimpsest_hub_session_delegation_ttl_seconds: int = Field(default=604800, ge=3600, le=2592000)
+    # Guest probe cadence and the age after which a missing report counts as an unknown
+    # observation (never as "no session"). The Hub only shelves from a fresh report.
+    palimpsest_hub_session_report_interval_seconds: int = Field(default=30, ge=10, le=120)
+    palimpsest_hub_session_report_max_age_seconds: int = Field(default=120, ge=30, le=600)
+    palimpsest_hub_session_tick_seconds: int = Field(default=30, ge=5, le=300)
     # Anonymous public-image reads are counted per client address as resolved by
     # uvicorn (request.client.host): the TCP peer, or the X-Forwarded-For value
     # only when uvicorn runs with --proxy-headers and the peer is listed in its
@@ -475,6 +485,18 @@ class Settings(DatabaseSettings):
     @classmethod
     def canonical_protected_ids(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         return tuple(dict.fromkeys(validate_keystone_id(item) for item in value))
+
+    @field_validator("palimpsest_hub_session_delegated_roles")
+    @classmethod
+    def least_session_roles(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        roles = tuple(dict.fromkeys(value))
+        if (
+            not roles
+            or any(not isinstance(role, str) or not role or role != role.strip() or len(role) > 255 for role in roles)
+            or {role.casefold() for role in roles} & FORBIDDEN_DELEGATED_ROLES
+        ):
+            raise ValueError("delegated session roles must be non-administrative Keystone role names")
+        return roles
 
     @field_validator("palimpsest_hub_export_delegated_roles")
     @classmethod

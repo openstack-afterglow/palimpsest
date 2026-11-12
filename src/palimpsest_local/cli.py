@@ -392,6 +392,9 @@ _CLOUD_CONSUMERS = frozenset(
         ("instance", "create"),
         ("instance", "advance"),
         ("instance", "stop"),
+        ("instance", "resume"),
+        ("instance", "renew"),
+        ("instance", "connection"),
         ("instance", "rm"),
         ("run", None),
         ("build", None),
@@ -1125,6 +1128,10 @@ def build_parser() -> argparse.ArgumentParser:
     instance_create.add_argument("--boot-gib", required=True, type=int, help="boot volume size in GiB")
     instance_create.add_argument("--writable-gib", type=int, help="guest-private writable capacity in GiB")
     instance_create.add_argument(
+        "--lifecycle", choices=("service", "dev"), help="service (default), or dev with idle auto-shelve"
+    )
+    instance_create.add_argument("--key-name", help="existing Nova SSH keypair name owned by the caller")
+    instance_create.add_argument(
         "--layer-digest", action="append", default=[], help="SHA-256 layer digest, in order (repeatable)"
     )
     instance_create.add_argument("--image-job-id", help="Hub image job id whose result selects the layer stack")
@@ -1152,6 +1159,14 @@ def build_parser() -> argparse.ArgumentParser:
     instance_advance.add_argument("--boot-volume-id", required=True, help="boot volume id reported by create/status")
     instance_stop = instance_commands.add_parser("stop", help="stop the instance's server (state is retained)")
     instance_stop.add_argument("instance_id", help="Hub instance id")
+    instance_resume = instance_commands.add_parser("resume", help="unshelve an instance using the caller's token")
+    instance_resume.add_argument("instance_id", help="Hub instance id")
+    instance_renew = instance_commands.add_parser("renew", help="renew the instance's idle-shelve delegation trust")
+    instance_renew.add_argument("instance_id", help="Hub instance id")
+    instance_connection = instance_commands.add_parser(
+        "connection", help="show instance addresses and SSH key name (SSH user and host keys are unknown)"
+    )
+    instance_connection.add_argument("instance_id", help="Hub instance id")
     instance_rm = instance_commands.add_parser(
         "rm", help="explicitly delete an instance and its guest-private upper layer"
     )
@@ -2726,7 +2741,7 @@ def _instance_create_request(args: argparse.Namespace) -> dict:
             request[key] = _uuid_arg(value, "--" + flag.replace("_", "-"))
     if args.security_group_id:
         request["security_group_ids"] = [_uuid_arg(item, "--security-group-id") for item in args.security_group_id]
-    for flag in ("gpu_profile", "cluster_profile"):
+    for flag in ("gpu_profile", "cluster_profile", "lifecycle", "key_name"):
         if getattr(args, flag) is not None:
             request[flag] = getattr(args, flag)
     if args.command_json is not None:
@@ -2762,6 +2777,12 @@ def _dispatch_instance(args: argparse.Namespace) -> int:
         )
     elif op == "stop":
         result = client.stop_instance(instance_id)
+    elif op == "resume":
+        result = client.resume_instance(instance_id)
+    elif op == "renew":
+        result = client.renew_instance_lifecycle(instance_id)
+    elif op == "connection":
+        result = client.instance_connection(instance_id)
     else:
         result = client.delete_instance(instance_id)
     print(json.dumps(result, indent=2))

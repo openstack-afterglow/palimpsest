@@ -130,3 +130,11 @@ async def test_sdk_calls_run_off_the_event_loop_thread():
 def test_nonpositive_timeouts_are_rejected():
     with pytest.raises(ValueError):
         NovaShelveProvider(SimpleNamespace(compute=None), timeout_seconds=0)
+
+
+@pytest.mark.asyncio
+async def test_server_status_reports_the_uppercase_nova_status_without_effects():
+    compute = FakeCompute("shelved_offloaded")
+    provider = NovaShelveProvider(SimpleNamespace(compute=compute))
+    assert await provider.server_status(SID) == SHELVED_OFFLOADED
+    assert compute.calls == ["get"]
