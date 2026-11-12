@@ -69,19 +69,28 @@ class Provider:
         self.block_storage = self
         self._afterglow_project_id = PROJECT
         self._afterglow_user_id = USER
-        self.session = SimpleNamespace(get_endpoint=lambda service_type, interface=None: "https://endpoint.invalid")
+        self.session = SimpleNamespace(
+            get_endpoint=lambda service_type, interface=None, region_name=None: "https://endpoint.invalid"
+        )
 
     def get_limits(self):
         return SimpleNamespace(
             absolute=SimpleNamespace(
                 instances=-1,
                 instances_used=0,
+                total_cores=-1,
+                total_cores_used=0,
+                total_ram=-1,
+                total_ram_used=0,
                 max_total_volumes=-1,
                 total_volumes_used=0,
                 max_total_volume_gigabytes=-1,
                 total_gigabytes_used=0,
             )
         )
+
+    def get_quota(self, project_id, details=True):
+        return {"ports": {"limit": -1, "used": 0, "reserved": 0}}
 
     def get_image(self, image_id):
         return {
@@ -248,6 +257,7 @@ async def instance_hub(tmp_path, monkeypatch):
         palimpsest_hub_build_worker_key=SecretStr("test-worker-secret-" + "x" * 32),
         palimpsest_hub_instance_ca_certificates=(),
         os_interface="internal",
+        os_region_name="RegionOne",
     )
     async with factory() as session:
         session.add_all(
@@ -390,7 +400,11 @@ async def test_create_idempotency_durable_snapshot_and_provider_active_not_ready
     ("break_it", "status", "check"),
     [
         (
-            lambda p: setattr(p, "session", SimpleNamespace(get_endpoint=lambda service_type, interface=None: None)),
+            lambda p: setattr(
+                p,
+                "session",
+                SimpleNamespace(get_endpoint=lambda service_type, interface=None, region_name=None: None),
+            ),
             424,
             "catalog",
         ),
@@ -422,13 +436,48 @@ async def test_preflight_network_calls_never_run_on_the_event_loop_thread(instan
     seen = []
     endpoint = h.provider.session.get_endpoint
     limits = h.provider.get_limits
-    h.provider.session.get_endpoint = lambda service_type, interface=None: (
-        seen.append(threading.get_ident()) or endpoint(service_type, interface)
+    h.provider.session.get_endpoint = lambda service_type, interface=None, region_name=None: (
+        seen.append(threading.get_ident()) or endpoint(service_type, interface, region_name)
     )
     h.provider.get_limits = lambda: seen.append(threading.get_ident()) or limits()
+    flavor = h.provider.get_flavor
+    quota = h.provider.get_quota
+    h.provider.get_flavor = lambda flavor_id: seen.append(threading.get_ident()) or flavor(flavor_id)
+    h.provider.get_quota = lambda project_id, details=True: (
+        seen.append(threading.get_ident()) or quota(project_id, details)
+    )
     created = await create_and_advance(h, json=request_body())
     assert created.status_code == 202, created.text
     assert len(seen) >= 6 and loop_thread not in seen
+
+
+@pytest.mark.asyncio
+async def test_quota_is_rechecked_before_server_post(instance_hub):
+    h = instance_hub
+    accepted = await h.client.post("/v1/instances", json=request_body())
+    assert accepted.status_code == 202, accepted.text
+    item = accepted.json()
+    assert item["provider_phase"] == "volume_ready"
+    assert len(h.provider.volume_creates) == 1 and h.provider.creates == []
+    h.provider.get_limits = lambda: SimpleNamespace(
+        absolute=SimpleNamespace(
+            instances=-1,
+            instances_used=0,
+            total_cores=0,
+            total_cores_used=0,
+            total_ram=-1,
+            total_ram_used=0,
+        )
+    )
+    response = await advance_instance(h, item)
+    assert response.status_code == 409, response.text
+    detail = response.json()["detail"]
+    assert detail["code"] == "preflight_failed"
+    assert any(entry["service"] == "compute" and "core quota" in entry["detail"] for entry in detail["failures"])
+    assert len(h.provider.volume_creates) == 1 and h.provider.creates == []
+    assert h.provider.volume_deletes == [] and len(h.provider.volumes_by_id) == 1
+    row = (await h.client.get("/v1/instances/" + item["id"])).json()
+    assert row["error_code"] == "preflight_failed", row
 
 
 @pytest.mark.asyncio
@@ -1256,7 +1305,9 @@ async def test_project_visible_private_gpu_flavor_does_not_require_tenant_acl_ad
 
     h = instance_hub
     body = await gpu_request(h, monkeypatch)
-    monkeypatch.setattr(h.provider, "get_flavor", lambda identity: {"id": identity, "ram": 1024, "is_public": False})
+    monkeypatch.setattr(
+        h.provider, "get_flavor", lambda identity: {"id": identity, "vcpus": 1, "ram": 1024, "is_public": False}
+    )
     monkeypatch.setattr(h.provider, "flavors", lambda **kwargs: iter([{"id": body["flavor_id"]}]), raising=False)
 
     def tenant_acl(identity):
@@ -1273,7 +1324,9 @@ async def test_project_visible_private_gpu_flavor_does_not_require_tenant_acl_ad
 async def test_admin_inventory_does_not_grant_unassigned_private_gpu_flavor(instance_hub, monkeypatch):
     h = instance_hub
     body = await gpu_request(h, monkeypatch)
-    monkeypatch.setattr(h.provider, "get_flavor", lambda identity: {"id": identity, "ram": 1024, "is_public": False})
+    monkeypatch.setattr(
+        h.provider, "get_flavor", lambda identity: {"id": identity, "vcpus": 1, "ram": 1024, "is_public": False}
+    )
 
     def available_flavors(*, is_public=None, **kwargs):
         # Nova's unrestricted admin inventory includes private IDs with no grant.
@@ -1323,7 +1376,9 @@ async def test_gpu_mismatch_never_admits_or_allocates(instance_hub, monkeypatch,
         monkeypatch.setattr(h.provider, "fetch_flavor_extra_specs", lambda flavor: {**flavor, "extra_specs": {}})
     elif failure == "private-flavor":
         monkeypatch.setattr(
-            h.provider, "get_flavor", lambda identity: {"id": identity, "ram": 1024, "is_public": False}
+            h.provider,
+            "get_flavor",
+            lambda identity: {"id": identity, "vcpus": 1, "ram": 1024, "is_public": False},
         )
         monkeypatch.setattr(h.provider, "flavors", lambda **kwargs: [{"id": str(uuid4())}], raising=False)
     elif failure == "mode":
@@ -1345,7 +1400,9 @@ async def test_gpu_second_fence_changes_fail_without_effect_or_replay(instance_h
     body = await gpu_request(h, monkeypatch)
     if failure == "access":
         monkeypatch.setattr(
-            h.provider, "get_flavor", lambda identity: {"id": identity, "ram": 1024, "is_public": False}
+            h.provider,
+            "get_flavor",
+            lambda identity: {"id": identity, "vcpus": 1, "ram": 1024, "is_public": False},
         )
         monkeypatch.setattr(h.provider, "flavors", lambda **kwargs: [{"id": body["flavor_id"]}], raising=False)
     original = service.qualified_gpu
@@ -1375,7 +1432,9 @@ async def test_gpu_second_fence_changes_fail_without_effect_or_replay(instance_h
                 )
             elif failure == "access":
                 monkeypatch.setattr(
-                    h.provider, "get_flavor", lambda identity: {"id": identity, "ram": 1024, "is_public": False}
+                    h.provider,
+                    "get_flavor",
+                    lambda identity: {"id": identity, "vcpus": 1, "ram": 1024, "is_public": False},
                 )
                 monkeypatch.setattr(h.provider, "flavors", lambda **kwargs: [], raising=False)
         return original(spec, project, settings)
@@ -3818,6 +3877,8 @@ async def native_hub(instance_hub, tmp_path, monkeypatch):
         "_operator_paths",
         lambda profile: {
             "grant_id": "explicit-fixture",
+            "boot_gib": 32,
+            "flavors": {"cpu": "small", "gpu": "small"},
             "project_id": PROJECT,
             "environment": profile["environment"],
             "source_digest": profile["manifest_digest"],
@@ -3931,8 +3992,8 @@ async def test_native_preflight_network_calls_never_run_on_the_event_loop_thread
     loop_thread = threading.get_ident()
     seen = []
     endpoint = n.h.provider.session.get_endpoint
-    n.h.provider.session.get_endpoint = lambda service_type, interface=None: (
-        seen.append(threading.get_ident()) or endpoint(service_type, interface)
+    n.h.provider.session.get_endpoint = lambda service_type, interface=None, region_name=None: (
+        seen.append(threading.get_ident()) or endpoint(service_type, interface, region_name)
     )
     response = await n.h.client.post("/v1/native-instances", json=n.body)
     assert response.status_code == 202, response.text
@@ -4052,6 +4113,23 @@ async def test_native_driver_cancellation_drains_before_releasing_pending_lifecy
             await asyncio.wait_for(request, timeout=5)
     settled = (await n.h.client.get("/v1/native-instances/" + pending["id"])).json()
     assert settled["status"] == "retained"
+
+
+async def test_native_preflight_refusal_ends_terminally_and_frees_the_environment(native_hub, monkeypatch):
+    n = native_hub
+
+    def refused(profile, actor, conn, checkpoint, run_id, image, request, approval_digest, deleting):
+        n.calls.append((run_id, deleting))
+        raise n.service._PreflightRefused("native preflight refused before any allocation")
+
+    monkeypatch.setattr(n.service, "_execute", refused)
+    created = await n.h.client.post("/v1/native-instances", json=n.body)
+    assert created.status_code == 202
+    settled = (await n.h.client.get("/v1/native-instances/" + created.json()["id"])).json()
+    assert settled["status"] == "deleted" and settled["error_code"] == "preflight_failed"
+    # A refused intent holds no consumer slot: a fresh request is admitted, not blocked by HOLD.
+    second = await n.h.client.post("/v1/native-instances", json={**n.body, "request_id": str(uuid4())})
+    assert second.status_code == 202 and len(n.calls) == 2
 
 
 async def test_native_api_create_defaults_to_retained_but_requires_explicit_operator_retention(native_hub, monkeypatch):
@@ -4190,6 +4268,8 @@ async def test_native_visible_terminal_commit_with_lost_ack_cannot_admit_second_
 
     grant = {
         "grant_id": "explicit-fixture",
+        "boot_gib": 32,
+        "flavors": {"cpu": "small", "gpu": "small"},
         "project_id": PROJECT,
         "environment": n.profile["environment"],
         "source_digest": n.profile["manifest_digest"],

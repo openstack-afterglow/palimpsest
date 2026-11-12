@@ -59,6 +59,10 @@ files_modified:
 - Local tests on current dev-derived source: `hub/tests/test_preflight.py` plus two `hub/tests/test_instances.py` cases (structured denial/no allocation and SDK calls off event loop): 15 passed. Tests use synthetic service catalog/quota/provider.
 - Not live-verified: real OpenStack catalog, quota endpoint behavior or allocation refusal. M4-03 remains unchecked until the stage GATE and its broader acceptance are met.
 
+### M4-03 preflight contract fix — 2026-11-12 (source, not yet merged when written)
+- Independent review (reviewer agent, read-only; not an Astra/Sol signoff) found: cores/RAM/ports not checked, no re-check before the Cinder/Nova POST, None limits failing open, region ignored, native boot GiB unchecked, and token-scope/policy denials preempted by route-dependency 403s. Fixed the first five in `services/preflight.py`, `services/instances.py`, `services/native_instances.py`; the sixth is documented in ARCHITECTURE.md (plain 403 precedes the structured body).
+- Local evidence: `hub/tests/test_preflight.py` + `hub/tests/test_instances.py` 379 passed, 5 skipped; ruff check/format clean. Synthetic provider only; M4-03 stays unchecked.
+
 ## Reader/member/manager priority cutover — 2026-11-06, source264 in progress
 
 Owner explicitly added this alongside the continuing local M1 Goal: existing

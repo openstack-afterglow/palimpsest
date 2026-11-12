@@ -20,6 +20,11 @@ All notable changes to Palimpsest Local are documented here.
   hardcoded `2025.2`, for Kolla-Ansible 2026.1 compatibility. Covered by the parametrized lifecycle
   regression `test_container_version_label_follows_openstack_release` and the `tests/test_kolla_*.py`
   set. Not deployed.
+- Hub preflight now checks compute cores/RAM and Neutron ports as well as instance and volume quota,
+  fails closed on missing limits, resolves the service catalog for the configured region, and re-checks
+  quota immediately before the Cinder and Nova POSTs; the native path sizes its check from the operator
+  grant. Covered by `hub/tests/test_preflight.py` and `hub/tests/test_instances.py` with synthetic
+  providers only; not verified against a real OpenStack cloud.
 
 ## [0.3.15] - 2026-11-08 (UTC; published; deployed to the three DMS Lab controllers and the dedicated build worker on 2026-11-09)
 
