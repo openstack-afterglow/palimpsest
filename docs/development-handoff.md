@@ -54,6 +54,11 @@ files_modified:
 - Supersedes the 2026-11-10 observer wording above: the probe runs `ps -e -o pid= -o ppid= -o args=` (separate `-o` per column), keeps argv only for sshd rows, and sends only pid/ppid for all other processes. The parser excludes the probe shell's sshd ancestors, keys remaining sessions by PID, and rejects a missing shell row. The awk reduction stage fails closed (`|| exit 1`). `fetch` must use non-pty exec.
 - Local evidence: observer tests 24 passed, related Hub tests 57 passed; mutations removing ancestor exclusion and argv reduction were caught. PR #71 head `fcf59c2` CI: 19 pass, 2 Native KVM skips. BusyBox/Linux guest and real SSH transport remain unverified; M4-10 remains unchecked.
 
+### M4-03 preflight CPU re-verification — 2026-11-12
+- Source path: `hub/src/palimpsest_hub/services/preflight.py` checks caller token project, policy action, service catalog and compute/block-storage quotas. `services/instances.py:create` runs it through `run_blocking` before any new server/volume allocation (idempotent replay is returned before preflight).
+- Local tests on current dev-derived source: `hub/tests/test_preflight.py` plus two `hub/tests/test_instances.py` cases (structured denial/no allocation and SDK calls off event loop): 15 passed. Tests use synthetic service catalog/quota/provider.
+- Not live-verified: real OpenStack catalog, quota endpoint behavior or allocation refusal. M4-03 remains unchecked until the stage GATE and its broader acceptance are met.
+
 ## Reader/member/manager priority cutover — 2026-11-06, source264 in progress
 
 Owner explicitly added this alongside the continuing local M1 Goal: existing
