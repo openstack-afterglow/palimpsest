@@ -1,6 +1,10 @@
 # Detailed installation and configuration guide
 
-## 0.3.17 transition note — 2026-11-13 (UTC; candidate)
+## 0.3.18 transition note — 2026-11-14 (UTC; candidate)
+
+0.3.18 is a patch over 0.3.17 with no schema change and no new setting. The system-administrator path for dev-lifecycle Trusts now refuses `palimpsest_hub_package_forbidden_user_ids` and `palimpsest_hub_package_forbidden_project_ids` exactly like the member path, and the retired-Trust sweep (which runs on every controller) skips rows another controller already revoked instead of recording `trust_unrecoverable`. Use the rollout gates below (writer drain, paired backup, no DB restore, no forced stop) and roll the API/worker cohorts and the build worker to the same release.
+
+## 0.3.17 transition note — 2026-11-13 (UTC; deployed)
 
 0.3.17 is a patch over 0.3.16 with no schema change and no new setting: no bootstrap is required. It lets a human system administrator who holds ordinary project roles use a project-scoped token for dev-lifecycle instance requests. Use the rollout gates below (writer drain, paired backup, no DB restore, no forced stop) and roll the API/worker cohorts and the build worker to the same release; then check the running image digests against the handoff, because the 0.3.15 pins were once lost.
 
@@ -35,11 +39,11 @@ initial configuration, upgrades, and administrator-owned Linux deployment.
 Released installations use pinned published bytes; trusted local installation below uses the actual checkout's bytes.
 
 Palimpsest Local requires Python 3.11 or newer; Hub requires Python 3.12+.
-Version 0.3.16 is published (tag `0.3.16`, PyPI `palimpsest-client` 0.3.16) and was deployed to the production Hub (three controllers and the build worker) on 2026-11-12/13 after a paired SQL/CAS backup (not restore-tested). 0.3.15 had also been deployed on 2026-11-09 but production was found running 0.3.13 before this rollout; see the handoff incident note. 0.3.17 is an unpublished, undeployed candidate until its tag, PyPI release and rollout are recorded in the handoff.
+Version 0.3.17 is published (tag `0.3.17`, PyPI `palimpsest-client` 0.3.17) and was deployed to the production Hub (three controllers and the build worker) on 2026-11-13 after a paired SQL/CAS backup (not restore-tested); 0.3.16 and 0.3.15 were deployed earlier (production was once found running 0.3.13, see the handoff incident note). 0.3.18 is an unpublished, undeployed candidate until its tag, PyPI release and rollout are recorded in the handoff.
 SDK publication and native execution remain separately qualified. Root/Hub metadata, module versions,
 generated locks and Kolla image defaults move together. After formal publication,
 install exact client bytes with
-`uv tool install --python 3.11 palimpsest-client==0.3.17`, or install a trusted
+`uv tool install --python 3.11 palimpsest-client==0.3.18`, or install a trusted
 local checkout with `uv tool install --force --python 3.11 .`.
 A root wheel upgrade neither deploys Hub nor qualifies actual build/run behavior.
 Git/outbound GitHub HTTPS is needed only for VCS installation.
@@ -1683,7 +1687,7 @@ and the [command workflows](cli/workflows.md) for operational details.
 
 ## SDK image/native integration: operator prerequisites
 
-The `0.3.17` Hub distribution declares the exact matching client dependency.
+The `0.3.18` Hub distribution declares the exact matching client dependency.
 Checkout resolution uses `hub`'s explicit parent-path source; installed release
 bytes must match the same immutable tag and reviewed image digests. Paired wheel
 or local container checks do not establish production upgrade or native readiness.

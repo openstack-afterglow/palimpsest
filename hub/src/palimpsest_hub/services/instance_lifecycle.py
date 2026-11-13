@@ -118,7 +118,7 @@ def delegation_from(row: Lifecycle) -> ExportDelegation | None:
         return None
 
 
-def held_roles(actor: dict, project_id: str) -> set[str]:
+def held_roles(actor: dict, project_id: str, settings=None) -> set[str]:
     """Roles the requester holds in ``project_id`` right now.
 
     Ordinary members carry ``current_roles`` from a fresh Keystone assignment check. A human who is also a
@@ -137,6 +137,9 @@ def held_roles(actor: dict, project_id: str) -> set[str]:
         and not actor.get("is_delegated")
         and not actor.get("system_scope")
         and not actor.get("domain_scope")
+        # The member path refuses protected principals and projects before it reports roles; so does this one.
+        and actor.get("user_id") not in tuple(getattr(settings, "palimpsest_hub_package_forbidden_user_ids", ()) or ())
+        and project_id not in tuple(getattr(settings, "palimpsest_hub_package_forbidden_project_ids", ()) or ())
     ):
         token_roles = {str(role) for role in actor.get("roles") or ()}
         if not {role.casefold() for role in token_roles} & {"service"}:
@@ -147,7 +150,7 @@ def held_roles(actor: dict, project_id: str) -> set[str]:
 async def admit_trust(actor: dict, project_id: str, settings) -> ExportDelegation:
     """Create the owner's bounded trust from the owner's own validated request."""
     role_names = tuple(settings.palimpsest_hub_session_delegated_roles)
-    if not set(role_names) <= held_roles(actor, project_id):
+    if not set(role_names) <= held_roles(actor, project_id, settings):
         raise HTTPException(403, "The requester does not currently hold the project role delegated for auto-shelve")
     auth_ref = actor.get("auth_ref")
     user_id = actor.get("user_id")
@@ -487,9 +490,11 @@ async def sweep_retired(factory, settings, *, limit: int = 20) -> int:
     for instance_id in ids:
         async with factory() as session:
             life = await session.get(Lifecycle, instance_id)
-            delegation = delegation_from(life) if life is not None else None
-            if life is None or not life.retired:
+            if life is None or not life.retired or life.trust_json is None:
+                # Another worker already revoked it (the sweep runs on every controller): nothing left to do,
+                # and a cleared reference must not be reported as unrecoverable.
                 continue
+            delegation = delegation_from(life)
             if delegation is None:
                 # A malformed reference has nothing left to revoke by id.
                 life.trust_json, life.last_error = None, "trust_unrecoverable"

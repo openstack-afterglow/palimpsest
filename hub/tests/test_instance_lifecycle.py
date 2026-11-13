@@ -544,6 +544,36 @@ async def test_a_trust_that_cannot_be_revoked_stays_pending_for_the_next_sweep(
     assert row.trust_json is not None and row.last_error == "trust_revoke_pending"
 
 
+@pytest.mark.asyncio
+async def test_a_trust_revoked_by_another_worker_mid_sweep_is_not_reported_unrecoverable(instance_hub, trust_boundary):
+    h = instance_hub
+    instance_id = await make_dev(h)
+    await set_life(h, instance_id, retired=True)
+    entered = 0
+
+    class RacingFactory:
+        def __call__(self):
+            return self
+
+        async def __aenter__(self):
+            nonlocal entered
+            entered += 1
+            if entered == 2:  # after the id selection, before the per-row read: a peer worker finishes first
+                async with h.factory() as peer, peer.begin():
+                    life = await peer.get(lifecycle.Lifecycle, instance_id)
+                    life.trust_json, life.trust_expires_at = None, None
+            self.session = h.factory()
+            return await self.session.__aenter__()
+
+        async def __aexit__(self, *exc):
+            return await self.session.__aexit__(*exc)
+
+    assert await lifecycle.sweep_retired(RacingFactory(), lifecycle_settings(h)) == 0
+    row = await life_state_raw(h, instance_id)
+    assert row.trust_json is None and row.last_error is None
+    assert trust_boundary.revoked == []
+
+
 # -- deletion, stop and resume -------------------------------------------------------------------
 
 
@@ -1056,4 +1086,15 @@ async def test_admit_trust_lets_a_system_admin_use_the_ordinary_project_roles_of
         with pytest.raises(HTTPException) as refused:
             await REAL_ADMIT_TRUST(actor, PROJECT, settings)
         assert refused.value.status_code == 403
+    assert len(created) == 1
+    settings.palimpsest_hub_package_forbidden_user_ids = (USER,)
+    with pytest.raises(HTTPException) as protected_user:
+        await REAL_ADMIT_TRUST(admin, PROJECT, settings)
+    assert protected_user.value.status_code == 403
+    settings.palimpsest_hub_package_forbidden_user_ids = ()
+    settings.palimpsest_hub_package_forbidden_project_ids = (PROJECT,)
+    with pytest.raises(HTTPException) as protected_project:
+        await REAL_ADMIT_TRUST(admin, PROJECT, settings)
+    assert protected_project.value.status_code == 403
+    settings.palimpsest_hub_package_forbidden_project_ids = ()
     assert len(created) == 1

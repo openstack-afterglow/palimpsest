@@ -4,7 +4,14 @@ All notable changes to Palimpsest Local are documented here.
 
 ## [Unreleased]
 
-## [0.3.17] - 2026-11-13 (UTC; candidate, not yet published or deployed)
+## [0.3.18] - 2026-11-14 (UTC; candidate, not yet published or deployed)
+
+### Fixed
+
+- The system-administrator path for dev-lifecycle Trusts refuses the configured protected user and project IDs, as the member path always did (independent review finding).
+- The retired-Trust sweep skips a row whose reference another controller already cleared, instead of recording a false `trust_unrecoverable` (observed on the first real deletion; the Keystone trust itself was revoked).
+
+## [0.3.17] - 2026-11-13 (UTC; published and deployed)
 
 ### Fixed
 
