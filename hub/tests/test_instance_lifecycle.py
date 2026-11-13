@@ -1098,3 +1098,31 @@ async def test_admit_trust_lets_a_system_admin_use_the_ordinary_project_roles_of
     assert protected_project.value.status_code == 403
     settings.palimpsest_hub_package_forbidden_project_ids = ()
     assert len(created) == 1
+
+
+@pytest.mark.parametrize(
+    ("token_roles", "opened"),
+    [
+        (["member"], True),
+        (["member", "reader"], True),
+        (["member", "reader", "manager"], False),
+        (["member", "project_admin"], False),
+        (["member", "admin"], False),
+        (["reader"], False),
+        ([], False),
+    ],
+)
+def test_trust_connection_accepts_the_reader_keystone_implies_for_member_and_nothing_else(
+    monkeypatch, token_roles, opened
+):
+    from palimpsest_hub import openstack as boundary
+
+    access = SimpleNamespace(role_names=token_roles)
+    monkeypatch.setattr(boundary, "_trust_session", lambda item: ("session", access))
+    monkeypatch.setattr(boundary.openstack.connection, "Connection", lambda **kwargs: "connection")
+    monkeypatch.setattr(boundary, "get_settings", lambda: SimpleNamespace(os_region_name="r", os_interface="public"))
+    if opened:
+        assert boundary.open_trust_connection(delegation(), allowed_role_names=frozenset({"member"})) == "connection"
+    else:
+        with pytest.raises(boundary.DelegationError):
+            boundary.open_trust_connection(delegation(), allowed_role_names=frozenset({"member"}))

@@ -4,6 +4,14 @@ All notable changes to Palimpsest Local are documented here.
 
 ## [Unreleased]
 
+## [0.3.19] - 2026-11-14 (UTC; candidate, not yet published or deployed)
+
+### Fixed
+
+- Trust-scoped connections (dev-instance auto-shelve and image exports) accept the `reader` role that Keystone role inference adds to a token carrying the delegated `member`; before, every shelve failed with "roles outside the stored export scope" on a real Keystone. Other extra roles and the forbidden set still fail closed.
+- The worker logs the reason (class and delegation code) when a delegated connection cannot be opened, instead of only `shelve-failed`.
+
+
 ## [0.3.18] - 2026-11-14 (UTC; published and deployed)
 
 ### Fixed

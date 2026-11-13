@@ -312,7 +312,14 @@ class TrustShelveProvider:
             raise ProviderError("instance is outside this delegation")
         try:
             connection = await asyncio.to_thread(self._open, self._delegation, allowed_role_names=self._roles)
-        except Exception:
+        except Exception as exc:
+            # Say why (class and, for delegation errors, the public detail/code), never a credential.
+            _logger.warning(
+                "delegated connection for instance %s unavailable: %s %s",
+                instance_id,
+                type(exc).__name__,
+                (getattr(exc, "code", None) or str(exc))[:160] if isinstance(exc, DelegationError) else "",
+            )
             raise ProviderError("delegated connection is unavailable") from None
         return self._provider_for(connection)
 

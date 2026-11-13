@@ -270,10 +270,14 @@ def open_trust_connection(
     """Return a Glance-capable connection limited to the verified trust token."""
     session, access = _trust_session(delegation)
     roles = set(access.role_names or [])
+    # Keystone role inference puts the weaker `reader` into every token that carries `member` (observed live:
+    # a trust delegating only `member` yields `['member', 'reader']`). That adds no authority beyond `member`,
+    # so it is accepted; every other extra role, and anything in the forbidden set, still fails closed.
+    permitted = set(allowed_role_names) | ({"reader"} if "member" in allowed_role_names else set())
     if (
         not roles
         or not set(delegation.role_names) <= roles
-        or not roles <= allowed_role_names
+        or not roles <= permitted
         or {name.casefold() for name in roles} & FORBIDDEN_DELEGATED_ROLES
     ):
         raise _scope_mismatch("Keystone delegation token carries roles outside the stored export scope")
