@@ -1,6 +1,6 @@
 # Detailed installation and configuration guide
 
-## 0.3.18 transition note — 2026-11-14 (UTC; candidate)
+## 0.3.18 transition note — 2026-11-14 (UTC; deployed)
 
 0.3.18 is a patch over 0.3.17 with no schema change and no new setting. The system-administrator path for dev-lifecycle Trusts now refuses `palimpsest_hub_package_forbidden_user_ids` and `palimpsest_hub_package_forbidden_project_ids` exactly like the member path, and the retired-Trust sweep (which runs on every controller) skips rows another controller already revoked instead of recording `trust_unrecoverable`. Use the rollout gates below (writer drain, paired backup, no DB restore, no forced stop) and roll the API/worker cohorts and the build worker to the same release.
 
@@ -39,7 +39,7 @@ initial configuration, upgrades, and administrator-owned Linux deployment.
 Released installations use pinned published bytes; trusted local installation below uses the actual checkout's bytes.
 
 Palimpsest Local requires Python 3.11 or newer; Hub requires Python 3.12+.
-Version 0.3.17 is published (tag `0.3.17`, PyPI `palimpsest-client` 0.3.17) and was deployed to the production Hub (three controllers and the build worker) on 2026-11-13 after a paired SQL/CAS backup (not restore-tested); 0.3.16 and 0.3.15 were deployed earlier (production was once found running 0.3.13, see the handoff incident note). 0.3.18 is an unpublished, undeployed candidate until its tag, PyPI release and rollout are recorded in the handoff.
+Version 0.3.18 is published (tag `0.3.18`, PyPI `palimpsest-client` 0.3.18) and was deployed to the production Hub (three controllers and the build worker) on 2026-11-14 after a paired SQL/CAS backup (not restore-tested); 0.3.17, 0.3.16 and 0.3.15 were deployed earlier (production was once found running 0.3.13, see the handoff incident note).
 SDK publication and native execution remain separately qualified. Root/Hub metadata, module versions,
 generated locks and Kolla image defaults move together. After formal publication,
 install exact client bytes with
