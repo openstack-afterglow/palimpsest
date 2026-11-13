@@ -4,6 +4,12 @@ All notable changes to Palimpsest Local are documented here.
 
 ## [Unreleased]
 
+## [0.3.17] - 2026-11-13 (UTC; candidate, not yet published or deployed)
+
+### Fixed
+
+- `instance create --lifecycle dev` (and `resume`/`renew`) now work for a human system administrator who uses a project-scoped token: the auto-shelve Trust is created from that token's own ordinary project roles instead of failing with 403 because the admin context carries no `current_roles`. Delegated, system/domain-scoped tokens, service identities and cross-project targets are still refused.
+
 ## [0.3.16] - 2026-11-12 (UTC; published and deployed)
 
 ### Added

@@ -118,10 +118,36 @@ def delegation_from(row: Lifecycle) -> ExportDelegation | None:
         return None
 
 
+def held_roles(actor: dict, project_id: str) -> set[str]:
+    """Roles the requester holds in ``project_id`` right now.
+
+    Ordinary members carry ``current_roles`` from a fresh Keystone assignment check. A human who is also a
+    system administrator is handled as the package-admin context, which has no such list; that user still
+    holds ordinary project roles through a project-scoped token. Those token roles were validated by Keystone
+    for this request, so they count only for the token's own project, and never for delegated, system- or
+    domain-scoped tokens or service identities. Keystone enforces the same roles again when the Trust is
+    created with that token.
+    """
+    current = {str(role) for role in actor.get("current_roles") or ()}
+    if current:
+        return current
+    if (
+        actor.get("is_package_system_admin")
+        and actor.get("project_id") == project_id
+        and not actor.get("is_delegated")
+        and not actor.get("system_scope")
+        and not actor.get("domain_scope")
+    ):
+        token_roles = {str(role) for role in actor.get("roles") or ()}
+        if not {role.casefold() for role in token_roles} & {"service"}:
+            return token_roles
+    return set()
+
+
 async def admit_trust(actor: dict, project_id: str, settings) -> ExportDelegation:
     """Create the owner's bounded trust from the owner's own validated request."""
     role_names = tuple(settings.palimpsest_hub_session_delegated_roles)
-    if not set(role_names) <= set(actor.get("current_roles") or ()):
+    if not set(role_names) <= held_roles(actor, project_id):
         raise HTTPException(403, "The requester does not currently hold the project role delegated for auto-shelve")
     auth_ref = actor.get("auth_ref")
     user_id = actor.get("user_id")

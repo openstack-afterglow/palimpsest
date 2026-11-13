@@ -1020,3 +1020,40 @@ async def test_admit_trust_requires_the_delegated_roles_and_the_owners_validated
             await REAL_ADMIT_TRUST(actor, PROJECT, settings)
         assert refused.value.status_code == status
     assert len(created) == 1
+
+
+@pytest.mark.asyncio
+async def test_admit_trust_lets_a_system_admin_use_the_ordinary_project_roles_of_a_project_token(
+    instance_hub, monkeypatch
+):
+    h = instance_hub
+    settings = lifecycle_settings(h)
+    created = []
+    monkeypatch.setattr(
+        lifecycle,
+        "create_export_trust",
+        lambda auth_ref, **kwargs: created.append(kwargs) or delegation(),
+    )
+    admin = {
+        "user_id": USER,
+        "token": "token-1",
+        "auth_ref": _auth_ref(),
+        "project_id": PROJECT,
+        "is_package_system_admin": True,
+        "roles": ["manager", "member", "reader"],
+    }
+    assert (await REAL_ADMIT_TRUST(admin, PROJECT, settings)).trust_id
+    assert created and created[0]["role_names"] == ("member",)
+    for actor in (
+        {**admin, "roles": ["manager", "reader"]},
+        {**admin, "roles": ["member", "Service"]},
+        {**admin, "project_id": "b" * 32},
+        {**admin, "is_delegated": True},
+        {**admin, "system_scope": True},
+        {**admin, "domain_scope": True},
+        {key: value for key, value in admin.items() if key != "is_package_system_admin"},
+    ):
+        with pytest.raises(HTTPException) as refused:
+            await REAL_ADMIT_TRUST(actor, PROJECT, settings)
+        assert refused.value.status_code == 403
+    assert len(created) == 1
