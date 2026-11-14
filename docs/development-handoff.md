@@ -24,6 +24,15 @@ files_modified:
 [ARCHITECTURE.md](../ARCHITECTURE.md), 실행 경계는 [testing.md](testing.md),
 세부 결과는 아래 링크된 문서와 source다.
 
+## 0.3.24 release and deployment; M4-03 checked — 2026-11-15 (UTC)
+
+- Refs: PR #100 squash `af42c57`; new annotated tag `0.3.24` (no overwrite); `Release` run `43633430131` and `Build and Push Palimpsest Hub` run `43633430228` succeeded; PyPI `palimpsest-client` 0.3.24 (wheel, sdist). Independent read-only review before merge (not an Astra/Sol signoff): no blocker; two should-fix findings and test gaps applied.
+- CI note: the `dev` push `Test` run `43633393244` failed once on `tests/unit/test_oci_process_session.py::test_console_append_after_readiness_is_followed_without_replay` (`run lock timed out`), unrelated to the change; only the failed jobs were re-run and passed. This is a second timing-sensitive test besides `test_oci_stage1_kvm_proof`.
+- Deployed: api `sha256:f73e6128813e…`, worker `sha256:760a4c84e264…`, build-worker `sha256:c02169bfc6ef…`. Sequence as before: pins in `globals.d/99-palimpsest.yml` (originals in `~/palimpsest-rollout-0.3.24-20261114T201157Z`), `kolla-ansible pull`, DB read showed no active work (two `deleting` rows are the stuck-volume instances), API/worker stopped on all three controllers (exit 0, no OOM), paired backup `/var/backups/palimpsest-pre-0.3.24-20261114T201405Z` (SQL 30 tables, CAS 199 entries, not restore-tested), `reconfigure` failed=0 (149/139/139 ok), build worker pull/reconfigure failed=0. Verified: all six controller containers and the build worker report 0.3.24 with the new digests, restarts 0, no error lines in the first minutes, `/v1/ready` 200.
+- Operator host finding (not fixed): the `palimpsest-client` entry in `/etc/kolla/uv.lock` has been hand-edited on the version line only (wheel names still 0.3.19), so `uv lock` fails to parse it. The same convention was kept; the client was installed with `uv pip install --no-deps --refresh --no-cache palimpsest-client==0.3.24` (the first attempt with only `--refresh-package` saw a stale index). Do not run `uv sync` or `uv lock` there.
+- Live with the released client (PyPI 0.3.24) against the deployed Hub: unknown cloud, entry without `auth_url`, unreachable Keystone and unreachable Hub each gave one specific line; `instance create` with a nonexistent flavor returned 422 `preflight_failed` and left 20 volumes, 4 servers and no Hub row. M4-03 is checked with the verification level stated in the item: catalog (424), policy (403) and quota (409) failures are test-only because they cannot be induced on this cloud. 59/108.
+- Still blocked: M4-12 live OOM restart and stop-without-restart (two stuck Cinder volumes, reset/force-delete not approved).
+
 ## Access-path live evidence, OOM policy observed under systemd, 0.3.24 candidate — 2026-11-15 (UTC)
 
 - No VM or volume was created for any of this (Cinder still has `m412-svc-05-boot` in `error_deleting` and `m412-dev-02-boot` in `creating`).

@@ -28,7 +28,7 @@ are not deployed-service acceptance; see the [control-plane boundaries](ARCHITEC
 - **0.3.21 (published and deployed 2026-11-14):** `restart=unless-stopped` restarts a crashed or exited long-running command of a service instance in place and reports restart status; default for service instances with a readiness probe. Live: restarts after SIGKILL and after a non-zero exit were observed; an OOM kill was not yet produced. No schema change.
 - **0.3.22 (published and deployed 2026-11-15):** longer limit for formatting the guest writable file and a distinct `guest_setup_timeout` error code, after two of four live service creations failed during guest setup. The one creation since then succeeded; the inferred cause is not confirmed.
 - **0.3.23 (published and deployed 2026-11-15):** the guest unit survives an OOM kill of the command (`OOMPolicy=continue`). On 0.3.22 a real OOM kill was followed by no restart; the same unit and runner under systemd as PID 1 in a container showed why (default policy fails the unit and kills the runner; `continue` restarts the command; `systemctl stop` does not relaunch). Not yet exercised by a live OOM kill in a Nova guest (test VMs are paused while two Cinder volumes are stuck).
-- **Candidate 0.3.24 (not yet published or deployed):** client-side `--cloud` failures (unknown cloud, unreachable Keystone, rejected credential) are reported as specific messages instead of tracebacks.
+- **0.3.24 (published and deployed 2026-11-15):** client-side `--cloud` failures (unknown or incomplete clouds.yaml cloud, unreachable Keystone, rejected credential, `auth_url` without an identity API) are reported as one specific message instead of a traceback. Checked with the released client against the deployed Hub.
 
 ## Install from PyPI
 
