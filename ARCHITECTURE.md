@@ -4037,8 +4037,8 @@ that CI never sees).
 {
   "schema_version": 1,
   "source_sha256": "1aaa5831ecf68675882d109b2355205f649d2be9bdf1b353734a96b837b6a12e",
-  "reviewed_at": "2026-11-14T05:47:12Z",
-  "summary": "spec: m412-dev-05 live observation"
+  "reviewed_at": "2026-11-14T06:05:12Z",
+  "summary": "docs: resume-path defect record"
 }
 ```
 <!-- architecture-review:end -->
