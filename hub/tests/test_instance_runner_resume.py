@@ -319,6 +319,8 @@ def test_unless_stopped_restarts_a_killed_command_in_place_and_reports_each_rest
     runner = guest.start()
     try:
         assert wait_for(lambda: sum(item["state"] == "running" for item in restart_reports(guest)) >= 2)
+        launches = guest.root / "launches"
+        assert wait_for(lambda: len(launches.read_text().splitlines()) >= 3)
         assert runner.poll() is None  # The runner (the VM's workload owner) never exits because of a crash.
     finally:
         runner.kill()
@@ -329,7 +331,6 @@ def test_unless_stopped_restarts_a_killed_command_in_place_and_reports_each_rest
     assert {item["last_exit_code"] for item in seen} == {-9}
     restart_puts = [item for item in guest.puts() if "restart-status" in item["path"]]
     assert {item["auth"] for item in restart_puts} == {"Bearer " + RESTART_CAPABILITY}
-    assert len((guest.root / "launches").read_text().splitlines()) >= 3
     # One mount of the root for all launches: the writable layer was never detached or rebuilt.
     assert sum("-t overlay" in line for line in guest.tools()) == 1
     assert "mkfs.ext4" not in tool_names(guest) and guest.backing_head() == MARKER
@@ -343,3 +344,24 @@ def test_without_a_restart_policy_a_finished_command_is_not_started_again(tmp_pa
     assert guest.run().returncode == 0
     assert (guest.root / "launches").read_text().splitlines() == ["launch"]
     assert not restart_reports(guest)
+
+
+def test_a_command_that_cannot_be_started_again_keeps_backing_off_instead_of_ending_the_runner(tmp_path, hub_server):
+    guest = Guest(tmp_path, hub_server)
+    script = guest.root / "once.sh"
+    script.write_text('#!/bin/sh\nsleep 1\nrm -- "$0"\nexit 5\n')
+    script.chmod(0o755)
+    guest.spec["restart"] = {"policy": "unless-stopped", "capability": RESTART_CAPABILITY}
+    guest.spec["command"] = [str(script)]
+    guest.write_session()
+    guest.retain_state()
+    runner = guest.start()
+    try:
+        assert wait_for(lambda: len(restart_reports(guest)) >= 3)
+        assert runner.poll() is None
+    finally:
+        runner.kill()
+        runner.wait()
+    seen = restart_reports(guest)[:3]
+    assert [item["state"] for item in seen] == ["backoff", "backoff", "backoff"]
+    assert [item["last_exit_code"] for item in seen] == [5, 127, 127]

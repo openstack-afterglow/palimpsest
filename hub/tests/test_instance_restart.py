@@ -141,3 +141,14 @@ async def test_omitting_restart_keeps_the_request_replayable(instance_hub):
     assert first.status_code == again.status_code == 202 and first.json()["id"] == again.json()["id"]
     changed = await h.client.post("/v1/instances", json={**body, "restart": "no"})
     assert changed.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_an_instance_created_before_the_option_existed_is_shown_as_not_restarting(instance_hub):
+    h = instance_hub
+    item = (await create_and_advance(h, json=request_body(readiness_argv=READINESS))).json()
+    async with h.factory() as session:
+        row = await session.get(PalimpsestHubInstance, item["id"])
+        row.spec_json = {key: val for key, val in row.spec_json.items() if not key.startswith("restart")}
+        await session.commit()
+    assert (await h.client.get("/v1/instances/" + item["id"])).json()["restart"]["policy"] == "no"

@@ -150,8 +150,13 @@ async def payload_authority(actor, conn, session=None, spec=None):
 
 
 def restart_policy(spec) -> str:
-    """The caller's choice, else unless-stopped for a plain service instance with a readiness probe."""
-    chosen = spec.get("restart")
+    """The caller's choice, else unless-stopped for a plain service instance with a readiness probe.
+
+    A row created before the option existed has no `restart` key and its guest never restarts.
+    """
+    if "restart" not in spec:
+        return "no"
+    chosen = spec["restart"]
     if chosen in ("no", "unless-stopped"):
         return chosen
     plain_service = (
