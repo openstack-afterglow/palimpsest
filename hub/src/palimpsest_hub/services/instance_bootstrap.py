@@ -156,6 +156,20 @@ def persist_resume():
         os.fsync(output.fileno())
     os.replace(temporary, resume_path)
 
+def report_restart(count, code, state):
+    # Observation only: restarting never depends on the Hub being reachable.
+    try:
+        body = json.dumps({'instance_id': spec['instance_id'], 'restarts': count,
+                           'last_exit_code': code, 'state': state}, separators=(',', ':')).encode()
+        request = urllib.request.Request(
+            spec['origin'] + '/v1/instance-bootstrap/' + spec['instance_id'] + '/restart-status', data=body,
+            headers={'Authorization': 'Bearer ' + spec['restart']['capability'],
+                     'Content-Type': 'application/json'}, method='PUT')
+        with urllib.request.urlopen(request, timeout=15) as response:
+            response.read(1024)
+    except Exception:
+        pass
+
 def make_dir(path):
     # First boot creates each directory exclusively. A resume reuses real directories (recreating a
     # missing mountpoint is harmless) but never follows a symlink or a non-directory.
@@ -448,9 +462,44 @@ def pump(timeout=0.2):
             pump(0)
             persist_resume()
             report('ready')
-            # systemd owns the running command lifecycle until instance shutdown.
-            while process.poll() is None:
-                pump()
+            # systemd owns the running command lifecycle until instance shutdown. With
+            # restart=unless-stopped a command that exits, crashes or is OOM-killed is started again in
+            # the same VM and writable layer; stopping the unit or the VM kills this runner first.
+            restarts = 0
+            delay = 2
+            while True:
+                started = time.time()
+                while process.poll() is None:
+                    pump()
+                if (spec.get('restart') or {}).get('policy') != 'unless-stopped':
+                    break
+                drained = time.time() + 2
+                while selector.get_map() and time.time() < drained:
+                    pump()
+                import signal
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)  # No leftover children of the old command.
+                except ProcessLookupError:
+                    pass
+                code = max(-255, min(255, process.returncode))
+                restarts += 1
+                if time.time() - started >= 300:
+                    delay = 2
+                report_restart(restarts, code, 'backoff')
+                time.sleep(delay)
+                delay = min(delay * 2, 60)
+                captures = list(outputs.values())
+                for key in list(selector.get_map().values()):
+                    selector.unregister(key.fileobj)
+                    key.fileobj.close()
+                outputs.clear()
+                process = subprocess.Popen(spec['command'], stdin=subprocess.DEVNULL,
+                                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=environment,
+                                           preexec_fn=enter_runtime, start_new_session=True)
+                for pipe, capture in zip((process.stdout, process.stderr), captures):
+                    outputs[pipe.fileno()] = capture
+                    selector.register(pipe, selectors.EVENT_READ)
+                report_restart(restarts, code, 'running')
         else:
             while process.poll() is None and time.time() < deadline:
                 pump()

@@ -4,6 +4,13 @@ All notable changes to Palimpsest Local are documented here.
 
 ## [Unreleased]
 
+## [0.3.21] - 2026-11-14 (UTC; candidate, not yet published or deployed)
+
+### Added
+
+- Main-command restart policy for Hub instances (`restart`: `no` or `unless-stopped`; `palimpsest instance create --restart`). With `unless-stopped` the guest runner starts a long-running command again in the same VM and writable layer after it exits, crashes or is OOM-killed (delays 2, 4, 8 … capped at 60 seconds, reset after a 300-second run), and reports the restart count, last exit code and state through the new `PUT /v1/instance-bootstrap/{id}/restart-status` under its own long-lived, report-only capability. The Hub shows it as `restart` in the instance projection and never changes instance status because of a restart. Default when the caller does not choose: `unless-stopped` for a service instance with a readiness probe, `no` for dev, run-to-completion, GPU and cluster instances. Stopping the unit or the VM ends the runner, so nothing is restarted after an explicit stop. Subprocess tests against fake mount tooling passed; no real crash or OOM kill has exercised it yet.
+
+
 ## [0.3.20] - 2026-11-14 (UTC; published and deployed)
 
 ### Fixed

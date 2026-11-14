@@ -458,6 +458,26 @@ def test_pull_blob_drops_partial_for_malformed_content_range(tmp_path: Path, mon
     assert not sidecar.exists()
 
 
+@pytest.mark.parametrize("restart", [None, "no", "unless-stopped"])
+def test_instance_create_sends_restart_only_when_selected(monkeypatch, restart):
+    client = HubClient("https://hub.example", "token")
+    calls = []
+    original = {"request_id": "original-request"}
+
+    def opened(method, path, **kwargs):
+        calls.append((method, path, kwargs["body"]))
+        return _Response({"id": "original-instance"})
+
+    monkeypatch.setattr(client, "_open", opened)
+    kwargs = {} if restart is None else {"restart": restart}
+    assert client.create_instance(original, **kwargs) == {"id": "original-instance"}
+    expected = {"request_id": "original-request"}
+    if restart is not None:
+        expected["restart"] = restart
+    assert calls == [("POST", "/instances", json.dumps(expected).encode("utf-8"))]
+    assert original == {"request_id": "original-request"}
+
+
 def test_instance_send_guard_runs_after_serialization_and_request_construction(monkeypatch):
     from types import SimpleNamespace
 

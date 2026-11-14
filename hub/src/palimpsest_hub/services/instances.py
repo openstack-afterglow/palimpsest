@@ -149,8 +149,34 @@ async def payload_authority(actor, conn, session=None, spec=None):
     return current
 
 
+def restart_policy(spec) -> str:
+    """The caller's choice, else unless-stopped for a plain service instance with a readiness probe."""
+    chosen = spec.get("restart")
+    if chosen in ("no", "unless-stopped"):
+        return chosen
+    plain_service = (
+        spec.get("lifecycle", "service") == "service"
+        and bool(spec.get("readiness_argv"))
+        and spec.get("gpu") is None
+        and spec.get("cluster") is None
+    )
+    return "unless-stopped" if plain_service else "no"
+
+
+def restart_projection(row):
+    status = row.spec_json.get("restart_status") or {}
+    return {
+        "policy": restart_policy(row.spec_json),
+        "restarts": status.get("restarts", 0),
+        "last_exit_code": status.get("last_exit_code"),
+        "state": status.get("state"),
+        "recorded_at": status.get("recorded_at"),
+    }
+
+
 def projection(row):
     return {
+        "restart": restart_projection(row),
         "id": row.id,
         "request_id": row.request_id,
         "name": row.name,
@@ -472,7 +498,10 @@ async def create(factory, store, settings, actor, conn, req):
     digest_req = {
         key: item
         for key, item in req.items()
-        if (key not in ("gpu_profile", "cluster_profile", "cluster_server_id", "key_name") or item is not None)
+        if (
+            key not in ("gpu_profile", "cluster_profile", "cluster_server_id", "key_name", "restart")
+            or item is not None
+        )
         and not (key == "lifecycle" and item == "service")
     }
     digest = (
@@ -1022,6 +1051,8 @@ async def advance_prepared_boot(session, row, actor, conn, settings, *, allocate
     spec = row.spec_json
     token = secrets.token_urlsafe(32)
     session_token = None
+    # Only the restart-status report uses this; it outlives the single-use bootstrap capability.
+    restart_token = secrets.token_urlsafe(32) if restart_policy(spec) == "unless-stopped" else None
     if spec.get("lifecycle") == "dev":
         from palimpsest_hub.services import instance_lifecycle as lifecycle
 
@@ -1054,6 +1085,7 @@ async def advance_prepared_boot(session, row, actor, conn, settings, *, allocate
             if session_token is not None
             else {}
         ),
+        **({"restart": {"policy": "unless-stopped", "capability": restart_token}} if restart_token is not None else {}),
     }
     user_data = base64.b64encode(render_bootstrap(guest).encode()).decode()
     if len(user_data) > 65535:
@@ -1061,6 +1093,11 @@ async def advance_prepared_boot(session, row, actor, conn, settings, *, allocate
         await session.commit()
         return
     row.capability_hash = hashlib.sha256(token.encode()).hexdigest()
+    if restart_token is not None:
+        row.spec_json = {
+            **row.spec_json,
+            "restart_capability_hash": hashlib.sha256(restart_token.encode()).hexdigest(),
+        }
     if session_token is not None:
         await lifecycle.bind_capability(session, row.id, session_hash)
     preparation_update(row, phase="nova_create_uncertain", server_create_attempted=True)
@@ -1579,3 +1616,11 @@ def capability(row, supplied):
         or row.status in ("deleting", "deleted")
     ):
         raise HTTPException(404, "Bootstrap capability not found or expired")
+
+
+def restart_capability(row, supplied):
+    """The long-lived, restart-status-only guest capability of a running instance."""
+    expected = row.spec_json.get("restart_capability_hash")
+    actual = hashlib.sha256(supplied.encode()).hexdigest()
+    if not expected or not hmac.compare_digest(actual, expected) or row.status in ("deleting", "deleted"):
+        raise HTTPException(404, "Restart status capability not found")

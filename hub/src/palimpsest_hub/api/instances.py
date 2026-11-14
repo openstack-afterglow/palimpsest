@@ -43,6 +43,8 @@ class InstanceRequest(BaseModel):
     request_id: UUID
     name: str = Field(pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$")
     lifecycle: Literal["service", "dev"] = "service"
+    # None lets the Hub choose: unless-stopped for a service instance with a readiness probe, else no.
+    restart: Literal["no", "unless-stopped"] | None = None
     key_name: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9_. @-]{0,254}$")
     image_id: UUID
     flavor_id: str = Field(min_length=1, max_length=64, pattern=r"^[a-zA-Z0-9_.-]+$")
@@ -103,6 +105,8 @@ class InstanceRequest(BaseModel):
             raise ValueError("lifecycle=dev excludes cluster_profile because guest user-data exceeds Nova's size limit")
         if self.cluster_profile and (self.gpu_profile or self.command or self.readiness_argv):
             raise ValueError("cluster_profile excludes GPU and caller-selected execution")
+        if self.restart == "unless-stopped" and (not self.readiness_argv or self.gpu_profile or self.cluster_profile):
+            raise ValueError("restart=unless-stopped needs a readiness probe and excludes GPU and cluster profiles")
         return self
 
 
@@ -430,6 +434,65 @@ async def bootstrap_resume_result(instance_id: UUID, request: Request):
         row.spec_json = {**row.spec_json, "resume_result": {**payload, "recorded_at": now.isoformat()}}
         row.status = payload["status"]
         row.error_code = payload["error_code"]
+        row.updated_at = now
+        await session.commit()
+    return Response(status_code=204, headers={"Cache-Control": "no-store"})
+
+
+class InstanceRestartStatus(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    instance_id: UUID
+    restarts: int = Field(ge=1, le=1_000_000_000, strict=True)
+    last_exit_code: int = Field(ge=-255, le=255, strict=True)
+    state: Literal["backoff", "running"]
+
+
+@router.put(
+    "/instance-bootstrap/{instance_id}/restart-status",
+    status_code=204,
+    operation_id="put_instance_bootstrap_restart_status",
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "content": {"application/json": {"schema": InstanceRestartStatus.model_json_schema()}},
+        }
+    },
+)
+async def bootstrap_restart_status(instance_id: UUID, request: Request):
+    """The guest reports that its main command exited and is being (or was) started again.
+
+    Observation only: the VM, its writable layer and the instance status are untouched. The guest
+    restarts regardless of whether this report is delivered.
+    """
+    token = bearer(request)
+    body = bytearray()
+    async for chunk in request.stream():
+        body.extend(chunk)
+        if len(body) > 1024:
+            raise HTTPException(413, "Guest restart status exceeds byte limit")
+    try:
+        report = InstanceRestartStatus.model_validate_json(bytes(body))
+    except ValueError:
+        raise HTTPException(422, "Invalid bounded guest restart status") from None
+    if str(report.instance_id) != str(instance_id):
+        raise HTTPException(409, "Guest restart status identity does not match capability")
+    async with sql_mutex(_factory_or_503(), "build-api:instance:" + str(instance_id)) as session:
+        row = await session.get(PalimpsestHubInstance, str(instance_id))
+        if row is None:
+            raise HTTPException(404, "Restart status capability not found")
+        service.restart_capability(row, token)
+        if row.status not in ("ready", "resumed"):
+            raise HTTPException(409, "Instance is not running a restartable command")
+        now = datetime.now(UTC)
+        row.spec_json = {
+            **row.spec_json,
+            "restart_status": {
+                "restarts": report.restarts,
+                "last_exit_code": report.last_exit_code,
+                "state": report.state,
+                "recorded_at": now.isoformat(),
+            },
+        }
         row.updated_at = now
         await session.commit()
     return Response(status_code=204, headers={"Cache-Control": "no-store"})

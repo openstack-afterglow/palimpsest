@@ -869,7 +869,7 @@ wheels = [
 
 [[package]]
 name = "palimpsest-client"
-version = "0.3.20"
+version = "0.3.21"
 source = { directory = "../" }
 
 [package.metadata]
@@ -888,7 +888,7 @@ provides-extras = ["kvm", "cloud", "dev"]
 
 [[package]]
 name = "palimpsest-hub"
-version = "0.3.20"
+version = "0.3.21"
 source = { editable = "." }
 dependencies = [
     { name = "asyncmy" },
