@@ -143,6 +143,7 @@ SPECIAL_FILES = {
             "instance_lifecycle_api",
             "instance_lifecycle",
             "instance_runner_resume",
+            "instance_restart",
             "execution_boundaries",
             "export_delegation",
             "migrate",

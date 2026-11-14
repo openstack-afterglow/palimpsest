@@ -1132,6 +1132,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     instance_create.add_argument("--key-name", help="existing Nova SSH keypair name owned by the caller")
     instance_create.add_argument(
+        "--restart",
+        choices=("no", "unless-stopped"),
+        help=(
+            "main command restart policy: unless-stopped restarts a crashed or OOM-killed long-running command "
+            "(needs --readiness-json); default is chosen by the Hub "
+            "(unless-stopped for service with a readiness probe, no for dev)"
+        ),
+    )
+    instance_create.add_argument(
         "--layer-digest", action="append", default=[], help="SHA-256 layer digest, in order (repeatable)"
     )
     instance_create.add_argument("--image-job-id", help="Hub image job id whose result selects the layer stack")
@@ -2748,6 +2757,8 @@ def _instance_create_request(args: argparse.Namespace) -> dict:
         request["command"] = _json_argv(args.command_json, "--command-json")
     if args.readiness_json is not None:
         request["readiness_argv"] = _json_argv(args.readiness_json, "--readiness-json")
+    if args.restart == "unless-stopped" and args.readiness_json is None:
+        raise PalimpsestError("--restart unless-stopped requires --readiness-json")
     return request
 
 
@@ -2769,7 +2780,7 @@ def _dispatch_instance(args: argparse.Namespace) -> int:
     elif op == "status":
         result = client.get_instance(instance_id)
     elif op == "create":
-        result = client.create_instance(request)
+        result = client.create_instance(request, restart=args.restart)
     elif op == "advance":
         request_id, boot_volume_id = advance_ids
         result = client.advance_instance(

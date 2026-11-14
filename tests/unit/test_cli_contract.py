@@ -3334,9 +3334,12 @@ def _instance_create_argv(**overrides):
 def test_cli_instance_create_posts_only_the_selected_fields(monkeypatch: pytest.MonkeyPatch, capsys):
     _instance_env(monkeypatch)
     sent = []
+    options = []
     monkeypatch.setattr(
         "palimpsest_local.cli.HubClient.create_instance",
-        lambda self, request, **kwargs: sent.append(request) or {"id": _INSTANCE_ID, "status": "creating"},
+        lambda self, request, **kwargs: (
+            sent.append(request) or options.append(kwargs) or {"id": _INSTANCE_ID, "status": "creating"}
+        ),
     )
     argv = _instance_create_argv(**{"--command-json": '["/bin/true"]', "--writable-gib": "8"})
     assert cli.main(argv) == 0
@@ -3353,15 +3356,18 @@ def test_cli_instance_create_posts_only_the_selected_fields(monkeypatch: pytest.
             "command": ["/bin/true"],
         }
     ]
+    assert "restart" not in sent[0]
+    assert options == [{"restart": None}]
     assert _INSTANCE_ID in capsys.readouterr().out
 
 
 def test_cli_instance_create_sends_every_optional_field_under_the_hub_names(monkeypatch: pytest.MonkeyPatch):
     _instance_env(monkeypatch)
     sent = []
+    options = []
     monkeypatch.setattr(
         "palimpsest_local.cli.HubClient.create_instance",
-        lambda self, request, **kwargs: sent.append(request) or {"id": _INSTANCE_ID},
+        lambda self, request, **kwargs: sent.append(request) or options.append(kwargs) or {"id": _INSTANCE_ID},
     )
     group = "55555555-5555-4555-8555-555555555555"
     job = "66666666-6666-4666-8666-666666666666"
@@ -3378,6 +3384,7 @@ def test_cli_instance_create_sends_every_optional_field_under_the_hub_names(monk
             "--readiness-json": '["/bin/ready"]',
             "--lifecycle": "dev",
             "--key-name": "my-key",
+            "--restart": "unless-stopped",
         }
     )
     assert cli.main(argv) == 0
@@ -3399,6 +3406,7 @@ def test_cli_instance_create_sends_every_optional_field_under_the_hub_names(monk
         "lifecycle": "dev",
         "key_name": "my-key",
     }
+    assert options == [{"restart": "unless-stopped"}]
     # source_instance_id is the remaining optional field; it replaces the layer stack on the Hub.
     sent.clear()
     source = "88888888-8888-4888-8888-888888888888"
@@ -3418,6 +3426,10 @@ _INSTANCE_BAD_CASES = [
     (_instance_create_argv(**{"--command-json": "[1]"}), "--command-json must be a JSON array of strings"),
     (_instance_create_argv(**{"--command-json": "[" * 200000}), "--command-json must be a JSON array of strings"),
     (_instance_create_argv(**{"--readiness-json": "not json"}), "--readiness-json must be a JSON array of strings"),
+    (
+        _instance_create_argv(**{"--restart": "unless-stopped"}),
+        "--restart unless-stopped requires --readiness-json",
+    ),
     (["instance", "status", _BAD_UUID], "instance_id must be a UUID"),
     (["instance", "stop", _BAD_UUID], "instance_id must be a UUID"),
     (["instance", "rm", _BAD_UUID], "instance_id must be a UUID"),
@@ -3592,6 +3604,18 @@ def test_cli_instance_explicit_service_lifecycle_is_not_omitted(monkeypatch: pyt
     assert sent[0]["lifecycle"] == "service"
 
 
+def test_cli_instance_explicit_no_restart_is_not_omitted(monkeypatch: pytest.MonkeyPatch):
+    _instance_env(monkeypatch)
+    sent = []
+    monkeypatch.setattr(
+        "palimpsest_local.cli.HubClient.create_instance",
+        lambda self, request, **kwargs: sent.append((request, kwargs)) or {"id": _INSTANCE_ID},
+    )
+    assert cli.main(_instance_create_argv(**{"--restart": "no"})) == 0
+    assert "restart" not in sent[0][0]
+    assert sent[0][1] == {"restart": "no"}
+
+
 def test_cli_instance_lifecycle_completion_candidates():
     from palimpsest_local import completion
 
@@ -3607,5 +3631,10 @@ def test_cli_instance_lifecycle_completion_candidates():
         "connection",
         "rm",
     }
-    assert set(completion.resolve_candidates(parser, ["instance", "create", "--"])) >= {"--lifecycle", "--key-name"}
+    assert set(completion.resolve_candidates(parser, ["instance", "create", "--"])) >= {
+        "--lifecycle",
+        "--key-name",
+        "--restart",
+    }
     assert completion.resolve_candidates(parser, ["instance", "create", "--lifecycle", ""]) == ["dev", "service"]
+    assert completion.resolve_candidates(parser, ["instance", "create", "--restart", ""]) == ["no", "unless-stopped"]

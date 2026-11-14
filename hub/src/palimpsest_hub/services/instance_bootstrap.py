@@ -9,7 +9,9 @@ and OverlayFS support; bootstrap failure is reported rather than running bare ba
 from __future__ import annotations
 
 import base64
+import io
 import json
+import tokenize
 
 from palimpsest_hub.services.instance_cluster_runtime import CLUSTER_RUNTIME
 from palimpsest_hub.services.instance_gpu_runtime import GPU_RUNTIME
@@ -66,9 +68,20 @@ if __name__ == '__main__':
 )
 
 
+def _without_comment_lines(source: str) -> str:
+    """Drop comment-only lines: the guest copy is size-limited by Nova user-data, not read by people."""
+    dropped = {
+        token.start[0]
+        for token in tokenize.generate_tokens(io.StringIO(source).readline)
+        if token.type == tokenize.COMMENT and token.line.lstrip().startswith("#")
+    }
+    return "".join(line for number, line in enumerate(source.splitlines(keepends=True), 1) if number not in dropped)
+
+
 def render_runner(gpu: bool = False, cluster: bool = False) -> str:
-    """Keep CPU cloud-init bytes unchanged; vendor code consumes GPU budget only."""
-    return (
+    """Render the guest runner. GPU and cluster code is added only to their own variants, the cluster
+    variant omits resume/restart helpers, and comment-only lines are stripped: Nova caps user-data."""
+    source = (
         r"""import hashlib, json, os, pathlib, stat, subprocess, time, urllib.request
 ROOT = pathlib.Path('/var/lib/palimpsest-instance')
 resume_path = ROOT / 'resume.json'
@@ -140,7 +153,12 @@ def report(state, code=None):
             time.sleep(1)
     raise RuntimeError('result_delivery_failed')
 
-def persist_resume():
+"""
+        + (
+            # The cluster runner never resumes or restarts and sits at Nova's user-data size limit.
+            ""
+            if cluster
+            else r"""def persist_resume():
     # Dev instances only (they have the session reporter): retain exactly what a resumed boot needs,
     # without the single-use bootstrap capability or its expiry, after the first ready report.
     if resuming or spec.get('gpu') is not None or spec.get('cluster') is not None:
@@ -156,6 +174,23 @@ def persist_resume():
         os.fsync(output.fileno())
     os.replace(temporary, resume_path)
 
+def report_restart(count, code, state):
+    # Observation only: restarting never depends on the Hub being reachable.
+    try:
+        body = json.dumps({'instance_id': spec['instance_id'], 'restarts': count,
+                           'last_exit_code': code, 'state': state}, separators=(',', ':')).encode()
+        request = urllib.request.Request(
+            spec['origin'] + '/v1/instance-bootstrap/' + spec['instance_id'] + '/restart-status', data=body,
+            headers={'Authorization': 'Bearer ' + spec['restart']['capability'],
+                     'Content-Type': 'application/json'}, method='PUT')
+        with urllib.request.urlopen(request, timeout=15) as response:
+            response.read(1024)
+    except Exception:
+        pass
+
+"""
+        )
+        + r"""
 def make_dir(path):
     # First boot creates each directory exclusively. A resume reuses real directories (recreating a
     # missing mountpoint is harmless) but never follows a symlink or a non-directory.
@@ -448,9 +483,53 @@ def pump(timeout=0.2):
             pump(0)
             persist_resume()
             report('ready')
-            # systemd owns the running command lifecycle until instance shutdown.
-            while process.poll() is None:
-                pump()
+            # systemd owns the running command lifecycle until instance shutdown. With
+            # restart=unless-stopped a command that exits, crashes or is OOM-killed is started again in
+            # the same VM and writable layer; stopping the unit or the VM kills this runner first.
+            restarts = 0
+            delay = 2
+            while True:
+                started = time.time()
+                while process.poll() is None:
+                    pump()
+                if (spec.get('restart') or {}).get('policy') != 'unless-stopped':
+                    break
+                drained = time.time() + 2
+                while selector.get_map() and time.time() < drained:
+                    pump()
+                import signal
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)  # No leftover children of the old command.
+                except ProcessLookupError:
+                    pass
+                code = max(-255, min(255, process.returncode))
+                captures = list(outputs.values())
+                for key in list(selector.get_map().values()):
+                    selector.unregister(key.fileobj)
+                    key.fileobj.close()
+                outputs.clear()
+                while True:
+                    restarts += 1
+                    if time.time() - started >= 300:
+                        delay = 2
+                    waited = time.time()
+                    report_restart(restarts, code, 'backoff')
+                    time.sleep(max(0, delay - (time.time() - waited)))
+                    delay = min(delay * 2, 60)
+                    try:
+                        process = subprocess.Popen(spec['command'], stdin=subprocess.DEVNULL,
+                                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                                   env=environment, preexec_fn=enter_runtime,
+                                                   start_new_session=True)
+                        break
+                    except (OSError, subprocess.SubprocessError):
+                        # The command could not be started (fork failure, damaged image): keep backing off.
+                        code = 127
+                        started = time.time()
+                for pipe, capture in zip((process.stdout, process.stderr), captures):
+                    outputs[pipe.fileno()] = capture
+                    selector.register(pipe, selectors.EVENT_READ)
+                report_restart(restarts, code, 'running')
         else:
             while process.poll() is None and time.time() < deadline:
                 pump()
@@ -558,6 +637,7 @@ finally:
     (ROOT / 'spec.json').unlink(missing_ok=True)
 """
     )
+    return _without_comment_lines(source)
 
 
 GUEST_RUNNER = render_runner()

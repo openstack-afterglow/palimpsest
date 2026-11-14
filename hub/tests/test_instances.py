@@ -1727,6 +1727,7 @@ async def test_cpu_request_digest_is_compatible_with_pre_gpu_api(instance_hub):
     # Defaults of later opt-in fields must not change the pre-upgrade idempotency digest.
     assert expected.pop("lifecycle") == "service"
     assert expected.pop("key_name") is None
+    assert expected.pop("restart") is None
     response = await create_and_advance(h, json=body)
     assert response.status_code == 202, response.text
     async with h.factory() as session:

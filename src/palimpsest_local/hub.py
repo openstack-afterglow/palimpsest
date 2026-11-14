@@ -611,9 +611,15 @@ class HubClient:
         return self._json_request("GET", "/image-jobs/" + urllib.parse.quote(job_id, safe=""))
 
     def create_instance(
-        self, request: dict[str, Any], *, before_send: Callable[[], None] | None = None
+        self,
+        request: dict[str, Any],
+        *,
+        restart: str | None = None,
+        before_send: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         """Create through the Hub API; optionally guard immediately before transport."""
+        if restart is not None:
+            request = {**request, "restart": restart}
         return self._json_request("POST", "/instances", request, before_send=before_send)
 
     def list_instances(self, *, limit: int = 50) -> list[dict[str, Any]]:

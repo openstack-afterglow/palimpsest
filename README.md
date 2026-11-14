@@ -25,30 +25,31 @@ are not deployed-service acceptance; see the [control-plane boundaries](ARCHITEC
 - **0.3.18 (published and deployed 2026-11-14):** the same admin path now also honours the protected user/project lists that members already obey, and the retired-Trust sweep no longer records a false `trust_unrecoverable` when another controller revoked first. No schema change.
 - **0.3.19 (published and deployed 2026-11-14):** trust-scoped shelve/export connections accept the `reader` role Keystone implies for `member`; found on the first real idle shelve. No schema change.
 - **0.3.20 (published and deployed 2026-11-14):** a shelved dev instance gets a real resume path that remounts its retained layers and writable upper; first live proof preserved a marker across shelve/unshelve. Instances created by older releases, GPU or cluster dev instances and service-instance crash restart are not covered. No schema change.
+- **Candidate 0.3.21 (not yet published or deployed):** `restart=unless-stopped` restarts a crashed or OOM-killed long-running command of a service instance in place and reports restart status; default for service instances with a readiness probe. No schema change; not yet exercised on a real crash.
 
 ## Install from PyPI
 
 Requires Python 3.11 or newer. Prefer an isolated uv tool, or a pip virtual environment:
 
 ```sh
-uv tool install --python 3.11 "palimpsest-client==0.3.20"
+uv tool install --python 3.11 "palimpsest-client==0.3.21"
 palimpsest --version
 
 # Alternative: pip, without modifying the system Python.
 python3.11 -m venv .venv
-.venv/bin/python -m pip install "palimpsest-client==0.3.20"
+.venv/bin/python -m pip install "palimpsest-client==0.3.21"
 .venv/bin/palimpsest --version
 ```
 
 If uv's tool directory is not on `PATH`, run `uv tool update-shell` explicitly
 and open a new terminal. One-off use: `uvx --python 3.11 --from
-palimpsest-client==0.3.20 palimpsest --version`.
+palimpsest-client==0.3.21 palimpsest --version`.
 
 Root client installation and Hub service deployment are separate. API, export
 worker and build-worker images must match the reviewed release; updating the
 root wheel alone does not update running Kolla containers.
 
-The commands above select version 0.3.20 after its formal publication. Check the
+The commands above select version 0.3.21 after its formal publication. Check the
 [release handoff](docs/development-handoff.md) for actual PyPI/image receipts and
 the deployment-server package/lock selection. Older release and production
 receipts remain historical and do not establish the currently running version.

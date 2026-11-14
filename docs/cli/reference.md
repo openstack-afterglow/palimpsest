@@ -3,7 +3,7 @@
 
 This file is generated from `palimpsest_local.cli.build_parser`. It inventories every command, positional, option, choice, and parser default. For behavior, examples, and runtime restrictions, read [the usage guide](usage.md). Every command except raw `docker` pass-through accepts automatic `-h`/`--help`.
 
-Coverage: **172 command paths**, **473 positional/option definitions** (excluding automatic `-h/--help`).
+Coverage: **172 command paths**, **474 positional/option definitions** (excluding automatic `-h/--help`).
 
 ## `palimpsest`
 
@@ -1248,7 +1248,7 @@ usage: palimpsest instance status [-h] instance_id
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest instance create [-h] --request-id REQUEST_ID --name NAME --image-id IMAGE_ID --flavor-id FLAVOR_ID --network-id NETWORK_ID --boot-gib BOOT_GIB [--writable-gib WRITABLE_GIB] [--lifecycle {service,dev}] [--key-name KEY_NAME] [--layer-digest LAYER_DIGEST] [--image-job-id IMAGE_JOB_ID] [--source-instance-id SOURCE_INSTANCE_ID] [--security-group-id SECURITY_GROUP_ID] [--gpu-profile GPU_PROFILE] [--cluster-profile CLUSTER_PROFILE] [--cluster-server-id CLUSTER_SERVER_ID] [--command-json COMMAND_JSON] [--readiness-json READINESS_JSON]
+usage: palimpsest instance create [-h] --request-id REQUEST_ID --name NAME --image-id IMAGE_ID --flavor-id FLAVOR_ID --network-id NETWORK_ID --boot-gib BOOT_GIB [--writable-gib WRITABLE_GIB] [--lifecycle {service,dev}] [--key-name KEY_NAME] [--restart {no,unless-stopped}] [--layer-digest LAYER_DIGEST] [--image-job-id IMAGE_JOB_ID] [--source-instance-id SOURCE_INSTANCE_ID] [--security-group-id SECURITY_GROUP_ID] [--gpu-profile GPU_PROFILE] [--cluster-profile CLUSTER_PROFILE] [--cluster-server-id CLUSTER_SERVER_ID] [--command-json COMMAND_JSON] [--readiness-json READINESS_JSON]
 ```
 
 | Argument | Value | Parser default | Description |
@@ -1262,6 +1262,7 @@ usage: palimpsest instance create [-h] --request-id REQUEST_ID --name NAME --ima
 | `--writable-gib` | int | `None` | guest-private writable capacity in GiB |
 | `--lifecycle` | one of: `service`, `dev` | `None` | service (default), or dev with idle auto-shelve |
 | `--key-name` | string | `None` | existing Nova SSH keypair name owned by the caller |
+| `--restart` | one of: `no`, `unless-stopped` | `None` | main command restart policy: unless-stopped restarts a crashed or OOM-killed long-running command (needs --readiness-json); default is chosen by the Hub (unless-stopped for service with a readiness probe, no for dev) |
 | `--layer-digest` | string; repeatable | `[]` | SHA-256 layer digest, in order (repeatable) |
 | `--image-job-id` | string | `None` | Hub image job id whose result selects the layer stack |
 | `--source-instance-id` | string | `None` | retained instance whose exact layer stack is reused |
