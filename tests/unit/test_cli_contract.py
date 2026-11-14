@@ -3213,6 +3213,49 @@ def test_hub_credentials_refuses_a_cloud_without_a_project(monkeypatch: pytest.M
         cloud_cli.hub_credentials("dms")
 
 
+def _credential_failures():
+    from keystoneauth1 import exceptions as keystone
+    from openstack import exceptions as sdk
+
+    def wrapped(cause):
+        # openstacksdk re-raises keystoneauth failures as SDKException(str(cause)) inside the handler.
+        try:
+            raise cause
+        except Exception as original:
+            try:
+                raise sdk.SDKException(str(original))
+            except sdk.SDKException as outer:
+                return outer
+
+    secret = "s3cr3t-password"
+    return [
+        (sdk.ConfigException("Cloud dms was not found."), "no usable cloud"),
+        (wrapped(keystone.ConnectTimeout("Request to https://keystone.example timed out")), "cannot reach Keystone"),
+        (wrapped(keystone.DiscoveryFailure("Could not find versioned identity endpoints")), "cannot reach Keystone"),
+        (wrapped(keystone.http.Unauthorized(f"password {secret} rejected")), "rejected the credential"),
+        (RuntimeError(f"unexpected {secret}"), "cannot obtain a Keystone token"),
+    ]
+
+
+@pytest.mark.parametrize("case", range(5))
+def test_hub_credentials_names_the_failed_client_side_check_without_leaking(monkeypatch: pytest.MonkeyPatch, case: int):
+    pytest.importorskip("openstack")
+    from palimpsest_local import cloud_cli
+    from palimpsest_local.errors import PalimpsestError
+
+    failure, expected = _credential_failures()[case]
+
+    def refuse(cloud):
+        raise failure
+
+    monkeypatch.setattr(cloud_cli, "_connect", refuse)
+    with pytest.raises(PalimpsestError) as raised:
+        cloud_cli.hub_credentials("dms")
+    message = str(raised.value)
+    assert expected in message and "'dms'" in message
+    assert "s3cr3t" not in message and "keystone.example" not in message
+
+
 def test_cloud_flag_is_refused_on_commands_that_never_contact_hub(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("PALIMPSEST_URL", "http://localhost:8080")
     monkeypatch.setattr(

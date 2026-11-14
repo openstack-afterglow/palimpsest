@@ -43,15 +43,42 @@ def _connect(cloud: str):
     return connection
 
 
+def _credential_failure(cloud: str, failure: BaseException) -> str:
+    """Name which client-side access check failed, without echoing credentials or response bodies."""
+    from keystoneauth1 import exceptions as keystone
+    from openstack import exceptions as sdk
+
+    chain: list[BaseException] = []
+    current: BaseException | None = failure
+    while current is not None and current not in chain:
+        chain.append(current)
+        current = current.__cause__ or current.__context__
+    if any(isinstance(item, sdk.ConfigException) for item in chain):
+        return f"clouds.yaml has no usable cloud named {cloud!r}; check the name and the clouds.yaml search path"
+    if any(isinstance(item, (keystone.connection.ConnectionError, keystone.DiscoveryFailure)) for item in chain):
+        return f"cannot reach Keystone for clouds.yaml cloud {cloud!r}; check the network, DNS and TLS trust"
+    if any(isinstance(item, (keystone.http.Unauthorized, keystone.http.Forbidden)) for item in chain):
+        return (
+            f"Keystone rejected the credential of clouds.yaml cloud {cloud!r}; "
+            "check the user, password, domain and project"
+        )
+    return f"cannot obtain a Keystone token for clouds.yaml cloud {cloud!r} ({type(failure).__name__})"
+
+
 def hub_credentials(cloud: str) -> tuple[str, str]:
     """Return a Keystone token and its project ID for Hub calls from one clouds.yaml cloud.
 
     The project ID is returned so the caller can send it as X-Project-Id; Hub otherwise scopes the
-    caller to the user's default project.
+    caller to the user's default project. A failure names the failed check instead of a traceback.
     """
-    connection = _connect(cloud)
-    token = connection.authorize()
-    project_id = connection.current_project_id
+    try:
+        connection = _connect(cloud)
+        token = connection.authorize()
+        project_id = connection.current_project_id
+    except PalimpsestError:
+        raise
+    except Exception as failure:
+        raise PalimpsestError(_credential_failure(cloud, failure)) from None
     if not isinstance(token, str) or not token.strip() or not project_id:
         raise PalimpsestError("clouds.yaml cloud did not yield a token and project for Hub")
     return token, project_id
