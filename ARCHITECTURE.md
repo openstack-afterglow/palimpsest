@@ -4037,8 +4037,8 @@ that CI never sees).
 {
   "schema_version": 1,
   "source_sha256": "1aaa5831ecf68675882d109b2355205f649d2be9bdf1b353734a96b837b6a12e",
-  "reviewed_at": "2026-11-14T00:00:37Z",
-  "summary": "Handoff: 0.3.19 live shelve record"
+  "reviewed_at": "2026-11-14T00:14:23Z",
+  "summary": "0.3.19 docs: published and deployed"
 }
 ```
 <!-- architecture-review:end -->

@@ -1,6 +1,6 @@
 # Detailed installation and configuration guide
 
-## 0.3.19 transition note — 2026-11-14 (UTC; candidate)
+## 0.3.19 transition note — 2026-11-14 (UTC; deployed)
 
 0.3.19 is a patch over 0.3.18 with no schema change and no new setting. Found on the first real shelve: Keystone role inference adds `reader` to every token that carries `member`, and the trust connection refused any role outside the delegated set, so a trust delegating `member` could never open a connection (the same check serves image exports). `open_trust_connection` now also accepts the implied `reader` when `member` is delegated; every other extra role and the forbidden set still fail closed. A worker log line now names the reason when a delegated connection cannot be opened. Use the rollout gates below and roll the API/worker cohorts and the build worker to the same release.
 
@@ -43,7 +43,7 @@ initial configuration, upgrades, and administrator-owned Linux deployment.
 Released installations use pinned published bytes; trusted local installation below uses the actual checkout's bytes.
 
 Palimpsest Local requires Python 3.11 or newer; Hub requires Python 3.12+.
-Version 0.3.18 is published (tag `0.3.18`, PyPI `palimpsest-client` 0.3.18) and was deployed to the production Hub (three controllers and the build worker) on 2026-11-14 after a paired SQL/CAS backup (not restore-tested); 0.3.17, 0.3.16 and 0.3.15 were deployed earlier (production was once found running 0.3.13, see the handoff incident note). 0.3.19 is an unpublished, undeployed candidate until its tag, PyPI release and rollout are recorded in the handoff.
+Version 0.3.19 is published (tag `0.3.19`, PyPI `palimpsest-client` 0.3.19) and was deployed to the production Hub (three controllers and the build worker) on 2026-11-14 after a paired SQL/CAS backup (not restore-tested); 0.3.18, 0.3.17, 0.3.16 and 0.3.15 were deployed earlier (production was once found running 0.3.13, see the handoff incident note).
 SDK publication and native execution remain separately qualified. Root/Hub metadata, module versions,
 generated locks and Kolla image defaults move together. After formal publication,
 install exact client bytes with
