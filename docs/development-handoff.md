@@ -24,6 +24,15 @@ files_modified:
 [ARCHITECTURE.md](../ARCHITECTURE.md), 실행 경계는 [testing.md](testing.md),
 세부 결과는 아래 링크된 문서와 source다.
 
+## 0.3.25 release and deployment; resume after stop live; M4-08 checked — 2026-11-15 (UTC)
+
+- Refs: PR #103 squash `a33f2b4`; new annotated tag `0.3.25`; `Release` run `43644642791` (about 49 min) and `Build and Push Palimpsest Hub` run `43644642798` succeeded; PyPI 0.3.25. Independent read-only review before merge (not an Astra/Sol signoff): no blocker; two should-fix findings and test gaps applied.
+- Deployed: api `sha256:d3a886970fe9…`, worker `sha256:0b65870fd40f…`, build-worker `sha256:9bd6556e9e15…`; rollout dir `~/palimpsest-rollout-0.3.25-20261114T223638Z`; backup `/var/backups/palimpsest-pre-0.3.25-20261114T223851Z` (SQL 30 tables, CAS 199 entries, not restore-tested); reconfigure failed=0 (149/139/139); all six controller containers and the build worker report 0.3.25, restarts 0, no error lines, `/v1/ready` 200. The operator client install hit the PyPI index lag right after publication and succeeded on retry.
+- Live (`m408-sdk-02`, `c27507d3-…`, dev): ready (`MARKER-WRITTEN`) → SDK stop → `stopped`/SHUTOFF → CLI resume → ready with API-visible `resume_result.stdout` `MARKER-PRESERVED` → CLI stop → SDK resume → ready → idle shelve → SDK resume (unshelve) → ready → SDK delete; server and boot volume `271f113f-…` absent, row `deleted`. Not seen live: the 409 refusals and the reconcile recovery (tests only).
+- M4-08 checked (61/108) with limits stated in the item: logs are the bounded stdout/stderr of the first and resume results, SSH login itself was not exercised, service instances cannot be resumed after `stop`.
+- Prepared, not merged: branch `feat/kolla-git-allowed-hosts-20261115` (commit `4a45939`) wires `palimpsest_git_allowed_hosts` (default empty) to the Hub API env with a precheck and ansible-evaluated tests; needed before M4-05/06 can be exercised in production. Which hosts to allow is an owner decision.
+- Still open: the two stuck Cinder volumes (`0a256fcf-…` `error_deleting`, `be592821-…` `creating`) and their Hub rows in `deleting`; M4-10 live needs a keypair, a floating IP and an SSH ingress rule.
+
 ## SDK journey on 0.3.24, stop-without-resume defect, 0.3.25 candidate — 2026-11-15 (UTC)
 
 - Live SDK-only journey (`HubClient`, deployed 0.3.24, dev instance `m408-sdk-01` `c38d7995-…`): create → advance → ready (`MARKER-WRITTEN`) → `instance_connection` (identical to the CLI output) → idle shelve → resume → ready → idle shelve again → resume → ready → stop → `stopped`/SHUTOFF → delete; server and boot volume `e14a1473-…` absent, row `deleted`.
