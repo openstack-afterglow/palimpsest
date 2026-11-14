@@ -1,6 +1,6 @@
 # Detailed installation and configuration guide
 
-## 0.3.20 transition note — 2026-11-14 (UTC; candidate)
+## 0.3.20 transition note — 2026-11-14 (UTC; deployed)
 
 0.3.20 is a patch over 0.3.19 with no schema change and no new setting. Dev instances created by 0.3.20 retain `resume.json` in the guest after their first ready report and restore from it after unshelve; instances created by older releases have no such file and stay unrestorable (delete and recreate them). The new `PUT /v1/instance-bootstrap/{id}/resume-result` is authenticated with the guest's session-report capability and accepted only while the Hub records the instance as `resumed`. GPU, cluster and service instances are unchanged. Roll the API/worker cohorts and the build worker to the same release.
 
@@ -47,7 +47,7 @@ initial configuration, upgrades, and administrator-owned Linux deployment.
 Released installations use pinned published bytes; trusted local installation below uses the actual checkout's bytes.
 
 Palimpsest Local requires Python 3.11 or newer; Hub requires Python 3.12+.
-Version 0.3.19 is published (tag `0.3.19`, PyPI `palimpsest-client` 0.3.19) and was deployed to the production Hub (three controllers and the build worker) on 2026-11-14 after a paired SQL/CAS backup (not restore-tested); 0.3.18, 0.3.17, 0.3.16 and 0.3.15 were deployed earlier (production was once found running 0.3.13, see the handoff incident note).
+Version 0.3.20 is published (tag `0.3.20`, PyPI `palimpsest-client` 0.3.20) and was deployed to the production Hub (three controllers and the build worker) on 2026-11-14 after a paired SQL/CAS backup (not restore-tested); 0.3.19, 0.3.18, 0.3.17, 0.3.16 and 0.3.15 were deployed earlier (production was once found running 0.3.13, see the handoff incident note).
 SDK publication and native execution remain separately qualified. Root/Hub metadata, module versions,
 generated locks and Kolla image defaults move together. After formal publication,
 install exact client bytes with

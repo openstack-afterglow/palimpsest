@@ -4038,8 +4038,8 @@ that CI never sees).
 {
   "schema_version": 1,
   "source_sha256": "d240fe17f2a9757922a502520acaea3732f44a96e642b3dd7fce4c0fbc93608b",
-  "reviewed_at": "2026-11-14T07:22:42Z",
-  "summary": "Merge dev into dev-resume-path"
+  "reviewed_at": "2026-11-14T08:45:33Z",
+  "summary": "0.3.20 deployed; M4-09 live evidence"
 }
 ```
 <!-- architecture-review:end -->

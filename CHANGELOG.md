@@ -4,7 +4,7 @@ All notable changes to Palimpsest Local are documented here.
 
 ## [Unreleased]
 
-## [0.3.20] - 2026-11-14 (UTC; candidate, not yet published or deployed)
+## [0.3.20] - 2026-11-14 (UTC; published and deployed)
 
 ### Fixed
 
