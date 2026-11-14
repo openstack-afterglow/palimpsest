@@ -655,6 +655,7 @@ Type=simple
 ExecStart=/usr/bin/python3 /var/lib/palimpsest-instance/runner.py
 PrivateMounts=yes
 KillMode=control-group
+OOMPolicy=continue
 Restart=no
 [Install]
 WantedBy=multi-user.target

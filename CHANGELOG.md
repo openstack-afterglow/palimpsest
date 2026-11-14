@@ -4,7 +4,13 @@ All notable changes to Palimpsest Local are documented here.
 
 ## [Unreleased]
 
-## [0.3.22] - 2026-11-15 (UTC; candidate, not yet published or deployed)
+## [0.3.23] - 2026-11-15 (UTC; candidate, not yet published or deployed)
+
+### Fixed
+
+- The guest unit sets `OOMPolicy=continue`. With systemd's default (`stop`) a kernel OOM kill of the instance command stopped the whole unit, runner included, so `restart=unless-stopped` never restarted an OOM-killed command. Found live on 0.3.22: the kernel logged `Out of memory: Killed process … (sh)` for the command and no restart followed.
+
+## [0.3.22] - 2026-11-15 (UTC; published and deployed)
 
 ### Fixed
 
