@@ -234,6 +234,34 @@ async def mark_resumed(session, instance_id: str) -> None:
         life.updated_at = _now()
 
 
+def restorable(instance: PalimpsestHubInstance) -> bool:
+    """Whether the guest wrote its resume state: only a non-GPU guest whose first result was a probed ready."""
+    spec = instance.spec_json or {}
+    first = instance.result_json or {}
+    return first.get("status") == "ready" and bool(spec.get("readiness_argv")) and spec.get("gpu") is None
+
+
+async def mark_started(session, instance: PalimpsestHubInstance) -> bool:
+    """A stopped dev server is ACTIVE again without a completed `resume`: let its guest report the restore.
+
+    Returns False for an instance without a live lifecycle (service) or without retained resume state.
+    """
+    life = await session.get(Lifecycle, instance.id)
+    if life is None or life.retired or not restorable(instance):
+        return False
+    try:
+        machine = SessionMachine.from_state(life.machine_json)
+    except ValueError:
+        return False
+    if not machine.sessions:
+        machine.phase = Phase.GRACE
+        machine.grace_started = None  # Boot time is not idle time.
+    life.reported_sessions_json, life.report_received_at = None, None
+    life.machine_json = machine.to_state()
+    life.updated_at = _now()
+    return True
+
+
 # -- guest report ---------------------------------------------------------------------------------
 
 
@@ -629,7 +657,7 @@ async def renew_trust(factory, actor, conn, instance_id: str, settings) -> dict:
 
 
 async def resume(factory, actor, conn, instance_id: str, settings) -> dict:
-    """Unshelve with the owner's own token and start a new full grace period."""
+    """Unshelve, or start a stopped server, with the owner's own token and begin a new full grace period."""
     async with sql_mutex(factory, "build-api:instance:" + instance_id) as session:
         project, instance, life = await _owned_dev(session, actor, conn, instance_id)
         if not instance.server_id:
@@ -649,10 +677,24 @@ async def resume(factory, actor, conn, instance_id: str, settings) -> dict:
             if status.startswith("SHELVING"):
                 raise HTTPException(409, "A shelve is still in flight; retry shortly")
             machine.shelve_settled(Claim(machine.generation), time.time(), ok=status.startswith("SHELVED"))
+        if (status == "SHUTOFF" or instance.status in ("stopping", "stopped")) and not restorable(instance):
+            raise HTTPException(409, "Instance has no retained ready state to restore after a stop; delete it instead")
         try:
-            await provider.unshelve(instance.server_id)
+            if status == "SHUTOFF":
+                if instance.status == "stopping":
+                    # Settle the observed stop durably first: a power-on whose outcome is unknown must leave
+                    # a row `reconcile` can recover (`stopped` with an ACTIVE server), not a stop in flight.
+                    instance.status, instance.provider_status = "stopped", "SHUTOFF"
+                    instance.updated_at = _now()
+                    await session.commit()
+                    await _refence(session, instance_id)
+                await provider.start(instance.server_id)
+            else:
+                if instance.status == "stopping":
+                    raise HTTPException(409, "A stop is still in flight; retry shortly")
+                await provider.unshelve(instance.server_id)
         except ProviderError as exc:
-            # A server that is not unshelvable is the caller's state conflict; Nova failures are 502.
+            # A server that is not resumable is the caller's state conflict; Nova failures are 502.
             raise HTTPException(409 if str(exc).startswith("server is ") else 502, str(exc)) from None
         if machine.phase is Phase.SHELVED:
             machine.unshelved()
@@ -664,9 +706,9 @@ async def resume(factory, actor, conn, instance_id: str, settings) -> dict:
         life.reported_sessions_json, life.report_received_at = None, None
         life.machine_json = machine.to_state()
         life.updated_at = _now()
-        if instance.status in ("shelved", "ready", "error", "resumed"):
-            # An unshelve was accepted, so the guest boots again and its runner restores the retained root
-            # and command, then reports through `resume-result`, which only a `resumed` row accepts.
+        if instance.status in ("shelved", "ready", "error", "resumed", "stopping", "stopped"):
+            # The guest boots again (unshelve or power-on) and its runner restores the retained root and
+            # command, then reports through `resume-result`, which only a `resumed` row accepts.
             instance.status = "resumed"
         instance.provider_status = "ACTIVE"
         instance.updated_at = _now()

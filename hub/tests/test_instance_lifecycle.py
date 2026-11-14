@@ -690,11 +690,147 @@ async def test_resume_of_a_server_that_cannot_be_unshelved_is_a_conflict_not_a_p
     async with h.factory() as session:
         server_id = (await session.get(PalimpsestHubInstance, instance_id)).server_id
     sdk_servers(h)
-    h.provider.servers_by_id[server_id]["status"] = "SHUTOFF"
+    h.provider.servers_by_id[server_id]["status"] = "PAUSED"
     actor = {"project_id": PROJECT, "user_id": USER, "package_actions": {"packages:manage"}}
     with pytest.raises(HTTPException) as refused:
         await lifecycle.resume(h.factory, actor, h.provider, instance_id, lifecycle_settings(h))
     assert refused.value.status_code == 409
+
+
+async def _stopped(h, *, status="stopped", result="ready", readiness=True, gpu=None):
+    """A dev instance whose server is SHUTOFF; by default it once reported a probed ready result."""
+    instance_id = await make_dev(h)
+    async with h.factory() as session:
+        row = await session.get(PalimpsestHubInstance, instance_id)
+        server_id = row.server_id
+        spec = {**row.spec_json, "readiness_argv": ["/bin/true"] if readiness else None, "gpu": gpu}
+        row.spec_json = spec
+        row.status, row.provider_status = status, "SHUTOFF"
+        row.result_json = {"status": result} if result else None
+        row.result_recorded_at = datetime.now(UTC) if result else None
+        await session.commit()
+    sdk_servers(h)
+    h.provider.servers_by_id[server_id]["status"] = "SHUTOFF"
+    started = []
+
+    def start_server(identity):
+        started.append(identity)
+        h.provider.servers_by_id[identity]["status"] = "ACTIVE"
+
+    h.provider.start_server = start_server
+    return instance_id, server_id, started
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["stopped", "stopping", "ready"])
+async def test_resume_powers_on_a_stopped_dev_instance_and_waits_for_its_resume_report(
+    instance_hub, trust_boundary, status
+):
+    # `ready` with a SHUTOFF server is a guest that powered itself off.
+    h = instance_hub
+    instance_id, server_id, started = await _stopped(h, status=status)
+    stale = SessionMachine(phase=Phase.GRACE, grace_started=123.0)
+    await set_life(
+        h, instance_id, machine_json=stale.to_state(), reported_sessions_json=[], report_received_at=datetime.now(UTC)
+    )
+    projected = await lifecycle.resume(h.factory, ACTOR, h.provider, instance_id, lifecycle_settings(h))
+    assert started == [server_id] and projected["status"] == "resumed"
+    state = await life_state(h, instance_id)
+    assert state.status == "resumed" and state.provider_status == "ACTIVE"
+    # Boot time is not idle time, exactly as after an unshelve: the old timer and report are dropped.
+    assert state.machine.phase is Phase.GRACE and state.machine.grace_started is None
+    assert state.life.report_received_at is None and state.life.reported_sessions_json is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "kind",
+    [{"result": None}, {"result": "error"}, {"readiness": False}, {"gpu": {"profile": "p"}}],
+    ids=["never-reported", "first-result-error", "no-readiness-probe", "gpu"],
+)
+@pytest.mark.parametrize("nova", ["SHUTOFF", "ACTIVE"])
+async def test_resume_refuses_a_stopped_guest_that_kept_no_resume_state(instance_hub, trust_boundary, kind, nova):
+    h = instance_hub
+    instance_id, server_id, started = await _stopped(h, **kind)
+    h.provider.servers_by_id[server_id]["status"] = nova
+    with pytest.raises(HTTPException) as refused:
+        await lifecycle.resume(h.factory, ACTOR, h.provider, instance_id, lifecycle_settings(h))
+    assert refused.value.status_code == 409 and "delete it instead" in refused.value.detail
+    assert started == [] and (await life_state(h, instance_id)).status == "stopped"
+
+
+@pytest.mark.asyncio
+async def test_resume_refuses_while_a_stop_is_still_in_flight(instance_hub, trust_boundary):
+    h = instance_hub
+    instance_id, server_id, started = await _stopped(h, status="stopping")
+    h.provider.servers_by_id[server_id]["status"] = "ACTIVE"  # Nova has not powered it off yet
+    with pytest.raises(HTTPException) as busy:
+        await lifecycle.resume(h.factory, ACTOR, h.provider, instance_id, lifecycle_settings(h))
+    assert busy.value.status_code == 409 and "stop is still in flight" in busy.value.detail
+    assert started == [] and (await life_state(h, instance_id)).status == "stopping"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["stopped", "stopping"])
+async def test_a_power_on_with_an_unknown_outcome_is_recovered_by_the_next_observation(
+    instance_hub, trust_boundary, status
+):
+    h = instance_hub
+    instance_id, server_id, started = await _stopped(h, status=status)
+    observe = h.provider.get_server
+
+    def flaky(identity):
+        if started:
+            raise RuntimeError("nova unavailable")
+        return observe(identity)
+
+    h.provider.get_server = flaky
+    with pytest.raises(HTTPException) as failed:
+        await lifecycle.resume(h.factory, ACTOR, h.provider, instance_id, lifecycle_settings(h))
+    # Nova accepted the start but the wait failed: the row must not read as a stop in flight.
+    assert failed.value.status_code == 502 and started == [server_id]
+    assert (await life_state(h, instance_id)).status == "stopped"
+    h.provider.get_server = observe
+    seen = await h.client.get(f"/v1/instances/{instance_id}")
+    assert seen.status_code == 200 and seen.json()["status"] == "resumed"
+    state = await life_state(h, instance_id)
+    assert state.machine.phase is Phase.GRACE and state.machine.grace_started is None
+
+
+@pytest.mark.asyncio
+async def test_a_stopped_service_instance_started_outside_the_hub_stays_stopped(instance_hub, trust_boundary):
+    h = instance_hub
+    response = await create_and_advance(h, json=request_body())
+    instance_id = response.json()["id"]
+    async with h.factory() as session:
+        row = await session.get(PalimpsestHubInstance, instance_id)
+        server_id = row.server_id
+        row.status, row.provider_status = "stopped", "SHUTOFF"
+        row.result_json, row.result_recorded_at = {"status": "ready"}, datetime.now(UTC)
+        row.spec_json = {**row.spec_json, "readiness_argv": ["/bin/true"]}
+        await session.commit()
+    h.provider.servers_by_id[server_id]["status"] = "ACTIVE"
+    seen = await h.client.get(f"/v1/instances/{instance_id}")
+    assert seen.status_code == 200 and seen.json()["status"] == "stopped"
+
+
+@pytest.mark.asyncio
+async def test_stop_then_resume_then_the_guest_resume_report_makes_the_instance_ready_again(
+    instance_hub, trust_boundary
+):
+    h = instance_hub
+    instance_id, server_id, started = await _stopped(h, status="ready")
+    h.provider.servers_by_id[server_id]["status"] = "ACTIVE"
+    stop = await h.client.post(f"/v1/instances/{instance_id}/stop")
+    assert stop.status_code == 202 and stop.json()["status"] == "stopping"
+    h.provider.servers_by_id[server_id]["status"] = "SHUTOFF"
+    resumed = await h.client.post(f"/v1/instances/{instance_id}/resume")
+    assert resumed.status_code == 202 and resumed.json()["status"] == "resumed" and started == [server_id]
+    body = {"instance_id": instance_id, "status": "ready", "exit_code": None, "stdout": "kept", "stderr": ""}
+    path = "/v1/instance-bootstrap/" + instance_id + "/resume-result"
+    assert (await h.client.put(path, json=body, headers={"Authorization": "Bearer " + TOKEN})).status_code == 204
+    final = await h.client.get(f"/v1/instances/{instance_id}")
+    assert final.json()["status"] == "ready" and final.json()["resume_result"]["stdout"] == "kept"
 
 
 async def _in_flight(h, nova_status):

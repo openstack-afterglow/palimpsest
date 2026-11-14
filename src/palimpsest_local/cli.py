@@ -1166,9 +1166,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     instance_advance.add_argument("--request-id", required=True, help="UUID of the original create request")
     instance_advance.add_argument("--boot-volume-id", required=True, help="boot volume id reported by create/status")
-    instance_stop = instance_commands.add_parser("stop", help="stop the instance's server (state is retained)")
+    instance_stop = instance_commands.add_parser(
+        "stop", help="stop the instance's server (state is retained; a dev instance can be resumed)"
+    )
     instance_stop.add_argument("instance_id", help="Hub instance id")
-    instance_resume = instance_commands.add_parser("resume", help="unshelve an instance using the caller's token")
+    instance_resume = instance_commands.add_parser(
+        "resume", help="unshelve or power on a dev instance using the caller's token"
+    )
     instance_resume.add_argument("instance_id", help="Hub instance id")
     instance_renew = instance_commands.add_parser("renew", help="renew the instance's idle-shelve delegation trust")
     instance_renew.add_argument("instance_id", help="Hub instance id")

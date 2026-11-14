@@ -40,6 +40,9 @@ class FakeCompute:
         if self.unshelve_error:
             raise self.unshelve_error
 
+    def start_server(self, server_id):
+        self._note("start")
+
 
 def provider(compute, *, timeout=10.0):
     now = [0.0]
@@ -112,6 +115,32 @@ async def test_unshelve_of_a_building_server_is_refused():
     with pytest.raises(ProviderError, match="not unshelvable"):
         await provider(compute).unshelve(SID)
     assert compute.calls == ["get"]
+
+
+async def test_start_of_a_stopped_server_waits_for_active():
+    compute = FakeCompute("SHUTOFF", "SHUTOFF", "ACTIVE")
+    await provider(compute).start(SID)
+    assert compute.calls == ["get", "start", "get", "get"]
+
+
+async def test_start_of_an_active_server_is_success_without_a_call():
+    compute = FakeCompute("ACTIVE")
+    await provider(compute).start(SID)
+    assert compute.calls == ["get"]
+
+
+@pytest.mark.parametrize("status", ["SHELVED_OFFLOADED", "BUILD", "ERROR", "PAUSED"])
+async def test_start_of_a_server_that_is_not_stopped_is_refused_without_calling_nova(status):
+    compute = FakeCompute(status)
+    with pytest.raises(ProviderError, match="not startable"):
+        await provider(compute).start(SID)
+    assert compute.calls == ["get"]
+
+
+async def test_start_that_never_reaches_active_times_out_as_a_provider_error():
+    compute = FakeCompute("SHUTOFF")
+    with pytest.raises(ProviderError, match="timed out"):
+        await provider(compute, timeout=3.0).start(SID)
 
 
 async def test_a_status_missing_from_the_response_is_refused():

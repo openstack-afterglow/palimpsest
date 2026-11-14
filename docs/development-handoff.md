@@ -24,6 +24,13 @@ files_modified:
 [ARCHITECTURE.md](../ARCHITECTURE.md), 실행 경계는 [testing.md](testing.md),
 세부 결과는 아래 링크된 문서와 source다.
 
+## SDK journey on 0.3.24, stop-without-resume defect, 0.3.25 candidate — 2026-11-15 (UTC)
+
+- Live SDK-only journey (`HubClient`, deployed 0.3.24, dev instance `m408-sdk-01` `c38d7995-…`): create → advance → ready (`MARKER-WRITTEN`) → `instance_connection` (identical to the CLI output) → idle shelve → resume → ready → idle shelve again → resume → ready → stop → `stopped`/SHUTOFF → delete; server and boot volume `e14a1473-…` absent, row `deleted`.
+- Defect 1 (live): after `stop`, `resume` answered `HTTP 409 server is SHUTOFF, not unshelvable`; nothing could power the instance on again. Defect 2: the stored `resume_result` (`MARKER-PRESERVED`) was not in the projection and could only be read from the database.
+- 0.3.25 candidate (source, tests passed, not deployed): `resume` powers on a SHUTOFF dev server and marks the row `resumed`; refusals with 409 for a guest without retained ready state and for a stop still in flight; `reconcile` recovers a dev row that is `stopped` while Nova is ACTIVE; projection key `resume_result`. Service instances remain non-resumable after `stop` (documented limit). Independent read-only review (not an Astra/Sol signoff): no blocker, two should-fix findings and test gaps applied; four mutations each failed a test. Hub suite: see the PR.
+- Next: release and deploy 0.3.25, then one dev instance: SDK stop → CLI resume, CLI stop → SDK resume, idle shelve → resume, delete (`/tmp/m408_live25.py` is the throwaway driver). M4-08 stays unchecked until then.
+
 ## Live OOM restart and stop on 0.3.24; M4-12 checked — 2026-11-15 (UTC)
 
 - Decision change: test VMs had been paused because two image-backed boot volumes are stuck in Cinder. A 1 GiB empty-volume probe as the ordinary user (create → `available` in 4 s, delete → absent in 3 s) showed Cinder itself works, so exactly one service instance was created. The two stuck volumes (`0a256fcf-…` `error_deleting`, `be592821-…` `creating`) were not touched; reset/force-delete still needs owner approval.

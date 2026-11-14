@@ -208,6 +208,8 @@ def projection(row):
         "writable_gib": row.spec_json["writable_gib"],
         "writable_storage": "guest-private boot-disk ext4 loop filesystem",
         "result": row.result_json,
+        # The latest restore report of a resumed dev guest; `result` stays the sealed first result.
+        "resume_result": row.spec_json.get("resume_result"),
         "error_code": row.error_code,
         "readiness_semantics": "point-in-time execution/probe proof, not ongoing health",
         "result_recorded_at": aware(row.result_recorded_at).isoformat() if row.result_recorded_at else None,
@@ -1449,6 +1451,13 @@ async def reconcile(session, row, conn, actor=None, settings=None):
 
             row.status = "resumed"
             await lifecycle.mark_resumed(session, row.id)
+        elif row.status == "stopped" and status == "ACTIVE":
+            # Powered on outside `resume`, or by a `resume` whose wait for ACTIVE failed: a dev guest
+            # restores itself on boot and must be able to report. A service instance stays `stopped`.
+            from palimpsest_hub.services import instance_lifecycle as lifecycle
+
+            if await lifecycle.mark_started(session, row):
+                row.status = "resumed"
         # ACTIVE is provider state, never proof of guest readiness.
     if row.status == "booting" and aware(row.capability_expires_at) <= datetime.now(UTC):
         row.status, row.error_code = "error", "bootstrap_expired"
