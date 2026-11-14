@@ -24,7 +24,7 @@ are not deployed-service acceptance; see the [control-plane boundaries](ARCHITEC
 - **0.3.17 (published and deployed 2026-11-13):** `instance create --lifecycle dev` (and `resume|renew`) works for a human system administrator using a project-scoped token. No schema change; see the [transition note](docs/install.md#0317-transition-note--2026-11-13-utc-deployed).
 - **0.3.18 (published and deployed 2026-11-14):** the same admin path now also honours the protected user/project lists that members already obey, and the retired-Trust sweep no longer records a false `trust_unrecoverable` when another controller revoked first. No schema change.
 - **0.3.19 (published and deployed 2026-11-14):** trust-scoped shelve/export connections accept the `reader` role Keystone implies for `member`; found on the first real idle shelve. No schema change.
-- **Candidate 0.3.20 (not yet published or deployed):** a shelved dev instance gets a real resume path that remounts its retained layers and writable upper instead of coming back as the bare base. No schema change; not yet exercised on a real unshelve.
+- **0.3.20 (published and deployed 2026-11-14):** a shelved dev instance gets a real resume path that remounts its retained layers and writable upper; first live proof preserved a marker across shelve/unshelve. Instances created by older releases, GPU or cluster dev instances and service-instance crash restart are not covered. No schema change.
 
 ## Install from PyPI
 
