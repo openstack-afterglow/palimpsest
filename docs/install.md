@@ -1,5 +1,9 @@
 # Detailed installation and configuration guide
 
+## 0.3.20 transition note — 2026-11-14 (UTC; candidate)
+
+0.3.20 is a patch over 0.3.19 with no schema change and no new setting. Dev instances created by 0.3.20 retain `resume.json` in the guest after their first ready report and restore from it after unshelve; instances created by older releases have no such file and stay unrestorable (delete and recreate them). The new `PUT /v1/instance-bootstrap/{id}/resume-result` is authenticated with the guest's session-report capability and accepted only while the Hub records the instance as `resumed`. GPU, cluster and service instances are unchanged. Roll the API/worker cohorts and the build worker to the same release.
+
 ## 0.3.19 transition note — 2026-11-14 (UTC; deployed)
 
 0.3.19 is a patch over 0.3.18 with no schema change and no new setting. Found on the first real shelve: Keystone role inference adds `reader` to every token that carries `member`, and the trust connection refused any role outside the delegated set, so a trust delegating `member` could never open a connection (the same check serves image exports). `open_trust_connection` now also accepts the implied `reader` when `member` is delegated; every other extra role and the forbidden set still fail closed. A worker log line now names the reason when a delegated connection cannot be opened. Use the rollout gates below and roll the API/worker cohorts and the build worker to the same release.
@@ -47,7 +51,7 @@ Version 0.3.19 is published (tag `0.3.19`, PyPI `palimpsest-client` 0.3.19) and 
 SDK publication and native execution remain separately qualified. Root/Hub metadata, module versions,
 generated locks and Kolla image defaults move together. After formal publication,
 install exact client bytes with
-`uv tool install --python 3.11 palimpsest-client==0.3.19`, or install a trusted
+`uv tool install --python 3.11 palimpsest-client==0.3.20`, or install a trusted
 local checkout with `uv tool install --force --python 3.11 .`.
 A root wheel upgrade neither deploys Hub nor qualifies actual build/run behavior.
 Git/outbound GitHub HTTPS is needed only for VCS installation.
@@ -1691,7 +1695,7 @@ and the [command workflows](cli/workflows.md) for operational details.
 
 ## SDK image/native integration: operator prerequisites
 
-The `0.3.19` Hub distribution declares the exact matching client dependency.
+The `0.3.20` Hub distribution declares the exact matching client dependency.
 Checkout resolution uses `hub`'s explicit parent-path source; installed release
 bytes must match the same immutable tag and reviewed image digests. Paired wheel
 or local container checks do not establish production upgrade or native readiness.

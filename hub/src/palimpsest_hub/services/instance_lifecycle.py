@@ -236,6 +236,15 @@ async def mark_resumed(session, instance_id: str) -> None:
 # -- guest report ---------------------------------------------------------------------------------
 
 
+async def verify_session_capability(session, instance_id: str, token: str) -> None:
+    """Raise 404 unless `token` is this live dev instance's session-report capability."""
+    actual = hashlib.sha256(token.encode()).hexdigest()
+    row = await session.get(Lifecycle, instance_id)
+    expected = row.session_capability_hash if row is not None else None
+    if row is None or row.retired or not expected or not hmac.compare_digest(actual, expected):
+        raise HTTPException(404, "Session report capability not found")
+
+
 async def ingest_report(factory, instance_id: str, token: str, probe_text: str) -> None:
     """Accept one guest probe report. Wrong capability or unknown instance is a 404."""
     actual = hashlib.sha256(token.encode()).hexdigest()

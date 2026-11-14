@@ -380,3 +380,52 @@ async def bootstrap_result(instance_id: UUID, request: Request):
         row.updated_at = datetime.now(UTC)
         await session.commit()
     return Response(status_code=204, headers={"Cache-Control": "no-store"})
+
+
+@router.put(
+    "/instance-bootstrap/{instance_id}/resume-result",
+    status_code=204,
+    operation_id="put_instance_bootstrap_resume_result",
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "content": {"application/json": {"schema": InstanceResult.model_json_schema()}},
+        }
+    },
+)
+async def bootstrap_resume_result(instance_id: UUID, request: Request):
+    """A shelved dev guest reports that it restored (or failed to restore) its retained root.
+
+    The single-use bootstrap capability has expired by then, so this uses the guest's session-report
+    capability, and only while the Hub itself recorded the instance as `resumed`. The sealed first
+    result stays untouched; the resume outcome is recorded beside it.
+    """
+    token = bearer(request)
+    body = bytearray()
+    async for chunk in request.stream():
+        body.extend(chunk)
+        if len(body) > 70000:
+            raise HTTPException(413, "Guest result exceeds byte limit")
+    try:
+        result = InstanceResult.model_validate_json(bytes(body))
+    except ValueError:
+        raise HTTPException(422, "Invalid bounded guest result") from None
+    if str(result.instance_id) != str(instance_id):
+        raise HTTPException(409, "Guest result identity does not match capability")
+    async with sql_mutex(_factory_or_503(), "build-api:instance:" + str(instance_id)) as session:
+        row = await session.get(PalimpsestHubInstance, str(instance_id))
+        if row is None:
+            raise HTTPException(404, "Session report capability not found")
+        await lifecycle.verify_session_capability(session, str(instance_id), token)
+        if row.status != "resumed":
+            raise HTTPException(409, "Instance is not awaiting a resume result")
+        payload = result.model_dump(mode="json")
+        for channel in ("stdout", "stderr"):
+            payload[channel] = payload[channel].replace(token, "[redacted session capability]")
+        now = datetime.now(UTC)
+        row.spec_json = {**row.spec_json, "resume_result": {**payload, "recorded_at": now.isoformat()}}
+        row.status = payload["status"]
+        row.error_code = payload["error_code"]
+        row.updated_at = now
+        await session.commit()
+    return Response(status_code=204, headers={"Cache-Control": "no-store"})
