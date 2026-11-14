@@ -64,6 +64,20 @@
   when:
     - palimpsest_public_haproxy_enabled | bool
 
+- name: Precheck | Validate the Git source host allow-list
+  ansible.builtin.assert:
+    that:
+      - palimpsest_git_allowed_hosts is sequence and palimpsest_git_allowed_hosts is not string
+      - (palimpsest_git_allowed_hosts | length) <= 16
+      - palimpsest_git_allowed_hosts | unique | length == palimpsest_git_allowed_hosts | length
+      - >-
+        palimpsest_git_allowed_hosts
+        | select('string')
+        | select('match', '^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z]([a-z0-9-]{0,61}[a-z0-9])?\\Z')
+        | list | length == palimpsest_git_allowed_hosts | length
+    fail_msg: "palimpsest_git_allowed_hosts must be at most 16 unique lowercase DNS host names (no scheme, port or path)"
+  tags: precheck
+
 - name: Precheck | Require the explicit pre-provisioned namespace mount
   ansible.builtin.assert:
     that:

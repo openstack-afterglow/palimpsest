@@ -37,6 +37,9 @@ palimpsest_build_worker_timeout_seconds: 3600
 palimpsest_build_worker_max_blob_bytes: 107374182400
 # Image import/build inputs are bounded separately from retained result blobs.
 palimpsest_registry_hosts: ["docker.io", "registry-1.docker.io", "ghcr.io", "quay.io"]
+# HTTPS Git hosts the Hub API may fetch build contexts from (POST /v1/git-builds).
+# Empty keeps the route off (503) and contacts nothing; list exact host names only.
+palimpsest_git_allowed_hosts: []
 # Registry hosts are a transport fence, not publisher permission. Empty denies
 # all image jobs until the operator selects exact namespace/repository rules.
 palimpsest_image_source_policy:
@@ -241,6 +244,7 @@ palimpsest_hub_api_service:
     PALIMPSEST_HUB_STAGED_TTL_SECONDS: "{{ palimpsest_hub_staged_ttl_seconds | string }}"
     PALIMPSEST_HUB_MAX_BLOCKING_OPERATIONS: "{{ palimpsest_hub_max_blocking_operations | string }}"
     PALIMPSEST_HUB_REGISTRY_HOSTS: "{{ palimpsest_registry_hosts | to_json }}"
+    PALIMPSEST_HUB_GIT_ALLOWED_HOSTS: "{{ palimpsest_git_allowed_hosts | to_json }}"
     PALIMPSEST_HUB_IMAGE_SOURCE_POLICY: "{{ palimpsest_image_source_policy | to_json }}"
     PALIMPSEST_HUB_IMAGE_RUN_NETWORK: "{{ palimpsest_image_run_network }}"
     PALIMPSEST_HUB_IMAGE_CGROUP_ROOT: "{{ palimpsest_image_cgroup_root }}"

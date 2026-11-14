@@ -294,6 +294,84 @@ def test_ansible_haproxy_only_guard_rejects_invalid_explicit_origin(tmp_path):
     assert rendered["guards_ok"] == [False, False]
 
 
+def _execute_git_allow_list(tmp_path, variables):
+    guard = next(task for task in yaml.safe_load(precheck_text) if "Git source host allow-list" in task["name"])
+    output = tmp_path / "rendered.json"
+    environment = yaml.safe_load(defaults_text)["palimpsest_hub_api_service"]["environment"]
+    tasks = [
+        {**guard, "register": "guard", "ignore_errors": True},
+        {
+            "name": "Capture the value the API container receives",
+            "ansible.builtin.copy": {
+                "dest": str(output),
+                "mode": "0600",
+                "content": "{{ {'env': rendered_env, 'ok': not (guard is failed)} | to_json }}",
+            },
+            "vars": {"rendered_env": environment["PALIMPSEST_HUB_GIT_ALLOWED_HOSTS"]},
+        },
+    ]
+    playbook = tmp_path / "playbook.yml"
+    playbook.write_text(
+        yaml.safe_dump(
+            [
+                {
+                    "hosts": "localhost",
+                    "gather_facts": False,
+                    "vars": {
+                        "palimpsest_git_allowed_hosts": yaml.safe_load(defaults_text)["palimpsest_git_allowed_hosts"]
+                    },
+                    "tasks": tasks,
+                }
+            ]
+        )
+    )
+    extra = tmp_path / "variables.json"
+    extra.write_text(json.dumps(variables))
+    result = subprocess.run(
+        ["ansible-playbook", "-i", "localhost,", "-c", "local", str(playbook), "-e", "@" + str(extra)],
+        env={
+            **os.environ,
+            "ANSIBLE_LOCAL_TEMP": str(tmp_path / "ansible-local"),
+            "ANSIBLE_REMOTE_TEMP": str(tmp_path / "ansible-remote"),
+            "ANSIBLE_NOCOLOR": "1",
+        },
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    return json.loads(output.read_text())
+
+
+@pytest.mark.parametrize("hosts", [None, [], ["github.com"], ["github.com", "git.example.org"]])
+def test_ansible_git_allow_list_reaches_the_api_as_json_and_defaults_to_off(tmp_path, hosts):
+    rendered = _execute_git_allow_list(tmp_path, {} if hosts is None else {"palimpsest_git_allowed_hosts": hosts})
+    assert rendered["ok"] is True
+    # pydantic-settings reads a tuple field from a JSON array; an empty array keeps the Git route off.
+    assert json.loads(rendered["env"]) == (hosts or [])
+
+
+@pytest.mark.parametrize(
+    "hosts",
+    [
+        "github.com",
+        ["https://github.com"],
+        ["github.com:443"],
+        ["github.com/owner"],
+        ["GitHub.com"],
+        ["github.com", "github.com"],
+        ["localhost"],
+        ["bad_host.example"],
+        ["10.0.0.5"],
+        [1],
+        ["*.github.com"],
+        [f"h{index}.example.org" for index in range(17)],
+    ],
+)
+def test_ansible_git_allow_list_precheck_rejects_anything_but_exact_host_names(tmp_path, hosts):
+    assert _execute_git_allow_list(tmp_path, {"palimpsest_git_allowed_hosts": hosts})["ok"] is False
+
+
 def test_reader_provisioning_preserves_return_shape_and_verified_least_privilege():
     tasks = yaml.safe_load(keystone_text)
     identity = next(task for task in tasks if task.get("register") == "palimpsest_reader_identity")
