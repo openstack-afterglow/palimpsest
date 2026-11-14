@@ -24,6 +24,14 @@ files_modified:
 [ARCHITECTURE.md](../ARCHITECTURE.md), 실행 경계는 [testing.md](testing.md),
 세부 결과는 아래 링크된 문서와 source다.
 
+## Live OOM restart and stop on 0.3.24; M4-12 checked — 2026-11-15 (UTC)
+
+- Decision change: test VMs had been paused because two image-backed boot volumes are stuck in Cinder. A 1 GiB empty-volume probe as the ordinary user (create → `available` in 4 s, delete → absent in 3 s) showed Cinder itself works, so exactly one service instance was created. The two stuck volumes (`0a256fcf-…` `error_deleting`, `be592821-…` `creating`) were not touched; reset/force-delete still needs owner approval.
+- `m412-svc-06` (`09045df5-d68f-43d2-adfa-7216114ece83`, deployed 0.3.24, `restart=unless-stopped`): ready 20:32:17Z; guest kernel `Out of memory: Killed process 1575 (sh) … anon-rss:7621076kB`; status at 20:49:16Z `restarts=1`, `last_exit_code=-9`, `state=running`, instance still ready/ACTIVE; no session for about twenty minutes and no shelve. `instance stop` → `stopped`/SHUTOFF; restart counters unchanged for five minutes.
+- SDK path on the same instance: `HubClient.get_instance`, `instance_connection`, `list_instances`, `delete_instance`. After deletion the Nova server and boot volume `d8c8b6a1-…` were absent and the Hub row was `deleted` (the volume went away without a separate `delete-volume` advance).
+- M4-12 checked (60/108). Not checked: M4-08 (SDK create/advance/resume not run live), M4-14 (two stuck volumes remain).
+- Observation, not changed: after `stop` the projection keeps the last guest-reported `restart.state` (`running`).
+
 ## 0.3.24 release and deployment; M4-03 checked — 2026-11-15 (UTC)
 
 - Refs: PR #100 squash `af42c57`; new annotated tag `0.3.24` (no overwrite); `Release` run `43633430131` and `Build and Push Palimpsest Hub` run `43633430228` succeeded; PyPI `palimpsest-client` 0.3.24 (wheel, sdist). Independent read-only review before merge (not an Astra/Sol signoff): no blocker; two should-fix findings and test gaps applied.
