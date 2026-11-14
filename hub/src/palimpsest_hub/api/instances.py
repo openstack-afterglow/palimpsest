@@ -313,7 +313,12 @@ class InstanceResult(BaseModel):
     exit_code: int | None = Field(None, ge=-255, le=255)
     stdout: str = Field(default="", max_length=8192)
     stderr: str = Field(default="", max_length=8192)
-    error_code: Literal["guest_execution_failed", "command_failed"] | GpuErrorCode | ClusterErrorCode | None = None
+    error_code: (
+        Literal["guest_execution_failed", "guest_setup_timeout", "command_failed"]
+        | GpuErrorCode
+        | ClusterErrorCode
+        | None
+    ) = None
 
     @model_validator(mode="after")
     def outcome(self):

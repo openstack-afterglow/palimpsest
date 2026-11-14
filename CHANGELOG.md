@@ -4,7 +4,14 @@ All notable changes to Palimpsest Local are documented here.
 
 ## [Unreleased]
 
-## [0.3.21] - 2026-11-14 (UTC; candidate, not yet published or deployed)
+## [0.3.22] - 2026-11-15 (UTC; candidate, not yet published or deployed)
+
+### Fixed
+
+- Guest setup no longer gives `mkfs.ext4` of the writable file only the 30-second step limit (now up to 900 seconds within the bootstrap window). Two of four live service instances on 0.3.21 failed before starting their command, about 30 seconds after the last layer download; the cause is inferred, not observed, because the guest reported only `guest_execution_failed`.
+- A setup step that exceeds its limit is now reported as `guest_setup_timeout` instead of the generic `guest_execution_failed`, so the next such failure is identifiable.
+
+## [0.3.21] - 2026-11-14 (UTC; published and deployed)
 
 ### Added
 
