@@ -4043,8 +4043,8 @@ that CI never sees).
 {
   "schema_version": 1,
   "source_sha256": "e27ac7c8a6dfae7ed8e7784bba14e37cced3118fcba87d186cc43b7d2a3f5b82",
-  "reviewed_at": "2026-11-14T17:45:22Z",
-  "summary": "Guest unit OOMPolicy=continue; 0.3.22 live records; 0.3.23 candidate"
+  "reviewed_at": "2026-11-14T18:47:25Z",
+  "summary": "0.3.23 deployed; live OOM re-test blocked by stuck Cinder volumes"
 }
 ```
 <!-- architecture-review:end -->

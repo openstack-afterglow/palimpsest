@@ -27,7 +27,7 @@ are not deployed-service acceptance; see the [control-plane boundaries](ARCHITEC
 - **0.3.20 (published and deployed 2026-11-14):** a shelved dev instance gets a real resume path that remounts its retained layers and writable upper; first live proof preserved a marker across shelve/unshelve. Instances created by older releases, GPU or cluster dev instances and service-instance crash restart are not covered. No schema change.
 - **0.3.21 (published and deployed 2026-11-14):** `restart=unless-stopped` restarts a crashed or exited long-running command of a service instance in place and reports restart status; default for service instances with a readiness probe. Live: restarts after SIGKILL and after a non-zero exit were observed; an OOM kill was not yet produced. No schema change.
 - **0.3.22 (published and deployed 2026-11-15):** longer limit for formatting the guest writable file and a distinct `guest_setup_timeout` error code, after two of four live service creations failed during guest setup. The one creation since then succeeded; the inferred cause is not confirmed.
-- **Candidate 0.3.23 (not yet published or deployed):** the guest unit survives an OOM kill of the command (`OOMPolicy=continue`); on 0.3.22 a real OOM kill stopped the unit and nothing was restarted.
+- **0.3.23 (published and deployed 2026-11-15):** the guest unit survives an OOM kill of the command (`OOMPolicy=continue`); on 0.3.22 a real OOM kill stopped the unit and nothing was restarted. The corrected unit has not been exercised by a live OOM kill yet (test VMs are paused while two Cinder volumes are stuck).
 
 ## Install from PyPI
 
