@@ -142,6 +142,7 @@ SPECIAL_FILES = {
             "instance_session_reporter",
             "instance_lifecycle_api",
             "instance_lifecycle",
+            "instance_runner_resume",
             "execution_boundaries",
             "export_delegation",
             "migrate",
