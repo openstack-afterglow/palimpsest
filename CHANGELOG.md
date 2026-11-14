@@ -4,6 +4,13 @@ All notable changes to Palimpsest Local are documented here.
 
 ## [Unreleased]
 
+## [0.3.25] - 2026-11-15 (UTC; candidate, not yet published or deployed)
+
+### Added
+
+- `instance resume` (CLI, SDK `resume_instance`, `POST /v1/instances/{id}/resume`) also powers on a stopped dev instance, so `stop` is no longer a dead end: the guest boots, restores its retained root and command and reports through `resume-result`. It is refused with 409 when the guest kept no resume state (never ready, first result an error, no readiness probe, GPU) or while a stop is still in flight. A stopped dev instance whose server is ACTIVE again without a completed `resume` becomes `resumed` at the next status read. Service instances have no resume: for them `stop` remains final apart from delete.
+- The instance projection exposes `resume_result` (the latest restore report of a resumed dev guest); before, the restored command's output was stored but not readable through the API.
+
 ## [0.3.24] - 2026-11-15 (UTC; published and deployed)
 
 ### Fixed

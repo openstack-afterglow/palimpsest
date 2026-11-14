@@ -93,3 +93,13 @@ class NovaShelveProvider:
         elif status != "UNSHELVING":
             raise ProviderError(f"server is {status}, not unshelvable")
         await self._await_status(instance_id, "ACTIVE")
+
+    async def start(self, instance_id: str) -> None:
+        """Power on a stopped server; any state other than SHUTOFF or ACTIVE is refused without a call."""
+        status = await self._status(instance_id)
+        if status == "ACTIVE":
+            return
+        if status != "SHUTOFF":
+            raise ProviderError(f"server is {status}, not startable")
+        await self._call(self._compute.start_server, instance_id)
+        await self._await_status(instance_id, "ACTIVE")
