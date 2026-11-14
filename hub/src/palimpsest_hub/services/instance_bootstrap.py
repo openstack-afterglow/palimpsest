@@ -69,10 +69,21 @@ if __name__ == '__main__':
 def render_runner(gpu: bool = False, cluster: bool = False) -> str:
     """Keep CPU cloud-init bytes unchanged; vendor code consumes GPU budget only."""
     return (
-        r"""import hashlib, json, os, pathlib, subprocess, time, urllib.request
+        r"""import hashlib, json, os, pathlib, stat, subprocess, time, urllib.request
 ROOT = pathlib.Path('/var/lib/palimpsest-instance')
-spec = json.loads((ROOT / 'spec.json').read_text())
-deadline = spec['expires_at']
+resume_path = ROOT / 'resume.json'
+resuming = resume_path.is_file()
+if resuming:
+    # A shelved dev instance booted again: restore from retained verified state, never rebuild.
+    spec = json.loads(resume_path.read_text())
+    session_state = json.loads((ROOT / 'session.json').read_text())
+    if spec['instance_id'] != session_state['instance_id'] or spec['origin'] != session_state['origin']:
+        raise SystemExit('resume_identity_mismatch')
+    spec['capability'] = session_state['capability']
+    deadline = time.time() + 3600
+else:
+    spec = json.loads((ROOT / 'spec.json').read_text())
+    deadline = spec['expires_at']
 headers = {'Authorization': 'Bearer ' + spec['capability']}
 process = None
 mounts = []
@@ -115,7 +126,7 @@ def report(state, code=None):
                 high = middle - 1
         data[channel] = output[:low]
         body = serialize()
-    request = urllib.request.Request(spec['origin'] + '/v1/instance-bootstrap/' + spec['instance_id'] + '/result',
+    request = urllib.request.Request(spec['origin'] + '/v1/instance-bootstrap/' + spec['instance_id'] + ('/resume-result' if resuming else '/result'),
                                      data=body, headers={**headers, 'Content-Type':'application/json'}, method='PUT')
     # Only retry the identical bounded observation; never retry execution.
     for attempt in range(3):
@@ -128,6 +139,32 @@ def report(state, code=None):
                 raise
             time.sleep(1)
     raise RuntimeError('result_delivery_failed')
+
+def persist_resume():
+    # Dev instances only (they have the session reporter): retain exactly what a resumed boot needs,
+    # without the single-use bootstrap capability or its expiry, after the first ready report.
+    if resuming or spec.get('gpu') is not None or spec.get('cluster') is not None:
+        return
+    if not (ROOT / 'session.json').is_file():
+        return
+    state = {key: value for key, value in spec.items() if key not in ('capability', 'expires_at')}
+    temporary = ROOT / 'resume.json.tmp'
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'w') as output:
+        json.dump(state, output, separators=(',', ':'))
+        output.flush()
+        os.fsync(output.fileno())
+    os.replace(temporary, resume_path)
+
+def make_dir(path):
+    # First boot creates each directory exclusively. A resume reuses real directories (recreating a
+    # missing mountpoint is harmless) but never follows a symlink or a non-directory.
+    if resuming:
+        if path.is_symlink() or (path.exists() and not path.is_dir()):
+            raise RuntimeError('resume_state_invalid')
+        path.mkdir(exist_ok=True)
+    else:
+        path.mkdir()
 
 def run(argv):
     subprocess.run(argv, check=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -220,53 +257,72 @@ def pump(timeout=0.2):
         + r"""    writable_bytes = spec['writable_bytes']
     if type(writable_bytes) is not int or not 1024**3 <= writable_bytes <= 4096 * 1024**3:
         raise RuntimeError('invalid_writable_capacity')
-    available = os.statvfs(ROOT)
-    required = writable_bytes + sum(layer['size_bytes'] for layer in spec['layers']) + 1024**3
-    if available.f_bavail * available.f_frsize < required:
-        raise RuntimeError('guest_disk_capacity_insufficient')
+    if not resuming:
+        # The retained layers and fully allocated writable file already occupy their space.
+        available = os.statvfs(ROOT)
+        required = writable_bytes + sum(layer['size_bytes'] for layer in spec['layers']) + 1024**3
+        if available.f_bavail * available.f_frsize < required:
+            raise RuntimeError('guest_disk_capacity_insufficient')
     # Private mount propagation prevents application mounts reaching the base namespace.
     run(['mount', '--make-rprivate', '/'])
     os.chdir(ROOT)
     lower = []
     for index, layer in enumerate(spec['layers']):
         blob = ROOT / ('layer-%d.squashfs' % index)
-        request = urllib.request.Request(spec['origin'] + '/v1/instance-bootstrap/' + spec['instance_id'] +
-                                         '/layers/' + layer['digest'], headers=headers)
         digest = hashlib.sha256()
         count = 0
-        with urllib.request.urlopen(request, timeout=30) as response, open(blob, 'xb') as output:
-            while True:
-                chunk = response.read(1024 * 1024)
-                if not chunk:
-                    break
-                count += len(chunk)
-                if count > layer['size_bytes'] or time.time() >= deadline:
-                    raise RuntimeError('layer_download_failed')
-                digest.update(chunk)
-                output.write(chunk)
+        if resuming:
+            # Re-verify the retained layer bytes; a changed or truncated file is never mounted.
+            fd = os.open(blob, os.O_RDONLY | os.O_NOFOLLOW)
+            with os.fdopen(fd, 'rb') as stream:
+                while True:
+                    chunk = stream.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    count += len(chunk)
+                    digest.update(chunk)
+        else:
+            request = urllib.request.Request(spec['origin'] + '/v1/instance-bootstrap/' + spec['instance_id'] +
+                                             '/layers/' + layer['digest'], headers=headers)
+            with urllib.request.urlopen(request, timeout=30) as response, open(blob, 'xb') as output:
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    count += len(chunk)
+                    if count > layer['size_bytes'] or time.time() >= deadline:
+                        raise RuntimeError('layer_download_failed')
+                    digest.update(chunk)
+                    output.write(chunk)
         if count != layer['size_bytes'] or 'sha256:' + digest.hexdigest() != layer['digest']:
             raise RuntimeError('layer_digest_mismatch')
         target = ROOT / ('lower-%d' % index)
-        target.mkdir()
+        make_dir(target)
         mount(['-t', 'squashfs', '-o', 'loop,ro,nodev,nosuid', str(blob)], target)
         lower.insert(0, target.name)
     # Application mode includes the boot root as a lower. Its writable layer
     # MUST be a different filesystem: a descendant upper/work on that same
     # filesystem is an overlapping OverlayFS layer and Linux rejects it.
     writable = ROOT / 'writable'
-    writable.mkdir()
-    available = os.statvfs(ROOT)
-    if available.f_bavail * available.f_frsize < writable_bytes + 1024**3:
-        raise RuntimeError('guest_disk_capacity_insufficient')
-    # Format ONLY this exclusively created regular file, never a discovered device.
-    fd = os.open(backing_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
-    try:
-        run(['truncate', '-s', str(writable_bytes), str(backing_file)])
-        os.posix_fallocate(fd, 0, writable_bytes)
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    run(['mkfs.ext4', '-q', '-F', '-m', '0', str(backing_file)])
+    make_dir(writable)
+    if resuming:
+        # Re-attach the existing private writable filesystem. NEVER truncate or format it.
+        existing = os.stat(backing_file, follow_symlinks=False)
+        if not stat.S_ISREG(existing.st_mode) or existing.st_size != writable_bytes:
+            raise RuntimeError('resume_writable_mismatch')
+    else:
+        available = os.statvfs(ROOT)
+        if available.f_bavail * available.f_frsize < writable_bytes + 1024**3:
+            raise RuntimeError('guest_disk_capacity_insufficient')
+        # Format ONLY this exclusively created regular file, never a discovered device.
+        fd = os.open(backing_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+        try:
+            run(['truncate', '-s', str(writable_bytes), str(backing_file)])
+            os.posix_fallocate(fd, 0, writable_bytes)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        run(['mkfs.ext4', '-q', '-F', '-m', '0', str(backing_file)])
     attached = subprocess.run(['losetup', '--find', '--show', str(backing_file)], check=True,
                               stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                               stderr=subprocess.DEVNULL, text=True, timeout=30)
@@ -277,14 +333,19 @@ def pump(timeout=0.2):
     loop_device = selected
     mount(['-t', 'ext4', '-o', 'nodev,nosuid', loop_device], writable)
     for name in ('upper', 'work'):
-        (writable / name).mkdir()
+        if resuming:
+            # Restore the existing writable layer; never recreate (that would discard it).
+            if (writable / name).is_symlink() or not (writable / name).is_dir():
+                raise RuntimeError('resume_writable_layer_missing')
+        else:
+            (writable / name).mkdir()
     if spec['mode'] == 'application':
         base = ROOT / 'base'
-        base.mkdir()
+        make_dir(base)
         mount(['--bind', '/'], base)
         run(['mount', '-o', 'remount,bind,ro', str(base)])
         lower.append(base.name)
-    (ROOT / 'merged').mkdir()
+    make_dir(ROOT / 'merged')
     merged = ROOT / 'merged'
     options = 'lowerdir=' + ':'.join(lower) + ',upperdir=writable/upper,workdir=writable/work'
     if len(options.encode()) >= 4096:
@@ -385,6 +446,7 @@ def pump(timeout=0.2):
             if not ready:
                 raise RuntimeError('readiness_failed')
             pump(0)
+            persist_resume()
             report('ready')
             # systemd owns the running command lifecycle until instance shutdown.
             while process.poll() is None:

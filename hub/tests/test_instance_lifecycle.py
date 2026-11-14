@@ -16,7 +16,15 @@ from uuid import uuid4
 import pytest
 from fastapi import HTTPException
 from sqlalchemy import select
-from test_instances import PROJECT, USER, advance_instance, create_and_advance, instance_hub, request_body  # noqa: F401
+from test_instances import (  # noqa: F401
+    PROJECT,
+    USER,
+    advance_instance,
+    create_and_advance,
+    guest_spec,
+    instance_hub,
+    request_body,
+)
 
 from palimpsest_hub.instance_lifecycle_models import PalimpsestHubInstanceLifecycle as Lifecycle
 from palimpsest_hub.instance_models import PalimpsestHubInstance
@@ -1126,3 +1134,101 @@ def test_trust_connection_accepts_the_reader_keystone_implies_for_member_and_not
     else:
         with pytest.raises(boundary.DelegationError):
             boundary.open_trust_connection(delegation(), allowed_role_names=frozenset({"member"}))
+
+
+RESUME_READY = {"status": "ready", "exit_code": None, "stdout": "", "stderr": ""}
+
+
+@pytest.mark.asyncio
+async def test_resume_result_needs_the_session_capability_and_a_resumed_instance(instance_hub, trust_boundary):
+    h = instance_hub
+    instance_id = await make_dev(h)
+    path = "/v1/instance-bootstrap/" + instance_id + "/resume-result"
+    auth = {"Authorization": "Bearer " + TOKEN}
+    body = {"instance_id": instance_id, **RESUME_READY}
+    # Not resumed yet (the guest has only the first, sealed result): refuse, record nothing.
+    assert (await h.client.put(path, json=body, headers=auth)).status_code == 409
+    await set_instance(h, instance_id, status="resumed")
+    wrong = {"Authorization": "Bearer " + "y" * 40}
+    assert (await h.client.put(path, json=body, headers=wrong)).status_code == 404
+    assert (await h.client.put(path, json={**body, "instance_id": str(uuid4())}, headers=auth)).status_code == 409
+    assert (await h.client.get("/v1/instances/" + instance_id)).json()["status"] == "resumed"
+
+
+@pytest.mark.asyncio
+async def test_resume_result_ready_moves_a_resumed_instance_to_ready_and_keeps_the_sealed_first_result(
+    instance_hub, trust_boundary
+):
+    h = instance_hub
+    instance_id = await make_dev(h)
+    first = {"instance_id": instance_id, "status": "ready", "exit_code": 0, "stdout": "first\n", "stderr": ""}
+    boot_auth = {"Authorization": "Bearer " + guest_spec(h.provider)["capability"]}
+    assert (
+        await h.client.put("/v1/instance-bootstrap/" + instance_id + "/result", json=first, headers=boot_auth)
+    ).status_code == 204
+    await set_instance(h, instance_id, status="resumed")
+    path = "/v1/instance-bootstrap/" + instance_id + "/resume-result"
+    auth = {"Authorization": "Bearer " + TOKEN}
+    body = {"instance_id": instance_id, **RESUME_READY, "stdout": "again " + TOKEN}
+    assert (await h.client.put(path, json=body, headers=auth)).status_code == 204
+    async with h.factory() as session:
+        row = await session.get(PalimpsestHubInstance, instance_id)
+        assert row.status == "ready" and row.error_code is None
+        assert row.result_json["stdout"] == "first\n"
+        assert "[redacted session capability]" in row.spec_json["resume_result"]["stdout"]
+        assert TOKEN not in str(row.spec_json["resume_result"])
+    # A lost response makes the guest resend the identical report: accepted. Anything else is not awaited.
+    assert (await h.client.put(path, json=body, headers=auth)).status_code == 204
+    assert (await h.client.put(path, json={**body, "stdout": "different"}, headers=auth)).status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_an_accepted_unshelve_makes_the_row_resumed_even_when_it_still_said_ready(instance_hub, trust_boundary):
+    # The Hub may not have recorded `shelved` yet (unfinished shelve settled by `resume`, or an unshelve
+    # issued after a timeout); the restored guest must still be able to report.
+    h = instance_hub
+    instance_id = await make_dev(h)
+    async with h.factory() as session:
+        server_id = (await session.get(PalimpsestHubInstance, instance_id)).server_id
+    await set_instance(h, instance_id, status="ready")
+    await set_life(h, instance_id, machine_json=SessionMachine(phase=Phase.SHELVED).to_state())
+    sdk_servers(h)
+    h.provider.servers_by_id[server_id]["status"] = "SHELVED_OFFLOADED"
+    h.provider.unshelve_server = lambda identity: h.provider.servers_by_id[identity].update(status="ACTIVE")
+    actor = {"project_id": PROJECT, "user_id": USER, "package_actions": {"packages:manage"}}
+    h.provider._afterglow_user_id = USER
+    projected = await lifecycle.resume(h.factory, actor, h.provider, instance_id, lifecycle_settings(h))
+    assert projected["status"] == "resumed"
+    path = "/v1/instance-bootstrap/" + instance_id + "/resume-result"
+    body = {"instance_id": instance_id, **RESUME_READY}
+    assert (await h.client.put(path, json=body, headers={"Authorization": "Bearer " + TOKEN})).status_code == 204
+
+
+@pytest.mark.asyncio
+async def test_resume_result_error_is_visible_and_never_a_silent_ready(instance_hub, trust_boundary):
+    h = instance_hub
+    instance_id = await make_dev(h)
+    await set_instance(h, instance_id, status="resumed")
+    body = {
+        "instance_id": instance_id,
+        "status": "error",
+        "exit_code": None,
+        "stdout": "",
+        "stderr": "",
+        "error_code": "guest_execution_failed",
+    }
+    path = "/v1/instance-bootstrap/" + instance_id + "/resume-result"
+    assert (await h.client.put(path, json=body, headers={"Authorization": "Bearer " + TOKEN})).status_code == 204
+    status = (await h.client.get("/v1/instances/" + instance_id)).json()
+    assert status["status"] == "error" and status["error_code"] == "guest_execution_failed"
+
+
+@pytest.mark.asyncio
+async def test_a_retired_instance_refuses_a_resume_result(instance_hub, trust_boundary):
+    h = instance_hub
+    instance_id = await make_dev(h)
+    await set_instance(h, instance_id, status="resumed")
+    await set_life(h, instance_id, retired=True)
+    path = "/v1/instance-bootstrap/" + instance_id + "/resume-result"
+    body = {"instance_id": instance_id, **RESUME_READY}
+    assert (await h.client.put(path, json=body, headers={"Authorization": "Bearer " + TOKEN})).status_code == 404

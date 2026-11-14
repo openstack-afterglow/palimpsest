@@ -183,6 +183,7 @@ def test_generated_guest_reporter_bounds_actual_json_envelope_and_retries_identi
         "ROOT": tmp_path,
         "spec": spec,
         "deadline": spec["expires_at"],
+        "resuming": False,
         "headers": {"Authorization": "Bearer " + capability},
         "process": SimpleNamespace(poll=lambda: 0),
         "json": json,

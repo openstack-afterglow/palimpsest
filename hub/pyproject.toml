@@ -4,11 +4,11 @@ build-backend = "hatchling.build"
 
 [project]
 name = "palimpsest-hub"
-version = "0.3.19"
+version = "0.3.20"
 description = "Dedicated Palimpsest Hub API, Glance export worker, and isolated build queue"
 requires-python = ">=3.12"
 dependencies = [
-    "palimpsest-client==0.3.19",
+    "palimpsest-client==0.3.20",
     "asyncmy>=0.2.13",
     "fastapi==0.133.0",
     "openstacksdk==3.3.0",

@@ -4,6 +4,14 @@ All notable changes to Palimpsest Local are documented here.
 
 ## [Unreleased]
 
+## [0.3.20] - 2026-11-14 (UTC; candidate, not yet published or deployed)
+
+### Fixed
+
+- A shelved `lifecycle="dev"` instance now has a resume path. Before, the one-shot guest runner could not restore after unshelve (its input had expired, its exclusive creates failed, and had it continued `mkfs.ext4 -F` would have erased the writable upper), so a resumed instance was ACTIVE on the bare base without its root or command. After the first ready report a dev guest retains `resume.json` (no capability); on boot it re-verifies the retained layer bytes, re-attaches the existing writable file without truncating or formatting it, requires the existing `upper`/`work` directories, remounts the overlay, restarts the command and reports through the new `PUT /v1/instance-bootstrap/{id}/resume-result` with its session-report capability. The Hub accepts that only while the instance is `resumed` and records the outcome beside the sealed first result. Fake-tool subprocess tests and a Linux first-boot→resume run passed; no real unshelve has run this code yet.
+- GPU and cluster runners and service instances do not retain resume state; OOM/crash restart for service instances is still not implemented.
+
+
 ## [0.3.19] - 2026-11-14 (UTC; published and deployed)
 
 ### Fixed
