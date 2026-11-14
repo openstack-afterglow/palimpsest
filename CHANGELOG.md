@@ -8,7 +8,7 @@ All notable changes to Palimpsest Local are documented here.
 
 ### Fixed
 
-- `--cloud` failures on the client name the failed check instead of printing a traceback: an unknown clouds.yaml cloud, an unreachable Keystone (network, DNS or TLS) and a rejected credential each give one specific message that carries no credential or response body.
+- `--cloud` failures on the client name the failed check instead of printing a traceback: an unknown or incomplete clouds.yaml cloud, an unreachable Keystone (network, DNS or TLS), a rejected credential and an `auth_url` without a usable identity API each give one specific message that carries no credential or response body; anything else names the original keystoneauth error class.
 
 ## [0.3.23] - 2026-11-15 (UTC; published and deployed)
 

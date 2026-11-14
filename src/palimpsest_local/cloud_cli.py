@@ -49,20 +49,33 @@ def _credential_failure(cloud: str, failure: BaseException) -> str:
     from openstack import exceptions as sdk
 
     chain: list[BaseException] = []
+    seen: set[int] = set()
     current: BaseException | None = failure
-    while current is not None and current not in chain:
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
         chain.append(current)
         current = current.__cause__ or current.__context__
-    if any(isinstance(item, sdk.ConfigException) for item in chain):
-        return f"clouds.yaml has no usable cloud named {cloud!r}; check the name and the clouds.yaml search path"
-    if any(isinstance(item, (keystone.connection.ConnectionError, keystone.DiscoveryFailure)) for item in chain):
+
+    def has(*kinds: type[BaseException]) -> bool:
+        return any(isinstance(item, kinds) for item in chain)
+
+    if has(sdk.ConfigException, keystone.auth_plugins.AuthPluginException):
+        return (
+            f"clouds.yaml has no usable cloud named {cloud!r}; "
+            "check the name, its auth settings and the clouds.yaml search path"
+        )
+    if has(keystone.connection.ConnectionError):
         return f"cannot reach Keystone for clouds.yaml cloud {cloud!r}; check the network, DNS and TLS trust"
-    if any(isinstance(item, (keystone.http.Unauthorized, keystone.http.Forbidden)) for item in chain):
+    if has(keystone.http.Unauthorized, keystone.http.Forbidden, keystone.MissingAuthMethods):
         return (
             f"Keystone rejected the credential of clouds.yaml cloud {cloud!r}; "
-            "check the user, password, domain and project"
+            "check the user, password, domain, project and required authentication methods"
         )
-    return f"cannot obtain a Keystone token for clouds.yaml cloud {cloud!r} ({type(failure).__name__})"
+    if has(keystone.DiscoveryFailure):
+        return f"found no usable identity API at the auth_url of clouds.yaml cloud {cloud!r}; check auth_url"
+    # openstacksdk re-raises keystoneauth failures as a bare SDKException, so name the original class.
+    named = next((item for item in reversed(chain) if isinstance(item, keystone.ClientException)), failure)
+    return f"cannot obtain a Keystone token for clouds.yaml cloud {cloud!r} ({type(named).__name__})"
 
 
 def hub_credentials(cloud: str) -> tuple[str, str]:

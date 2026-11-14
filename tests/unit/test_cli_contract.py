@@ -3213,7 +3213,20 @@ def test_hub_credentials_refuses_a_cloud_without_a_project(monkeypatch: pytest.M
         cloud_cli.hub_credentials("dms")
 
 
-def _credential_failures():
+_CREDENTIAL_FAILURE_CASES = (
+    "unknown-cloud",
+    "missing-auth-option",
+    "connect-timeout",
+    "tls",
+    "unauthorized",
+    "forbidden",
+    "discovery",
+    "server-error",
+    "unclassified",
+)
+
+
+def _credential_failure_case(name: str):
     from keystoneauth1 import exceptions as keystone
     from openstack import exceptions as sdk
 
@@ -3228,32 +3241,56 @@ def _credential_failures():
                 return outer
 
     secret = "s3cr3t-password"
-    return [
-        (sdk.ConfigException("Cloud dms was not found."), "no usable cloud"),
-        (wrapped(keystone.ConnectTimeout("Request to https://keystone.example timed out")), "cannot reach Keystone"),
-        (wrapped(keystone.DiscoveryFailure("Could not find versioned identity endpoints")), "cannot reach Keystone"),
-        (wrapped(keystone.http.Unauthorized(f"password {secret} rejected")), "rejected the credential"),
-        (RuntimeError(f"unexpected {secret}"), "cannot obtain a Keystone token"),
-    ]
+    url = "https://keystone.example"
+    return {
+        "unknown-cloud": (sdk.ConfigException("Cloud dms was not found."), "no usable cloud"),
+        "missing-auth-option": (keystone.MissingRequiredOptions([]), "no usable cloud"),
+        "connect-timeout": (wrapped(keystone.ConnectTimeout(f"Request to {url} timed out")), "cannot reach Keystone"),
+        "tls": (wrapped(keystone.SSLError(f"SSL exception connecting to {url}")), "cannot reach Keystone"),
+        "unauthorized": (wrapped(keystone.http.Unauthorized(f"password {secret} rejected")), "rejected the credential"),
+        "forbidden": (wrapped(keystone.http.Forbidden(f"{secret} forbidden")), "rejected the credential"),
+        "discovery": (wrapped(keystone.DiscoveryFailure(f"no versioned endpoint at {url}")), "no usable identity API"),
+        "server-error": (wrapped(keystone.http.InternalServerError(f"{url} failed")), "(InternalServerError)"),
+        "unclassified": (RuntimeError(f"unexpected {secret}"), "(RuntimeError)"),
+    }[name]
 
 
-@pytest.mark.parametrize("case", range(5))
-def test_hub_credentials_names_the_failed_client_side_check_without_leaking(monkeypatch: pytest.MonkeyPatch, case: int):
+@pytest.mark.parametrize("case", _CREDENTIAL_FAILURE_CASES)
+@pytest.mark.parametrize("stage", ["connect", "authorize"])
+def test_hub_credentials_names_the_failed_client_side_check_without_leaking(
+    monkeypatch: pytest.MonkeyPatch, case: str, stage: str
+):
     pytest.importorskip("openstack")
     from palimpsest_local import cloud_cli
     from palimpsest_local.errors import PalimpsestError
 
-    failure, expected = _credential_failures()[case]
+    failure, expected = _credential_failure_case(case)
 
-    def refuse(cloud):
+    def refuse(*_):
         raise failure
 
-    monkeypatch.setattr(cloud_cli, "_connect", refuse)
+    class _Connection:
+        authorize = refuse
+        current_project_id = "p" * 32
+
+    monkeypatch.setattr(cloud_cli, "_connect", refuse if stage == "connect" else lambda cloud: _Connection())
     with pytest.raises(PalimpsestError) as raised:
         cloud_cli.hub_credentials("dms")
     message = str(raised.value)
     assert expected in message and "'dms'" in message
     assert "s3cr3t" not in message and "keystone.example" not in message
+
+
+def test_hub_credentials_keeps_its_own_refusals_unchanged(monkeypatch: pytest.MonkeyPatch):
+    from palimpsest_local import cloud_cli
+    from palimpsest_local.errors import PalimpsestError
+
+    def refuse(cloud):
+        raise PalimpsestError("Nova commands require palimpsest-client[cloud]")
+
+    monkeypatch.setattr(cloud_cli, "_connect", refuse)
+    with pytest.raises(PalimpsestError, match=r"require palimpsest-client\[cloud\]"):
+        cloud_cli.hub_credentials("dms")
 
 
 def test_cloud_flag_is_refused_on_commands_that_never_contact_hub(monkeypatch: pytest.MonkeyPatch):
