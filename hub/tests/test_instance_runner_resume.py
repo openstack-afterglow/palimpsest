@@ -72,6 +72,7 @@ def hub_server():
 
 FAKE_TOOL = """#!/bin/sh
 echo "$(basename "$0") $*" >> "$FAKE_LOG"
+[ -e "$(dirname "$0")/slow-$(basename "$0")" ] && sleep 3
 case "$(basename "$0")" in
   losetup)
     case "$*" in
@@ -120,6 +121,15 @@ class Guest:
     def write_session(self, instance_id=INSTANCE_ID):
         state = {"capability": SESSION_CAPABILITY, "instance_id": instance_id, "origin": self.spec["origin"]}
         (self.root / "session.json").write_text(json.dumps(state))
+
+    def step_limit(self, seconds: int):
+        runner = self.root / "runner.py"
+        source = runner.read_text()
+        assert "def run(argv, limit=30):" in source
+        runner.write_text(source.replace("def run(argv, limit=30):", f"def run(argv, limit={seconds}):"))
+
+    def slow(self, tool: str):
+        (self.bin / ("slow-" + tool)).write_text("")
 
     def first_boot_files(self):
         spec = {**self.spec, "capability": BOOT_CAPABILITY, "expires_at": 4_000_000_000}
@@ -365,3 +375,26 @@ def test_a_command_that_cannot_be_started_again_keeps_backing_off_instead_of_end
     seen = restart_reports(guest)[:3]
     assert [item["state"] for item in seen] == ["backoff", "backoff", "backoff"]
     assert [item["last_exit_code"] for item in seen] == [5, 127, 127]
+
+
+def test_a_setup_step_that_exceeds_its_limit_is_reported_as_a_setup_timeout(tmp_path, hub_server):
+    guest = Guest(tmp_path, hub_server)
+    guest.write_session()
+    guest.retain_state()
+    guest.step_limit(1)
+    guest.slow("mount")
+    guest.run()
+    (report,) = guest.puts()
+    body = json.loads(report["body"])
+    assert body["status"] == "error" and body["error_code"] == "guest_setup_timeout"
+
+
+@pytest.mark.skipif(not hasattr(os, "posix_fallocate"), reason="the first-boot allocation needs Linux")
+def test_formatting_the_writable_file_may_take_longer_than_an_ordinary_setup_step(tmp_path, hub_server):
+    guest = Guest(tmp_path, hub_server)
+    guest.first_boot_files()
+    guest.step_limit(1)
+    guest.slow("mkfs.ext4")
+    assert guest.run().returncode == 0
+    (report,) = guest.puts()
+    assert json.loads(report["body"])["status"] == "ready"

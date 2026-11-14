@@ -201,9 +201,9 @@ def make_dir(path):
     else:
         path.mkdir()
 
-def run(argv):
+def run(argv, limit=30):
     subprocess.run(argv, check=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                   stderr=subprocess.DEVNULL, timeout=30)
+                   stderr=subprocess.DEVNULL, timeout=limit)
 
 def mount(argv, target):
     run(['mount', *argv, str(target)])
@@ -357,7 +357,8 @@ def pump(timeout=0.2):
             os.fsync(fd)
         finally:
             os.close(fd)
-        run(['mkfs.ext4', '-q', '-F', '-m', '0', str(backing_file)])
+        # Formatting the fully allocated file can take longer than the 30-second step limit on slow storage.
+        run(['mkfs.ext4', '-q', '-F', '-m', '0', str(backing_file)], max(30, min(900, deadline - time.time())))
     attached = subprocess.run(['losetup', '--find', '--show', str(backing_file)], check=True,
                               stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                               stderr=subprocess.DEVNULL, text=True, timeout=30)
@@ -547,7 +548,7 @@ def pump(timeout=0.2):
             pipe.close()
 """
         )
-        + ("except BaseException as failure:\n" if gpu or cluster else "except BaseException:\n")
+        + "except BaseException as failure:\n"
         + r"""    if process is not None and process.poll() is None:
         import signal
         os.killpg(process.pid, signal.SIGTERM)
@@ -567,7 +568,7 @@ def pump(timeout=0.2):
             else (
                 "        code = str(failure)\n        report('error', code if code in ('cluster_prerequisite_failed', 'cluster_bootstrap_failed', 'cluster_proof_failed') else 'cluster_bootstrap_failed')\n"
                 if cluster
-                else "        report('error', 'guest_execution_failed')\n"
+                else "        report('error', 'guest_setup_timeout' if isinstance(failure, subprocess.TimeoutExpired) else 'guest_execution_failed')\n"
             )
         )
         + r"""    except Exception:

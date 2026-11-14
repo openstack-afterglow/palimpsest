@@ -1,6 +1,10 @@
 # Detailed installation and configuration guide
 
-## 0.3.21 transition note — 2026-11-14 (UTC; candidate)
+## 0.3.22 transition note — 2026-11-15 (UTC; candidate)
+
+0.3.22 is a patch over 0.3.21 with no schema change and no new setting. Guest results may now carry the error code `guest_setup_timeout`. Roll the API/worker cohorts and the build worker to the same release.
+
+## 0.3.21 transition note — 2026-11-14 (UTC; deployed)
 
 0.3.21 is a patch over 0.3.20 with no schema change and no new setting. New instances accept `restart` (`no`/`unless-stopped`); a service instance with a readiness probe now defaults to `unless-stopped`, so its long-running command is started again after an exit, crash or OOM kill. Pass `restart: "no"` (CLI `--restart no`) to keep the old one-shot behaviour. Instances created by older releases are unchanged (their guest runner has no restart loop). Roll the API/worker cohorts and the build worker to the same release.
 
@@ -51,11 +55,11 @@ initial configuration, upgrades, and administrator-owned Linux deployment.
 Released installations use pinned published bytes; trusted local installation below uses the actual checkout's bytes.
 
 Palimpsest Local requires Python 3.11 or newer; Hub requires Python 3.12+.
-Version 0.3.20 is published (tag `0.3.20`, PyPI `palimpsest-client` 0.3.20) and was deployed to the production Hub (three controllers and the build worker) on 2026-11-14 after a paired SQL/CAS backup (not restore-tested); 0.3.19, 0.3.18, 0.3.17, 0.3.16 and 0.3.15 were deployed earlier (production was once found running 0.3.13, see the handoff incident note).
+Version 0.3.21 is published (tag `0.3.21`, PyPI `palimpsest-client` 0.3.21) and was deployed to the production Hub (three controllers and the build worker) on 2026-11-14 after a paired SQL/CAS backup (not restore-tested); 0.3.20, 0.3.19, 0.3.18, 0.3.17, 0.3.16 and 0.3.15 were deployed earlier (production was once found running 0.3.13, see the handoff incident note). 0.3.22 is an unpublished candidate until its rollout is recorded in the handoff.
 SDK publication and native execution remain separately qualified. Root/Hub metadata, module versions,
 generated locks and Kolla image defaults move together. After formal publication,
 install exact client bytes with
-`uv tool install --python 3.11 palimpsest-client==0.3.21`, or install a trusted
+`uv tool install --python 3.11 palimpsest-client==0.3.22`, or install a trusted
 local checkout with `uv tool install --force --python 3.11 .`.
 A root wheel upgrade neither deploys Hub nor qualifies actual build/run behavior.
 Git/outbound GitHub HTTPS is needed only for VCS installation.
@@ -1699,7 +1703,7 @@ and the [command workflows](cli/workflows.md) for operational details.
 
 ## SDK image/native integration: operator prerequisites
 
-The `0.3.21` Hub distribution declares the exact matching client dependency.
+The `0.3.22` Hub distribution declares the exact matching client dependency.
 Checkout resolution uses `hub`'s explicit parent-path source; installed release
 bytes must match the same immutable tag and reviewed image digests. Paired wheel
 or local container checks do not establish production upgrade or native readiness.
