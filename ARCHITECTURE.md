@@ -4038,8 +4038,8 @@ that CI never sees).
 {
   "schema_version": 1,
   "source_sha256": "d240fe17f2a9757922a502520acaea3732f44a96e642b3dd7fce4c0fbc93608b",
-  "reviewed_at": "2026-11-14T07:05:43Z",
-  "summary": "Register instance_runner_resume hub test"
+  "reviewed_at": "2026-11-14T07:22:42Z",
+  "summary": "Merge dev into dev-resume-path"
 }
 ```
 <!-- architecture-review:end -->
