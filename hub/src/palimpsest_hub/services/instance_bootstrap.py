@@ -76,8 +76,11 @@ resuming = resume_path.is_file()
 if resuming:
     # A shelved dev instance booted again: restore from retained verified state, never rebuild.
     spec = json.loads(resume_path.read_text())
-    spec['capability'] = json.loads((ROOT / 'session.json').read_text())['capability']
-    deadline = time.time() + 900
+    session_state = json.loads((ROOT / 'session.json').read_text())
+    if spec['instance_id'] != session_state['instance_id'] or spec['origin'] != session_state['origin']:
+        raise SystemExit('resume_identity_mismatch')
+    spec['capability'] = session_state['capability']
+    deadline = time.time() + 3600
 else:
     spec = json.loads((ROOT / 'spec.json').read_text())
     deadline = spec['expires_at']
@@ -152,6 +155,16 @@ def persist_resume():
         output.flush()
         os.fsync(output.fileno())
     os.replace(temporary, resume_path)
+
+def make_dir(path):
+    # First boot creates each directory exclusively. A resume reuses real directories (recreating a
+    # missing mountpoint is harmless) but never follows a symlink or a non-directory.
+    if resuming:
+        if path.is_symlink() or (path.exists() and not path.is_dir()):
+            raise RuntimeError('resume_state_invalid')
+        path.mkdir(exist_ok=True)
+    else:
+        path.mkdir()
 
 def run(argv):
     subprocess.run(argv, check=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -244,10 +257,12 @@ def pump(timeout=0.2):
         + r"""    writable_bytes = spec['writable_bytes']
     if type(writable_bytes) is not int or not 1024**3 <= writable_bytes <= 4096 * 1024**3:
         raise RuntimeError('invalid_writable_capacity')
-    available = os.statvfs(ROOT)
-    required = writable_bytes + sum(layer['size_bytes'] for layer in spec['layers']) + 1024**3
-    if available.f_bavail * available.f_frsize < required:
-        raise RuntimeError('guest_disk_capacity_insufficient')
+    if not resuming:
+        # The retained layers and fully allocated writable file already occupy their space.
+        available = os.statvfs(ROOT)
+        required = writable_bytes + sum(layer['size_bytes'] for layer in spec['layers']) + 1024**3
+        if available.f_bavail * available.f_frsize < required:
+            raise RuntimeError('guest_disk_capacity_insufficient')
     # Private mount propagation prevents application mounts reaching the base namespace.
     run(['mount', '--make-rprivate', '/'])
     os.chdir(ROOT)
@@ -282,14 +297,14 @@ def pump(timeout=0.2):
         if count != layer['size_bytes'] or 'sha256:' + digest.hexdigest() != layer['digest']:
             raise RuntimeError('layer_digest_mismatch')
         target = ROOT / ('lower-%d' % index)
-        target.mkdir(exist_ok=resuming)
+        make_dir(target)
         mount(['-t', 'squashfs', '-o', 'loop,ro,nodev,nosuid', str(blob)], target)
         lower.insert(0, target.name)
     # Application mode includes the boot root as a lower. Its writable layer
     # MUST be a different filesystem: a descendant upper/work on that same
     # filesystem is an overlapping OverlayFS layer and Linux rejects it.
     writable = ROOT / 'writable'
-    writable.mkdir(exist_ok=resuming)
+    make_dir(writable)
     if resuming:
         # Re-attach the existing private writable filesystem. NEVER truncate or format it.
         existing = os.stat(backing_file, follow_symlinks=False)
@@ -326,11 +341,11 @@ def pump(timeout=0.2):
             (writable / name).mkdir()
     if spec['mode'] == 'application':
         base = ROOT / 'base'
-        base.mkdir(exist_ok=resuming)
+        make_dir(base)
         mount(['--bind', '/'], base)
         run(['mount', '-o', 'remount,bind,ro', str(base)])
         lower.append(base.name)
-    (ROOT / 'merged').mkdir(exist_ok=resuming)
+    make_dir(ROOT / 'merged')
     merged = ROOT / 'merged'
     options = 'lowerdir=' + ':'.join(lower) + ',upperdir=writable/upper,workdir=writable/work'
     if len(options.encode()) >= 4096:
@@ -431,8 +446,8 @@ def pump(timeout=0.2):
             if not ready:
                 raise RuntimeError('readiness_failed')
             pump(0)
-            report('ready')
             persist_resume()
+            report('ready')
             # systemd owns the running command lifecycle until instance shutdown.
             while process.poll() is None:
                 pump()

@@ -18,7 +18,8 @@ This module supplies what production needs around them:
   grace period. A shelved guest cannot report, so only an explicit resume brings it back.
 
 Processes inside a shelved guest do not survive: shelve offloads the VM, the boot volume (with the
-instance's writable layer) is preserved, and a resumed guest boots from that disk.
+instance's writable layer and retained layers) is preserved, and the guest runner restores the root and
+command from that disk on boot (`resume.json`), then reports through `resume-result`.
 """
 
 from __future__ import annotations
@@ -663,8 +664,9 @@ async def resume(factory, actor, conn, instance_id: str, settings) -> dict:
         life.reported_sessions_json, life.report_received_at = None, None
         life.machine_json = machine.to_state()
         life.updated_at = _now()
-        if instance.status == "shelved":
-            # Only the base VM comes back: the runner does not restart the layer overlay or command.
+        if instance.status in ("shelved", "ready", "error", "resumed"):
+            # An unshelve was accepted, so the guest boots again and its runner restores the retained root
+            # and command, then reports through `resume-result`, which only a `resumed` row accepts.
             instance.status = "resumed"
         instance.provider_status = "ACTIVE"
         instance.updated_at = _now()

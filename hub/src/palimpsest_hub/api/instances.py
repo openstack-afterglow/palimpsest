@@ -417,11 +417,15 @@ async def bootstrap_resume_result(instance_id: UUID, request: Request):
         if row is None:
             raise HTTPException(404, "Session report capability not found")
         await lifecycle.verify_session_capability(session, str(instance_id), token)
-        if row.status != "resumed":
-            raise HTTPException(409, "Instance is not awaiting a resume result")
         payload = result.model_dump(mode="json")
         for channel in ("stdout", "stderr"):
             payload[channel] = payload[channel].replace(token, "[redacted session capability]")
+        if row.status != "resumed":
+            # The guest resends the identical bounded report after a lost response; accept only that.
+            recorded = row.spec_json.get("resume_result")
+            if recorded is not None and {key: val for key, val in recorded.items() if key != "recorded_at"} == payload:
+                return Response(status_code=204, headers={"Cache-Control": "no-store"})
+            raise HTTPException(409, "Instance is not awaiting a resume result")
         now = datetime.now(UTC)
         row.spec_json = {**row.spec_json, "resume_result": {**payload, "recorded_at": now.isoformat()}}
         row.status = payload["status"]

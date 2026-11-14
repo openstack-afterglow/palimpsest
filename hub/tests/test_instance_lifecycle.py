@@ -1177,8 +1177,31 @@ async def test_resume_result_ready_moves_a_resumed_instance_to_ready_and_keeps_t
         assert row.result_json["stdout"] == "first\n"
         assert "[redacted session capability]" in row.spec_json["resume_result"]["stdout"]
         assert TOKEN not in str(row.spec_json["resume_result"])
-    # A second report for the same boot is no longer awaited.
-    assert (await h.client.put(path, json=body, headers=auth)).status_code == 409
+    # A lost response makes the guest resend the identical report: accepted. Anything else is not awaited.
+    assert (await h.client.put(path, json=body, headers=auth)).status_code == 204
+    assert (await h.client.put(path, json={**body, "stdout": "different"}, headers=auth)).status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_an_accepted_unshelve_makes_the_row_resumed_even_when_it_still_said_ready(instance_hub, trust_boundary):
+    # The Hub may not have recorded `shelved` yet (unfinished shelve settled by `resume`, or an unshelve
+    # issued after a timeout); the restored guest must still be able to report.
+    h = instance_hub
+    instance_id = await make_dev(h)
+    async with h.factory() as session:
+        server_id = (await session.get(PalimpsestHubInstance, instance_id)).server_id
+    await set_instance(h, instance_id, status="ready")
+    await set_life(h, instance_id, machine_json=SessionMachine(phase=Phase.SHELVED).to_state())
+    sdk_servers(h)
+    h.provider.servers_by_id[server_id]["status"] = "SHELVED_OFFLOADED"
+    h.provider.unshelve_server = lambda identity: h.provider.servers_by_id[identity].update(status="ACTIVE")
+    actor = {"project_id": PROJECT, "user_id": USER, "package_actions": {"packages:manage"}}
+    h.provider._afterglow_user_id = USER
+    projected = await lifecycle.resume(h.factory, actor, h.provider, instance_id, lifecycle_settings(h))
+    assert projected["status"] == "resumed"
+    path = "/v1/instance-bootstrap/" + instance_id + "/resume-result"
+    body = {"instance_id": instance_id, **RESUME_READY}
+    assert (await h.client.put(path, json=body, headers={"Authorization": "Bearer " + TOKEN})).status_code == 204
 
 
 @pytest.mark.asyncio

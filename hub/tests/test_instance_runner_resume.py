@@ -83,7 +83,8 @@ exit 0
 
 
 class Guest:
-    def __init__(self, tmp_path: Path, server):
+    def __init__(self, tmp_path: Path, server, free_bytes: int | None = None):
+        tmp_path.mkdir(parents=True, exist_ok=True)
         self.root = tmp_path / "state"
         self.root.mkdir()
         self.bin = tmp_path / "bin"
@@ -97,7 +98,12 @@ class Guest:
         source = GUEST_RUNNER.replace("/var/lib/palimpsest-instance", str(self.root))
         source = source.replace("('x86_64', 'amd64')", "('x86_64', 'amd64', 'arm64', 'aarch64')")
         source = source.replace("def enter_runtime():", "def enter_runtime():\n    return", 1)
-        assert source != GUEST_RUNNER
+        assert str(self.root) in source and "return\n" in source and "'arm64'" in source
+        assert "/var/lib/palimpsest-instance" not in source
+        if free_bytes is not None:
+            fake = f"type('S', (), {{'f_bavail': {free_bytes}, 'f_frsize': 1}})()"
+            assert "os.statvfs(ROOT)" in source
+            source = source.replace("os.statvfs(ROOT)", fake)
         (self.root / "runner.py").write_text(source)
         self.spec = {
             "instance_id": INSTANCE_ID,
@@ -110,8 +116,9 @@ class Guest:
             "readiness_argv": ["/bin/sh", "-c", "exit 0"],
         }
 
-    def write_session(self):
-        (self.root / "session.json").write_text(json.dumps({"capability": SESSION_CAPABILITY}))
+    def write_session(self, instance_id=INSTANCE_ID):
+        state = {"capability": SESSION_CAPABILITY, "instance_id": instance_id, "origin": self.spec["origin"]}
+        (self.root / "session.json").write_text(json.dumps(state))
 
     def first_boot_files(self):
         spec = {**self.spec, "capability": BOOT_CAPABILITY, "expires_at": 4_000_000_000}
@@ -229,10 +236,44 @@ def test_first_boot_retains_exactly_what_a_resume_needs_and_a_resume_then_uses_i
 
 
 def test_a_service_instance_without_the_session_reporter_retains_nothing(tmp_path, hub_server):
-    pytest.importorskip("os")
     if not hasattr(os, "posix_fallocate"):
         pytest.skip("the first-boot allocation needs Linux")
     guest = Guest(tmp_path, hub_server)
     guest.first_boot_files()
     assert guest.run().returncode == 0
     assert not (guest.root / "resume.json").exists()
+
+
+def test_resume_does_not_demand_first_boot_free_space_but_a_first_boot_does(tmp_path, hub_server):
+    # The retained layers and the fully allocated writable file already occupy the disk.
+    resumed = Guest(tmp_path / "resume", hub_server, free_bytes=0)
+    resumed.write_session()
+    resumed.retain_state()
+    assert resumed.run().returncode == 0
+    assert json.loads(resumed.puts()[0]["body"])["status"] == "ready"
+    hub_server.requests.clear()
+    first = Guest(tmp_path / "first", hub_server, free_bytes=0)
+    first.write_session()
+    first.first_boot_files()
+    first.run()
+    (report,) = first.puts()
+    assert json.loads(report["body"])["status"] == "error" and not first.tools()
+
+
+def test_resume_refuses_a_planted_symlink_in_place_of_a_state_directory(tmp_path, hub_server):
+    guest = Guest(tmp_path, hub_server)
+    guest.write_session()
+    guest.retain_state()
+    (guest.root / "lower-0").symlink_to(tmp_path)
+    guest.run()
+    assert not any("squashfs" in line for line in guest.tools())
+    (report,) = guest.puts()
+    assert json.loads(report["body"])["status"] == "error"
+
+
+def test_resume_state_from_another_instance_or_origin_is_not_used(tmp_path, hub_server):
+    guest = Guest(tmp_path, hub_server)
+    guest.write_session(instance_id="99999999-2222-4333-8444-555555555555")
+    guest.retain_state()
+    assert guest.run().returncode != 0
+    assert not guest.puts() and not guest.tools()

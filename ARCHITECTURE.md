@@ -4037,9 +4037,9 @@ that CI never sees).
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "a762652eb6c5379a0c721b1ad37ab6c76b3486127bfa942a4d850c2a6ac21e10",
-  "reviewed_at": "2026-11-14T06:21:10Z",
-  "summary": "Dev instance resume path (guest runner resume branch, resume-result endpoint), version 0.3.20 candidate"
+  "source_sha256": "249f54f7cb8a46ff1f4e3b506168564c6ce88b2fb62bc5200e3d1ba282ed1750",
+  "reviewed_at": "2026-11-14T06:49:46Z",
+  "summary": "Resume path review fixes"
 }
 ```
 <!-- architecture-review:end -->
