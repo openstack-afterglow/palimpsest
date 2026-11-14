@@ -24,6 +24,15 @@ files_modified:
 [ARCHITECTURE.md](../ARCHITECTURE.md), 실행 경계는 [testing.md](testing.md),
 세부 결과는 아래 링크된 문서와 source다.
 
+## 0.3.19 — first live idle shelve, release and deployment — 2026-11-14 (UTC)
+
+- Finding: 0.3.16–0.3.18 never shelved on the real cloud. The worker logged `shelve-failed` because `open_trust_connection` refused the token roles `['member','reader']` (Keystone implies `reader` for `member`) against the stored `('member',)`; `TrustShelveProvider` swallowed the cause. Fix (PR #89, merge be2768e, tag `0.3.19`): accept the implied `reader` only when `member` is delegated; extra roles and the forbidden set still fail closed; the worker now logs the reason. Mutation check: without the fix the `member+reader` case fails. Tests: 184 root-lane and 681 hub tests passed. No independent reviewer ran before release (not an Astra/Sol signoff).
+- Release: Release and Hub image workflows succeeded. Digests: api `686b5cb5…`, worker `b39fd067…`, build-worker `83865f22…`.
+- Deployment: drained cohorts (0 busy rows), paired SQL dump and CAS tar at `/var/backups/palimpsest-pre-0.3.19-20261113T235245Z` on dms-controller1 (not restore-tested), `reconfigure` of three controllers and the build worker; all report version 0.3.19, restarts 0, `/v1/ready` 200. No DB restore, no forced stop.
+- Live evidence: dev instance `m412-dev-04` (ordinary `pieroot` credential) went ready, then `SHELVED_OFFLOADED` by the idle lifecycle after the rollout, `instance resume` returned it to ACTIVE/ready, and `instance rm` reached row status `deleted`; with the same credential Nova server `b16e6131…` and boot volume `f5c49f09…` were independently absent. Trust revocation was not separately read. Evidence covers this single instance.
+- Operator venv: the first `uv pip install palimpsest-client==0.3.19` failed from a stale index; the retry with `--refresh-package palimpsest-client` (no sync) installed 0.3.19, so `/etc/kolla` lock/pyproject and venv agree; waygate stays 0.3.9.
+- Left over, not touched (no force/reset authorized): instance rows `m412-dev-03` (729c4f9d…) and `m412-dev-02` (5b090b86…) remain `deleting`; the Cinder volume `m412-dev-02-boot` is still `creating` (the known Cinder stall). They violate the no-accumulated-test-instances rule until deletion completes through the normal path. This completes M4-12 live idle-shelve evidence for one instance only; checklist counts are unchanged until reviewed.
+
 ## M4 CPU slices, git-build route and handoff — 2026-11-10
 
 - Source of truth: `origin/dev` `e78eda0` (PR #63 squash), after PRs #54–#63. Checked spec boxes remain 54/108.

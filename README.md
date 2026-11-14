@@ -23,7 +23,7 @@ are not deployed-service acceptance; see the [control-plane boundaries](ARCHITEC
 - **0.3.16 (published 2026-11-12, deployed to the production Hub's three controllers and the build worker):** Hub dev-instance idle auto-shelve (`instance create --lifecycle dev`, `resume|renew|connection`; fake-cloud tests only, never exercised on a real cloud), the `palimpsest instance` CLI, preflight checks for cores/RAM/ports, and the Kolla-Ansible 2026.1 `kolla_version` label fix. The new table was created by the offline Hub bootstrap; see the [transition note](docs/install.md#0316-transition-note--2026-11-13-utc-deployed) and the [handoff](docs/development-handoff.md) for the unexplained 0.3.15→0.3.13 regression found before this rollout.
 - **0.3.17 (published and deployed 2026-11-13):** `instance create --lifecycle dev` (and `resume|renew`) works for a human system administrator using a project-scoped token. No schema change; see the [transition note](docs/install.md#0317-transition-note--2026-11-13-utc-deployed).
 - **0.3.18 (published and deployed 2026-11-14):** the same admin path now also honours the protected user/project lists that members already obey, and the retired-Trust sweep no longer records a false `trust_unrecoverable` when another controller revoked first. No schema change.
-- **Candidate 0.3.19 (not yet published or deployed):** trust-scoped shelve/export connections accept the `reader` role Keystone implies for `member`; found on the first real idle shelve. No schema change.
+- **0.3.19 (published and deployed 2026-11-14):** trust-scoped shelve/export connections accept the `reader` role Keystone implies for `member`; found on the first real idle shelve. No schema change.
 
 ## Install from PyPI
 
