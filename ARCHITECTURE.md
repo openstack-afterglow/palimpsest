@@ -4045,8 +4045,8 @@ that CI never sees).
 {
   "schema_version": 1,
   "source_sha256": "9421d1643347b4e89adaca910622610e602f505068a29ab3861a9f232d410484",
-  "reviewed_at": "2026-11-14T19:25:27Z",
-  "summary": "0.3.24 candidate: client --cloud credential failures named per check (review findings applied); OOM policy observed under systemd; M4-02 live access-path evidence"
+  "reviewed_at": "2026-11-14T20:20:06Z",
+  "summary": "docs: record 0.3.24 release and deployment; M4-03 checked with stated verification levels (59/108)"
 }
 ```
 <!-- architecture-review:end -->
