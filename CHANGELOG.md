@@ -14,7 +14,7 @@ All notable changes to Palimpsest Local are documented here.
 
 ### Fixed
 
-- The guest unit sets `OOMPolicy=continue`. Live on 0.3.22 the kernel OOM-killed the instance command (`Out of memory: Killed process … (sh)`) and no restart followed. The mechanism was then observed outside the cloud with the same rendered unit and runner under systemd 255 as PID 1 (privileged container, memory-limited unit): with the default policy (`stop`) the unit failed with result `oom-kill` and the runner was killed without any report; with `continue` the runner survived, reported and restarted the command; `systemctl stop` was not followed by a relaunch. The corrected unit has not yet been exercised by a live OOM kill in a Nova guest.
+- The guest unit sets `OOMPolicy=continue`. Live on 0.3.22 the kernel OOM-killed the instance command (`Out of memory: Killed process … (sh)`) and no restart followed. The mechanism was then observed outside the cloud with the same rendered unit and runner under systemd 255 as PID 1 (privileged container, memory-limited unit): with the default policy (`stop`) the unit failed with result `oom-kill` and the runner was killed without any report; with `continue` the runner survived, reported and restarted the command; `systemctl stop` was not followed by a relaunch. Live confirmation followed on deployed 0.3.24: a service instance's command was OOM-killed by the guest kernel and the instance reported one restart with exit code -9 and state `running`.
 
 ## [0.3.22] - 2026-11-15 (UTC; published and deployed)
 
