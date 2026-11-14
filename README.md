@@ -27,31 +27,32 @@ are not deployed-service acceptance; see the [control-plane boundaries](ARCHITEC
 - **0.3.20 (published and deployed 2026-11-14):** a shelved dev instance gets a real resume path that remounts its retained layers and writable upper; first live proof preserved a marker across shelve/unshelve. Instances created by older releases, GPU or cluster dev instances and service-instance crash restart are not covered. No schema change.
 - **0.3.21 (published and deployed 2026-11-14):** `restart=unless-stopped` restarts a crashed or exited long-running command of a service instance in place and reports restart status; default for service instances with a readiness probe. Live: restarts after SIGKILL and after a non-zero exit were observed; an OOM kill was not yet produced. No schema change.
 - **0.3.22 (published and deployed 2026-11-15):** longer limit for formatting the guest writable file and a distinct `guest_setup_timeout` error code, after two of four live service creations failed during guest setup. The one creation since then succeeded; the inferred cause is not confirmed.
-- **0.3.23 (published and deployed 2026-11-15):** the guest unit survives an OOM kill of the command (`OOMPolicy=continue`); on 0.3.22 a real OOM kill stopped the unit and nothing was restarted. The corrected unit has not been exercised by a live OOM kill yet (test VMs are paused while two Cinder volumes are stuck).
+- **0.3.23 (published and deployed 2026-11-15):** the guest unit survives an OOM kill of the command (`OOMPolicy=continue`). On 0.3.22 a real OOM kill was followed by no restart; the same unit and runner under systemd as PID 1 in a container showed why (default policy fails the unit and kills the runner; `continue` restarts the command; `systemctl stop` does not relaunch). Not yet exercised by a live OOM kill in a Nova guest (test VMs are paused while two Cinder volumes are stuck).
+- **Candidate 0.3.24 (not yet published or deployed):** client-side `--cloud` failures (unknown cloud, unreachable Keystone, rejected credential) are reported as specific messages instead of tracebacks.
 
 ## Install from PyPI
 
 Requires Python 3.11 or newer. Prefer an isolated uv tool, or a pip virtual environment:
 
 ```sh
-uv tool install --python 3.11 "palimpsest-client==0.3.23"
+uv tool install --python 3.11 "palimpsest-client==0.3.24"
 palimpsest --version
 
 # Alternative: pip, without modifying the system Python.
 python3.11 -m venv .venv
-.venv/bin/python -m pip install "palimpsest-client==0.3.23"
+.venv/bin/python -m pip install "palimpsest-client==0.3.24"
 .venv/bin/palimpsest --version
 ```
 
 If uv's tool directory is not on `PATH`, run `uv tool update-shell` explicitly
 and open a new terminal. One-off use: `uvx --python 3.11 --from
-palimpsest-client==0.3.23 palimpsest --version`.
+palimpsest-client==0.3.24 palimpsest --version`.
 
 Root client installation and Hub service deployment are separate. API, export
 worker and build-worker images must match the reviewed release; updating the
 root wheel alone does not update running Kolla containers.
 
-The commands above select version 0.3.23 after its formal publication. Check the
+The commands above select version 0.3.24 after its formal publication. Check the
 [release handoff](docs/development-handoff.md) for actual PyPI/image receipts and
 the deployment-server package/lock selection. Older release and production
 receipts remain historical and do not establish the currently running version.

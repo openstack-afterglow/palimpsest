@@ -43,15 +43,55 @@ def _connect(cloud: str):
     return connection
 
 
+def _credential_failure(cloud: str, failure: BaseException) -> str:
+    """Name which client-side access check failed, without echoing credentials or response bodies."""
+    from keystoneauth1 import exceptions as keystone
+    from openstack import exceptions as sdk
+
+    chain: list[BaseException] = []
+    seen: set[int] = set()
+    current: BaseException | None = failure
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        chain.append(current)
+        current = current.__cause__ or current.__context__
+
+    def has(*kinds: type[BaseException]) -> bool:
+        return any(isinstance(item, kinds) for item in chain)
+
+    if has(sdk.ConfigException, keystone.auth_plugins.AuthPluginException):
+        return (
+            f"clouds.yaml has no usable cloud named {cloud!r}; "
+            "check the name, its auth settings and the clouds.yaml search path"
+        )
+    if has(keystone.connection.ConnectionError):
+        return f"cannot reach Keystone for clouds.yaml cloud {cloud!r}; check the network, DNS and TLS trust"
+    if has(keystone.http.Unauthorized, keystone.http.Forbidden, keystone.MissingAuthMethods):
+        return (
+            f"Keystone rejected the credential of clouds.yaml cloud {cloud!r}; "
+            "check the user, password, domain, project and required authentication methods"
+        )
+    if has(keystone.DiscoveryFailure):
+        return f"found no usable identity API at the auth_url of clouds.yaml cloud {cloud!r}; check auth_url"
+    # openstacksdk re-raises keystoneauth failures as a bare SDKException, so name the original class.
+    named = next((item for item in reversed(chain) if isinstance(item, keystone.ClientException)), failure)
+    return f"cannot obtain a Keystone token for clouds.yaml cloud {cloud!r} ({type(named).__name__})"
+
+
 def hub_credentials(cloud: str) -> tuple[str, str]:
     """Return a Keystone token and its project ID for Hub calls from one clouds.yaml cloud.
 
     The project ID is returned so the caller can send it as X-Project-Id; Hub otherwise scopes the
-    caller to the user's default project.
+    caller to the user's default project. A failure names the failed check instead of a traceback.
     """
-    connection = _connect(cloud)
-    token = connection.authorize()
-    project_id = connection.current_project_id
+    try:
+        connection = _connect(cloud)
+        token = connection.authorize()
+        project_id = connection.current_project_id
+    except PalimpsestError:
+        raise
+    except Exception as failure:
+        raise PalimpsestError(_credential_failure(cloud, failure)) from None
     if not isinstance(token, str) or not token.strip() or not project_id:
         raise PalimpsestError("clouds.yaml cloud did not yield a token and project for Hub")
     return token, project_id
