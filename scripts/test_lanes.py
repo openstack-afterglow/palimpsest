@@ -158,6 +158,7 @@ SPECIAL_FILES = {
             "nova_shelve_provider",
             "git_context",
             "git_staging",
+            "instance_options",
         )
     ),
 }

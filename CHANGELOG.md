@@ -4,7 +4,14 @@ All notable changes to Palimpsest Local are documented here.
 
 ## [Unreleased]
 
-## [0.3.27] - 2026-11-15 (UTC; candidate, not yet published or deployed)
+## [0.3.28] - 2026-11-15 (UTC; candidate, not yet published or deployed)
+
+### Added
+
+- Hub dashboard (`/app`): a Playbooks section. It lists the images the caller can see (published images, and the caller's own completed image jobs from before images were published) and shows, for the selected one, its audience, owning project, architecture, operating system, base, the ordered layers with their sizes, the default command and the recorded source (the Git commit for a Git build). For an image built by the caller's own image job in the connected project it offers a form that creates a VM from it, then lists the project's VMs with the explicit next step for each (start the server once the boot volume is ready, show the connection details, delete, remove the boot volume). Other images are view-only there: the Hub starts only the caller's own image jobs.
+- Hub API: `GET /v1/instance-options` returns, for a caller with write authority, the boot images, flavors, networks of the caller's project and SSH key names that a create request could name, each list cut at 200 entries. It reads them with the caller's own token and admits nothing; `POST /v1/instances` checks every selected object again.
+
+## [0.3.27] - 2026-11-15 (UTC; published and deployed)
 
 ### Fixed
 
