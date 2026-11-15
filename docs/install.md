@@ -1,6 +1,6 @@
 # Detailed installation and configuration guide
 
-## 0.3.28 transition note — 2026-11-15 (UTC; candidate)
+## 0.3.28 transition note — 2026-11-15 (UTC; deployed)
 
 The Hub dashboard adds playbook inspection and instance creation through the existing image-job and instance contracts. `GET /v1/instance-options` reads boot images, flavors, project networks and SSH key names with the original caller's token; it allocates nothing. Creation, provider advancement and removal retain the existing server-side authorization and ownership checks. No schema or Kolla role input changes. Roll all Hub cohorts together after publication. The separate local-only native VZ HOLD recovery work is not included in this release.
 
