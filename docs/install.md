@@ -1,5 +1,9 @@
 # Detailed installation and configuration guide
 
+## 0.3.26 transition note — 2026-11-15 (UTC; candidate)
+
+0.3.26 is a patch over 0.3.25 with no schema change. The Kolla role gains the optional input `palimpsest_git_allowed_hosts` (default `[]`, Git builds stay off); nothing changes for a deployment that does not set it. To enable Git builds an operator sets that list and an `palimpsest_image_source_policy` rule for the base images, then reconfigures. The client's experimental native VZ commit now honours a `/.plmignore` carried by the image. Roll the API/worker cohorts and the build worker to the same release.
+
 ## 0.3.25 transition note — 2026-11-15 (UTC; deployed)
 
 0.3.25 is a patch over 0.3.24 with no schema change and no new setting. `resume` now also starts a stopped dev instance and the instance projection gains the `resume_result` key (additive). Guests are unchanged: any dev instance that already reported a probed ready result can be stopped and resumed. Roll the API/worker cohorts and the build worker to the same release.
@@ -71,7 +75,7 @@ Version 0.3.25 is published (tag `0.3.25`, PyPI `palimpsest-client` 0.3.25) and 
 SDK publication and native execution remain separately qualified. Root/Hub metadata, module versions,
 generated locks and Kolla image defaults move together. After formal publication,
 install exact client bytes with
-`uv tool install --python 3.11 palimpsest-client==0.3.25`, or install a trusted
+`uv tool install --python 3.11 palimpsest-client==0.3.26`, or install a trusted
 local checkout with `uv tool install --force --python 3.11 .`.
 A root wheel upgrade neither deploys Hub nor qualifies actual build/run behavior.
 Git/outbound GitHub HTTPS is needed only for VCS installation.
@@ -110,7 +114,7 @@ while an API still has an older setting; terminal settlement remains available.
 Source checks and isolated fixtures do not apply this configuration to a running
 service, migrate production data or authorize an operational rollout.
 
-### Unreleased Git build source allow-list
+### Git build source allow-list (role input since 0.3.26)
 
 `POST /v1/git-builds` stays disabled (503, with no DNS or Git call) until the
 operator lists exact HTTPS Git host names in `palimpsest_git_allowed_hosts`; the
@@ -120,9 +124,10 @@ but at most 16 unique lowercase DNS names. Listing a host permits anonymous
 HTTPS fetches of a caller-chosen repository and pinned commit from any port of
 that host; the Hub
 still refuses non-public resolved addresses, redirects and any `credential_ref`,
-and a Git build also needs the image-source policy above to be configured.
-Private Git credentials are not supported. Which hosts to allow is an operator
-decision; the variable takes effect only with a release whose role contains it.
+and a Git build also needs the image-source policy above to allow the
+Dockerfile's base image. Private Git credentials are not supported. Which hosts
+to allow is an operator decision. `examples/git-build` is a minimal context for
+a first build.
 
 ### Unreleased GPU and fixed k3s runtime profiles
 
@@ -1729,7 +1734,7 @@ and the [command workflows](cli/workflows.md) for operational details.
 
 ## SDK image/native integration: operator prerequisites
 
-The `0.3.25` Hub distribution declares the exact matching client dependency.
+The `0.3.26` Hub distribution declares the exact matching client dependency.
 Checkout resolution uses `hub`'s explicit parent-path source; installed release
 bytes must match the same immutable tag and reviewed image digests. Paired wheel
 or local container checks do not establish production upgrade or native readiness.
