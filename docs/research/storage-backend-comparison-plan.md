@@ -121,7 +121,8 @@ Format `0.1.0-turbo.ociv1` requires OverlayBD >= v0.6.10 according to ACI's vers
 Unknown: equivalence of native and TurboOCI filesystem semantics for these exact fixtures; test both independently. [S3, S7]
 Every B4-N/B4-T/B4-U trial carries one of two proposed trust-tier labels; these are experiment rules, not upstream guarantees. [S2, S6, S8, S11]
 **T-A, admissible:** verify complete source and derived blobs before any guest read; charge every required download and verification.
-Cold T-A may therefore require full materialization and cannot be presented as pre-digest lazy startup. [S2, S6, S11]
+Native B4-N T-A uses a harness full-blob fetch/hash into immutable `file` lowers with background downloads disabled; it has no lazy read path and C2 duplicates B3's local execution control. [S2, S6; proposed harness]
+B4-T/U T-A stay blocked until a fully verified local-consumption path is qualified; do not assume registry `digest` fields implement that gate. [S6, S8, S11]
 **T-M, measurement-only lazy:** separately approved disposable hosts and synthetic workloads may expose the pre-digest window for analysis. [S6, S10, S11]
 T-M records the first guest read, full-digest completion, trusted components, and any bytes consumed before verification.
 T-M must still perform eventual full-blob verification; CRC, TLS, and registry-side hashing are not replacements. [S2, S11]
@@ -183,13 +184,15 @@ Test parent changes as new generations: unchanged chain, changed early prefix, c
 Record actual conversion reuse and BuildKit reuse separately; never infer command reruns from a conversion cache miss. [P1, P2]
 
 ### Cache and network matrix
-- **C0, cold:** no source blobs, converted artifacts, range cache, decompressed cache, or relevant guest/host page cache.
-- **C1, source-warm:** verified OCI blobs present; derived artifacts absent; page cache cold.
+- **C0-N, never converted:** only pinned source OCI content exists in the private source registry; no workload-derived artifacts exist in any host/store/cluster namespace.
+- C0-N includes every arm's conversion/preparation, B4 publication/push, and B6 import/snapshot/protection/clone before first response; it is the primary cold endpoint.
+- **C0-P, derived published/host cold:** immutable derived inputs already exist in the arm's declared staging store/registry/cluster, but host/range/page caches are empty; preparation is reported separately.
+- **C1, source-warm:** verified source OCI blobs exist locally, but workload-derived artifacts are absent everywhere; include conversion/publication as in C0-N.
 - **C2, artifact-warm:** verified derived artifacts present; guest and host page caches cold; per-instance writable state fresh.
 - **C3, working-set-warm:** one unmeasured startup primes the declared cache; the next instance still has fresh writable state.
 - **C4, partial/evicted:** create a disposable cache-root copy with a recorded subset of fetched ranges omitted; never evict from shared/permanent caches.
 - Split every B4 cache/network/trace cell by trust tier; never aggregate T-A and T-M samples. [S2, S6, S8, S11]
-- T-A C0/C4 must materialize and verify missing bytes before guest reads; preserve those costs rather than calling them absent.
+- T-A C0-N/C0-P/C4 must obtain complete derived bytes and verify them before guest reads; B6 verifies its pinned snapshot export instead of pretending to cache registry ranges.
 - Pre-digest startup/replay and post-ready digest completion belong only to approved T-M diagnostics; T-A can replay traces after verification. [S2, S8]
 - Record converter database state, registry/CDN cache, filesystem cache, RBD client/OSD cache, and QEMU caches independently.
 - A cold state requires evidence of reset/isolation; an uncontrollable cache is “unknown,” not “cold.”
@@ -205,20 +208,20 @@ Record actual conversion reuse and BuildKit reuse separately; never infer comman
 - OverlayBD downloads may fetch whole blobs after launch; freeze delay/delayExtra/rate, with disabled/immediate/delayed download as separate arms. [S5]
 - Before another trial require torn-down prior devices, no live download tasks, idle snaptrim, and flushed dirty pages; otherwise invalidate and stop scheduling. [S5, S6, S14]
 - Record prefetch concurrency and cache budgets; never allow an unbounded B4 cache while capping B1. [S5, S8]
+- Freeze `cacheConfig.cacheType=file` (`ocf`/`download` are separate unqualified variants) and `p2pConfig.enable=false`; do not silently enable dadip2p. [S5]
 
 ### Repetitions and order
 Use 30 pilots per eligible cell only to validate instrumentation/resource bounds; freeze an expanded cell manifest and exact resource totals before approval or execution.
-Confirmatory cells are T-A {B1,B2,B3,B4-N,B5,B6-if-available} × four workloads × {C0,C2} × baseline network × cohort 1, with downloads disabled: 1,000 cohorts/cell.
-Exploratory cells are the remaining backend/cache/network/cohort/download tuples, including B4-T/U only after prerequisites and T-M only after separate approval: 30 cohorts/cell.
+Confirmatory cells are T-A {B1,B2,B3,B4-N,B5,B6-if-available} × four workloads × {C0-N,C2} × baseline network × cohort 1, with downloads disabled: 1,000 cohorts/cell.
+Exploratory normal-performance cells are the remaining eligible backend/cache/network/cohort/download tuples, including separately approved T-M and qualified B4-T/U: also 1,000 cohorts/cell.
 The approval manifest must enumerate every tuple, excluded reason, frontend, boot path, n, and maximum starts/bytes/runtime; no implicit Cartesian-product campaign is authorized.
 Parent-change/reuse cases each receive 30 independent conversions per workload/arm/change type; conversion-preparation measurements receive 30 repetitions per arm/input/policy.
 Split confirmatory cohorts across at least five time blocks; pre-register the full tuple list and its total before approval, not after seeing outcomes.
 A concurrent cohort is one independent unit; do not treat its correlated guests as independent repetitions.
 Use a recorded random seed to randomize backend order within each workload/cache/network/time block.
 Balance order with a Latin square; restore declared states through fresh disposable roots or frozen-root clones, never by deleting shared/permanent cache entries.
-Report empirical wall-time p50/p95/p99, sample counts, and block-bootstrap 95% confidence intervals.
-At n=1,000, p99 still depends on few tail samples; publish raw tails and interval width, not false precision.
-For each fault/lifecycle cell, plan 30 repetitions and report every outcome; tail percentiles are descriptive only.
+Report normal-performance p50/p95/p99 only from the 1,000-cohort cells, with counts and block-bootstrap intervals; publish raw tails and interval width because p99 still rests on few samples.
+For 30-sample pilots, conversion/reuse, fault, and lifecycle cells report p50, the full sample/outcome list, and maximum/censoring; p95/p99 are unavailable, not inferred from the largest observation.
 Keep failures/timeouts in the denominator; report censored latency bounds rather than excluding unsuccessful starts.
 Do not extrapolate missing cells; unavailable B6 or blocked B4 remains unavailable or blocked.
 
@@ -299,6 +302,7 @@ Require allowlisted registry/helper origins, protected credential files/sockets,
 The documented centralized ublk daemon shares one ImageService/cache tree under an exclusive lock. [S6]
 **Unknown:** cross-tenant authorization, cache-key completeness, crash-atomic range publication, and poisoned-cache recovery. [S6, S12]
 **Test/contract:** isolate tenants and daemon cache roots; share only fully verified immutable artifacts under an explicit authorization check.
+P2P is disabled: S5 documents a dadip2p proxy, not a qualified tenant-sharing/authentication contract; enabling that peer data path would require a separate trust analysis and poisoning tests. [S5]
 Inject stale/truncated cache extents, same-name different-digest content, eviction during reads, and concurrent device creation.
 Require corruption detection before guest consumption, no unauthorized cache hit, and measured clean recovery without deleting referenced data.
 
@@ -308,7 +312,7 @@ The standalone one-device ublk process loses its device when killed; unmount bef
 **Unknown:** TCMU versus ublk guest I/O errors, timeouts, durability, device identity, and restart recovery under this VM attachment. [S5, S6]
 **Test/contract:** in disposable VMs only, stop/crash each selected daemon during reads and fsync; verify acknowledged writes and bounded failure.
 Offline behavior is **unknown** for partial caches; local-file configurations and background full downloads are documented. [S5, S6]
-Test egress-denied startup/workload on C0/C2/C3/C4 by tier; T-A incomplete closure must block before execution, while T-M observes only approved synthetic failures.
+Test egress-denied startup/workload on C0-N/C0-P/C2/C3/C4 by tier; T-A incomplete closure must block before execution, while T-M observes only approved synthetic failures.
 Require a declared verified offline dependency closure; a successful health check alone does not establish offline completeness.
 
 ### OpenStack Nova device lifetime
@@ -364,7 +368,7 @@ Stop an affected cell when its cache/network state cannot be established; preser
 Missing required lifecycle or integrity guarantees block backend acceptance even if isolated timing samples exist.
 
 “No advantage” is a possible decision, not an expected result.
-Pre-register each workload's sole primary endpoint: T-A C0 admission-to-first-validated-response p95 versus B1, with 10% useful-change and 5% regression thresholds.
+Pre-register each workload's sole primary endpoint: T-A C0-N admission-request-to-first-validated-response p95 versus B1, including every preparation/publication/verification step, with 10% useful-change and 5% regression thresholds.
 Use Bonferroni-adjusted block-bootstrap intervals for family-wise 95% coverage across the frozen primary comparisons; C2 and every other endpoint are exploratory.
 Report no demonstrated practical advantage when the confidence interval does not establish that threshold under the same trust contract.
 Also report no acceptable advantage when any gain requires weaker verification, lost semantics, unsafe operations, or unapproved resources.
