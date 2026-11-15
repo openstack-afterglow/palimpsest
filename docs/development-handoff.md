@@ -24,6 +24,13 @@ files_modified:
 [ARCHITECTURE.md](../ARCHITECTURE.md), 실행 경계는 [testing.md](testing.md),
 세부 결과는 아래 링크된 문서와 source다.
 
+## Allocation hold correction and pending owner decision — 2026-11-15
+
+- **Current hold:** no further test-resource allocation, including health-probe volumes, VMs, boot disks or M4-10 SSH resources, while the earlier cleanup remains incomplete. This supersedes the allocation rationale and executable “next” instructions in older entries below.
+- The 1 GiB empty-volume probe demonstrated only that one create/delete path worked. It did not establish recovery of the stuck image-backed volumes, waive the cleanup gate, or authorize another case. Creating `m412-svc-06`, `m408-sdk-01` and `m408-sdk-02` while those volumes remained was a process deviation from `openspec/specs/contributor-workflow/spec.md` (Verification entrypoints and protected material). Their observed results and subsequent cleanup remain evidence, not permission to repeat the sequence.
+- **Pending owner decision:** the residual volumes are `0a256fcf-3879-4dd6-936d-c322b35c7f95` (`m412-svc-05-boot`, last observed `error_deleting`) and `be592821-14c9-44b9-a86e-e1a9a9bb9ede` (`m412-dev-02-boot`, last observed `creating`); both Hub rows were still `deleting`. Resume allocations only after authorized cleanup and provider absence are recorded, or an explicit owner exception names these residuals and bounds the exact next ref, actions, resources and quantities. Approval to recover these volumes alone does not authorize a new allocation. State reset and force-delete remain unapproved.
+- Until then, only work within existing authority that allocates no new test resources may proceed. M4-10's keypair, floating IP and SSH ingress requirements are prerequisites, not a grant. This correction changes no checklist count (61/108), claims no new cloud check or cleanup, and leaves M4-14/GATE unresolved.
+
 ## 0.3.25 release and deployment; resume after stop live; M4-08 checked — 2026-11-15 (UTC)
 
 - Refs: PR #103 squash `a33f2b4`; new annotated tag `0.3.25`; `Release` run `43644642791` (about 49 min) and `Build and Push Palimpsest Hub` run `43644642798` succeeded; PyPI 0.3.25. Independent read-only review before merge (not an Astra/Sol signoff): no blocker; two should-fix findings and test gaps applied.
@@ -31,7 +38,7 @@ files_modified:
 - Live (`m408-sdk-02`, `c27507d3-…`, dev): ready (`MARKER-WRITTEN`) → SDK stop → `stopped`/SHUTOFF → CLI resume → ready with API-visible `resume_result.stdout` `MARKER-PRESERVED` → CLI stop → SDK resume → ready → idle shelve → SDK resume (unshelve) → ready → SDK delete; server and boot volume `271f113f-…` absent, row `deleted`. Not seen live: the 409 refusals and the reconcile recovery (tests only).
 - M4-08 checked (61/108) with limits stated in the item: logs are the bounded stdout/stderr of the first and resume results, SSH login itself was not exercised, service instances cannot be resumed after `stop`.
 - Prepared, not merged: branch `feat/kolla-git-allowed-hosts-20261115` (commit `4a45939`) wires `palimpsest_git_allowed_hosts` (default empty) to the Hub API env with a precheck and ansible-evaluated tests; needed before M4-05/06 can be exercised in production. Which hosts to allow is an owner decision.
-- Still open: the two stuck Cinder volumes (`0a256fcf-…` `error_deleting`, `be592821-…` `creating`) and their Hub rows in `deleting`; M4-10 live needs a keypair, a floating IP and an SSH ingress rule.
+- Still open: the two stuck Cinder volumes (`0a256fcf-…` `error_deleting`, `be592821-…` `creating`) and their Hub rows in `deleting`. M4-10 also needs a keypair, a floating IP and an SSH ingress rule, but provisioning any of them is on hold under the allocation correction above; listing prerequisites grants no approval.
 
 ## SDK journey on 0.3.24, stop-without-resume defect, 0.3.25 candidate — 2026-11-15 (UTC)
 
@@ -42,7 +49,7 @@ files_modified:
 
 ## Live OOM restart and stop on 0.3.24; M4-12 checked — 2026-11-15 (UTC)
 
-- Decision change: test VMs had been paused because two image-backed boot volumes are stuck in Cinder. A 1 GiB empty-volume probe as the ordinary user (create → `available` in 4 s, delete → absent in 3 s) showed Cinder itself works, so exactly one service instance was created. The two stuck volumes (`0a256fcf-…` `error_deleting`, `be592821-…` `creating`) were not touched; reset/force-delete still needs owner approval.
+- Historical allocation decision, withdrawn on 2026-11-15: a 1 GiB empty-volume probe as the ordinary user (create → `available` in 4 s, delete → absent in 3 s) was incorrectly treated as grounds to resume test VM creation while two image-backed boot volumes remained stuck. It proved only that probe's create/delete path, not cleanup completion or authorization. The service instance and its results below did occur, but the current allocation hold above controls all future cases. The two stuck volumes (`0a256fcf-…` `error_deleting`, `be592821-…` `creating`) were not touched; reset/force-delete still needs owner approval.
 - `m412-svc-06` (`09045df5-d68f-43d2-adfa-7216114ece83`, deployed 0.3.24, `restart=unless-stopped`): ready 20:32:17Z; guest kernel `Out of memory: Killed process 1575 (sh) … anon-rss:7621076kB`; status at 20:49:16Z `restarts=1`, `last_exit_code=-9`, `state=running`, instance still ready/ACTIVE; no session for about twenty minutes and no shelve. `instance stop` → `stopped`/SHUTOFF; restart counters unchanged for five minutes.
 - SDK path on the same instance: `HubClient.get_instance`, `instance_connection`, `list_instances`, `delete_instance`. After deletion the Nova server and boot volume `d8c8b6a1-…` were absent and the Hub row was `deleted` (the volume went away without a separate `delete-volume` advance).
 - M4-12 checked (60/108). Not checked: M4-08 (SDK create/advance/resume not run live), M4-14 (two stuck volumes remain).
