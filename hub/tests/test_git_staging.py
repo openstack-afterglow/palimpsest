@@ -7,6 +7,7 @@ import tarfile
 import pytest
 
 from palimpsest_hub.services import git_source
+from palimpsest_hub.services.git_context import ContextError
 from palimpsest_hub.services.git_source import GitBuildRequest, GitSourceError
 from palimpsest_hub.services.git_staging import GitStagingUnavailable, stage_git_context
 from palimpsest_hub.services.hub_store import HubStoreError, LocalPathBlobStore
@@ -239,6 +240,21 @@ async def test_context_subdir_uses_its_own_dockerignore(store, head):
     assert not any(n.startswith("tmp") for n in names)
 
 
+async def test_an_oversized_dockerignore_is_refused_before_its_rules_are_used(store, head):
+    runner = Runner(files={"Dockerfile": "FROM scratch\n", ".dockerignore": "#" + "x" * (64 * 1024) + "\n"})
+    with pytest.raises(ContextError, match="byte limit"):
+        await _stage(store, runner)
+    assert scratch_dirs(store) == []
+
+
+async def test_a_dockerignore_of_exactly_the_byte_limit_is_accepted(store, head):
+    body = "tmp/\n" + "#" + "x" * (64 * 1024 - 7) + "\n"
+    assert len(body.encode()) == 64 * 1024
+    runner = Runner(files={"Dockerfile": "FROM scratch\n", "tmp/junk": "x\n", ".dockerignore": body})
+    result = await _stage(store, runner)
+    assert not any(name.startswith("tmp") for name in tar_names(store, result.blob_digest))
+
+
 async def test_a_context_subdir_that_is_missing_or_a_file_is_refused(store, head):
     with pytest.raises(GitSourceError) as info:
         await _stage(store, Runner(), context_subdir="nope")
@@ -346,6 +362,27 @@ async def test_a_context_over_the_worker_member_limit_is_refused_before_publicat
         )
     assert info.value.code == "context"
     assert blobs(store) == before
+    assert scratch_dirs(store) == []
+
+
+async def test_the_member_limit_stops_packing_before_later_entries_are_read(store, head):
+    # The entry after the limit is a symlink that leaves the context. Packing everything first
+    # would report that link; stopping at the limit reports the size, and reads nothing further.
+    runner = Runner(
+        files={"Dockerfile": "FROM scratch\n", "app/a": "1\n", "app/b": "2\n", "outside.txt": "o\n"},
+        links={"app/zz-link": "../outside.txt"},
+    )
+    with pytest.raises(GitSourceError) as info:
+        await stage_git_context(
+            request(context_subdir="app"),
+            allowed_hosts=["github.com"],
+            store=store,
+            max_context_bytes=10**6,
+            max_members=2,
+            resolver=lambda h, p: PUBLIC,
+            runner=runner,
+        )
+    assert info.value.code == "context"
     assert scratch_dirs(store) == []
 
 

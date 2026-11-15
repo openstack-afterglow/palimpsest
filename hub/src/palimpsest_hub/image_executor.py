@@ -27,7 +27,9 @@ def validate_claim(value: dict, settings) -> dict:
         raise ValueError("unsupported image job")
     if not isinstance(value["name"], str) or not 0 < len(value["name"]) <= 256:
         raise ValueError("invalid image name")
-    maximum = worker._size(value["max_output_bytes"], settings.palimpsest_hub_max_blob_bytes)
+    # The API offers its own blob limit; this worker may be configured with a smaller one. Take
+    # the smaller value, as the recipe protocol does, instead of refusing every claim.
+    maximum = min(worker._size(value["max_output_bytes"], 2**63 - 1), settings.palimpsest_hub_max_blob_bytes)
     request = value["request"]
     if not isinstance(request, dict):
         raise ValueError("invalid image request")

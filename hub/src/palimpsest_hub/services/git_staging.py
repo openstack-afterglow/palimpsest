@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from palimpsest_hub.services import git_source
-from palimpsest_hub.services.git_context import ContextError, write_context_tar
+from palimpsest_hub.services.git_context import ContextError, ContextTooLarge, write_context_tar
 from palimpsest_hub.services.git_source import GitBuildRequest, GitSourceError, default_resolver
 from palimpsest_hub.services.hub_store import LocalPathBlobStore
 from palimpsest_hub.services.worker_leases import run_blocking
@@ -94,10 +94,16 @@ def _check_dockerfile(checkout: Path, dockerfile_path: str) -> None:
         raise GitSourceError("dockerfile", "dockerfile_path resolves outside the checkout")
 
 
+MAX_DOCKERIGNORE_BYTES = 64 * 1024
+
+
 def _read_dockerignore(context: Path) -> list[str]:
     path = context / ".dockerignore"
     if not path.is_file() or path.is_symlink():
         return []
+    # The file comes from the repository; its rules are evaluated for every entry of the context.
+    if path.stat().st_size > MAX_DOCKERIGNORE_BYTES:
+        raise ContextError(".dockerignore exceeds the byte limit")
     try:
         return path.read_text(encoding="utf-8").splitlines()
     except UnicodeDecodeError:
@@ -118,15 +124,20 @@ def _read_dockerfile(checkout: Path, dockerfile_path: str) -> str:
 
 
 def _pack(context: Path, out: Path, max_members: int, max_expanded_bytes: int) -> tuple[str, int]:
+    too_large = GitSourceError("context", "build context exceeds the worker's member or byte limit")
     ignore = _read_dockerignore(context)
-    with out.open("wb") as handle:
-        digest, entries = write_context_tar(context, handle, ignore_lines=ignore)
+    try:
+        with out.open("wb") as handle:
+            # Stop at the first entry beyond the member limit instead of packing all of them first.
+            digest, entries = write_context_tar(context, handle, ignore_lines=ignore, max_entries=max_members)
+    except ContextTooLarge:
+        raise too_large from None
     # Mirror the worker's extract_context limits so an oversized repo fails here, not in the worker.
     with tarfile.open(out) as tar:
         members = tar.getmembers()
     expanded = sum(member.size for member in members)
     if len(members) > max_members or expanded > max_expanded_bytes:
-        raise GitSourceError("context", "build context exceeds the worker's member or byte limit")
+        raise too_large
     return digest, entries
 
 

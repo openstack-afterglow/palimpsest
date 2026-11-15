@@ -244,6 +244,30 @@ def test_an_xattr_value_that_forges_a_prompt_cannot_silently_drop_later_xattrs(t
     assert names.get("trusted.overlay.opaque") == b"y", "an injected prompt silently dropped a later xattr"
 
 
+def test_a_directory_that_lists_one_name_twice_refuses_instead_of_letting_one_copy_win(image):
+    import re
+    import subprocess
+
+    from palimpsest_local.ext4_upper import limited_run
+
+    doubled = []
+
+    def doubling(argv, **kwargs):
+        done = limited_run(argv, **kwargs)
+        lines = done.stdout.split(b"\n")
+        for index, line in enumerate(lines):
+            # The first real entry of a listing (not ``.`` or ``..``), as a corrupted directory block would repeat it.
+            if not doubled and re.match(rb"^/\d+/\d+/\d+/\d+/[^./][^/]*/", line):
+                lines.insert(index, line)
+                doubled.append(line)
+                break
+        return subprocess.CompletedProcess(done.args, done.returncode, b"\n".join(lines), done.stderr)
+
+    with pytest.raises(CaptureError) as error:
+        read_upper(image, DEBUGFS, runner=doubling)
+    assert doubled and "lists a path twice" in str(error.value)
+
+
 def test_staged_payloads_match_the_streamed_bytes_and_use_few_processes(image, tmp_path):
     from palimpsest_local.ext4_upper import StagedPayload, stage_payloads
 

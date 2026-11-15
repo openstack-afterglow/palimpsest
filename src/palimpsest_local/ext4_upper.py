@@ -260,6 +260,9 @@ def read_upper(
                     continue
                 path = f"{prefix}{_name(raw)}"
                 mode_i = int(mode, 8)
+                if path in records:
+                    # Only a corrupted filesystem lists one name twice; never let one copy win silently.
+                    raise _fail("the upper lists a path twice")
                 records[path] = (int(child), mode_i, int(uid), int(gid), int(size or 0))
                 if len(records) > max_entries:
                     raise _fail("upper exceeds the entry limit")
