@@ -4080,8 +4080,8 @@ Reserved names and duplicate listings (2026-11-15, from the commit-path review, 
 {
   "schema_version": 1,
   "source_sha256": "c95807f22ce68d7296d80e346c70b42766d199bfac9d9aa0cd08295b4f037a8b",
-  "reviewed_at": "2026-11-15T12:07:16Z",
-  "summary": "Docs only: 0.3.28 published and deployed; one approved CPU VM from the Git image; M4-06 checked with Hub degradation limits; request-failure diagnosability defect recorded"
+  "reviewed_at": "2026-11-15T12:20:45Z",
+  "summary": "Docs only: 0.3.28 published and deployed; one approved CPU VM from the Git image; M4-06 checked with Hub degradation limits and dependency-side signals; request-failure diagnosability defect recorded"
 }
 ```
 <!-- architecture-review:end -->
