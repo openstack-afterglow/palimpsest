@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 import errno
+import hashlib
+import io
+import itertools
 import os
 import shutil
 import sys
+import tarfile
+from contextlib import contextmanager
 
 import pytest
 
+from palimpsest_local.oci_capture import CaptureError, convert_upper_to_layer
 from palimpsest_local.oci_commit import CommitError
-from palimpsest_local.vz_commit import CLONE_NAME, clonefile, private_upper_clone
+from palimpsest_local.vz_commit import CLONE_NAME, _scan_parent, clonefile, parent_layer_paths, private_upper_clone
 
 SIZE = 64 * 1024
 
@@ -138,3 +144,92 @@ def test_clonefile_refuses_an_existing_destination(tmp_path):
     with pytest.raises(OSError):
         clonefile(source, destination)
     assert destination.read_bytes() == b"x"
+
+
+def _parent(tmp_path, *layers):
+    """A parent image whose layer tars list their members in exactly the given order."""
+    manifest, blobs = {"layers": []}, {}
+    for index, members in enumerate(layers):
+        path = tmp_path / f"layer{index}.tar.gz"
+        with tarfile.open(path, "w:gz") as archive:
+            for name, data in members:
+                info = tarfile.TarInfo(name)
+                if data is None:
+                    info.type = tarfile.DIRTYPE
+                    archive.addfile(info)
+                else:
+                    info.size = len(data)
+                    archive.addfile(info, io.BytesIO(data))
+        digest = "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+        manifest["layers"].append({"digest": digest})
+        blobs[digest] = path
+    return manifest, blobs
+
+
+LOWER = [("etc", None), ("etc/ssh", None), ("etc/ssh/old_host_key", b"old"), ("srv", None), ("srv/lower", b"l")]
+# One changeset: /etc/ssh is replaced wholesale (opaque) and gains a new key; /srv is deleted and
+# recreated with different content. OCI markers act on lower layers only, whatever their position.
+REPLACING = [
+    ("etc/ssh", None),
+    ("etc/ssh/ssh_host_ed25519_key", b"PRIVATE"),
+    ("etc/ssh/.wh..wh..opq", b""),
+    ("srv", None),
+    ("srv/new", b"n"),
+    (".wh.srv", b""),
+]
+REPLACED_VIEW = {"etc", "etc/ssh", "etc/ssh/ssh_host_ed25519_key", "srv", "srv/new"}
+
+
+def test_markers_listed_after_same_layer_entries_hide_only_the_lower_layers(tmp_path):
+    manifest, blobs = _parent(tmp_path, LOWER, REPLACING)
+    assert parent_layer_paths(manifest, blobs) == REPLACED_VIEW
+
+
+def test_the_visible_parent_view_does_not_depend_on_member_order_inside_a_layer(tmp_path):
+    views = set()
+    for index, order in enumerate(itertools.permutations(REPLACING)):
+        if index % 37:  # 720 orders; a spread of 20 keeps the test fast
+            continue
+        scratch = tmp_path / str(index)
+        scratch.mkdir()
+        manifest, blobs = _parent(scratch, LOWER, list(order))
+        views.add(frozenset(parent_layer_paths(manifest, blobs)))
+    assert views == {frozenset(REPLACED_VIEW)}
+
+
+def test_a_root_opaque_marker_keeps_the_entries_of_its_own_layer(tmp_path):
+    manifest, blobs = _parent(tmp_path, LOWER, [(".plmignore", b"cache/\n"), ("app", b"a"), (".wh..wh..opq", b"")])
+    visible, ignore = _scan_parent(manifest, blobs)
+    assert visible == {".plmignore", "app"}
+    assert ignore == b"cache/\n"
+
+
+def test_a_later_layer_still_deletes_what_an_earlier_layer_added(tmp_path):
+    manifest, blobs = _parent(tmp_path, LOWER, REPLACING, [("etc/ssh/.wh.ssh_host_ed25519_key", b""), (".wh.srv", b"")])
+    assert parent_layer_paths(manifest, blobs) == {"etc", "etc/ssh"}
+
+
+@contextmanager
+def _no_payload(payload):
+    yield io.BytesIO(b"")
+
+
+def test_commit_hides_a_parent_identity_file_whose_layer_lists_it_before_the_marker(tmp_path):
+    # The consequence the order defect had: the parent's host key was not seen, so the committed
+    # layer carried no whiteout for it and the key stayed visible in the new image.
+    manifest, blobs = _parent(tmp_path, LOWER, REPLACING)
+    receipt = convert_upper_to_layer([], io.BytesIO(), _no_payload, parent_paths=parent_layer_paths(manifest, blobs))
+    assert "etc/ssh/ssh_host_ed25519_key" in receipt.hidden
+
+
+def test_commit_still_refuses_unclassified_parent_authorized_keys_listed_before_a_marker(tmp_path):
+    layer = [
+        ("root", None),
+        ("root/.ssh", None),
+        ("root/.ssh/authorized_keys", b"ssh-ed25519 AAAA"),
+        ("root/.wh..wh..opq", b""),
+    ]
+    manifest, blobs = _parent(tmp_path, LOWER, layer)
+    with pytest.raises(CaptureError) as refused:
+        convert_upper_to_layer([], io.BytesIO(), _no_payload, parent_paths=parent_layer_paths(manifest, blobs))
+    assert refused.value.code == "capture-provenance"
