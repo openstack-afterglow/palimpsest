@@ -355,6 +355,7 @@ def test_ansible_git_allow_list_reaches_the_api_as_json_and_defaults_to_off(tmp_
     "hosts",
     [
         "github.com",
+        {"github.com": 1},
         ["https://github.com"],
         ["github.com:443"],
         ["github.com/owner"],

@@ -67,7 +67,8 @@
 - name: Precheck | Validate the Git source host allow-list
   ansible.builtin.assert:
     that:
-      - palimpsest_git_allowed_hosts is sequence and palimpsest_git_allowed_hosts is not string
+      - palimpsest_git_allowed_hosts is sequence
+      - palimpsest_git_allowed_hosts is not string and palimpsest_git_allowed_hosts is not mapping
       - (palimpsest_git_allowed_hosts | length) <= 16
       - palimpsest_git_allowed_hosts | unique | length == palimpsest_git_allowed_hosts | length
       - >-
