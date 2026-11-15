@@ -52,7 +52,7 @@ files_modified:
 - Known issues re-checked and left as they were: the mac-mini `retained-authority-changed` hold (untouched) and the 0.3.28 Hub 5xx window (cause not established; 0.3.29 only names such failures in logs).
 - Pending owner decisions added by this work: whether PR #115 may merge; which of the design records to pursue; the bounded OpenStack experiment in the review (two sequential CPU instances, small volumes and images); the earlier pending items are unchanged.
 
-## Immutable block-layer proposal with reference code (OverlayBD, OCI registry, Ceph RBD, local KVM) — 2026-11-15/16 (design, not merged)
+## Immutable block-layer proposal with reference code (OverlayBD, OCI registry, Ceph RBD, local KVM) — 2026-11-15/16 (PR #116 open against the lineage branch, not merged)
 
 - **Count unchanged: 69/108.** Owner direction of 2026-11-15: design and implement a single immutable block-layer workflow across OpenStack + Ceph RBD and local KVM with OverlayBD (architecture, build/publish automation, provisioning, developer workflow). Branch `design/immutable-block-layers-20261115`, stacked on `feat/layer-lineage-diagnostics-20261115`. Nothing merged, released, deployed or installed on any production host.
 - Delivered: `docs/design/immutable-block-layers/` (README plus four deliverables, Korean) and `examples/immutable-block-layers/` (bash CLI `blkstack`, pipeline and recipes, Ceph pool script, node agent, libvirt hook, Cinder driver sketch, proof scripts). Reference code only: nothing in `src/` or `hub/` imports it, it has no CI lane, and it is shell rather than Rust because it only orchestrates external tools; a product version would have to follow the Rust preference and get CI.
