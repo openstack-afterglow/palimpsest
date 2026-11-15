@@ -316,6 +316,7 @@
     playbooks = []; selected = null; choices = null; instances = []; pending = null; playbookVersion++; instanceVersion++;
     quietRounds = 0; lastSeen = "";
     $("playbook-list").replaceChildren(); $("instance-list").replaceChildren(); $("playbook-detail").hidden = true;
+    $("launch-submit").disabled = false;
     for (const id of ["playbook-message", "launch-message", "launch-reason", "instance-message"]) message(id, "");
   });
 })();
