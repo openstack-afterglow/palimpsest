@@ -1,6 +1,10 @@
 # Detailed installation and configuration guide
 
-## 0.3.27 transition note — 2026-11-15 (UTC; candidate)
+## 0.3.28 transition note — 2026-11-15 (UTC; candidate)
+
+The Hub dashboard adds playbook inspection and instance creation through the existing image-job and instance contracts. `GET /v1/instance-options` reads boot images, flavors, project networks and SSH key names with the original caller's token; it allocates nothing. Creation, provider advancement and removal retain the existing server-side authorization and ownership checks. No schema or Kolla role input changes. Roll all Hub cohorts together after publication. The separate local-only native VZ HOLD recovery work is not included in this release.
+
+## 0.3.27 transition note — 2026-11-15 (UTC; deployed)
 
 0.3.27 is a patch over 0.3.26 with no schema change and no new role input. The build worker now takes the smaller of the API's blob limit and its own output limit for an image job; on 0.3.26 and earlier a deployment with `palimpsest_build_worker_max_blob_bytes` below `palimpsest_hub_max_blob_bytes` failed every image job (registry intake, Dockerfile and Git builds) as `build_failed` before the build started. Such a deployment needs this release on the build worker; no setting has to change. The API bounds the `.dockerignore` of a Git build's repository (64 KiB, 1,000 rules); a deployment that allows Git hosts should take this release, because an unbounded rule file could keep an API worker busy. The client's experimental native VZ commit gains refusals (ordinary files named `.wh.*`, an upper that lists a path twice, a `/.plmignore` rule with the bracket `[!]`, a rule over 4096 bytes, more than 10,000 rules, or evaluation beyond its time budget). Roll the API/worker cohorts and the build worker to the same release.
 
@@ -79,7 +83,7 @@ Version 0.3.25 is published (tag `0.3.25`, PyPI `palimpsest-client` 0.3.25) and 
 SDK publication and native execution remain separately qualified. Root/Hub metadata, module versions,
 generated locks and Kolla image defaults move together. After formal publication,
 install exact client bytes with
-`uv tool install --python 3.11 palimpsest-client==0.3.27`, or install a trusted
+`uv tool install --python 3.11 palimpsest-client==0.3.28`, or install a trusted
 local checkout with `uv tool install --force --python 3.11 .`.
 A root wheel upgrade neither deploys Hub nor qualifies actual build/run behavior.
 Git/outbound GitHub HTTPS is needed only for VCS installation.
@@ -1738,7 +1742,7 @@ and the [command workflows](cli/workflows.md) for operational details.
 
 ## SDK image/native integration: operator prerequisites
 
-The `0.3.27` Hub distribution declares the exact matching client dependency.
+The `0.3.28` Hub distribution declares the exact matching client dependency.
 Checkout resolution uses `hub`'s explicit parent-path source; installed release
 bytes must match the same immutable tag and reviewed image digests. Paired wheel
 or local container checks do not establish production upgrade or native readiness.

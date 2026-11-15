@@ -2009,11 +2009,11 @@ async def test_legacy_upload_remains_private_to_its_original_member(tmp_path: Pa
 def test_app_assets_http_allowlist_includes_package_console_without_arbitrary_files(tmp_path, monkeypatch):
     from palimpsest_hub import main as hub_main
 
-    for asset in ("hub.js", "hub.css", "hub-packages.js", "private.js"):
+    for asset in ("hub.js", "hub.css", "hub-packages.js", "hub-playbooks.js", "private.js"):
         (tmp_path / asset).write_text("fixture asset", encoding="utf-8")
     monkeypatch.setattr(hub_main, "_APP_FILES", tmp_path)
     client = TestClient(app)
-    for asset in ("hub.js", "hub.css", "hub-packages.js"):
+    for asset in ("hub.js", "hub.css", "hub-packages.js", "hub-playbooks.js"):
         response = client.get("/app/" + asset)
         assert response.status_code == 200 and response.text == "fixture asset"
         assert response.headers["cache-control"] == "no-store"

@@ -7,6 +7,7 @@
   <link rel="stylesheet" href="/app/hub.css">
   <script defer src="/app/hub.js"></script>
   <script defer src="/app/hub-packages.js"></script>
+  <script defer src="/app/hub-playbooks.js"></script>
 </head>
 <body>
   <header class="masthead"><div class="brand">PALIMPSEST <span>/ HUB</span></div><a href="/docs">API reference ↗</a></header>
@@ -18,7 +19,7 @@
     </section>
     <section class="workspace" id="workspace" hidden>
       <section class="panel identity"><h2>Connected identity</h2><p id="identity"></p><p id="permissions"></p></section>
-      <nav class="tabs" aria-label="Workspace sections"><a href="#artifacts">Images & layers</a><a href="#upload">Upload</a><a href="#build">Build</a><a href="#packages">Native packages</a></nav>
+      <nav class="tabs" aria-label="Workspace sections"><a href="#artifacts">Images & layers</a><a href="#upload">Upload</a><a href="#build">Build</a><a href="#playbooks">Playbooks</a><a href="#packages">Native packages</a></nav>
       <section id="artifacts" class="panel">
         <div class="panel-heading"><div><p class="eyebrow">CONTENT-ADDRESSED</p><h2>Images & layers</h2></div><p>Verified downloads are streamed in chunks. Project managers can delete project-owned registrations without dependent layers or foreign-project grants; shared catalogs remain system-managed and blob cleanup is deferred.</p></div>
         <div class="toolbar"><label>Exact name<input id="search-name" placeholder="ubuntu-base"></label><label>Type<select id="search-kind"><option value="">All</option><option value="squashfs">SquashFS</option><option value="cloud-image">Cloud image</option></select></label><label>Digest prefix<input id="search-digest" placeholder="At least 4 hex characters"></label><label>Architecture<select id="search-arch"><option value="">All</option><option value="x86_64">x86_64</option><option value="aarch64">aarch64</option></select></label><label>OS variant<input id="search-os" placeholder="ubuntu-24.04"></label><label>Ubuntu base<input id="search-ubuntu" placeholder="ubuntu-24.04"></label><label>Disk format<select id="search-format"><option value="">All</option><option value="raw">raw</option><option value="qcow2">qcow2</option><option value="vmdk">vmdk</option><option value="vdi">vdi</option><option value="vhd">vhd</option><option value="vhdx">vhdx</option></select></label><button type="button" class="secondary" id="search">Search</button></div>
@@ -40,6 +41,33 @@
         <div class="panel-heading"><div><p class="eyebrow">SERVER BUILD</p><h2>Build a layer</h2></div><p>Requires current project member authority and a configured isolated host worker; readers can view project build status. No recipe runs in the API process.</p></div>
         <form id="build-form" class="form-grid"><label>Output name<input id="build-name" required pattern="[a-z0-9][a-z0-9.+-]{0,63}" placeholder="service-base"></label><label>Cloud-image digest<input id="build-base" required pattern="sha256:[0-9a-fA-F]{64}" placeholder="sha256:…"></label><label class="wide">Parent layer digests <span class="hint">Root first; leave empty for a base-only build.</span><textarea id="build-layers" rows="2" placeholder="sha256:…"></textarea></label><label class="wide">Palimpsestfile <span class="hint">FROM and LAYER must match the digests above. RUN executes inside the guest with network disabled.</span><textarea id="build-recipe" rows="7" required spellcheck="false" placeholder="FROM sha256:…&#10;RUN echo ready > /opt/ready"></textarea></label><div class="wide actions"><button type="submit">Queue build</button></div></form><p id="build-message" role="status"></p>
         <div class="list-heading"><h3>Recent builds</h3><button type="button" class="secondary" id="refresh-builds">Refresh</button></div><div id="build-list" class="rows" aria-live="polite"></div>
+      </section>
+      <section id="playbooks" class="panel">
+        <div class="panel-heading"><div><p class="eyebrow">IMAGE + LAYERS</p><h2>Playbooks</h2></div><p>A playbook is an image as the Hub stores it: an ordered stack of layers with its recorded source and audience. Select one to inspect it and, when you built it in this project, to create a VM from it. Every request is checked again by the server.</p></div>
+        <div class="list-heading"><h3>Visible playbooks</h3><button type="button" class="secondary" id="refresh-playbooks">Refresh</button></div>
+        <p id="playbook-message" role="status"></p><div id="playbook-list" class="rows" aria-live="polite"></div>
+        <div id="playbook-detail" class="native-section" hidden>
+          <h3 id="playbook-title"></h3>
+          <dl id="playbook-facts" class="facts"></dl>
+          <h4>Layers, lowest first</h4><ol id="playbook-layers" class="layers"></ol>
+          <p id="launch-reason" class="hint"></p>
+          <form id="launch-form" class="form-grid" hidden>
+            <label>VM name<input id="launch-name" required pattern="[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}" placeholder="demo-vm"></label>
+            <label>Lifecycle<select id="launch-lifecycle"><option value="service">service: keeps running</option><option value="dev">dev: shelved after the last session ends</option></select></label>
+            <label>Boot image<select id="launch-image" required></select></label>
+            <label>Flavor<select id="launch-flavor" required></select></label>
+            <label>Network<select id="launch-network" required></select></label>
+            <label>SSH key <span class="hint">Required for a dev VM you want to log in to.</span><select id="launch-key"></select></label>
+            <label>Boot volume (GiB)<input type="number" id="launch-boot" required min="2" step="1" value="20"></label>
+            <label>Writable space (GiB) <span class="hint">Private to this VM; smaller than the boot volume.</span><input type="number" id="launch-writable" required min="1" step="1" value="8"></label>
+            <label class="wide">Command <span class="hint">One argument per line. Leave empty to run the image's own entrypoint and command.</span><textarea id="launch-command" rows="3" spellcheck="false"></textarea></label>
+            <label class="wide">Readiness check <span class="hint">Optional; one argument per line. The VM is reported ready when this command succeeds inside it.</span><textarea id="launch-readiness" rows="2" spellcheck="false"></textarea></label>
+            <div class="wide actions"><button type="submit" id="launch-submit">Create VM</button><span class="hint">Creating reserves a boot volume. Starting the server is a second, explicit step in the list below.</span></div>
+          </form>
+          <p id="launch-message" role="status"></p>
+        </div>
+        <div class="list-heading"><h3>VMs in this project</h3><button type="button" class="secondary" id="refresh-instances">Refresh</button></div>
+        <p id="instance-message" role="status"></p><div id="instance-list" class="rows" aria-live="polite"></div>
       </section>
     </section>
     <section id="packages" class="panel"></section>

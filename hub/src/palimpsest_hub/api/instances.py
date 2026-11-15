@@ -24,6 +24,7 @@ from palimpsest_hub.config import get_settings
 from palimpsest_hub.instance_models import PalimpsestHubInstance
 from palimpsest_hub.models import exact_identity
 from palimpsest_hub.services import instance_lifecycle as lifecycle
+from palimpsest_hub.services import instance_options
 from palimpsest_hub.services import instances as service
 from palimpsest_hub.services.digest import normalize_digest
 from palimpsest_hub.services.instance_cluster_runtime import (
@@ -125,6 +126,19 @@ async def create_instance(req: InstanceRequest, actor: dict = Depends(_legacy_wr
     ):
         raise HTTPException(503, "A canonical HTTPS public origin is required for instance bootstrap")
     return await service.create(_factory_or_503(), _store_or_503(), settings, actor, conn, req.model_dump(mode="json"))
+
+
+@router.get("/instance-options", operation_id="list_hub_instance_options")
+async def instance_options_route(
+    response: Response, actor: dict = Depends(_legacy_writer), conn=Depends(get_os_conn)
+) -> dict:
+    """Boot images, flavors, project networks and key names the caller can name in a create request."""
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        return await run_blocking(instance_options.choices, conn, actor, get_settings())
+    except HTTPException as exc:
+        exc.headers = {**(exc.headers or {}), "Cache-Control": "no-store"}
+        raise
 
 
 @router.get("/instances", operation_id="list_hub_instances")

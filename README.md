@@ -31,31 +31,32 @@ are not deployed-service acceptance; see the [control-plane boundaries](ARCHITEC
 - **0.3.24 (published and deployed 2026-11-15):** client-side `--cloud` failures (unknown or incomplete clouds.yaml cloud, unreachable Keystone, rejected credential, `auth_url` without an identity API) are reported as one specific message instead of a traceback. Checked with the released client against the deployed Hub.
 - **0.3.25 (published and deployed 2026-11-15):** `instance resume` also powers on a stopped dev instance, and the instance status exposes `resume_result`. Service instances still cannot be resumed after `stop`.
 - **0.3.26 (published and deployed 2026-11-15):** the Kolla role can enable Hub Git builds through `palimpsest_git_allowed_hosts` (default off), with `examples/git-build` as a first build; the experimental native VZ commit honours a `/.plmignore` carried by the image. Production allows `github.com`; the first Git build there was admitted and then failed as `build_failed` because of the worker limit defect fixed in 0.3.27.
-- **Candidate 0.3.27 (not yet published or deployed):** Hub image jobs (registry intake, Dockerfile and Git builds) no longer fail when the build worker's output limit is smaller than the API's blob limit. The experimental native VZ commit bounds `/.plmignore` evaluation and refuses ordinary files named `.wh.*`; a session marker left by a killed `exec` client is released only by its own run, also when that run's VM is stopped.
+- **0.3.27 (published and deployed 2026-11-15):** Hub image jobs (registry intake, Dockerfile and Git builds) no longer reject claims when the build worker's output limit is smaller than the API's blob limit. The experimental native VZ commit bounds `/.plmignore` evaluation and refuses ordinary files named `.wh.*`; a session marker left by a killed `exec` client is released only by its own run, also when that run's VM is stopped. The image-rule fallback and reserved-name refusal were exercised on the tag source in native VZ; an out-of-band unclean stop remains an unresolved recovery limit.
+- **Candidate 0.3.28 (not yet published or deployed):** the Hub dashboard can inspect visible playbooks and request VMs from the caller's own completed image jobs. Provider choices use the caller's token, and server creation and deletion remain explicit actions. Browser verification used a local fake API, not production VM allocation.
 
 ## Install from PyPI
 
 Requires Python 3.11 or newer. Prefer an isolated uv tool, or a pip virtual environment:
 
 ```sh
-uv tool install --python 3.11 "palimpsest-client==0.3.27"
+uv tool install --python 3.11 "palimpsest-client==0.3.28"
 palimpsest --version
 
 # Alternative: pip, without modifying the system Python.
 python3.11 -m venv .venv
-.venv/bin/python -m pip install "palimpsest-client==0.3.27"
+.venv/bin/python -m pip install "palimpsest-client==0.3.28"
 .venv/bin/palimpsest --version
 ```
 
 If uv's tool directory is not on `PATH`, run `uv tool update-shell` explicitly
 and open a new terminal. One-off use: `uvx --python 3.11 --from
-palimpsest-client==0.3.27 palimpsest --version`.
+palimpsest-client==0.3.28 palimpsest --version`.
 
 Root client installation and Hub service deployment are separate. API, export
 worker and build-worker images must match the reviewed release; updating the
 root wheel alone does not update running Kolla containers.
 
-The commands above select version 0.3.27 after its formal publication. Check the
+The commands above select version 0.3.28 after its formal publication. Check the
 [release handoff](docs/development-handoff.md) for actual PyPI/image receipts and
 the deployment-server package/lock selection. Older release and production
 receipts remain historical and do not establish the currently running version.
