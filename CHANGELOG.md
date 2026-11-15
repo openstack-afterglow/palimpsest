@@ -4,6 +4,10 @@ All notable changes to Palimpsest Local are documented here.
 
 ## [Unreleased]
 
+### Fixed
+
+- Experimental native VZ commit: `/.plmignore` evaluation can no longer run without limit. A rule with many `**` or `*` segments took seconds per path (more than fifteen seconds with twelve segments), so a file carried by an image could stall every commit made from it. Patterns with more than two wildcards are now matched in time linear in pattern and path length, a file may hold at most 10,000 rules and evaluation has a 120-second budget; exceeding a bound refuses the commit. Matching results are unchanged for valid patterns. An invalid character class is a typed refusal, and a bracket that only forms a class together with the text after it is refused when the pattern also has more than two wildcards.
+
 ## [0.3.26] - 2026-11-15 (UTC; candidate, not yet published or deployed)
 
 ### Added

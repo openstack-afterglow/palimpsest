@@ -12,6 +12,7 @@ import hashlib
 import posixpath
 import re
 import tarfile
+import time
 from collections.abc import Callable, Collection, Iterable, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
@@ -170,8 +171,21 @@ def _is_mandatory(
     return False
 
 
-def _glob_to_regex(pattern: str) -> re.Pattern[str]:
-    out: list[str] = []
+# Ignore-rule bounds. A /.plmignore comes from the guest or from an image, so matching must not
+# be able to run without limit: patterns with more than two unbounded wildcards are matched by a
+# linear state simulation instead of the backtracking regex engine, and the whole evaluation has
+# a rule cap and a time budget that end in a refusal, never in a silent pass.
+_MAX_PLMIGNORE_RULES = 10_000
+_MAX_REGEX_WILDCARDS = 2
+_PLMIGNORE_BUDGET_SECONDS = 120.0
+_UNBOUNDED = ("star", "globstar", "globdir")
+
+
+def _glob_tokens(pattern: str) -> list[tuple[str, str]]:
+    """Tokens ``(kind, text)``: ``star`` is ``*`` (no "/"), ``qmark`` is ``?`` (no "/"),
+    ``globstar`` is ``**`` (anything but a newline), ``globdir`` is ``**/`` (zero or more whole
+    directories), ``class`` is a bracket expression as regex text and ``lit`` one literal character."""
+    tokens: list[tuple[str, str]] = []
     index = 0
     while index < len(pattern):
         char = pattern[index]
@@ -180,38 +194,129 @@ def _glob_to_regex(pattern: str) -> re.Pattern[str]:
                 index += 2
                 if pattern[index : index + 1] == "/":
                     index += 1
-                    out.append("(?:.*/)?")
+                    tokens.append(("globdir", ""))
                 else:
-                    out.append(".*")
+                    tokens.append(("globstar", ""))
                 continue
-            out.append("[^/]*")
+            tokens.append(("star", ""))
         elif char == "?":
-            out.append("[^/]")
+            tokens.append(("qmark", ""))
         elif char == "[":
             end = pattern.find("]", index + 2)
             if end == -1:
-                out.append(re.escape(char))
+                tokens.append(("lit", char))
             else:
                 body = pattern[index + 1 : end]
                 if body.startswith("!"):
                     body = "^" + body[1:]
-                out.append("[" + body.replace("\\", "\\\\") + "]")
+                tokens.append(("class", "[" + body.replace("\\", "\\\\") + "]"))
                 index = end
         elif char == "\\" and index + 1 < len(pattern):
             index += 1
-            out.append(re.escape(pattern[index]))
+            tokens.append(("lit", pattern[index]))
         else:
-            out.append(re.escape(char))
+            tokens.append(("lit", char))
         index += 1
-    return re.compile("^" + "".join(out) + "$")
+    return tokens
+
+
+def _regex(text: str, problem: str = ".plmignore has an invalid character class") -> re.Pattern[str]:
+    try:
+        return re.compile(text)
+    except re.error:
+        raise CaptureError("plmignore", problem) from None
+
+
+def _tokens_to_regex(tokens: list[tuple[str, str]]) -> re.Pattern[str]:
+    parts = {"star": "[^/]*", "qmark": "[^/]", "globstar": ".*", "globdir": "(?:.*/)?"}
+    out = [text if kind == "class" else re.escape(text) if kind == "lit" else parts[kind] for kind, text in tokens]
+    return _regex("^" + "".join(out) + "$")
+
+
+class _LinearGlob:
+    """Match one pattern by simulating its states; time is pattern length times path length.
+
+    It accepts exactly what the regex translation accepts, including that ``**`` does not cross a
+    newline and that one trailing newline in the path is ignored at the end of the pattern. A
+    bracket expression that is a class only together with the text after it (``[!]...]``) has no
+    token of its own; such a pattern is refused here rather than matched approximately.
+    """
+
+    def __init__(self, tokens: list[tuple[str, str]]) -> None:
+        self._kinds = [kind for kind, _ in tokens]
+        self._literals = [text for _, text in tokens]
+        ambiguous = ".plmignore combines an ambiguous character class with more than two wildcards"
+        self._classes = [_regex(text, ambiguous).match if kind == "class" else None for kind, text in tokens]
+        self._size = len(tokens)
+
+    def _closure(self, states: set[int]) -> set[int]:
+        # State i: before token i. State size + 1 + i: inside the ``**/`` group of token i.
+        size, kinds = self._size, self._kinds
+        pending = list(states)
+        while pending:
+            state = pending.pop()
+            if state >= size or kinds[state] not in _UNBOUNDED:
+                continue
+            for following in (state + 1, size + 1 + state) if kinds[state] == "globdir" else (state + 1,):
+                if following not in states:
+                    states.add(following)
+                    pending.append(following)
+        return states
+
+    def match(self, text: str) -> bool:
+        size, kinds, literals, classes = self._size, self._kinds, self._literals, self._classes
+        states = self._closure({0})
+        last = len(text) - 1
+        for position, char in enumerate(text):
+            if position == last and char == "\n" and size in states:
+                return True
+            moved: set[int] = set()
+            for state in states:
+                if state == size:
+                    continue
+                if state > size:
+                    if char != "\n":
+                        moved.add(state)
+                        if char == "/":
+                            moved.add(state - size)
+                    continue
+                kind = kinds[state]
+                if kind == "lit":
+                    if char == literals[state]:
+                        moved.add(state + 1)
+                elif kind == "star":
+                    if char != "/":
+                        moved.add(state)
+                elif kind == "qmark":
+                    if char != "/":
+                        moved.add(state + 1)
+                elif kind == "globstar":
+                    if char != "\n":
+                        moved.add(state)
+                elif kind == "class" and classes[state](char):
+                    moved.add(state + 1)
+            if not moved:
+                return False
+            states = self._closure(moved)
+        return size in states
+
+
+def _compile_rule(pattern: str) -> Callable[[str], object]:
+    tokens = _glob_tokens(pattern)
+    regex = _tokens_to_regex(tokens)  # also validates character classes
+    if sum(1 for kind, _ in tokens if kind in _UNBOUNDED) <= _MAX_REGEX_WILDCARDS:
+        return regex.match
+    return _LinearGlob(tokens).match
 
 
 class IgnoreMatcher:
     """Docker-ignore syntax: last matching rule wins; ``!`` re-includes; a rule that
     matches a directory also covers its descendants."""
 
-    def __init__(self, text: str | bytes | None) -> None:
-        self._rules: list[tuple[bool, re.Pattern[str]]] = []
+    def __init__(self, text: str | bytes | None, *, budget_seconds: float = _PLMIGNORE_BUDGET_SECONDS) -> None:
+        self._rules: list[tuple[bool, Callable[[str], object]]] = []
+        self._budget = budget_seconds
+        self._spent = 0.0
         if text is None:
             return
         if isinstance(text, bytes):
@@ -238,16 +343,23 @@ class IgnoreMatcher:
             line = posixpath.normpath(line.strip("/")) if line.strip("/") else ""
             if not line or line == ".":
                 continue
-            self._rules.append((negate, _glob_to_regex(line)))
+            if len(self._rules) >= _MAX_PLMIGNORE_RULES:
+                raise CaptureError("plmignore", ".plmignore has too many rules")
+            self._rules.append((negate, _compile_rule(line)))
 
     def ignored(self, path: str, *, is_dir: bool = False) -> bool:
+        if not self._rules:
+            return False
+        started = time.monotonic()
         state = False
         parts = path.split("/")
         prefixes = ["/".join(parts[: i + 1]) for i in range(len(parts))]
-        for negate, regex in self._rules:
-            matched = any(regex.match(candidate) for candidate in prefixes)
-            if matched:
+        for negate, match in self._rules:
+            if any(match(candidate) for candidate in prefixes):
                 state = not negate
+        self._spent += time.monotonic() - started
+        if self._spent > self._budget:
+            raise CaptureError("plmignore", ".plmignore rules took too long to evaluate")
         return state
 
 

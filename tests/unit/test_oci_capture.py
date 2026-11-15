@@ -108,6 +108,67 @@ def test_directory_rule_covers_descendants_and_reinclusion_wins_when_later():
     assert not matcher.ignored("var/app/x.txt")
 
 
+_MANY_WILDCARD_CASES = [
+    ("**/build/**/*.o", "src/build/x/y/a.o", True),
+    ("**/build/**/*.o", "src/build/a.o", True),
+    ("**/build/**/*.o", "build/a.o", True),
+    ("**/build/**/*.o", "src/build/a.c", False),
+    ("**/build/**/*.o", "src/builder/a.o", False),
+    ("a*b*c*d", "axbxcxd", True),
+    ("a*b*c*d", "axb/cxd", False),
+    ("**x**y**z", "a/x/b/y/c/z", True),
+    ("**x**y**z", "a/z/b/y/c/x", False),
+    ("*/?[ab]/**/*.[!c]", "d/qa/deep/er/f.h", True),
+    ("*/?[ab]/**/*.[!c]", "d/qa/f.c", False),
+    ("**/a/**/b/*", "a/b/c\n", True),  # one trailing newline is ignored at the end of the pattern
+    ("**/a/**/b/*", "a/x\ny/b/c", False),  # ``**`` does not cross a newline
+]
+
+
+@pytest.mark.parametrize("pattern,path,expected", _MANY_WILDCARD_CASES)
+def test_patterns_with_many_wildcards_match_like_their_regex_translation(pattern, path, expected):
+    from palimpsest_local import oci_capture
+
+    tokens = oci_capture._glob_tokens(pattern)
+    assert sum(kind in oci_capture._UNBOUNDED for kind, _ in tokens) > oci_capture._MAX_REGEX_WILDCARDS
+    assert bool(oci_capture._tokens_to_regex(tokens).match(path)) is expected
+    assert oci_capture._LinearGlob(tokens).match(path) is expected
+    assert IgnoreMatcher(pattern + "\n").ignored(path) is expected
+
+
+def test_a_pathological_rule_is_evaluated_in_bounded_time():
+    import time
+
+    # Twelve ``**`` segments made the backtracking translation take more than fifteen seconds
+    # for one path; the state simulation is linear in pattern and path length.
+    matcher = IgnoreMatcher("/".join(["**", "a"] * 12) + "/b\n")
+    started = time.monotonic()
+    assert not matcher.ignored("/".join(["a"] * 40) + "/c")
+    assert matcher.ignored("/".join(["a"] * 40) + "/b")
+    assert time.monotonic() - started < 2.0
+
+
+def test_ignore_rules_have_a_count_cap_a_time_budget_and_typed_refusals():
+    with pytest.raises(CaptureError) as error:
+        IgnoreMatcher("x\n" * 10_001)
+    assert error.value.code == "plmignore" and "too many rules" in str(error.value)
+    assert IgnoreMatcher("x\n" * 10_000).ignored("x")
+
+    spent = IgnoreMatcher("*.log\n", budget_seconds=0.0)
+    with pytest.raises(CaptureError) as error:
+        spent.ignored("a.log")
+    assert error.value.code == "plmignore" and "too long" in str(error.value)
+
+    # An invalid class; then a bracket that is a class only together with the text after it,
+    # combined with more than two wildcards.
+    for text, reason in (("[z-a]\n", "invalid character class"), ("a*b*c*[!][ab]\n", "ambiguous character class")):
+        with pytest.raises(CaptureError) as error:
+            IgnoreMatcher(text)
+        assert error.value.code == "plmignore" and reason in str(error.value)
+    # With few wildcards that bracket keeps its historical regex meaning: not "]", "[", "a" or "b".
+    assert IgnoreMatcher("[!][ab]\n").ignored("q") and not IgnoreMatcher("[!][ab]\n").ignored("a")
+
+
 def test_plmignore_capture_root_patterns_and_reinclusion():
     receipt, _, members = _layer(
         [_file("build"), _file("tempa"), _file("subdir/tempa"), _file("subdir/app.log")],
