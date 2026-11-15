@@ -202,6 +202,22 @@ def test_image_executes_once_cleanup_precedes_all_uploads_and_finalizes_ordered_
     assert harness.journal.load() is None
 
 
+def test_image_claim_above_the_worker_limit_executes_with_the_worker_limit(harness, monkeypatch):
+    # The path that failed in production: the claim was refused in `process_one` and the job
+    # ended as `build_failed` before the executor started.
+    seen, execute = [], image.build
+
+    def recording(instance, admitted, record, deadline):
+        seen.append(admitted["max_output_bytes"])
+        return execute(instance, admitted, record, deadline)
+
+    monkeypatch.setattr(image, "build", recording)
+    offered = {**claim(), "max_output_bytes": 100 * 1024**3}
+    instance, _ = harness.make([Response(202, offered), *publication_responses()])
+    assert instance.process_one()
+    assert harness.executions == [JOB] and seen == [4096] and harness.journal.load() is None
+
+
 def test_empty_image_queue_falls_back_to_recipe_only_after_durable_204(harness):
     instance, transport = harness.make([Response(204), Response(204)])
     assert not instance.process_one()
@@ -290,6 +306,20 @@ def test_context_claim_requires_exact_digest_descriptor_binding():
     )
     with pytest.raises(ValueError, match="context"):
         image.validate_claim(value, settings())
+
+
+def test_claim_output_limit_is_the_smaller_of_the_api_and_worker_limits():
+    # A deployment ran the worker with a 4 GiB limit under an API that offers 100 GiB. The recipe
+    # protocol takes the smaller value; the image protocol refused every claim as `build_failed`.
+    value = claim()
+    value.update(kind="dockerfile", request={"dockerfile": "FROM scratch\n"}, max_output_bytes=100 * 1024**3)
+    assert image.validate_claim(value, settings())["max_output_bytes"] == 4096
+    value["max_output_bytes"] = 1024
+    assert image.validate_claim(value, settings())["max_output_bytes"] == 1024
+    for invalid in (0, -1, "4096", True, 2**63):
+        value["max_output_bytes"] = invalid
+        with pytest.raises(ValueError, match="size"):
+            image.validate_claim(value, settings())
 
 
 @pytest.mark.parametrize(

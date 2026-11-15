@@ -125,6 +125,98 @@ def test_ignore_rules_cannot_climb_out_of_the_context(rule):
         parse_ignore([rule])
 
 
+def test_ignore_rules_from_the_repository_have_a_count_and_a_length_bound():
+    # The rules are tried against every entry in a Hub API worker thread; a repository with
+    # 40,000 rules kept that thread busy for minutes on a 2,000-file context.
+    assert len(parse_ignore([f"r{i}" for i in range(1000)])) == 1000
+    with pytest.raises(ContextError, match="too many ignore rules"):
+        parse_ignore([f"r{i}" for i in range(1001)])
+    assert parse_ignore(["a" * 4096]) == ("a" * 4096,)
+    with pytest.raises(ContextError, match="longer than a path"):
+        parse_ignore(["a" * 4097])
+
+
+def test_a_rule_drops_what_it_matches_whole_and_everything_below_an_ignored_directory(tmp_path):
+    # Each rule is tried against an entry's own path only; the parents were tried when they
+    # were visited, and an ignored directory is never entered.
+    make_tree(tmp_path)
+    (tmp_path / "src" / "deep" / "er").mkdir(parents=True)
+    (tmp_path / "src" / "deep" / "er" / "keep.py").write_text("k")
+    (tmp_path / "src" / "deep" / "er" / "x.log").write_text("x")
+    (tmp_path / "srcx").mkdir()
+    (tmp_path / "srcx" / "other.py").write_text("o")
+    assert "src/deep/er/keep.py" in names(build(tmp_path)[0])
+    got = names(build(tmp_path, ignore=["src/deep"])[0])
+    assert not any(name.startswith("src/deep") for name in got) and "src/app.py" in got
+    got = names(build(tmp_path, ignore=["s*g"])[0])  # ``*`` crosses "/": src/deep/er/x.log
+    assert "src/deep/er/x.log" not in got and "src/deep/er/keep.py" in got
+    got = names(build(tmp_path, ignore=["src"])[0])
+    assert not any(name == "src" or name.startswith("src/") for name in got) and "srcx/other.py" in got
+
+
+def test_a_rule_is_anchored_at_the_context_root(tmp_path):
+    make_tree(tmp_path)
+    (tmp_path / "app.py").write_text("root\n")
+    got = names(build(tmp_path, ignore=["app.py"])[0])
+    assert "app.py" not in got and "src/app.py" in got
+
+
+def test_ignore_matching_has_a_work_budget_that_does_not_depend_on_the_host(tmp_path, monkeypatch):
+    from palimpsest_hub.services import git_context
+
+    # Trying a rule costs a fixed call plus about rule length times path length. One request with
+    # 64 KiB of rules and long paths took 87 seconds for 2,000 files before this bound, and one
+    # with a thousand one-character rules and a million short names 49 seconds.
+    make_tree(tmp_path)
+    rules = ["*" + "a" * 60 + "b"] * 10
+    assert "src/app.py" in names(build(tmp_path, ignore=rules)[0])
+    entries = names(build(tmp_path)[0])
+    spent = sum(len(name) * sum(len(rule) for rule in rules) + 64 * len(rules) for name in entries)
+    monkeypatch.setattr(git_context, "MAX_IGNORE_WORK", spent)
+    assert "src/app.py" in names(build(tmp_path, ignore=rules)[0])
+    monkeypatch.setattr(git_context, "MAX_IGNORE_WORK", spent - 1)
+    with pytest.raises(ContextError, match="too much work"):
+        build(tmp_path, ignore=rules)
+    assert "src/app.py" in names(build(tmp_path)[0]), "a context without rules costs no matching work"
+
+
+def test_entries_that_a_rule_drops_still_count_as_matching_work(tmp_path, monkeypatch):
+    from palimpsest_hub.services import git_context
+
+    # Dropped entries never reach the member limit, so the work budget is their only bound.
+    for index in range(50):
+        (tmp_path / f"n{index:02d}").write_text("x")
+    assert names(build(tmp_path, ignore=["n*"])[0]) == []
+    monkeypatch.setattr(git_context, "MAX_IGNORE_WORK", 50 * (3 * 2 + 64) - 1)
+    with pytest.raises(ContextError, match="too much work"):
+        build(tmp_path, ignore=["n*"])
+    monkeypatch.setattr(git_context, "MAX_IGNORE_WORK", 50 * (3 * 2 + 64))
+    assert names(build(tmp_path, ignore=["n*"])[0]) == []
+
+
+def test_a_bracket_rule_beyond_latin_1_is_refused_before_it_is_compiled():
+    # Compiling such classes walks every code point of their ranges: 17 seconds for 64 KiB.
+    for rule in ("[\x01-\uffff]*.bin", "데이터/[ab].txt", "[a\u0100]"):
+        with pytest.raises(ContextError, match="Latin-1"):
+            parse_ignore([rule])
+    accepted = ["[a-zé]*.txt", "[\x01-\xff]", "데이터/*.txt", "데이터[임시", "임시[]"]
+    assert parse_ignore(accepted) == tuple(accepted), "Latin-1 classes, and a '[' that opens no class"
+
+
+def test_packing_stops_at_the_first_entry_beyond_the_callers_limit(tmp_path):
+    from palimpsest_hub.services.git_context import ContextTooLarge
+
+    make_tree(tmp_path)
+    total = len(names(build(tmp_path)[0]))
+    buf = io.BytesIO()
+    assert write_context_tar(tmp_path, buf, max_entries=total)[1] == total
+    partial = io.BytesIO()
+    with pytest.raises(ContextTooLarge):
+        write_context_tar(tmp_path, partial, max_entries=total - 1)
+    with tarfile.open(fileobj=io.BytesIO(partial.getvalue() + bytes(1024)), mode="r|") as tar:
+        assert len(tar.getmembers()) <= total - 1, "nothing beyond the limit was written"
+
+
 def test_a_root_level_secret_is_not_stored_when_the_rule_is_refused(tmp_path):
     make_tree(tmp_path)
     (tmp_path / ".env").write_text("SECRET=1\n")
