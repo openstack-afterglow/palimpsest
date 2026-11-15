@@ -178,6 +178,8 @@ def _is_mandatory(
 _MAX_PLMIGNORE_RULES = 10_000
 _MAX_REGEX_WILDCARDS = 2
 _PLMIGNORE_BUDGET_SECONDS = 120.0
+# Remembered matcher transitions and state sets, shared by all rules of one /.plmignore.
+_MAX_CACHED_STEPS = 500_000
 _UNBOUNDED = ("star", "globstar", "globdir")
 
 
@@ -227,27 +229,39 @@ def _regex(text: str, problem: str = ".plmignore has an invalid character class"
         raise CaptureError("plmignore", problem) from None
 
 
-def _tokens_to_regex(tokens: list[tuple[str, str]]) -> re.Pattern[str]:
+def _covering_regex(tokens: list[tuple[str, str]]) -> re.Pattern[str]:
+    """Regex that matches a path the rule covers: the pattern matches a whole leading run of
+    components (one trailing newline may follow it, as ``$`` allows), so one match replaces
+    testing the pattern against every prefix of the path."""
     parts = {"star": "[^/]*", "qmark": "[^/]", "globstar": ".*", "globdir": "(?:.*/)?"}
     out = [text if kind == "class" else re.escape(text) if kind == "lit" else parts[kind] for kind, text in tokens]
-    return _regex("^" + "".join(out) + "$")
+    return _regex("^(?:" + "".join(out) + ")\\n?(?:/|\\Z)")
 
 
 class _LinearGlob:
     """Match one pattern by simulating its states; time is pattern length times path length.
 
     It accepts exactly what the regex translation accepts, including that ``**`` does not cross a
-    newline and that one trailing newline in the path is ignored at the end of the pattern. A
-    bracket expression that is a class only together with the text after it (``[!]...]``) has no
-    token of its own; such a pattern is refused here rather than matched approximately.
+    newline and that one trailing newline is ignored at the end of the pattern. A bracket
+    expression that is a class only together with the text after it (``[!]...]``) has no token of
+    its own; such a pattern is refused here rather than matched approximately.
     """
 
-    def __init__(self, tokens: list[tuple[str, str]]) -> None:
+    def __init__(self, tokens: list[tuple[str, str]], cache_room: list[int]) -> None:
         self._kinds = [kind for kind, _ in tokens]
         self._literals = [text for _, text in tokens]
         ambiguous = ".plmignore combines an ambiguous character class with more than two wildcards"
         self._classes = [_regex(text, ambiguous).match if kind == "class" else None for kind, text in tokens]
         self._size = len(tokens)
+        # Transitions between state sets are remembered, so most paths cost one lookup per
+        # character. ``cache_room`` is the remaining shared allowance; when it is used up,
+        # matching continues uncached.
+        self._cache_room = cache_room
+        start = frozenset(self._closure({0}))
+        self._sets: list[frozenset[int]] = [start]
+        self._ids: dict[frozenset[int], int] = {start: 0}
+        self._accepting: list[bool] = [self._size in start]
+        self._moves: dict[tuple[int, str], int] = {}
 
     def _closure(self, states: set[int]) -> set[int]:
         # State i: before token i. State size + 1 + i: inside the ``**/`` group of token i.
@@ -263,50 +277,102 @@ class _LinearGlob:
                     pending.append(following)
         return states
 
-    def match(self, text: str) -> bool:
+    def _step(self, states: Iterable[int], char: str) -> set[int]:
         size, kinds, literals, classes = self._size, self._kinds, self._literals, self._classes
-        states = self._closure({0})
-        last = len(text) - 1
-        for position, char in enumerate(text):
-            if position == last and char == "\n" and size in states:
-                return True
-            moved: set[int] = set()
-            for state in states:
-                if state == size:
-                    continue
-                if state > size:
-                    if char != "\n":
-                        moved.add(state)
-                        if char == "/":
-                            moved.add(state - size)
-                    continue
-                kind = kinds[state]
-                if kind == "lit":
-                    if char == literals[state]:
-                        moved.add(state + 1)
-                elif kind == "star":
-                    if char != "/":
-                        moved.add(state)
-                elif kind == "qmark":
-                    if char != "/":
-                        moved.add(state + 1)
-                elif kind == "globstar":
-                    if char != "\n":
-                        moved.add(state)
-                elif kind == "class" and classes[state](char):
+        moved: set[int] = set()
+        for state in states:
+            if state == size:
+                continue
+            if state > size:
+                if char != "\n":
+                    moved.add(state)
+                    if char == "/":
+                        moved.add(state - size)
+                continue
+            kind = kinds[state]
+            if kind == "lit":
+                if char == literals[state]:
                     moved.add(state + 1)
-            if not moved:
-                return False
-            states = self._closure(moved)
-        return size in states
+            elif kind == "star":
+                if char != "/":
+                    moved.add(state)
+            elif kind == "qmark":
+                if char != "/":
+                    moved.add(state + 1)
+            elif kind == "globstar":
+                if char != "\n":
+                    moved.add(state)
+            elif kind == "class" and classes[state](char):
+                moved.add(state + 1)
+        return self._closure(moved) if moved else moved
+
+    def _cached_step(self, state: int, char: str) -> int | set[int]:
+        """Next state-set id, -1 when no state survives, or the raw set when the cache is full."""
+        key = (state, char)
+        target = self._moves.get(key)
+        if target is not None:
+            return target
+        moved = self._step(self._sets[state], char)
+        if not moved:
+            target = -1
+        else:
+            frozen = frozenset(moved)
+            target = self._ids.get(frozen)
+            if target is None:
+                if self._cache_room[0] <= 0:
+                    return moved
+                self._cache_room[0] -= 1
+                target = len(self._sets)
+                self._sets.append(frozen)
+                self._ids[frozen] = target
+                self._accepting.append(self._size in frozen)
+        if self._cache_room[0] > 0:
+            self._cache_room[0] -= 1
+            self._moves[key] = target
+        return target
+
+    def covers(self, text: str) -> bool:
+        """The pattern matches some leading run of whole components of the text, in one pass.
+
+        A prefix also counts when the pattern is complete just before a newline that ends the
+        component (``before_newline``), which is what ``$`` allows in the regex translation.
+        """
+        accepting = self._accepting
+        state = 0
+        before_newline = False
+        for index, char in enumerate(text):
+            if char == "/" and (accepting[state] or before_newline):
+                return True
+            before_newline = char == "\n" and accepting[state]
+            following = self._cached_step(state, char)
+            if following == -1:
+                # No state survives, so no longer prefix can match; the prefix ending at this
+                # newline still does when the component ends here.
+                return before_newline and text[index + 1 : index + 2] in ("/", "")
+            if not isinstance(following, int):
+                return self._covers_uncached(text, index + 1, following, before_newline)
+            state = following
+        return accepting[state] or before_newline
+
+    def _covers_uncached(self, text: str, start: int, states: set[int], before_newline: bool) -> bool:
+        size = self._size
+        for index in range(start, len(text)):
+            char = text[index]
+            if char == "/" and (size in states or before_newline):
+                return True
+            before_newline = char == "\n" and size in states
+            states = self._step(states, char)
+            if not states:
+                return before_newline and text[index + 1 : index + 2] in ("/", "")
+        return size in states or before_newline
 
 
-def _compile_rule(pattern: str) -> Callable[[str], object]:
+def _compile_rule(pattern: str, cache_room: list[int]) -> Callable[[str], object]:
     tokens = _glob_tokens(pattern)
-    regex = _tokens_to_regex(tokens)  # also validates character classes
+    regex = _covering_regex(tokens)  # also validates character classes
     if sum(1 for kind, _ in tokens if kind in _UNBOUNDED) <= _MAX_REGEX_WILDCARDS:
         return regex.match
-    return _LinearGlob(tokens).match
+    return _LinearGlob(tokens, cache_room).covers
 
 
 class IgnoreMatcher:
@@ -317,6 +383,7 @@ class IgnoreMatcher:
         self._rules: list[tuple[bool, Callable[[str], object]]] = []
         self._budget = budget_seconds
         self._spent = 0.0
+        cache_room = [_MAX_CACHED_STEPS]
         if text is None:
             return
         if isinstance(text, bytes):
@@ -345,21 +412,22 @@ class IgnoreMatcher:
                 continue
             if len(self._rules) >= _MAX_PLMIGNORE_RULES:
                 raise CaptureError("plmignore", ".plmignore has too many rules")
-            self._rules.append((negate, _compile_rule(line)))
+            self._rules.append((negate, _compile_rule(line, cache_room)))
 
     def ignored(self, path: str, *, is_dir: bool = False) -> bool:
-        if not self._rules:
-            return False
-        started = time.monotonic()
+        """Whether the last rule covering ``path`` ignores it. The time budget is checked after
+        every rule, so one path with many slow rules cannot outrun it by more than one rule."""
         state = False
-        parts = path.split("/")
-        prefixes = ["/".join(parts[: i + 1]) for i in range(len(parts))]
-        for negate, match in self._rules:
-            if any(match(candidate) for candidate in prefixes):
+        clock = time.monotonic
+        mark = clock()
+        for negate, covers in self._rules:
+            if covers(path):
                 state = not negate
-        self._spent += time.monotonic() - started
-        if self._spent > self._budget:
-            raise CaptureError("plmignore", ".plmignore rules took too long to evaluate")
+            now = clock()
+            self._spent += now - mark
+            mark = now
+            if self._spent > self._budget:
+                raise CaptureError("plmignore", ".plmignore rules took too long to evaluate")
         return state
 
 
@@ -571,6 +639,12 @@ def convert_upper_to_layer(
                 ignored.append(path)
         else:
             kept[path] = entry
+    for path in kept:
+        # ``.wh.`` names are how a layer spells deletions. Overlayfs gives them no meaning, so a
+        # guest can hold ordinary files with such names (an unpacked layer tarball, for example);
+        # written as they are they would delete or hide parent content in the committed image.
+        if any(part.startswith(_WHITEOUT_PREFIX) for part in path.split("/")):
+            raise CaptureError("capture-path", f"entry name uses the reserved whiteout prefix: {path}")
 
     hidden: list[str] = []
     for lower in sorted(normalize_capture_path(item) for item in parent_paths):

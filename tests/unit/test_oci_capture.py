@@ -112,39 +112,53 @@ _MANY_WILDCARD_CASES = [
     ("**/build/**/*.o", "src/build/x/y/a.o", True),
     ("**/build/**/*.o", "src/build/a.o", True),
     ("**/build/**/*.o", "build/a.o", True),
+    ("**/build/**/*.o", "build/a.o/below/it", True),  # a covered directory covers what is below it
     ("**/build/**/*.o", "src/build/a.c", False),
     ("**/build/**/*.o", "src/builder/a.o", False),
+    ("**/build/**/*.o", "src/build/a.ox/y", False),  # a prefix must end at a component boundary
     ("a*b*c*d", "axbxcxd", True),
+    ("a*b*c*d", "axbxcxd/e", True),
     ("a*b*c*d", "axb/cxd", False),
     ("**x**y**z", "a/x/b/y/c/z", True),
     ("**x**y**z", "a/z/b/y/c/x", False),
     ("*/?[ab]/**/*.[!c]", "d/qa/deep/er/f.h", True),
     ("*/?[ab]/**/*.[!c]", "d/qa/f.c", False),
     ("**/a/**/b/*", "a/b/c\n", True),  # one trailing newline is ignored at the end of the pattern
+    ("**/a/**/b/*", "a/b/c\n/d", True),  # also when that component is a covered directory
+    ("**/a/**/b/**/c", "a/b/c\n", True),
+    ("**/a/**/b/**/c", "a/b/c\nx", False),  # only a newline that ends the component is ignored
     ("**/a/**/b/*", "a/x\ny/b/c", False),  # ``**`` does not cross a newline
 ]
 
 
 @pytest.mark.parametrize("pattern,path,expected", _MANY_WILDCARD_CASES)
-def test_patterns_with_many_wildcards_match_like_their_regex_translation(pattern, path, expected):
+def test_rules_with_many_wildcards_cover_the_same_paths_on_both_matching_routes(pattern, path, expected):
     from palimpsest_local import oci_capture
 
     tokens = oci_capture._glob_tokens(pattern)
     assert sum(kind in oci_capture._UNBOUNDED for kind, _ in tokens) > oci_capture._MAX_REGEX_WILDCARDS
-    assert bool(oci_capture._tokens_to_regex(tokens).match(path)) is expected
-    assert oci_capture._LinearGlob(tokens).match(path) is expected
+    assert bool(oci_capture._covering_regex(tokens).match(path)) is expected
+    assert oci_capture._LinearGlob(tokens, [1000]).covers(path) is expected
+    assert oci_capture._LinearGlob(tokens, [0]).covers(path) is expected, "without any remembered transition"
     assert IgnoreMatcher(pattern + "\n").ignored(path) is expected
 
 
-def test_a_pathological_rule_is_evaluated_in_bounded_time():
+@pytest.mark.parametrize(
+    "rule",
+    ["**/**/b", "**a**b", "/".join(["**", "a"] * 12) + "/b", "a*a*a*a*a*b", "**a**a**a**b"],
+    ids=["two-globdirs", "two-globstars", "twelve-globdirs", "five-stars", "four-globstars"],
+)
+def test_pathological_rules_are_evaluated_in_bounded_time_on_a_maximum_length_path(rule):
     import time
 
-    # Twelve ``**`` segments made the backtracking translation take more than fifteen seconds
-    # for one path; the state simulation is linear in pattern and path length.
-    matcher = IgnoreMatcher("/".join(["**", "a"] * 12) + "/b\n")
+    # Measured before the bounds: about ten seconds for the first rule and more than fifteen for
+    # the third, per path. Each prefix of the path was matched separately by a backtracking regex.
+    deep = "/".join(["a"] * 2047) + "/a"  # 4095 bytes, 2048 components
+    wide = "/".join(["a" * 255] * 15)  # maximum-length components
+    matcher = IgnoreMatcher(rule + "\n")
     started = time.monotonic()
-    assert not matcher.ignored("/".join(["a"] * 40) + "/c")
-    assert matcher.ignored("/".join(["a"] * 40) + "/b")
+    for path in (deep, wide, deep + "x", wide + "/b"):
+        matcher.ignored(path)
     assert time.monotonic() - started < 2.0
 
 
@@ -154,7 +168,7 @@ def test_ignore_rules_have_a_count_cap_a_time_budget_and_typed_refusals():
     assert error.value.code == "plmignore" and "too many rules" in str(error.value)
     assert IgnoreMatcher("x\n" * 10_000).ignored("x")
 
-    spent = IgnoreMatcher("*.log\n", budget_seconds=0.0)
+    spent = IgnoreMatcher("*.log\n", budget_seconds=-1.0)
     with pytest.raises(CaptureError) as error:
         spent.ignored("a.log")
     assert error.value.code == "plmignore" and "too long" in str(error.value)
@@ -167,6 +181,38 @@ def test_ignore_rules_have_a_count_cap_a_time_budget_and_typed_refusals():
         assert error.value.code == "plmignore" and reason in str(error.value)
     # With few wildcards that bracket keeps its historical regex meaning: not "]", "[", "a" or "b".
     assert IgnoreMatcher("[!][ab]\n").ignored("q") and not IgnoreMatcher("[!][ab]\n").ignored("a")
+
+
+def test_the_time_budget_stops_between_rules_of_one_path():
+    import time
+
+    calls = []
+
+    def slow(path):
+        calls.append(path)
+        time.sleep(0.05)
+        return False
+
+    matcher = IgnoreMatcher("placeholder\n", budget_seconds=0.12)
+    matcher._rules = [(False, slow)] * 20
+    with pytest.raises(CaptureError) as error:
+        matcher.ignored("some/path")
+    assert error.value.code == "plmignore" and 3 <= len(calls) <= 5, "one path must not run all twenty slow rules"
+
+
+@pytest.mark.parametrize("name", ["opt/.wh.app", "etc/ssh/.wh..wh..opq", ".wh.rootfile", "srv/.wh.dir/inner"])
+def test_an_ordinary_entry_with_a_reserved_whiteout_name_refuses_the_commit(name):
+    # Overlayfs gives ``.wh.`` names no meaning, so a guest can hold such files; written into the
+    # layer unchanged they would delete parent content (``opt/app``) or hide a whole directory.
+    with pytest.raises(CaptureError) as error:
+        _layer([_file(name, b"x"), _file("opt/keep", b"1")])
+    assert error.value.code == "capture-path" and "whiteout prefix" in str(error.value)
+    # The user can leave such a file out explicitly; a real deletion is still written as a whiteout.
+    receipt, _, members = _layer(
+        [_file(name, b"x"), _file("opt/keep", b"1"), UpperEntry("opt/gone", UpperKind.WHITEOUT)],
+        plmignore=name.removesuffix("/inner") + "\n",
+    )
+    assert name not in members and "opt/.wh.gone" in members
 
 
 def test_plmignore_capture_root_patterns_and_reinclusion():
