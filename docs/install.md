@@ -995,6 +995,25 @@ including when launched through the direct `uvicorn palimpsest_hub.main:app`
 command. Do not enable third-party HTTP/SQL trace logging or an independent
 server access logger that emits raw targets in production.
 
+From 0.3.29 three kinds of swallowed failure are named in the log, without the
+exception's message or traceback. An unhandled request failure (the fixed
+`500`) adds an ERROR line `hub request failed method=… route=… request_id=…
+cause=<exception class> site=<Hub module>:<function>:<line>` before the usual
+`status=500` line; `site` is the innermost Hub frame, and for package routes
+`request_id` equals the `X-Request-Id` the client received. `/v1/ready` adds a
+WARNING `readiness probe failed check=<database|redis|blob_store> cause=…
+site=…`, or `readiness probe timed out check=… timeout_seconds=2.0` once per
+stuck probe. The export worker's `Session lifecycle pass failed`, `Image export
+worker iteration failed`, `Export delegation cleanup failed` and `Export
+maintenance failed` lines gain the same `cause=… site=…` fields. Nothing else
+changed: answers the Hub builds on purpose, such as the 503 for an unreachable
+Keystone or policy source, a delegation failure, or a failed export task, are
+still logged without a cause. On 0.3.28 and earlier the request and readiness
+lines do not exist and the worker lines carry no fields: a failed request
+appears only as an INFO line with `status=5xx`, so count those lines
+(`grep -c -E 'status=5[0-9][0-9]'`) rather than searching for `error` or
+`Traceback`.
+
 For image-build failures the worker retains one private owner-only
 `last-image-failure.json` beside `worker.json`, after exact executor cleanup and
 before deleting the disposable job tree. It contains the last64KiB from each
