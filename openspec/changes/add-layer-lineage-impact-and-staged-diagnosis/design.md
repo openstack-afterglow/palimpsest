@@ -64,6 +64,7 @@ A lock would record how a requirement became an exact composition: requested ref
 - **Most inputs already exist** as separate records (build record, materialization receipt, published manifest, layer-cache consumer binding). The lock would be a single canonical document referencing them, so a composition can be re-resolved and compared later.
 - **What it must not claim:** bit-identical rebuilds. Build records do not capture tool versions or the environment, and recipes download from the network. A lock pins inputs and tool identities; it does not make a recipe deterministic. A solver that produces a lock orders and selects; it does not prove ABI.
 - **Open decisions:** where the lock lives (client file next to the project, Hub row, or OCI artifact with a `subject`), who may write it, whether running requires one, and how it relates to the published manifest, which already fixes order and digests. Until these are decided, the lock stays a proposal.
+- **A second consumer of the same identity:** if the writable layer of a cloud instance becomes a user-owned volume that outlives the instance ([review](../../../docs/research/openstack-shared-readonly-layers.md)), that volume is valid only over the exact ordered lowers it was written on. The identity a lock records is the identity such a volume would have to carry, and a mismatch would have to go through the base-migration acknowledgement, never through an automatic update.
 
 ### Hub reverse lookup
 

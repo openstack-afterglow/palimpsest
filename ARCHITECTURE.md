@@ -54,7 +54,8 @@ Decision: a parent or base replacement is shown as a plan before anything is don
 - Dependency direction: `cli → inventory → lineage → compatibility_stages → base_migration`. The pure modules read no file and make no network call.
 - Reviewed, not implemented, each needing its own approval: declared `provides`/`requires`/`conflicts` metadata (a resolver checks declarations, not ABI; path disjointness is not adopted because ordered OCI changesets overwrite by design), a composition lock (pins inputs and tool identities, does not make a recipe deterministic), a Hub descendant/consumer lookup (new read endpoint under the existing visibility rules), a smoke-test result record.
 - Two defects found while tracing the layer paths are fixed in the same branch. `vz_commit._scan_parent` applied a layer's whiteout and opaque markers in tar-member order, dropping same-layer entries listed before a marker from the visible parent view, so a committed layer could lack the whiteout that hides a parent identity file and an unclassified parent `authorized_keys` was not refused; markers now act on lower layers only. Palimpsest-written layers list markers first and were not affected. The dashboard's Create VM button stayed disabled after a disconnect during a create request; the disconnect hook restores it, covered by the first Node-run test of the dashboard script (`hub/tests/js`, started from `hub/tests/test_dashboard_js.py`, skipped without Node).
-- Research documents, plans only: [related work and validation design](docs/research/related-work-and-validation.md), [storage-backend comparison plan](docs/research/storage-backend-comparison-plan.md). No experiment was run and no backend was changed.
+- Research documents, plans only: [related work and validation design](docs/research/related-work-and-validation.md), [storage-backend comparison plan](docs/research/storage-backend-comparison-plan.md), [shared read-only base and layers with a user-owned writable volume on OpenStack](docs/research/openstack-shared-readonly-layers.md). No experiment was run and no backend was changed.
+- Cloud storage as traced on 2026-11-15, unchanged by this branch: the standard Hub instance boots from one Cinder volume created from the Glance base image, downloads every layer into that volume and keeps the writable layer as a file on it; the native-root and `cloud env` paths read layers from a Manila CephFS share instead. The OpenStack document records that image-backed volumes on the deployed cloud are RBD copy-on-write clones (aggregate read-only observation) and reviews a Nova/Cinder composition (a read-only clone volume per layer from a `raw` Glance layer image, the writable layer on a user-owned volume bound to its composition). That composition is a candidate to test, needs Hub API and schema decisions and an approved experiment, and would revise the Manila storage target; nothing of it is implemented.
 
 ## M2 Hub image publication, quotas, image keys and anonymous public reads — 2026-11-07/08 merge-worktree source
 
@@ -4102,8 +4103,8 @@ Reserved names and duplicate listings (2026-11-15, from the commit-path review, 
 {
   "schema_version": 1,
   "source_sha256": "f7f19a37dfaf357f176577ee959fad9d80d119ec2c233582c1f6d9b6f782faf2",
-  "reviewed_at": "2026-11-15T14:43:44Z",
-  "summary": "Layer lineage review fixes: structure stage fails a replacement that descends from the replaced layer and stays unverified for an unknown base or incomplete chain; BuildKit runtime pack planned as a new pack with separate caches; unreached layers and retained-instance consumers reported; staged diagnosis tolerates malformed input and fails on any found conflict; VZ commit parent view removes entries below a replaced directory"
+  "reviewed_at": "2026-11-15T15:03:06Z",
+  "summary": "Layer lineage branch: add OpenStack shared read-only base/layer and user-volume review (docs only); no source change since the review fixes"
 }
 ```
 <!-- architecture-review:end -->

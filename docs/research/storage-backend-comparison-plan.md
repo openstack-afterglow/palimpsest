@@ -146,6 +146,7 @@ The guest sees a block device containing the admitted filesystem; OCI semantics 
 Clones depend on parent snapshots; flattening removes that dependency by copying parent data. [S14]
 Keep referenced parents protected and immutable; account for snapshot retention, replication, and eventual snaptrim. [S14]
 Without a cluster containing no production pools, clients, or OSDs and explicit approval, B6 is unavailable; pool-scoped credentials alone are insufficient.
+B6 is the storage mechanism only. How Nova, Cinder and Glance would expose such clones to an instance (one read-only clone volume per layer, a user-owned writable volume) is reviewed separately in [openstack-shared-readonly-layers.md](openstack-shared-readonly-layers.md); its functional check through ordinary tenant APIs is not a B6 measurement and does not lift the isolated-cluster rule above.
 
 ### Native BuildKit support is a separate build-path check
 ACI states support for OverlayBD image building since BuildKit v0.22; this is a build feature, not runtime or VM-attachment qualification. [S10]
