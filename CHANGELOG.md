@@ -4,6 +4,18 @@ All notable changes to Palimpsest Local are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- `palimpsest layer impact REFERENCE [--replacement REFERENCE] [--json]`: a read-only plan for replacing a parent layer or a base image. It lists every recorded descendant, reports the existing lineage as kept (with the local runs and projects that stay bound to it), and reports what a lineage on the new parent would need as four separate states: rebuild (recipe recorded or not, build cache behaviour), reconversion, transfer and deployment. It builds, converts, transfers and deploys nothing and reads recorded local metadata only; descendants that exist only on a Hub or another host are not listed.
+- Staged compatibility diagnosis in that plan: `structure`, `filesystem`, `distribution_abi`, `kernel_device` and `smoke_test`, each `passed`, `failed` or `unverified` with reasons, and no overall verdict. Today only the structure stage has evidence in the product; the filesystem stage accepts a base-migration structure-check report, and the other stages are always `unverified`.
+- Base-migration structure check (M51-01): pure comparison of an old and a new base against the paths kept layers touch, with a fixed report format. Listing adapters, acknowledgement and registration are not implemented.
+- Design records without implementation: declared `provides`/`requires`/`conflicts`, composition lock, Hub descendant lookup (`openspec/changes/add-layer-lineage-impact-and-staged-diagnosis`); related-work comparison with a validation design, and a storage-backend comparison plan including OverlayBD (`docs/research/`). No experiment was run.
+
+### Fixed
+
+- Experimental native VZ commit: the view of the parent image no longer depends on where a layer lists its whiteout and opaque markers. Before, an entry that a layer listed before its own marker was treated as absent, so the committed layer could miss the whiteout that hides a parent identity file (an SSH host key, for example) and an unclassified parent `authorized_keys` was not refused. Images whose layers were written by Palimpsest list markers first and were not affected; images from other tools could be.
+- Hub dashboard: Create VM stayed disabled until a page reload when the connection was closed while a create request was in flight. The button is restored on disconnect.
+
 ## [0.3.29] - 2026-11-15 (UTC; candidate, not yet published or deployed)
 
 ### Changed

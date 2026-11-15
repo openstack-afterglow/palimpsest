@@ -20,6 +20,7 @@ from typing import Any
 from . import (
     host_inventory,
     host_vm_control,
+    lineage,
     local_catalog,
     named_volumes,
     oci_network_status,
@@ -1680,6 +1681,111 @@ def check_local_artifact(roots: StatePaths, reference: str, *, requested_backend
         if artifact["digest"] == digest:
             return {"digest": digest, **artifact["compatibility"]}
     raise StateError("artifact is not present in the selected local inventory")
+
+
+def lineage_impact(roots: StatePaths, reference: str, *, replacement: str | None = None) -> dict[str, Any]:
+    """Plan from local ledgers only, without refreshing the catalog or acquiring mutation locks."""
+    changed = require_digest(reference if reference.startswith("sha256:") else read_tag_record(roots, reference).digest)
+    replacement_digest = (
+        None
+        if replacement is None
+        else require_digest(
+            replacement if replacement.startswith("sha256:") else read_tag_record(roots, replacement).digest
+        )
+    )
+    warnings: set[str] = set()
+    tags: dict[str, list[str]] = {}
+    for tag_file in _catalog_index_files(
+        roots.tags, warnings, "Some artifact tag metadata is unavailable or inconsistent"
+    ):
+        try:
+            tag = read_tag_record(roots, tag_file.stem)
+            tags.setdefault(tag.digest, []).append(tag.tag)
+        except (*_METADATA_ERRORS, ArtifactValidationError, InvalidDigestError):
+            warnings.add("Some artifact tag metadata is unavailable or inconsistent")
+
+    recipes: dict[str, tuple[str | None, str]] = {}
+    for build_dir, record in _build_records(roots, warnings=warnings):
+        try:
+            build = _normalize_build_record(build_dir, record, warnings=warnings)
+            if build["status"] != "success" or build["output_digest"] is None:
+                continue
+            engine = _build_engine(record)
+            recipe_field = "dockerfile_digest" if engine == "buildkit" else "recipe_sha256"
+            recipe = record.get(recipe_field)
+            # Validate the original value: normalization must not hide a corrupt recipe identity.
+            lineage.Artifact(build["output_digest"], "squashfs", recipe=recipe)
+            output = build["output_digest"]
+            if output not in recipes or recipes[output][0] is None:
+                recipes[output] = (recipe, engine)
+        except (*_METADATA_ERRORS, ArtifactValidationError, InvalidDigestError):
+            warnings.add("Some build metadata is unavailable or inconsistent")
+
+    store = ContentStore(roots.store)
+    artifacts = []
+    for metadata_file in _catalog_index_files(
+        roots.store / "metadata", warnings, "Some content-store metadata is unavailable or inconsistent"
+    ):
+        try:
+            digest = f"sha256:{metadata_file.stem}"
+            metadata = store.read_metadata(digest)
+            kind = metadata.get("kind")
+            if kind is not None and (not isinstance(kind, str) or not kind):
+                raise StateError("invalid content-store artifact kind")
+            if metadata.get("size") is not None and (type(metadata["size"]) is not int or metadata["size"] < 0):
+                raise StateError("invalid content-store artifact size")
+            for field in ("base_digest", "base_image_digest", "parent_digest"):
+                if metadata.get(field) is not None:
+                    require_digest(metadata[field])
+            if "parent_digests" in metadata:
+                if not isinstance(metadata["parent_digests"], list):
+                    raise StateError("invalid content-store artifact parents")
+                for parent in metadata["parent_digests"]:
+                    require_digest(parent)
+            recipe, engine = recipes.get(digest, (None, None))
+            artifacts.append(
+                lineage.Artifact(
+                    digest,
+                    kind or "unknown",
+                    parent=metadata.get("parent_digest"),
+                    base=metadata.get("base_image_digest"),
+                    arch=artifact_arch(metadata),
+                    names=tuple(tags.get(digest, ())),
+                    recipe=recipe,
+                    engine=engine,
+                )
+            )
+        except (*_METADATA_ERRORS, ArtifactValidationError, InvalidDigestError):
+            warnings.add("Some content-store metadata is unavailable or inconsistent")
+
+    consumers = []
+    owners = _owners(_projects(roots, warnings), warnings)
+    try:
+        snapshots, errors = state.enumerate_run_snapshots(roots)
+        if errors:
+            warnings.add(_RUN_WARNING)
+        for snapshot in snapshots:
+            try:
+                digests = _run_artifact_digests(_json_projection(snapshot.state))
+                consumers.append(lineage.Consumer(f"run:{snapshot.record.name}", digests))
+                project = owners.get(
+                    (snapshot.record.name, snapshot.record.run_id, snapshot.record.dispatch_key.backend.value)
+                )
+                if project is not None:
+                    consumers.append(lineage.Consumer(f"project:{project}", digests))
+            except (*_METADATA_ERRORS, ArtifactValidationError, InvalidDigestError):
+                warnings.add(_RUN_WARNING)
+    except _METADATA_ERRORS:
+        warnings.add(_RUN_WARNING)
+
+    known = {artifact.digest for artifact in artifacts}
+    if changed not in known or replacement_digest is not None and replacement_digest not in known:
+        raise StateError("artifact is not present in the selected local inventory")
+    try:
+        plan = lineage.impact_plan(artifacts, changed=changed, replacement=replacement_digest, consumers=consumers)
+    except lineage.LineageInputError as exc:
+        raise StateError(str(exc)) from None
+    return {**plan, "warnings": sorted(warnings)}
 
 
 def _retained_package_artifacts(roots: StatePaths, *, warnings: set[str]) -> Iterator[dict[str, Any]]:

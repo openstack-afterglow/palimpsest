@@ -44,6 +44,17 @@ Decision: migration replaces a published `oci-root` base prefix and keeps the re
 - Not implemented: stored-layer listers, manifest/OS admission, service enrichment, CLI/API/dashboard migration requests, registration, acknowledgement controls or run-time gate. Listers must enumerate the stored translated payload, including synthesized/inherited parents; refuse root opacity or kept-root metadata unequal to the new base's effective root; and supply canonical xattrs identities on every non-whiteout entry before attesting complete input. These are lister prerequisites, not pure-function enforcement or runtime compatibility proof.
 - Review: one independent review, not an Astra/Sol signoff; its findings are applied. Regression tests cover hidden subtrees, malformed input, fixed report/digest, bounded retention, shuffled input and deterministic operation counts. No second review is claimed.
 
+## Layer lineage impact and staged compatibility diagnosis — 2026-11-15 decision record (client, read-only)
+
+Decision: a parent or base replacement is shown as a plan before anything is done, and compatibility is reported per stage with explicit `unverified` ([change](openspec/changes/add-layer-lineage-impact-and-staged-diagnosis/design.md)). Existing layers, runs and instances stay bound to their recorded digests; nothing here rebuilds, converts, transfers or deploys.
+
+- Implemented: pure `lineage.impact_plan` (recorded descendants of a layer or base image, breadth-first, cycle-safe, bounded at 5000; `existing_lineage: kept` with bound local consumers; `new_lineage` with separate `rebuild`, `reconversion`, `transfer`, `deployment` states) and pure `compatibility_stages.diagnose` (five stages `structure`, `filesystem`, `distribution_abi`, `kernel_device`, `smoke_test`; `passed`/`failed`/`unverified`; no overall verdict). `inventory.lineage_impact` is the only reader and `palimpsest layer impact` the only surface. `check_artifact` keeps its `compatible`/`incompatible`/`unknown` result for existing consumers and maps to the structure stage.
+- Evidence per stage today: structure from recorded kind, declared architecture and base binding; filesystem only from a `base_migration.check` report, for which no listing adapter exists yet, so it is `unverified` in every real plan; ABI, kernel/device and smoke test have no producer and are always `unverified`.
+- Dependency direction: `cli → inventory → lineage → compatibility_stages → base_migration`. The pure modules read no file and make no network call.
+- Reviewed, not implemented, each needing its own approval: declared `provides`/`requires`/`conflicts` metadata (a resolver checks declarations, not ABI; path disjointness is not adopted because ordered OCI changesets overwrite by design), a composition lock (pins inputs and tool identities, does not make a recipe deterministic), a Hub descendant/consumer lookup (new read endpoint under the existing visibility rules), a smoke-test result record.
+- Two defects found while tracing the layer paths are fixed in the same branch. `vz_commit._scan_parent` applied a layer's whiteout and opaque markers in tar-member order, dropping same-layer entries listed before a marker from the visible parent view, so a committed layer could lack the whiteout that hides a parent identity file and an unclassified parent `authorized_keys` was not refused; markers now act on lower layers only. Palimpsest-written layers list markers first and were not affected. The dashboard's Create VM button stayed disabled after a disconnect during a create request; the disconnect hook restores it, covered by the first Node-run test of the dashboard script (`hub/tests/js`, started from `hub/tests/test_dashboard_js.py`, skipped without Node).
+- Research documents, plans only: [related work and validation design](docs/research/related-work-and-validation.md), [storage-backend comparison plan](docs/research/storage-backend-comparison-plan.md). No experiment was run and no backend was changed.
+
 ## M2 Hub image publication, quotas, image keys and anonymous public reads — 2026-11-07/08 merge-worktree source
 
 **Independently reviewed merge-worktree source (whole-surface security review,
@@ -4089,9 +4100,9 @@ Reserved names and duplicate listings (2026-11-15, from the commit-path review, 
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "4af50b9615c443282623b121e357f43ffb77e3b2e413a87609e4e9e3e9de6382",
-  "reviewed_at": "2026-11-15T12:36:20Z",
-  "summary": "0.3.29: Hub API and export worker name swallowed request, readiness and worker-pass failures by exception class and Hub call site (never message or traceback); responses unchanged; independent review found no P0-P2, five P3 applied"
+  "source_sha256": "986351493149f0140bf01b4c2d08e11cb61cd610f7bac64bc8e81374d863e46f",
+  "reviewed_at": "2026-11-15T14:12:07Z",
+  "summary": "Layer lineage: read-only parent-change impact plan (lineage, inventory.lineage_impact, layer impact CLI) and staged compatibility diagnosis; M51-01 structure check carried; VZ commit whiteout-order fix; dashboard Create VM disconnect fix; design and research plans only"
 }
 ```
 <!-- architecture-review:end -->
