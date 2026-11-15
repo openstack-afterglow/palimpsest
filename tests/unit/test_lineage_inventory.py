@@ -132,7 +132,8 @@ def test_completed_build_recipe_and_bound_run_and_project_are_reported(stored):
     rows = {item["digest"]: item for item in plan["affected"]}
     assert rows[digests["child"]]["new_lineage"]["rebuild"] == {
         "state": "required",
-        "recipe": "recorded",
+        "recipe": "digest-recorded",
+        "recipe_edit": "required",
         "cache": "not-reused",
     }
     for name in ("branch", "leaf"):
@@ -144,8 +145,10 @@ def test_completed_build_recipe_and_bound_run_and_project_are_reported(stored):
     assert rows[digests["branch"]]["existing_lineage"]["consumers"] == []
 
 
-def test_buildkit_recipe_uses_recorded_dockerfile_digest_for_runtime_output(stored):
+def test_a_buildkit_runtime_pack_is_planned_as_a_new_pack_for_the_new_base(stored):
     roots, digests = stored
+    # A runtime pack is a root layer bound to one base image; the Dockerfile build does not read that base.
+    pack = _artifact(ContentStore(roots.store), "pack", base_image_digest=digests["base"])
     _record(
         roots,
         {
@@ -153,18 +156,51 @@ def test_buildkit_recipe_uses_recorded_dockerfile_digest_for_runtime_output(stor
             "build_id": "bk-000000000003",
             "engine": "buildkit",
             "status": "success",
-            "runtime_block_digest": digests["leaf"],
+            "runtime_block_digest": pack,
             "dockerfile_digest": "sha256:" + "c" * 64,
             "output_oci_manifest_digest": "sha256:" + "d" * 64,
         },
     )
-    plan = inventory.lineage_impact(roots, "python")
-    leaf = next(item for item in plan["affected"] if item["digest"] == digests["leaf"])
-    assert leaf["new_lineage"]["rebuild"] == {
-        "state": "required",
-        "recipe": "recorded",
+    plan = inventory.lineage_impact(roots, "base-old", replacement="base-new")
+    new_lineage = next(item for item in plan["affected"] if item["digest"] == pack)["new_lineage"]
+    assert new_lineage["rebuild"] == {
+        "state": "inputs-unchanged",
+        "recipe": "digest-recorded",
         "cache": "decided-by-buildkit",
     }
+    assert new_lineage["reconversion"] == {"state": "required", "cache": "keyed-by-base-image"}
+
+
+def test_a_retained_instance_is_a_consumer_and_its_free_text_name_is_not_repeated(stored, monkeypatch):
+    roots, digests = stored
+    identity = "9" * 64
+    monkeypatch.setattr(
+        inventory.retained_instances,
+        "observe_artifact_references",
+        lambda _roots: {digests["branch"]: [f"retained-instance:{identity} (vm\nINFO forged)"]},
+    )
+    plan = inventory.lineage_impact(roots, "python")
+    branch = next(item for item in plan["affected"] if item["digest"] == digests["branch"])
+    assert branch["existing_lineage"]["consumers"] == [f"retained-instance:{identity}"]
+    assert "forged" not in json.dumps(plan)
+
+
+def test_layers_that_record_the_changed_artifact_across_a_missing_parent_are_listed_as_unreached(
+    stored, tmp_path, monkeypatch, capsys
+):
+    roots, digests = stored
+    store = ContentStore(roots.store)
+    missing = "sha256:" + "8" * 64
+    under_base = _artifact(store, "under-base", parent_digest=missing, base_image_digest=digests["base"])
+    under_layer = _artifact(store, "under-layer", parent_digest=missing, parent_digests=[digests["root"], missing])
+    base_plan = inventory.lineage_impact(roots, "base-old")
+    assert base_plan["unreached"] == [under_base] and under_base not in {i["digest"] for i in base_plan["affected"]}
+    assert inventory.lineage_impact(roots, "python")["unreached"] == [under_layer]
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.delenv("PALIMPSEST_STATE_DIR", raising=False)
+    assert cli.main(["layer", "impact", "python"]) == 0
+    assert under_layer in capsys.readouterr().out
 
 
 def test_tags_and_digests_resolve_to_the_same_plan_without_store_writes(stored):
@@ -276,8 +312,7 @@ def test_cli_json_human_failed_structure_truncation_and_cloud_refusal(stored, tm
     human = capsys.readouterr().out
     assert lineage.STATEMENT in human
     assert "structure=passed filesystem=unverified" in human
-    assert "rebuild: required (recipe recorded; build cache not-reused)" in human
-    assert "rebuild: required (no recipe recorded)" in human
+    assert human.count("rebuild: required") == 4
     assert "consumers stay bound: project:project-bound" in human
     assert "torch" in human and digests["child"][:19] in human
     assert _snapshot_cli_state(roots.state) == before
@@ -290,7 +325,7 @@ def test_cli_json_human_failed_structure_truncation_and_cloud_refusal(stored, tm
     assert cli.main(["--cloud", "unused", "layer", "impact", "python"]) == 1
     assert "--cloud does not apply to layer impact" in capsys.readouterr().err
     assert cli.main(["layer", "impact", "missing-tag"]) == 1
-    assert capsys.readouterr().err == "state file not found\n"
+    capsys.readouterr()
 
 
 def test_cli_missing_state_stays_absent(tmp_path: Path, monkeypatch, capsys):

@@ -3495,11 +3495,21 @@ def dispatch_args(args: argparse.Namespace) -> int:
                 for item in plan["affected"]:
                     indent = "  " * item["depth"]
                     names = ", ".join(item["names"]) or "-"
-                    recipe = item["new_lineage"]["rebuild"]["recipe"]
-                    recipe_note = "recipe recorded" if recipe == "recorded" else "no recipe recorded"
-                    cache = item["new_lineage"]["rebuild"]["cache"]
-                    if cache != "unknown":
-                        recipe_note += f"; build cache {cache}"
+                    rebuild = item["new_lineage"]["rebuild"]
+                    pack = item["new_lineage"]["reconversion"]
+                    if rebuild["state"] == "required":
+                        note = (
+                            "recipe digest recorded" if rebuild["recipe"] == "digest-recorded" else "no recipe recorded"
+                        )
+                        if rebuild.get("recipe_edit") == "required":
+                            note += "; the recipe must name the new parent"
+                        if rebuild["cache"] != "unknown":
+                            note += f"; build cache {rebuild['cache']}"
+                        action = f"rebuild: required ({note})"
+                    else:
+                        action = f"rebuild: {rebuild['state']} (build cache {rebuild['cache']})"
+                    if pack["state"] == "required":
+                        action += f"; reconversion: required (cache {pack['cache']})"
                     consumers = ", ".join(item["existing_lineage"]["consumers"]) or "-"
                     stages = (
                         " "
@@ -3508,9 +3518,15 @@ def dispatch_args(args: argparse.Namespace) -> int:
                         else ""
                     )
                     print(
-                        f"{indent}{item['digest'][:19]} ({names}) rebuild: required ({recipe_note}); "
-                        f"consumers stay bound: {consumers}{stages}"
+                        f"{indent}{item['digest'][:19]} ({names}) {action}; consumers stay bound: {consumers}{stages}"
                     )
+                if plan["unreached"]:
+                    print(
+                        f"Note: {len(plan['unreached'])} stored layer(s) record this artifact but cannot be reached "
+                        "through stored parent records; they are not planned:"
+                    )
+                    for digest in plan["unreached"][:10]:
+                        print(f"  {digest}")
                 print(plan["statement"])
                 if plan["truncated"]:
                     print("Note: plan truncated; more affected layers may exist.")

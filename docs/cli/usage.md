@@ -291,18 +291,24 @@ palimpsest layer impact ubuntu:24.04 --replacement ubuntu:24.04-r2 --json
 ```
 
 `layer impact REFERENCE` accepts a local layer or base-image digest or immutable
-tag. It reads stored artifact, tag, completed-build, run, and project metadata
-without refreshing the catalog, writing state, or contacting Hub. `--cloud` is
-refused. Descendants appear nearest-first; existing consumers stay bound to
-their recorded digests. No VM or writable data changes.
+tag. It reads stored artifact, tag, completed-build, run, project, and
+retained-instance metadata without refreshing the catalog, writing state, or
+contacting Hub. `--cloud` is refused. Descendants appear nearest-first; existing
+consumers stay bound to their recorded digests. No VM or writable data changes.
+A stored layer that names the changed artifact but cannot be reached through
+stored parent records is listed as unreached, not planned.
 
 Rebuild, reconversion, transfer, and deployment are separate plan states; none
 is performed. A recorded recipe digest (`recipe_sha256`, or BuildKit's
-`dockerfile_digest`) does not guarantee a replayable or bit-identical build.
+`dockerfile_digest`) does not guarantee a replayable or bit-identical build, and
+a `Palimpsestfile` recipe must be edited to name the new parent. A BuildKit
+runtime pack under a changed base image is reported as a new pack
+(`reconversion`), with the BuildKit build cache and the pack cache apart.
 Bases can be resolved through recorded parent links without inventing child
 metadata. With `--replacement REFERENCE`, structure is diagnosed separately
 from filesystem, distribution/ABI, kernel/device, and smoke-test stages.
-Those later stages remain `unverified`, even when structure passes.
+Structure is `unverified`, not passed, when a base or parent chain cannot be
+compared. The later stages remain `unverified`, even when structure passes.
 
 `--json` emits schema `palimpsest.lineage-impact-plan.v1`, including path-free
 `warnings` for unreadable or corrupt individual records and an explicit

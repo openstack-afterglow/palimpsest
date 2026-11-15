@@ -19,13 +19,13 @@ from . import compatibility_stages
 
 SCHEMA = "palimpsest.lineage-impact-plan.v1"
 MAX_AFFECTED = 5000
-LAYER, BASE = "squashfs", "cloud-image"
+LAYER, BASE, UNRECORDED = "squashfs", "cloud-image", "unknown"
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _LABEL = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}\Z")
 STATEMENT = (
     "This plan reads recorded metadata only. Every listed artifact stays bound to its current "
     "parent and keeps working as before; nothing is rebuilt, converted, transferred or deployed. "
-    "A new lineage exists only after each affected layer is built again on the new parent, and "
+    "A new lineage exists only after each affected layer is produced again for the new parent, and "
     "compatibility beyond the stages marked passed is not verified."
 )
 
@@ -38,8 +38,11 @@ class LineageInputError(ValueError):
 class Artifact:
     """What the plan needs to know about one stored artifact.
 
-    ``recipe`` is the digest of a recorded build recipe that produced the artifact, ``engine``
-    the build engine of that record; both are ``None`` for committed or imported artifacts.
+    ``recipe`` is the recorded digest of the recipe that produced the artifact and ``engine``
+    the engine of that build record (``palimpsestfile`` or ``buildkit``); both are ``None``
+    for committed or imported artifacts. A ``buildkit`` artifact is a runtime pack: an OCI
+    build result converted to one SquashFS block for one base image. ``ancestors`` are the
+    lower layers the artifact's own record lists, when it lists them.
     """
 
     digest: str
@@ -50,9 +53,12 @@ class Artifact:
     names: tuple[str, ...] = ()
     recipe: str | None = None
     engine: str | None = None
+    ancestors: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        for value in (self.digest, self.parent, self.base, self.recipe):
+        if not isinstance(self.ancestors, tuple):
+            raise LineageInputError("recorded ancestors must be a tuple of digests")
+        for value in (self.digest, self.parent, self.base, self.recipe, *self.ancestors):
             if value is not None and (not isinstance(value, str) or _DIGEST.match(value) is None):
                 raise LineageInputError("artifact digests must be sha256:<64 lowercase hex digits>")
         # kind and arch are repeated in diagnoses, so they must be plain labels, not free text.
@@ -64,22 +70,36 @@ class Artifact:
 
 @dataclass(frozen=True)
 class Consumer:
-    """A recorded user of artifacts (a run or a project); it stays bound to what it recorded."""
+    """A recorded user of artifacts (a run, a project, a retained instance); it stays bound to what it recorded."""
 
     name: str
     digests: frozenset[str]
 
 
-def _bound_base(artifact: Artifact, known: dict[str, Artifact]) -> str | None:
-    """The base image a layer is bound to: its own record, or the nearest ancestor that records one."""
-    seen: set[str] = set()
-    current: Artifact | None = artifact
-    while current is not None and current.digest not in seen:
-        if current.base is not None:
-            return current.base
-        seen.add(current.digest)
-        current = known.get(current.parent) if current.parent is not None else None
-    return None
+@dataclass(frozen=True)
+class _Chain:
+    """A layer's recorded way down to its base image."""
+
+    ancestors: frozenset[str]
+    base: str | None
+    complete: bool
+
+
+def _chain(artifact: Artifact, known: dict[str, Artifact]) -> _Chain:
+    """Walk recorded parent links. The base is the nearest one recorded; complete means a root layer was reached."""
+    ancestors: set[str] = set()
+    base: str | None = None
+    current = artifact
+    while True:
+        if base is None:
+            base = current.base
+        if current.parent is None:
+            return _Chain(frozenset(ancestors), base, True)
+        following = known.get(current.parent)
+        if following is None or following.digest in ancestors or following.digest == artifact.digest:
+            return _Chain(frozenset(ancestors | {current.parent}), base, False)
+        ancestors.add(following.digest)
+        current = following
 
 
 def _structure(
@@ -91,17 +111,27 @@ def _structure(
     if new is None:
         return compatibility_stages.structure_stage(unverified=["the replacement has no metadata in this store"])
     failed, unknown = [], []
-    if new.kind != old.kind:
+    if new.kind == UNRECORDED:
+        unknown.append("the replacement records no artifact kind")
+    elif new.kind != old.kind:
         failed.append(f"the replacement is a {new.kind} artifact, not a {old.kind} artifact")
     if old.arch is None or new.arch is None:
         unknown.append("the architecture of the replaced artifact or of the replacement is not declared")
     elif old.arch != new.arch:
         failed.append(f"the replacement targets {new.arch}, the replaced artifact {old.arch}")
     if new.kind == LAYER and old.kind == LAYER:
-        old_base, new_base = _bound_base(old, known), _bound_base(new, known)
-        if new_base is None:
-            unknown.append("the replacement layer's chain to a base image is not recorded in this store")
-        elif old_base is not None and new_base != old_base:
+        before, after = _chain(old, known), _chain(new, known)
+        if old.digest in after.ancestors:
+            failed.append(
+                "the replacement descends from the replaced layer; a layer cannot be rebuilt on its own descendant"
+            )
+        if not after.complete:
+            unknown.append("the replacement layer's parent chain is not completely recorded in this store")
+        if after.base is None:
+            unknown.append("the replacement layer's chain records no base image")
+        elif before.base is None:
+            unknown.append("the replaced layer's chain records no base image, so the base binding cannot be compared")
+        elif after.base != before.base:
             unknown.append("the replacement layer is bound to a different base image; the base changes as well")
     return compatibility_stages.structure_stage(failed=failed, unverified=unknown)
 
@@ -109,10 +139,8 @@ def _structure(
 def _child_structure(replaced: dict[str, Any] | None, child: Artifact, new: Artifact | None) -> dict[str, Any] | None:
     if replaced is None:
         return None
-    failed = [reason for reason in replaced["reasons"]] if replaced["status"] == compatibility_stages.FAILED else []
-    unknown = (
-        [reason for reason in replaced["reasons"]] if replaced["status"] == compatibility_stages.UNVERIFIED else []
-    )
+    failed = list(replaced["reasons"]) if replaced["status"] == compatibility_stages.FAILED else []
+    unknown = list(replaced["reasons"]) if replaced["status"] == compatibility_stages.UNVERIFIED else []
     if new is not None and new.arch is not None:
         if child.arch is None:
             unknown.append("this layer declares no architecture")
@@ -121,15 +149,33 @@ def _child_structure(replaced: dict[str, Any] | None, child: Artifact, new: Arti
     return compatibility_stages.structure_stage(failed=failed, unverified=unknown)
 
 
-def _rebuild(child: Artifact) -> dict[str, str]:
-    cache = {
-        "buildkit": "decided-by-buildkit",  # the solver reuses steps whose inputs did not change
-        "palimpsestfile": "not-reused",  # the recipe runs again as a whole on the new parent
-    }.get(child.engine or "", "unknown")
+def _new_lineage(child: Artifact) -> dict[str, dict[str, str]]:
+    """What producing this layer for another parent involves; nothing here says it will succeed."""
+    if child.engine == "buildkit":
+        # A runtime pack is the conversion of an OCI build result for one base image. The base is not
+        # an input of the Dockerfile build, so another base changes the pack, not the build: the build
+        # command runs again, BuildKit's own cache decides which steps execute, and the pack has a
+        # different key because that key binds the base image.
+        rebuild = {
+            "state": "inputs-unchanged",
+            "recipe": "digest-recorded" if child.recipe else "not-recorded",
+            "cache": "decided-by-buildkit",
+        }
+        reconversion = {"state": "required", "cache": "keyed-by-base-image"}
+    elif child.recipe is not None:
+        # A Palimpsestfile names FROM and LAYER by digest and runs as a whole in a fresh builder.
+        # Only the recipe's digest is recorded, and the recipe itself must name the new parent.
+        rebuild = {"state": "required", "recipe": "digest-recorded", "recipe_edit": "required", "cache": "not-reused"}
+        reconversion = {"state": "not-applicable"}
+    else:
+        # Committed or imported: there is no record to build from.
+        rebuild = {"state": "required", "recipe": "not-recorded", "cache": "unknown"}
+        reconversion = {"state": "not-applicable"}
     return {
-        "state": "required",
-        "recipe": "recorded" if child.recipe else "not-recorded",
-        "cache": cache,
+        "rebuild": rebuild,
+        "reconversion": reconversion,
+        "transfer": {"state": "not-inspected"},
+        "deployment": {"state": "not-inspected"},
     }
 
 
@@ -187,7 +233,6 @@ def impact_plan(
                     break
                 seen.add(child.digest)
                 following.append(child.digest)
-                bound = sorted(set(users.get(child.digest, ())))
                 structure = _child_structure(replaced, child, new)
                 affected.append(
                     {
@@ -196,14 +241,8 @@ def impact_plan(
                         "arch": child.arch,
                         "depth": depth,
                         "parent": parent,
-                        "existing_lineage": {"state": "kept", "consumers": bound},
-                        "new_lineage": {
-                            "rebuild": _rebuild(child),
-                            # These layers are runtime SquashFS already; no OCI conversion stands between build and run.
-                            "reconversion": {"state": "not-applicable"},
-                            "transfer": {"state": "not-inspected"},
-                            "deployment": {"state": "not-inspected"},
-                        },
+                        "existing_lineage": {"state": "kept", "consumers": sorted(set(users.get(child.digest, ())))},
+                        "new_lineage": _new_lineage(child),
                         "compatibility": None
                         if structure is None
                         else compatibility_stages.diagnose(structure=structure),
@@ -212,6 +251,23 @@ def impact_plan(
             if truncated:
                 break
         frontier = following
+
+    # Parent links are followed one stored record at a time, so a layer whose own record names the changed
+    # artifact is out of reach when a layer between them is not stored here. It is reported, not dropped.
+    unreached = (
+        []
+        if truncated
+        else sorted(
+            artifact.digest
+            for artifact in known.values()
+            if artifact.kind == LAYER
+            and artifact.digest not in seen
+            and (changed in artifact.ancestors or (old.kind == BASE and _chain(artifact, known).base == changed))
+        )
+    )
+
+    def count(action: str, state: str) -> int:
+        return sum(1 for item in affected if item["new_lineage"][action]["state"] == state)
 
     return {
         "schema": SCHEMA,
@@ -233,17 +289,18 @@ def impact_plan(
             "structure": replaced,
         },
         "affected": affected,
+        "unreached": unreached[:MAX_AFFECTED],
         "summary": {
             "affected": len(affected),
-            "rebuild_with_recipe": sum(
-                1 for item in affected if item["new_lineage"]["rebuild"]["recipe"] == "recorded"
+            "rebuild_required": count("rebuild", "required"),
+            "recipe_digest_recorded": sum(
+                1 for item in affected if item["new_lineage"]["rebuild"]["recipe"] == "digest-recorded"
             ),
-            "rebuild_without_recipe": sum(
-                1 for item in affected if item["new_lineage"]["rebuild"]["recipe"] == "not-recorded"
-            ),
+            "reconversion_required": count("reconversion", "required"),
             "with_consumers": sum(1 for item in affected if item["existing_lineage"]["consumers"]),
+            "unreached": len(unreached),
         },
-        "truncated": truncated,
+        "truncated": truncated or len(unreached) > MAX_AFFECTED,
         "statement": STATEMENT,
     }
 
@@ -254,6 +311,7 @@ __all__ = [
     "MAX_AFFECTED",
     "SCHEMA",
     "STATEMENT",
+    "UNRECORDED",
     "Artifact",
     "Consumer",
     "LineageInputError",

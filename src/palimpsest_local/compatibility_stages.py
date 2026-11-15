@@ -4,6 +4,9 @@ The stages are separate verification levels. A passed stage says nothing about t
 after it, and there is no overall "compatible" verdict. A stage that nothing evaluated is
 ``unverified`` with the reason; it is never read as safe. Pure: no filesystem, network or
 runtime access, and no path contents or credentials in the output.
+
+The platform check (``artifact_compatibility.check_artifact``) is deliberately not an input:
+its result mixes structure with facts about the client host and backend.
 """
 
 from __future__ import annotations
@@ -35,44 +38,53 @@ _NOT_EVALUATED = {
     "kernel_device": "guest kernel, driver and device support is evaluated only by running on the target",
     "smoke_test": "no run of this combination is recorded",
 }
+_UNRECOGNISED = {"status": UNVERIFIED, "reasons": ["the supplied structure-check report is not a recognised report"]}
 
 
-def _reasons(values: Iterable[object]) -> list[str]:
+def _reasons(values: object) -> list[str]:
+    if not isinstance(values, (list, tuple)):
+        return []
     return list(dict.fromkeys(value for value in values if isinstance(value, str) and value))
 
 
 def structure_stage(*, failed: Iterable[str] = (), unverified: Iterable[str] = ()) -> dict[str, Any]:
     """A structure result from separate lists of definite contradictions and unknowns."""
-    failed, unverified = _reasons(failed), _reasons(unverified)
+    failed, unverified = _reasons(list(failed)), _reasons(list(unverified))
     status = FAILED if failed else UNVERIFIED if unverified else PASSED
     return {"status": status, "reasons": failed + unverified}
 
 
-def _from_platform_check(result: Mapping[str, Any]) -> dict[str, Any]:
-    """Map ``artifact_compatibility.check_artifact`` (compatible/incompatible/unknown) to a stage."""
-    status = {"compatible": PASSED, "incompatible": FAILED}.get(result.get("status"), UNVERIFIED)
-    reasons = _reasons(result.get("reasons") or ())
-    if status == UNVERIFIED and not reasons:
-        reasons = ["the platform metadata check gave no usable result"]
-    return {"status": status, "reasons": reasons}
+def _count(counts: Mapping[str, Any], key: str) -> int | None:
+    value = counts.get(key)
+    return value if type(value) is int and value >= 0 else None
 
 
-def _from_structure_check(report: Mapping[str, Any]) -> dict[str, Any]:
+def _from_structure_check(report: object) -> dict[str, Any]:
     """Map a ``base_migration.check`` report to the filesystem stage; anything else is unverified."""
+    if not isinstance(report, Mapping) or report.get("schema") != base_migration.SCHEMA:
+        return dict(_UNRECOGNISED)
     counts = report.get("counts")
-    verdict = report.get("verdict")
-    if report.get("schema") != base_migration.SCHEMA or not isinstance(counts, Mapping):
-        return {"status": UNVERIFIED, "reasons": ["the supplied structure-check report is not a recognised report"]}
+    if not isinstance(counts, Mapping):
+        return dict(_UNRECOGNISED)
+    conflicts, incomplete = _count(counts, "conflict"), _count(counts, "incomplete")
+    try:
+        digest = base_migration.report_digest(report)
+    except (TypeError, ValueError):
+        return dict(_UNRECOGNISED)
+    if conflicts is None or incomplete is None:
+        return dict(_UNRECOGNISED)
     evidence = {
         "schema": base_migration.SCHEMA,
-        "report_digest": base_migration.report_digest(report),
-        "counts": {key: counts[key] for key in sorted(counts) if type(counts[key]) is int},
+        "report_digest": digest,
+        "counts": {key: counts[key] for key in sorted(counts) if isinstance(key, str) and type(counts[key]) is int},
     }
-    if verdict == "clean":
-        return {"status": PASSED, "reasons": [], "evidence": evidence}
-    if verdict == "conflict":
+    verdict = report.get("verdict")
+    # A found conflict is definite even when other parts of the check could not be completed.
+    if conflicts or verdict == "conflict":
         reason = "the structure check found conflicts; running this combination needs an explicit risk acknowledgement"
         return {"status": FAILED, "reasons": [reason], "evidence": evidence}
+    if verdict == "clean" and not incomplete and report.get("inputs_complete") is True:
+        return {"status": PASSED, "reasons": [], "evidence": evidence}
     return {
         "status": UNVERIFIED,
         "reasons": ["the structure check could not be completed for every kept layer"],
@@ -82,23 +94,22 @@ def _from_structure_check(report: Mapping[str, Any]) -> dict[str, Any]:
 
 def diagnose(
     *,
-    structure: Mapping[str, Any] | None = None,
-    filesystem: Mapping[str, Any] | None = None,
-    distribution: Mapping[str, Any] | None = None,
+    structure: object = None,
+    filesystem: object = None,
+    distribution: object = None,
 ) -> dict[str, Any]:
     """Compose the five stages from the results that exist.
 
-    ``structure`` is a ``structure_stage`` result or a ``check_artifact`` result;
-    ``filesystem`` is a ``base_migration.check`` report; ``distribution`` may carry the declared
-    ``old`` and ``new`` release names, which are reported but never turn the ABI stage to passed.
+    ``structure`` is a ``structure_stage`` result; ``filesystem`` is a ``base_migration.check``
+    report; ``distribution`` may carry the declared ``old`` and ``new`` release names, which are
+    reported but never turn the ABI stage to passed. Input of any other shape leaves its stage
+    ``unverified``.
     """
     found: dict[str, dict[str, Any]] = {}
     if structure is None:
         found["structure"] = {"status": UNVERIFIED, "reasons": ["no structure evaluation was supplied"]}
-    elif "scope" in structure:
-        found["structure"] = _from_platform_check(structure)
-    elif structure.get("status") in (PASSED, FAILED, UNVERIFIED):
-        found["structure"] = {"status": structure["status"], "reasons": _reasons(structure.get("reasons") or ())}
+    elif isinstance(structure, Mapping) and structure.get("status") in (PASSED, FAILED, UNVERIFIED):
+        found["structure"] = {"status": structure["status"], "reasons": _reasons(structure.get("reasons"))}
     else:
         found["structure"] = {"status": UNVERIFIED, "reasons": ["the structure evaluation has no usable status"]}
     if filesystem is None:
@@ -106,10 +117,10 @@ def diagnose(
     else:
         found["filesystem"] = _from_structure_check(filesystem)
     abi = [_NOT_EVALUATED["distribution_abi"]]
-    if distribution is not None:
+    if isinstance(distribution, Mapping):
         old, new = distribution.get("old"), distribution.get("new")
         # Release names come from artifact metadata: only short plain names are repeated.
-        if all(isinstance(name, str) and _RELEASE.fullmatch(name) for name in (old, new)):
+        if all(isinstance(name, str) and _RELEASE.match(name) for name in (old, new)):
             abi.insert(
                 0,
                 f"declared release is unchanged: {new}" if old == new else f"declared release changes: {old} -> {new}",

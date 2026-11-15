@@ -209,6 +209,42 @@ def test_a_later_layer_still_deletes_what_an_earlier_layer_added(tmp_path):
     assert parent_layer_paths(manifest, blobs) == {"etc", "etc/ssh"}
 
 
+DEEP = [*LOWER, ("etc/ssh/keys", None), ("etc/ssh/keys/deep_key", b"k"), ("srv/a", None), ("srv/a/b", b"b")]
+
+
+def test_markers_hide_lower_entries_at_any_depth_below_them(tmp_path):
+    manifest, blobs = _parent(tmp_path, DEEP, [("etc/ssh", None), ("etc/ssh/.wh..wh..opq", b""), (".wh.srv", b"")])
+    assert parent_layer_paths(manifest, blobs) == {"etc", "etc/ssh"}
+
+
+@pytest.mark.parametrize("replacing", [[("etc/ssh", b"now a file")], [("srv/a", b"file"), ("etc/ssh", b"file")]])
+def test_a_file_that_replaces_a_lower_directory_removes_the_directory_entries(tmp_path, replacing):
+    manifest, blobs = _parent(tmp_path, DEEP, replacing)
+    replaced = {name for name, _ in replacing}
+    visible = parent_layer_paths(manifest, blobs)
+    assert replaced <= visible
+    assert not [path for path in visible if any(path.startswith(name + "/") for name in replaced)]
+    assert {"etc", "srv", "srv/lower"} <= visible
+
+
+def test_a_directory_listed_without_its_own_entry_is_still_replaced_by_a_file(tmp_path):
+    manifest, blobs = _parent(tmp_path, [("opt/app/bin", b"b")], [("opt/app", b"file")])
+    assert parent_layer_paths(manifest, blobs) == {"opt/app"}
+
+
+def test_within_one_layer_a_later_file_replaces_entries_listed_below_its_path_earlier(tmp_path):
+    manifest, blobs = _parent(tmp_path, [("opt/a/b", b"b"), ("opt/a", b"file"), ("opt/c/d", b"d")])
+    assert parent_layer_paths(manifest, blobs) == {"opt/a", "opt/c/d"}
+
+
+def test_a_plmignore_listed_before_its_own_whiteout_in_one_layer_is_the_visible_one(tmp_path):
+    lower = [(".plmignore", b"old/\n")]
+    manifest, blobs = _parent(tmp_path, lower, [(".plmignore", b"new/\n"), (".wh..plmignore", b"")])
+    assert _scan_parent(manifest, blobs) == ({".plmignore"}, b"new/\n")
+    manifest, blobs = _parent(tmp_path, lower, [(".wh..plmignore", b"")])
+    assert _scan_parent(manifest, blobs) == (set(), None)
+
+
 @contextmanager
 def _no_payload(payload):
     yield io.BytesIO(b"")

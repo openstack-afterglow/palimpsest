@@ -85,7 +85,8 @@ function dashboard() {
     onConnect: [],
     onDisconnect: [],
   };
-  const window = { Hub, crypto: { randomUUID: () => "request-1" }, setTimeout, clearTimeout };
+  let issued = 0;
+  const window = { Hub, crypto: { randomUUID: () => `request-${++issued}` }, setTimeout, clearTimeout };
   vm.runInContext(source, vm.createContext({ document: { getElementById: get }, window }), { filename: "hub-playbooks.js" });
 
   return {
@@ -155,5 +156,9 @@ for (const outcome of ["resolve", "reject"]) {
     await page.select();
     assert.equal(page.get("launch-submit").disabled, false, "Create remains available after reconnect");
     assert.equal(page.requests.length, 1, "Reconnect must not repeat the create request");
+    // The control works again, and what it sends is a new request, not the old one under the new connection.
+    await page.submit().catch(() => {});
+    assert.equal(page.requests.length, 2);
+    assert.notEqual(JSON.parse(page.requests[1].body).request_id, JSON.parse(page.requests[0].body).request_id);
   });
 }

@@ -1753,6 +1753,7 @@ def lineage_impact(roots: StatePaths, reference: str, *, replacement: str | None
                     names=tuple(tags.get(digest, ())),
                     recipe=recipe,
                     engine=engine,
+                    ancestors=tuple(metadata.get("parent_digests", ())),
                 )
             )
         except (*_METADATA_ERRORS, ArtifactValidationError, InvalidDigestError):
@@ -1777,6 +1778,17 @@ def lineage_impact(roots: StatePaths, reference: str, *, replacement: str | None
                 warnings.add(_RUN_WARNING)
     except _METADATA_ERRORS:
         warnings.add(_RUN_WARNING)
+    try:
+        retained: dict[str, set[str]] = {}
+        for digest, labels in retained_instances.observe_artifact_references(roots).items():
+            for label in labels:
+                # A label carries the instance's free-text name; only its validated identity is repeated.
+                identity = re.match(r"retained-instance:[0-9a-f]{64}", label)
+                if identity is not None:
+                    retained.setdefault(identity.group(0), set()).add(digest)
+        consumers.extend(lineage.Consumer(name, frozenset(digests)) for name, digests in sorted(retained.items()))
+    except _METADATA_ERRORS:
+        warnings.add("Some retained instance metadata is unavailable or inconsistent")
 
     known = {artifact.digest for artifact in artifacts}
     if changed not in known or replacement_digest is not None and replacement_digest not in known:

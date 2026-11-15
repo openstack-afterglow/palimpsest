@@ -59,7 +59,8 @@ def test_existing_lineage_is_kept_and_the_four_actions_of_a_new_lineage_are_sepa
     assert torch["existing_lineage"] == {"state": "kept", "consumers": ["project-b", "run-a"]}
     assert plan["changed"]["consumers"] == ["run-a"]
     assert torch["new_lineage"] == {
-        "rebuild": {"state": "required", "recipe": "recorded", "cache": "not-reused"},
+        # Only the recipe's digest is recorded, and a Palimpsestfile names its parents by digest.
+        "rebuild": {"state": "required", "recipe": "digest-recorded", "recipe_edit": "required", "cache": "not-reused"},
         "reconversion": {"state": "not-applicable"},
         "transfer": {"state": "not-inspected"},
         "deployment": {"state": "not-inspected"},
@@ -68,9 +69,11 @@ def test_existing_lineage_is_kept_and_the_four_actions_of_a_new_lineage_are_sepa
     assert vllm["new_lineage"]["rebuild"] == {"state": "required", "recipe": "not-recorded", "cache": "unknown"}
     assert plan["summary"] == {
         "affected": 3,
-        "rebuild_with_recipe": 1,
-        "rebuild_without_recipe": 2,
+        "rebuild_required": 3,
+        "recipe_digest_recorded": 1,
+        "reconversion_required": 0,
         "with_consumers": 1,
+        "unreached": 0,
     }
     assert tools["existing_lineage"]["consumers"] == []
 
@@ -112,10 +115,45 @@ def test_a_replacement_that_contradicts_or_lacks_structure_is_reported_on_every_
         assert any(fragment in reason for reason in structure["reasons"])
 
 
-def test_a_layer_replacement_on_another_base_is_unverified_not_passed():
-    plan = impact_plan(store(), changed=PYTHON, replacement=PYTHON_NEW)
+def test_a_runtime_pack_needs_a_new_pack_for_another_base_not_a_new_build():
+    # The base image is bound by the pack, not read by the Dockerfile build: the two caches are separate.
+    pack = Artifact(d("7"), "squashfs", base=BASE_OLD, arch="x86_64", recipe=d("e"), engine="buildkit")
+    plan = impact_plan([*store(), pack], changed=BASE_OLD, replacement=BASE_NEW)
+    new_lineage = next(item for item in plan["affected"] if item["digest"] == pack.digest)["new_lineage"]
+    assert new_lineage["rebuild"] == {
+        "state": "inputs-unchanged",
+        "recipe": "digest-recorded",
+        "cache": "decided-by-buildkit",
+    }
+    assert new_lineage["reconversion"] == {"state": "required", "cache": "keyed-by-base-image"}
+    assert plan["summary"]["reconversion_required"] == 1
+    assert plan["summary"]["rebuild_required"] == plan["summary"]["affected"] - 1
+
+
+@pytest.mark.parametrize("replacement", [TORCH, VLLM])
+def test_a_replacement_that_descends_from_the_replaced_layer_fails_structure(replacement):
+    plan = impact_plan(store(), changed=PYTHON, replacement=replacement)
+    assert plan["replacement"]["structure"]["status"] == "failed"
+    assert all(item["compatibility"]["stages"][0]["status"] == "failed" for item in plan["affected"])
+
+
+ORPHAN = d("7")
+
+
+@pytest.mark.parametrize(
+    ("changes", "replacement"),
+    [
+        ({}, PYTHON_NEW),  # bound to another base: the base changes as well
+        ({PYTHON: Artifact(PYTHON, "squashfs", arch="x86_64")}, PYTHON_NEW),  # the replaced chain records no base
+        ({PYTHON_NEW: Artifact(PYTHON_NEW, "squashfs", arch="x86_64")}, PYTHON_NEW),  # the replacement records none
+        # A base on the layer itself does not stand in for a parent that is not stored.
+        ({ORPHAN: Artifact(ORPHAN, "squashfs", parent=d("8"), base=BASE_OLD, arch="x86_64")}, ORPHAN),
+        ({PYTHON_NEW: Artifact(PYTHON_NEW, "unknown", base=BASE_OLD, arch="x86_64")}, PYTHON_NEW),
+    ],
+)
+def test_a_layer_replacement_whose_chain_or_base_cannot_be_compared_is_unverified_not_passed(changes, replacement):
+    plan = impact_plan(store(**changes), changed=PYTHON, replacement=replacement)
     assert plan["replacement"]["structure"]["status"] == "unverified"
-    assert "different base image" in plan["replacement"]["structure"]["reasons"][0]
 
 
 def test_a_layer_base_is_read_through_its_chain_when_only_the_root_layer_records_it():
@@ -128,10 +166,18 @@ def test_a_layer_base_is_read_through_its_chain_when_only_the_root_layer_records
     )
     same_base = impact_plan(rows, changed=TORCH, replacement=TOOLS)
     assert same_base["replacement"]["structure"] == {"status": "passed", "reasons": []}
-    orphan = Artifact(d("7"), "squashfs", parent=d("8"), arch="x86_64")
-    unknown = impact_plan([*rows, orphan], changed=TORCH, replacement=orphan.digest)
-    assert unknown["replacement"]["structure"]["status"] == "unverified"
-    assert "not recorded in this store" in unknown["replacement"]["structure"]["reasons"][0]
+
+
+def test_a_layer_that_records_the_changed_artifact_but_is_out_of_reach_is_reported_not_dropped():
+    # The layer between them is not stored here, so parent links cannot reach it.
+    under_base = Artifact(ORPHAN, "squashfs", parent=d("8"), base=BASE_OLD, arch="x86_64")
+    plan = impact_plan([*store(), under_base], changed=BASE_OLD)
+    assert ORPHAN not in digests(plan)
+    assert plan["unreached"] == [ORPHAN] and plan["summary"]["unreached"] == 1
+    under_layer = Artifact(ORPHAN, "squashfs", parent=d("8"), arch="x86_64", ancestors=(PYTHON, d("8")))
+    plan = impact_plan([*store(), under_layer], changed=PYTHON)
+    assert plan["unreached"] == [ORPHAN]
+    assert impact_plan(store(), changed=BASE_OLD)["unreached"] == []
 
 
 def test_cycles_and_duplicate_records_do_not_repeat_or_loop():
@@ -204,25 +250,32 @@ def test_filesystem_stage_follows_the_structure_check_verdict_and_never_the_othe
     assert partial["stages"][1]["status"] == "unverified"
 
 
-def test_a_platform_metadata_result_maps_to_the_structure_stage_only():
-    platform = {"status": "unknown", "reasons": ["artifact architecture is unknown"], "scope": "platform-metadata"}
-    result = compatibility_stages.diagnose(structure=platform)
-    assert result["stages"][0] == {
-        "stage": "structure",
-        "checks": compatibility_stages.STAGES[0][1],
-        "status": "unverified",
-        "reasons": ["artifact architecture is unknown"],
-    }
-    assert (
-        compatibility_stages.diagnose(structure={**platform, "status": "compatible", "reasons": []})["stages"][0][
-            "status"
-        ]
-        == "passed"
-    )
-    assert (
-        compatibility_stages.diagnose(structure={**platform, "status": "incompatible"})["stages"][0]["status"]
-        == "failed"
-    )
+def test_only_a_stage_result_counts_as_structure_evidence():
+    # A platform-check result ("compatible") also reflects the client host and backend; it is not a stage status.
+    for foreign in ({"status": "compatible", "reasons": []}, {"status": "incompatible"}, "passed", ["passed"], {}):
+        assert compatibility_stages.diagnose(structure=foreign)["stages"][0]["status"] == "unverified"
+    passed = compatibility_stages.diagnose(structure={"status": "passed", "reasons": "not a list"})["stages"][0]
+    assert passed["status"] == "passed" and passed["reasons"] == []
+
+
+def test_a_found_conflict_fails_the_filesystem_stage_even_when_the_check_was_incomplete():
+    report = structure_report(layer=[entry("etc", "dir"), entry("etc/app.conf")], complete=False)
+    assert report["verdict"] == "incomplete" and report["counts"]["conflict"] == 1
+    assert compatibility_stages.diagnose(filesystem=report)["stages"][1]["status"] == "failed"
+
+
+def test_a_report_that_does_not_agree_with_itself_or_is_not_a_report_never_passes():
+    clean = structure_report(layer=[entry("opt", "dir")])
+    for report, status in (
+        ({**clean, "counts": {**clean["counts"], "conflict": 1}}, "failed"),
+        ({**clean, "inputs_complete": False}, "unverified"),
+        ({**clean, "counts": "none"}, "unverified"),
+        ({**clean, "extra": float("nan")}, "unverified"),
+        ({**clean, "schema": "something-else"}, "unverified"),
+        (["clean"], "unverified"),
+    ):
+        assert compatibility_stages.diagnose(filesystem=report)["stages"][1]["status"] == status
+    assert compatibility_stages.diagnose(structure="x", filesystem=3, distribution=3)["summary"]["passed"] == 0
 
 
 def test_a_declared_release_change_is_reported_but_the_abi_stage_stays_unverified():
