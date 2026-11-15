@@ -4080,8 +4080,8 @@ Reserved names and duplicate listings (2026-11-15, from the commit-path review, 
 {
   "schema_version": 1,
   "source_sha256": "4af50b9615c443282623b121e357f43ffb77e3b2e413a87609e4e9e3e9de6382",
-  "reviewed_at": "2026-11-15T12:36:20Z",
-  "summary": "0.3.29: Hub API and export worker name swallowed request, readiness and worker-pass failures by exception class and Hub call site (never message or traceback); responses unchanged; independent review found no P0-P2, five P3 applied"
+  "reviewed_at": "2026-11-15T13:42:19Z",
+  "summary": "Docs only: 0.3.29 published and deployed (Hub failure logging); corrected verification method; owner-approved prune of old pre-release backups"
 }
 ```
 <!-- architecture-review:end -->
