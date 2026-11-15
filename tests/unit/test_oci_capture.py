@@ -441,6 +441,16 @@ def test_plmignore_size_limits_fail_closed():
     assert error.value.code == "plmignore"
 
 
+def test_a_plmignore_that_is_not_utf8_is_a_typed_refusal_from_either_source():
+    for arguments in (
+        {"entries": [_file(".plmignore", b"opt/\xff\n"), _file("app.py", b"1")]},
+        {"entries": [_file("app.py", b"1")], "parent_plmignore": b"opt/\xff\n"},
+    ):
+        with pytest.raises(CaptureError) as error:
+            _layer(arguments.pop("entries"), **arguments)
+        assert error.value.code == "plmignore"
+
+
 def test_streamed_payload_size_excess_fails_closed():
     # Declared size 4 but stream yields 8 bytes -> fail closed
     entry = UpperEntry("overflow.bin", UpperKind.FILE, size=4, payload=b"12345678")
