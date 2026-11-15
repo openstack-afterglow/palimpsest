@@ -29,7 +29,25 @@ files_modified:
 - **Current hold:** no further test-resource allocation, including health-probe volumes, VMs, boot disks or M4-10 SSH resources, while the earlier cleanup remains incomplete. This supersedes the allocation rationale and executable “next” instructions in older entries below.
 - The 1 GiB empty-volume probe demonstrated only that one create/delete path worked. It did not establish recovery of the stuck image-backed volumes, waive the cleanup gate, or authorize another case. Creating `m412-svc-06`, `m408-sdk-01` and `m408-sdk-02` while those volumes remained was a process deviation from `openspec/specs/contributor-workflow/spec.md` (Verification entrypoints and protected material). Their observed results and subsequent cleanup remain evidence, not permission to repeat the sequence.
 - **Pending owner decision:** the residual volumes are `0a256fcf-3879-4dd6-936d-c322b35c7f95` (`m412-svc-05-boot`, last observed `error_deleting`) and `be592821-14c9-44b9-a86e-e1a9a9bb9ede` (`m412-dev-02-boot`, last observed `creating`); both Hub rows were still `deleting`. Resume allocations only after authorized cleanup and provider absence are recorded, or an explicit owner exception names these residuals and bounds the exact next ref, actions, resources and quantities. Approval to recover these volumes alone does not authorize a new allocation. State reset and force-delete remain unapproved.
-- Until then, only work within existing authority that allocates no new test resources may proceed. M4-10's keypair, floating IP and SSH ingress requirements are prerequisites, not a grant. That correction changed no checklist count, claimed no new cloud check or cleanup, and leaves M4-14/GATE unresolved. The count is now 64/108 through the allocation-free M3 audit below.
+- Until then, only work within existing authority that allocates no new test resources may proceed. M4-10's keypair, floating IP and SSH ingress requirements are prerequisites, not a grant. That correction changed no checklist count, claimed no new cloud check or cleanup, and leaves M4-14/GATE unresolved. The count is now 65/108 through the allocation-free M3 audit and M4-11 adjudication below.
+
+## Owner decisions (form answers) — 2026-11-15
+
+- Residual volumes: state reset followed by a **normal** delete is approved for exactly `0a256fcf-3879-4dd6-936d-c322b35c7f95` and `be592821-14c9-44b9-a86e-e1a9a9bb9ede`. Force-delete stays prohibited. Allocation of new test resources resumes only after cleanup and provider absence are recorded.
+- Git build hosts: `github.com` only, in production. Release 0.3.26 → canonical Kolla deployment → one or two Git builds of a public repository (no VM or volume). No private Git credentials, no other host.
+- mac-mini Lima VM budget: 5 creations for M3-08 (publish and reuse) and M3-09 (session end preservation); each case is deleted and verified absent before the next. No cloud resources.
+- M3-03 volume clause: accepted as not applicable on native VZ; M3-03 checked (**66/108**), to be re-verified if volumes become attachable.
+- Receipt 581: stays open, so M2-17 stays unchecked.
+- Build failure logs: unchanged contract. The user API shows `error_code`, status and timestamps; raw log tails remain operator evidence on the build worker host.
+- Not included: any other volume or resource, force-delete, GPU, DB restore, CI bypass, tag overwrite, VMs beyond the budget.
+
+## M4-11 evidence adjudication — 2026-11-15
+
+- Allocation-free. Independent read-only adjudication (not an Astra/Sol signoff): M4-11 may be checked with limits written into the item. Checked: **65/108**. The adjudicator ran `test_instance_lifecycle.py`, `test_export_delegation.py`, `test_nova_shelve_provider.py` locally: 161 passed. The trust path is unchanged since 0.3.19 and `hub/src` is unchanged since 0.3.25, so the live records apply to the current source.
+- Live: idle shelve only through a requester-created impersonation trust with `member` (+ implied `reader`), expiry set 7 days after creation, revocation on delete (four cases), no service-credential fallback (0.3.16–0.3.18 refused every trust token and never shelved). Test-only: refusal after expiry, role-escalation refusal, immediate deletion of a rejected trust, refusal after the user revokes in Keystone.
+- Limits recorded in the item: the Keystone grant is project-wide `member`; the one-server, shelve-only limit is enforced by the Hub alone; Hub authority is not re-checked per use; no Hub route revokes the trust while keeping the instance; trust cleanup after the 0.3.25 power-on resume was not checked.
+- Record corrections (originals kept): the 2026-11-14 statement "no live scope refusal" overlooked the fail-closed `reader` refusals of 0.3.16–0.3.18; "trust narrowed to one server" is a Hub-enforced limit, not a Keystone one; the `ShelveDelegation` description in `ARCHITECTURE.md` refers to a removed module.
+- Not run, needs explicit owner approval: a no-VM probe on a production controller that opens a ~120 s trust with the Hub service identity and checks it before expiry, after expiry, after user revocation and with a disallowed role.
 
 ## M3 evidence audit, independent adjudication, parent `.plmignore` inheritance — 2026-11-15
 
