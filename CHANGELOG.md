@@ -4,9 +4,12 @@ All notable changes to Palimpsest Local are documented here.
 
 ## [Unreleased]
 
+## [0.3.26] - 2026-11-15 (UTC; candidate, not yet published or deployed)
+
 ### Added
 
 - Kolla role variable `palimpsest_git_allowed_hosts` (default `[]`), passed to the Hub API as `PALIMPSEST_HUB_GIT_ALLOWED_HOSTS`. The canonical deployment previously had no way to enable `POST /v1/git-builds`: the setting existed only in the Hub, so the route always answered 503. The default keeps the route off and contacts nothing; a controller precheck accepts at most 16 unique lowercase DNS host names (no scheme, port, path, wildcard, IP literal or single-label name).
+- `examples/git-build`: a minimal Dockerfile and context for a Hub Git build of this public repository at a pinned commit.
 
 ### Fixed
 

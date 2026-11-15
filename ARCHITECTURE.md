@@ -4059,9 +4059,9 @@ Source change from the audit (2026-11-15): the same host-level runs showed that 
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "c23273055b251967027606b42ee23cbe16638e03d6583caf4d4e3cddb23ad4cc",
-  "reviewed_at": "2026-11-15T02:15:42Z",
-  "summary": "M3 evidence audit records; native VZ commit inherits the parent image /.plmignore with lazy validation and typed refusals; Kolla Git allow-list input (unreleased)"
+  "source_sha256": "d4449e6d7bf87c0847bb4f6fae8b16f5706053607e33b68d579b0a159919c385",
+  "reviewed_at": "2026-11-15T03:38:05Z",
+  "summary": "0.3.26 candidate: Kolla Git allow-list input, examples/git-build, native VZ commit inherits image /.plmignore"
 }
 ```
 <!-- architecture-review:end -->
