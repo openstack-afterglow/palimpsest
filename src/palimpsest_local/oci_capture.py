@@ -306,9 +306,13 @@ def _emitted_tar_name(path: str, role: str, entry: UpperEntry | None) -> str:
 def resolve_commit_plmignore(
     ordered_entries: Mapping[str, UpperEntry],
     open_payload: Callable[[object], AbstractContextManager[_Readable]],
-    parent_plmignore: str | bytes | None = None,
+    parent_plmignore: str | bytes | CaptureError | None = None,
 ) -> str | None:
-    """Resolve guest root /.plmignore: upper entry wins if present; otherwise parent."""
+    """Resolve guest root /.plmignore: upper entry wins if present; otherwise parent.
+
+    A parent file the caller found unusable is passed as the ``CaptureError`` to raise; it is
+    raised only when the upper has no entry of its own.
+    """
     if ".plmignore" in ordered_entries:
         entry = ordered_entries[".plmignore"]
         if entry.kind is UpperKind.FILE and entry.payload is not None:
@@ -320,16 +324,26 @@ def resolve_commit_plmignore(
                 raw = stream.read(_MAX_PLMIGNORE_BYTES + 1)
                 if len(raw) > _MAX_PLMIGNORE_BYTES:
                     raise CaptureError("plmignore", ".plmignore exceeds its byte limit")
-                return raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+                if not isinstance(raw, bytes):
+                    return str(raw)
+                try:
+                    return raw.decode("utf-8")
+                except UnicodeDecodeError:
+                    raise CaptureError("plmignore", ".plmignore is not UTF-8") from None
         if entry.kind is UpperKind.WHITEOUT:
             return None
         if entry.kind is not UpperKind.FILE:
             raise CaptureError("plmignore", ".plmignore must be a regular file or whiteout")
     if parent_plmignore is not None:
+        if isinstance(parent_plmignore, CaptureError):
+            raise parent_plmignore
         if isinstance(parent_plmignore, bytes):
             if len(parent_plmignore) > _MAX_PLMIGNORE_BYTES:
                 raise CaptureError("plmignore", "parent .plmignore exceeds its byte limit")
-            return parent_plmignore.decode("utf-8")
+            try:
+                return parent_plmignore.decode("utf-8")
+            except UnicodeDecodeError:
+                raise CaptureError("plmignore", "parent .plmignore is not UTF-8") from None
         if isinstance(parent_plmignore, str):
             if len(parent_plmignore.encode("utf-8", "surrogateescape")) > _MAX_PLMIGNORE_BYTES:
                 raise CaptureError("plmignore", "parent .plmignore exceeds its byte limit")
@@ -344,7 +358,7 @@ def convert_upper_to_layer(
     open_payload: Callable[[object], AbstractContextManager[_Readable]],
     *,
     plmignore: str | bytes | None = None,
-    parent_plmignore: str | bytes | None = None,
+    parent_plmignore: str | bytes | CaptureError | None = None,
     generated_placeholders: Collection[str] = (),
     injected_placeholders: Collection[str] = (),
     user_authored_keys: Collection[str] = (),

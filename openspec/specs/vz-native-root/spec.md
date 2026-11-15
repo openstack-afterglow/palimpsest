@@ -640,6 +640,18 @@ The mandatory exclusion set consists of the reserved `/.palimpsest` namespace; g
 
 The committed result SHALL be a normal catalog image: a new OCI manifest whose layers are the parent chain followed by the new layer, an image config that inherits the parent's runtime configuration (Entrypoint, Cmd, Env, User, WorkingDir) and appends the new DiffID and history, and a parent link to the source image and run. It SHALL be runnable and publishable through the existing materialize, run and `published push`/`pull` paths without a new Hub schema.
 
+Implementation status (2026-11-15; informative, the requirement text above is unchanged). The native VZ adapter differs from this requirement in the following ways, and each difference is open work rather than an accepted narrowing:
+
+- Capture mechanism: the adapter does not boot a guest capture mode. The host reads a private same-volume clone of the stopped root disk with `debugfs -c`, after `e2fsck -p` on that clone only (decision and trade-off in `ARCHITECTURE.md`, M3-01 record). The running-capture opt-in is not implemented; anything but an exactly stopped, unheld run is refused.
+- `.plmignore`: read from `/.plmignore` in the captured upper; when the upper has none, the parent image's visible root `/.plmignore` applies (an upper whiteout of the file disables both). The parent fallback exists in source since 2026-11-15 and is tested on real ext4 images through the host commit path only; it has not run in a VM. A parent `/.plmignore` that is not a regular UTF-8 file within 1 MiB refuses the commit unless the instance has its own `/.plmignore` file or whiteout. Matching has no CPU bound: a pathological pattern (many `**` segments) in either file can make a commit hang until interrupted.
+- `authorized_keys`: any `authorized_keys` or `authorized_keys2` path in the upper or visible in the parent fails the commit closed unless it is classified. The adapter supplies no classification, so a commit of a root in which the user wrote such a file is refused until the file is removed; nothing is silently excluded. Platform-injected login keys live outside the root and never reach the upper.
+- Bound identity files: `etc/machine-id`, `var/lib/dbus/machine-id`, `etc/hostname` and `etc/resolv.conf` are left out of the new layer through a fixed path list the adapter passes: whatever the upper holds at those four paths is dropped, which is broader than "a placeholder recorded as generated". A copy that already exists in a parent layer is not hidden by a whiteout, so a base image's own `etc/hostname` remains in the committed image; the guest binds per-run values over these paths at boot.
+- Volumes: the native VZ runtime attaches no named or external volume, so "mounted external volumes are not captured" has no case to exercise there; virtiofs shares and tmpfs were exercised.
+- Result: an OCI layout directory under `<state>/oci-commits/<tag>` that the run source path accepts. It is not registered in the catalog, and no `published push`/`pull` of a commit has been exercised.
+- Gate: the operation is unadvertised and requires `PALIMPSEST_EXPERIMENTAL_VZ_COMMIT=1` plus `PALIMPSEST_COMMIT_DEBUGFS` and `PALIMPSEST_COMMIT_E2FSCK`.
+
+Which clauses are live-verified, host-verified on real ext4 images or unit-tested only is recorded in the dated M3 evidence audit in `ARCHITECTURE.md` and `spec.md`.
+
 #### Scenario: Stopped run is captured without touching its upper
 - **WHEN** a stopped run's upper contains a modified file, a deleted lower file, an opaque directory and a generated machine-id placeholder
 - **THEN** the committed layer contains the modified file, a `.wh.` entry for the deleted file, an opaque marker, and no machine-id placeholder

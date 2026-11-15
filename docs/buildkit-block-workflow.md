@@ -86,10 +86,22 @@ context invalidate the lookup key. This does not relax fresh source admission,
 policy transport, strict-offline builder topology, runtime architecture or
 publication gates.
 
-This change does **not** implement `.plmignore` for remote Git sources, Hub
-worker execution, or commit phases. Those paths require a later explicit
+The local frontend change above does **not** implement `.plmignore` for remote
+Git sources or Hub worker execution. Those paths require a later explicit
 cutover and their own acceptance evidence; local frontend support is not a
 claim that those phases or the roadmap goal are complete.
+
+Commit-phase `.plmignore` is a separate contract with its own implementation. It
+is `/.plmignore` at the guest root of the instance being committed; when that
+instance has none, the `/.plmignore` its image already carries applies instead.
+Patterns are relative to the guest root, not to a build context, and there is no
+`.dockerignore` baseline. It can only leave out files created or changed in that
+instance, never files already present in a parent layer, and it can neither
+re-include mandatory exclusions (machine identity, SSH host keys, cloud-init
+state, DHCP leases, the reserved `/.palimpsest` namespace) nor drop the package
+database. It exists only in the experimental native VZ commit; the rules and the
+current implementation status are in the
+[native-root contract](../openspec/specs/vz-native-root/spec.md).
 
 ## Selected Buildx builder preflight
 
