@@ -1,0 +1,11 @@
+[Unit]
+Description=blkstack compute-node agent (assembles block stacks for instances)
+
+[Socket]
+ListenStream=/run/blkstack/agent.sock
+SocketMode=0600
+DirectoryMode=0700
+Accept=yes
+
+[Install]
+WantedBy=sockets.target

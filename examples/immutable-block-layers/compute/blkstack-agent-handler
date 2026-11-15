@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# One request per connection on /run/blkstack/agent.sock (systemd socket activation, root only).
+# Request: "attach VOLUME_ID" or "detach VOLUME_ID". Reply: "ok [DEVICE]" or "error REASON".
+# The libvirt hook is the only intended caller. Nothing from the request reaches a shell
+# unvalidated: the volume ID must be a UUID, and everything else comes from /etc/blkstack/node.env.
+#
+# State is what blkstack keeps (its session directory), not the /dev/blkstack link: a failed
+# attach is rolled back by blkstack itself, and detach always asks blkstack, so a half-made
+# attach never survives a release.
+set -uo pipefail
+. /etc/blkstack/node.env   # BLKSTACK_LAYER_POOL, BLKSTACK_DELTA_POOL, optional BLKSTACK_RBD, BLKSTACK_ROOT
+export BLKSTACK_ROOT BLKSTACK_RBD
+IFS=' ' read -r -t 10 -n 128 op id _ || { echo "error no request"; exit 0; }
+[[ $id =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || { echo "error invalid volume id"; exit 0; }
+# Serialises requests for one volume; blkstack holds a node-wide lock for the mapping work.
+# Lock files are never removed: removing one would let a waiter and a newcomer both proceed.
+exec 8>"/run/blkstack/$id.lock"; flock -w 30 8 || { echo "error busy"; exit 0; }
+case $op in
+  attach)
+    if [ -b "/dev/blkstack/$id" ] && [ -d "${BLKSTACK_ROOT:-/var/lib/blkstack}/sessions/node-$id" ]; then echo "ok /dev/blkstack/$id"; exit 0; fi
+    if out=$(/usr/local/bin/blkstack node-attach - --instance "$id" --delta-image "volume-$id" \
+        --layer-pool "$BLKSTACK_LAYER_POOL" --delta-pool "$BLKSTACK_DELTA_POOL" 2>&1); then
+      echo "ok /dev/blkstack/$id"
+    else
+      logger -t blkstack-agent "attach $id failed: $out"; echo "error attach failed (see journal)"
+    fi ;;
+  detach)
+    if out=$(/usr/local/bin/blkstack node-detach --instance "$id" --missing-ok 2>&1); then echo "ok"
+    else logger -t blkstack-agent "detach $id failed: $out"; echo "error detach failed (see journal)"; fi ;;
+  *) echo "error unknown operation" ;;
+esac

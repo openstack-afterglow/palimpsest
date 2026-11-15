@@ -1,0 +1,7 @@
+# /etc/udev/rules.d/69-blkstack-ignore.rules
+#
+# Devices assembled by blkstack hold guest disks, not this host's. Keep udisks and systemd
+# device units away from them and from their partitions. LVM needs its own exclusion: set
+# devices/global_filter in lvm.conf so that /dev/mapper/blk-* and these SCSI disks are rejected.
+SUBSYSTEM=="block", ENV{ID_SCSI_SERIAL}=="blk[0-9a-f]*", ENV{UDISKS_IGNORE}="1", ENV{SYSTEMD_READY}="0"
+SUBSYSTEM=="block", ENV{DM_NAME}=="blk-[0-9a-f]*", ENV{UDISKS_IGNORE}="1", ENV{SYSTEMD_READY}="0"

@@ -1,0 +1,16 @@
+[Unit]
+Description=blkstack compute-node agent request
+After=overlaybd-tcmu.service
+Requires=overlaybd-tcmu.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/blkstack-agent-handler
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+# Longer than the handler's own waits (30 s volume lock + 120 s node lock + the attach itself),
+# and shorter than the hook's timeout, so the hook never gives up before the agent has answered.
+TimeoutStartSec=240
+# Default KillMode (control-group): a request that is stopped anyway sends SIGTERM to blkstack
+# too, whose exit handler rolls the attach back.
