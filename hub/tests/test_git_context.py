@@ -196,11 +196,11 @@ def test_entries_that_a_rule_drops_still_count_as_matching_work(tmp_path, monkey
 
 def test_a_bracket_rule_beyond_latin_1_is_refused_before_it_is_compiled():
     # Compiling such classes walks every code point of their ranges: 17 seconds for 64 KiB.
-    with pytest.raises(ContextError, match="Latin-1"):
-        parse_ignore(["[\x01-\uffff]*.bin"])
-    with pytest.raises(ContextError, match="Latin-1"):
-        parse_ignore(["데이터/[ab].txt"])
-    assert parse_ignore(["[a-zé]*.txt", "데이터/*.txt"]) == ("[a-zé]*.txt", "데이터/*.txt")
+    for rule in ("[\x01-\uffff]*.bin", "데이터/[ab].txt", "[a\u0100]"):
+        with pytest.raises(ContextError, match="Latin-1"):
+            parse_ignore([rule])
+    accepted = ["[a-zé]*.txt", "[\x01-\xff]", "데이터/*.txt", "데이터[임시", "임시[]"]
+    assert parse_ignore(accepted) == tuple(accepted), "Latin-1 classes, and a '[' that opens no class"
 
 
 def test_packing_stops_at_the_first_entry_beyond_the_callers_limit(tmp_path):

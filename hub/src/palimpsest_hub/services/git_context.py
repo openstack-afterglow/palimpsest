@@ -34,8 +34,9 @@ MAX_IGNORE_RULES = 1000
 # Trying one rule costs a fixed call plus about its length times the path length. The work for
 # one context is counted as, per entry, (path characters x total rule bytes) plus
 # RULE_CALL_WORK per rule, and is bounded. The count does not depend on the host, so the same
-# repository gets the same answer everywhere, and it keeps the matching to seconds.
-MAX_IGNORE_WORK = 20_000_000_000
+# repository gets the same answer everywhere; the worst cases found cost about one second per
+# 10^9 units, and an ordinary context of 10,000 entries with 200 rules uses under a third.
+MAX_IGNORE_WORK = 12_000_000_000
 RULE_CALL_WORK = 64
 
 
@@ -74,9 +75,11 @@ def parse_ignore(lines: Sequence[str]) -> tuple[str, ...]:
             raise ContextError("ignore rule must stay inside the context")
         if len(line.encode()) > MAX_NAME_BYTES:
             raise ContextError("ignore rule is longer than a path can be")
-        if "[" in line and any(ord(char) > 0xFF for char in line):
-            # Compiling a bracket expression that reaches beyond Latin-1 walks every code point
-            # of its ranges; 64 KiB of such rules took 17 seconds before any path was matched.
+        bracket = line.find("[")
+        if bracket != -1 and "]" in line[bracket + 2 :] and any(ord(char) > 0xFF for char in line):
+            # A "[" with a later "]" is a bracket expression. Compiling one that reaches beyond
+            # Latin-1 walks every code point of its ranges; 64 KiB of such rules took 17 seconds
+            # before any path was matched.
             raise ContextError("ignore rule with a bracket expression must stay within Latin-1")
         if len(patterns) >= MAX_IGNORE_RULES:
             raise ContextError("too many ignore rules")
