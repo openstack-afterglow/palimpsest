@@ -40,7 +40,7 @@ from palimpsest_hub.api.published_images import router as published_image_router
 from palimpsest_hub.cache import close_redis, get_redis
 from palimpsest_hub.config import get_settings
 from palimpsest_hub.database import close_db, get_session_factory, init_db
-from palimpsest_hub.logging import configure_logging
+from palimpsest_hub.logging import configure_logging, failure_fields
 from palimpsest_hub.rate_limit import limiter
 from palimpsest_hub.services.hub_store import get_blob_store
 
@@ -50,6 +50,8 @@ _READINESS_TIMEOUT_SECONDS = 2.0
 # Retain timed-out work: cancelling an await cannot stop a filesystem syscall.
 # Repeated probes must not queue more threads or SQL/Redis checkouts behind it.
 _readiness_tasks: dict[str, asyncio.Task[bool]] = {}
+# One line per stuck probe, not one per request that waits on it.
+_readiness_timeouts_logged: dict[str, asyncio.Task[bool]] = {}
 
 
 class VersionLink(BaseModel):
@@ -103,6 +105,7 @@ async def lifespan(_: FastAPI):
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         _readiness_tasks.clear()
+        _readiness_timeouts_logged.clear()
         await close_redis()
         await close_db()
 
@@ -218,9 +221,16 @@ async def log_request(request: Request, call_next):
     method = request.method if request.method in _METHODS else "OTHER"
     try:
         response = await call_next(request)
-    except Exception:
+    except Exception as exc:
         # Never expose exception text or traceback (SQL binds, paths or remote
         # credentials). Legacy routes keep plain text; package routes get an envelope.
+        logger.error(
+            "hub request failed method=%s route=%s request_id=%s %s",
+            method,
+            getattr(request.scope.get("route"), "path", "<unmatched>"),
+            request.state.request_id,
+            failure_fields(exc),
+        )
         response = (
             _package_error(500, "INTERNAL_ERROR", "Package request failed", request_id=request.state.request_id)
             if _package_path(request)
@@ -341,12 +351,13 @@ async def _check_blob_store() -> None:
     await asyncio.to_thread(_check_blob_store_access)
 
 
-async def _readiness_check(probe: Callable[[], Awaitable[None]]) -> bool:
+async def _readiness_check(name: str, probe: Callable[[], Awaitable[None]]) -> bool:
     try:
         await probe()
-    except Exception:
+    except Exception as exc:
         # This endpoint is unauthenticated: no paths, URLs, credentials, SQL or
         # remote exception messages belong in its response or logs.
+        logger.warning("readiness probe failed check=%s %s", name, failure_fields(exc))
         return False
     return True
 
@@ -366,7 +377,7 @@ async def ready_v1() -> JSONResponse:
     ):
         task = _readiness_tasks.get(name)
         if task is None or task.done():
-            task = asyncio.create_task(_readiness_check(probe))
+            task = asyncio.create_task(_readiness_check(name, probe))
             _readiness_tasks[name] = task
         tasks[name] = task
     # Unlike wait_for, wait returns at the deadline without waiting for driver
@@ -376,6 +387,10 @@ async def ready_v1() -> JSONResponse:
         name: "timeout" if task not in done else "ok" if not task.cancelled() and task.result() else "error"
         for name, task in tasks.items()
     }
+    for name, task in tasks.items():
+        if checks[name] == "timeout" and _readiness_timeouts_logged.get(name) is not task:
+            _readiness_timeouts_logged[name] = task
+            logger.warning("readiness probe timed out check=%s timeout_seconds=%.1f", name, _READINESS_TIMEOUT_SECONDS)
     ready = all(value == "ok" for value in checks.values())
     body = ReadinessResponse(status="ready" if ready else "not_ready", checks=checks)
     return JSONResponse(body.model_dump(), status_code=200 if ready else 503, headers={"Cache-Control": "no-store"})

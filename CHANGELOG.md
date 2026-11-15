@@ -4,6 +4,12 @@ All notable changes to Palimpsest Local are documented here.
 
 ## [Unreleased]
 
+## [0.3.29] - 2026-11-15 (UTC; candidate, not yet published or deployed)
+
+### Changed
+
+- Hub logs: three kinds of failure that the Hub swallows are now named, by exception class and innermost Hub call site (`cause=<class> site=<module>:<function>:<line>`), never by message or traceback. An unhandled request failure adds an ERROR line `hub request failed method=… route=… request_id=… cause=… site=…` before the existing `status=500` line (for package routes the id is the `X-Request-Id` the client received). `/v1/ready` adds a WARNING `readiness probe failed check=<database|redis|blob_store> cause=… site=…`, or `readiness probe timed out check=…` once per stuck probe. The export worker's session-lifecycle, export-iteration, delegation-cleanup and maintenance failure lines gain the same fields. Answers the Hub builds on purpose (Keystone, policy and delegation 503s, a failed export task) are unchanged. Responses, API, schema and role inputs are unchanged. Reason: on deployed 0.3.28 a five-minute window of `/v1/ready` 503s on all three controllers, two 30-second 500s and a failed worker pass left no cause in the Hub logs; only ProxySQL and Valkey logs showed database lock-wait timeouts and slow fsync at the same time.
+
 ## [0.3.28] - 2026-11-15 (UTC; published and deployed)
 
 ### Added

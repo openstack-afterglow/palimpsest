@@ -1077,12 +1077,60 @@ async def test_readiness_redis_exception_is_sanitized(ready_dependencies, monkey
         "checks": {"database": "ok", "redis": "error", "blob_store": "ok"},
     }
     assert "private:secret" not in response.text + caplog.text
+    # The log names the failed probe and the failure's class and Hub call site.
+    assert "readiness probe failed check=redis cause=builtins.RuntimeError " in caplog.text
+    assert "site=palimpsest_hub.main:_check_redis:" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_unhandled_request_failure_logs_class_and_hub_site_without_message(monkeypatch, caplog):
+    def broken(request):
+        raise RuntimeError("mysql://hub:secret-password@db/palimpsest")
+
+    monkeypatch.setattr(hub_main, "_version_document", broken)
+    with caplog.at_level(logging.DEBUG):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.get("/v1/?token=query-secret")
+    assert response.status_code == 500
+    assert response.text == "Internal Server Error"
+    # The test client's own logger prints the request URL; only Hub records count.
+    hub_log = [r.getMessage() for r in caplog.records if r.name.startswith("palimpsest_hub")]
+    failures = [message for message in hub_log if message.startswith("hub request failed ")]
+    assert len(failures) == 1
+    assert failures[0].startswith("hub request failed method=GET route=/v1/ request_id=")
+    assert " cause=builtins.RuntimeError site=palimpsest_hub.main:version_discovery:" in failures[0]
+    assert not any("secret" in message for message in hub_log)
+    assert any(message.startswith("hub request method=GET route=/v1/ status=500 ") for message in hub_log)
+
+
+def test_failure_fields_never_echo_an_untrusted_class_name_or_message():
+    hostile = type("Boom\nINFO forged line", (Exception,), {})
+    fields = hub_main.failure_fields(hostile("secret"))
+    assert fields == "cause=unknown site=unknown"
+
+
+@pytest.mark.asyncio
+async def test_worker_session_pass_failure_logs_class_and_site(monkeypatch, caplog):
+    from palimpsest_hub import worker as export_worker
+
+    stop = asyncio.Event()
+
+    async def failing_pass(settings):
+        stop.set()
+        raise OSError("/srv/palimpsest/hub/private-path")
+
+    monkeypatch.setattr(export_worker, "run_session_lifecycle", failing_pass)
+    with caplog.at_level(logging.DEBUG):
+        await export_worker._session_lifecycle_loop(SimpleNamespace(palimpsest_hub_session_tick_seconds=0.01), stop)
+    assert "Session lifecycle pass failed cause=builtins.OSError " in caplog.text
+    assert "site=palimpsest_hub.worker:_session_lifecycle_loop:" in caplog.text
+    assert "private-path" not in caplog.text
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["unset", "missing", "file", "child_file", "dangling_child", "denied"])
 async def test_readiness_store_access_fails_without_creating_or_repairing_paths(
-    ready_dependencies, monkeypatch, failure
+    ready_dependencies, monkeypatch, failure, caplog
 ):
     root = ready_dependencies.root
     if failure == "unset":
@@ -1105,6 +1153,10 @@ async def test_readiness_store_access_fails_without_creating_or_repairing_paths(
         "status": "not_ready",
         "checks": {"database": "ok", "redis": "ok", "blob_store": "error"},
     }
+    # The probe runs in a worker thread; its failure is still attributed.
+    assert "readiness probe failed check=blob_store cause=" in caplog.text
+    if failure == "denied":
+        assert "cause=builtins.PermissionError site=palimpsest_hub.main:_check_blob_store_access:" in caplog.text
     if failure == "missing":
         assert not root.exists()
     elif failure == "file":
@@ -1121,7 +1173,7 @@ async def test_readiness_store_access_fails_without_creating_or_repairing_paths(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("dependency", ["database", "redis", "blob_store"])
 async def test_readiness_timeout_bounds_wait_and_retains_single_probe_until_recovery(
-    ready_dependencies, monkeypatch, dependency
+    ready_dependencies, monkeypatch, dependency, caplog
 ):
     monkeypatch.setattr(hub_main, "_READINESS_TIMEOUT_SECONDS", 0.01)
     release = asyncio.Event()
@@ -1169,6 +1221,8 @@ async def test_readiness_timeout_bounds_wait_and_retains_single_probe_until_reco
             assert response.json()["checks"][dependency] == "timeout"
             assert response.headers["cache-control"] == "no-store"
         assert calls == 1
+        # Two waiting requests, one stuck probe: it is named once.
+        assert caplog.text.count(f"readiness probe timed out check={dependency} ") == 1
     finally:
         release.set()
         thread_release.set()
@@ -1177,6 +1231,50 @@ async def test_readiness_timeout_bounds_wait_and_retains_single_probe_until_reco
     response = await _get_ready()
     assert response.status_code == 200
     assert response.json()["checks"] == {"database": "ok", "redis": "ok", "blob_store": "ok"}
+
+
+@pytest.mark.asyncio
+async def test_readiness_names_each_stuck_probe_once_not_once_per_process(ready_dependencies, monkeypatch, caplog):
+    monkeypatch.setattr(hub_main, "_READINESS_TIMEOUT_SECONDS", 0.01)
+    for stuck in (1, 2):
+        release = asyncio.Event()
+
+        async def blocked_ping(release=release):
+            await release.wait()
+            return True
+
+        monkeypatch.setattr(ready_dependencies.redis, "ping", blocked_ping)
+        try:
+            for _ in range(2):
+                response = await asyncio.wait_for(_get_ready(), timeout=5)
+                assert response.json()["checks"]["redis"] == "timeout"
+            assert caplog.text.count("readiness probe timed out check=redis ") == stuck
+        finally:
+            release.set()
+            await asyncio.gather(*hub_main._readiness_tasks.values())
+
+
+@pytest.mark.asyncio
+async def test_package_route_failure_log_carries_the_client_visible_request_id(monkeypatch, caplog):
+    from palimpsest_hub.api import packages as package_api
+
+    async def broken_actor():
+        raise RuntimeError("keystone password secret")
+
+    monkeypatch.setitem(app.dependency_overrides, package_api.key_actor, broken_actor)
+    with caplog.at_level(logging.DEBUG):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.get("/v1/auth/me")
+    assert response.status_code == 500
+    error = response.json()["error"]
+    assert error["code"] == "INTERNAL_ERROR"
+    assert error["request_id"] == response.headers["x-request-id"]
+    hub_log = [r.getMessage() for r in caplog.records if r.name.startswith("palimpsest_hub")]
+    failures = [message for message in hub_log if message.startswith("hub request failed ")]
+    assert len(failures) == 1
+    assert f" request_id={error['request_id']} cause=builtins.RuntimeError " in failures[0]
+    assert "secret" not in response.text
+    assert not any("secret" in message for message in hub_log)
 
 
 @pytest.mark.asyncio
