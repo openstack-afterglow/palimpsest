@@ -1,5 +1,9 @@
 # Detailed installation and configuration guide
 
+## 0.3.29 transition note — 2026-11-15 (UTC; candidate)
+
+0.3.29 is a patch over 0.3.28 with no API, schema or role input change. The API and export worker add log lines that name swallowed failures by exception class and Hub call site (see "Hub API and worker logs"). Log collectors that count ERROR or WARNING lines of the Hub will now see unhandled request failures and failed readiness probes that 0.3.28 logged only as INFO `status=5xx` lines or not at all. Roll all Hub cohorts together after publication.
+
 ## 0.3.28 transition note — 2026-11-15 (UTC; deployed)
 
 The Hub dashboard adds playbook inspection and instance creation through the existing image-job and instance contracts. `GET /v1/instance-options` reads boot images, flavors, project networks and SSH key names with the original caller's token; it allocates nothing. Creation, provider advancement and removal retain the existing server-side authorization and ownership checks. No schema or Kolla role input changes. Roll all Hub cohorts together after publication. The separate local-only native VZ HOLD recovery work is not included in this release.
@@ -83,7 +87,7 @@ Version 0.3.25 is published (tag `0.3.25`, PyPI `palimpsest-client` 0.3.25) and 
 SDK publication and native execution remain separately qualified. Root/Hub metadata, module versions,
 generated locks and Kolla image defaults move together. After formal publication,
 install exact client bytes with
-`uv tool install --python 3.11 palimpsest-client==0.3.28`, or install a trusted
+`uv tool install --python 3.11 palimpsest-client==0.3.29`, or install a trusted
 local checkout with `uv tool install --force --python 3.11 .`.
 A root wheel upgrade neither deploys Hub nor qualifies actual build/run behavior.
 Git/outbound GitHub HTTPS is needed only for VCS installation.
@@ -1761,7 +1765,7 @@ and the [command workflows](cli/workflows.md) for operational details.
 
 ## SDK image/native integration: operator prerequisites
 
-The `0.3.28` Hub distribution declares the exact matching client dependency.
+The `0.3.29` Hub distribution declares the exact matching client dependency.
 Checkout resolution uses `hub`'s explicit parent-path source; installed release
 bytes must match the same immutable tag and reviewed image digests. Paired wheel
 or local container checks do not establish production upgrade or native readiness.
