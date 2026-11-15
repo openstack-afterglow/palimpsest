@@ -110,6 +110,19 @@ while an API still has an older setting; terminal settlement remains available.
 Source checks and isolated fixtures do not apply this configuration to a running
 service, migrate production data or authorize an operational rollout.
 
+### Unreleased Git build source allow-list
+
+`POST /v1/git-builds` stays disabled (503, with no DNS or Git call) until the
+operator lists exact HTTPS Git host names in `palimpsest_git_allowed_hosts`; the
+Kolla default is `[]`. The role passes the list to the Hub API only, as
+`PALIMPSEST_HUB_GIT_ALLOWED_HOSTS`, and the controller precheck rejects anything
+but at most 16 unique lowercase DNS names. Listing a host permits anonymous
+HTTPS fetches of a caller-chosen repository and pinned commit from it; the Hub
+still refuses non-public resolved addresses, redirects and any `credential_ref`,
+and a Git build also needs the image-source policy above to be configured.
+Private Git credentials are not supported. Which hosts to allow is an operator
+decision; the variable takes effect only with a release whose role contains it.
+
 ### Unreleased GPU and fixed k3s runtime profiles
 
 These candidate contracts are not enabled by installing the client wheel alone.

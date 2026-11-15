@@ -31,6 +31,12 @@ files_modified:
 - **Pending owner decision:** the residual volumes are `0a256fcf-3879-4dd6-936d-c322b35c7f95` (`m412-svc-05-boot`, last observed `error_deleting`) and `be592821-14c9-44b9-a86e-e1a9a9bb9ede` (`m412-dev-02-boot`, last observed `creating`); both Hub rows were still `deleting`. Resume allocations only after authorized cleanup and provider absence are recorded, or an explicit owner exception names these residuals and bounds the exact next ref, actions, resources and quantities. Approval to recover these volumes alone does not authorize a new allocation. State reset and force-delete remain unapproved.
 - Until then, only work within existing authority that allocates no new test resources may proceed. M4-10's keypair, floating IP and SSH ingress requirements are prerequisites, not a grant. This correction changes no checklist count (61/108), claims no new cloud check or cleanup, and leaves M4-14/GATE unresolved.
 
+## Kolla input for the Git source allow-list (source only, unreleased) — 2026-11-15
+
+- Gap found: `palimpsest_hub_git_allowed_hosts` existed only as a Hub setting; the Kolla role never rendered it, so `POST /v1/git-builds` could not be enabled in the canonical deployment (always 503).
+- Change: role variable `palimpsest_git_allowed_hosts` (default `[]`) → API env `PALIMPSEST_HUB_GIT_ALLOWED_HOSTS` (JSON array); controller precheck (≤16 unique lowercase multi-label DNS names). Tests evaluate default, rendered value and precheck with `ansible-playbook`: Kolla contract files 72 passed locally.
+- Not released or deployed (recorded under `[Unreleased]`; version stays 0.3.25). It needs a release before any deployment can use it. **Pending owner decision:** which Git hosts, if any, to allow in production. No host was allowed and no Git build ran. M4-05/M4-06 stay unchecked.
+
 ## 0.3.25 release and deployment; resume after stop live; M4-08 checked — 2026-11-15 (UTC)
 
 - Refs: PR #103 squash `a33f2b4`; new annotated tag `0.3.25`; `Release` run `43644642791` (about 49 min) and `Build and Push Palimpsest Hub` run `43644642798` succeeded; PyPI 0.3.25. Independent read-only review before merge (not an Astra/Sol signoff): no blocker; two should-fix findings and test gaps applied.
