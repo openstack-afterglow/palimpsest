@@ -24,9 +24,9 @@ _CHECKS = {
     "packages:write": _WRITE,
     "cache:read": _READ,
     "cache:write": _WRITE,
-    "keys:issue": _MANAGE,
+    "keys:issue": _WRITE,
     "keys:list": _READ,
-    "keys:revoke": _MANAGE,
+    "keys:revoke": _WRITE,
     "keys:revoke_own": _READ,
     "system:manage": "role:admin",
     "packages:delete": _MANAGE,
@@ -37,8 +37,8 @@ ACTIONS = tuple(sorted(_CHECKS))
 KEY_ACTIONS = frozenset({"packages:inventory", "packages:read", "packages:write", "cache:read", "cache:write"})
 SYSTEM_ACTIONS = frozenset({"system:manage"})
 READ_ACTIONS = frozenset({"packages:inventory", "packages:read", "cache:read", "keys:list", "keys:revoke_own"})
-WRITE_ACTIONS = frozenset({"packages:write", "cache:write", "packages:manage_own"})
-MANAGE_ACTIONS = frozenset({"packages:delete", "packages:manage", "keys:issue", "keys:revoke"})
+WRITE_ACTIONS = frozenset({"packages:write", "cache:write", "packages:manage_own", "keys:issue", "keys:revoke"})
+MANAGE_ACTIONS = frozenset({"packages:delete", "packages:manage"})
 PROJECT_READ_ROLES = frozenset({"reader", "member", "manager", "admin"})
 PROJECT_WRITE_ROLES = frozenset({"member", "manager", "admin"})
 PROJECT_MANAGE_ROLES = frozenset({"manager", "admin"})

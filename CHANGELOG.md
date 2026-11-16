@@ -4,6 +4,10 @@ All notable changes to Palimpsest Local are documented here.
 
 ## [Unreleased]
 
+### Changed
+
+- Package-key issuance and revoke (`keys:issue`, `keys:revoke`) moved from the manager tier to the member tier, so a project member holds every package action and a manager keeps only package/layer/export deletion and project management. A reader is unchanged: inventory/download plus listing and revoking its own keys. Operator policy YAML can still narrow these actions to managers; the hard ceiling no longer blocks a member rule for them. Package keys stay bound to the original token, the exact project and key ownership.
+
 ### Added
 
 - `palimpsest layer impact REFERENCE [--replacement REFERENCE] [--json]`: a read-only plan for replacing a parent layer or a base image. It lists every recorded descendant, reports the existing lineage as kept (with the local runs, projects and retained instances that stay bound to it), and reports what a lineage on the new parent would need as four separate states: rebuild (recipe digest recorded or not, whether the recipe must be edited, build cache behaviour), reconversion (a BuildKit runtime pack under a changed base needs a new pack, with its own cache), transfer and deployment. It builds, converts, transfers and deploys nothing and reads recorded local metadata only; descendants that exist only on a Hub or another host are not listed, and stored layers that cannot be reached through stored parent records are listed as unreached.

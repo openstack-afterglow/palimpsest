@@ -1269,13 +1269,14 @@ async def test_standard_project_roles_publish_but_only_managers_manage(hub, role
     assert (await hub.client.get(base + "/packages", headers=member)).status_code == 200
     assert (await hub.client.get(base + "/keys", headers=member)).status_code == 200
     management = role in {"manager", "admin"}
+    # Package-key issuance is a member action; only deletion remains manager-only.
     assert (
         await hub.client.post(
             base + "/keys",
             headers=member,
             json={"name": "new", "scope": {"packages": ["test"]}, "actions": ["packages:read"]},
         )
-    ).status_code == (201 if management else 403)
+    ).status_code == 201
     assert (await hub.client.delete(base + "/keys/" + issued["key"]["key_id"], headers=member)).status_code == 204
     assert (await hub.client.get("/v1/auth/me", headers=key_headers)).status_code == 401
     assert (await hub.client.delete(base + "/package", params={"package": "test"}, headers=member)).status_code == (
@@ -1425,7 +1426,7 @@ async def test_key_control_rechecks_current_authority_at_commit(hub, monkeypatch
     async def downgrade(member, required, **kwargs):
         if required == action:
             if action == "keys:issue":
-                hub.people["one"]["roles"] = ["member"]
+                hub.people["one"]["roles"] = ["reader"]
             else:
                 hub.disabled.add(member["user_id"])
         return await original(member, required, **kwargs)
@@ -1484,7 +1485,7 @@ async def test_manager_layer_delete_preserves_all_parent_and_base_consumers(hub,
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("role", ["reader", "member"])
+@pytest.mark.parametrize("role", ["reader"])
 async def test_demoted_owner_can_revoke_only_own_key_with_original_token(hub, role):
     namespace, issued, credential = await key(hub)
     hub.people["one"]["roles"] = hub.people["two"]["roles"] = [role]
