@@ -1,5 +1,61 @@
 # Detailed installation and configuration guide
 
+## 0.3.29 transition note — 2026-11-15 (UTC; deployed)
+
+0.3.29 is a patch over 0.3.28 with no API, schema or role input change. The API and export worker add log lines that name swallowed failures by exception class and Hub call site (see "Hub API and worker logs"). Log collectors that count ERROR or WARNING lines of the Hub will now see unhandled request failures and failed readiness probes that 0.3.28 logged only as INFO `status=5xx` lines or not at all. Roll all Hub cohorts together after publication.
+
+## 0.3.28 transition note — 2026-11-15 (UTC; deployed)
+
+The Hub dashboard adds playbook inspection and instance creation through the existing image-job and instance contracts. `GET /v1/instance-options` reads boot images, flavors, project networks and SSH key names with the original caller's token; it allocates nothing. Creation, provider advancement and removal retain the existing server-side authorization and ownership checks. No schema or Kolla role input changes. Roll all Hub cohorts together after publication. The separate local-only native VZ HOLD recovery work is not included in this release.
+
+## 0.3.27 transition note — 2026-11-15 (UTC; deployed)
+
+0.3.27 is a patch over 0.3.26 with no schema change and no new role input. The build worker now takes the smaller of the API's blob limit and its own output limit for an image job; on 0.3.26 and earlier a deployment with `palimpsest_build_worker_max_blob_bytes` below `palimpsest_hub_max_blob_bytes` failed every image job (registry intake, Dockerfile and Git builds) as `build_failed` before the build started. Such a deployment needs this release on the build worker; no setting has to change. The API bounds the `.dockerignore` of a Git build's repository (64 KiB, 1,000 rules); a deployment that allows Git hosts should take this release, because an unbounded rule file could keep an API worker busy. The client's experimental native VZ commit gains refusals (ordinary files named `.wh.*`, an upper that lists a path twice, a `/.plmignore` rule with the bracket `[!]`, a rule over 4096 bytes, more than 10,000 rules, or evaluation beyond its time budget). Roll the API/worker cohorts and the build worker to the same release.
+
+## 0.3.26 transition note — 2026-11-15 (UTC; deployed)
+
+0.3.26 is a patch over 0.3.25 with no schema change. The Kolla role gains the optional input `palimpsest_git_allowed_hosts` (default `[]`, Git builds stay off); nothing changes for a deployment that does not set it. To enable Git builds an operator sets that list and an `palimpsest_image_source_policy` rule for the base images, then reconfigures. The client's experimental native VZ commit now honours a `/.plmignore` carried by the image. Roll the API/worker cohorts and the build worker to the same release.
+
+## 0.3.25 transition note — 2026-11-15 (UTC; deployed)
+
+0.3.25 is a patch over 0.3.24 with no schema change and no new setting. `resume` now also starts a stopped dev instance and the instance projection gains the `resume_result` key (additive). Guests are unchanged: any dev instance that already reported a probed ready result can be stopped and resumed. Roll the API/worker cohorts and the build worker to the same release.
+
+## 0.3.24 transition note — 2026-11-15 (UTC; deployed)
+
+0.3.24 is a patch over 0.3.23 with no schema change, no new setting and no Hub behaviour change: only the client's `--cloud` error messages change. Roll the API/worker cohorts and the build worker to the same release so the bundled client matches.
+
+## 0.3.23 transition note — 2026-11-15 (UTC; deployed)
+
+0.3.23 is a patch over 0.3.22 with no schema change and no new setting. New instances get `OOMPolicy=continue` in `palimpsest-instance.service`, so an OOM kill of the command no longer stops the guest runner; instances created earlier keep systemd's default and are not restarted after an OOM kill. Roll the API/worker cohorts and the build worker to the same release.
+
+## 0.3.22 transition note — 2026-11-15 (UTC; deployed)
+
+0.3.22 is a patch over 0.3.21 with no schema change and no new setting. Guest results may now carry the error code `guest_setup_timeout`. Roll the API/worker cohorts and the build worker to the same release.
+
+## 0.3.21 transition note — 2026-11-14 (UTC; deployed)
+
+0.3.21 is a patch over 0.3.20 with no schema change and no new setting. New instances accept `restart` (`no`/`unless-stopped`); a service instance with a readiness probe now defaults to `unless-stopped`, so its long-running command is started again after an exit, crash or OOM kill. Pass `restart: "no"` (CLI `--restart no`) to keep the old one-shot behaviour. Instances created by older releases are unchanged (their guest runner has no restart loop). Roll the API/worker cohorts and the build worker to the same release.
+
+## 0.3.20 transition note — 2026-11-14 (UTC; deployed)
+
+0.3.20 is a patch over 0.3.19 with no schema change and no new setting. Dev instances created by 0.3.20 retain `resume.json` in the guest after their first ready report and restore from it after unshelve; instances created by older releases have no such file and stay unrestorable (delete and recreate them). The new `PUT /v1/instance-bootstrap/{id}/resume-result` is authenticated with the guest's session-report capability and accepted only while the Hub records the instance as `resumed`. GPU, cluster and service instances are unchanged. Roll the API/worker cohorts and the build worker to the same release.
+
+## 0.3.19 transition note — 2026-11-14 (UTC; deployed)
+
+0.3.19 is a patch over 0.3.18 with no schema change and no new setting. Found on the first real shelve: Keystone role inference adds `reader` to every token that carries `member`, and the trust connection refused any role outside the delegated set, so a trust delegating `member` could never open a connection (the same check serves image exports). `open_trust_connection` now also accepts the implied `reader` when `member` is delegated; every other extra role and the forbidden set still fail closed. A worker log line now names the reason when a delegated connection cannot be opened. Use the rollout gates below and roll the API/worker cohorts and the build worker to the same release.
+
+## 0.3.18 transition note — 2026-11-14 (UTC; deployed)
+
+0.3.18 is a patch over 0.3.17 with no schema change and no new setting. The system-administrator path for dev-lifecycle Trusts now refuses `palimpsest_hub_package_forbidden_user_ids` and `palimpsest_hub_package_forbidden_project_ids` exactly like the member path, and the retired-Trust sweep (which runs on every controller) skips rows another controller already revoked instead of recording `trust_unrecoverable`. Use the rollout gates below (writer drain, paired backup, no DB restore, no forced stop) and roll the API/worker cohorts and the build worker to the same release.
+
+## 0.3.17 transition note — 2026-11-13 (UTC; deployed)
+
+0.3.17 is a patch over 0.3.16 with no schema change and no new setting: no bootstrap is required. It lets a human system administrator who holds ordinary project roles use a project-scoped token for dev-lifecycle instance requests. Use the rollout gates below (writer drain, paired backup, no DB restore, no forced stop) and roll the API/worker cohorts and the build worker to the same release; then check the running image digests against the handoff, because the 0.3.15 pins were once lost.
+
+## 0.3.16 transition note — 2026-11-13 (UTC; deployed)
+
+0.3.16 is a patch over 0.3.15 and adds one table, `palimpsest_hub_instance_lifecycle`, for `lifecycle=dev` instances (idle auto-shelve). `kolla-ansible reconfigure` does not create it: run the new API image's `palimpsest-hub-bootstrap` once, offline, with every writer stopped and a paired SQL/CAS backup taken, before any dev instance is created. Existing (`service`) instances never touch the table and keep working without it. New optional settings `PALIMPSEST_HUB_SESSION_*` (see the Hub settings table) are not rendered by the Kolla role and default to a 7-day per-instance Trust, 30 s guest reports and a 120 s report age bound. The worker runs an extra `session-lifecycle` role task. Use the rollout gates below (writer drain, paired backup, no DB restore, no forced stop).
+
 ## 0.3.15 transition note — 2026-11-08 (UTC; deployed 2026-11-09)
 
 0.3.15 is a patch over 0.3.14: staged publication payload registration and limit checks enforce byte-exact `project_id` and `created_by` equality via binary SQL casts (`cast(..., LargeBinary)`) under case-insensitive SQL collations (such as SQLite NOCASE and MariaDB/MySQL default collations). Foreign casing variants can no longer match an image or free/claim staged quota. Test limits and residuals: verified under synthetic SQLite NOCASE schema simulation; live MariaDB reproduction was not executed in CI; existing database primary key collation collision risks remain if unique identity columns use case-insensitive collations. No schema change or bootstrap run is required. Follow the 0.3.13 transition gate below as amended by the 0.3.14 note, including `/v1/published-images/quota` in step 6. Writer drain, paired backup, build-worker rollout and rollback remain required. 0.3.15 was deployed to the DMS Lab controllers on 2026-11-09 following the gate below; the paired backup was taken but never restore-tested.
@@ -27,11 +83,11 @@ initial configuration, upgrades, and administrator-owned Linux deployment.
 Released installations use pinned published bytes; trusted local installation below uses the actual checkout's bytes.
 
 Palimpsest Local requires Python 3.11 or newer; Hub requires Python 3.12+.
-This source prepares unpublished candidate 0.3.15 over 0.3.14; this checkpoint does not establish publication or deployment of 0.3.15.
+Version 0.3.25 is published (tag `0.3.25`, PyPI `palimpsest-client` 0.3.25) and was deployed to the production Hub (three controllers and the build worker) on 2026-11-14/15 after a paired SQL/CAS backup (not restore-tested); 0.3.24, 0.3.23, 0.3.22, 0.3.21, 0.3.20, 0.3.19, 0.3.18, 0.3.17, 0.3.16 and 0.3.15 were deployed earlier (production was once found running 0.3.13, see the handoff incident note).
 SDK publication and native execution remain separately qualified. Root/Hub metadata, module versions,
 generated locks and Kolla image defaults move together. After formal publication,
 install exact client bytes with
-`uv tool install --python 3.11 palimpsest-client==0.3.15` once formally published, or install a trusted
+`uv tool install --python 3.11 palimpsest-client==0.3.29`, or install a trusted
 local checkout with `uv tool install --force --python 3.11 .`.
 A root wheel upgrade neither deploys Hub nor qualifies actual build/run behavior.
 Git/outbound GitHub HTTPS is needed only for VCS installation.
@@ -69,6 +125,21 @@ Worker publication recovery must independently apply its current policy even
 while an API still has an older setting; terminal settlement remains available.
 Source checks and isolated fixtures do not apply this configuration to a running
 service, migrate production data or authorize an operational rollout.
+
+### Git build source allow-list (role input since 0.3.26)
+
+`POST /v1/git-builds` stays disabled (503, with no DNS or Git call) until the
+operator lists exact HTTPS Git host names in `palimpsest_git_allowed_hosts`; the
+Kolla default is `[]`. The role passes the list to the Hub API only, as
+`PALIMPSEST_HUB_GIT_ALLOWED_HOSTS`, and the controller precheck rejects anything
+but at most 16 unique lowercase DNS names. Listing a host permits anonymous
+HTTPS fetches of a caller-chosen repository and pinned commit from any port of
+that host; the Hub
+still refuses non-public resolved addresses, redirects and any `credential_ref`,
+and a Git build also needs the image-source policy above to allow the
+Dockerfile's base image. Private Git credentials are not supported. Which hosts
+to allow is an operator decision. `examples/git-build` is a minimal context for
+a first build.
 
 ### Unreleased GPU and fixed k3s runtime profiles
 
@@ -928,6 +999,25 @@ including when launched through the direct `uvicorn palimpsest_hub.main:app`
 command. Do not enable third-party HTTP/SQL trace logging or an independent
 server access logger that emits raw targets in production.
 
+From 0.3.29 three kinds of swallowed failure are named in the log, without the
+exception's message or traceback. An unhandled request failure (the fixed
+`500`) adds an ERROR line `hub request failed method=… route=… request_id=…
+cause=<exception class> site=<Hub module>:<function>:<line>` before the usual
+`status=500` line; `site` is the innermost Hub frame, and for package routes
+`request_id` equals the `X-Request-Id` the client received. `/v1/ready` adds a
+WARNING `readiness probe failed check=<database|redis|blob_store> cause=…
+site=…`, or `readiness probe timed out check=… timeout_seconds=2.0` once per
+stuck probe. The export worker's `Session lifecycle pass failed`, `Image export
+worker iteration failed`, `Export delegation cleanup failed` and `Export
+maintenance failed` lines gain the same `cause=… site=…` fields. Nothing else
+changed: answers the Hub builds on purpose, such as the 503 for an unreachable
+Keystone or policy source, a delegation failure, or a failed export task, are
+still logged without a cause. On 0.3.28 and earlier the request and readiness
+lines do not exist and the worker lines carry no fields: a failed request
+appears only as an INFO line with `status=5xx`, so count those lines
+(`grep -c -E 'status=5[0-9][0-9]'`) rather than searching for `error` or
+`Traceback`.
+
 For image-build failures the worker retains one private owner-only
 `last-image-failure.json` beside `worker.json`, after exact executor cleanup and
 before deleting the disposable job tree. It contains the last64KiB from each
@@ -1177,6 +1267,9 @@ Optional settings and defaults:
 | `PALIMPSEST_HUB_PACKAGE_PUBLIC_ORIGIN` | Empty. Trusted HTTPS origin in canonical lower-case host/port form, with no credentials, path, query or fragment; other forms are rejected at startup. It is never inferred from the request Host. If empty, no package authority is advertised, and every native push fails closed with `503 HUB_UNAVAILABLE` before its tag is published. |
 | `PALIMPSEST_HUB_EXPORT_DELEGATED_ROLES` | `'["member"]'`; JSON array of the least global roles a deferred Glance export Trust delegates. Glance's default `download_image` policy requires `member`, even for images the project owns. The requester must currently hold each listed role in the target project. `admin`, `manager` and `service` are rejected at startup. |
 | `PALIMPSEST_HUB_EXPORT_DELEGATION_TTL_SECONDS` | `21600`, valid 900–86400; finite Trust lifetime. A queued export not started within it fails `delegation_expired`. |
+| `PALIMPSEST_HUB_SESSION_DELEGATED_ROLES` | `'["member"]'`; roles the per-instance Trust of a `lifecycle=dev` instance delegates so the worker can shelve it. The owner must currently hold each role; `admin`, `manager` and `service` are rejected at startup. Not rendered by the Kolla role: the default applies unless the API/worker environment is set another way. |
+| `PALIMPSEST_HUB_SESSION_DELEGATION_TTL_SECONDS` | `604800` (7 days), valid 3600–2592000. The per-instance Trust is finite and is replaced only by the owner's own requests (`instance create`, `resume`, `renew`). An expired Trust means no auto-shelve (the instance keeps running), never a fallback credential. |
+| `PALIMPSEST_HUB_SESSION_REPORT_INTERVAL_SECONDS` / `..._MAX_AGE_SECONDS` / `PALIMPSEST_HUB_SESSION_TICK_SECONDS` | `30` (10–120) guest report cadence; `120` (30–600) age after which a missing report is an unknown observation (never "no session"); `30` (5–300) worker pass interval. |
 | `PALIMPSEST_HUB_ANONYMOUS_RATE_LIMIT_ENABLED` | `true`; anonymous `public` published-image reads are counted per client |
 | `PALIMPSEST_HUB_ANONYMOUS_RATE_LIMIT_REQUESTS` | `120`, valid 1–100000 requests per window per client; excess is 429 with `Retry-After` |
 | `PALIMPSEST_HUB_ANONYMOUS_RATE_LIMIT_WINDOW_SECONDS` | `60`, valid 1–3600; fixed window |
@@ -1672,7 +1765,7 @@ and the [command workflows](cli/workflows.md) for operational details.
 
 ## SDK image/native integration: operator prerequisites
 
-The `0.3.15` candidate Hub distribution declares the exact matching client dependency.
+The `0.3.29` Hub distribution declares the exact matching client dependency.
 Checkout resolution uses `hub`'s explicit parent-path source; installed release
 bytes must match the same immutable tag and reviewed image digests. Paired wheel
 or local container checks do not establish production upgrade or native readiness.

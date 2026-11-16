@@ -108,6 +108,252 @@ def test_directory_rule_covers_descendants_and_reinclusion_wins_when_later():
     assert not matcher.ignored("var/app/x.txt")
 
 
+_MANY_WILDCARD_CASES = [
+    ("**/build/**/*.o", "src/build/x/y/a.o", True),
+    ("**/build/**/*.o", "src/build/a.o", True),
+    ("**/build/**/*.o", "build/a.o", True),
+    ("**/build/**/*.o", "build/a.o/below/it", True),  # a covered directory covers what is below it
+    ("**/build/**/*.o", "src/build/a.c", False),
+    ("**/build/**/*.o", "src/builder/a.o", False),
+    ("**/build/**/*.o", "src/build/a.ox/y", False),  # a prefix must end at a component boundary
+    ("a*b*c*d", "axbxcxd", True),
+    ("a*b*c*d", "axbxcxd/e", True),
+    ("a*b*c*d", "axb/cxd", False),
+    ("a*b*c*d", "abcd\n/z", True),  # the newline is read by ``*`` and still ends a matched component
+    ("a*b*c*d", "abcd\nq/z", False),
+    ("**x**y**z", "a/x/b/y/c/z", True),
+    ("**x**y**z", "a/z/b/y/c/x", False),
+    ("*/?[ab]/**/*.[!c]", "d/qa/deep/er/f.h", True),
+    ("*/?[ab]/**/*.[!c]", "d/qa/f.c", False),
+    ("**/a/**/b/*", "a/b/c\n", True),  # one trailing newline is ignored at the end of the pattern
+    ("**/a/**/b/*", "a/b/c\n/d", True),  # also when that component is a covered directory
+    ("**/a/**/b/**/c", "a/b/c\n", True),
+    ("**/a/**/b/**/c", "a/b/c\nx", False),  # only a newline that ends the component is ignored
+    ("**/a/**/b/*", "a/x\ny/b/c", False),  # ``**`` does not cross a newline
+    ("a?b*c*", "axbc", True),  # ``?`` and a class break a literal run: "ab" is not required text
+    ("a[x]b*c*", "axbc", True),
+    ("a?b*c*", "ab", False),
+]
+
+
+@pytest.mark.parametrize("pattern,path,expected", _MANY_WILDCARD_CASES)
+def test_rules_with_many_wildcards_cover_the_same_paths_on_both_matching_routes(pattern, path, expected):
+    from palimpsest_local import oci_capture
+
+    tokens = oci_capture._glob_tokens(pattern)
+    assert sum(kind in oci_capture._UNBOUNDED for kind, _ in tokens) > oci_capture._MAX_REGEX_WILDCARDS
+    assert bool(oci_capture._covering_regex(tokens).match(path)) is expected
+    assert oci_capture._LinearGlob(tokens, [1000]).covers(path) is expected
+    assert oci_capture._LinearGlob(tokens, [0]).covers(path) is expected, "without any remembered transition"
+    assert IgnoreMatcher(pattern + "\n").ignored(path) is expected
+
+
+@pytest.mark.parametrize(
+    "rule",
+    [
+        "**/**/b",
+        "**a**b",
+        "/".join(["**", "a"] * 12) + "/b",
+        "a*a*a*a*a*b",
+        "**a**a**a**b",
+        "****" + "[a/]" * 1023,
+        "**" + "[a/]" * 1023 + "b",
+        "**a" * 1365,
+    ],
+    ids=[
+        "two-globdirs",
+        "two-globstars",
+        "twelve-globdirs",
+        "five-stars",
+        "four-globstars",
+        "two-wildcards-long-class-run",
+        "one-wildcard-long-class-run",
+        "longest-rule-of-wildcards",
+    ],
+)
+def test_pathological_rules_are_evaluated_in_bounded_time_on_maximum_length_paths(rule):
+    import time
+
+    # Measured before the bounds, per path: about ten seconds for the first rule, more than
+    # fifteen for the third, and fifteen for a two-wildcard rule followed by a long class run.
+    deep = "/".join(["a"] * 2047) + "/a"  # 4095 bytes, 2048 components
+    wide = "/".join(["a" * 255] * 15)  # maximum-length components
+    matcher = IgnoreMatcher(rule + "\n")
+    started = time.monotonic()
+    for path in (deep, wide, deep + "x", wide + "/b"):
+        matcher.ignored(path)
+    assert time.monotonic() - started < 5.0
+
+
+def test_ignore_rules_have_count_length_and_time_bounds_and_typed_refusals():
+    with pytest.raises(CaptureError) as error:
+        IgnoreMatcher("x\n" * 10_001)
+    assert error.value.code == "plmignore" and "too many rules" in str(error.value)
+    assert IgnoreMatcher("x\n" * 10_000).ignored("x")
+
+    with pytest.raises(CaptureError) as error:
+        IgnoreMatcher("a" * 4097 + "\n")
+    assert error.value.code == "plmignore" and "longer than a path" in str(error.value)
+    assert IgnoreMatcher("a" * 4096 + "\n").ignored("a" * 4096)
+
+    spent = IgnoreMatcher("*.log\n", budget_seconds=-1.0)
+    with pytest.raises(CaptureError) as error:
+        spent.ignored("a.log")
+    assert error.value.code == "plmignore" and "too long" in str(error.value)
+
+    # The rule length limit counts bytes: 1366 three-byte characters are 4098 bytes.
+    with pytest.raises(CaptureError) as error:
+        IgnoreMatcher("\u4e00" * 1366 + "\n")
+    assert "longer than a path" in str(error.value)
+    assert IgnoreMatcher("\u4e00" * 1365 + "\n").ignored("\u4e00" * 1365)
+
+    with pytest.raises(CaptureError) as error:
+        IgnoreMatcher("[z-a]\n")
+    assert error.value.code == "plmignore" and "invalid character class" in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "rule",
+    ["[!]", "[^]", "[!][ab]", "*[!][ab]", "a*b*[!][ab]", "[!][](a|a)*c]", "**/[!][](a|a)*c]", "[!][]|b]", "x[^]y]"],
+)
+def test_a_bracket_that_would_stay_open_as_regex_text_is_refused_for_every_rule(rule):
+    # ``[!]`` becomes the regex text ``[^]``, a class that runs on into what follows. With a later
+    # ``[]...]`` a rule carried alternation and nested repeats to the regex engine: exponential
+    # time on a 26-character name, and matches that depended on how the regex was wrapped.
+    with pytest.raises(CaptureError) as error:
+        IgnoreMatcher(rule + "\n")
+    assert error.value.code == "plmignore" and "ambiguous character class" in str(error.value)
+
+
+@pytest.mark.parametrize("rule", ["[+--]", "[a--b]", "*z*[+--]", "x[!a--z]"])
+def test_a_class_that_spells_a_set_difference_is_refused(rule):
+    # ``--`` in a class is reserved by the regex engine (it warns today). It cannot be escaped
+    # without changing ranges, so the rule is refused rather than left to change meaning.
+    with pytest.raises(CaptureError) as error:
+        IgnoreMatcher(rule + "\n")
+    assert error.value.code == "plmignore" and "ambiguous character class" in str(error.value)
+    assert IgnoreMatcher("[a-c-]\n").ignored("-") and IgnoreMatcher("[-a]\n").ignored("-")
+
+
+def test_brackets_that_hold_a_closing_bracket_first_are_plain_classes():
+    # ``[]a]`` is the class of "]" and "a"; its text never leaves the class, whatever it spells.
+    assert IgnoreMatcher("[]a]\n").ignored("]") and IgnoreMatcher("[]a]\n").ignored("a")
+    assert not IgnoreMatcher("[]a]\n").ignored("b")
+    spelled = IgnoreMatcher("[](a|a)*c]\n")
+    assert all(spelled.ignored(char) for char in "](a|)*c") and not spelled.ignored("aac") and not spelled.ignored("x")
+
+
+@pytest.mark.parametrize("route", ["", "*z*"], ids=["regex-route", "simulation-route"])
+def test_a_class_body_holds_only_literal_characters_and_ranges(route, recwarn):
+    import warnings
+
+    warnings.simplefilter("error")  # nested-set and set-operator FutureWarnings would fail here
+
+    def ignored(rule, text):
+        return IgnoreMatcher(route + rule + "\n").ignored(("zz" if route else "") + text)
+
+    # A backslash in a class is a backslash, never a regex escape such as ``\d``.
+    assert ignored("[\\d]", "\\") and ignored("[\\d]", "d") and not ignored("[\\d]", "5")
+    # "[", "&", "|" and "~" mean themselves, also doubled.
+    assert all(ignored("x[a&&b]", "x" + char) for char in "a&b") and not ignored("x[a&&b]", "xc")
+    assert all(ignored("[a||b~~c]", char) for char in "a|b~c") and not ignored("[a||b~~c]", "d")
+    assert ignored("[[:alpha:]", ":") and ignored("[[:alpha:]", "[") and not ignored("[[:alpha:]", "z")
+    assert ignored("[a-c]", "b") and not ignored("[a-c]", "d")
+
+
+def test_remembered_transitions_do_not_confuse_characters_beyond_the_basic_plane(monkeypatch):
+    import random
+
+    from palimpsest_local import oci_capture
+
+    # U+10061 and "a" differ by exactly 0x10000; a transition key that folded them would let one
+    # state's step answer for another's.
+    rule = "**a**\U00010061**z\n"
+    remembering = IgnoreMatcher(rule)
+    monkeypatch.setattr(oci_capture, "_MAX_CACHED_STATE", 0)
+    plain = IgnoreMatcher(rule)
+    rng = random.Random(20261115)
+    for _ in range(3000):
+        path = "".join(rng.choice(["a", "\U00010061", "z", "b", "/"]) for _ in range(rng.randint(1, 9)))
+        assert remembering.ignored(path) == plain.ignored(path), path
+    assert remembering._rules[0][1].__self__._moves and not plain._rules[0][1].__self__._moves
+
+
+def test_the_time_budget_stops_between_rules_of_one_path(monkeypatch):
+    from palimpsest_local import oci_capture
+
+    clock = [100.0]
+    calls = []
+
+    def slow(path):
+        calls.append(path)
+        clock[0] += 0.05
+        return False
+
+    monkeypatch.setattr(oci_capture.time, "monotonic", lambda: clock[0])
+    matcher = IgnoreMatcher("placeholder\n", budget_seconds=0.12)
+    matcher._rules = [(False, slow)] * 20
+    with pytest.raises(CaptureError) as error:
+        matcher.ignored("some/path")
+    assert error.value.code == "plmignore" and len(calls) == 3, (
+        "the third rule passes the budget; seventeen must not run"
+    )
+
+
+def test_what_the_matcher_remembers_is_bounded_by_states_not_by_entries(monkeypatch):
+    from palimpsest_local import oci_capture
+
+    # Each remembered state set of this rule holds thousands of states. Counting entries instead of
+    # their sizes let a 38 KB file hold fifty million states (3.5 GiB) in one commit.
+    monkeypatch.setattr(oci_capture, "_MAX_CACHED_STATE", 20_000)
+    matcher = IgnoreMatcher(("**a" * 1365) + "\n" + ("**b" * 1365) + "\n")
+    wide = "/".join(["a" * 255] * 16)
+    assert matcher.ignored(wide) and not matcher.ignored("b/b")
+    remembered = 0
+    for _, covers in matcher._rules:
+        glob = covers.__self__
+        remembered += sum(len(states) for states in glob._sets) + len(glob._moves)
+    assert 0 < remembered <= 20_000
+    # Matching stays correct once nothing more is remembered.
+    assert matcher.ignored(wide + "/below") and matcher.ignored("b" * 1365) and not matcher.ignored("b" * 1364)
+
+
+def test_remembered_transitions_count_against_the_same_allowance(monkeypatch):
+    from palimpsest_local import oci_capture
+
+    # A rule with small state sets still remembers one transition per distinct character.
+    monkeypatch.setattr(oci_capture, "_MAX_CACHED_STATE", 300)
+    matcher = IgnoreMatcher("****z\n")
+    for start in range(0x4E00, 0x4E00 + 4000, 40):
+        assert not matcher.ignored("".join(chr(start + offset) for offset in range(40)) + "zy")
+    glob = matcher._rules[0][1].__self__
+    assert 0 < len(glob._moves) + sum(len(states) for states in glob._sets) <= 300
+    assert matcher.ignored("\u4e00\u4e01z") and not matcher.ignored("\u4e00\u4e01zy")
+
+
+@pytest.mark.parametrize("name", ["opt/.wh.app", "etc/ssh/.wh..wh..opq", ".wh.rootfile", "srv/.wh.dir/inner"])
+def test_an_ordinary_entry_with_a_reserved_whiteout_name_refuses_the_commit(name):
+    # Overlayfs gives ``.wh.`` names no meaning, so a guest can hold such files; written into the
+    # layer unchanged they would delete parent content (``opt/app``) or hide a whole directory.
+    with pytest.raises(CaptureError) as error:
+        _layer([_file(name, b"x"), _file("opt/keep", b"1")])
+    assert error.value.code == "capture-path" and "whiteout prefix" in str(error.value)
+    # The user can leave such a file out explicitly; a real deletion is still written as a whiteout.
+    receipt, _, members = _layer(
+        [_file(name, b"x"), _file("opt/keep", b"1"), UpperEntry("opt/gone", UpperKind.WHITEOUT)],
+        plmignore=name.removesuffix("/inner") + "\n",
+    )
+    assert name not in members and "opt/.wh.gone" in members
+
+
+def test_a_reserved_name_in_the_package_database_cannot_be_excluded_and_still_refuses():
+    # Package-database paths are kept whatever the rules say, so the only way out is removing the file.
+    for rules in ("var/lib/dpkg/.wh.status-old\n", "var/lib/dpkg/\n", "**/.wh.*\n"):
+        with pytest.raises(CaptureError) as error:
+            _layer([_file("var/lib/dpkg/.wh.status-old", b"x"), _file("var/lib/dpkg/status", b"s")], plmignore=rules)
+        assert error.value.code == "capture-path"
+
+
 def test_plmignore_capture_root_patterns_and_reinclusion():
     receipt, _, members = _layer(
         [_file("build"), _file("tempa"), _file("subdir/tempa"), _file("subdir/app.log")],
@@ -439,6 +685,16 @@ def test_plmignore_size_limits_fail_closed():
     with pytest.raises(CaptureError) as error:
         IgnoreMatcher(oversized)
     assert error.value.code == "plmignore"
+
+
+def test_a_plmignore_that_is_not_utf8_is_a_typed_refusal_from_either_source():
+    for arguments in (
+        {"entries": [_file(".plmignore", b"opt/\xff\n"), _file("app.py", b"1")]},
+        {"entries": [_file("app.py", b"1")], "parent_plmignore": b"opt/\xff\n"},
+    ):
+        with pytest.raises(CaptureError) as error:
+            _layer(arguments.pop("entries"), **arguments)
+        assert error.value.code == "plmignore"
 
 
 def test_streamed_payload_size_excess_fails_closed():

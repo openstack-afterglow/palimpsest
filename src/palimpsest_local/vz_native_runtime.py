@@ -521,9 +521,61 @@ def _verify_custody_binding(root, directory_fd, lock_fd, expected_lock):
         raise VZNativeHold("native VZ custody binding is unavailable after acquisition") from error
 
 
+def _dead_session_run(marker_fd) -> tuple[str, str] | None:
+    """Run id and name of an unlocked session marker whose recorded SSH actor pid no longer exists, else None."""
+    try:
+        raw = os.pread(marker_fd, 65537, 0)
+        if not raw or len(raw) > 65536:
+            return None
+        lines = raw.decode("utf-8").split("\n")
+        if len(lines) != 2:
+            return None
+        owner, actor = json.loads(lines[0]), json.loads(lines[1])
+        if owner.get("schema") != _SCHEMA or owner.get("operation") != "user-ssh" or actor.get("schema") != _SCHEMA:
+            return None
+        run_id, run_name, pid = owner.get("run_id"), owner.get("run_name"), actor.get("actor_pid")
+        if type(run_id) is not str or not run_id or type(run_name) is not str or type(pid) is not int or pid <= 1:
+            return None
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return run_id, run_name
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def _settle_orphan_markers(custody, names, status, *, stopped=False) -> None:
+    """Unlink one run's dead-owner/dead-actor session markers once that run's guest has no user session.
+
+    Mirrors the in-process release (`hold_actor`): either the provider instance is Stopped (no guest
+    runs), or the authenticated status reports `user_sessions_known is True` with
+    `user_session_count == 0`. A live or unknown guest session keeps HOLD even though the host SSH
+    actor is gone (sshd may keep a guest command running). The caller passes only markers of the run
+    whose instance and status it observed; another run's guest proves nothing about them.
+    """
+    if not names:
+        return
+    if not stopped and (status.get("user_sessions_known") is not True or status.get("user_session_count") != 0):
+        raise VZNativeHold("native VZ SSH actor custody survived its owner; guest user sessions are not proven gone")
+    for name in names:
+        (custody / name).unlink()
+    fd = _directory(custody)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 @contextmanager
 def _custody(
-    config, *, lock_timeout=0, lock_deadline=None, observation_budget=None, cleanup_hold=None, read_only_probe=False
+    config,
+    *,
+    lock_timeout=0,
+    lock_deadline=None,
+    observation_budget=None,
+    cleanup_hold=None,
+    read_only_probe=False,
+    orphan_markers=None,
 ):
     """Fence actors; only exact cleanup/stop settlement or pinned probes pass HOLD."""
     _require_native_custody_owner()
@@ -619,7 +671,12 @@ def _custody(
                     continue
                 if (visible.st_dev, visible.st_ino) != (actor.st_dev, actor.st_ino):
                     raise VZNativeHold("native VZ SSH custody marker changed")
-                raise VZNativeHold("native VZ SSH actor custody survived its owner; reconciliation required")
+                orphan_run = None if orphan_markers is None or read_only_probe else _dead_session_run(actor_fd)
+                if orphan_run is None:
+                    raise VZNativeHold("native VZ SSH actor custody survived its owner; reconciliation required")
+                # Owner gone and its recorded host SSH actor gone. Host-side death alone does not prove the guest
+                # user session ended, so the caller must pass that run's guest-side gate before settling the marker.
+                orphan_markers.append((name, *orphan_run))
             finally:
                 os.close(actor_fd)
         yield root
@@ -4253,16 +4310,39 @@ def _session(
     # Waiting admits one command; it never resubmits an SSH or guest operation.
     with locked_existing_run(roots, name, expected=expected, observation_budget=_observation_budget) as authority:
         config = _config_for(authority)
+        orphans: list[tuple[str, str, str]] = []
         with _custody(
             config,
             lock_timeout=RUN_OBSERVATION_TIMEOUT_SECONDS,
             observation_budget=_observation_budget,
+            orphan_markers=orphans,
         ) as custody:
             data, *_ = _load(authority, roots, config, custody)
             native = data["vz_native"]
-            # Host preparation and this fixed-duration status actor do not spend
-            # the guest execution timer or the shared mutex-contention allowance.
-            _validate_status(native, _control(config, native, "status", custody), handed_off=True)
+            own = [marker for marker, run_id, _ in orphans if run_id == authority.record.run_id]
+            others = sorted({run_name for _, run_id, run_name in orphans if run_id != authority.record.run_id})
+            # This run's own markers are settled first, so two runs that each left a marker do
+            # not block each other.
+            guest_checked = False
+            if own:
+                if _owned_instance(config, native, custody).get("status") == "Stopped":
+                    # A stopped provider runs no guest session, and it cannot answer a status request.
+                    _settle_orphan_markers(custody, own, {}, stopped=True)
+                else:
+                    status = _validate_status(native, _control(config, native, "status", custody), handed_off=True)
+                    _settle_orphan_markers(custody, own, status)
+                    guest_checked = True
+            if others:
+                # The custody directory is shared by every run of this Lima home. This run's guest
+                # says nothing about another run's sessions, so those markers stay for their run.
+                raise VZNativeHold(
+                    "native VZ SSH actor custody of another run survived its owner; an exec in that run "
+                    "reconciles it: " + ", ".join(repr(item) for item in others)
+                )
+            if not guest_checked:
+                # Host preparation and this fixed-duration status actor do not spend
+                # the guest execution timer or the shared mutex-contention allowance.
+                _validate_status(native, _control(config, native, "status", custody), handed_off=True)
             command = "plm-follow-v1" if follow else None
             if request is not None:
                 payload = _json({"argv": list(request.argv), "timeout_ms": request.timeout_ms})

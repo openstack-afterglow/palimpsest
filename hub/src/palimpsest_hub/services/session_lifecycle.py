@@ -117,9 +117,54 @@ class SessionMachine:
         self.phase = Phase.SHELVED
         return reconnected
 
-    def unshelved(self) -> None:
+    def unshelved(self, now: float | None = None) -> None:
+        """Back from SHELVED. With no session the full grace period starts at `now` (when given).
+
+        Without `now` a session-less machine has no running timer and never becomes due until a
+        session connects and leaves; callers that resume a user-less instance must pass `now`.
+        """
         if self.phase is not Phase.SHELVED:
             raise ValueError("instance is not shelved")
         self.reconnected_during_shelve = False
         self.phase = Phase.ACTIVE if self.sessions else Phase.GRACE
-        self.grace_started = None
+        self.grace_started = None if self.sessions or now is None else now
+
+    def to_state(self) -> dict:
+        """JSON-serializable snapshot; times are the caller's clock (persist with a wall clock)."""
+        return {
+            "grace_seconds": self.grace_seconds,
+            "phase": self.phase.value,
+            "sessions": sorted(self.sessions),
+            "generation": self.generation,
+            "grace_started": self.grace_started,
+            "reconnected_during_shelve": self.reconnected_during_shelve,
+            "observation_failures": self.observation_failures,
+        }
+
+    @classmethod
+    def from_state(cls, state: dict) -> SessionMachine:
+        """Rebuild a snapshot; any malformed field raises ValueError (callers fail closed)."""
+        try:
+            sessions = state["sessions"]
+            started = state["grace_started"]
+            if (
+                not isinstance(sessions, list)
+                or not all(isinstance(item, str) for item in sessions)
+                or type(state["generation"]) is not int
+                or type(state["observation_failures"]) is not int
+                or type(state["reconnected_during_shelve"]) is not bool
+                or (started is not None and (type(started) not in (int, float) or isinstance(started, bool)))
+                or type(state["grace_seconds"]) not in (int, float)
+            ):
+                raise ValueError("malformed session machine state")
+            return cls(
+                grace_seconds=float(state["grace_seconds"]),
+                phase=Phase(state["phase"]),
+                sessions=set(sessions),
+                generation=state["generation"],
+                grace_started=None if started is None else float(started),
+                reconnected_during_shelve=state["reconnected_during_shelve"],
+                observation_failures=state["observation_failures"],
+            )
+        except (KeyError, TypeError) as exc:
+            raise ValueError("malformed session machine state") from exc

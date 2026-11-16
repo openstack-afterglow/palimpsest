@@ -51,6 +51,44 @@ def test_generic_hub_cache_upload_is_rejected_before_transport(tmp_path: Path, m
     assert source.read_bytes() == b"cache bytes"
 
 
+@pytest.mark.parametrize(
+    ("method", "verb", "suffix"),
+    [
+        ("resume_instance", "POST", "/resume"),
+        ("renew_instance_lifecycle", "POST", "/lifecycle/renew"),
+        ("instance_connection", "GET", "/connection"),
+    ],
+)
+def test_instance_lifecycle_methods_send_exact_verb_and_quoted_path(monkeypatch, method, verb, suffix):
+    client = HubClient("https://hub.example", "original-token")
+    calls = []
+
+    def opened(actual_verb, path, **kwargs):
+        calls.append((actual_verb, path, kwargs))
+        return _Response({"instance_id": "instance/id"})
+
+    monkeypatch.setattr(client, "_open", opened)
+    assert getattr(client, method)("instance/id") == {"instance_id": "instance/id"}
+    assert len(calls) == 1
+    assert calls[0][:2] == (verb, "/instances/instance%2Fid" + suffix)
+    assert calls[0][2]["body"] is None
+
+
+@pytest.mark.parametrize("method", ["resume_instance", "renew_instance_lifecycle", "instance_connection"])
+def test_instance_lifecycle_methods_never_retry_uncertain_transport(monkeypatch, method):
+    client = HubClient("https://hub.example", "original-token")
+    calls = []
+
+    def failed(*args, **kwargs):
+        calls.append(args)
+        raise HubError("uncertain provider response")
+
+    monkeypatch.setattr(client, "_open", failed)
+    with pytest.raises(HubError, match="uncertain provider response"):
+        getattr(client, method)("instance/id")
+    assert len(calls) == 1
+
+
 @pytest.mark.parametrize("failure", ["server-error", "disconnect", "rejected"])
 def test_instance_advance_posts_exact_original_binding_and_get_remains_pure(failure):
     import http.client
@@ -420,6 +458,26 @@ def test_pull_blob_drops_partial_for_malformed_content_range(tmp_path: Path, mon
     assert not sidecar.exists()
 
 
+@pytest.mark.parametrize("restart", [None, "no", "unless-stopped"])
+def test_instance_create_sends_restart_only_when_selected(monkeypatch, restart):
+    client = HubClient("https://hub.example", "token")
+    calls = []
+    original = {"request_id": "original-request"}
+
+    def opened(method, path, **kwargs):
+        calls.append((method, path, kwargs["body"]))
+        return _Response({"id": "original-instance"})
+
+    monkeypatch.setattr(client, "_open", opened)
+    kwargs = {} if restart is None else {"restart": restart}
+    assert client.create_instance(original, **kwargs) == {"id": "original-instance"}
+    expected = {"request_id": "original-request"}
+    if restart is not None:
+        expected["restart"] = restart
+    assert calls == [("POST", "/instances", json.dumps(expected).encode("utf-8"))]
+    assert original == {"request_id": "original-request"}
+
+
 def test_instance_send_guard_runs_after_serialization_and_request_construction(monkeypatch):
     from types import SimpleNamespace
 
@@ -645,3 +703,16 @@ def test_sdk_extension_transfers_only_new_payload_and_never_reconstructs_private
     assert all(
         call[3]["query"]["project_id"] == "origin" and call[3]["query"]["image_id"] == "base-hub-id" for call in calls
     )
+
+
+def test_build_git_posts_the_pinned_request_to_the_git_builds_contract(monkeypatch):
+    client = HubClient("http://hub.invalid", "token")
+    sent = []
+    monkeypatch.setattr(
+        client,
+        "_json_request",
+        lambda method, path, body=None, **_: sent.append((method, path, body)) or {"id": "job-1"},
+    )
+    request = {"repo_url": "https://github.com/o/r.git", "revision": "a" * 40, "name": "git-app"}
+    assert client.build_git(request) == {"id": "job-1"}
+    assert sent == [("POST", "/git-builds", request)]

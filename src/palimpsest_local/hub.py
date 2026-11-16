@@ -600,6 +600,10 @@ class HubClient:
         """Submit Dockerfile text and an optional previously uploaded context digest."""
         return self._json_request("POST", "/dockerfile-builds", request)
 
+    def build_git(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Submit a pinned Git checkout (URL, full commit SHA, Dockerfile and context paths) for a server-side build."""
+        return self._json_request("POST", "/git-builds", request)
+
     def list_image_jobs(self, *, limit: int = 50) -> list[dict[str, Any]]:
         return self._json_request("GET", "/image-jobs", query={"limit": limit})
 
@@ -607,9 +611,15 @@ class HubClient:
         return self._json_request("GET", "/image-jobs/" + urllib.parse.quote(job_id, safe=""))
 
     def create_instance(
-        self, request: dict[str, Any], *, before_send: Callable[[], None] | None = None
+        self,
+        request: dict[str, Any],
+        *,
+        restart: str | None = None,
+        before_send: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         """Create through the Hub API; optionally guard immediately before transport."""
+        if restart is not None:
+            request = {**request, "restart": restart}
         return self._json_request("POST", "/instances", request, before_send=before_send)
 
     def list_instances(self, *, limit: int = 50) -> list[dict[str, Any]]:
@@ -630,6 +640,15 @@ class HubClient:
 
     def stop_instance(self, instance_id: str) -> dict[str, Any]:
         return self._json_request("POST", "/instances/" + urllib.parse.quote(instance_id, safe="") + "/stop")
+
+    def resume_instance(self, instance_id: str) -> dict[str, Any]:
+        return self._json_request("POST", "/instances/" + urllib.parse.quote(instance_id, safe="") + "/resume")
+
+    def renew_instance_lifecycle(self, instance_id: str) -> dict[str, Any]:
+        return self._json_request("POST", "/instances/" + urllib.parse.quote(instance_id, safe="") + "/lifecycle/renew")
+
+    def instance_connection(self, instance_id: str) -> dict[str, Any]:
+        return self._json_request("GET", "/instances/" + urllib.parse.quote(instance_id, safe="") + "/connection")
 
     def delete_instance(self, instance_id: str) -> dict[str, Any]:
         return self._json_request("DELETE", "/instances/" + urllib.parse.quote(instance_id, safe=""))

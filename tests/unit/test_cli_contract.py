@@ -1593,7 +1593,9 @@ def test_cli_compose_ps_aligns_long_names_and_preserves_json(
         ),
         ProjectServiceStatus("db", "db", "stopped"),
     )
-    monkeypatch.setattr(cli, "_compose_callbacks", lambda *_args: SimpleNamespace(inspect=lambda _name: None))
+    monkeypatch.setattr(
+        cli, "_compose_callbacks", lambda *_args, **_kwargs: SimpleNamespace(inspect=lambda _name: None)
+    )
     monkeypatch.setattr(cli, "project_ps", lambda *_args, **_kwargs: rows)
     argv = ["compose", "--project-directory", str(tmp_path), "ps"]
 
@@ -3091,3 +3093,628 @@ def test_materialization_keeps_committed_artifacts_when_catalog_sync_fails(tmp_p
         assert "sha256:" + hasher.hexdigest() == receipt.image_digest
     cas.verify_image(snapshot)
     assert roots.metadata_db.read_bytes() == damaged
+
+
+_GIT_SHA = "a" * 40
+_REQUEST_ID = "7d4c8b1e-2f3a-4b5c-8d9e-0f1a2b3c4d5e"
+
+
+def _git_build_argv(**overrides):
+    values = {
+        "--repo-url": "https://github.com/o/r.git",
+        "--revision": _GIT_SHA,
+        "--request-id": _REQUEST_ID,
+        "--name": "git-app",
+        "--os-family": "alpine",
+        "--os-version": "3",
+    }
+    values.update(overrides)
+    argv = ["image", "git-build"]
+    for key, value in values.items():
+        argv += [key, value]
+    return argv
+
+
+def test_cli_dispatch_image_git_build_posts_the_exact_pinned_request(monkeypatch: pytest.MonkeyPatch, capsys):
+    monkeypatch.setenv("PALIMPSEST_URL", "http://localhost:8080")
+    monkeypatch.setenv("PALIMPSEST_TOKEN", "test-token")
+    sent = []
+    monkeypatch.setattr(
+        "palimpsest_local.cli.HubClient.build_git",
+        lambda self, request: sent.append(request) or {"id": "job-1", "status": "queued"},
+    )
+    assert cli.main(_git_build_argv()) == 0
+    assert sent == [
+        {
+            "repo_url": "https://github.com/o/r.git",
+            "revision": _GIT_SHA,
+            "dockerfile_path": "Dockerfile",
+            "context_subdir": ".",
+            "request_id": _REQUEST_ID,
+            "name": "git-app",
+            "os_family": "alpine",
+            "os_version": "3",
+            "visibility": "private",
+        }
+    ]
+    assert '"job-1"' in capsys.readouterr().out
+
+
+def test_cli_image_git_build_refuses_a_non_uuid_request_id_before_any_hub_call(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("PALIMPSEST_URL", "http://localhost:8080")
+    monkeypatch.setenv("PALIMPSEST_TOKEN", "test-token")
+    monkeypatch.setattr(
+        "palimpsest_local.cli.HubClient.build_git",
+        lambda self, request: pytest.fail("hub called with a bad request id"),
+    )
+    assert cli.main(_git_build_argv(**{"--request-id": "not-a-uuid"})) != 0
+
+
+def test_cli_dispatch_image_git_job_shows_the_commit_the_build_used(monkeypatch: pytest.MonkeyPatch, capsys):
+    monkeypatch.setenv("PALIMPSEST_URL", "http://localhost:8080")
+    monkeypatch.setenv("PALIMPSEST_TOKEN", "test-token")
+    monkeypatch.setattr(
+        "palimpsest_local.cli.HubClient.get_image_job",
+        lambda self, job_id: {"id": job_id, "git": {"revision": _GIT_SHA, "repo_url": "https://github.com/o/r.git"}},
+    )
+    assert cli.main(["image", "git-job", "job-1"]) == 0
+    assert _GIT_SHA in capsys.readouterr().out
+
+
+class _FakeHubClient:
+    seen: list = []
+
+    def __init__(self, url, token, project_id=None, **kwargs):
+        _FakeHubClient.seen.append({"url": url, "token": token, "project_id": project_id})
+
+    def list_images(self, **kwargs):
+        return []
+
+
+def test_hub_cloud_flag_authenticates_with_the_clouds_token_and_its_project(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    monkeypatch.setenv("PALIMPSEST_URL", "http://localhost:8080")
+    monkeypatch.delenv("PALIMPSEST_TOKEN", raising=False)
+    _FakeHubClient.seen = []
+    monkeypatch.setattr("palimpsest_local.cli.HubClient", _FakeHubClient)
+    monkeypatch.setattr(
+        "palimpsest_local.cloud_cli.hub_credentials", lambda cloud: ("keystone-token", "project-uuid-1")
+    )
+    assert cli.main(["--cloud", "dms", "image", "ls"]) == 0
+    assert _FakeHubClient.seen == [
+        {"url": "http://localhost:8080", "token": "keystone-token", "project_id": "project-uuid-1"}
+    ]
+
+
+def test_hub_without_cloud_keeps_the_palimpsest_token_and_sends_no_project(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("PALIMPSEST_URL", "http://localhost:8080")
+    monkeypatch.setenv("PALIMPSEST_TOKEN", "env-token")
+    _FakeHubClient.seen = []
+    monkeypatch.setattr("palimpsest_local.cli.HubClient", _FakeHubClient)
+    assert cli.main(["image", "ls"]) == 0
+    assert _FakeHubClient.seen == [{"url": "http://localhost:8080", "token": "env-token", "project_id": None}]
+
+
+def test_hub_credentials_refuses_a_cloud_without_a_project(monkeypatch: pytest.MonkeyPatch):
+    from palimpsest_local import cloud_cli
+    from palimpsest_local.errors import PalimpsestError
+
+    class _NoProject:
+        def authorize(self):
+            return "keystone-token"
+
+        current_project_id = None
+
+    monkeypatch.setattr(cloud_cli, "_connect", lambda cloud: _NoProject())
+    with pytest.raises(PalimpsestError):
+        cloud_cli.hub_credentials("dms")
+
+
+_CREDENTIAL_FAILURE_CASES = (
+    "unknown-cloud",
+    "missing-auth-option",
+    "connect-timeout",
+    "tls",
+    "unauthorized",
+    "forbidden",
+    "discovery",
+    "server-error",
+    "unclassified",
+)
+
+
+def _credential_failure_case(name: str):
+    from keystoneauth1 import exceptions as keystone
+    from openstack import exceptions as sdk
+
+    def wrapped(cause):
+        # openstacksdk re-raises keystoneauth failures as SDKException(str(cause)) inside the handler.
+        try:
+            raise cause
+        except Exception as original:
+            try:
+                raise sdk.SDKException(str(original))
+            except sdk.SDKException as outer:
+                return outer
+
+    secret = "s3cr3t-password"
+    url = "https://keystone.example"
+    return {
+        "unknown-cloud": (sdk.ConfigException("Cloud dms was not found."), "no usable cloud"),
+        "missing-auth-option": (keystone.MissingRequiredOptions([]), "no usable cloud"),
+        "connect-timeout": (wrapped(keystone.ConnectTimeout(f"Request to {url} timed out")), "cannot reach Keystone"),
+        "tls": (wrapped(keystone.SSLError(f"SSL exception connecting to {url}")), "cannot reach Keystone"),
+        "unauthorized": (wrapped(keystone.http.Unauthorized(f"password {secret} rejected")), "rejected the credential"),
+        "forbidden": (wrapped(keystone.http.Forbidden(f"{secret} forbidden")), "rejected the credential"),
+        "discovery": (wrapped(keystone.DiscoveryFailure(f"no versioned endpoint at {url}")), "no usable identity API"),
+        "server-error": (wrapped(keystone.http.InternalServerError(f"{url} failed")), "(InternalServerError)"),
+        "unclassified": (RuntimeError(f"unexpected {secret}"), "(RuntimeError)"),
+    }[name]
+
+
+@pytest.mark.parametrize("case", _CREDENTIAL_FAILURE_CASES)
+@pytest.mark.parametrize("stage", ["connect", "authorize"])
+def test_hub_credentials_names_the_failed_client_side_check_without_leaking(
+    monkeypatch: pytest.MonkeyPatch, case: str, stage: str
+):
+    pytest.importorskip("openstack")
+    from palimpsest_local import cloud_cli
+    from palimpsest_local.errors import PalimpsestError
+
+    failure, expected = _credential_failure_case(case)
+
+    def refuse(*_):
+        raise failure
+
+    class _Connection:
+        authorize = refuse
+        current_project_id = "p" * 32
+
+    monkeypatch.setattr(cloud_cli, "_connect", refuse if stage == "connect" else lambda cloud: _Connection())
+    with pytest.raises(PalimpsestError) as raised:
+        cloud_cli.hub_credentials("dms")
+    message = str(raised.value)
+    assert expected in message and "'dms'" in message
+    assert "s3cr3t" not in message and "keystone.example" not in message
+
+
+def test_hub_credentials_keeps_its_own_refusals_unchanged(monkeypatch: pytest.MonkeyPatch):
+    from palimpsest_local import cloud_cli
+    from palimpsest_local.errors import PalimpsestError
+
+    def refuse(cloud):
+        raise PalimpsestError("Nova commands require palimpsest-client[cloud]")
+
+    monkeypatch.setattr(cloud_cli, "_connect", refuse)
+    with pytest.raises(PalimpsestError, match=r"require palimpsest-client\[cloud\]"):
+        cloud_cli.hub_credentials("dms")
+
+
+def test_cloud_flag_is_refused_on_commands_that_never_contact_hub(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("PALIMPSEST_URL", "http://localhost:8080")
+    monkeypatch.setattr(
+        "palimpsest_local.cloud_cli.hub_credentials",
+        lambda cloud: pytest.fail("cloud credentials used for a non-Hub command"),
+    )
+    assert cli.main(["--cloud", "dms", "ps"]) != 0
+
+
+def test_published_push_with_cloud_uses_the_keystone_token_and_project(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    monkeypatch.setenv("PALIMPSEST_URL", "https://hub.example")
+    monkeypatch.setenv("PALIMPSEST_TOKEN", "env-token-must-not-be-used")
+    monkeypatch.delenv("PALIMPSEST_IMAGE_KEY", raising=False)
+    monkeypatch.setattr("palimpsest_local.cloud_cli.hub_credentials", lambda cloud: ("cloud-token", "project-uuid-9"))
+    seen = {}
+
+    def fake_publish(roots, image_id, *, client, **kwargs):
+        seen["token"] = client._token
+        seen["project_id"] = client._project_id
+        return {"status": "published"}
+
+    monkeypatch.setattr("palimpsest_local.hub_publish.publish_local_image", fake_publish)
+    rc = cli.main(
+        ["--cloud", "dms", "published", "push", "sha256:" + "a" * 64, "--name", "demo", "--state-root", str(tmp_path)]
+    )
+    assert rc == 0
+    assert seen == {"token": "cloud-token", "project_id": "project-uuid-9"}
+
+
+def test_compose_stack_resolution_forwards_cloud_to_hub_image_lookup(monkeypatch: pytest.MonkeyPatch):
+    from types import SimpleNamespace
+
+    captured = {}
+
+    def fake_build_project_callbacks(project, roots, resolve_stack, environment):
+        captured["resolve_stack"] = resolve_stack
+        return SimpleNamespace()
+
+    def fake_resolve_runtime_stack(store, target, layers, explicit_url, **kwargs):
+        captured["kwargs"] = kwargs
+        captured["explicit_url"] = explicit_url
+        return SimpleNamespace()
+
+    monkeypatch.setattr(cli, "build_project_callbacks", fake_build_project_callbacks)
+    monkeypatch.setattr(cli, "_resolve_runtime_stack", fake_resolve_runtime_stack)
+    cli._compose_callbacks(None, {}, None, None, "https://hub.example", cloud="dms")
+    captured["resolve_stack"](SimpleNamespace(name="svc", bundle=None, image="sha256:" + "b" * 64, layers=()))
+    assert captured["kwargs"]["cloud"] == "dms"
+    assert captured["explicit_url"] == "https://hub.example"
+
+
+def test_cloud_env_up_keeps_its_own_cloud_flag_and_passes_the_hub_gate():
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            "cloud",
+            "env",
+            "up",
+            "demo",
+            "--cloud",
+            "dms",
+            "--network",
+            "net",
+            "--external-network",
+            "ext",
+            "--image",
+            "img",
+            "--worker-flavor",
+            "flv",
+        ]
+    )
+    assert args.cloud == "dms"
+    assert args.hub_cloud is None
+    cli._reject_unused_cloud(args)
+
+
+def test_global_cloud_flag_before_run_keeps_the_command_override(monkeypatch: pytest.MonkeyPatch):
+    captured = {}
+
+    def capture_and_stop(args, parser):
+        captured["command_override"] = getattr(args, "command_override", "unset")
+        captured["hub_cloud"] = args.hub_cloud
+        raise cli.PalimpsestError("stop after parse")
+
+    monkeypatch.setattr(cli, "_validate_args", capture_and_stop)
+    rc = cli.main(["--cloud", "dms", "run", "example:image", "--", "echo", "ok"])
+    assert rc != 0
+    assert captured == {"command_override": ("echo", "ok"), "hub_cloud": "dms"}
+
+
+_INSTANCE_IMAGE = "11111111-1111-4111-8111-111111111111"
+_INSTANCE_NETWORK = "22222222-2222-4222-8222-222222222222"
+_INSTANCE_VOLUME = "33333333-3333-4333-8333-333333333333"
+_INSTANCE_ID = "44444444-4444-4444-8444-444444444444"
+
+
+def _instance_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PALIMPSEST_URL", "http://localhost:8080")
+    monkeypatch.setenv("PALIMPSEST_TOKEN", "test-token")
+
+
+def _instance_create_argv(**overrides):
+    values = {
+        "--request-id": _REQUEST_ID,
+        "--name": "dev-box",
+        "--image-id": _INSTANCE_IMAGE,
+        "--flavor-id": "m1.small",
+        "--network-id": _INSTANCE_NETWORK,
+        "--boot-gib": "20",
+        "--layer-digest": "sha256:" + "b" * 64,
+    }
+    values.update(overrides)
+    argv = ["instance", "create"]
+    for key, value in values.items():
+        argv += [key, value]
+    return argv
+
+
+def test_cli_instance_create_posts_only_the_selected_fields(monkeypatch: pytest.MonkeyPatch, capsys):
+    _instance_env(monkeypatch)
+    sent = []
+    options = []
+    monkeypatch.setattr(
+        "palimpsest_local.cli.HubClient.create_instance",
+        lambda self, request, **kwargs: (
+            sent.append(request) or options.append(kwargs) or {"id": _INSTANCE_ID, "status": "creating"}
+        ),
+    )
+    argv = _instance_create_argv(**{"--command-json": '["/bin/true"]', "--writable-gib": "8"})
+    assert cli.main(argv) == 0
+    assert sent == [
+        {
+            "request_id": _REQUEST_ID,
+            "name": "dev-box",
+            "image_id": _INSTANCE_IMAGE,
+            "flavor_id": "m1.small",
+            "network_id": _INSTANCE_NETWORK,
+            "boot_gib": 20,
+            "writable_gib": 8,
+            "layer_digests": ["sha256:" + "b" * 64],
+            "command": ["/bin/true"],
+        }
+    ]
+    assert "restart" not in sent[0]
+    assert options == [{"restart": None}]
+    assert _INSTANCE_ID in capsys.readouterr().out
+
+
+def test_cli_instance_create_sends_every_optional_field_under_the_hub_names(monkeypatch: pytest.MonkeyPatch):
+    _instance_env(monkeypatch)
+    sent = []
+    options = []
+    monkeypatch.setattr(
+        "palimpsest_local.cli.HubClient.create_instance",
+        lambda self, request, **kwargs: sent.append(request) or options.append(kwargs) or {"id": _INSTANCE_ID},
+    )
+    group = "55555555-5555-4555-8555-555555555555"
+    job = "66666666-6666-4666-8666-666666666666"
+    cluster = "77777777-7777-4777-8777-777777777777"
+    argv = _instance_create_argv(
+        **{
+            "--layer-digest": "sha256:" + "c" * 64,
+            "--image-job-id": job,
+            "--security-group-id": group,
+            "--gpu-profile": "rtx",
+            "--cluster-profile": "k3s-agent",
+            "--cluster-server-id": cluster,
+            "--command-json": '["/bin/app", "--serve"]',
+            "--readiness-json": '["/bin/ready"]',
+            "--lifecycle": "dev",
+            "--key-name": "my-key",
+            "--restart": "unless-stopped",
+        }
+    )
+    assert cli.main(argv) == 0
+    assert sent[0] == {
+        "request_id": _REQUEST_ID,
+        "name": "dev-box",
+        "image_id": _INSTANCE_IMAGE,
+        "flavor_id": "m1.small",
+        "network_id": _INSTANCE_NETWORK,
+        "boot_gib": 20,
+        "layer_digests": ["sha256:" + "c" * 64],
+        "image_job_id": job,
+        "security_group_ids": [group],
+        "gpu_profile": "rtx",
+        "cluster_profile": "k3s-agent",
+        "cluster_server_id": cluster,
+        "command": ["/bin/app", "--serve"],
+        "readiness_argv": ["/bin/ready"],
+        "lifecycle": "dev",
+        "key_name": "my-key",
+    }
+    assert options == [{"restart": "unless-stopped"}]
+    # source_instance_id is the remaining optional field; it replaces the layer stack on the Hub.
+    sent.clear()
+    source = "88888888-8888-4888-8888-888888888888"
+    argv = _instance_create_argv(**{"--source-instance-id": source})
+    assert cli.main([*argv[: argv.index("--layer-digest")], *argv[argv.index("--layer-digest") + 2 :]]) == 0
+    assert sent[0]["source_instance_id"] == source and "layer_digests" not in sent[0]
+
+
+_BAD_UUID = "not-a-uuid"
+_INSTANCE_BAD_CASES = [
+    (_instance_create_argv(**{"--request-id": _BAD_UUID}), "--request-id must be a UUID"),
+    (_instance_create_argv(**{"--image-id": _BAD_UUID}), "--image-id must be a UUID"),
+    (_instance_create_argv(**{"--network-id": _BAD_UUID}), "--network-id must be a UUID"),
+    (_instance_create_argv(**{"--security-group-id": _BAD_UUID}), "--security-group-id must be a UUID"),
+    (_instance_create_argv(**{"--image-job-id": _BAD_UUID}), "--image-job-id must be a UUID"),
+    (_instance_create_argv(**{"--command-json": '"/bin/true"'}), "--command-json must be a JSON array of strings"),
+    (_instance_create_argv(**{"--command-json": "[1]"}), "--command-json must be a JSON array of strings"),
+    (_instance_create_argv(**{"--command-json": "[" * 200000}), "--command-json must be a JSON array of strings"),
+    (_instance_create_argv(**{"--readiness-json": "not json"}), "--readiness-json must be a JSON array of strings"),
+    (
+        _instance_create_argv(**{"--restart": "unless-stopped"}),
+        "--restart unless-stopped requires --readiness-json",
+    ),
+    (["instance", "status", _BAD_UUID], "instance_id must be a UUID"),
+    (["instance", "stop", _BAD_UUID], "instance_id must be a UUID"),
+    (["instance", "rm", _BAD_UUID], "instance_id must be a UUID"),
+    (["instance", "resume", _BAD_UUID], "instance_id must be a UUID"),
+    (["instance", "renew", _BAD_UUID], "instance_id must be a UUID"),
+    (["instance", "connection", _BAD_UUID], "instance_id must be a UUID"),
+    (
+        [
+            "instance",
+            "advance",
+            _INSTANCE_ID,
+            "--operation",
+            "create-server",
+            "--request-id",
+            _BAD_UUID,
+            "--boot-volume-id",
+            _INSTANCE_VOLUME,
+        ],
+        "--request-id must be a UUID",
+    ),
+    (
+        [
+            "instance",
+            "advance",
+            _INSTANCE_ID,
+            "--operation",
+            "create-server",
+            "--request-id",
+            _REQUEST_ID,
+            "--boot-volume-id",
+            _BAD_UUID,
+        ],
+        "--boot-volume-id must be a UUID",
+    ),
+    (["instance", "ls", "--limit", "101"], "--limit must be between 1 and 100 for instance ls"),
+]
+
+
+@pytest.mark.parametrize(("argv", "message"), _INSTANCE_BAD_CASES)
+def test_cli_instance_rejects_malformed_arguments_before_any_credential_or_hub_call(
+    monkeypatch: pytest.MonkeyPatch, capsys, argv, message
+):
+    _instance_env(monkeypatch)
+    monkeypatch.setattr(
+        "palimpsest_local.cli.hub_client",
+        lambda *args, **kwargs: pytest.fail("credentials or Hub reached before local validation"),
+    )
+    assert cli.main(argv) == 1
+    assert message in capsys.readouterr().err
+
+
+def test_cli_instance_advance_binds_the_operation_to_the_reserved_volume(monkeypatch: pytest.MonkeyPatch, capsys):
+    _instance_env(monkeypatch)
+    sent = []
+    monkeypatch.setattr(
+        "palimpsest_local.cli.HubClient.advance_instance",
+        lambda self, instance_id, **kwargs: sent.append((instance_id, kwargs)) or {"status": "creating"},
+    )
+    argv = [
+        "instance",
+        "advance",
+        _INSTANCE_ID,
+        "--operation",
+        "create-server",
+        "--request-id",
+        _REQUEST_ID,
+        "--boot-volume-id",
+        _INSTANCE_VOLUME,
+    ]
+    assert cli.main(argv) == 0
+    assert sent == [
+        (
+            _INSTANCE_ID,
+            {"operation": "create-server", "request_id": _REQUEST_ID, "boot_volume_id": _INSTANCE_VOLUME},
+        )
+    ]
+    assert cli.main([*argv[:3], "--operation", "force-delete", *argv[5:]]) != 0
+    assert len(sent) == 1
+
+
+def test_cli_instance_stop_status_ls_and_rm_use_distinct_hub_calls(monkeypatch: pytest.MonkeyPatch, capsys):
+    _instance_env(monkeypatch)
+    calls = []
+    for name, result in (
+        ("list_instances", []),
+        ("get_instance", {"id": _INSTANCE_ID}),
+        ("stop_instance", {"status": "stopping"}),
+        ("delete_instance", {"status": "deleting"}),
+    ):
+        monkeypatch.setattr(
+            f"palimpsest_local.cli.HubClient.{name}",
+            lambda self, *args, _name=name, _result=result, **kwargs: calls.append((_name, args, kwargs)) or _result,
+        )
+    for argv in (
+        ["instance", "ls", "--limit", "5"],
+        ["instance", "status", _INSTANCE_ID],
+        ["instance", "stop", _INSTANCE_ID],
+        ["instance", "rm", _INSTANCE_ID],
+    ):
+        assert cli.main(argv) == 0
+    assert calls == [
+        ("list_instances", (), {"limit": 5}),
+        ("get_instance", (_INSTANCE_ID,), {}),
+        ("stop_instance", (_INSTANCE_ID,), {}),
+        ("delete_instance", (_INSTANCE_ID,), {}),
+    ]
+
+
+def test_cli_instance_commands_accept_the_cloud_flag(monkeypatch: pytest.MonkeyPatch):
+    _InstanceFakeClient.seen = []
+    monkeypatch.setattr("palimpsest_local.cli.HubClient", _InstanceFakeClient)
+    monkeypatch.setattr("palimpsest_local.cloud_cli.hub_credentials", lambda cloud: ("cloud-token", "p" * 32))
+    monkeypatch.delenv("PALIMPSEST_TOKEN", raising=False)
+    assert cli.main(["--cloud", "mycloud", "instance", "ls"]) == 0
+    assert _InstanceFakeClient.seen == [{"token": "cloud-token", "project_id": "p" * 32}]
+
+
+class _InstanceFakeClient:
+    seen: list = []
+
+    def __init__(self, url, token, project_id=None, **kwargs):
+        _InstanceFakeClient.seen.append({"token": token, "project_id": project_id})
+
+    def list_instances(self, **kwargs):
+        return []
+
+
+@pytest.mark.parametrize(
+    ("command", "method", "result"),
+    [
+        ("resume", "resume_instance", {"id": _INSTANCE_ID, "status": "resuming"}),
+        (
+            "renew",
+            "renew_instance_lifecycle",
+            {"instance_id": _INSTANCE_ID, "trust_expires_at": "2030-01-02T03:04:05Z"},
+        ),
+        (
+            "connection",
+            "instance_connection",
+            {"instance_id": _INSTANCE_ID, "addresses": [], "ssh": {"key_name": "my-key"}},
+        ),
+    ],
+)
+@pytest.mark.parametrize("cloud", [False, True])
+def test_cli_instance_lifecycle_commands_dispatch_json(
+    monkeypatch: pytest.MonkeyPatch, capsys, command, method, result, cloud
+):
+    _instance_env(monkeypatch)
+    calls = []
+    monkeypatch.setattr(
+        f"palimpsest_local.cli.HubClient.{method}",
+        lambda self, instance_id: calls.append(instance_id) or result,
+    )
+    prefix = []
+    if cloud:
+        monkeypatch.delenv("PALIMPSEST_TOKEN")
+        monkeypatch.setattr("palimpsest_local.cloud_cli.hub_credentials", lambda name: ("cloud-token", "p" * 32))
+        prefix = ["--cloud", "mycloud"]
+    assert cli.main([*prefix, "instance", command, _INSTANCE_ID]) == 0
+    assert calls == [_INSTANCE_ID]
+    assert json.loads(capsys.readouterr().out) == result
+
+
+def test_cli_instance_explicit_service_lifecycle_is_not_omitted(monkeypatch: pytest.MonkeyPatch):
+    _instance_env(monkeypatch)
+    sent = []
+    monkeypatch.setattr(
+        "palimpsest_local.cli.HubClient.create_instance",
+        lambda self, request, **kwargs: sent.append(request) or {"id": _INSTANCE_ID},
+    )
+    assert cli.main(_instance_create_argv(**{"--lifecycle": "service"})) == 0
+    assert sent[0]["lifecycle"] == "service"
+
+
+def test_cli_instance_explicit_no_restart_is_not_omitted(monkeypatch: pytest.MonkeyPatch):
+    _instance_env(monkeypatch)
+    sent = []
+    monkeypatch.setattr(
+        "palimpsest_local.cli.HubClient.create_instance",
+        lambda self, request, **kwargs: sent.append((request, kwargs)) or {"id": _INSTANCE_ID},
+    )
+    assert cli.main(_instance_create_argv(**{"--restart": "no"})) == 0
+    assert "restart" not in sent[0][0]
+    assert sent[0][1] == {"restart": "no"}
+
+
+def test_cli_instance_lifecycle_completion_candidates():
+    from palimpsest_local import completion
+
+    parser = cli.build_parser()
+    assert set(completion.resolve_candidates(parser, ["instance", ""])) >= {
+        "ls",
+        "status",
+        "create",
+        "advance",
+        "stop",
+        "resume",
+        "renew",
+        "connection",
+        "rm",
+    }
+    assert set(completion.resolve_candidates(parser, ["instance", "create", "--"])) >= {
+        "--lifecycle",
+        "--key-name",
+        "--restart",
+    }
+    assert completion.resolve_candidates(parser, ["instance", "create", "--lifecycle", ""]) == ["dev", "service"]
+    assert completion.resolve_candidates(parser, ["instance", "create", "--restart", ""]) == ["no", "unless-stopped"]

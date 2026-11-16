@@ -12,15 +12,29 @@ from contextlib import suppress
 
 from palimpsest_hub.config import get_settings
 from palimpsest_hub.database import close_db, init_db
-from palimpsest_hub.logging import configure_logging
+from palimpsest_hub.logging import configure_logging, failure_fields
 from palimpsest_hub.services.image_exports import (
     process_one_image_export,
     run_delegation_cleanup,
     run_export_maintenance,
     validate_qemu_img_support,
 )
+from palimpsest_hub.services.instance_lifecycle import run_session_lifecycle
 
 logger = logging.getLogger(__name__)
+
+
+async def _session_lifecycle_loop(settings, stop_event: asyncio.Event) -> None:
+    """Idle auto-shelve passes run beside export work: a shelve can wait minutes on Nova."""
+    while not stop_event.is_set():
+        try:
+            await run_session_lifecycle(settings)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Session lifecycle pass failed %s", failure_fields(exc))
+        with suppress(TimeoutError):
+            await asyncio.wait_for(stop_event.wait(), timeout=float(settings.palimpsest_hub_session_tick_seconds))
 
 
 async def main() -> None:
@@ -63,34 +77,39 @@ async def main() -> None:
     last_delegation_cleanup = 0.0
     delegation_cleanup_interval = 60.0  # Retired requester Trusts are deleted promptly and retried durably
 
+    session_task = asyncio.create_task(_session_lifecycle_loop(settings, stop_event))
     try:
         while not stop_event.is_set():
             processed = False
             try:
                 processed = await process_one_image_export(owner=worker_id)
-            except Exception:
-                logger.error("Image export worker iteration failed")
+            except Exception as exc:
+                logger.error("Image export worker iteration failed %s", failure_fields(exc))
 
             now = loop.time()
             if now - last_delegation_cleanup > delegation_cleanup_interval:
                 # The service owns its SQL role even when called outside this entrypoint.
                 try:
                     await run_delegation_cleanup()
-                except Exception:
-                    logger.warning("Export delegation cleanup failed")
+                except Exception as exc:
+                    logger.warning("Export delegation cleanup failed %s", failure_fields(exc))
                 last_delegation_cleanup = now
 
             if now - last_maint > maint_interval:
                 try:
                     await run_export_maintenance()
                     last_maint = now
-                except Exception:
-                    logger.warning("Export maintenance failed")
+                except Exception as exc:
+                    logger.warning("Export maintenance failed %s", failure_fields(exc))
 
             if not processed and not stop_event.is_set():
                 with suppress(TimeoutError):
                     await asyncio.wait_for(stop_event.wait(), timeout=2.0)
     finally:
+        stop_event.set()
+        session_task.cancel()
+        with suppress(asyncio.CancelledError, Exception):
+            await session_task
         logger.info("Palimpsest worker shutting down DB connection pool")
         await close_db()
 

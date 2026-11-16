@@ -56,7 +56,7 @@ PORTABLE_FILES = {
         benchmark_station_cli benchmark_station_cloud benchmark_station_disk benchmark_station_measurements
         platforms process_session darwin_process project project_adapter project_runtime project_volumes oci_host
         ext4_upper oci_capture oci_commit vz_commit vz_commit_e2e vz_native_commit_tool vz_root_volume_lifecycle
-        oci_run_request oci_run_adapter oci_public_cli oci_resource_status oci_docker_hub_cli_live_contract
+        oci_run_request oci_run_adapter oci_public_cli vz_native_session_marker oci_resource_status oci_docker_hub_cli_live_contract
         oci_docker_hub_services_live_contract oci_ml_cpu_live_contract oci_network oci_network_live_contract
         oci_exec_cli_live_contract oci_stdio_cli_live_contract
     """),
@@ -139,6 +139,11 @@ SPECIAL_FILES = {
             "public_images",
             "image_executor",
             "instances",
+            "instance_session_reporter",
+            "instance_lifecycle_api",
+            "instance_lifecycle",
+            "instance_runner_resume",
+            "instance_restart",
             "execution_boundaries",
             "export_delegation",
             "migrate",
@@ -148,6 +153,12 @@ SPECIAL_FILES = {
             "preflight",
             "git_source",
             "session_lifecycle",
+            "session_controller",
+            "session_observer",
+            "nova_shelve_provider",
+            "git_context",
+            "git_staging",
+            "instance_options",
         )
     ),
 }

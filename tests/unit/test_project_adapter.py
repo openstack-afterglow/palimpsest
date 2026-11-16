@@ -757,7 +757,7 @@ services:
         fresh["host_shares"] = project_adapter.cloud_runtime._host_share_records(item.resolved.request.spec.host_shares)
         state.atomic_write_json(fresh_paths.state, fresh)
 
-    def callbacks(project, _environment, received_roots, _store, _url):
+    def callbacks(project, _environment, received_roots, _store, _url, **_kwargs):
         assert received_roots == roots
         built = project_adapter.build_project_callbacks(project, roots, lambda _service: stack)
         return replace(built, inspect=inspect, stop=stop, remove=remove, start=start)
@@ -2277,7 +2277,7 @@ services:
     monkeypatch.setattr(project_adapter.kvm, "validate_network", forbidden)
     monkeypatch.setattr(project_adapter.runtime_dispatch, "preflight_run_request", forbidden)
 
-    def callbacks(loaded, _environment, received_roots, _store, _url):
+    def callbacks(loaded, _environment, received_roots, _store, _url, **_kwargs):
         assert received_roots == roots
         built = project_adapter.build_project_callbacks(loaded, roots, forbidden)
         return replace(

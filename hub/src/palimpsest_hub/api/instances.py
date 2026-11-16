@@ -23,6 +23,8 @@ from palimpsest_hub.auth import get_os_conn, get_package_manager_info, package_t
 from palimpsest_hub.config import get_settings
 from palimpsest_hub.instance_models import PalimpsestHubInstance
 from palimpsest_hub.models import exact_identity
+from palimpsest_hub.services import instance_lifecycle as lifecycle
+from palimpsest_hub.services import instance_options
 from palimpsest_hub.services import instances as service
 from palimpsest_hub.services.digest import normalize_digest
 from palimpsest_hub.services.instance_cluster_runtime import (
@@ -41,6 +43,10 @@ class InstanceRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     request_id: UUID
     name: str = Field(pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$")
+    lifecycle: Literal["service", "dev"] = "service"
+    # None lets the Hub choose: unless-stopped for a service instance with a readiness probe, else no.
+    restart: Literal["no", "unless-stopped"] | None = None
+    key_name: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9_. @-]{0,254}$")
     image_id: UUID
     flavor_id: str = Field(min_length=1, max_length=64, pattern=r"^[a-zA-Z0-9_.-]+$")
     gpu_profile: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
@@ -96,8 +102,12 @@ class InstanceRequest(BaseModel):
             raise ValueError("writable_gib must be smaller than boot_gib")
         if self.cluster_server_id and not self.cluster_profile:
             raise ValueError("cluster_server_id requires cluster_profile")
+        if self.lifecycle == "dev" and self.cluster_profile:
+            raise ValueError("lifecycle=dev excludes cluster_profile because guest user-data exceeds Nova's size limit")
         if self.cluster_profile and (self.gpu_profile or self.command or self.readiness_argv):
             raise ValueError("cluster_profile excludes GPU and caller-selected execution")
+        if self.restart == "unless-stopped" and (not self.readiness_argv or self.gpu_profile or self.cluster_profile):
+            raise ValueError("restart=unless-stopped needs a readiness probe and excludes GPU and cluster profiles")
         return self
 
 
@@ -116,6 +126,19 @@ async def create_instance(req: InstanceRequest, actor: dict = Depends(_legacy_wr
     ):
         raise HTTPException(503, "A canonical HTTPS public origin is required for instance bootstrap")
     return await service.create(_factory_or_503(), _store_or_503(), settings, actor, conn, req.model_dump(mode="json"))
+
+
+@router.get("/instance-options", operation_id="list_hub_instance_options")
+async def instance_options_route(
+    response: Response, actor: dict = Depends(_legacy_writer), conn=Depends(get_os_conn)
+) -> dict:
+    """Boot images, flavors, project networks and key names the caller can name in a create request."""
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        return await run_blocking(instance_options.choices, conn, actor, get_settings())
+    except HTTPException as exc:
+        exc.headers = {**(exc.headers or {}), "Cache-Control": "no-store"}
+        raise
 
 
 @router.get("/instances", operation_id="list_hub_instances")
@@ -176,6 +199,26 @@ async def stop_instance(instance_id: UUID, actor: dict = Depends(_instance_contr
     return await service.action(_factory_or_503(), actor, conn, str(instance_id), "stop")
 
 
+@router.post("/instances/{instance_id}/resume", status_code=202, operation_id="resume_hub_instance")
+async def resume_instance(instance_id: UUID, actor: dict = Depends(_instance_controller), conn=Depends(get_os_conn)):
+    return await lifecycle.resume(_factory_or_503(), actor, conn, str(instance_id), get_settings())
+
+
+@router.post("/instances/{instance_id}/lifecycle/renew", operation_id="renew_hub_instance_lifecycle")
+async def renew_instance_lifecycle(
+    instance_id: UUID, actor: dict = Depends(_instance_controller), conn=Depends(get_os_conn)
+):
+    return await lifecycle.renew_trust(_factory_or_503(), actor, conn, str(instance_id), get_settings())
+
+
+@router.get("/instances/{instance_id}/connection", operation_id="get_hub_instance_connection")
+async def instance_connection(
+    instance_id: UUID, response: Response, actor: dict = Depends(_legacy_inventory), conn=Depends(get_os_conn)
+):
+    response.headers["Cache-Control"] = "no-store"
+    return await lifecycle.connection_info(_factory_or_503(), actor, conn, str(instance_id), get_settings())
+
+
 @router.delete("/instances/{instance_id}", status_code=202, operation_id="delete_hub_instance")
 async def delete_instance(instance_id: UUID, actor: dict = Depends(_instance_controller), conn=Depends(get_os_conn)):
     return await service.action(_factory_or_503(), actor, conn, str(instance_id), "delete")
@@ -186,6 +229,37 @@ def bearer(request):
     if not header.startswith("Bearer ") or not 32 <= len(header[7:]) <= 128:
         raise HTTPException(404, "Bootstrap capability not found or expired")
     return header[7:]
+
+
+class InstanceSessionReport(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    probe: str = Field(max_length=65536)
+
+
+@router.put(
+    "/instance-bootstrap/{instance_id}/sessions",
+    status_code=204,
+    operation_id="report_instance_sessions",
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "content": {"application/json": {"schema": InstanceSessionReport.model_json_schema()}},
+        }
+    },
+)
+async def report_instance_sessions(instance_id: UUID, request: Request):
+    token = bearer(request)
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > 6 * 65536 + 64:
+            raise HTTPException(413, "Guest session report exceeds byte limit")
+        body.extend(chunk)
+    try:
+        report = InstanceSessionReport.model_validate_json(bytes(body))
+    except ValueError:
+        raise HTTPException(422, "Invalid bounded guest session report") from None
+    await lifecycle.ingest_report(_factory_or_503(), str(instance_id), token, report.probe)
+    return Response(status_code=204, headers={"Cache-Control": "no-store"})
 
 
 @router.get("/instance-bootstrap/{instance_id}/layers/{digest}", operation_id="get_instance_bootstrap_layer")
@@ -253,7 +327,12 @@ class InstanceResult(BaseModel):
     exit_code: int | None = Field(None, ge=-255, le=255)
     stdout: str = Field(default="", max_length=8192)
     stderr: str = Field(default="", max_length=8192)
-    error_code: Literal["guest_execution_failed", "command_failed"] | GpuErrorCode | ClusterErrorCode | None = None
+    error_code: (
+        Literal["guest_execution_failed", "guest_setup_timeout", "command_failed"]
+        | GpuErrorCode
+        | ClusterErrorCode
+        | None
+    ) = None
 
     @model_validator(mode="after")
     def outcome(self):
@@ -322,5 +401,117 @@ async def bootstrap_result(instance_id: UUID, request: Request):
         row.status = payload["status"]
         row.error_code = payload["error_code"]
         row.updated_at = datetime.now(UTC)
+        await session.commit()
+    return Response(status_code=204, headers={"Cache-Control": "no-store"})
+
+
+@router.put(
+    "/instance-bootstrap/{instance_id}/resume-result",
+    status_code=204,
+    operation_id="put_instance_bootstrap_resume_result",
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "content": {"application/json": {"schema": InstanceResult.model_json_schema()}},
+        }
+    },
+)
+async def bootstrap_resume_result(instance_id: UUID, request: Request):
+    """A shelved dev guest reports that it restored (or failed to restore) its retained root.
+
+    The single-use bootstrap capability has expired by then, so this uses the guest's session-report
+    capability, and only while the Hub itself recorded the instance as `resumed`. The sealed first
+    result stays untouched; the resume outcome is recorded beside it.
+    """
+    token = bearer(request)
+    body = bytearray()
+    async for chunk in request.stream():
+        body.extend(chunk)
+        if len(body) > 70000:
+            raise HTTPException(413, "Guest result exceeds byte limit")
+    try:
+        result = InstanceResult.model_validate_json(bytes(body))
+    except ValueError:
+        raise HTTPException(422, "Invalid bounded guest result") from None
+    if str(result.instance_id) != str(instance_id):
+        raise HTTPException(409, "Guest result identity does not match capability")
+    async with sql_mutex(_factory_or_503(), "build-api:instance:" + str(instance_id)) as session:
+        row = await session.get(PalimpsestHubInstance, str(instance_id))
+        if row is None:
+            raise HTTPException(404, "Session report capability not found")
+        await lifecycle.verify_session_capability(session, str(instance_id), token)
+        payload = result.model_dump(mode="json")
+        for channel in ("stdout", "stderr"):
+            payload[channel] = payload[channel].replace(token, "[redacted session capability]")
+        if row.status != "resumed":
+            # The guest resends the identical bounded report after a lost response; accept only that.
+            recorded = row.spec_json.get("resume_result")
+            if recorded is not None and {key: val for key, val in recorded.items() if key != "recorded_at"} == payload:
+                return Response(status_code=204, headers={"Cache-Control": "no-store"})
+            raise HTTPException(409, "Instance is not awaiting a resume result")
+        now = datetime.now(UTC)
+        row.spec_json = {**row.spec_json, "resume_result": {**payload, "recorded_at": now.isoformat()}}
+        row.status = payload["status"]
+        row.error_code = payload["error_code"]
+        row.updated_at = now
+        await session.commit()
+    return Response(status_code=204, headers={"Cache-Control": "no-store"})
+
+
+class InstanceRestartStatus(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    instance_id: UUID
+    restarts: int = Field(ge=1, le=1_000_000_000, strict=True)
+    last_exit_code: int = Field(ge=-255, le=255, strict=True)
+    state: Literal["backoff", "running"]
+
+
+@router.put(
+    "/instance-bootstrap/{instance_id}/restart-status",
+    status_code=204,
+    operation_id="put_instance_bootstrap_restart_status",
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "content": {"application/json": {"schema": InstanceRestartStatus.model_json_schema()}},
+        }
+    },
+)
+async def bootstrap_restart_status(instance_id: UUID, request: Request):
+    """The guest reports that its main command exited and is being (or was) started again.
+
+    Observation only: the VM, its writable layer and the instance status are untouched. The guest
+    restarts regardless of whether this report is delivered.
+    """
+    token = bearer(request)
+    body = bytearray()
+    async for chunk in request.stream():
+        body.extend(chunk)
+        if len(body) > 1024:
+            raise HTTPException(413, "Guest restart status exceeds byte limit")
+    try:
+        report = InstanceRestartStatus.model_validate_json(bytes(body))
+    except ValueError:
+        raise HTTPException(422, "Invalid bounded guest restart status") from None
+    if str(report.instance_id) != str(instance_id):
+        raise HTTPException(409, "Guest restart status identity does not match capability")
+    async with sql_mutex(_factory_or_503(), "build-api:instance:" + str(instance_id)) as session:
+        row = await session.get(PalimpsestHubInstance, str(instance_id))
+        if row is None:
+            raise HTTPException(404, "Restart status capability not found")
+        service.restart_capability(row, token)
+        if row.status not in ("ready", "resumed"):
+            raise HTTPException(409, "Instance is not running a restartable command")
+        now = datetime.now(UTC)
+        row.spec_json = {
+            **row.spec_json,
+            "restart_status": {
+                "restarts": report.restarts,
+                "last_exit_code": report.last_exit_code,
+                "state": report.state,
+                "recorded_at": now.isoformat(),
+            },
+        }
+        row.updated_at = now
         await session.commit()
     return Response(status_code=204, headers={"Cache-Control": "no-store"})

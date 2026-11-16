@@ -103,7 +103,7 @@ def test_prefix_filtering():
     parser = cli.build_parser()
 
     i_candidates = completion.resolve_candidates(parser, ["i"])
-    assert set(i_candidates) == {"image", "images", "inspect"}
+    assert set(i_candidates) == {"image", "images", "inspect", "instance"}
 
     st_candidates = completion.resolve_candidates(parser, ["st"])
     assert set(st_candidates) == {"start", "stop", "store"}

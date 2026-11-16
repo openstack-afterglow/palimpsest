@@ -27,6 +27,7 @@ from palimpsest_hub.main import app
     [
         ("/v1/instances", {"command": [{"private-input": "never-reflect-execution-secret"}]}),
         ("/v1/dockerfile-builds", {"dockerfile": {"private-input": "never-reflect-execution-secret"}}),
+        ("/v1/git-builds", {"repo_url": {"private-input": "never-reflect-execution-secret"}}),
         ("/v1/published-images", {"manifest": {"private-input": "never-reflect-execution-secret"}}),
         ("/v1/native-instances", {"command": [{"private-input": "never-reflect-execution-secret"}]}),
     ],
@@ -182,6 +183,7 @@ def test_generated_guest_reporter_bounds_actual_json_envelope_and_retries_identi
         "ROOT": tmp_path,
         "spec": spec,
         "deadline": spec["expires_at"],
+        "resuming": False,
         "headers": {"Authorization": "Bearer " + capability},
         "process": SimpleNamespace(poll=lambda: 0),
         "json": json,

@@ -4,8 +4,122 @@ All notable changes to Palimpsest Local are documented here.
 
 ## [Unreleased]
 
+## [0.3.29] - 2026-11-15 (UTC; published and deployed)
+
+### Changed
+
+- Hub logs: three kinds of failure that the Hub swallows are now named, by exception class and innermost Hub call site (`cause=<class> site=<module>:<function>:<line>`), never by message or traceback. An unhandled request failure adds an ERROR line `hub request failed method=… route=… request_id=… cause=… site=…` before the existing `status=500` line (for package routes the id is the `X-Request-Id` the client received). `/v1/ready` adds a WARNING `readiness probe failed check=<database|redis|blob_store> cause=… site=…`, or `readiness probe timed out check=…` once per stuck probe. The export worker's session-lifecycle, export-iteration, delegation-cleanup and maintenance failure lines gain the same fields. Answers the Hub builds on purpose (Keystone, policy and delegation 503s, a failed export task) are unchanged. Responses, API, schema and role inputs are unchanged. Reason: on deployed 0.3.28 a five-minute window of `/v1/ready` 503s on all three controllers, two 30-second 500s and a failed worker pass left no cause in the Hub logs; only ProxySQL and Valkey logs showed database lock-wait timeouts and slow fsync at the same time.
+
+## [0.3.28] - 2026-11-15 (UTC; published and deployed)
+
 ### Added
 
+- Hub dashboard (`/app`): a Playbooks section. It lists the images the caller can see (published images, and the caller's own completed image jobs from before images were published) and shows, for the selected one, its audience, owning project, architecture, operating system, base, the ordered layers with their sizes, the default command and the recorded source (the Git commit for a Git build). For an image built by the caller's own image job in the connected project it offers a form that creates a VM from it, then lists the project's VMs with the explicit next step for each (start the server once the boot volume is ready, show the connection details, delete, remove the boot volume). Other images are view-only there: the Hub starts only the caller's own image jobs.
+- Hub API: `GET /v1/instance-options` returns, for a caller with write authority, the boot images, flavors, networks of the caller's project and SSH key names that a create request could name, each list cut at 200 entries. It reads them with the caller's own token and admits nothing; `POST /v1/instances` checks every selected object again.
+
+## [0.3.27] - 2026-11-15 (UTC; published and deployed)
+
+### Fixed
+
+- Experimental native VZ commit: `/.plmignore` evaluation is bounded. Rules were tried against every prefix of every path with a backtracking regex, so one rule such as `**/**/b` took about ten seconds on a long path and a file carried by an image could stall every commit made from it. Each rule is now evaluated once per path; patterns with more than one wildcard are matched in time proportional to pattern length times path length, with bounded memory; a rule may be at most 4096 bytes and a file may hold at most 10,000 rules; evaluation has a 120-second budget that is checked after every rule (one rule on one path took up to about 1.2 seconds in the measurements, so a refusal can come that much later). Exceeding a bound refuses the commit. Matching results are unchanged for the rules that are still accepted. Newly refused: an invalid character class (it was an uncaught error), the bracket `[!]` or `[^]` with nothing after the negation, and a bracket that contains `--`. The first bracket used to be read as a class running on into the following text; with a later `[]…]` a rule could hand arbitrary regular-expression syntax to the matcher, which could run for hours on one short name.
+- Experimental native VZ commit: an ordinary file or directory whose name starts with `.wh.` now refuses the commit. Such a name was written into the layer unchanged, where it means a deletion: `opt/.wh.app` removed the parent image's `opt/app` from the committed image and `.wh..wh..opq` hid a whole parent directory. Remove the file or exclude it in `/.plmignore` (under `var/lib/dpkg`, which is always kept, it has to be removed); real deletions are still recorded.
+- Experimental native VZ commit: a root disk whose upper lists one path twice (a corrupted filesystem) refuses the commit instead of keeping one of the two records.
+- Native VZ `exec`/`shell`: a session marker left by a killed client is released only by a session in the run it belongs to. A session in another run of the same Lima home used to release it on its own guest's status. A marker of a run whose VM is stopped is now released by the next `exec` attempt in that run; before, only that cross-run release could remove it.
+- Hub image jobs (registry intake, Dockerfile builds and Git builds): the build worker refused every image claim, and the job ended as `build_failed` within seconds, when its own output limit (`palimpsest_build_worker_max_blob_bytes`) was smaller than the API's blob limit (`palimpsest_hub_max_blob_bytes`). The worker now uses the smaller of the two, as recipe builds already did. Seen on the production deployment (worker 4 GiB, API 100 GiB) with the first Git build after 0.3.26.
+- Hub Git builds: the repository's `.dockerignore` is bounded (64 KiB, 1,000 rules, 4096 bytes per rule, bracket expressions within Latin-1, and a limit on the total matching work for one context; beyond a bound the request is refused as `422 build context rejected`), each rule is tried once per entry, and packing stops at the first entry beyond the worker's member limit. Before, a repository with a large rule file kept a Hub API worker busy for minutes or longer. Which paths an accepted rule drops is unchanged.
+
+## [0.3.26] - 2026-11-15 (UTC; published and deployed)
+
+### Added
+
+- Kolla role variable `palimpsest_git_allowed_hosts` (default `[]`), passed to the Hub API as `PALIMPSEST_HUB_GIT_ALLOWED_HOSTS`. The canonical deployment previously had no way to enable `POST /v1/git-builds`: the setting existed only in the Hub, so the route always answered 503. The default keeps the route off and contacts nothing; a controller precheck accepts at most 16 unique lowercase DNS host names (no scheme, port, path, wildcard, IP literal or single-label name).
+- `examples/git-build`: a minimal Dockerfile and context for a Hub Git build of this public repository at a pinned commit.
+
+### Fixed
+
+- Experimental native VZ commit: an instance that has no `/.plmignore` of its own now inherits the `/.plmignore` its image carries (later whiteouts in the image honoured), as the commit contract states. Before, rules that existed only in a parent layer were silently ignored, so an image committed with its own `/.plmignore` lost those rules on the next commit. A `/.plmignore` file or whiteout in the instance still replaces the image's rules, and an unusable one in the image (not a regular file, over 1 MiB, not UTF-8) refuses the commit only when the instance has none of its own. A non-UTF-8 `/.plmignore` in the instance is now a typed refusal.
+
+## [0.3.25] - 2026-11-15 (UTC; published and deployed)
+
+### Added
+
+- `instance resume` (CLI, SDK `resume_instance`, `POST /v1/instances/{id}/resume`) also powers on a stopped dev instance, so `stop` is no longer a dead end: the guest boots, restores its retained root and command and reports through `resume-result`. It is refused with 409 when the guest kept no resume state (never ready, first result an error, no readiness probe, GPU) or while a stop is still in flight. A stopped dev instance whose server is ACTIVE again without a completed `resume` becomes `resumed` at the next status read. Service instances have no resume: for them `stop` remains final apart from delete.
+- The instance projection exposes `resume_result` (the latest restore report of a resumed dev guest); before, the restored command's output was stored but not readable through the API.
+
+## [0.3.24] - 2026-11-15 (UTC; published and deployed)
+
+### Fixed
+
+- `--cloud` failures on the client name the failed check instead of printing a traceback: an unknown or incomplete clouds.yaml cloud, an unreachable Keystone (network, DNS or TLS), a rejected credential and an `auth_url` without a usable identity API each give one specific message that carries no credential or response body; anything else names the original keystoneauth error class.
+
+## [0.3.23] - 2026-11-15 (UTC; published and deployed)
+
+### Fixed
+
+- The guest unit sets `OOMPolicy=continue`. Live on 0.3.22 the kernel OOM-killed the instance command (`Out of memory: Killed process … (sh)`) and no restart followed. The mechanism was then observed outside the cloud with the same rendered unit and runner under systemd 255 as PID 1 (privileged container, memory-limited unit): with the default policy (`stop`) the unit failed with result `oom-kill` and the runner was killed without any report; with `continue` the runner survived, reported and restarted the command; `systemctl stop` was not followed by a relaunch. Live confirmation followed on deployed 0.3.24: a service instance's command was OOM-killed by the guest kernel and the instance reported one restart with exit code -9 and state `running`.
+
+## [0.3.22] - 2026-11-15 (UTC; published and deployed)
+
+### Fixed
+
+- Guest setup no longer gives `mkfs.ext4` of the writable file only the 30-second step limit (now up to 900 seconds within the bootstrap window). Two of four live service instances on 0.3.21 failed before starting their command, about 30 seconds after the last layer download; the cause is inferred, not observed, because the guest reported only `guest_execution_failed`.
+- A setup step that exceeds its limit is now reported as `guest_setup_timeout` instead of the generic `guest_execution_failed`, so the next such failure is identifiable.
+
+## [0.3.21] - 2026-11-14 (UTC; published and deployed)
+
+### Added
+
+- Main-command restart policy for Hub instances (`restart`: `no` or `unless-stopped`; `palimpsest instance create --restart`). With `unless-stopped` the guest runner starts a long-running command again in the same VM and writable layer after it exits, crashes or is OOM-killed (delays 2, 4, 8 … capped at 60 seconds, reset after a 300-second run), and reports the restart count, last exit code and state through the new `PUT /v1/instance-bootstrap/{id}/restart-status` under its own long-lived, report-only capability. The Hub shows it as `restart` in the instance projection and never changes instance status because of a restart. Default when the caller does not choose: `unless-stopped` for a service instance with a readiness probe, `no` for dev, run-to-completion, GPU and cluster instances. Stopping the unit or the VM ends the runner, so nothing is restarted after an explicit stop. Subprocess tests against fake mount tooling passed; no real crash or OOM kill has exercised it yet.
+
+
+## [0.3.20] - 2026-11-14 (UTC; published and deployed)
+
+### Fixed
+
+- A shelved `lifecycle="dev"` instance now has a resume path. Before, the one-shot guest runner could not restore after unshelve (its input had expired, its exclusive creates failed, and had it continued `mkfs.ext4 -F` would have erased the writable upper), so a resumed instance was ACTIVE on the bare base without its root or command. After the first ready report a dev guest retains `resume.json` (no capability); on boot it re-verifies the retained layer bytes, re-attaches the existing writable file without truncating or formatting it, requires the existing `upper`/`work` directories, remounts the overlay, restarts the command and reports through the new `PUT /v1/instance-bootstrap/{id}/resume-result` with its session-report capability. The Hub accepts that only while the instance is `resumed` and records the outcome beside the sealed first result. Fake-tool subprocess tests and a Linux first-boot→resume run passed; no real unshelve has run this code yet.
+- GPU and cluster runners and service instances do not retain resume state; OOM/crash restart for service instances is still not implemented.
+
+
+## [0.3.19] - 2026-11-14 (UTC; published and deployed)
+
+### Fixed
+
+- Trust-scoped connections (dev-instance auto-shelve and image exports) accept the `reader` role that Keystone role inference adds to a token carrying the delegated `member`; before, every shelve failed with "roles outside the stored export scope" on a real Keystone. Other extra roles and the forbidden set still fail closed.
+- The worker logs the reason (class and delegation code) when a delegated connection cannot be opened, instead of only `shelve-failed`.
+
+
+## [0.3.18] - 2026-11-14 (UTC; published and deployed)
+
+### Fixed
+
+- The system-administrator path for dev-lifecycle Trusts refuses the configured protected user and project IDs, as the member path always did (independent review finding).
+- The retired-Trust sweep skips a row whose reference another controller already cleared, instead of recording a false `trust_unrecoverable` (observed on the first real deletion; the Keystone trust itself was revoked).
+
+## [0.3.17] - 2026-11-13 (UTC; published and deployed)
+
+### Fixed
+
+- `instance create --lifecycle dev` (and `resume`/`renew`) now work for a human system administrator who uses a project-scoped token: the auto-shelve Trust is created from that token's own ordinary project roles instead of failing with 403 because the admin context carries no `current_roles`. Delegated, system/domain-scoped tokens, service identities and cross-project targets are still refused.
+
+## [0.3.16] - 2026-11-12 (UTC; published and deployed)
+
+### Added
+
+- `palimpsest instance ls|status|create|advance|stop|rm`: CLI over the existing Hub `/v1/instances`
+  endpoints (the same calls as `HubClient`). Arguments are validated before any credential lookup or Hub
+  call, and `--cloud` is accepted. Covered by `tests/unit/test_cli_contract.py` with a stubbed client;
+  not run against a real Hub or OpenStack. `status` shows the guest-reported stdout/stderr; there is no
+  streaming log endpoint.
+- Hub dev-instance idle auto-shelve: `palimpsest instance create --lifecycle dev [--key-name NAME]`,
+  `instance resume|renew|connection`. A `dev` instance keeps an owner-minted Keystone Trust (default 7
+  days, renewed by `create`, `resume`, `renew`), reports guest login sessions through a hardened guest
+  service, and is shelved by the worker after 5 minutes with no observed session. Missing, stale or
+  unparseable guest reports are unknown, never idle; a crash or unconfirmed Nova wait is settled from
+  Nova's real status; an expired trust means no shelve. `resume` unshelves with the caller's own token and
+  boots only the base VM (the layer overlay and command are not restarted; processes do not survive;
+  status `resumed`). New table `palimpsest_hub_instance_lifecycle` (offline `palimpsest-hub-bootstrap`
+  before dev instances; `migrate` copies it). New settings `PALIMPSEST_HUB_SESSION_*`. `service` instances
+  (the default) are unchanged. Covered by fake-Nova/Keystone tests only; not verified on a real cloud.
 - Experimental native VZ `commit` (opt-in `PALIMPSEST_EXPERIMENTAL_VZ_COMMIT=1`, not advertised as a
   capability): a stopped, unheld Lima-VZ OCI-root instance's overlay upper is cloned (APFS
   clonefile), read with e2fsprogs `debugfs`/`e2fsck` (`PALIMPSEST_COMMIT_DEBUGFS`,
@@ -14,12 +128,29 @@ All notable changes to Palimpsest Local are documented here.
   source disk is never modified. Proven once live on one Apple-silicon host (three VMs); package
   installs, `.plmignore` and Hub publication are not yet proven live.
 
+### Removed
+
+- `services/shelve_delegation.py` (short-TTL trust per shelve, never wired): superseded by the
+  instance-lifetime trust above.
+
+### Fixed
+
+- Kolla role container label `kolla_version` now follows the target `openstack_release` instead of a
+  hardcoded `2025.2`, for Kolla-Ansible 2026.1 compatibility. Covered by the parametrized lifecycle
+  regression `test_container_version_label_follows_openstack_release` and the `tests/test_kolla_*.py`
+  set. Not deployed.
+- Hub preflight now checks compute cores/RAM and Neutron ports as well as instance and volume quota,
+  fails closed on missing limits, resolves the service catalog for the configured region, and re-checks
+  quota immediately before the Cinder and Nova POSTs; the native path sizes its check from the operator
+  grant. Covered by `hub/tests/test_preflight.py` and `hub/tests/test_instances.py` with synthetic
+  providers only; not verified against a real OpenStack cloud.
+
 ## [0.3.15] - 2026-11-08 (UTC; published; deployed to the three DMS Lab controllers and the dedicated build worker on 2026-11-09)
 
 ### Fixed
 
 - Enforce byte-exact `project_id` and `created_by` equality when registering staged publication payloads against published images and enforcing staging limits (`services/staged_payloads.py`). Binary SQL casts (`cast(..., LargeBinary)`) ensure that database engines or tables using case-insensitive SQL collations (such as CI SQLite NOCASE or MariaDB/MySQL default collations) cannot match differing casing variants as the same project or user. Foreign casing variants can no longer match an image, free staged quota, or reveal payload existence.
-- Test limits and residuals: 0.3.15 was deployed on 2026-11-09 (writer drain, paired SQL/CAS backup, `reconfigure` onto the new digests; no restore test of that backup, no authenticated stage smoke on production yet). The fix is tested under simulated SQLite NOCASE schema collation in `hub/tests/test_staged_payload_limits.py`; live MariaDB reproduction was not executed in CI. Existing database primary key collation collision risks remain when tables use case-insensitive collations for unique identity columns.
+- Test limits and residuals: 0.3.15 was deployed on 2026-11-09 (writer drain, paired SQL/CAS backup, `reconfigure` onto the new digests; no restore test of that backup, an authenticated 35-byte stage smoke on production returned 200 on 2026-11-09 (receipts 589/590), and the unregistered stage row from 0.3.14 was removed by the maintenance sweep (receipt 596)). The fix is tested under simulated SQLite NOCASE schema collation in `hub/tests/test_staged_payload_limits.py`; live MariaDB reproduction was not executed in CI. Existing database primary key collation collision risks remain when tables use case-insensitive collations for unique identity columns.
 
 ## [0.3.14] - 2026-11-08 (UTC)
 

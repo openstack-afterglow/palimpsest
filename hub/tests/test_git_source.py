@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 
 import pytest
@@ -178,3 +179,23 @@ def test_credential_is_a_reference_never_a_value():
     assert request(credential_ref="deploy-key.1").credential_ref == "deploy-key.1"
     with pytest.raises(ValidationError):
         request(credential_ref="tok en/with space")
+
+
+def test_a_symlinked_directory_pointing_outside_the_checkout_is_refused(tmp_path):
+    root = tmp_path / "checkout"
+    outside = tmp_path / "outside"
+    root.mkdir()
+    outside.mkdir()
+    (outside / "hostname").write_text("secret\n")
+    os.symlink(outside, root / "d")
+    with pytest.raises(GitSourceError) as info:
+        git_source.check_tree(root)
+    assert info.value.code == "symlink"
+
+
+def test_a_symlinked_directory_inside_the_checkout_is_allowed(tmp_path):
+    root = tmp_path / "checkout"
+    (root / "real").mkdir(parents=True)
+    (root / "real" / "f.txt").write_text("x")
+    os.symlink(root / "real", root / "alias")
+    assert git_source.check_tree(root)[1] == 1

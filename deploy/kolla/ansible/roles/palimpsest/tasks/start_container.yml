@@ -26,7 +26,7 @@
     cpus: "{{ palimpsest_service.cpus | default(omit) }}"
     pids_limit: "{{ palimpsest_service.pids_limit | default(omit) }}"
     labels:
-      kolla_version: "2025.2"
+      kolla_version: "{{ openstack_release }}"
       service: palimpsest
       config_hash: "{{ palimpsest_build_worker_key_stat.stat.checksum | default('') if item.key == 'palimpsest-hub-build-worker' else palimpsest_config_stat.stat.checksum | default('') }}"
   vars:

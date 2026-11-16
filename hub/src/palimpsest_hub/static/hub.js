@@ -146,7 +146,7 @@ async function downloadVerified(request, path, digest, size, filename, check, pr
     throw error;
   }
 }
-window.Hub = { node, message, hashFile, downloadVerified };
+window.Hub = { node, message, hashFile, downloadVerified, empty, action, onConnect: [], onDisconnect: [] };
 
 let token = "", project = "", identity = null, activeUpload = null, uploadBusy = false, uploadAborting = false, uploadFinalizing = false;
 let connectionVersion = 0, connectionController = new AbortController(), searchVersion = 0, buildVersion = 0;
@@ -179,6 +179,8 @@ async function json(path, options = {}) {
   return result;
 }
 function bodyOptions(method, body) { return { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }; }
+// Other dashboard scripts use the same connection: one token, one cancellation scope.
+Object.assign(window.Hub, { json, bodyOptions, guard, report, connection: () => connectionVersion, identity: () => identity });
 function reportUploadError(version, error, upload = activeUpload) {
   if (version !== connectionVersion) return;
   if (error.status === 404 && upload && activeUpload === upload && error.path === `/uploads/${upload.sessionId}`) {
@@ -205,6 +207,7 @@ function disconnect() {
   message("connection", "Disconnected; credentials cleared. Interrupted server sessions expire after their idle timeout.");
   for (const id of ["identity", "permissions", "artifact-message", "build-message", "upload-message"]) message(id, "");
   $("artifact-list").replaceChildren(); $("build-list").replaceChildren();
+  for (const hook of window.Hub.onDisconnect) hook();
   uploadControls();
 }
 async function artifactDownload(row, target = "artifact-message") {
@@ -298,7 +301,7 @@ $("auth-form").addEventListener("submit", async (event) => {
     message("identity", `${me.project_name || "Project"} · ${me.project_id} · User ${me.user_id} · Original token roles: ${me.roles.join(", ") || "none"} · Current system administrator: ${me.is_system_admin ? "yes" : "no"}`);
     message("permissions", `Current authority · ${Object.entries(me.capabilities).map(([name, allowed]) => `${name}: ${allowed ? "allowed" : "not allowed"}`).join(" · ")}. Every operation is authorized again by the server.`);
     for (const control of $("build-form").elements) control.disabled = !me.capabilities.build;
-    uploadControls(); await Promise.all([listArtifacts(), listBuilds()]);
+    uploadControls(); await Promise.all([listArtifacts(), listBuilds(), ...window.Hub.onConnect.map((hook) => hook())]);
   } catch (error) { if (version === connectionVersion) { disconnect(); message("connection", error.message); } }
 });
 $("disconnect").addEventListener("click", disconnect);

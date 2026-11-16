@@ -1044,3 +1044,49 @@ def test_migrate_cli_accepts_reviewed_mapping_path():
     )
     assert args.reviewed_mapping == Path("/operator/reviewed-creators.json")
     assert args.dry_run is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source_has_ledger", [True, False], ids=["with-ledger", "pre-lifecycle-source"])
+async def test_migrate_keeps_the_dev_instance_lifecycle_ledger_or_accepts_an_older_source(tmp_path, source_has_ledger):
+    from palimpsest_hub.instance_lifecycle_models import PalimpsestHubInstanceLifecycle
+
+    ledger = PalimpsestHubInstanceLifecycle.__table__
+    source_url = f"sqlite+aiosqlite:///{tmp_path / 'ledger-source.sqlite'}"
+    destination_url = f"sqlite+aiosqlite:///{tmp_path / 'ledger-destination.sqlite'}"
+    source = create_async_engine(source_url)
+    destination = create_async_engine(destination_url)
+    now = datetime(2026, 11, 12, 1, 2, 3, 456789, tzinfo=UTC)
+    row = {
+        "instance_id": "00000000-0000-4000-8000-000000000010",
+        "project_id": "a" * 32,
+        "machine_json": {"phase": "grace", "sessions": [], "grace_started": None},
+        "session_capability_hash": "e" * 64,
+        "reported_sessions_json": ["sshd: alice@pts/0 (pid 200)"],
+        "report_received_at": now,
+        "trust_json": {"trust_id": "t" * 32, "role_names": ["member"]},
+        "trust_expires_at": now + timedelta(days=7),
+        "retired": False,
+        "last_error": None,
+        "created_at": now,
+        "updated_at": now,
+    }
+    try:
+        async with destination.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        async with source.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+            if source_has_ledger:
+                await connection.execute(ledger.insert().values(**row))
+            else:
+                await connection.execute(text("DROP TABLE palimpsest_hub_instance_lifecycle"))
+        copied = await migrate(source_url, destination_url)
+        assert copied[ledger.name] == (1 if source_has_ledger else 0)
+        if source_has_ledger:
+            async with source.connect() as original, destination.connect() as migrated:
+                before = (await original.execute(select(ledger))).mappings().one()
+                after = (await migrated.execute(select(ledger))).mappings().one()
+                assert after == before and after["trust_json"]["trust_id"] == "t" * 32
+    finally:
+        await source.dispose()
+        await destination.dispose()

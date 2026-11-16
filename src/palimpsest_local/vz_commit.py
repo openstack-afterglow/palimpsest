@@ -34,7 +34,7 @@ from .ext4_upper import (
     read_upper,
     stage_payloads,
 )
-from .oci_capture import CaptureReceipt, convert_upper_to_layer
+from .oci_capture import CaptureError, CaptureReceipt, convert_upper_to_layer
 from .oci_commit import CommitError, CommittedImage, GzipTee, admit_capture, write_commit_layout
 
 _FICLONE = 0x40049409
@@ -234,11 +234,22 @@ def _stage_parent_layers(
 
 
 MAX_PARENT_PATHS = 5_000_000
+# The same bound the capture applies to an instance's own /.plmignore.
+MAX_PARENT_PLMIGNORE_BYTES = 1024 * 1024
+_PLMIGNORE = ".plmignore"
 
 
-def parent_layer_paths(manifest: dict, blobs: Mapping[str, Path]) -> set[str]:
-    """Paths visible in the parent image after applying its layers in order (whiteouts honoured)."""
+def _scan_parent(manifest: dict, blobs: Mapping[str, Path]) -> tuple[set[str], bytes | CaptureError | None]:
+    """Visible parent paths and the parent's root /.plmignore, in one pass.
+
+    The parent's /.plmignore is the one left visible after every layer (a later whiteout or
+    opaque marker removes it). Its bytes are returned unvalidated, at most one byte past the
+    limit, and a non-regular file is returned as the error to raise: the capture judges them
+    only when the instance has no /.plmignore of its own, so a broken file in an image can
+    still be overridden or deleted in the instance.
+    """
     visible: set[str] = set()
+    ignore: bytes | None = None
     for item in manifest.get("layers", ()):
         try:
             archive = tarfile.open(blobs[item["digest"]], mode="r|gz")
@@ -259,11 +270,23 @@ def parent_layer_paths(manifest: dict, blobs: Mapping[str, Path]) -> set[str]:
                         visible = {path for path in visible if path != gone and not path.startswith(gone + "/")}
                     else:
                         visible.add(name)
+                        if name == _PLMIGNORE:
+                            source = archive.extractfile(member) if member.isreg() else None
+                            ignore = source.read(MAX_PARENT_PLMIGNORE_BYTES + 1) if source is not None else None
                     if len(visible) > MAX_PARENT_PATHS:
                         raise CommitError("commit-parent", "the parent image has too many paths to inspect")
             except tarfile.TarError:
                 raise CommitError("commit-parent", "a parent layer is not a readable tar") from None
-    return visible
+    if _PLMIGNORE not in visible:
+        return visible, None
+    if ignore is None:
+        return visible, CaptureError("plmignore", "the parent image's /.plmignore is not a regular file")
+    return visible, ignore
+
+
+def parent_layer_paths(manifest: dict, blobs: Mapping[str, Path]) -> set[str]:
+    """Paths visible in the parent image after applying its layers in order (whiteouts honoured)."""
+    return _scan_parent(manifest, blobs)[0]
 
 
 def commit_stopped_disk(
@@ -319,7 +342,12 @@ def commit_stopped_disk(
         options = dict(capture_options or {})
         options.setdefault("generated_placeholders", tuple(generated_placeholders))
         options.setdefault("injected_placeholders", tuple(injected_placeholders))
-        options.setdefault("parent_paths", parent_layer_paths(manifest, blobs))
+        if "parent_paths" not in options or "parent_plmignore" not in options:
+            # An instance without its own /.plmignore inherits the rules its image carries; the
+            # capture lets an upper /.plmignore (or its whiteout) override them.
+            parent_paths, parent_plmignore = _scan_parent(manifest, blobs)
+            options.setdefault("parent_paths", parent_paths)
+            options.setdefault("parent_plmignore", parent_plmignore)
         committed, _receipt = capture_to_layout(
             disk=disk,
             disk_size=disk_size,

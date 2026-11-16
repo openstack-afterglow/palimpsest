@@ -35,3 +35,7 @@ class PalimpsestHubInstance(Base):
     capability_expires_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False, default=lambda: datetime.now(UTC))
     updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False, default=lambda: datetime.now(UTC))
+
+
+# Register the dev-instance lifecycle ledger with the same metadata wherever instances are used.
+from palimpsest_hub import instance_lifecycle_models  # noqa: E402,F401

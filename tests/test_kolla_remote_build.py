@@ -140,6 +140,7 @@ def _run_lifecycle(tmp_path, actions, variables, *, hosts=None, expect_success=T
     inventory_file = tmp_path / "inventory.yml"
     inventory_file.write_text(yaml.safe_dump(inventory))
     settings = {
+        "openstack_release": "2026.1",
         "ansible_become": False,
         "enable_palimpsest": False,
         "enable_palimpsest_hub_build_worker": True,
@@ -202,6 +203,15 @@ def _run_lifecycle(tmp_path, actions, variables, *, hosts=None, expect_success=T
 
 def _docker_records(records, kind="community.docker.docker_container"):
     return [(host.split("-", 1)[0], data["arguments"]) for host, data in records if data["kind"] == kind]
+
+
+@pytest.mark.parametrize("release", ["2025.2", "2027.1"])
+def test_container_version_label_follows_openstack_release(tmp_path, release):
+    records, _ = _run_lifecycle(tmp_path, ["deploy"], {"openstack_release": release})
+    containers = _docker_records(records)
+    workers = [args for _, args in containers if args["name"] == "palimpsest_hub_build_worker"]
+    assert workers
+    assert {args["labels"]["kolla_version"] for args in workers} == {release}
 
 
 @pytest.mark.parametrize("source_mode", [False, True])

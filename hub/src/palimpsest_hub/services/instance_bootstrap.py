@@ -9,19 +9,94 @@ and OverlayFS support; bootstrap failure is reported rather than running bare ba
 from __future__ import annotations
 
 import base64
+import io
 import json
+import tokenize
 
 from palimpsest_hub.services.instance_cluster_runtime import CLUSTER_RUNTIME
 from palimpsest_hub.services.instance_gpu_runtime import GPU_RUNTIME
+from palimpsest_hub.services.session_observer import GUEST_PROBE_COMMAND
+
+SESSION_REPORTER = (
+    "import json, pathlib, subprocess, time, urllib.request\n"
+    f"PROBE = {GUEST_PROBE_COMMAND!r}\n"
+    + r"""
+CONFIG = pathlib.Path('/var/lib/palimpsest-instance/session.json')
+
+
+def run_once(cfg):
+    try:
+        result = subprocess.run(
+            ['/bin/sh', '-c', PROBE],
+            stdin=subprocess.DEVNULL, capture_output=True, timeout=10,
+        )
+        if result.returncode != 0 or len(result.stdout) > 65536:
+            return
+        probe = result.stdout.decode('utf-8')
+        request = urllib.request.Request(
+            cfg['origin'] + '/v1/instance-bootstrap/' + cfg['instance_id'] + '/sessions',
+            data=json.dumps({'probe': probe}).encode('utf-8'),
+            headers={
+                'Authorization': 'Bearer ' + cfg['capability'],
+                'Content-Type': 'application/json',
+            },
+            method='PUT',
+        )
+        with urllib.request.urlopen(request, timeout=15):
+            pass
+    except Exception:
+        # Failed observations must go stale, not become an empty session report.
+        pass
+
+
+def main():
+    while True:
+        interval = 30
+        try:
+            cfg = json.loads(CONFIG.read_text(encoding='utf-8'))
+            interval = max(10, min(120, int(cfg['interval_seconds'])))
+            run_once(cfg)
+        except Exception:
+            # Keep retrying without logging credentials or probe output.
+            pass
+        time.sleep(interval)
+
+
+if __name__ == '__main__':
+    main()
+"""
+)
+
+
+def _without_comment_lines(source: str) -> str:
+    """Drop comment-only lines: the guest copy is size-limited by Nova user-data, not read by people."""
+    dropped = {
+        token.start[0]
+        for token in tokenize.generate_tokens(io.StringIO(source).readline)
+        if token.type == tokenize.COMMENT and token.line.lstrip().startswith("#")
+    }
+    return "".join(line for number, line in enumerate(source.splitlines(keepends=True), 1) if number not in dropped)
 
 
 def render_runner(gpu: bool = False, cluster: bool = False) -> str:
-    """Keep CPU cloud-init bytes unchanged; vendor code consumes GPU budget only."""
-    return (
-        r"""import hashlib, json, os, pathlib, subprocess, time, urllib.request
+    """Render the guest runner. GPU and cluster code is added only to their own variants, the cluster
+    variant omits resume/restart helpers, and comment-only lines are stripped: Nova caps user-data."""
+    source = (
+        r"""import hashlib, json, os, pathlib, stat, subprocess, time, urllib.request
 ROOT = pathlib.Path('/var/lib/palimpsest-instance')
-spec = json.loads((ROOT / 'spec.json').read_text())
-deadline = spec['expires_at']
+resume_path = ROOT / 'resume.json'
+resuming = resume_path.is_file()
+if resuming:
+    # A shelved dev instance booted again: restore from retained verified state, never rebuild.
+    spec = json.loads(resume_path.read_text())
+    session_state = json.loads((ROOT / 'session.json').read_text())
+    if spec['instance_id'] != session_state['instance_id'] or spec['origin'] != session_state['origin']:
+        raise SystemExit('resume_identity_mismatch')
+    spec['capability'] = session_state['capability']
+    deadline = time.time() + 3600
+else:
+    spec = json.loads((ROOT / 'spec.json').read_text())
+    deadline = spec['expires_at']
 headers = {'Authorization': 'Bearer ' + spec['capability']}
 process = None
 mounts = []
@@ -64,7 +139,7 @@ def report(state, code=None):
                 high = middle - 1
         data[channel] = output[:low]
         body = serialize()
-    request = urllib.request.Request(spec['origin'] + '/v1/instance-bootstrap/' + spec['instance_id'] + '/result',
+    request = urllib.request.Request(spec['origin'] + '/v1/instance-bootstrap/' + spec['instance_id'] + ('/resume-result' if resuming else '/result'),
                                      data=body, headers={**headers, 'Content-Type':'application/json'}, method='PUT')
     # Only retry the identical bounded observation; never retry execution.
     for attempt in range(3):
@@ -78,9 +153,57 @@ def report(state, code=None):
             time.sleep(1)
     raise RuntimeError('result_delivery_failed')
 
-def run(argv):
+"""
+        + (
+            # The cluster runner never resumes or restarts and sits at Nova's user-data size limit.
+            ""
+            if cluster
+            else r"""def persist_resume():
+    # Dev instances only (they have the session reporter): retain exactly what a resumed boot needs,
+    # without the single-use bootstrap capability or its expiry, after the first ready report.
+    if resuming or spec.get('gpu') is not None or spec.get('cluster') is not None:
+        return
+    if not (ROOT / 'session.json').is_file():
+        return
+    state = {key: value for key, value in spec.items() if key not in ('capability', 'expires_at')}
+    temporary = ROOT / 'resume.json.tmp'
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'w') as output:
+        json.dump(state, output, separators=(',', ':'))
+        output.flush()
+        os.fsync(output.fileno())
+    os.replace(temporary, resume_path)
+
+def report_restart(count, code, state):
+    # Observation only: restarting never depends on the Hub being reachable.
+    try:
+        body = json.dumps({'instance_id': spec['instance_id'], 'restarts': count,
+                           'last_exit_code': code, 'state': state}, separators=(',', ':')).encode()
+        request = urllib.request.Request(
+            spec['origin'] + '/v1/instance-bootstrap/' + spec['instance_id'] + '/restart-status', data=body,
+            headers={'Authorization': 'Bearer ' + spec['restart']['capability'],
+                     'Content-Type': 'application/json'}, method='PUT')
+        with urllib.request.urlopen(request, timeout=15) as response:
+            response.read(1024)
+    except Exception:
+        pass
+
+"""
+        )
+        + r"""
+def make_dir(path):
+    # First boot creates each directory exclusively. A resume reuses real directories (recreating a
+    # missing mountpoint is harmless) but never follows a symlink or a non-directory.
+    if resuming:
+        if path.is_symlink() or (path.exists() and not path.is_dir()):
+            raise RuntimeError('resume_state_invalid')
+        path.mkdir(exist_ok=True)
+    else:
+        path.mkdir()
+
+def run(argv, limit=30):
     subprocess.run(argv, check=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                   stderr=subprocess.DEVNULL, timeout=30)
+                   stderr=subprocess.DEVNULL, timeout=limit)
 
 def mount(argv, target):
     run(['mount', *argv, str(target)])
@@ -169,53 +292,73 @@ def pump(timeout=0.2):
         + r"""    writable_bytes = spec['writable_bytes']
     if type(writable_bytes) is not int or not 1024**3 <= writable_bytes <= 4096 * 1024**3:
         raise RuntimeError('invalid_writable_capacity')
-    available = os.statvfs(ROOT)
-    required = writable_bytes + sum(layer['size_bytes'] for layer in spec['layers']) + 1024**3
-    if available.f_bavail * available.f_frsize < required:
-        raise RuntimeError('guest_disk_capacity_insufficient')
+    if not resuming:
+        # The retained layers and fully allocated writable file already occupy their space.
+        available = os.statvfs(ROOT)
+        required = writable_bytes + sum(layer['size_bytes'] for layer in spec['layers']) + 1024**3
+        if available.f_bavail * available.f_frsize < required:
+            raise RuntimeError('guest_disk_capacity_insufficient')
     # Private mount propagation prevents application mounts reaching the base namespace.
     run(['mount', '--make-rprivate', '/'])
     os.chdir(ROOT)
     lower = []
     for index, layer in enumerate(spec['layers']):
         blob = ROOT / ('layer-%d.squashfs' % index)
-        request = urllib.request.Request(spec['origin'] + '/v1/instance-bootstrap/' + spec['instance_id'] +
-                                         '/layers/' + layer['digest'], headers=headers)
         digest = hashlib.sha256()
         count = 0
-        with urllib.request.urlopen(request, timeout=30) as response, open(blob, 'xb') as output:
-            while True:
-                chunk = response.read(1024 * 1024)
-                if not chunk:
-                    break
-                count += len(chunk)
-                if count > layer['size_bytes'] or time.time() >= deadline:
-                    raise RuntimeError('layer_download_failed')
-                digest.update(chunk)
-                output.write(chunk)
+        if resuming:
+            # Re-verify the retained layer bytes; a changed or truncated file is never mounted.
+            fd = os.open(blob, os.O_RDONLY | os.O_NOFOLLOW)
+            with os.fdopen(fd, 'rb') as stream:
+                while True:
+                    chunk = stream.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    count += len(chunk)
+                    digest.update(chunk)
+        else:
+            request = urllib.request.Request(spec['origin'] + '/v1/instance-bootstrap/' + spec['instance_id'] +
+                                             '/layers/' + layer['digest'], headers=headers)
+            with urllib.request.urlopen(request, timeout=30) as response, open(blob, 'xb') as output:
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    count += len(chunk)
+                    if count > layer['size_bytes'] or time.time() >= deadline:
+                        raise RuntimeError('layer_download_failed')
+                    digest.update(chunk)
+                    output.write(chunk)
         if count != layer['size_bytes'] or 'sha256:' + digest.hexdigest() != layer['digest']:
             raise RuntimeError('layer_digest_mismatch')
         target = ROOT / ('lower-%d' % index)
-        target.mkdir()
+        make_dir(target)
         mount(['-t', 'squashfs', '-o', 'loop,ro,nodev,nosuid', str(blob)], target)
         lower.insert(0, target.name)
     # Application mode includes the boot root as a lower. Its writable layer
     # MUST be a different filesystem: a descendant upper/work on that same
     # filesystem is an overlapping OverlayFS layer and Linux rejects it.
     writable = ROOT / 'writable'
-    writable.mkdir()
-    available = os.statvfs(ROOT)
-    if available.f_bavail * available.f_frsize < writable_bytes + 1024**3:
-        raise RuntimeError('guest_disk_capacity_insufficient')
-    # Format ONLY this exclusively created regular file, never a discovered device.
-    fd = os.open(backing_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
-    try:
-        run(['truncate', '-s', str(writable_bytes), str(backing_file)])
-        os.posix_fallocate(fd, 0, writable_bytes)
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    run(['mkfs.ext4', '-q', '-F', '-m', '0', str(backing_file)])
+    make_dir(writable)
+    if resuming:
+        # Re-attach the existing private writable filesystem. NEVER truncate or format it.
+        existing = os.stat(backing_file, follow_symlinks=False)
+        if not stat.S_ISREG(existing.st_mode) or existing.st_size != writable_bytes:
+            raise RuntimeError('resume_writable_mismatch')
+    else:
+        available = os.statvfs(ROOT)
+        if available.f_bavail * available.f_frsize < writable_bytes + 1024**3:
+            raise RuntimeError('guest_disk_capacity_insufficient')
+        # Format ONLY this exclusively created regular file, never a discovered device.
+        fd = os.open(backing_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+        try:
+            run(['truncate', '-s', str(writable_bytes), str(backing_file)])
+            os.posix_fallocate(fd, 0, writable_bytes)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        # Formatting the fully allocated file can take longer than the 30-second step limit on slow storage.
+        run(['mkfs.ext4', '-q', '-F', '-m', '0', str(backing_file)], max(30, min(900, deadline - time.time())))
     attached = subprocess.run(['losetup', '--find', '--show', str(backing_file)], check=True,
                               stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                               stderr=subprocess.DEVNULL, text=True, timeout=30)
@@ -226,14 +369,19 @@ def pump(timeout=0.2):
     loop_device = selected
     mount(['-t', 'ext4', '-o', 'nodev,nosuid', loop_device], writable)
     for name in ('upper', 'work'):
-        (writable / name).mkdir()
+        if resuming:
+            # Restore the existing writable layer; never recreate (that would discard it).
+            if (writable / name).is_symlink() or not (writable / name).is_dir():
+                raise RuntimeError('resume_writable_layer_missing')
+        else:
+            (writable / name).mkdir()
     if spec['mode'] == 'application':
         base = ROOT / 'base'
-        base.mkdir()
+        make_dir(base)
         mount(['--bind', '/'], base)
         run(['mount', '-o', 'remount,bind,ro', str(base)])
         lower.append(base.name)
-    (ROOT / 'merged').mkdir()
+    make_dir(ROOT / 'merged')
     merged = ROOT / 'merged'
     options = 'lowerdir=' + ':'.join(lower) + ',upperdir=writable/upper,workdir=writable/work'
     if len(options.encode()) >= 4096:
@@ -334,10 +482,55 @@ def pump(timeout=0.2):
             if not ready:
                 raise RuntimeError('readiness_failed')
             pump(0)
+            persist_resume()
             report('ready')
-            # systemd owns the running command lifecycle until instance shutdown.
-            while process.poll() is None:
-                pump()
+            # systemd owns the running command lifecycle until instance shutdown. With
+            # restart=unless-stopped a command that exits, crashes or is OOM-killed is started again in
+            # the same VM and writable layer; stopping the unit or the VM kills this runner first.
+            restarts = 0
+            delay = 2
+            while True:
+                started = time.time()
+                while process.poll() is None:
+                    pump()
+                if (spec.get('restart') or {}).get('policy') != 'unless-stopped':
+                    break
+                drained = time.time() + 2
+                while selector.get_map() and time.time() < drained:
+                    pump()
+                import signal
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)  # No leftover children of the old command.
+                except ProcessLookupError:
+                    pass
+                code = max(-255, min(255, process.returncode))
+                captures = list(outputs.values())
+                for key in list(selector.get_map().values()):
+                    selector.unregister(key.fileobj)
+                    key.fileobj.close()
+                outputs.clear()
+                while True:
+                    restarts += 1
+                    if time.time() - started >= 300:
+                        delay = 2
+                    waited = time.time()
+                    report_restart(restarts, code, 'backoff')
+                    time.sleep(max(0, delay - (time.time() - waited)))
+                    delay = min(delay * 2, 60)
+                    try:
+                        process = subprocess.Popen(spec['command'], stdin=subprocess.DEVNULL,
+                                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                                   env=environment, preexec_fn=enter_runtime,
+                                                   start_new_session=True)
+                        break
+                    except (OSError, subprocess.SubprocessError):
+                        # The command could not be started (fork failure, damaged image): keep backing off.
+                        code = 127
+                        started = time.time()
+                for pipe, capture in zip((process.stdout, process.stderr), captures):
+                    outputs[pipe.fileno()] = capture
+                    selector.register(pipe, selectors.EVENT_READ)
+                report_restart(restarts, code, 'running')
         else:
             while process.poll() is None and time.time() < deadline:
                 pump()
@@ -355,7 +548,7 @@ def pump(timeout=0.2):
             pipe.close()
 """
         )
-        + ("except BaseException as failure:\n" if gpu or cluster else "except BaseException:\n")
+        + "except BaseException as failure:\n"
         + r"""    if process is not None and process.poll() is None:
         import signal
         os.killpg(process.pid, signal.SIGTERM)
@@ -375,7 +568,7 @@ def pump(timeout=0.2):
             else (
                 "        code = str(failure)\n        report('error', code if code in ('cluster_prerequisite_failed', 'cluster_bootstrap_failed', 'cluster_proof_failed') else 'cluster_bootstrap_failed')\n"
                 if cluster
-                else "        report('error', 'guest_execution_failed')\n"
+                else "        report('error', 'guest_setup_timeout' if isinstance(failure, subprocess.TimeoutExpired) else 'guest_execution_failed')\n"
             )
         )
         + r"""    except Exception:
@@ -445,6 +638,7 @@ finally:
     (ROOT / 'spec.json').unlink(missing_ok=True)
 """
     )
+    return _without_comment_lines(source)
 
 
 GUEST_RUNNER = render_runner()
@@ -461,6 +655,7 @@ Type=simple
 ExecStart=/usr/bin/python3 /var/lib/palimpsest-instance/runner.py
 PrivateMounts=yes
 KillMode=control-group
+OOMPolicy=continue
 Restart=no
 [Install]
 WantedBy=multi-user.target
@@ -476,9 +671,10 @@ WantedBy=multi-user.target
             "content": base64.b64encode(content.encode()).decode(),
         }
 
+    runner_spec = {key: value for key, value in spec.items() if key != "session_report"}
     payload = {
         "write_files": [
-            file("/var/lib/palimpsest-instance/spec.json", json.dumps(spec, separators=(",", ":"))),
+            file("/var/lib/palimpsest-instance/spec.json", json.dumps(runner_spec, separators=(",", ":"))),
             file(
                 "/var/lib/palimpsest-instance/runner.py",
                 render_runner(cluster=True)
@@ -489,6 +685,40 @@ WantedBy=multi-user.target
         ],
         "runcmd": [["systemctl", "daemon-reload"], ["systemctl", "enable", "--now", "palimpsest-instance.service"]],
     }
+    session_report = spec.get("session_report")
+    if isinstance(session_report, dict):
+        session_config = {
+            "origin": spec["origin"],
+            "instance_id": spec["instance_id"],
+            "capability": session_report["capability"],
+            "interval_seconds": session_report["interval_seconds"],
+        }
+        reporter_unit = """[Unit]
+Description=Palimpsest guest session reporter
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /var/lib/palimpsest-instance/session_reporter.py
+Restart=always
+RestartSec=10
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+[Install]
+WantedBy=multi-user.target
+"""
+        payload["write_files"].extend(
+            [
+                file("/var/lib/palimpsest-instance/session.json", json.dumps(session_config, separators=(",", ":"))),
+                file("/var/lib/palimpsest-instance/session_reporter.py", SESSION_REPORTER, "0700"),
+                file("/etc/systemd/system/palimpsest-session-reporter.service", reporter_unit, "0644"),
+            ]
+        )
+        payload["runcmd"].append(["systemctl", "enable", "--now", "palimpsest-session-reporter.service"])
     if spec.get("ca_certificates"):
         payload["ca_certs"] = {"trusted": spec["ca_certificates"]}
     return "#cloud-config\n" + json.dumps(payload, separators=(",", ":")) + "\n"

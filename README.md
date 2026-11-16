@@ -20,31 +20,44 @@ are not deployed-service acceptance; see the [control-plane boundaries](ARCHITEC
 - **Linux:** supported libvirt/KVM runtime for conventional cloud-image VMs on `x86_64` and `aarch64`; Linux OCI-root execution supports `x86_64`/`amd64` KVM only.
 - **Declarative projects:** a strict `palimpsest.yml` workflow reconciles multiple VM services with dependencies, environment, typed cloud-init, persistent block volumes, networks, and Lima TCP forwarding.
 - **Release source:** 0.3.13 adds Hub image quotas, `ppi_v1_` image API keys, anonymous reads of `public` images, optional OCI source-closure publication, `palimpsest published push|pull|status`, and the local Lima VZ arm64 OCI-root runtime, on top of 0.3.12 (Hub-authoritative SDK image publication/query/extension, parent-aware logical layers, immutable visibility-scoped payloads, opt-in Manila/CephFS native lane, standard reader/member/manager project roles). It preserves the released HTTPS worker, HA/readiness and catalog/instance paths. New native profiles remain inactive until storage/issuer qualification; source, publication and actual deployment have separate evidence in the [latest handoff](docs/development-handoff.md).
-- **Candidate 0.3.15:** staging registration compares project and creator IDs byte-for-byte even under case-insensitive SQL collations. Publication and deployment are not yet complete; see the [transition note](docs/install.md#0315-transition-note--2026-11-08-utc-undeployed-candidate).
+- **0.3.16 (published 2026-11-12, deployed to the production Hub's three controllers and the build worker):** Hub dev-instance idle auto-shelve (`instance create --lifecycle dev`, `resume|renew|connection`; fake-cloud tests only, never exercised on a real cloud), the `palimpsest instance` CLI, preflight checks for cores/RAM/ports, and the Kolla-Ansible 2026.1 `kolla_version` label fix. The new table was created by the offline Hub bootstrap; see the [transition note](docs/install.md#0316-transition-note--2026-11-13-utc-deployed) and the [handoff](docs/development-handoff.md) for the unexplained 0.3.15→0.3.13 regression found before this rollout.
+- **0.3.17 (published and deployed 2026-11-13):** `instance create --lifecycle dev` (and `resume|renew`) works for a human system administrator using a project-scoped token. No schema change; see the [transition note](docs/install.md#0317-transition-note--2026-11-13-utc-deployed).
+- **0.3.18 (published and deployed 2026-11-14):** the same admin path now also honours the protected user/project lists that members already obey, and the retired-Trust sweep no longer records a false `trust_unrecoverable` when another controller revoked first. No schema change.
+- **0.3.19 (published and deployed 2026-11-14):** trust-scoped shelve/export connections accept the `reader` role Keystone implies for `member`; found on the first real idle shelve. No schema change.
+- **0.3.20 (published and deployed 2026-11-14):** a shelved dev instance gets a real resume path that remounts its retained layers and writable upper; first live proof preserved a marker across shelve/unshelve. Instances created by older releases, GPU or cluster dev instances and service-instance crash restart are not covered. No schema change.
+- **0.3.21 (published and deployed 2026-11-14):** `restart=unless-stopped` restarts a crashed or exited long-running command of a service instance in place and reports restart status; default for service instances with a readiness probe. Live: restarts after SIGKILL and after a non-zero exit were observed; an OOM kill was not yet produced. No schema change.
+- **0.3.22 (published and deployed 2026-11-15):** longer limit for formatting the guest writable file and a distinct `guest_setup_timeout` error code, after two of four live service creations failed during guest setup. The one creation since then succeeded; the inferred cause is not confirmed.
+- **0.3.23 (published and deployed 2026-11-15):** the guest unit survives an OOM kill of the command (`OOMPolicy=continue`). On 0.3.22 a real OOM kill was followed by no restart; the same unit and runner under systemd as PID 1 in a container showed why (default policy fails the unit and kills the runner; `continue` restarts the command; `systemctl stop` does not relaunch). Live on deployed 0.3.24: a real OOM kill in a Nova guest was followed by a reported restart, and `instance stop` left the instance stopped with no further restart.
+- **0.3.24 (published and deployed 2026-11-15):** client-side `--cloud` failures (unknown or incomplete clouds.yaml cloud, unreachable Keystone, rejected credential, `auth_url` without an identity API) are reported as one specific message instead of a traceback. Checked with the released client against the deployed Hub.
+- **0.3.25 (published and deployed 2026-11-15):** `instance resume` also powers on a stopped dev instance, and the instance status exposes `resume_result`. Service instances still cannot be resumed after `stop`.
+- **0.3.26 (published and deployed 2026-11-15):** the Kolla role can enable Hub Git builds through `palimpsest_git_allowed_hosts` (default off), with `examples/git-build` as a first build; the experimental native VZ commit honours a `/.plmignore` carried by the image. Production allows `github.com`; the first Git build there was admitted and then failed as `build_failed` because of the worker limit defect fixed in 0.3.27.
+- **0.3.27 (published and deployed 2026-11-15):** Hub image jobs (registry intake, Dockerfile and Git builds) no longer reject claims when the build worker's output limit is smaller than the API's blob limit. The experimental native VZ commit bounds `/.plmignore` evaluation and refuses ordinary files named `.wh.*`; a session marker left by a killed `exec` client is released only by its own run, also when that run's VM is stopped. The image-rule fallback and reserved-name refusal were exercised on the tag source in native VZ; an out-of-band unclean stop remains an unresolved recovery limit.
+- **0.3.28 (published and deployed 2026-11-15):** the Hub dashboard can inspect visible playbooks and request VMs from the caller's own completed image jobs. Provider choices use the caller's token, and server creation and deletion remain explicit actions. Browser verification of the dashboard used a local fake API; in production one CPU VM was created from a Git-built image and deleted through the released CLI, not through the dashboard.
+- **0.3.29 (published and deployed 2026-11-15):** the Hub API and export worker name three kinds of swallowed failure in their logs (an unhandled request failure, a failed or stuck `/v1/ready` probe, a failed worker pass) by exception class and Hub call site, never by message or traceback. No API, schema or role input changes. It follows a production window on 0.3.28 in which 5xx answers could not be attributed from the Hub's own logs. The new lines are covered by tests; none has been observed in production because no failure has occurred since the rollout.
 
 ## Install from PyPI
 
 Requires Python 3.11 or newer. Prefer an isolated uv tool, or a pip virtual environment:
 
 ```sh
-uv tool install --python 3.11 "palimpsest-client==0.3.15"
+uv tool install --python 3.11 "palimpsest-client==0.3.29"
 palimpsest --version
 
 # Alternative: pip, without modifying the system Python.
 python3.11 -m venv .venv
-.venv/bin/python -m pip install "palimpsest-client==0.3.15"
+.venv/bin/python -m pip install "palimpsest-client==0.3.29"
 .venv/bin/palimpsest --version
 ```
 
 If uv's tool directory is not on `PATH`, run `uv tool update-shell` explicitly
 and open a new terminal. One-off use: `uvx --python 3.11 --from
-palimpsest-client==0.3.15 palimpsest --version`.
+palimpsest-client==0.3.29 palimpsest --version`.
 
 Root client installation and Hub service deployment are separate. API, export
 worker and build-worker images must match the reviewed release; updating the
 root wheel alone does not update running Kolla containers.
 
-The commands above select version 0.3.15 after its formal publication. Check the
+The commands above select version 0.3.29 after its formal publication. Check the
 [release handoff](docs/development-handoff.md) for actual PyPI/image receipts and
 the deployment-server package/lock selection. Older release and production
 receipts remain historical and do not establish the currently running version.

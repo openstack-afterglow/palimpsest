@@ -76,14 +76,16 @@ def _parent(tmp_path):
     return manifest, config, blobs, digest
 
 
-@pytest.fixture
-def disk(tmp_path):
+def _make_disk(tmp_path, extra=None, whiteouts=()):
     tree = tmp_path / "tree"
     upper = tree / "upper"
     (upper / "opt" / "app").mkdir(parents=True)
     (upper / "opt" / "app" / "new.txt").write_bytes(b"committed change\n")
     (upper / "etc").mkdir()
     (upper / "etc" / "machine-id").write_text("0123456789abcdef0123456789abcdef\n")
+    for name, data in (extra or {}).items():
+        (upper / name).parent.mkdir(parents=True, exist_ok=True)
+        (upper / name).write_bytes(data)
     (tree / "work").mkdir()
     (tree / "platform-state").mkdir()
     (tree / "platform-state" / "binding.json").write_text(json.dumps({**BINDING, "phase": "initialized"}))
@@ -92,8 +94,18 @@ def disk(tmp_path):
     with image.open("wb") as handle:
         handle.truncate(SIZE)
     subprocess.run([str(MKE2FS), "-q", "-t", "ext4", "-d", str(tree), str(image)], check=True, capture_output=True)
+    if whiteouts:
+        script = tmp_path / "whiteouts.cmd"
+        # debugfs links a new node only into its current directory.
+        script.write_text("cd /upper\n" + "".join(f"mknod {name} c 0 0\n" for name in whiteouts))
+        subprocess.run([str(DEBUGFS), "-w", "-f", str(script), str(image)], check=True, capture_output=True)
     os.chmod(image, 0o600)
     return image
+
+
+@pytest.fixture
+def disk(tmp_path):
+    return _make_disk(tmp_path)
 
 
 def copy_clone(source, destination):
@@ -281,13 +293,13 @@ def test_the_expected_binding_must_name_exactly_run_volume_graph_and_nonce(tmp_p
     assert raised.value.code == "binding-expected"
 
 
-def _real_parent(tmp_path, layer_files=None):
+def _real_parent(tmp_path, layer_files=None, raw_layers=None):
     """A parent whose manifest names the real digest of its config bytes."""
     from contextlib import contextmanager
 
     layers, diff_ids, streams = [], [], {}
-    for files in layer_files or ({"a": b"1"}, {"b": b"2"}):
-        blob, layer = gzip_layer(_tar(files))
+    for raw in raw_layers or [_tar(files) for files in layer_files or ({"a": b"1"}, {"b": b"2"})]:
+        blob, layer = gzip_layer(raw)
         layers.append({"mediaType": _MEDIA, "digest": layer.digest, "size": layer.size})
         diff_ids.append(layer.diff_id)
 
@@ -450,6 +462,92 @@ def test_an_unclassified_parent_authorized_keys_fails_the_commit_closed(tmp_path
         commit(tmp_path, disk, parent=parent)
     assert raised.value.code == "capture-provenance"
     assert list((tmp_path / "scratch").iterdir()) == [] and not (tmp_path / "out" / "layout").exists()
+
+
+def test_an_instance_without_its_own_plmignore_inherits_the_rules_of_its_image(tmp_path, disk):
+    (tmp_path / "out").mkdir()
+    parent = _real_parent(tmp_path, ({".plmignore": b"opt/app/\n", "a": b"1"}, {"b": b"2"}))
+    receipt = commit(tmp_path, disk, parent=parent, generated_placeholders=["etc/machine-id"])
+    names = _new_layer_names(tmp_path / "out" / "layout", receipt)
+    assert "opt/app/new.txt" not in names, "the image's /.plmignore must exclude the instance's change"
+
+
+def test_an_instance_plmignore_replaces_the_rules_of_its_image(tmp_path):
+    (tmp_path / "out").mkdir()
+    disk = _make_disk(tmp_path, {".plmignore": b"opt/other/\n"})
+    parent = _real_parent(tmp_path, ({".plmignore": b"opt/app/\n"},))
+    receipt = commit(tmp_path, disk, parent=parent, generated_placeholders=["etc/machine-id"])
+    names = _new_layer_names(tmp_path / "out" / "layout", receipt)
+    assert "opt/app/new.txt" in names and ".plmignore" in names
+
+
+def test_deleting_plmignore_in_the_instance_disables_the_rules_of_its_image(tmp_path):
+    (tmp_path / "out").mkdir()
+    disk = _make_disk(tmp_path, whiteouts=[".plmignore"])
+    parent = _real_parent(tmp_path, ({".plmignore": b"opt/app/\n"},))
+    receipt = commit(tmp_path, disk, parent=parent, generated_placeholders=["etc/machine-id"])
+    names = _new_layer_names(tmp_path / "out" / "layout", receipt)
+    assert "opt/app/new.txt" in names and ".wh..plmignore" in names
+
+
+@pytest.mark.parametrize(
+    "later",
+    [{".wh..plmignore": b""}, {".wh..wh..opq": b""}],
+    ids=["whiteout", "root-opaque"],
+)
+def test_a_plmignore_removed_by_a_later_parent_layer_is_not_inherited(tmp_path, disk, later):
+    (tmp_path / "out").mkdir()
+    parent = _real_parent(tmp_path, ({".plmignore": b"opt/app/\n"}, later))
+    receipt = commit(tmp_path, disk, parent=parent, generated_placeholders=["etc/machine-id"])
+    assert "opt/app/new.txt" in _new_layer_names(tmp_path / "out" / "layout", receipt)
+
+
+def test_the_newest_parent_plmignore_is_the_one_inherited(tmp_path, disk):
+    (tmp_path / "out").mkdir()
+    parent = _real_parent(tmp_path, ({".plmignore": b"opt/app/\n"}, {"./.plmignore": b"opt/unrelated/\n"}))
+    receipt = commit(tmp_path, disk, parent=parent, generated_placeholders=["etc/machine-id"])
+    assert "opt/app/new.txt" in _new_layer_names(tmp_path / "out" / "layout", receipt)
+
+
+def _symlink_layer():
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        info = tarfile.TarInfo(".plmignore")
+        info.type, info.linkname = tarfile.SYMTYPE, "etc/rules"
+        tar.addfile(info)
+    return buf.getvalue()
+
+
+_UNUSABLE = {
+    "oversize": _tar({".plmignore": b"#" * (1024 * 1024 + 1)}),
+    "not-utf8": _tar({".plmignore": b"opt/\xff\n"}),
+    "symlink": _symlink_layer(),
+}
+
+
+@pytest.mark.parametrize("kind", sorted(_UNUSABLE))
+def test_an_unusable_parent_plmignore_refuses_the_commit_and_leaves_no_trace(tmp_path, disk, kind):
+    from palimpsest_local.oci_capture import CaptureError
+
+    parent = _real_parent(tmp_path, raw_layers=(_UNUSABLE[kind],))
+    with pytest.raises(CaptureError) as raised:
+        commit(tmp_path, disk, parent=parent, generated_placeholders=["etc/machine-id"])
+    assert raised.value.code == "plmignore"
+    assert list((tmp_path / "scratch").iterdir()) == [] and not (tmp_path / "out" / "layout").exists()
+
+
+@pytest.mark.parametrize("kind", sorted(_UNUSABLE))
+@pytest.mark.parametrize("own", ["file", "whiteout"])
+def test_an_unusable_parent_plmignore_can_be_overridden_or_deleted_in_the_instance(tmp_path, kind, own):
+    (tmp_path / "out").mkdir()
+    disk = (
+        _make_disk(tmp_path, {".plmignore": b"opt/other/\n"})
+        if own == "file"
+        else _make_disk(tmp_path, whiteouts=[".plmignore"])
+    )
+    parent = _real_parent(tmp_path, raw_layers=(_UNUSABLE[kind],))
+    receipt = commit(tmp_path, disk, parent=parent, generated_placeholders=["etc/machine-id"])
+    assert "opt/app/new.txt" in _new_layer_names(tmp_path / "out" / "layout", receipt)
 
 
 def test_parent_whiteouts_remove_paths_before_they_are_considered(tmp_path):

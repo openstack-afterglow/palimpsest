@@ -176,3 +176,11 @@ button.danger:hover { background: #fff1ef; }
 }
 .toolbar { flex-wrap: wrap; }
 .toolbar label { flex: 1 1 180px; }
+.facts { display: grid; grid-template-columns: max-content 1fr; gap: 6px 24px; margin: 0 0 24px; font-size: 13px; }
+.facts dt { color: #69736b; grid-column: 1; }
+.facts dd { margin: 0; grid-column: 2; overflow-wrap: anywhere; line-height: 1.5; }
+.layers { margin: 0 0 24px; padding-left: 24px; font-size: 12px; line-height: 1.9; }
+.layers code { font-family: "SF Mono", monospace; font-size: 11px; overflow-wrap: anywhere; }
+.layers .meta { color: #7b867d; }
+#playbook-detail h4 { font-size: 13px; margin: 0 0 10px; }
+#launch-reason { margin: 0 0 20px; }

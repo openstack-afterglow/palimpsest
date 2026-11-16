@@ -149,8 +149,39 @@ async def payload_authority(actor, conn, session=None, spec=None):
     return current
 
 
+def restart_policy(spec) -> str:
+    """The caller's choice, else unless-stopped for a plain service instance with a readiness probe.
+
+    A row created before the option existed has no `restart` key and its guest never restarts.
+    """
+    if "restart" not in spec:
+        return "no"
+    chosen = spec["restart"]
+    if chosen in ("no", "unless-stopped"):
+        return chosen
+    plain_service = (
+        spec.get("lifecycle", "service") == "service"
+        and bool(spec.get("readiness_argv"))
+        and spec.get("gpu") is None
+        and spec.get("cluster") is None
+    )
+    return "unless-stopped" if plain_service else "no"
+
+
+def restart_projection(row):
+    status = row.spec_json.get("restart_status") or {}
+    return {
+        "policy": restart_policy(row.spec_json),
+        "restarts": status.get("restarts", 0),
+        "last_exit_code": status.get("last_exit_code"),
+        "state": status.get("state"),
+        "recorded_at": status.get("recorded_at"),
+    }
+
+
 def projection(row):
     return {
+        "restart": restart_projection(row),
         "id": row.id,
         "request_id": row.request_id,
         "name": row.name,
@@ -164,6 +195,8 @@ def projection(row):
         "image_job_id": row.spec_json.get("image_job_id"),
         "boot_volume_id": row.boot_volume_id,
         "mode": row.spec_json["mode"],
+        "lifecycle": row.spec_json.get("lifecycle", "service"),
+        "key_name": row.spec_json.get("key_name"),
         "gpu_profile": row.spec_json.get("gpu_profile"),
         "gpu": row.spec_json.get("gpu"),
         "cluster": (
@@ -175,6 +208,8 @@ def projection(row):
         "writable_gib": row.spec_json["writable_gib"],
         "writable_storage": "guest-private boot-disk ext4 loop filesystem",
         "result": row.result_json,
+        # The latest restore report of a resumed dev guest; `result` stays the sealed first result.
+        "resume_result": row.spec_json.get("resume_result"),
         "error_code": row.error_code,
         "readiness_semantics": "point-in-time execution/probe proof, not ongoing health",
         "result_recorded_at": aware(row.result_recorded_at).isoformat() if row.result_recorded_at else None,
@@ -262,6 +297,9 @@ def provider_inputs(conn, spec, project, max_boot, base_images=None, gpu=None):
     flavor = conn.compute.get_flavor(spec["flavor_id"])
     if flavor is None or int(value(flavor, "ram", 0) or 0) < int(value(image, "min_ram", 0) or 0):
         raise HTTPException(422, "Flavor is unavailable or smaller than image minimum RAM")
+    # A wrong key name would make Nova refuse the create after the boot volume exists.
+    if spec.get("key_name") and conn.compute.find_keypair(spec["key_name"], ignore_missing=True) is None:
+        raise HTTPException(422, "SSH key pair was not found for the caller")
     if value(flavor, "is_disabled") is True:
         raise HTTPException(422, "Flavor is disabled")
     public = value(flavor, "is_public")
@@ -467,7 +505,11 @@ async def create(factory, store, settings, actor, conn, req):
     digest_req = {
         key: item
         for key, item in req.items()
-        if key not in ("gpu_profile", "cluster_profile", "cluster_server_id") or item is not None
+        if (
+            key not in ("gpu_profile", "cluster_profile", "cluster_server_id", "key_name", "restart")
+            or item is not None
+        )
+        and not (key == "lifecycle" and item == "service")
     }
     digest = (
         "sha256:" + hashlib.sha256(json.dumps(digest_req, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
@@ -492,8 +534,13 @@ async def create(factory, store, settings, actor, conn, req):
             preflight.require,
             conn,
             actor,
-            preflight.PreflightNeed(volume_gib=req["boot_gib"]),
+            preflight.PreflightNeed(
+                volume_gib=req["boot_gib"],
+                flavor_id=req["flavor_id"],
+                ports=1,
+            ),
             interface=settings.os_interface,
+            region_name=settings.os_region_name,
         )
         source = (
             await owned(session, req["source_instance_id"], project, actor["user_id"])
@@ -612,12 +659,28 @@ async def create(factory, store, settings, actor, conn, req):
         )
         if spec["cluster"] is not None:
             spec["cluster"]["node_name"] = "pal-" + uuid.UUID(row.id).hex
-        session.add(row)
-        for bound_digest in dict.fromkeys(
-            [*spec["layer_digests"], *([spec["base_image_digest"]] if spec["base_image_digest"] else [])]
-        ):
-            await retain_blob(session, bound_digest, "instance", row.id)
-        await session.commit()  # Durable intent precedes the first allocation; never replay it.
+        delegation = None
+        if req.get("lifecycle") == "dev":
+            # The owner's own request mints the instance-lifetime trust that later lets the worker
+            # shelve this server; nothing is allocated if the owner cannot delegate.
+            from palimpsest_hub.services import instance_lifecycle as lifecycle
+
+            delegation = await lifecycle.admit_trust(actor, project, settings)
+        try:
+            session.add(row)
+            if delegation is not None:
+                session.add(lifecycle.new_row(row.id, project, delegation, now))
+            for bound_digest in dict.fromkeys(
+                [*spec["layer_digests"], *([spec["base_image_digest"]] if spec["base_image_digest"] else [])]
+            ):
+                await retain_blob(session, bound_digest, "instance", row.id)
+            await session.commit()  # Durable intent precedes the first allocation; never replay it.
+        except BaseException:
+            if delegation is not None:
+                # Also on cancellation: a leaked trust would stay valid until its expiry.
+                with suppress(BaseException):
+                    await asyncio.shield(lifecycle.discard_trust(actor, delegation))
+            raise
         instance_id = row.id
     async with sql_mutex(factory, "build-api:instance:" + instance_id) as session:
         row = await owned(session, instance_id, project, actor["user_id"])
@@ -773,7 +836,7 @@ def fail_preparation(row, code, *, no_call=None):
         preparation_update(row, phase="nova_not_attempted", server_create_attempted=False)
 
 
-async def allocation_authority(session, row, actor, conn, settings, *, no_call=None):
+async def allocation_authority(session, row, actor, conn, settings, *, no_call, preflight_phase):
     """Revalidate after slow provider reads, without renewing the accepted expiry."""
     spec = row.spec_json
     try:
@@ -805,6 +868,37 @@ async def allocation_authority(session, row, actor, conn, settings, *, no_call=N
         if isinstance(exc, HTTPException):
             raise
         raise HTTPException(502, "Provider input validation unavailable") from None
+    try:
+        need = (
+            preflight.PreflightNeed(
+                instances=1,
+                volumes=1,
+                volume_gib=spec["boot_gib"],
+                flavor_id=spec["flavor_id"],
+                ports=1,
+            )
+            if preflight_phase == "volume"
+            else preflight.PreflightNeed(
+                instances=1,
+                volumes=0,
+                volume_gib=0,
+                flavor_id=spec["flavor_id"],
+                ports=1,
+            )
+        )
+        await run_blocking(
+            preflight.require,
+            conn,
+            actor,
+            need,
+            interface=settings.os_interface,
+            region_name=settings.os_region_name,
+        )
+    except HTTPException:
+        fail_preparation(row, "preflight_failed", no_call=no_call)
+        await session.commit()
+        raise
+    # Preflight errors retain their structured 4xx response.
     try:
         await payload_authority(actor, conn, session, spec)
     except HTTPException:
@@ -853,7 +947,9 @@ async def advance_prepared_boot(session, row, actor, conn, settings, *, allocate
         and "packages:write" in actor.get("package_actions", ())
     )
     if phase == "volume_not_attempted":
-        if not may_allocate or not await allocation_authority(session, row, actor, conn, settings):
+        if not may_allocate or not await allocation_authority(
+            session, row, actor, conn, settings, no_call="volume", preflight_phase="volume"
+        ):
             return
         preparation_update(row, phase="volume_create_uncertain", volume_create_attempted=True)
         row.status, row.error_code = "uncertain", "provider_volume_create_uncertain"
@@ -867,7 +963,9 @@ async def advance_prepared_boot(session, row, actor, conn, settings, *, allocate
                     preparation_update(row, delete_phase="absent", delete_ready=False)
                 await session.commit()
             return
-        if not await allocation_authority(session, row, actor, conn, settings, no_call="volume"):
+        if not await allocation_authority(
+            session, row, actor, conn, settings, no_call="volume", preflight_phase="volume"
+        ):
             return
         try:
             volume = await run_blocking(
@@ -932,7 +1030,13 @@ async def advance_prepared_boot(session, row, actor, conn, settings, *, allocate
     await preparation_refence(session, row)
     if not can_continue_preparation(row, "nova_not_attempted"):
         return
-    if not launch or not may_allocate or not await allocation_authority(session, row, actor, conn, settings):
+    if (
+        not launch
+        or not may_allocate
+        or not await allocation_authority(
+            session, row, actor, conn, settings, no_call="server", preflight_phase="server"
+        )
+    ):
         return
     # Final volume observation precedes the final original-human fence.
     volume = await run_blocking(get_prepared_volume, conn, row)
@@ -953,6 +1057,13 @@ async def advance_prepared_boot(session, row, actor, conn, settings, *, allocate
         return
     spec = row.spec_json
     token = secrets.token_urlsafe(32)
+    session_token = None
+    # Only the restart-status report uses this; it outlives the single-use bootstrap capability.
+    restart_token = secrets.token_urlsafe(32) if restart_policy(spec) == "unless-stopped" else None
+    if spec.get("lifecycle") == "dev":
+        from palimpsest_hub.services import instance_lifecycle as lifecycle
+
+        session_token, session_hash = lifecycle.new_capability()
     guest = {
         "instance_id": row.id,
         "origin": settings.palimpsest_hub_package_public_origin.rstrip("/"),
@@ -971,6 +1082,17 @@ async def advance_prepared_boot(session, row, actor, conn, settings, *, allocate
         "command": spec["command"],
         "readiness_argv": spec["readiness_argv"],
         "ca_certificates": list(settings.palimpsest_hub_instance_ca_certificates),
+        **(
+            {
+                "session_report": {
+                    "capability": session_token,
+                    "interval_seconds": settings.palimpsest_hub_session_report_interval_seconds,
+                }
+            }
+            if session_token is not None
+            else {}
+        ),
+        **({"restart": {"policy": "unless-stopped", "capability": restart_token}} if restart_token is not None else {}),
     }
     user_data = base64.b64encode(render_bootstrap(guest).encode()).decode()
     if len(user_data) > 65535:
@@ -978,6 +1100,13 @@ async def advance_prepared_boot(session, row, actor, conn, settings, *, allocate
         await session.commit()
         return
     row.capability_hash = hashlib.sha256(token.encode()).hexdigest()
+    if restart_token is not None:
+        row.spec_json = {
+            **row.spec_json,
+            "restart_capability_hash": hashlib.sha256(restart_token.encode()).hexdigest(),
+        }
+    if session_token is not None:
+        await lifecycle.bind_capability(session, row.id, session_hash)
     preparation_update(row, phase="nova_create_uncertain", server_create_attempted=True)
     row.status, row.error_code = "uncertain", "provider_create_uncertain"
     await session.commit()  # Only this request holds raw token; never replay Nova POST.
@@ -993,7 +1122,7 @@ async def advance_prepared_boot(session, row, actor, conn, settings, *, allocate
         return
     # Reacquire cluster-source authority/lock, settings, human and payload after
     # the commit and potentially slow mutex wait; retain these locks through POST.
-    if not await allocation_authority(session, row, actor, conn, settings, no_call="server"):
+    if not await allocation_authority(session, row, actor, conn, settings, no_call="server", preflight_phase="server"):
         return
     bootstrap_expires_at = guest["expires_at"]
     create_not_sent = object()
@@ -1008,6 +1137,7 @@ async def advance_prepared_boot(session, row, actor, conn, settings, *, allocate
             expired_without_call = True
             return create_not_sent
         return conn.compute.create_server(
+            **({"key_name": spec["key_name"]} if spec.get("key_name") else {}),
             name=spec["name"],
             flavor_id=spec["flavor_id"],
             networks=[{"uuid": spec["network_id"]}],
@@ -1132,7 +1262,14 @@ def inspect_boot_volume(conn, row, server, *, deleting=False):
                 volume is None
                 or owner != row.project_id
                 or not dot
-                or not any(value(item, "server_id") == value(server, "id") for item in attached)
+                or not (
+                    any(value(item, "server_id") == value(server, "id") for item in attached)
+                    # An offloaded server keeps its boot volume reserved; it must not be held by another server.
+                    or (
+                        str(value(server, "status", "")).upper().startswith("SHELVED")
+                        and all(value(item, "server_id") in (None, value(server, "id")) for item in attached)
+                    )
+                )
                 or value(volume, "bootable", value(volume, "is_bootable")) not in (True, "true")
             ):
                 raise HTTPException(409, "Original boot volume ownership or attachment is not verified")
@@ -1308,6 +1445,19 @@ async def reconcile(session, row, conn, actor=None, settings=None):
             row.status, row.error_code = "booting", None
         elif row.status == "stopping" and status == "SHUTOFF":
             row.status = "stopped"
+        elif row.status == "shelved" and status == "ACTIVE":
+            # Someone unshelved the server outside the Hub; the lifecycle must not stay shelved.
+            from palimpsest_hub.services import instance_lifecycle as lifecycle
+
+            row.status = "resumed"
+            await lifecycle.mark_resumed(session, row.id)
+        elif row.status == "stopped" and status == "ACTIVE":
+            # Powered on outside `resume`, or by a `resume` whose wait for ACTIVE failed: a dev guest
+            # restores itself on boot and must be able to report. A service instance stays `stopped`.
+            from palimpsest_hub.services import instance_lifecycle as lifecycle
+
+            if await lifecycle.mark_started(session, row):
+                row.status = "resumed"
         # ACTIVE is provider state, never proof of guest readiness.
     if row.status == "booting" and aware(row.capability_expires_at) <= datetime.now(UTC):
         row.status, row.error_code = "error", "bootstrap_expired"
@@ -1387,6 +1537,9 @@ async def action(factory, actor, conn, instance_id, operation):
             if preparation(row):
                 preparation_update(row, terminal=True, delete_phase="absent", delete_ready=False)
             row.status = "deleted"
+            from palimpsest_hub.services import instance_lifecycle as lifecycle
+
+            await lifecycle.retire(session, row)
             row.updated_at = datetime.now(UTC)
             await session.commit()
             return projection(row)
@@ -1401,6 +1554,8 @@ async def action(factory, actor, conn, instance_id, operation):
                 raise HTTPException(502, "Provider instance observation unavailable") from None
         if operation == "delete":
             row.capability_hash = None
+            from palimpsest_hub.services import instance_lifecycle as lifecycle
+
             if server is not None:
                 try:
                     row.boot_volume_id = await run_blocking(inspect_boot_volume, conn, row, server, deleting=True)
@@ -1416,6 +1571,7 @@ async def action(factory, actor, conn, instance_id, operation):
                 and preparation(row)
                 and (row.server_id or preparation(row)["phase"] not in ("nova_create_uncertain", "nova_observed"))
             ):
+                await lifecycle.retire(session, row)
                 await dispose_prepared_volume(session, row, actor, conn)
                 return projection(row)
             if server is None and row.server_id is None:
@@ -1428,7 +1584,11 @@ async def action(factory, actor, conn, instance_id, operation):
         else:
             if server is None:
                 raise HTTPException(409, "Instance has no observed owned provider server")
+            if row.status == "shelved":
+                raise HTTPException(409, "Instance is shelved; resume it before stopping")
             row.status, row.error_code = "stopping", None
+        if operation == "delete":
+            await lifecycle.retire(session, row)
         row.updated_at = datetime.now(UTC)
         await session.commit()  # Durable lifecycle intent before effect.
     if server is not None:
@@ -1470,3 +1630,11 @@ def capability(row, supplied):
         or row.status in ("deleting", "deleted")
     ):
         raise HTTPException(404, "Bootstrap capability not found or expired")
+
+
+def restart_capability(row, supplied):
+    """The long-lived, restart-status-only guest capability of a running instance."""
+    expected = row.spec_json.get("restart_capability_hash")
+    actual = hashlib.sha256(supplied.encode()).hexdigest()
+    if not expected or not hmac.compare_digest(actual, expected) or row.status in ("deleting", "deleted"):
+        raise HTTPException(404, "Restart status capability not found")

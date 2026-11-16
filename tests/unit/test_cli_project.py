@@ -153,7 +153,7 @@ def test_compose_up_passes_selection_and_recreate_policy(
     _write_project(tmp_path)
     callbacks = object()
     calls: list[object] = []
-    monkeypatch.setattr(cli, "_compose_callbacks", lambda *args: callbacks)
+    monkeypatch.setattr(cli, "_compose_callbacks", lambda *args, **_kwargs: callbacks)
 
     def fake_up(project, received_callbacks, **kwargs):
         calls.append((project.name, received_callbacks, kwargs))
@@ -184,7 +184,7 @@ def test_compose_down_preserves_volumes_unless_requested(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _write_project(tmp_path)
-    monkeypatch.setattr(cli, "_compose_callbacks", lambda *args: object())
+    monkeypatch.setattr(cli, "_compose_callbacks", lambda *args, **_kwargs: object())
     calls: list[bool] = []
 
     def fake_down(_project, _callbacks, **kwargs):
@@ -269,7 +269,7 @@ services:
         remove_volume=remove_volume,
     )
 
-    def build_callbacks(project, *_args):
+    def build_callbacks(project, *_args, **_kwargs):
         loaded.append(project)
         return callbacks
 
@@ -342,7 +342,7 @@ def test_compose_ps_json_uses_logical_service_names(
 ) -> None:
     _write_project(tmp_path)
     callbacks = SimpleNamespace(inspect=lambda _name: None)
-    monkeypatch.setattr(cli, "_compose_callbacks", lambda *args: callbacks)
+    monkeypatch.setattr(cli, "_compose_callbacks", lambda *args, **_kwargs: callbacks)
     monkeypatch.setattr(
         cli,
         "project_ps",
@@ -362,7 +362,7 @@ def test_compose_follow_rejects_multiple_services_before_reading_logs(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     _write_project(tmp_path)
-    monkeypatch.setattr(cli, "_compose_callbacks", lambda *args: object())
+    monkeypatch.setattr(cli, "_compose_callbacks", lambda *args, **_kwargs: object())
     monkeypatch.setattr(cli, "project_log_targets", lambda *_args, **_kwargs: (("api", "one"), ("db", "two")))
 
     assert cli.main(["compose", "--project-directory", str(tmp_path), "logs", "--follow"]) == 1
@@ -374,7 +374,7 @@ def test_compose_exec_preserves_argv_and_never_uses_a_shell(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _write_project(tmp_path)
-    monkeypatch.setattr(cli, "_compose_callbacks", lambda *args: SimpleNamespace(inspect=lambda _name: None))
+    monkeypatch.setattr(cli, "_compose_callbacks", lambda *args, **_kwargs: SimpleNamespace(inspect=lambda _name: None))
     monkeypatch.setattr(
         cli,
         "project_service_operation",
@@ -420,7 +420,7 @@ def test_compose_port_prints_owner_verified_applied_mapping_instead_of_current_y
     _write_project(tmp_path)
     inspected = _typed_inspect("running", (InspectPort("127.0.0.1", 19090, 8080, "tcp"),))
     callbacks = SimpleNamespace(inspect=lambda _name: inspected)
-    monkeypatch.setattr(cli, "_compose_callbacks", lambda *args: callbacks)
+    monkeypatch.setattr(cli, "_compose_callbacks", lambda *args, **_kwargs: callbacks)
 
     def fake_managed_run_name(_project, _service, *, roots, inspect):
         assert roots is not None
@@ -440,7 +440,7 @@ def test_compose_port_rejects_malformed_applied_runtime_state(
 ) -> None:
     _write_project(tmp_path)
     callbacks = SimpleNamespace(inspect=lambda _name: {"state": {"status": "running", "ports": "18080:8080"}})
-    monkeypatch.setattr(cli, "_compose_callbacks", lambda *args: callbacks)
+    monkeypatch.setattr(cli, "_compose_callbacks", lambda *args, **_kwargs: callbacks)
 
     def fake_managed_run_name(_project, _service, *, roots, inspect):
         inspect("demo-api-1")
@@ -461,7 +461,7 @@ def test_compose_port_rejects_removed_runtime_instead_of_falling_back_to_yaml(
     callbacks = SimpleNamespace(
         inspect=lambda _name: _typed_inspect("removed", (InspectPort("127.0.0.1", 18080, 8080, "tcp"),))
     )
-    monkeypatch.setattr(cli, "_compose_callbacks", lambda *args: callbacks)
+    monkeypatch.setattr(cli, "_compose_callbacks", lambda *args, **_kwargs: callbacks)
 
     def fake_managed_run_name(_project, _service, *, roots, inspect):
         inspect("demo-api-1")
