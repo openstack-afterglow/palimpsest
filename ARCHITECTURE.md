@@ -4103,8 +4103,8 @@ Reserved names and duplicate listings (2026-11-15, from the commit-path review, 
 {
   "schema_version": 1,
   "source_sha256": "a01397314340c87fe21652ab55216e5d1e3a7493348a4340882570f4ce3ccedb",
-  "reviewed_at": "2026-11-16T06:21:27Z",
-  "summary": "Record the second 2026-11-16 owner form results: M3-02 manual settlement, M4-07 Dockerfile path live, registry failure diagnosis, log-count correction"
+  "reviewed_at": "2026-11-16T08:13:50Z",
+  "summary": "Record 2026-11-16 third/fourth owner-form results: M4-07 checked, M3-03/04/05 reverted after PR #115, M3-10 and M4-10 adjudications, defects and fix candidate"
 }
 ```
 <!-- architecture-review:end -->
