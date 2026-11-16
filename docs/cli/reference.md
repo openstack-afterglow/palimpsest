@@ -3,7 +3,7 @@
 
 This file is generated from `palimpsest_local.cli.build_parser`. It inventories every command, positional, option, choice, and parser default. For behavior, examples, and runtime restrictions, read [the usage guide](usage.md). Every command except raw `docker` pass-through accepts automatic `-h`/`--help`.
 
-Coverage: **172 command paths**, **474 positional/option definitions** (excluding automatic `-h/--help`).
+Coverage: **173 command paths**, **477 positional/option definitions** (excluding automatic `-h/--help`).
 
 ## `palimpsest`
 
@@ -1367,10 +1367,10 @@ usage: palimpsest instance rm [-h] instance_id
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest layer [-h] {cloud-init,ls,check,pull,pack,push} ...
+usage: palimpsest layer [-h] {cloud-init,ls,check,impact,pull,pack,push} ...
 ```
 
-Subcommands: `cloud-init`, `ls`, `check`, `pull`, `pack`, `push`.
+Subcommands: `cloud-init`, `ls`, `check`, `impact`, `pull`, `pack`, `push`.
 
 ### `palimpsest layer cloud-init`
 
@@ -1422,6 +1422,22 @@ usage: palimpsest layer check [-h] [--backend {auto,kvm,lima-vz,libvirt-hvf,lima
 | --- | --- | --- | --- |
 | `digest` | string | required | Expected or selected SHA-256 content digest. |
 | `--backend` | one of: `auto`, `kvm`, `lima-vz`, `libvirt-hvf`, `lima-krunkit` | `'auto'` | Select or automatically detect the runtime backend. |
+
+### `palimpsest layer impact`
+
+[Behavior, restrictions, and examples](usage.md#hub-cloud-images-layers-and-bundles).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest layer impact [-h] [--replacement REFERENCE] [--json] REFERENCE
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `reference` | string | required | local layer or base image digest or tag |
+| `--replacement` | string | `None` | local replacement digest or tag |
+| `--json` | flag | `False` | emit the recorded local impact plan as JSON |
 
 ### `palimpsest layer pull`
 

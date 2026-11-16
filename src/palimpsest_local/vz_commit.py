@@ -247,14 +247,31 @@ def _scan_parent(manifest: dict, blobs: Mapping[str, Path]) -> tuple[set[str], b
     limit, and a non-regular file is returned as the error to raise: the capture judges them
     only when the instance has no /.plmignore of its own, so a broken file in an image can
     still be overridden or deleted in the instance.
+
+    A layer's whiteout and opaque markers act on the layers below it only, wherever they sit in
+    the tar: its own entries are added after its markers are applied. Images written by other
+    tools do not always list markers first, and a path wrongly taken as absent would leave the
+    parent's identity files without a whiteout in the committed layer.
+
+    A non-directory entry replaces whatever was at its path, so a lower directory's entries are
+    gone once a file or symlink takes the directory's place, as are entries the same layer
+    listed below that path earlier. This is the view ``oci_changeset.normalize_changeset`` gives
+    the materializer; a path wrongly taken as present would be whiteouted under a non-directory.
     """
     visible: set[str] = set()
+    # Every proper ancestor of a path that was ever visible. Stale entries only cost a scan.
+    lower_dirs: set[str] = set()
     ignore: bytes | None = None
     for item in manifest.get("layers", ()):
         try:
             archive = tarfile.open(blobs[item["digest"]], mode="r|gz")
         except (OSError, tarfile.TarError, KeyError):
             raise CommitError("commit-parent", "a parent layer could not be read to list its paths") from None
+        added: set[str] = set()
+        deleted: set[str] = set()
+        opaque: set[str] = set()
+        replaced: set[str] = set()
+        parents: set[str] = set()
         with archive:
             try:
                 for member in archive:
@@ -263,25 +280,54 @@ def _scan_parent(manifest: dict, blobs: Mapping[str, Path]) -> tuple[set[str], b
                         continue
                     directory, _, base = name.rpartition("/")
                     if base == ".wh..wh..opq":
-                        prefix = directory + "/" if directory else ""
-                        visible = {path for path in visible if not path.startswith(prefix)} if prefix else set()
+                        opaque.add(directory)
                     elif base.startswith(".wh."):
-                        gone = (directory + "/" if directory else "") + base.removeprefix(".wh.")
-                        visible = {path for path in visible if path != gone and not path.startswith(gone + "/")}
+                        deleted.add((directory + "/" if directory else "") + base.removeprefix(".wh."))
                     else:
-                        visible.add(name)
+                        if not member.isdir():
+                            if name in lower_dirs:
+                                replaced.add(name)
+                            if name in parents:
+                                below = name + "/"
+                                added = {path for path in added if not path.startswith(below)}
+                        added.add(name)
+                        while directory and directory not in parents:
+                            parents.add(directory)
+                            directory = directory.rpartition("/")[0]
                         if name == _PLMIGNORE:
                             source = archive.extractfile(member) if member.isreg() else None
                             ignore = source.read(MAX_PARENT_PLMIGNORE_BYTES + 1) if source is not None else None
-                    if len(visible) > MAX_PARENT_PATHS:
+                    if len(added) + len(deleted) + len(opaque) > MAX_PARENT_PATHS:
                         raise CommitError("commit-parent", "the parent image has too many paths to inspect")
             except tarfile.TarError:
                 raise CommitError("commit-parent", "a parent layer is not a readable tar") from None
+        if "" in opaque:
+            visible = set()
+        elif deleted or opaque or replaced:
+            # Removed in place: the view and a second copy of it never exist together.
+            visible.difference_update([path for path in visible if _hidden_by(path, deleted, opaque, replaced)])
+        visible |= added
+        lower_dirs |= parents
+        if len(visible) > MAX_PARENT_PATHS:
+            raise CommitError("commit-parent", "the parent image has too many paths to inspect")
     if _PLMIGNORE not in visible:
         return visible, None
     if ignore is None:
         return visible, CaptureError("plmignore", "the parent image's /.plmignore is not a regular file")
     return visible, ignore
+
+
+def _hidden_by(path: str, deleted: set[str], opaque: set[str], replaced: set[str]) -> bool:
+    """Whether a lower path is removed by a layer: whiteouted, below an opaque directory, or below a replaced one."""
+    if path in deleted:
+        return True
+    end = path.rfind("/")
+    while end > 0:
+        ancestor = path[:end]
+        if ancestor in deleted or ancestor in opaque or ancestor in replaced:
+            return True
+        end = path.rfind("/", 0, end)
+    return False
 
 
 def parent_layer_paths(manifest: dict, blobs: Mapping[str, Path]) -> set[str]:

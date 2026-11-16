@@ -283,6 +283,39 @@ Ubuntu24.04 arm64 Lima VZ profile on macOS. Native VZ requires its pinned boot
 assets and Linux worker; matching an image's CPU architecture alone does not
 establish execution admission. Registry acquisition support remains separate.
 
+### Local layer and base-image impact
+
+```sh
+palimpsest layer impact python:3.12
+palimpsest layer impact ubuntu:24.04 --replacement ubuntu:24.04-r2 --json
+```
+
+`layer impact REFERENCE` accepts a local layer or base-image digest or immutable
+tag. It reads stored artifact, tag, completed-build, run, project, and
+retained-instance metadata without refreshing the catalog, writing state, or
+contacting Hub. `--cloud` is refused. Descendants appear nearest-first; existing
+consumers stay bound to their recorded digests. No VM or writable data changes.
+A stored layer that names the changed artifact but cannot be reached through
+stored parent records is listed as unreached, not planned.
+
+Rebuild, reconversion, transfer, and deployment are separate plan states; none
+is performed. A recorded recipe digest (`recipe_sha256`, or BuildKit's
+`dockerfile_digest`) does not guarantee a replayable or bit-identical build, and
+a `Palimpsestfile` recipe must be edited to name the new parent. A BuildKit
+runtime pack under a changed base image is reported as a new pack
+(`reconversion`), with the BuildKit build cache and the pack cache apart.
+Bases can be resolved through recorded parent links without inventing child
+metadata. With `--replacement REFERENCE`, structure is diagnosed separately
+from filesystem, distribution/ABI, kernel/device, and smoke-test stages.
+Structure is `unverified`, not passed, when a base or parent chain cannot be
+compared. The later stages remain `unverified`, even when structure passes.
+
+`--json` emits schema `palimpsest.lineage-impact-plan.v1`, including path-free
+`warnings` for unreadable or corrupt individual records and an explicit
+`truncated` flag. Human output includes the plan's scope statement and notes
+truncation. A computed plan exits 0 even when structure fails; unusable input
+exits non-zero. This is information, not an admission or migration decision.
+
 The Docker-compatible `image inspect`, `image history`, `image rm`, `image save`, and `image load` commands are aliases for Docker-backed operations; they do not inspect or mutate Hub `/v1` cloud-image records.
 
 ## Registry profiles and Docker wrapper commands

@@ -1204,6 +1204,10 @@ def build_parser() -> argparse.ArgumentParser:
     layer_check = layer_commands.add_parser("check", help="check a Hub layer's full base/parent chain for this client")
     layer_check.add_argument("digest")
     layer_check.add_argument("--backend", choices=("auto", *platforms.BACKENDS), default="auto")
+    layer_impact = layer_commands.add_parser("impact", help="plan descendant rebuilds from recorded local metadata")
+    layer_impact.add_argument("reference", metavar="REFERENCE", help="local layer or base image digest or tag")
+    layer_impact.add_argument("--replacement", metavar="REFERENCE", help="local replacement digest or tag")
+    layer_impact.add_argument("--json", action="store_true", help="emit the recorded local impact plan as JSON")
     layer_pull = layer_commands.add_parser("pull", help="download a Hub layer into the local store")
     layer_pull.add_argument("digest")
     layer_pull.add_argument("--output", type=Path)
@@ -2951,6 +2955,7 @@ def dispatch_args(args: argparse.Namespace) -> int:
         if deferred_package_state
         or deferred_source_state
         or read_only_store
+        or (op == "layer" and args.layer_operation == "impact")
         or op in read_only_root_operations
         or (op == "oci" and args.oci_operation in read_only_oci_operations)
         else init_roots()
@@ -3472,6 +3477,62 @@ def dispatch_args(args: argparse.Namespace) -> int:
             result = check_artifact(metadata, lookup=client.get_layer, requested_backend=args.backend)
             print(json.dumps(result, indent=2))
             return 0 if result["compatible"] else 1
+        elif lyr_op == "impact":
+            plan = inventory.lineage_impact(roots, args.reference, replacement=args.replacement)
+            if args.json:
+                print(json.dumps(plan, indent=2))
+            else:
+                changed = plan["changed"]
+                names = ", ".join(changed["names"]) or "-"
+                print(f"Impact: replace {changed['digest']} ({names})")
+                replacement = plan["replacement"]
+                if replacement is None:
+                    print("Replacement: not specified; structure=not-inspected")
+                else:
+                    print(f"Replacement: {replacement['digest']}; structure={replacement['structure']['status']}")
+                    for reason in replacement["structure"]["reasons"]:
+                        print(f"  {reason}")
+                for item in plan["affected"]:
+                    indent = "  " * item["depth"]
+                    names = ", ".join(item["names"]) or "-"
+                    rebuild = item["new_lineage"]["rebuild"]
+                    pack = item["new_lineage"]["reconversion"]
+                    if rebuild["state"] == "required":
+                        note = (
+                            "recipe digest recorded" if rebuild["recipe"] == "digest-recorded" else "no recipe recorded"
+                        )
+                        if rebuild.get("recipe_edit") == "required":
+                            note += "; the recipe must name the new parent"
+                        if rebuild["cache"] != "unknown":
+                            note += f"; build cache {rebuild['cache']}"
+                        action = f"rebuild: required ({note})"
+                    else:
+                        action = f"rebuild: {rebuild['state']} (build cache {rebuild['cache']})"
+                    if pack["state"] == "required":
+                        action += f"; reconversion: required (cache {pack['cache']})"
+                    consumers = ", ".join(item["existing_lineage"]["consumers"]) or "-"
+                    stages = (
+                        " "
+                        + " ".join(f"{stage['stage']}={stage['status']}" for stage in item["compatibility"]["stages"])
+                        if item["compatibility"] is not None
+                        else ""
+                    )
+                    print(
+                        f"{indent}{item['digest'][:19]} ({names}) {action}; consumers stay bound: {consumers}{stages}"
+                    )
+                if plan["unreached"]:
+                    print(
+                        f"Note: {len(plan['unreached'])} stored layer(s) record this artifact but cannot be reached "
+                        "through stored parent records; they are not planned:"
+                    )
+                    for digest in plan["unreached"][:10]:
+                        print(f"  {digest}")
+                print(plan["statement"])
+                if plan["truncated"]:
+                    print("Note: plan truncated; more affected layers may exist.")
+                for warning in plan["warnings"]:
+                    print(f"warning: {warning}", file=sys.stderr)
+            return 0
         elif lyr_op == "pull":
             norm_digest = require_digest(args.digest)
             client = hub_client(args.url, args.hub_cloud)
@@ -4237,7 +4298,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             # Explicit --state-root isolation: never journal into the configured root.
             or args.operation == "published"
             or (args.operation == "build" and args.executor == "nova")
-            or (args.operation == "layer" and args.layer_operation == "cloud-init")
+            or (args.operation == "layer" and args.layer_operation in {"cloud-init", "impact"})
             or (args.operation == "oci" and args.oci_operation == "cache")
             or (args.operation == "docker" and _docker_help_requested(args.docker_args))
         ):

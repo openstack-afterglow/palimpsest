@@ -278,6 +278,33 @@ The complete interface, performance matrix, receipt fields, and acceptance gates
 
 ---
 
+## 8. Parent Changes and Verification Stages
+
+A layer names its parent and its base image by digest, and a tag cannot move to different bytes. A new version of a parent therefore changes nothing that exists: children, runs and Hub instances stay bound to the digests they recorded. A lineage on a new parent exists only after each child is built again on it. Palimpsest does not rebuild descendants automatically.
+
+`palimpsest layer impact REFERENCE [--replacement REFERENCE]` shows, from recorded local metadata and without changing anything, which stored layers descend from a layer or base image, which local runs, projects and retained instances stay bound to them, and what a new lineage would need. Rebuild, reconversion, transfer and deployment are reported as separate states because they are separate actions with separate caches:
+
+- A `Palimpsestfile` layer needs its recipe run again as a whole, and the recipe must first be edited to name the new parent: it names `FROM` and `LAYER` by digest, and only the recipe's digest is recorded.
+- A committed or imported layer has no recorded recipe.
+- A BuildKit runtime pack bound to a changed base image needs a new pack, not a new build: the base image is not an input of the Dockerfile build, BuildKit decides step reuse from the real inputs of each step, and the pack cache has its own key, which binds the base image.
+- The OCI-to-SquashFS conversion cache of pulled images re-converts only the layers after a changed parent.
+
+Descendants that exist only on a Hub or on another host are not listed. A stored layer that names the changed artifact but cannot be reached because a layer between them is not stored is listed as `unreached`.
+
+Compatibility is reported per stage, and a stage that nothing evaluated is `unverified`, not safe:
+
+| Stage | What it covers | Evidence in the product today |
+|---|---|---|
+| `structure` | parent chain, digests, artifact kinds, base binding, declared architecture | recorded metadata (`layer impact`): `failed` for another kind or architecture or a replacement that descends from the replaced layer; `unverified` when a base or chain cannot be compared |
+| `filesystem` | path collisions, overwrites, whiteouts and opaque directories between a base and kept layers | the base-migration structure check exists as a pure comparison; nothing produces its input yet, so real plans report `unverified` |
+| `distribution_abi` | distribution release, libc and library ABI, package dependencies | none; always `unverified` |
+| `kernel_device` | guest kernel, drivers, devices, GPU | none; always `unverified` |
+| `smoke_test` | an actual run of the combination | none recorded; always `unverified` |
+
+There is no overall "compatible" result. A passed stage does not establish the stages after it. Layers are ordered changesets: a later layer may overwrite or delete paths of an earlier one, so overlapping paths are reported by the filesystem stage as findings to acknowledge, not forbidden. Existing VMs and writable data are never updated or migrated by any of this.
+
+---
+
 ## KVM Release Gate Notice
 
 > **Mandatory Release Gate:** Package release `v0.1.0` and Afterglow dependency cutover remain blocked until the required physical Linux x86_64 KVM integration contract is successfully and independently executed (`pytest -m kvm`). This document defines the boundary; it does not claim that a test or live proof was run during this documentation change.
