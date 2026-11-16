@@ -43,6 +43,7 @@ from palimpsest_hub.database import close_db, get_session_factory, init_db
 from palimpsest_hub.logging import configure_logging, failure_fields
 from palimpsest_hub.rate_limit import limiter
 from palimpsest_hub.services.hub_store import get_blob_store
+from palimpsest_hub.services.worker_leases import MutexBusy
 
 logger = logging.getLogger(__name__)
 _METHODS = frozenset({"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"})
@@ -182,6 +183,14 @@ async def handle_http_error(request: Request, exc: StarletteHTTPException):
     else:
         code, message = fallback.get(exc.status_code, "REQUEST_FAILED"), str(detail)
     return _package_error(exc.status_code, code, message, exc.headers, request_id=request.state.request_id)
+
+
+@app.exception_handler(MutexBusy)
+async def handle_mutex_busy(request: Request, exc: MutexBusy):
+    return await handle_http_error(
+        request,
+        HTTPException(503, "Resource is busy with another operation; retry shortly", headers={"Retry-After": "1"}),
+    )
 
 
 @app.exception_handler(RequestValidationError)

@@ -1,21 +1,24 @@
 from __future__ import annotations
 
 import threading
+from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
 
 import pytest
 
-from palimpsest_hub.services.nova_shelve_provider import SHELVED_OFFLOADED, NovaShelveProvider
+from palimpsest_hub.services.nova_shelve_provider import SHELVED_OFFLOADED, NovaShelveProvider, ServerState
 from palimpsest_hub.services.session_controller import ProviderError
 
 SID = "server-1"
+SHELVE_TASKS = ("shelving", "shelving_image_pending_upload", "shelving_image_uploading", "shelving_offloading")
+UNSHELVE_TASKS = ("unshelving", "spawning")
 
 
 class FakeCompute:
-    """Scripted Nova: `statuses` is consumed by get_server; the last value repeats."""
+    """Scripted Nova: states are status strings, (status, task_state) pairs or mappings."""
 
-    def __init__(self, *statuses, shelve_error=None, unshelve_error=None):
-        self.statuses = list(statuses)
+    def __init__(self, *states, shelve_error=None, unshelve_error=None):
+        self.states = list(states)
         self.shelve_error = shelve_error
         self.unshelve_error = unshelve_error
         self.calls: list[str] = []
@@ -27,8 +30,11 @@ class FakeCompute:
 
     def get_server(self, server_id):
         self._note("get")
-        status = self.statuses[0] if len(self.statuses) == 1 else self.statuses.pop(0)
-        return SimpleNamespace(id=server_id, status=status)
+        state = self.states[0] if len(self.states) == 1 else self.states.pop(0)
+        if isinstance(state, dict):
+            return state
+        status, task_state = state if isinstance(state, tuple) else (state, None)
+        return SimpleNamespace(id=server_id, status=status, task_state=task_state)
 
     def shelve_server(self, server_id):
         self._note("shelve")
@@ -60,7 +66,7 @@ def provider(compute, *, timeout=10.0):
 
 
 async def test_an_active_server_is_shelved_and_confirmed_only_when_offloaded():
-    compute = FakeCompute("ACTIVE", "SHELVING", SHELVED_OFFLOADED)
+    compute = FakeCompute("ACTIVE", ("ACTIVE", "shelving"), SHELVED_OFFLOADED)
     await provider(compute).shelve(SID)
     assert compute.calls == ["get", "shelve", "get", "get"]
 
@@ -71,10 +77,32 @@ async def test_an_already_offloaded_server_is_success_without_a_second_shelve():
     assert compute.calls == ["get"]
 
 
-async def test_a_shelve_already_in_progress_is_awaited_not_repeated():
-    compute = FakeCompute("SHELVING", SHELVED_OFFLOADED)
+@pytest.mark.parametrize("task_state", SHELVE_TASKS)
+@pytest.mark.parametrize("status", ["ACTIVE", "SHELVED", SHELVED_OFFLOADED, "SHUTOFF", "PAUSED", "SUSPENDED"])
+async def test_a_shelve_already_in_progress_is_awaited_not_repeated(status, task_state):
+    compute = FakeCompute((status, task_state), SHELVED_OFFLOADED)
     await provider(compute).shelve(SID)
-    assert "shelve" not in compute.calls
+    assert compute.calls == ["get", "get"]
+
+
+async def test_an_idle_shelved_server_still_waits_for_offload():
+    compute = FakeCompute("SHELVED", "SHELVED", SHELVED_OFFLOADED)
+    await provider(compute).shelve(SID)
+    assert compute.calls == ["get", "get", "get"]
+
+
+async def test_shelve_waits_for_the_offloading_task_to_clear_at_the_target_status():
+    compute = FakeCompute("ACTIVE", (SHELVED_OFFLOADED, "shelving_offloading"), SHELVED_OFFLOADED)
+    await provider(compute).shelve(SID)
+    assert compute.calls == ["get", "shelve", "get", "get"]
+
+
+@pytest.mark.parametrize("task_state", UNSHELVE_TASKS)
+async def test_shelve_during_unshelving_conflicts_without_a_second_action(task_state):
+    compute = FakeCompute((SHELVED_OFFLOADED, task_state))
+    with pytest.raises(ProviderError, match="unshelving is still in progress"):
+        await provider(compute).shelve(SID)
+    assert compute.calls == ["get"]
 
 
 async def test_shelve_of_a_server_in_another_state_is_refused_without_calling_nova():
@@ -85,7 +113,7 @@ async def test_shelve_of_a_server_in_another_state_is_refused_without_calling_no
 
 
 async def test_shelve_that_never_reaches_offloaded_times_out_as_a_provider_error():
-    compute = FakeCompute("ACTIVE", "SHELVING")
+    compute = FakeCompute("ACTIVE", ("ACTIVE", "shelving"))
     with pytest.raises(ProviderError, match="timed out"):
         await provider(compute, timeout=3.0).shelve(SID)
 
@@ -98,10 +126,49 @@ async def test_sdk_failure_is_mapped_to_a_provider_error_without_leaking_details
     assert "RuntimeError" in str(info.value)
 
 
-async def test_unshelve_of_an_offloaded_server_waits_for_active():
-    compute = FakeCompute(SHELVED_OFFLOADED, "UNSHELVING", "ACTIVE")
+@pytest.mark.parametrize("status", ["SHELVED", SHELVED_OFFLOADED])
+async def test_unshelve_of_an_idle_shelved_server_waits_for_active(status):
+    compute = FakeCompute(status, (SHELVED_OFFLOADED, "unshelving"), ("ACTIVE", "spawning"))
     await provider(compute).unshelve(SID)
+    assert compute.calls == ["get", "unshelve", "get", "get"]
+
+
+@pytest.mark.parametrize("task_state", SHELVE_TASKS)
+@pytest.mark.parametrize("status", ["ACTIVE", "SHELVED", SHELVED_OFFLOADED, "SHUTOFF", "PAUSED", "SUSPENDED"])
+async def test_unshelve_during_shelving_conflicts_instead_of_returning_active(status, task_state):
+    compute = FakeCompute((status, task_state))
+    with pytest.raises(ProviderError, match="shelving is still in progress"):
+        await provider(compute).unshelve(SID)
+    assert compute.calls == ["get"]
+
+
+@pytest.mark.parametrize("task_state", UNSHELVE_TASKS)
+@pytest.mark.parametrize("status", ["SHELVED", SHELVED_OFFLOADED])
+async def test_unshelve_already_in_progress_waits_without_a_second_action(status, task_state):
+    compute = FakeCompute((status, task_state), (status, task_state), ("ACTIVE", task_state))
+    await provider(compute).unshelve(SID)
+    assert compute.calls == ["get", "get", "get"]
+
+
+@pytest.mark.parametrize("task_state", UNSHELVE_TASKS)
+async def test_unshelve_of_an_active_server_with_an_unrelated_task_is_success_without_a_call(task_state):
+    compute = FakeCompute(("ACTIVE", task_state))
+    await provider(compute).unshelve(SID)
+    assert compute.calls == ["get"]
+
+
+async def test_unshelve_does_not_finish_if_shelving_starts_during_the_wait():
+    compute = FakeCompute(SHELVED_OFFLOADED, ("ACTIVE", "shelving"))
+    with pytest.raises(ProviderError, match="timed out"):
+        await provider(compute, timeout=3.0).unshelve(SID)
     assert compute.calls.count("unshelve") == 1
+
+
+async def test_unshelve_sdk_failure_does_not_leak_details():
+    compute = FakeCompute(SHELVED_OFFLOADED, unshelve_error=RuntimeError("token=secret"))
+    with pytest.raises(ProviderError) as info:
+        await provider(compute).unshelve(SID)
+    assert str(info.value) == "nova call failed: RuntimeError"
 
 
 async def test_unshelve_of_an_active_server_is_success_without_a_call():
@@ -126,6 +193,14 @@ async def test_start_of_a_stopped_server_waits_for_active():
 async def test_start_of_an_active_server_is_success_without_a_call():
     compute = FakeCompute("ACTIVE")
     await provider(compute).start(SID)
+    assert compute.calls == ["get"]
+
+
+@pytest.mark.parametrize("task_state", SHELVE_TASKS)
+async def test_start_during_shelving_conflicts_without_powering_on(task_state):
+    compute = FakeCompute(("SHUTOFF", task_state))
+    with pytest.raises(ProviderError, match="shelving is still in progress"):
+        await provider(compute).start(SID)
     assert compute.calls == ["get"]
 
 
@@ -161,9 +236,87 @@ def test_nonpositive_timeouts_are_rejected():
         NovaShelveProvider(SimpleNamespace(compute=None), timeout_seconds=0)
 
 
-@pytest.mark.asyncio
-async def test_server_status_reports_the_uppercase_nova_status_without_effects():
-    compute = FakeCompute("shelved_offloaded")
-    provider = NovaShelveProvider(SimpleNamespace(compute=compute))
-    assert await provider.server_status(SID) == SHELVED_OFFLOADED
+async def test_server_state_reports_normalized_sdk_fields_without_effects():
+    compute = FakeCompute(("active", "SHELVING_IMAGE_PENDING_UPLOAD"))
+    assert await provider(compute).server_state(SID) == ServerState("ACTIVE", "shelving_image_pending_upload")
     assert compute.calls == ["get"]
+    assert all(thread is not threading.main_thread() for thread in compute.threads)
+
+
+@pytest.mark.parametrize("key", ["task_state", "OS-EXT-STS:task_state"])
+async def test_server_state_reads_mapping_fields(key):
+    compute = FakeCompute({"status": "shelved_offloaded", key: "UNSHELVING"})
+    state = await provider(compute).server_state(SID)
+    assert state == ServerState(SHELVED_OFFLOADED, "unshelving")
+    assert state.unshelving
+    assert compute.calls == ["get"]
+
+
+async def test_server_state_reads_raw_task_state_when_sdk_attribute_is_none():
+    class SDKServer(dict):
+        status = "ACTIVE"
+        task_state = None
+
+    compute = FakeCompute(SDKServer({"OS-EXT-STS:task_state": "SHELVING"}))
+    assert (await provider(compute).server_state(SID)).shelving
+
+
+async def test_server_state_rejects_invalid_task_state_without_leaking_it():
+    compute = FakeCompute({"status": "ACTIVE", "task_state": {"token": "secret"}})
+    with pytest.raises(ProviderError) as info:
+        await provider(compute).server_state(SID)
+    assert str(info.value) == "nova returned invalid server task state"
+
+
+def test_server_state_is_immutable_and_normalizes_fields():
+    state = ServerState("shelved", "SPAWNING")
+    assert state.status == "SHELVED"
+    assert state.task_state == "spawning"
+    with pytest.raises(FrozenInstanceError):
+        state.status = "ACTIVE"
+
+
+@pytest.mark.parametrize("task_state", SHELVE_TASKS)
+@pytest.mark.parametrize(
+    "status", ["ACTIVE", "SHELVED", SHELVED_OFFLOADED, "BUILD", "ERROR", "SHUTOFF", "PAUSED", "SUSPENDED", "UNKNOWN"]
+)
+def test_server_state_recognizes_shelving_tasks(status, task_state):
+    state = ServerState(status, task_state)
+    assert state.shelving
+    assert not state.unshelving
+    assert not state.shelved
+
+
+@pytest.mark.parametrize("task_state", UNSHELVE_TASKS)
+@pytest.mark.parametrize("status", ["SHELVED", SHELVED_OFFLOADED])
+def test_server_state_recognizes_unshelving_tasks(status, task_state):
+    state = ServerState(status, task_state)
+    assert not state.shelving
+    assert state.unshelving
+    assert not state.shelved
+
+
+@pytest.mark.parametrize("status", ["ACTIVE", "SHELVED", SHELVED_OFFLOADED])
+def test_server_state_distinguishes_idle_statuses(status):
+    state = ServerState(status)
+    assert not state.shelving
+    assert not state.unshelving
+    assert state.shelved == (status in {"SHELVED", SHELVED_OFFLOADED})
+
+
+@pytest.mark.parametrize("status", ["ACTIVE", "BUILD", "ERROR", "SHUTOFF", "PAUSED", "SUSPENDED", "UNKNOWN"])
+@pytest.mark.parametrize("task_state", UNSHELVE_TASKS)
+def test_server_state_does_not_treat_unrelated_statuses_as_unshelving(status, task_state):
+    state = ServerState(status, task_state)
+    assert not state.shelving
+    assert not state.unshelving
+    assert not state.shelved
+
+
+@pytest.mark.parametrize("status", ["ACTIVE", "SHELVED", SHELVED_OFFLOADED, "SHUTOFF", "PAUSED"])
+@pytest.mark.parametrize("task_state", ["shelving_unknown", "shelving_done", "rebuilding", "powering-on"])
+def test_server_state_does_not_confuse_unrecognized_tasks_with_shelving(status, task_state):
+    state = ServerState(status, task_state)
+    assert not state.shelving
+    assert not state.unshelving
+    assert state.shelved == (status in {"SHELVED", SHELVED_OFFLOADED})

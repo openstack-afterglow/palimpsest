@@ -31,8 +31,10 @@ from palimpsest_hub.instance_models import PalimpsestHubInstance
 from palimpsest_hub.openstack import ExportDelegation
 from palimpsest_hub.services import instance_lifecycle as lifecycle
 from palimpsest_hub.services import instances as service
+from palimpsest_hub.services.nova_shelve_provider import ServerState
 from palimpsest_hub.services.session_controller import ProviderError
 from palimpsest_hub.services.session_lifecycle import GRACE_SECONDS, Phase, SessionMachine
+from palimpsest_hub.services.worker_leases import MutexBusy
 
 TOKEN = "guest-session-capability-" + "x" * 24
 NO_SESSIONS = "PALIMPSEST-UTMP-OK\nPALIMPSEST-SELF 100\n100 1\n1 0\nPALIMPSEST-END\n"
@@ -54,11 +56,12 @@ def delegation(expires_in=timedelta(days=7)):
 
 
 class FakeProvider:
-    """Records Nova effects; `status` is what `server_status` reports."""
+    """Records Nova effects and exposes Nova's separate status and task state."""
 
-    def __init__(self, *, status="ACTIVE", shelve_error=None, crash=None):
+    def __init__(self, *, status="ACTIVE", task_state=None, shelve_error=None, crash=None):
         self.calls: list[tuple[str, str]] = []
         self.status = status
+        self.task_state = task_state
         self.shelve_error = shelve_error
         self.crash = crash
 
@@ -69,14 +72,15 @@ class FakeProvider:
         if self.shelve_error is not None:
             raise self.shelve_error
         self.status = "SHELVED_OFFLOADED"
+        self.task_state = None
 
     async def unshelve(self, instance_id):
         self.calls.append(("unshelve", instance_id))
         self.status = "ACTIVE"
 
-    async def server_status(self, instance_id):
+    async def server_state(self, instance_id):
         self.calls.append(("status", instance_id))
-        return self.status
+        return ServerState(self.status, self.task_state)
 
 
 @pytest.fixture
@@ -190,6 +194,22 @@ async def tick(h, instance_id, provider, clock):
     )
 
 
+@pytest.mark.parametrize("first", [None, {}, {"status": "error"}, {"status": "ready"}])
+@pytest.mark.parametrize("probe", [False, True])
+@pytest.mark.parametrize("retention", [None, False, True])
+@pytest.mark.parametrize("gpu", [None, {"profile": "gpu"}])
+@pytest.mark.parametrize("cluster", [None, {"role": "server"}])
+def test_restorable_requires_a_ready_result_and_a_runner_that_retained_state(first, probe, retention, gpu, cluster):
+    spec = {"readiness_argv": ["/bin/true"] if probe else [], "gpu": gpu, "cluster": cluster}
+    if retention is not None:
+        spec["resume_without_probe"] = retention
+    instance = SimpleNamespace(spec_json=spec, result_json=first)
+    expected = (
+        (first or {}).get("status") == "ready" and gpu is None and cluster is None and (probe or retention is True)
+    )
+    assert lifecycle.restorable(instance) is expected
+
+
 # -- creation -----------------------------------------------------------------------------------
 
 
@@ -207,6 +227,9 @@ async def test_dev_create_admits_a_trust_binds_the_capability_and_installs_the_r
     # The reporter is installed from cloud-init and the raw capability never reaches the database.
     assert b"session_reporter.py" in __import__("base64").b64decode(sent["user_data"])
     assert TOKEN not in str(state.life.machine_json) and state.life.session_capability_hash
+    async with h.factory() as session:
+        row = await session.get(PalimpsestHubInstance, instance_id)
+        assert row.spec_json["resume_without_probe"] is True
 
 
 @pytest.mark.asyncio
@@ -216,10 +239,38 @@ async def test_service_instances_get_no_lifecycle_row_trust_or_reporter(instance
     assert response.status_code == 202, response.text
     async with h.factory() as session:
         assert (await session.scalars(select(Lifecycle))).all() == []
+        row = await session.get(PalimpsestHubInstance, response.json()["id"])
+        assert "resume_without_probe" not in row.spec_json
     assert trust_boundary.created == []
     assert "key_name" not in h.provider.creates[-1]
     assert b"session_reporter.py" not in __import__("base64").b64decode(h.provider.creates[-1]["user_data"])
     assert response.json()["lifecycle"] == "service"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("probe", [[], ["/bin/true"]], ids=["no-probe", "probed"])
+async def test_dev_resume_retention_is_stamped_only_when_server_create_sends_the_new_runner(
+    instance_hub, trust_boundary, probe
+):
+    import base64
+    import json
+
+    h = instance_hub
+    lifecycle_settings(h)
+    response = await h.client.post("/v1/instances", json=request_body(lifecycle="dev", readiness_argv=probe))
+    assert response.status_code == 202, response.text
+    async with h.factory() as session:
+        row = await session.get(PalimpsestHubInstance, response.json()["id"])
+        assert "resume_without_probe" not in row.spec_json
+    advanced = await advance_instance(h, response.json())
+    assert advanced.status_code == 202, advanced.text
+    async with h.factory() as session:
+        row = await session.get(PalimpsestHubInstance, response.json()["id"])
+        assert row.spec_json["resume_without_probe"] is True
+    payload = json.loads(base64.b64decode(h.provider.creates[-1]["user_data"]).decode().split("\n", 1)[1])
+    runner = next(file for file in payload["write_files"] if file["path"].endswith("/runner.py"))
+    assert b"if process.returncode == 0:\n                persist_resume()" in base64.b64decode(runner["content"])
+    assert any(file["path"].endswith("/session.json") for file in payload["write_files"])
 
 
 @pytest.mark.asyncio
@@ -312,10 +363,36 @@ async def test_a_retired_instance_no_longer_accepts_reports(instance_hub, trust_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["legacy-no-probe", "first-error", "never-ready", "gpu", "cluster"])
+async def test_an_idle_guest_without_resume_state_still_shelves(instance_hub, trust_boundary, kind):
+    h = instance_hub
+    instance_id = await make_dev(h)
+    async with h.factory() as session:
+        row = await session.get(PalimpsestHubInstance, instance_id)
+        spec = {**row.spec_json, "readiness_argv": []}
+        if kind == "legacy-no-probe":
+            spec.pop("resume_without_probe")
+        elif kind in ("gpu", "cluster"):
+            spec[kind] = {"profile": kind}
+        row.spec_json = spec
+        row.status = "error" if kind == "first-error" else "ready"
+        row.result_json = None if kind == "never-ready" else {"status": row.status}
+        await session.commit()
+    provider, clock = FakeProvider(), Clock()
+    machine = SessionMachine(phase=Phase.GRACE, grace_started=clock.now - 2 * GRACE_SECONDS)
+    await set_life(h, instance_id, machine_json=machine.to_state())
+    await report(h, instance_id)
+    assert await tick(h, instance_id, provider, clock) == "shelved"
+    state = await life_state(h, instance_id)
+    assert state.machine.phase is Phase.SHELVED and state.status == "shelved"
+    assert provider.calls == [("shelve", instance_id)]
+
+
+@pytest.mark.asyncio
 async def test_boot_time_never_counts_as_idle_and_the_first_fresh_report_starts_the_timer(instance_hub, trust_boundary):
     h = instance_hub
     instance_id = await make_dev(h)
-    await set_instance(h, instance_id, status="ready")
+    await set_instance(h, instance_id, status="ready", result_json={"status": "ready"})
     provider, clock = FakeProvider(), Clock()
     # No report yet: unknown, nothing starts.
     assert await tick(h, instance_id, provider, clock) == "observation-failed"
@@ -330,11 +407,12 @@ async def test_boot_time_never_counts_as_idle_and_the_first_fresh_report_starts_
     assert [call for call in provider.calls if call[0] == "shelve"] == []
 
 
+@pytest.mark.parametrize("probe", [[], ["/bin/true"]], ids=["no-probe", "probed"])
 @pytest.mark.asyncio
-async def test_an_idle_ready_instance_is_shelved_once_after_the_full_grace_period(instance_hub, trust_boundary):
+async def test_an_idle_ready_instance_is_shelved_once_after_the_full_grace_period(instance_hub, trust_boundary, probe):
     h = instance_hub
-    instance_id = await make_dev(h)
-    await set_instance(h, instance_id, status="ready")
+    instance_id = await make_dev(h, readiness_argv=probe)
+    await set_instance(h, instance_id, status="ready", result_json={"status": "ready"})
     provider, clock = FakeProvider(), Clock()
     await report(h, instance_id)
     await tick(h, instance_id, provider, clock)
@@ -353,7 +431,7 @@ async def test_an_idle_ready_instance_is_shelved_once_after_the_full_grace_perio
 async def test_an_open_session_blocks_shelve_and_leaving_restarts_the_full_grace(instance_hub, trust_boundary):
     h = instance_hub
     instance_id = await make_dev(h)
-    await set_instance(h, instance_id, status="ready")
+    await set_instance(h, instance_id, status="ready", result_json={"status": "ready"})
     provider, clock = FakeProvider(), Clock()
     await report(h, instance_id, ONE_SESSION)
     clock.now += 10 * GRACE_SECONDS
@@ -373,7 +451,7 @@ async def test_an_open_session_blocks_shelve_and_leaving_restarts_the_full_grace
 async def test_a_stale_report_is_unknown_not_idle(instance_hub, trust_boundary):
     h = instance_hub
     instance_id = await make_dev(h)
-    await set_instance(h, instance_id, status="ready")
+    await set_instance(h, instance_id, status="ready", result_json={"status": "ready"})
     provider, clock = FakeProvider(), Clock()
     await report(h, instance_id)
     await tick(h, instance_id, provider, clock)
@@ -389,7 +467,7 @@ async def test_a_stale_report_is_unknown_not_idle(instance_hub, trust_boundary):
 async def test_time_without_a_usable_report_is_not_idle_time(instance_hub, trust_boundary):
     h = instance_hub
     instance_id = await make_dev(h)
-    await set_instance(h, instance_id, status="ready")
+    await set_instance(h, instance_id, status="ready", result_json={"status": "ready"})
     provider, clock = FakeProvider(), Clock()
     await report(h, instance_id)
     await tick(h, instance_id, provider, clock)
@@ -406,7 +484,7 @@ async def test_time_without_a_usable_report_is_not_idle_time(instance_hub, trust
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status", ["booting", "uncertain", "stopped", "deleting", "deleted"])
+@pytest.mark.parametrize("status", ["booting", "uncertain", "stopping", "stopped", "deleting", "deleted"])
 async def test_only_a_ready_or_error_guest_is_ever_shelved(instance_hub, trust_boundary, status):
     h = instance_hub
     instance_id = await make_dev(h)
@@ -424,7 +502,7 @@ async def test_only_a_ready_or_error_guest_is_ever_shelved(instance_hub, trust_b
 async def test_an_expired_or_missing_trust_fails_closed_and_keeps_the_instance_running(instance_hub, trust_boundary):
     h = instance_hub
     instance_id = await make_dev(h)
-    await set_instance(h, instance_id, status="ready")
+    await set_instance(h, instance_id, status="ready", result_json={"status": "ready"})
     provider, clock = FakeProvider(), Clock()
     await report(h, instance_id)
     await tick(h, instance_id, provider, clock)
@@ -442,7 +520,7 @@ async def test_an_expired_or_missing_trust_fails_closed_and_keeps_the_instance_r
 async def test_a_failed_shelve_keeps_the_instance_and_restarts_the_full_grace(instance_hub, trust_boundary):
     h = instance_hub
     instance_id = await make_dev(h)
-    await set_instance(h, instance_id, status="ready")
+    await set_instance(h, instance_id, status="ready", result_json={"status": "ready"})
     provider, clock = FakeProvider(shelve_error=ProviderError("nova refused")), Clock()
     await report(h, instance_id)
     await tick(h, instance_id, provider, clock)
@@ -464,7 +542,7 @@ async def test_a_crash_during_the_nova_call_leaves_shelving_and_the_next_tick_se
 ):
     h = instance_hub
     instance_id = await make_dev(h)
-    await set_instance(h, instance_id, status="ready")
+    await set_instance(h, instance_id, status="ready", result_json={"status": "ready"})
     crashing, clock = FakeProvider(crash=RuntimeError("worker killed")), Clock()
     await report(h, instance_id)
     await tick(h, instance_id, crashing, clock)
@@ -485,7 +563,7 @@ async def test_a_crash_during_the_nova_call_leaves_shelving_and_the_next_tick_se
 async def test_a_shelve_that_never_started_is_released_with_a_fresh_grace(instance_hub, trust_boundary):
     h = instance_hub
     instance_id = await make_dev(h)
-    await set_instance(h, instance_id, status="ready")
+    await set_instance(h, instance_id, status="ready", result_json={"status": "ready"})
     crashing, clock = FakeProvider(crash=RuntimeError("worker killed")), Clock()
     await report(h, instance_id)
     await tick(h, instance_id, crashing, clock)
@@ -499,7 +577,8 @@ async def test_a_shelve_that_never_started_is_released_with_a_fresh_grace(instan
     assert state.machine.phase is Phase.GRACE and state.machine.grace_started == clock.now
     # Nova still working: look again later, change nothing.
     await set_life(h, instance_id, machine_json={**state.machine.to_state(), "phase": "shelving"})
-    assert await tick(h, instance_id, FakeProvider(status="SHELVING"), clock) == "shelve-in-progress"
+    provider = FakeProvider(status="ACTIVE", task_state="shelving")
+    assert await tick(h, instance_id, provider, clock) == "shelve-in-progress"
     assert (await life_state(h, instance_id)).machine.phase is Phase.SHELVING
 
 
@@ -520,7 +599,8 @@ async def life_state_raw(h, instance_id):
 
 
 @pytest.mark.asyncio
-async def test_tick_all_isolates_one_failing_instance_and_sweeps_retired_trusts(instance_hub, trust_boundary):
+@pytest.mark.parametrize("failure", [RuntimeError("worker failed"), MutexBusy("Resource is busy")])
+async def test_tick_all_isolates_one_failing_instance_and_sweeps_retired_trusts(instance_hub, trust_boundary, failure):
     h = instance_hub
     first = await make_dev(h)
     second = await make_dev(h)
@@ -531,12 +611,33 @@ async def test_tick_all_isolates_one_failing_instance_and_sweeps_retired_trusts(
 
     async def fake_tick(factory, settings, instance_id, **kwargs):
         calls.append(instance_id)
-        raise RuntimeError("boom " + instance_id)
+        raise failure
 
     counts = await lifecycle.tick_all(h.factory, lifecycle_settings(h), tick=fake_tick)
     assert calls == [first] and counts["error"] == 1 and counts["revoked"] == 1
     assert trust_boundary.revoked == [trust_boundary.created[1].trust_id]
     assert (await life_state_raw(h, second)).trust_json is None
+
+
+@pytest.mark.asyncio
+async def test_worker_session_loop_retries_after_a_busy_mutex_instead_of_crashing(monkeypatch):
+    import asyncio
+
+    from palimpsest_hub import worker
+
+    stop = asyncio.Event()
+    calls = []
+
+    async def pass_once(settings):
+        calls.append(settings)
+        if len(calls) == 1:
+            raise MutexBusy("Resource is busy")
+        stop.set()
+
+    monkeypatch.setattr(worker, "run_session_lifecycle", pass_once)
+    settings = SimpleNamespace(palimpsest_hub_session_tick_seconds=0.001)
+    await asyncio.wait_for(worker._session_lifecycle_loop(settings, stop), timeout=5)
+    assert calls == [settings, settings]
 
 
 @pytest.mark.asyncio
@@ -609,7 +710,9 @@ async def test_resume_unshelves_with_the_owners_connection_and_starts_a_new_grac
         server_id = row.server_id
     machine = SessionMachine(phase=Phase.SHELVED, grace_started=None)
     await set_life(h, instance_id, machine_json=machine.to_state())
-    await set_instance(h, instance_id, status="shelved", provider_status="SHELVED_OFFLOADED")
+    await set_instance(
+        h, instance_id, status="shelved", provider_status="SHELVED_OFFLOADED", result_json={"status": "ready"}
+    )
     unshelved = []
     sdk_servers(h)
     h.provider.servers_by_id[server_id]["status"] = "SHELVED_OFFLOADED"
@@ -639,7 +742,7 @@ async def test_a_resume_whose_trust_renewal_fails_still_succeeds_and_records_it(
     async with h.factory() as session:
         server_id = (await session.get(PalimpsestHubInstance, instance_id)).server_id
     await set_life(h, instance_id, machine_json=SessionMachine(phase=Phase.SHELVED).to_state())
-    await set_instance(h, instance_id, status="shelved")
+    await set_instance(h, instance_id, status="shelved", result_json={"status": "ready"})
     sdk_servers(h)
     h.provider.servers_by_id[server_id]["status"] = "SHELVED_OFFLOADED"
     h.provider.unshelve_server = lambda identity: h.provider.servers_by_id[identity].update(status="ACTIVE")
@@ -668,7 +771,7 @@ async def test_a_manager_who_is_not_the_creator_can_resume_but_cannot_replace_th
     async with h.factory() as session:
         server_id = (await session.get(PalimpsestHubInstance, instance_id)).server_id
     await set_life(h, instance_id, machine_json=SessionMachine(phase=Phase.SHELVED).to_state())
-    await set_instance(h, instance_id, status="shelved")
+    await set_instance(h, instance_id, status="shelved", result_json={"status": "ready"})
     sdk_servers(h)
     h.provider.servers_by_id[server_id]["status"] = "SHELVED_OFFLOADED"
     h.provider.unshelve_server = lambda identity: h.provider.servers_by_id[identity].update(status="ACTIVE")
@@ -682,28 +785,35 @@ async def test_a_manager_who_is_not_the_creator_can_resume_but_cannot_replace_th
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("nova_status", ["PAUSED", "ERROR"])
 async def test_resume_of_a_server_that_cannot_be_unshelved_is_a_conflict_not_a_provider_outage(
-    instance_hub, trust_boundary
+    instance_hub, trust_boundary, nova_status
 ):
     h = instance_hub
     instance_id = await make_dev(h)
     async with h.factory() as session:
         server_id = (await session.get(PalimpsestHubInstance, instance_id)).server_id
     sdk_servers(h)
-    h.provider.servers_by_id[server_id]["status"] = "PAUSED"
+    h.provider.servers_by_id[server_id]["status"] = nova_status
     actor = {"project_id": PROJECT, "user_id": USER, "package_actions": {"packages:manage"}}
     with pytest.raises(HTTPException) as refused:
         await lifecycle.resume(h.factory, actor, h.provider, instance_id, lifecycle_settings(h))
     assert refused.value.status_code == 409
+    assert not refused.value.headers or "Retry-After" not in refused.value.headers
 
 
-async def _stopped(h, *, status="stopped", result="ready", readiness=True, gpu=None):
-    """A dev instance whose server is SHUTOFF; by default it once reported a probed ready result."""
+async def _stopped(h, *, status="stopped", result="ready", readiness=True, gpu=None, retention=True):
+    """A dev instance whose server is SHUTOFF; by default it once reported a probed ready result.
+
+    `retention=False` models the runner before no-probe retention.
+    """
     instance_id = await make_dev(h)
     async with h.factory() as session:
         row = await session.get(PalimpsestHubInstance, instance_id)
         server_id = row.server_id
         spec = {**row.spec_json, "readiness_argv": ["/bin/true"] if readiness else None, "gpu": gpu}
+        if not retention:
+            spec.pop("resume_without_probe", None)
         row.spec_json = spec
         row.status, row.provider_status = status, "SHUTOFF"
         row.result_json = {"status": result} if result else None
@@ -722,13 +832,14 @@ async def _stopped(h, *, status="stopped", result="ready", readiness=True, gpu=N
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("readiness", [True, False], ids=["probed", "no-probe"])
 @pytest.mark.parametrize("status", ["stopped", "stopping", "ready"])
 async def test_resume_powers_on_a_stopped_dev_instance_and_waits_for_its_resume_report(
-    instance_hub, trust_boundary, status
+    instance_hub, trust_boundary, status, readiness
 ):
     # `ready` with a SHUTOFF server is a guest that powered itself off.
     h = instance_hub
-    instance_id, server_id, started = await _stopped(h, status=status)
+    instance_id, server_id, started = await _stopped(h, status=status, readiness=readiness)
     stale = SessionMachine(phase=Phase.GRACE, grace_started=123.0)
     await set_life(
         h, instance_id, machine_json=stale.to_state(), reported_sessions_json=[], report_received_at=datetime.now(UTC)
@@ -745,8 +856,8 @@ async def test_resume_powers_on_a_stopped_dev_instance_and_waits_for_its_resume_
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "kind",
-    [{"result": None}, {"result": "error"}, {"readiness": False}, {"gpu": {"profile": "p"}}],
-    ids=["never-reported", "first-result-error", "no-readiness-probe", "gpu"],
+    [{"result": None}, {"result": "error"}, {"readiness": False, "retention": False}, {"gpu": {"profile": "p"}}],
+    ids=["never-reported", "first-result-error", "legacy-no-readiness-probe", "gpu"],
 )
 @pytest.mark.parametrize("nova", ["SHUTOFF", "ACTIVE"])
 async def test_resume_refuses_a_stopped_guest_that_kept_no_resume_state(instance_hub, trust_boundary, kind, nova):
@@ -760,23 +871,30 @@ async def test_resume_refuses_a_stopped_guest_that_kept_no_resume_state(instance
 
 
 @pytest.mark.asyncio
-async def test_resume_refuses_while_a_stop_is_still_in_flight(instance_hub, trust_boundary):
+async def test_resume_refuses_while_a_stop_is_still_in_flight(instance_hub, trust_boundary, monkeypatch):
     h = instance_hub
     instance_id, server_id, started = await _stopped(h, status="stopping")
     h.provider.servers_by_id[server_id]["status"] = "ACTIVE"  # Nova has not powered it off yet
+
+    async def unexpected_wait(*args):
+        pytest.fail("resume waited for a provider operation despite an in-flight stop")
+
+    monkeypatch.setattr(lifecycle.NovaShelveProvider, "_await_status", unexpected_wait)
     with pytest.raises(HTTPException) as busy:
         await lifecycle.resume(h.factory, ACTOR, h.provider, instance_id, lifecycle_settings(h))
     assert busy.value.status_code == 409 and "stop is still in flight" in busy.value.detail
+    assert busy.value.headers["Retry-After"] == "10"
     assert started == [] and (await life_state(h, instance_id)).status == "stopping"
 
 
+@pytest.mark.parametrize("readiness", [True, False], ids=["probed", "no-probe"])
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status", ["stopped", "stopping"])
 async def test_a_power_on_with_an_unknown_outcome_is_recovered_by_the_next_observation(
-    instance_hub, trust_boundary, status
+    instance_hub, trust_boundary, status, readiness
 ):
     h = instance_hub
-    instance_id, server_id, started = await _stopped(h, status=status)
+    instance_id, server_id, started = await _stopped(h, status=status, readiness=readiness)
     observe = h.provider.get_server
 
     def flaky(identity):
@@ -833,13 +951,232 @@ async def test_stop_then_resume_then_the_guest_resume_report_makes_the_instance_
     assert final.json()["status"] == "ready" and final.json()["resume_result"]["stdout"] == "kept"
 
 
-async def _in_flight(h, nova_status):
+@pytest.mark.asyncio
+@pytest.mark.parametrize("nova_status", ["SHELVED_OFFLOADED", "ACTIVE"])
+@pytest.mark.parametrize(
+    "kind", ["legacy-no-probe", "new-no-probe", "legacy-probe", "first-error", "never-ready", "gpu", "cluster"]
+)
+async def test_http_resume_unshelves_only_when_needed_and_waits_for_a_report_only_with_retained_state(
+    instance_hub, trust_boundary, kind, nova_status
+):
+    h = instance_hub
     instance_id = await make_dev(h)
+    async with h.factory() as session:
+        row = await session.get(PalimpsestHubInstance, instance_id)
+        server_id = row.server_id
+        spec = {**row.spec_json, "readiness_argv": ["/bin/true"] if kind == "legacy-probe" else []}
+        if kind.startswith("legacy"):
+            spec.pop("resume_without_probe")
+        elif kind in ("gpu", "cluster"):
+            spec[kind] = {"profile": kind}
+        row.spec_json = spec
+        row.status, row.provider_status = "shelved", "SHELVED_OFFLOADED"
+        row.result_json = None if kind == "never-ready" else {"status": "error" if kind == "first-error" else "ready"}
+        await session.commit()
+    await set_life(
+        h,
+        instance_id,
+        machine_json=SessionMachine(phase=Phase.SHELVED).to_state(),
+        reported_sessions_json=[],
+        report_received_at=datetime.now(UTC),
+    )
+    sdk_servers(h)
+    h.provider.servers_by_id[server_id]["status"] = nova_status
+    unshelved = []
+
+    def unshelve_server(identity):
+        unshelved.append(identity)
+        h.provider.servers_by_id[identity]["status"] = "ACTIVE"
+
+    h.provider.unshelve_server = unshelve_server
+    response = await h.client.post(f"/v1/instances/{instance_id}/resume")
+    assert response.status_code == 202, response.text
+    expected = "resumed" if kind in ("new-no-probe", "legacy-probe") else "error"
+    assert response.json()["status"] == expected and response.json()["provider_status"] == "ACTIVE"
+    expected_calls = [server_id] if nova_status != "ACTIVE" else []
+    assert unshelved == expected_calls
+    state = await life_state(h, instance_id)
+    assert state.status == expected and state.machine.phase is Phase.GRACE
+    assert state.machine.grace_started is None
+    assert state.life.reported_sessions_json is None and state.life.report_received_at is None
+    if expected == "error":
+        assert response.json()["error_code"] == "resume_state_missing"
+        seen = await h.client.get(f"/v1/instances/{instance_id}")
+        assert seen.json()["status"] == "error" and seen.json()["error_code"] == "resume_state_missing"
+        assert unshelved == expected_calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["ready", "error", "resumed"])
+async def test_http_resume_of_an_active_restorable_guest_preserves_its_workload_status(
+    instance_hub, trust_boundary, status
+):
+    h = instance_hub
+    instance_id = await make_dev(h)
+    error_code = "guest_execution_failed" if status == "error" else None
+    await set_instance(h, instance_id, status=status, result_json={"status": "ready"}, error_code=error_code)
+    await set_life(
+        h,
+        instance_id,
+        machine_json=SessionMachine(phase=Phase.GRACE, grace_started=123.0).to_state(),
+        reported_sessions_json=[],
+        report_received_at=datetime.now(UTC),
+    )
+    sdk_servers(h)
+    unshelved, started = [], []
+    h.provider.unshelve_server, h.provider.start_server = unshelved.append, started.append
+    response = await h.client.post(f"/v1/instances/{instance_id}/resume")
+    assert response.status_code == 202, response.text
+    assert response.json()["status"] == status and response.json()["error_code"] == error_code
+    assert response.json()["provider_status"] == "ACTIVE" and unshelved == [] and started == []
+    state = await life_state(h, instance_id)
+    assert state.status == status and state.machine.phase is Phase.GRACE
+    assert state.machine.grace_started is None
+    assert state.life.reported_sessions_json is None and state.life.report_received_at is None
+    assert len(trust_boundary.created) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["legacy-no-probe", "gpu", "booting", "first-error"])
+async def test_http_resume_of_an_active_nonrestorable_guest_preserves_its_workload_status(
+    instance_hub, trust_boundary, kind
+):
+    h = instance_hub
+    instance_id = await make_dev(h)
+    expected = "booting" if kind == "booting" else ("error" if kind == "first-error" else "ready")
+    error_code = "command_failed" if kind == "first-error" else None
+    async with h.factory() as session:
+        row = await session.get(PalimpsestHubInstance, instance_id)
+        spec = {**row.spec_json, "readiness_argv": []}
+        if kind == "legacy-no-probe":
+            spec.pop("resume_without_probe")
+        elif kind == "gpu":
+            spec["gpu"] = {"profile": "gpu"}
+        row.spec_json = spec
+        row.status, row.error_code = expected, error_code
+        row.result_json = None if kind == "booting" else {"status": expected}
+        await session.commit()
+    sdk_servers(h)
+    unshelved = []
+    h.provider.unshelve_server = unshelved.append
+    response = await h.client.post(f"/v1/instances/{instance_id}/resume")
+    assert response.status_code == 202, response.text
+    assert response.json()["status"] == expected and response.json()["error_code"] == error_code
+    assert response.json()["provider_status"] == "ACTIVE" and unshelved == []
+    assert (await life_state(h, instance_id)).status == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retention", [False, True], ids=["legacy-no-probe", "restorable"])
+async def test_http_resume_repairs_only_nonrestorable_legacy_resumed_guests(instance_hub, trust_boundary, retention):
+    h = instance_hub
+    instance_id, server_id, started = await _stopped(h, status="resumed", readiness=False, retention=retention)
+    await set_instance(h, instance_id, provider_status="ACTIVE")
+    h.provider.servers_by_id[server_id]["status"] = "ACTIVE"
+    unshelved = []
+    h.provider.unshelve_server = unshelved.append
+    response = await h.client.post(f"/v1/instances/{instance_id}/resume")
+    assert response.status_code == 202, response.text
+    expected = "resumed" if retention else "error"
+    assert response.json()["status"] == expected
+    assert response.json()["error_code"] == (None if retention else "resume_state_missing")
+    assert (await life_state(h, instance_id)).status == expected
+    assert unshelved == [] and started == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retention", [False, True], ids=["legacy-no-probe", "restorable"])
+@pytest.mark.parametrize("task_state", [None, "shelving", "unshelving", "spawning", "powering-on"])
+@pytest.mark.parametrize("task_key", ["task_state", "OS-EXT-STS:task_state"])
+async def test_get_repairs_only_idle_active_nonrestorable_legacy_resumed_guests(
+    instance_hub, trust_boundary, retention, task_state, task_key
+):
+    h = instance_hub
+    instance_id, server_id, started = await _stopped(h, status="resumed", readiness=False, retention=retention)
+    await set_instance(h, instance_id, provider_status="ACTIVE")
+    h.provider.servers_by_id[server_id].update(status="ACTIVE", **{task_key: task_state})
+    h.provider.get_server = lambda identity: h.provider.servers_by_id[identity]
+    response = await h.client.get(f"/v1/instances/{instance_id}")
+    assert response.status_code == 200, response.text
+    expected = "error" if not retention and task_state is None else "resumed"
+    assert response.json()["status"] == expected
+    assert response.json()["error_code"] == ("resume_state_missing" if expected == "error" else None)
+    assert (await life_state(h, instance_id)).status == expected and started == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("instance_hub", [0.5], indirect=True)
+async def test_reads_remain_read_only_and_owner_mutations_are_not_applied_while_the_instance_mutex_is_held(
+    instance_hub, trust_boundary, monkeypatch
+):
+    import asyncio
+
+    from palimpsest_hub.services.worker_leases import sql_mutex
+
+    h = instance_hub
+    instance_id = await make_dev(h)
+    await set_instance(h, instance_id, status="ready", result_json={"status": "ready"})
+    async with h.factory() as session:
+        row = await session.get(PalimpsestHubInstance, instance_id)
+        committed = service.projection(row)
+        spec = row.spec_json
+        life = await session.get(Lifecycle, instance_id)
+        trust, machine = life.trust_json, life.machine_json
+    reconciled = []
+    reconcile = service.reconcile
+
+    async def record_reconcile(session, row, *args):
+        reconciled.append(row.id)
+        return await reconcile(session, row, *args)
+
+    monkeypatch.setattr(service, "reconcile", record_reconcile)
+    async with sql_mutex(h.factory, "build-api:instance:" + instance_id):
+        observed = await asyncio.wait_for(h.client.get(f"/v1/instances/{instance_id}"), timeout=4)
+        assert observed.status_code == 200 and observed.json() == committed
+        listed = await h.client.get("/v1/instances")
+        assert listed.status_code == 200 and listed.json() == [committed]
+        assert reconciled == []
+        advance = {
+            "operation": "create-server",
+            "request_id": committed["request_id"],
+            "boot_volume_id": committed["boot_volume_id"],
+        }
+        for method, suffix, body in [
+            ("POST", "/resume", None),
+            ("POST", "/lifecycle/renew", None),
+            ("POST", "/stop", None),
+            ("DELETE", "", None),
+            ("POST", "/advance", advance),
+        ]:
+            response = await asyncio.wait_for(
+                h.client.request(method, f"/v1/instances/{instance_id}{suffix}", json=body), timeout=4
+            )
+            assert response.status_code == 409, response.text
+            assert response.headers["Retry-After"] == "10"
+            assert "request was not applied" in response.json()["detail"]
+        async with h.factory() as session:
+            row = await session.get(PalimpsestHubInstance, instance_id)
+            life = await session.get(Lifecycle, instance_id)
+            assert service.projection(row) == committed and row.spec_json == spec
+            assert life.trust_json == trust and life.machine_json == machine
+        assert reconciled == [] and h.provider.stops == [] and h.provider.deletes == []
+        assert len(trust_boundary.created) == 1
+    # A released fence admits the normal paths again, rather than caching a busy result.
+    renewed = await h.client.post(f"/v1/instances/{instance_id}/lifecycle/renew")
+    assert renewed.status_code == 200 and len(trust_boundary.created) == 2
+    observed = await h.client.get(f"/v1/instances/{instance_id}")
+    assert observed.status_code == 200 and reconciled == [instance_id]
+
+
+async def _in_flight(h, nova_status, task_state=None):
+    instance_id = await make_dev(h)
+    await set_instance(h, instance_id, status="ready", result_json={"status": "ready"})
     async with h.factory() as session:
         server_id = (await session.get(PalimpsestHubInstance, instance_id)).server_id
     await set_life(h, instance_id, machine_json=SessionMachine(phase=Phase.SHELVING).to_state())
     sdk_servers(h)
     h.provider.servers_by_id[server_id]["status"] = nova_status
+    h.provider.servers_by_id[server_id]["task_state"] = task_state
     unshelved = []
 
     def unshelve_server(identity):
@@ -854,27 +1191,90 @@ ACTOR = {"project_id": PROJECT, "user_id": USER, "package_actions": {"packages:m
 
 
 @pytest.mark.asyncio
-async def test_resume_refuses_while_nova_is_still_shelving(instance_hub, trust_boundary):
+@pytest.mark.parametrize(
+    ("nova_status", "task_state"),
+    [
+        ("ACTIVE", "shelving"),
+        ("ACTIVE", "shelving_image_pending_upload"),
+        ("ACTIVE", "shelving_image_uploading"),
+        ("ACTIVE", "shelving_offloading"),
+        ("SHUTOFF", "shelving"),
+        ("PAUSED", "shelving"),
+        ("SHELVED_OFFLOADED", "unshelving"),
+        ("SHELVED", "spawning"),
+    ],
+)
+async def test_resume_refuses_while_nova_is_still_shelving(instance_hub, trust_boundary, nova_status, task_state):
     h = instance_hub
-    instance_id, unshelved = await _in_flight(h, "SHELVING")
+    instance_id, unshelved = await _in_flight(h, nova_status, task_state)
+    started = []
+    h.provider.start_server = started.append
     with pytest.raises(HTTPException) as busy:
         await lifecycle.resume(h.factory, ACTOR, h.provider, instance_id, lifecycle_settings(h))
-    assert busy.value.status_code == 409 and unshelved == []
+    assert busy.value.status_code == 409 and unshelved == [] and started == []
+    assert busy.value.headers["Retry-After"] == "10"
+    assert (await life_state(h, instance_id)).status == "ready"
     # The refusal must not settle the worker's shelve: the machine is still SHELVING.
     assert (await life_state(h, instance_id)).machine.phase is Phase.SHELVING
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("nova_status", "unshelve_calls"), [("SHELVED_OFFLOADED", 1), ("SHELVED", 1), ("ACTIVE", 0)])
-async def test_resume_settles_an_unfinished_shelve_itself_so_the_owner_is_never_locked_out(
-    instance_hub, trust_boundary, nova_status, unshelve_calls
+@pytest.mark.parametrize("initial_status", ["ACTIVE", "SHELVED"])
+async def test_resume_conflicts_if_nova_starts_shelving_between_provider_reads(
+    instance_hub, trust_boundary, initial_status
 ):
     h = instance_hub
-    instance_id, unshelved = await _in_flight(h, nova_status)
+    instance_id = await make_dev(h)
+    await set_instance(h, instance_id, status="ready", result_json={"status": "ready"})
+    await set_life(h, instance_id, machine_json=SessionMachine(phase=Phase.SHELVING).to_state())
+    async with h.factory() as session:
+        row = await session.get(PalimpsestHubInstance, instance_id)
+        before = service.projection(row)
+        server_id = row.server_id
+    before_machine = (await life_state(h, instance_id)).machine.to_state()
+    reads, unshelved, started = [], [], []
+
+    def get_server(identity):
+        assert identity == server_id
+        reads.append(identity)
+        assert len(reads) <= 2
+        task_state = None if len(reads) == 1 else "shelving"
+        return {**h.provider.servers_by_id[identity], "status": initial_status, "OS-EXT-STS:task_state": task_state}
+
+    h.provider.get_server = get_server
+    h.provider.unshelve_server, h.provider.start_server = unshelved.append, started.append
+    response = await h.client.post(f"/v1/instances/{instance_id}/resume")
+    assert response.status_code == 409, response.text
+    assert response.headers["Retry-After"] == "10"
+    assert response.json()["detail"] == "server shelving is still in progress"
+    assert reads == [server_id, server_id] and unshelved == [] and started == []
+    async with h.factory() as session:
+        assert service.projection(await session.get(PalimpsestHubInstance, instance_id)) == before
+    assert (await life_state(h, instance_id)).machine.to_state() == before_machine
+    assert len(trust_boundary.created) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("nova_status", "task_state", "unshelve_calls", "row_status"),
+    [
+        ("SHELVED_OFFLOADED", None, 1, "resumed"),
+        ("SHELVED", None, 1, "resumed"),
+        # The shelve never happened and the guest never rebooted: no restore report is owed.
+        ("ACTIVE", None, 0, "ready"),
+    ],
+    ids=["offloaded-idle", "shelved-idle", "active-idle-no-task"],
+)
+async def test_resume_settles_an_unfinished_shelve_itself_so_the_owner_is_never_locked_out(
+    instance_hub, trust_boundary, nova_status, task_state, unshelve_calls, row_status
+):
+    h = instance_hub
+    instance_id, unshelved = await _in_flight(h, nova_status, task_state)
     projected = await lifecycle.resume(h.factory, ACTOR, h.provider, instance_id, lifecycle_settings(h))
     assert len(unshelved) == unshelve_calls
     state = await life_state(h, instance_id)
     assert state.machine.phase is Phase.GRACE and projected["provider_status"] == "ACTIVE"
+    assert state.status == row_status
 
 
 @pytest.mark.asyncio
@@ -946,7 +1346,7 @@ REAL_ADMIT_TRUST = lifecycle.admit_trust
 async def test_ready_error_and_resumed_guests_are_all_shelvable(instance_hub, trust_boundary, status):
     h = instance_hub
     instance_id = await make_dev(h)
-    await set_instance(h, instance_id, status=status)
+    await set_instance(h, instance_id, status=status, result_json={"status": "ready"})
     provider, clock = FakeProvider(), Clock()
     await report(h, instance_id)
     await tick(h, instance_id, provider, clock)
@@ -957,33 +1357,47 @@ async def test_ready_error_and_resumed_guests_are_all_shelvable(instance_hub, tr
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("nova_status", "label", "phase"),
+    ("nova_status", "task_state", "label", "phase"),
     [
-        ("SHELVED", "recovered-shelved", Phase.SHELVED),
-        ("SHUTOFF", "recovered-not-shelved", Phase.GRACE),
-        ("ERROR", "recovered-not-shelved", Phase.GRACE),
+        ("SHELVED", None, "recovered-shelved", Phase.SHELVED),
+        ("SHELVED_OFFLOADED", None, "recovered-shelved", Phase.SHELVED),
+        ("ACTIVE", None, "recovered-active", Phase.GRACE),
+        ("SHUTOFF", None, "recovered-not-shelved", Phase.GRACE),
+        ("ERROR", None, "recovered-not-shelved", Phase.GRACE),
+        ("ACTIVE", "shelving", "shelve-in-progress", Phase.SHELVING),
+        ("ACTIVE", "shelving_image_pending_upload", "shelve-in-progress", Phase.SHELVING),
+        ("ACTIVE", "shelving_image_uploading", "shelve-in-progress", Phase.SHELVING),
+        ("ACTIVE", "shelving_offloading", "shelve-in-progress", Phase.SHELVING),
+        ("SHUTOFF", "shelving", "shelve-in-progress", Phase.SHELVING),
+        ("ACTIVE", "spawning", "recovered-active", Phase.GRACE),
+        ("SHELVED_OFFLOADED", "unshelving", "unshelve-in-progress", Phase.SHELVING),
+        ("SHELVED", "spawning", "unshelve-in-progress", Phase.SHELVING),
     ],
 )
 async def test_every_nova_status_settles_an_unknown_shelve_so_it_never_stays_stuck(
-    instance_hub, trust_boundary, nova_status, label, phase
+    instance_hub, trust_boundary, nova_status, task_state, label, phase
 ):
     h = instance_hub
     instance_id = await make_dev(h)
     await set_instance(h, instance_id, status="ready")
     await set_life(h, instance_id, machine_json=SessionMachine(phase=Phase.SHELVING).to_state())
-    assert await tick(h, instance_id, FakeProvider(status=nova_status), Clock()) == label
+    assert await tick(h, instance_id, FakeProvider(status=nova_status, task_state=task_state), Clock()) == label
     assert (await life_state(h, instance_id)).machine.phase is phase
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "task_state",
+    ["shelving", "shelving_image_pending_upload", "shelving_image_uploading", "shelving_offloading"],
+)
 async def test_a_shelve_that_nova_accepted_but_the_worker_could_not_confirm_stays_shelving(
-    instance_hub, trust_boundary
+    instance_hub, trust_boundary, task_state
 ):
     h = instance_hub
     instance_id = await make_dev(h)
-    await set_instance(h, instance_id, status="ready")
+    await set_instance(h, instance_id, status="ready", result_json={"status": "ready"})
     provider, clock = FakeProvider(shelve_error=ProviderError("timed out waiting for SHELVED_OFFLOADED")), Clock()
-    provider.status = "SHELVING"
+    provider.task_state = task_state
     await report(h, instance_id)
     await tick(h, instance_id, provider, clock)
     clock.now += GRACE_SECONDS
@@ -994,6 +1408,7 @@ async def test_a_shelve_that_nova_accepted_but_the_worker_could_not_confirm_stay
     assert state.status == "ready"
     # The next tick settles from Nova instead of leaving a half-shelved instance looking ready.
     provider.status = "SHELVED_OFFLOADED"
+    provider.task_state = None
     assert await tick(h, instance_id, provider, clock) == "recovered-shelved"
 
 
@@ -1003,7 +1418,7 @@ async def test_a_delete_that_lands_after_the_claim_cancels_the_shelve(instance_h
 
     h = instance_hub
     instance_id = await make_dev(h)
-    await set_instance(h, instance_id, status="ready")
+    await set_instance(h, instance_id, status="ready", result_json={"status": "ready"})
     provider, clock = FakeProvider(), Clock()
     await report(h, instance_id)
     await tick(h, instance_id, provider, clock)
@@ -1031,7 +1446,7 @@ async def test_a_user_who_connects_between_the_claim_and_the_call_is_never_shelv
 ):
     h = instance_hub
     instance_id = await make_dev(h)
-    await set_instance(h, instance_id, status="ready")
+    await set_instance(h, instance_id, status="ready", result_json={"status": "ready"})
     provider, clock = FakeProvider(), Clock()
     await report(h, instance_id)
     await tick(h, instance_id, provider, clock)
@@ -1116,13 +1531,32 @@ async def test_the_guest_capability_in_user_data_is_the_one_whose_hash_is_stored
 
 
 @pytest.mark.asyncio
-async def test_an_unshelve_outside_the_hub_is_noticed_on_the_next_read(instance_hub, trust_boundary):
+@pytest.mark.parametrize(
+    "kind", ["new-no-probe", "legacy-probe", "legacy-no-probe", "first-error", "never-ready", "gpu", "cluster"]
+)
+async def test_an_unshelve_outside_the_hub_is_noticed_on_the_next_read(instance_hub, trust_boundary, kind):
     h = instance_hub
     instance_id = await make_dev(h)
     await set_life(h, instance_id, machine_json=SessionMachine(phase=Phase.SHELVED).to_state())
-    await set_instance(h, instance_id, status="shelved", provider_status="SHELVED_OFFLOADED")
+    async with h.factory() as session:
+        row = await session.get(PalimpsestHubInstance, instance_id)
+        spec = {**row.spec_json, "readiness_argv": ["/bin/true"] if kind == "legacy-probe" else []}
+        if kind.startswith("legacy"):
+            spec.pop("resume_without_probe")
+        elif kind in ("gpu", "cluster"):
+            spec[kind] = {"profile": kind}
+        row.spec_json = spec
+        row.status, row.provider_status = "shelved", "SHELVED_OFFLOADED"
+        row.result_json = None if kind == "never-ready" else {"status": "error" if kind == "first-error" else "ready"}
+        await session.commit()
     observed = await h.client.get(f"/v1/instances/{instance_id}")  # the fake server is ACTIVE
-    assert observed.status_code == 200 and observed.json()["status"] == "resumed"
+    expected = "resumed" if kind in ("new-no-probe", "legacy-probe") else "error"
+    assert observed.status_code == 200 and observed.json()["status"] == expected
+    assert observed.json()["provider_status"] == "ACTIVE"
+    if expected == "error":
+        assert observed.json()["error_code"] == "resume_state_missing"
+        again = await h.client.get(f"/v1/instances/{instance_id}")
+        assert again.json()["status"] == "error" and again.json()["error_code"] == "resume_state_missing"
     state = await life_state(h, instance_id)
     assert state.machine.phase is Phase.GRACE and state.machine.grace_started is not None
 
@@ -1279,6 +1713,7 @@ RESUME_READY = {"status": "ready", "exit_code": None, "stdout": "", "stderr": ""
 async def test_resume_result_needs_the_session_capability_and_a_resumed_instance(instance_hub, trust_boundary):
     h = instance_hub
     instance_id = await make_dev(h)
+    await set_instance(h, instance_id, status="ready", result_json={"status": "ready"})
     path = "/v1/instance-bootstrap/" + instance_id + "/resume-result"
     auth = {"Authorization": "Bearer " + TOKEN}
     body = {"instance_id": instance_id, **RESUME_READY}
@@ -1326,7 +1761,7 @@ async def test_an_accepted_unshelve_makes_the_row_resumed_even_when_it_still_sai
     instance_id = await make_dev(h)
     async with h.factory() as session:
         server_id = (await session.get(PalimpsestHubInstance, instance_id)).server_id
-    await set_instance(h, instance_id, status="ready")
+    await set_instance(h, instance_id, status="ready", result_json={"status": "ready"})
     await set_life(h, instance_id, machine_json=SessionMachine(phase=Phase.SHELVED).to_state())
     sdk_servers(h)
     h.provider.servers_by_id[server_id]["status"] = "SHELVED_OFFLOADED"

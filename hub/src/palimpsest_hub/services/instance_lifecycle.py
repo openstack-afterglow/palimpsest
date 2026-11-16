@@ -50,7 +50,7 @@ from palimpsest_hub.openstack import (
     open_trust_connection,
 )
 from palimpsest_hub.services import instances as instance_service
-from palimpsest_hub.services.nova_shelve_provider import SHELVED_OFFLOADED, NovaShelveProvider
+from palimpsest_hub.services.nova_shelve_provider import SHELVED_OFFLOADED, NovaShelveProvider, ServerState
 from palimpsest_hub.services.session_controller import (
     ObservationError,
     Outcome,
@@ -235,10 +235,15 @@ async def mark_resumed(session, instance_id: str) -> None:
 
 
 def restorable(instance: PalimpsestHubInstance) -> bool:
-    """Whether the guest wrote its resume state: only a non-GPU guest whose first result was a probed ready."""
+    """Whether a ready CPU guest retained resume state, accounting for older runners."""
     spec = instance.spec_json or {}
     first = instance.result_json or {}
-    return first.get("status") == "ready" and bool(spec.get("readiness_argv")) and spec.get("gpu") is None
+    return (
+        first.get("status") == "ready"
+        and spec.get("gpu") is None
+        and spec.get("cluster") is None
+        and (bool(spec.get("readiness_argv")) or spec.get("resume_without_probe") is True)
+    )
 
 
 async def mark_started(session, instance: PalimpsestHubInstance) -> bool:
@@ -367,8 +372,8 @@ class TrustShelveProvider:
     async def unshelve(self, instance_id: str) -> None:
         await (await self._provider(instance_id)).unshelve(self._server_id)
 
-    async def server_status(self, instance_id: str) -> str:
-        return await (await self._provider(instance_id)).server_status(self._server_id)
+    async def server_state(self, instance_id: str) -> ServerState:
+        return await (await self._provider(instance_id)).server_state(self._server_id)
 
 
 # -- worker tick ---------------------------------------------------------------------------------
@@ -397,19 +402,21 @@ class _ClaimCancelled(Exception):
 async def _settle_unknown_shelve(session, instance, life, machine, provider, wall: float) -> str:
     """A durable SHELVING phase means a previous tick died: settle it from Nova's real status."""
     try:
-        status = await provider.server_status(instance.id)
+        state = await provider.server_state(instance.id)
     except ProviderError:
         return "recovery-unavailable"
     claim = Claim(machine.generation)
-    if status.startswith("SHELVED"):  # SHELVED or SHELVED_OFFLOADED: the VM is off either way
-        machine.shelve_settled(claim, wall, ok=True)
-        instance.status, instance.provider_status = "shelved", status[:32]
-        return "recovered-shelved"
-    if status.startswith("SHELVING"):
+    if state.shelving:
         return "shelve-in-progress"  # Nova is still working; look again next tick.
-    # ACTIVE, SHUTOFF, ERROR or anything else: the shelve did not happen; release with a fresh grace.
+    if state.unshelving:
+        return "unshelve-in-progress"
+    if state.shelved:
+        machine.shelve_settled(claim, wall, ok=True)
+        instance.status, instance.provider_status = "shelved", state.status[:32]
+        return "recovered-shelved"
+    # Idle ACTIVE, SHUTOFF, ERROR or anything else: release with a fresh grace.
     machine.shelve_settled(claim, wall, ok=False)
-    return "recovered-active" if status == "ACTIVE" else "recovered-not-shelved"
+    return "recovered-active" if state.status == "ACTIVE" else "recovered-not-shelved"
 
 
 async def tick_instance(
@@ -505,7 +512,8 @@ async def tick_instance(
             # An accepted shelve can still fail the wait (poll error, timeout, trust expiring mid-wait)
             # while Nova finishes it: stay SHELVING so the next tick settles from Nova's real status.
             with suppress(ProviderError):
-                if (await provider.server_status(instance_id)).startswith("SHELV"):
+                state = await provider.server_state(instance_id)
+                if state.shelving or state.unshelving or state.shelved:
                     machine.phase = Phase.SHELVING
                     life.machine_json = machine.to_state()
                     life.last_error = "shelve_unconfirmed"
@@ -649,7 +657,7 @@ async def _replace_trust(session, actor, project: str, life: Lifecycle, settings
 
 
 async def renew_trust(factory, actor, conn, instance_id: str, settings) -> dict:
-    async with sql_mutex(factory, "build-api:instance:" + instance_id) as session:
+    async with instance_service.mutation_mutex(factory, actor, conn, instance_id) as session:
         project, instance, life = await _owned_dev(session, actor, conn, instance_id)
         _require_creator(actor, instance)
         new = await _replace_trust(session, actor, project, life, settings)
@@ -658,7 +666,7 @@ async def renew_trust(factory, actor, conn, instance_id: str, settings) -> dict:
 
 async def resume(factory, actor, conn, instance_id: str, settings) -> dict:
     """Unshelve, or start a stopped server, with the owner's own token and begin a new full grace period."""
-    async with sql_mutex(factory, "build-api:instance:" + instance_id) as session:
+    async with instance_service.mutation_mutex(factory, actor, conn, instance_id) as session:
         project, instance, life = await _owned_dev(session, actor, conn, instance_id)
         if not instance.server_id:
             raise HTTPException(409, "Instance has no provider server to resume")
@@ -668,15 +676,20 @@ async def resume(factory, actor, conn, instance_id: str, settings) -> dict:
             raise HTTPException(409, "Instance lifecycle state is invalid; contact an operator") from None
         provider = NovaShelveProvider(conn)
         try:
-            status = await provider.server_status(instance.server_id)
+            state = await provider.server_state(instance.server_id)
         except ProviderError as exc:
             raise HTTPException(502, str(exc)) from None
+        status = state.status
+        if state.shelving or state.unshelving:
+            raise HTTPException(
+                409,
+                "A shelve or unshelve is still in flight; the request was not applied",
+                headers={"Retry-After": str(instance_service.INSTANCE_LIFECYCLE_RETRY_SECONDS)},
+            )
         if machine.phase is Phase.SHELVING:
             # The worker's shelve is unfinished or its outcome is unknown: settle it from Nova here, so
             # an owner is never locked out by a worker that cannot (for example an expired trust).
-            if status.startswith("SHELVING"):
-                raise HTTPException(409, "A shelve is still in flight; retry shortly")
-            machine.shelve_settled(Claim(machine.generation), time.time(), ok=status.startswith("SHELVED"))
+            machine.shelve_settled(Claim(machine.generation), time.time(), ok=state.shelved)
         if (status == "SHUTOFF" or instance.status in ("stopping", "stopped")) and not restorable(instance):
             raise HTTPException(409, "Instance has no retained ready state to restore after a stop; delete it instead")
         try:
@@ -691,11 +704,24 @@ async def resume(factory, actor, conn, instance_id: str, settings) -> dict:
                 await provider.start(instance.server_id)
             else:
                 if instance.status == "stopping":
-                    raise HTTPException(409, "A stop is still in flight; retry shortly")
+                    raise HTTPException(
+                        409,
+                        "A stop is still in flight; retry shortly",
+                        headers={"Retry-After": str(instance_service.INSTANCE_LIFECYCLE_RETRY_SECONDS)},
+                    )
                 await provider.unshelve(instance.server_id)
         except ProviderError as exc:
             # A server that is not resumable is the caller's state conflict; Nova failures are 502.
-            raise HTTPException(409 if str(exc).startswith("server is ") else 502, str(exc)) from None
+            conflict = str(exc).startswith("server ")
+            transient = str(exc) in (
+                "server shelving is still in progress",
+                "server unshelving is still in progress",
+            )
+            raise HTTPException(
+                409 if conflict else 502,
+                str(exc),
+                headers={"Retry-After": str(instance_service.INSTANCE_LIFECYCLE_RETRY_SECONDS)} if transient else None,
+            ) from None
         if machine.phase is Phase.SHELVED:
             machine.unshelved()
         elif not machine.sessions:
@@ -707,9 +733,15 @@ async def resume(factory, actor, conn, instance_id: str, settings) -> dict:
         life.machine_json = machine.to_state()
         life.updated_at = _now()
         if instance.status in ("shelved", "ready", "error", "resumed", "stopping", "stopped"):
-            # The guest boots again (unshelve or power-on) and its runner restores the retained root and
-            # command, then reports through `resume-result`, which only a `resumed` row accepts.
-            instance.status = "resumed"
+            if restorable(instance):
+                if status != "ACTIVE" or instance.status in ("shelved", "stopping", "stopped"):
+                    # Only a guest that boots again owes a restore report. A row that is already
+                    # ACTIVE and ready/error/resumed keeps its status, also when an unfinished
+                    # shelve was settled above as "did not happen".
+                    instance.status = "resumed"
+            elif status != "ACTIVE" or instance.status in ("shelved", "resumed"):
+                # Unshelve restores VM access, but no guest restore report can arrive.
+                instance.status, instance.error_code = "error", "resume_state_missing"
         instance.provider_status = "ACTIVE"
         instance.updated_at = _now()
         await session.commit()
