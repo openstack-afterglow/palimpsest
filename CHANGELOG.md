@@ -17,7 +17,7 @@ All notable changes to Palimpsest Local are documented here.
 - Experimental native VZ commit: a file or symlink that replaces a lower directory now removes that directory's entries from the parent view, as the materializer does. Before, they stayed listed, so a commit could refuse on a path that no longer exists or write a whiteout below a non-directory.
 - Hub dashboard: Create VM stayed disabled until a page reload when the connection was closed while a create request was in flight. The button is restored on disconnect.
 
-## [0.3.29] - 2026-11-15 (UTC; candidate, not yet published or deployed)
+## [0.3.29] - 2026-11-15 (UTC; published and deployed)
 
 ### Changed
 

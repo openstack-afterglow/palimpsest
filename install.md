@@ -2,7 +2,7 @@
 
 Palimpsest requires Python 3.11 or newer. This source prepares
 [`palimpsest-client 0.3.29`](https://pypi.org/project/palimpsest-client/0.3.29/)
-(2026-11-15 UTC release candidate; 0.3.28 is published and deployed). Publication and deployment are separate. After publication, install exact bytes in isolation:
+(published and deployed 2026-11-15 UTC). Publication and deployment are separate. Install exact bytes in isolation:
 
 ```sh
 uv tool install --python 3.11 "palimpsest-client==0.3.29"
@@ -124,7 +124,7 @@ Repository tags also drive GHCR image tags for
 `ghcr.io/openstack-afterglow/palimpsest-hub-api`,
 `ghcr.io/openstack-afterglow/palimpsest-hub-worker` and
 `ghcr.io/openstack-afterglow/palimpsest-hub-build-worker`; image tags follow the
-repository tag, not the independently versioned Hub wheel. This candidate's Kolla
+repository tag, not the independently versioned Hub wheel. This source's Kolla
 role defaults to Hub image tag `0.3.29`; verify publication and exact reviewed
 API/export/build-worker digests and platform manifests before any deployment.
 Root publication requires trusted tag artifact checks and protected PyPI
