@@ -4,6 +4,8 @@ All notable changes to Palimpsest Local are documented here.
 
 ## [Unreleased]
 
+## [0.3.30] - 2026-11-17 (UTC)
+
 ### Changed
 
 - Package-key issuance and revoke (`keys:issue`, `keys:revoke`) moved from the manager tier to the member tier, so a project member holds every package action and a manager keeps only package/layer/export deletion and project management. A reader is unchanged: inventory/download plus listing and revoking its own keys. Operator policy YAML can still narrow these actions to managers; the hard ceiling no longer blocks a member rule for them. Package keys stay bound to the original token, the exact project and key ownership.

@@ -1,5 +1,9 @@
 # Detailed installation and configuration guide
 
+## 0.3.30 transition note — 2026-11-17 (UTC; prepared)
+
+0.3.30 is a patch over 0.3.29 with no schema change. Package-key issuance and revoke (`keys:issue`, `keys:revoke`) are now member-tier actions: a project member can issue its own restricted package keys, and a manager keeps package/layer/export deletion and project management. Key listing, issuance and revocation stay owner-only for the exact project, and another owner's key is never reachable. An operator `policy.yaml` that narrowed these actions to manager keeps denying member; one that granted them to member now takes effect. Existing bearer keys keep their stored scope and actions. The release also carries the merged read-only client commands `palimpsest layer impact` and the staged compatibility diagnosis. Roll all Hub cohorts together after publication.
+
 ## 0.3.29 transition note — 2026-11-15 (UTC; deployed)
 
 0.3.29 is a patch over 0.3.28 with no API, schema or role input change. The API and export worker add log lines that name swallowed failures by exception class and Hub call site (see "Hub API and worker logs"). Log collectors that count ERROR or WARNING lines of the Hub will now see unhandled request failures and failed readiness probes that 0.3.28 logged only as INFO `status=5xx` lines or not at all. Roll all Hub cohorts together after publication.
@@ -87,7 +91,7 @@ Version 0.3.25 is published (tag `0.3.25`, PyPI `palimpsest-client` 0.3.25) and 
 SDK publication and native execution remain separately qualified. Root/Hub metadata, module versions,
 generated locks and Kolla image defaults move together. After formal publication,
 install exact client bytes with
-`uv tool install --python 3.11 palimpsest-client==0.3.29`, or install a trusted
+`uv tool install --python 3.11 palimpsest-client==0.3.30`, or install a trusted
 local checkout with `uv tool install --force --python 3.11 .`.
 A root wheel upgrade neither deploys Hub nor qualifies actual build/run behavior.
 Git/outbound GitHub HTTPS is needed only for VCS installation.
@@ -1765,7 +1769,7 @@ and the [command workflows](cli/workflows.md) for operational details.
 
 ## SDK image/native integration: operator prerequisites
 
-The `0.3.29` Hub distribution declares the exact matching client dependency.
+The `0.3.30` Hub distribution declares the exact matching client dependency.
 Checkout resolution uses `hub`'s explicit parent-path source; installed release
 bytes must match the same immutable tag and reviewed image digests. Paired wheel
 or local container checks do not establish production upgrade or native readiness.
