@@ -292,9 +292,9 @@ VZ OCI-root runtime record the later state.
 Fresh native project roles, not custom operation roles, determine thirteen
 oslo-policy actions. Reader-or-above has visible inventory/content/cache reads,
 own-key metadata and original-token `keys:revoke_own`. Member-or-above adds
-publication/cache editing and `packages:manage_own` for only its recorded
-consumer/exclusive boot volume. Manager-or-above adds project management,
-package/layer/export deletion and key issuance/full owner-bound revocation.
+publication/cache editing, package-key issuance/full owner-bound revocation and
+`packages:manage_own` for only its recorded consumer/exclusive boot volume.
+Manager-or-above adds project management and package/layer/export deletion.
 Human system administration remains separately proved; project manager/admin
 does not create cross-project or other-private-creator authority.
 
@@ -4102,9 +4102,9 @@ Reserved names and duplicate listings (2026-11-15, from the commit-path review, 
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "f7f19a37dfaf357f176577ee959fad9d80d119ec2c233582c1f6d9b6f782faf2",
-  "reviewed_at": "2026-11-15T15:44:27Z",
-  "summary": "Layer lineage branch: wording of the deployed-cloud clone observation narrowed to what was observed (docs only)"
+  "source_sha256": "33924260eb9de1457974ce03728df59af6b592d5aeccb7fb7a1a079ff8a9837c",
+  "reviewed_at": "2026-11-16T17:16:56Z",
+  "summary": "Release 0.3.30: member-tier package-key issue/revoke; version bump, locks, docs, changelog."
 }
 ```
 <!-- architecture-review:end -->

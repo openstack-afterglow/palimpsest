@@ -1,5 +1,9 @@
 # Detailed installation and configuration guide
 
+## 0.3.30 transition note — 2026-11-17 (UTC; prepared)
+
+0.3.30 is a patch over 0.3.29 with no schema change. Package-key issuance and revoke (`keys:issue`, `keys:revoke`) are now member-tier actions: a project member can issue its own restricted package keys, and a manager keeps package/layer/export deletion and project management. Key listing, issuance and revocation stay owner-only for the exact project, and another owner's key is never reachable. An operator `policy.yaml` that narrowed these actions to manager keeps denying member; one that granted them to member now takes effect. Existing bearer keys keep their stored scope and actions. The release also carries the merged read-only client commands `palimpsest layer impact` and the staged compatibility diagnosis. Roll all Hub cohorts together after publication.
+
 ## 0.3.29 transition note — 2026-11-15 (UTC; deployed)
 
 0.3.29 is a patch over 0.3.28 with no API, schema or role input change. The API and export worker add log lines that name swallowed failures by exception class and Hub call site (see "Hub API and worker logs"). Log collectors that count ERROR or WARNING lines of the Hub will now see unhandled request failures and failed readiness probes that 0.3.28 logged only as INFO `status=5xx` lines or not at all. Roll all Hub cohorts together after publication.
@@ -87,7 +91,7 @@ Version 0.3.25 is published (tag `0.3.25`, PyPI `palimpsest-client` 0.3.25) and 
 SDK publication and native execution remain separately qualified. Root/Hub metadata, module versions,
 generated locks and Kolla image defaults move together. After formal publication,
 install exact client bytes with
-`uv tool install --python 3.11 palimpsest-client==0.3.29`, or install a trusted
+`uv tool install --python 3.11 palimpsest-client==0.3.30`, or install a trusted
 local checkout with `uv tool install --force --python 3.11 .`.
 A root wheel upgrade neither deploys Hub nor qualifies actual build/run behavior.
 Git/outbound GitHub HTTPS is needed only for VCS installation.
@@ -553,8 +557,8 @@ Palimpsest operation roles. Higher tiers include all lower-tier actions:
 | Existing project role | Default project authority |
 | --- | --- |
 | `reader` | Query/list visible metadata, manifests, content/cache downloads, build/instance status; list/revoke only its own keys using its original Keystone token |
-| `member` | Reader actions plus create/publish/upload/edit, build/export/instance admission and stop/delete of only its own consumers/exclusive boot volumes |
-| `manager` | Member actions plus authorized project management, package/layer/export deletion and own-key issuance; private creator and key-owner isolation still apply |
+| `member` | Reader actions plus create/publish/upload/edit, own package-key issuance and revoke, build/export/instance admission and stop/delete of only its own consumers/exclusive boot volumes |
+| `manager` | Member actions plus authorized project management and package/layer/export deletion; private creator and key-owner isolation still apply |
 | Project `admin` | At least manager project authority; never system/cross-project authority from that assignment alone |
 
 Canonical `project_*` roles require actual current Keystone core-role implications;
@@ -1219,7 +1223,7 @@ Profiles live at `${XDG_CONFIG_HOME:-~/.config}/palimpsest/registries.toml`, sch
 
 Native profiles require `--api-base HTTPS_URL` on exactly the `endpoint` authority and optionally a one-component namespace. Native HTTPS verifies system trust plus absolute `--ca` files and refuses redirects; mirrors, plain HTTP, TLS-skip and Docker cache exporters are rejected. The helper entry is exactly `api_base.rstrip('/') + '/projects/' + namespace`; lookup checks that `credHelpers` entry then `credsStore`, never host-only entries or `auths`. Configure/install `docker-credential-HELPER` first. Native login verifies `/auth/me` before storing anything, uses the key's public UUID as `--username`, and accepts the secret only through stdin/prompt. Native `--namespace` selects the credential namespace. OCI profiles retain Docker's `DOCKER_CONFIG`/`~/.docker` credentials.
 
-An ordinary member-or-above first registers the operator-bound namespace; a manager-or-above then issues its own secret-once exact-package/action-bound key through the native control API. Key use retains current-owner and action attenuation, even after a downgrade to member. Follow the complete [registry flow](registries.md#native-authentication-build-and-transfer), including conditional `cloud.dmslab.re.kr/openstack-afterglow/test:v1` usage only after binding the alias to the actual immutable project UUID. Native `push --input`/`--manifest` and `pull --output` transfer verified OCI-layout archives without loading Docker; local typed receipts and frozen exports live under `state/package-references/` and `state/package-artifacts/`, separate from runtime-layer tags. These source paths and written tests are not deployment or executed acceptance evidence.
+An ordinary member-or-above first registers the operator-bound namespace and then issues its own secret-once exact-package/action-bound key through the native control API. Key use retains current-owner and action attenuation and is attenuated again by every later role change. Follow the complete [registry flow](registries.md#native-authentication-build-and-transfer), including conditional `cloud.dmslab.re.kr/openstack-afterglow/test:v1` usage only after binding the alias to the actual immutable project UUID. Native `push --input`/`--manifest` and `pull --output` transfer verified OCI-layout archives without loading Docker; local typed receipts and frozen exports live under `state/package-references/` and `state/package-artifacts/`, separate from runtime-layer tags. These source paths and written tests are not deployment or executed acceptance evidence.
 
 ### Compose project identity
 
@@ -1441,7 +1445,7 @@ standard tiers without uplifting self-actions into foreign/private authority.
 
 Because standard oslo.policy role matching is case-insensitive, trusted global role binding uniqueness is checked by casefold before policy evaluation. Actual role names remain unchanged. Distinct `custom_policy_writer` and `Custom_Policy_Writer` IDs cannot borrow one another's YAML authority; the native real-engine HTTP regression covers the collision.
 
-Authenticated `GET /v1/policy/capabilities` returns `service: "palimpsest"` and sorted `actions`; old operation-role labels are removed. Reader actions are `packages:inventory`, `packages:read`, `cache:read`, `keys:list`, `keys:revoke_own`; member adds `packages:write`, `cache:write`, `packages:manage_own`; manager adds `packages:delete`, `packages:manage`, `keys:issue`, `keys:revoke`. The own actions require the original Keystone token and freshly verified exact creator/key ownership: reader can revoke only its own keys, and member can stop/delete only its own consumers and exclusive boot volumes. They never authorize another private creator's VM, package/layer/export deletion, API-key management by a bearer key, or foreign-project access. Creator-only upload cancellation retains its package/cache write action and exact session/key ownership. `system:manage` still requires fresh human-system proof. Even `@` cannot bypass these tiers or ownership/credential fences.
+Authenticated `GET /v1/policy/capabilities` returns `service: "palimpsest"` and sorted `actions`; old operation-role labels are removed. Reader actions are `packages:inventory`, `packages:read`, `cache:read`, `keys:list`, `keys:revoke_own`; member adds `packages:write`, `cache:write`, `packages:manage_own`, `keys:issue`, `keys:revoke`; manager adds `packages:delete`, `packages:manage`. The own actions require the original Keystone token and freshly verified exact creator/key ownership: reader can revoke only its own keys, and member can stop/delete only its own consumers and exclusive boot volumes. They never authorize another private creator's VM, package/layer/export deletion, API-key management by a bearer key, or foreign-project access. Creator-only upload cancellation retains its package/cache write action and exact session/key ownership. `system:manage` still requires fresh human-system proof. Even `@` cannot bypass these tiers or ownership/credential fences.
 
 The following focused rerun commands cover actual loopback Uvicorn/Keystone SDK YAML reload, key ceilings and project/system constraints. The final complete Hub suite passed650 with two opt-in database skips; these subsets are not separately claimed as a final counted run:
 
@@ -1765,7 +1769,7 @@ and the [command workflows](cli/workflows.md) for operational details.
 
 ## SDK image/native integration: operator prerequisites
 
-The `0.3.29` Hub distribution declares the exact matching client dependency.
+The `0.3.30` Hub distribution declares the exact matching client dependency.
 Checkout resolution uses `hub`'s explicit parent-path source; installed release
 bytes must match the same immutable tag and reviewed image digests. Paired wheel
 or local container checks do not establish production upgrade or native readiness.
