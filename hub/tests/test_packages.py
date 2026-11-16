@@ -1485,7 +1485,7 @@ async def test_manager_layer_delete_preserves_all_parent_and_base_consumers(hub,
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("role", ["reader"])
+@pytest.mark.parametrize("role", ["reader", "member"])
 async def test_demoted_owner_can_revoke_only_own_key_with_original_token(hub, role):
     namespace, issued, credential = await key(hub)
     hub.people["one"]["roles"] = hub.people["two"]["roles"] = [role]
@@ -1495,15 +1495,16 @@ async def test_demoted_owner_can_revoke_only_own_key_with_original_token(hub, ro
     context = await hub.client.get("/v1/projects/current", headers=own)
     assert context.status_code == 200
     assert context.json()["capabilities"]["keys_revoke"] is True
-    assert context.json()["capabilities"]["keys_issue"] is False
+    assert context.json()["capabilities"]["keys_issue"] is (role == "member")
     assert (await hub.client.delete(base + "/" + issued["key"]["key_id"], headers=credential)).status_code == 401
+    # Owner-only for every tier that can revoke, including the member tier that now holds keys:revoke.
     assert (await hub.client.delete(base + "/" + issued["key"]["key_id"], headers=other)).status_code == 404
     denied = await hub.client.post(
         base,
         headers=own,
         json={"name": "cannot delegate", "scope": {"packages": ["test"]}, "actions": ["packages:read"]},
     )
-    assert denied.status_code == 403
+    assert denied.status_code == (201 if role == "member" else 403)
     assert (await hub.client.delete(base + "/" + issued["key"]["key_id"], headers=own)).status_code == 204
     assert (await hub.client.get("/v1/auth/me", headers=credential)).status_code == 401
 

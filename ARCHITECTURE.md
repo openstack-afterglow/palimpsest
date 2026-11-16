@@ -4102,9 +4102,9 @@ Reserved names and duplicate listings (2026-11-15, from the commit-path review, 
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "217ccdfec5e806b5ed8a4db25a1dee00a3d10f133c96274cf8cae1f9d495163e",
-  "reviewed_at": "2026-11-16T16:59:05Z",
-  "summary": "Package-key issue/revoke moved to the member tier; tests, docs, spec and sample policy updated."
+  "source_sha256": "1aca99cc29d20908962902906db60c75bbb0cd7822a279d1413d289471c070f2",
+  "reviewed_at": "2026-11-16T17:02:27Z",
+  "summary": "Package-key issue/revoke moved to the member tier; owner-only revoke asserted for member and reader."
 }
 ```
 <!-- architecture-review:end -->
