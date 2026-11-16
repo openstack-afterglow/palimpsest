@@ -1,6 +1,6 @@
 # Detailed installation and configuration guide
 
-## 0.3.29 transition note — 2026-11-15 (UTC; candidate)
+## 0.3.29 transition note — 2026-11-15 (UTC; deployed)
 
 0.3.29 is a patch over 0.3.28 with no API, schema or role input change. The API and export worker add log lines that name swallowed failures by exception class and Hub call site (see "Hub API and worker logs"). Log collectors that count ERROR or WARNING lines of the Hub will now see unhandled request failures and failed readiness probes that 0.3.28 logged only as INFO `status=5xx` lines or not at all. Roll all Hub cohorts together after publication.
 

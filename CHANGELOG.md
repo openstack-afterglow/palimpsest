@@ -10,7 +10,8 @@ All notable changes to Palimpsest Local are documented here.
 - Staged compatibility diagnosis in that plan: `structure`, `filesystem`, `distribution_abi`, `kernel_device` and `smoke_test`, each `passed`, `failed` or `unverified` with reasons, and no overall verdict. Today only the structure stage has evidence in the product; the filesystem stage accepts a base-migration structure-check report, and the other stages are always `unverified`.
 - Base-migration structure check (M51-01): pure comparison of an old and a new base against the paths kept layers touch, with a fixed report format. Listing adapters, acknowledgement and registration are not implemented.
 - Design records without implementation: declared `provides`/`requires`/`conflicts`, composition lock, Hub descendant lookup (`openspec/changes/add-layer-lineage-impact-and-staged-diagnosis`); related-work comparison with a validation design, a storage-backend comparison plan including OverlayBD, and a review of sharing the base and layers read-only with a user-owned writable volume through Nova, Cinder and Glance (`docs/research/`). No experiment was run.
-- Design proposal with reference code, not part of the product: immutable block layers with OverlayBD across an OCI registry, Ceph RBD and local KVM (`docs/design/immutable-block-layers/`, `examples/immutable-block-layers/`). A proof run on one disposable VM covered the local and Ceph paths and a libvirt hook; Nova and Cinder were not run. The proposal records two OverlayBD behaviours found in those runs (damage after sub-4 KiB writes to a sparse writable layer, flushes not reaching it) and the host-side settings that avoid them.
+
+- Immutable block-layer design proposal and reference code (OverlayBD, OCI registry, Ceph RBD, local KVM): `docs/design/immutable-block-layers/`, `examples/immutable-block-layers/`. Not wired into the product or CI. A disposable VM run covered local and Ceph assembly, lazy loading, delta commit/push, integrity and the libvirt hook; Nova/Cinder, multi-host, GPU and performance were not run. The run also found sparse-upper sub-4 KiB write damage and undelivered guest flushes without host-side mitigations.
 
 ### Fixed
 
@@ -18,7 +19,7 @@ All notable changes to Palimpsest Local are documented here.
 - Experimental native VZ commit: a file or symlink that replaces a lower directory now removes that directory's entries from the parent view, as the materializer does. Before, they stayed listed, so a commit could refuse on a path that no longer exists or write a whiteout below a non-directory.
 - Hub dashboard: Create VM stayed disabled until a page reload when the connection was closed while a create request was in flight. The button is restored on disconnect.
 
-## [0.3.29] - 2026-11-15 (UTC; candidate, not yet published or deployed)
+## [0.3.29] - 2026-11-15 (UTC; published and deployed)
 
 ### Changed
 
