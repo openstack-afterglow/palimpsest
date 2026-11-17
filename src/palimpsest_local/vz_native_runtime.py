@@ -2194,6 +2194,30 @@ def _require_stopped_root_exclusive(directory):
         os.close(fd)
 
 
+def _verify_carrier_ctime_delete(authority, native):
+    """Prove only destruction eligibility; never restore carrier continuity."""
+    carrier = native["carrier"]
+    path = _path(carrier["path"])
+    expected_stamp = carrier["stamp"]
+    if (
+        not isinstance(expected_stamp, list)
+        or len(expected_stamp) != 8
+        or any(type(item) is not int for item in expected_stamp)
+    ):
+        raise VZNativeHold("native VZ cleanup carrier stamp is malformed")
+    if (
+        set(carrier) != {"path", "digest", "stamp"}
+        or path != authority.paths.root / "vz-private" / "carrier.img"
+        or not isinstance(carrier["digest"], str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", carrier["digest"]) is None
+    ):
+        raise VZNativeHold("native VZ ctime deletion carrier authority differs")
+    _, digest, stamp = _file(path, private=True, capture=False)
+    if digest != carrier["digest"] or stamp[:7] != expected_stamp[:7] or stamp[7] == expected_stamp[7]:
+        raise VZNativeHold("native VZ pinned carrier copy changed")
+    return {"path": str(path), "digest": digest, "original_stamp": list(expected_stamp), "current_stamp": stamp}
+
+
 def _load_checked(
     authority,
     roots,
@@ -2206,6 +2230,7 @@ def _load_checked(
     failed_start=False,
     stopped_hold=False,
     stopped_delete=False,
+    carrier_ctime_delete=False,
 ):
     data = _data(authority) if data is None else data
     native = data.get("vz_native", {})
@@ -2219,7 +2244,7 @@ def _load_checked(
     read_vz_plan(state)
     _stop_settlement(authority, config, native)
     if stopped_delete:
-        _stopped_delete_hold(authority, config, data)
+        _stopped_delete_hold(authority, config, data, carrier_ctime=carrier_ctime_delete)
     elif stopped_hold:
         _ordinary_stop_hold(authority, config, data)
     elif failed_start:
@@ -2232,32 +2257,37 @@ def _load_checked(
     config.verify(allow_expired=allow_expired)
     if _record(authority).dispatch_key.backend.value != "lima-vz":
         raise StateError("native VZ authority belongs to another backend")
-    carrier = native["carrier"]
-    _, digest, stamp = _file(_path(carrier["path"]), private=True, capture=False)
-    expected_stamp = carrier["stamp"]
-    guard = _FAILED_START_CLEANUP.get()
-    history_allowed = failed_start and guard is not None and guard.operation in guard.carrier_ctime_operations
-    if cleanup_only or history_allowed:
-        # Operation-specific destruction/stop eligibility never restores boot
-        # continuity or replaces _file's full current-read stability.
-        if (
-            not isinstance(expected_stamp, list)
-            or len(expected_stamp) != 8
-            or any(type(item) is not int for item in expected_stamp)
-        ):
-            raise VZNativeHold("native VZ cleanup carrier stamp is malformed")
-        carrier_matches = stamp[:7] == expected_stamp[:7]
+    if carrier_ctime_delete:
+        if not stopped_delete:
+            raise VZNativeHold("native VZ carrier ctime exception requires destruction-only RM")
+        _verify_carrier_ctime_delete(authority, native)
     else:
-        carrier_matches = stamp == expected_stamp
-    if digest != carrier["digest"] or not carrier_matches:
-        raise VZNativeHold("native VZ pinned carrier copy changed")
-    if history_allowed:
-        native["failed_start_carrier_history"] = {
-            "operation": guard.operation.value,
-            "digest": digest,
-            "original_stamp": list(expected_stamp),
-            "current_stamp": list(stamp),
-        }
+        carrier = native["carrier"]
+        _, digest, stamp = _file(_path(carrier["path"]), private=True, capture=False)
+        expected_stamp = carrier["stamp"]
+        guard = _FAILED_START_CLEANUP.get()
+        history_allowed = failed_start and guard is not None and guard.operation in guard.carrier_ctime_operations
+        if cleanup_only or history_allowed:
+            # Operation-specific destruction/stop eligibility never restores boot
+            # continuity or replaces _file's full current-read stability.
+            if (
+                not isinstance(expected_stamp, list)
+                or len(expected_stamp) != 8
+                or any(type(item) is not int for item in expected_stamp)
+            ):
+                raise VZNativeHold("native VZ cleanup carrier stamp is malformed")
+            carrier_matches = stamp[:7] == expected_stamp[:7]
+        else:
+            carrier_matches = stamp == expected_stamp
+        if digest != carrier["digest"] or not carrier_matches:
+            raise VZNativeHold("native VZ pinned carrier copy changed")
+        if history_allowed:
+            native["failed_start_carrier_history"] = {
+                "operation": guard.operation.value,
+                "digest": digest,
+                "original_stamp": list(expected_stamp),
+                "current_stamp": list(stamp),
+            }
     _reopen_source(roots, native["source_snapshot"], data["source_qualification"])
     assets = load_vz_runtime_assets(_path(config.value["assets"]))
     if assets.manifest_digest != native["assets_digest"]:
@@ -3353,14 +3383,15 @@ def _stop_settlement(authority, config, native):
     return recovery
 
 
-def _stopped_delete_hold(authority, config, data):
+def _stopped_delete_hold(authority, config, data, *, carrier_ctime=False):
     """Bind destruction only; a stopped provider does not prove guest quiescence."""
     native = data["vz_native"]
     attempt = native.get("start_attempt")
+    reason = "retained-authority-changed" if carrier_ctime else "stop-incomplete"
     if (
         _FAILED_START_CLEANUP.get() is not None
         or authority.snapshot.state["status"] != "failed"
-        or native.get("hold") != "stop-incomplete"
+        or native.get("hold") != reason
         or native.get("instance") != "plm-" + authority.record.run_id.replace("-", "")[:12]
         or not isinstance(attempt, dict)
         or type(attempt.get("started_unix")) not in (int, float)
@@ -3369,12 +3400,12 @@ def _stopped_delete_hold(authority, config, data):
         or "failed_start_cleanup" in native
         or "stop_settlement" in native
     ):
-        raise VZNativeHold("native VZ deletion requires exact stopped stop-incomplete authority")
+        raise VZNativeHold("native VZ deletion requires exact stopped resource-HOLD authority")
     _verify_host_authority(config, native)
     config.verify(allow_expired=True)
     marker = config.home / "_palimpsest-native" / ("hold-" + authority.record.run_id + ".json")
     value, digest, stamp = _resource_hold_marker(marker)
-    if value != {"schema": _SCHEMA, "run_id": authority.record.run_id, "reason": "stop-incomplete"}:
+    if value != {"schema": _SCHEMA, "run_id": authority.record.run_id, "reason": reason}:
         raise VZNativeHold("native VZ stopped deletion original HOLD differs")
     authority.verify_binding()
     return marker, digest, stamp
@@ -3397,7 +3428,9 @@ def _stopped_delete_actors(config, native):
         raise VZNativeHold("native VZ stopped deletion has launchd autostart custody")
 
 
-def _stopped_delete_observation(authority, roots, config, custody, data, *, previous=None, deadline):
+def _stopped_delete_observation(
+    authority, roots, config, custody, data, *, previous=None, deadline, carrier_ctime=False
+):
     """Observe deletion eligibility, never authenticate or adopt a stopped run."""
     native = data["vz_native"]
 
@@ -3427,7 +3460,7 @@ def _stopped_delete_observation(authority, roots, config, custody, data, *, prev
         config.home / native["instance"],
         native,
         native["start_attempt"]["started_unix"],
-        _stopped_delete_hold(authority, config, data)[2][6] / 1_000_000_000,
+        _stopped_delete_hold(authority, config, data, carrier_ctime=carrier_ctime)[2][6] / 1_000_000_000,
         check,
         previous=None if previous is None else previous["endpoints"],
     )
@@ -3443,6 +3476,17 @@ def _stopped_delete_observation(authority, roots, config, custody, data, *, prev
         "instance_names": list(names),
         "endpoints": endpoints,
     }
+    if carrier_ctime:
+        carrier = native["carrier"]
+        stamp = _stamp(_path(carrier["path"]).lstat())
+        if stamp[:7] != carrier["stamp"][:7] or stamp[7] == carrier["stamp"][7]:
+            raise VZNativeHold("native VZ ctime deletion carrier changed during observation")
+        observation["carrier"] = {
+            "path": carrier["path"],
+            "digest": carrier["digest"],
+            "original_stamp": list(carrier["stamp"]),
+            "current_stamp": stamp,
+        }
     if previous is not None and observation != previous:
         raise VZNativeHold("native VZ stopped deletion resource observation changed")
     authority.verify_binding()
@@ -3454,7 +3498,7 @@ def _stopped_delete_observation(authority, roots, config, custody, data, *, prev
         config.home / native["instance"],
         native,
         native["start_attempt"]["started_unix"],
-        _stopped_delete_hold(authority, config, data)[2][6] / 1_000_000_000,
+        _stopped_delete_hold(authority, config, data, carrier_ctime=carrier_ctime)[2][6] / 1_000_000_000,
         check,
         previous=endpoints,
     )
@@ -3462,6 +3506,8 @@ def _stopped_delete_observation(authority, roots, config, custody, data, *, prev
         raise VZNativeHold("native VZ stopped deletion endpoints changed during resource observation")
     _require_stopped_root_exclusive(root.record.storage.directory)
     _stopped_delete_actors(config, native)
+    if carrier_ctime and _stamp(_path(native["carrier"]["path"]).lstat()) != observation["carrier"]["current_stamp"]:
+        raise VZNativeHold("native VZ ctime deletion carrier changed after resource observation")
     check()
     return observation
 
@@ -3921,7 +3967,11 @@ def rm_oci_run(roots, name, *, expected_record=None):
         failed_start = (
             data.get("vz_native", {}).get("hold") == "launch-incomplete" and "start_attempt" in data["vz_native"]
         )
-        stopped_delete = data.get("vz_native", {}).get("hold") == "stop-incomplete"
+        carrier_ctime_delete = (
+            data.get("vz_native", {}).get("hold") == "retained-authority-changed"
+            and "start_attempt" in data["vz_native"]
+        )
+        stopped_delete = data.get("vz_native", {}).get("hold") == "stop-incomplete" or carrier_ctime_delete
         if stopped_delete and "stopped_delete" in data["vz_native"]:
             raise VZNativeHold("native VZ stopped deletion was already attempted; blind replay forbidden")
         cleanup_only = bool(data.get("vz_native", {}).get("hold")) and not failed_start and not stopped_delete
@@ -3932,7 +3982,7 @@ def rm_oci_run(roots, name, *, expected_record=None):
         cleanup_hold = (
             _failed_start_cleanup_hold(authority, config, data)
             if failed_start
-            else _stopped_delete_hold(authority, config, data)
+            else _stopped_delete_hold(authority, config, data, carrier_ctime=carrier_ctime_delete)
             if stopped_delete
             else _prestart_cleanup_hold(authority, config, data)
             if cleanup_only
@@ -3943,7 +3993,7 @@ def rm_oci_run(roots, name, *, expected_record=None):
             options = (
                 {"failed_start": True}
                 if failed_start
-                else {"stopped_delete": True}
+                else {"stopped_delete": True, "carrier_ctime_delete": carrier_ctime_delete}
                 if stopped_delete
                 else {"cleanup_only": cleanup_only}
             )
@@ -3953,9 +4003,24 @@ def rm_oci_run(roots, name, *, expected_record=None):
             native = data["vz_native"]
             if stopped_delete:
                 delete_observation = _stopped_delete_observation(
-                    authority, roots, config, custody, data, deadline=time.monotonic() + 30
+                    authority,
+                    roots,
+                    config,
+                    custody,
+                    data,
+                    deadline=time.monotonic() + 30,
+                    carrier_ctime=carrier_ctime_delete,
                 )
-                _load_checked(authority, roots, config, custody, allow_expired=True, data=data, stopped_delete=True)
+                _load_checked(
+                    authority,
+                    roots,
+                    config,
+                    custody,
+                    allow_expired=True,
+                    data=data,
+                    stopped_delete=True,
+                    carrier_ctime_delete=carrier_ctime_delete,
+                )
                 _stopped_delete_observation(
                     authority,
                     roots,
@@ -3964,8 +4029,9 @@ def rm_oci_run(roots, name, *, expected_record=None):
                     data,
                     previous=delete_observation,
                     deadline=time.monotonic() + 30,
+                    carrier_ctime=carrier_ctime_delete,
                 )
-                if _stopped_delete_hold(authority, config, data) != cleanup_hold:
+                if _stopped_delete_hold(authority, config, data, carrier_ctime=carrier_ctime_delete) != cleanup_hold:
                     raise VZNativeHold("native VZ stopped deletion original HOLD changed during observation")
             try:
                 if failed_start:

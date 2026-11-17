@@ -213,9 +213,32 @@ root/export/lease authority. Release only the pinned original HOLD last.
 An uncertain delete SHALL stay held and SHALL NOT be replayed or settled by
 ordinary stop, even when older authenticated stop-ready evidence remains.
 Unrelated SSH port reuse SHALL NOT manufacture removal custody. Missing original
-provider/root custody or a different HOLD reason SHALL NOT enter this path.
+provider/root custody SHALL NOT enter this path.
 
+Canonical RM MAY also admit an original `retained-authority-changed` HOLD only
+when its marker and failed run agree on reason, run UUID and schema, and the
+canonical run-private `vz-private/carrier.img` differs from its original
+eight-integer stamp ONLY in ctime_ns. The other seven fields and streaming
+SHA-256 SHALL match exactly; an unchanged ctime is not this exception.
+All other retained source, host, configuration, run/provider/disk, directory,
+boot, seed, SSH, lower-export and lease authorities SHALL reverify unchanged.
+Use the same complete stopped-delete proofs, repeated bounded observations,
+one-shot intent and release order above; never issue stop, signal or force.
+Repeated observations SHALL bind the current carrier stamp around the full
+authority reload. Preserve its original/current stamps and verified digest in
+the removed ledger receipt; never repin the original or restore boot continuity.
+Malformed stamps, content differences, other changed fields, noncanonical paths,
+symlinks/hardlinks, running/absent providers, mismatched markers and other HOLD
+reasons SHALL refuse before mutation.
+
+Both destruction-only predicates SHALL retain the canonical removed run ledger
+and its private carrier/seed evidence, matching #119. Release only the owned
+provider, disposable root, export references/leases and original run's marker,
+never another run's marker or the custody lock. Ordinary exec/stop/start/capture
+retain the full-stamp fail-closed policy. The actor behind the carrier ctime
+change is unknown; this is deletion eligibility, not a root-cause fix.
 These local source contracts and regression cases are not a live qualification.
+The held mac-mini cleanup remains pending a separately reviewed product release.
 
 
 A clean retained dev exit whose exact provider has naturally stopped MAY
@@ -563,7 +586,9 @@ Do not remove that lock, normalize unknown entries or invoke provider cleanup
 when any actor/consumer ownership remains uncertain.
 Runtime start/resume/admission keeps full carrier/config/source continuity.
 Canonical RM may separate destruction eligibility from historical carrier ctime
-only after the complete failed-prestart checks above. Require an eight-integer
+after the complete failed-prestart checks above, or through the separately
+specified started-run ctime-only destruction predicate. For failed-prestart
+cleanup, require an eight-integer
 original carrier stamp, identical digest/dev/inode/UID/full mode/link count/
 size/mtime and complete current-read stability, including ctime. Never repin
 the original carrier. Admit only the original `launch-incomplete` resource marker
@@ -675,6 +700,7 @@ Implementation status (2026-11-15; informative, the requirement text above is un
 - Corrupted upper: an upper that lists one path twice refuses the commit (since 0.3.27, test-defined only).
 - Reserved names: a kept upper entry with a path component that starts with `.wh.` refuses the commit (`capture-path`), because the layer format reads such names as deletions of parent content. The entry can be removed, or excluded in `/.plmignore` unless it is under the always-kept package database `var/lib/dpkg`. In source since 0.3.27; seen in a VM on `dev` `4f65a30` on 2026-11-16 (the commit was refused, the source disk hash and the list of commit layouts were unchanged, and the commit succeeded after the file was removed). The earlier VM run on the 0.3.27 tag source is void as evidence by an owner decision of 2026-11-16.
 - Stop outside the product (historical observation, 2026-11-15): when the provider VM of a run was stopped by something other than this adapter and left socket files in the instance directory, `stop` refused and recorded a stop-incomplete HOLD; `start` and `exec` were seen refused. The adapter still cannot recover authenticated guest quiescence or make that run startable. The source now permits only the destruction-only canonical RM path specified above, under the original HOLD and full repeated ownership/absence checks. This RM exception has local regression coverage only, not a live qualification. The earlier `rm` refusal after manual marker removal (`requires exact failed-prestart provenance`) remains historical evidence, not a test of this new path.
+- Carrier ctime-only HOLD (2026-11-18 source change): a started run with the original `retained-authority-changed` marker may enter only the destruction-only predicate above. It does not settle an unchanged carrier, missing provider, changed content or other authority. The observed ctime-changing actor is unknown; no root-cause repair or live cleanup is claimed. The removed ledger and private carrier/seed remain evidence.
 - `authorized_keys`: any `authorized_keys` or `authorized_keys2` path in the upper or visible in the parent fails the commit closed unless it is classified. The adapter supplies no classification, so a commit of a root in which the user wrote such a file is refused until the file is removed; nothing is silently excluded (seen in a VM on `dev` `4f65a30` on 2026-11-16: `capture-provenance`, source disk hash unchanged, no layout). Platform-injected login keys live outside the root and never reach the upper.
 - Bound identity files: `etc/machine-id`, `var/lib/dbus/machine-id`, `etc/hostname` and `etc/resolv.conf` are left out of the new layer through a fixed path list the adapter passes: whatever the upper holds at those four paths is dropped, which is broader than "a placeholder recorded as generated". A copy that already exists in a parent layer is not hidden by a whiteout, so a base image's own `etc/hostname` remains in the committed image; the guest binds per-run values over these paths at boot.
 - Volumes: the native VZ runtime attaches no named or external volume, so "mounted external volumes are not captured" has no case to exercise there; virtiofs shares and tmpfs were exercised.

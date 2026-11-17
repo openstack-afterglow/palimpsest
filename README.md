@@ -37,6 +37,18 @@ are not deployed-service acceptance; see the [control-plane boundaries](ARCHITEC
 - **0.3.30 (published and deployed 2026-11-16 UTC):** a project member issues its own package keys (`keys:issue`, `keys:revoke` moved from the manager tier to the member tier), so a member holds all five package capabilities; a manager keeps package/layer/export deletion and project management, a reader is unchanged, and key access stays owner-only. It also carries the merged read-only layer impact plan and staged diagnosis (PR #115). No schema change.
 - **0.3.31 (prepared; not published, deployed or live-verified):** contains both the Hub dev-resume/contention fixes and the native-VZ client destruction-only RM fix (#119, original patch `d8d2717`). New CPU dev guests retain resume state after a successful command without a readiness probe; resumed boots rerun that command. Idle auto-shelve and its cost policy are unchanged. Legacy guests without retained state are not upgraded and report `error` / `resume_state_missing` after resume rather than remaining falsely `resumed`. Instance reads and owner admission use a two-second mutex allowance: busy reads return committed state, and refused mutations return transient HTTP 409 with `Retry-After: 10` without applying the request. Other typed mutex timeouts receive HTTP 503 at the API boundary. Nova status plus task state distinguishes shelving and unshelving from idle states. The native-VZ change permits only canonical RM of an exact proved stopped `stop-incomplete` HOLD; it does not grant start/capture or graceful-stop recovery and has local-test evidence only. No schema change; see the [transition note](docs/install.md#0331-transition-note--2026-11-17-utc-prepared).
 
+Unreleased native-VZ source extends only canonical `rm` to an exact
+`retained-authority-changed` HOLD whose run-private carrier changed only in
+ctime_ns, with the same streamed content digest and every other pinned authority
+unchanged. It uses #119's complete repeated stopped-provider/actor/network/upper
+proof and one-shot deletion, not a force or recovery flag. The removed ledger
+keeps both carrier stamps, the verified digest and private carrier/seed evidence;
+only owned provider/root/export/lease resources and that run's marker are
+released. Ordinary exec/stop/start/capture stay fail-closed. The ctime-changing
+actor is unknown, and the held mac-mini cleanup remains pending reviewed release
+and live proof. See the [native-root contract](openspec/specs/vz-native-root/spec.md).
+
+
 ## Install from PyPI
 
 Requires Python 3.11 or newer. Prefer an isolated uv tool, or a pip virtual environment:

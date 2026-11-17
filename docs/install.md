@@ -66,6 +66,26 @@ max_images=3, max_chain_bytes=1073741824, max_source_bytes=None)`,
 automatically retried. After an uncertain mutation, read usage/history and
 reconcile before deciding whether another explicit request is needed; repeated
 set/remove requests append another audit revision.
+## Unreleased native-VZ carrier-ctime destruction
+
+The working source adds only a destruction-only canonical `rm` predicate for an
+original `retained-authority-changed` HOLD: marker and failed run must agree,
+the canonical run-private carrier's only differing stamp field must be ctime_ns,
+and its streaming SHA-256 and every other pinned authority must still match.
+The complete #119 stopped-provider/actor/network/endpoint/exclusive-root proofs,
+full reload and repeated observations remain required. A stopped/absent provider
+alone is not authority; a missing original provider refuses this predicate.
+There is no new flag, forced stop, signal, manual marker deletion or relaxed
+exec/stop/start/capture policy. Admission refusal preserves ledger/HOLD bytes;
+uncertain destructive work stays held and is not blindly replayed.
+
+As in #119, provider, disposable root, export references and leases are released,
+then only the original run's marker. The canonical removed ledger and private
+carrier/seed remain evidence, including pinned/current carrier stamps and the
+verified digest; the custody lock and other runs' markers are never deleted.
+The ctime-changing actor is unknown. This is not a cause fix or live
+qualification; held mac-mini cleanup remains pending review and release.
+
 
 ## 0.3.31 transition note — 2026-11-17 (UTC; prepared)
 
