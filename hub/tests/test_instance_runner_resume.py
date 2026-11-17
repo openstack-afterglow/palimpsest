@@ -85,7 +85,7 @@ exit 0
 
 
 class Guest:
-    def __init__(self, tmp_path: Path, server, free_bytes: int | None = None):
+    def __init__(self, tmp_path: Path, server, free_bytes: int | None = None, *, fake_allocation=False):
         tmp_path.mkdir(parents=True, exist_ok=True)
         self.root = tmp_path / "state"
         self.root.mkdir()
@@ -106,6 +106,10 @@ class Guest:
             fake = f"type('S', (), {{'f_bavail': {free_bytes}, 'f_frsize': 1}})()"
             assert "os.statvfs(ROOT)" in source
             source = source.replace("os.statvfs(ROOT)", fake)
+        if fake_allocation:
+            # Mounts and formatting are already fake; model file size without allocating 1 GiB.
+            assert "os.posix_fallocate(fd, 0, writable_bytes)" in source
+            source = source.replace("os.posix_fallocate(fd, 0, writable_bytes)", "os.ftruncate(fd, writable_bytes)")
         (self.root / "runner.py").write_text(source)
         self.spec = {
             "instance_id": INSTANCE_ID,
@@ -260,10 +264,59 @@ def test_first_boot_retains_exactly_what_a_resume_needs_and_a_resume_then_uses_i
     assert not [item for item in hub_server.requests if item["method"] == "GET"]
 
 
-def test_a_service_instance_without_the_session_reporter_retains_nothing(tmp_path, hub_server):
-    if not hasattr(os, "posix_fallocate"):
-        pytest.skip("the first-boot allocation needs Linux")
-    guest = Guest(tmp_path, hub_server)
+@pytest.mark.parametrize("exit_code", [0, 7], ids=["success", "command-failed"])
+def test_first_boot_without_a_probe_retains_only_success_and_resumes(tmp_path, hub_server, exit_code):
+    guest = Guest(tmp_path, hub_server, free_bytes=3 * WRITABLE_BYTES, fake_allocation=True)
+    command_log = tmp_path / "commands"
+    guest.spec.update(
+        readiness_argv=[],
+        command=["/bin/sh", "-c", f"echo run >> '{command_log}'; exit {exit_code}"],
+    )
+    guest.write_session()
+    guest.first_boot_files()
+    first = guest.run()
+    assert first.returncode == 0, first.stderr.decode()
+    (report,) = guest.puts()
+    body = json.loads(report["body"])
+    assert report["path"] == f"/v1/instance-bootstrap/{INSTANCE_ID}/result"
+    assert report["auth"] == "Bearer " + BOOT_CAPABILITY
+    assert body["exit_code"] == exit_code
+    assert body["status"] == ("ready" if exit_code == 0 else "error")
+    assert body["error_code"] == (None if exit_code == 0 else "command_failed")
+    assert command_log.read_text().splitlines() == ["run"]
+    assert not (guest.root / "spec.json").exists()
+    assert (guest.root / "resume.json").exists() is (exit_code == 0)
+    if exit_code != 0:
+        assert not (guest.root / "resume.json.tmp").exists()
+        return
+    kept = json.loads((guest.root / "resume.json").read_text())
+    assert kept["readiness_argv"] == [] and kept["command"] == guest.spec["command"]
+    assert "capability" not in kept and "expires_at" not in kept
+    assert (guest.root / "resume.json").stat().st_mode & 0o777 == 0o600
+    with open(guest.root / "writable.ext4", "r+b") as backing:
+        backing.write(MARKER)
+    hub_server.requests.clear()
+    guest.log.write_text("")
+    second = guest.run()
+    assert second.returncode == 0, second.stderr.decode()
+    assert command_log.read_text().splitlines() == ["run", "run"]
+    assert guest.backing_head() == MARKER
+    assert not {"mkfs.ext4", "truncate"} & set(tool_names(guest))
+    assert any(line.startswith("losetup --find --show ") for line in guest.tools())
+    assert any("upperdir=writable/upper,workdir=writable/work" in line for line in guest.tools())
+    assert not [item for item in hub_server.requests if item["method"] == "GET"]
+    (report,) = guest.puts()
+    assert report["path"] == f"/v1/instance-bootstrap/{INSTANCE_ID}/resume-result"
+    assert report["auth"] == "Bearer " + SESSION_CAPABILITY
+    assert json.loads(report["body"])["status"] == "ready"
+    assert json.loads(report["body"])["exit_code"] == 0
+
+
+@pytest.mark.parametrize("readiness", [True, False], ids=["probed", "no-probe"])
+def test_a_service_instance_without_the_session_reporter_retains_nothing(tmp_path, hub_server, readiness):
+    guest = Guest(tmp_path, hub_server, free_bytes=3 * WRITABLE_BYTES, fake_allocation=True)
+    if not readiness:
+        guest.spec["readiness_argv"] = []
     guest.first_boot_files()
     assert guest.run().returncode == 0
     assert not (guest.root / "resume.json").exists()

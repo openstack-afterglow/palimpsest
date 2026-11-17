@@ -160,7 +160,7 @@ def report(state, code=None):
             if cluster
             else r"""def persist_resume():
     # Dev instances only (they have the session reporter): retain exactly what a resumed boot needs,
-    # without the single-use bootstrap capability or its expiry, after the first ready report.
+    # without the single-use bootstrap capability or its expiry, before the first ready report.
     if resuming or spec.get('gpu') is not None or spec.get('cluster') is not None:
         return
     if not (ROOT / 'session.json').is_file():
@@ -539,6 +539,8 @@ def pump(timeout=0.2):
             drain_deadline = min(deadline, time.time() + 2)
             while selector.get_map() and time.time() < drain_deadline:
                 pump()
+            if process.returncode == 0:
+                persist_resume()
             report('ready' if process.returncode == 0 else 'error', None if process.returncode == 0 else 'command_failed')
     finally:
         selector.close()

@@ -10,7 +10,7 @@ import json
 import re
 import secrets
 import uuid
-from contextlib import suppress
+from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime, timedelta
 
 from fastapi import HTTPException
@@ -30,9 +30,11 @@ from palimpsest_hub.services.instance_cluster_runtime import (
     require_cluster_source,
     server_address,
 )
-from palimpsest_hub.services.worker_leases import run_blocking, sql_mutex
+from palimpsest_hub.services.worker_leases import MutexBusy, run_blocking, sql_mutex
 
 MARKER = "palimpsest_instance_id"
+INSTANCE_MUTEX_WAIT_SECONDS = 2
+INSTANCE_LIFECYCLE_RETRY_SECONDS = 10
 
 
 def value(resource, name, default=None):
@@ -227,6 +229,32 @@ async def owned(session, instance_id, project, user_id=None):
     ):
         raise HTTPException(404, "Instance not found")
     return row
+
+
+@asynccontextmanager
+async def mutation_mutex(factory, actor, conn, instance_id):
+    """Bound owner admission, before any intent or provider effect can be applied."""
+    project = request_project(actor, conn)
+    admitted = False
+    try:
+        async with sql_mutex(
+            factory, "build-api:instance:" + instance_id, wait_seconds=INSTANCE_MUTEX_WAIT_SECONDS
+        ) as session:
+            admitted = True
+            yield session
+    except MutexBusy:
+        if admitted:
+            # A timeout inside the admitted body is not "not applied": let the handler answer 503.
+            raise
+        # Preserve the same ownership boundary even when the protected transaction is busy.
+        async with factory() as session:
+            await owned(session, instance_id, project, actor["user_id"])
+        raise HTTPException(
+            409,
+            "Another request is holding this instance (such as an automatic shelve, resume or status read); "
+            "the request was not applied",
+            headers={"Retry-After": str(INSTANCE_LIFECYCLE_RETRY_SECONDS)},
+        ) from None
 
 
 def qualified_gpu(spec, project, settings):
@@ -1106,6 +1134,9 @@ async def advance_prepared_boot(session, row, actor, conn, settings, *, allocate
             "restart_capability_hash": hashlib.sha256(restart_token.encode()).hexdigest(),
         }
     if session_token is not None:
+        if spec["gpu"] is None and spec.get("cluster") is None:
+            # Stamp the runner actually sent, not the version that only prepared the boot volume.
+            row.spec_json = {**row.spec_json, "resume_without_probe": True}
         await lifecycle.bind_capability(session, row.id, session_hash)
     preparation_update(row, phase="nova_create_uncertain", server_create_attempted=True)
     row.status, row.error_code = "uncertain", "provider_create_uncertain"
@@ -1449,7 +1480,10 @@ async def reconcile(session, row, conn, actor=None, settings=None):
             # Someone unshelved the server outside the Hub; the lifecycle must not stay shelved.
             from palimpsest_hub.services import instance_lifecycle as lifecycle
 
-            row.status = "resumed"
+            if row.spec_json.get("lifecycle") == "dev" and not lifecycle.restorable(row):
+                row.status, row.error_code = "error", "resume_state_missing"
+            else:
+                row.status = "resumed"
             await lifecycle.mark_resumed(session, row.id)
         elif row.status == "stopped" and status == "ACTIVE":
             # Powered on outside `resume`, or by a `resume` whose wait for ACTIVE failed: a dev guest
@@ -1458,6 +1492,17 @@ async def reconcile(session, row, conn, actor=None, settings=None):
 
             if await lifecycle.mark_started(session, row):
                 row.status = "resumed"
+        elif (
+            row.status == "resumed"
+            and status == "ACTIVE"
+            and row.spec_json.get("lifecycle") == "dev"
+            and not (value(server, "task_state") or value(server, "OS-EXT-STS:task_state"))
+        ):
+            # Old no-probe runners could leave a row awaiting a report that can never arrive.
+            from palimpsest_hub.services import instance_lifecycle as lifecycle
+
+            if not lifecycle.restorable(row):
+                row.status, row.error_code = "error", "resume_state_missing"
         # ACTIVE is provider state, never proof of guest readiness.
     if row.status == "booting" and aware(row.capability_expires_at) <= datetime.now(UTC):
         row.status, row.error_code = "error", "bootstrap_expired"
@@ -1468,15 +1513,27 @@ async def reconcile(session, row, conn, actor=None, settings=None):
 
 async def observe(factory, actor, conn, instance_id, settings=None):
     project = request_project(actor, conn)
-    async with sql_mutex(factory, "build-api:instance:" + instance_id) as session:
-        row = await owned(session, instance_id, project, actor["user_id"])
-        await reconcile(session, row, conn, actor, settings)
-        return projection(row)
+    admitted = False
+    try:
+        async with sql_mutex(
+            factory, "build-api:instance:" + instance_id, wait_seconds=INSTANCE_MUTEX_WAIT_SECONDS
+        ) as session:
+            admitted = True
+            row = await owned(session, instance_id, project, actor["user_id"])
+            await reconcile(session, row, conn, actor, settings)
+            return projection(row)
+    except MutexBusy:
+        if admitted:
+            # Reconciliation already ran: a body timeout must not become a successful stale read.
+            raise
+        # A busy read returns committed state only; it must not reconcile or write.
+        async with factory() as session:
+            return projection(await owned(session, instance_id, project, actor["user_id"]))
 
 
 async def advance(factory, actor, conn, instance_id, request, settings):
     project = request_project(actor, conn)
-    async with sql_mutex(factory, "build-api:instance:" + instance_id) as session:
+    async with mutation_mutex(factory, actor, conn, instance_id) as session:
         row = await owned(session, instance_id, project, actor["user_id"])
         if row.request_id != request["request_id"] or row.boot_volume_id != request["boot_volume_id"]:
             raise HTTPException(409, "Advance does not match the original request and prepared boot volume")
@@ -1522,7 +1579,7 @@ async def advance(factory, actor, conn, instance_id, request, settings):
 
 async def action(factory, actor, conn, instance_id, operation):
     project = request_project(actor, conn)
-    async with sql_mutex(factory, "build-api:instance:" + instance_id) as session:
+    async with mutation_mutex(factory, actor, conn, instance_id) as session:
         row = await owned(session, instance_id, project, actor["user_id"])
         await fresh_instance_controller(actor, conn, row)
         if row.status == "deleted":
@@ -1592,6 +1649,9 @@ async def action(factory, actor, conn, instance_id, operation):
         row.updated_at = datetime.now(UTC)
         await session.commit()  # Durable lifecycle intent before effect.
     if server is not None:
+        # A worker tick cannot start a provider wait after this durable stopping/deleting intent.
+        # An owner may still resume an already-SHUTOFF stopping row and wait for power-on; this
+        # post-intent fence stays unbounded and the API handler returns 503 if its lock wait expires.
         async with sql_mutex(factory, "build-api:instance:" + instance_id) as session:
             row = await owned(session, instance_id, project, actor["user_id"])
             if operation == "stop" and row.status != "stopping":

@@ -11,6 +11,7 @@ import base64
 import copy
 import hashlib
 import json
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from threading import Event
 from types import SimpleNamespace
@@ -33,6 +34,7 @@ from palimpsest_hub.services.hub_store import (
     MEDIA_TYPE_LAYER_SQUASHFS,
     LocalPathBlobStore,
 )
+from palimpsest_hub.services.worker_leases import MutexBusy
 
 REAL_FRESH_WRITER = service.fresh_writer
 
@@ -227,7 +229,7 @@ def request_body(**overrides):
 
 
 @pytest.fixture
-async def instance_hub(tmp_path, monkeypatch):
+async def instance_hub(tmp_path, monkeypatch, request):
     # Import the image table before create_all, as the production bootstrap does.
     clock = SimpleNamespace(now=datetime(2030, 1, 2, 3, 4, 5, tzinfo=UTC))
 
@@ -243,7 +245,9 @@ async def instance_hub(tmp_path, monkeypatch):
     monkeypatch.setattr(instances, "datetime", FixedDatetime)
     from palimpsest_hub import image_models  # noqa: F401
 
-    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'instances.sqlite'}")
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'instances.sqlite'}", connect_args={"timeout": getattr(request, "param", 5.0)}
+    )
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
     factory = async_sessionmaker(engine, expire_on_commit=False)
@@ -296,6 +300,9 @@ async def instance_hub(tmp_path, monkeypatch):
         await session.commit()
     provider = Provider()
     app = FastAPI()
+    from palimpsest_hub.main import handle_mutex_busy
+
+    app.add_exception_handler(MutexBusy, handle_mutex_busy)
     app.include_router(instances.router, prefix="/v1")
 
     async def actor(request: Request):
@@ -341,7 +348,7 @@ async def instance_hub(tmp_path, monkeypatch):
     monkeypatch.setattr(service, "fresh_instance_controller", control)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="https://hub.example.test") as client:
         yield SimpleNamespace(
-            client=client, provider=provider, factory=factory, store=store, settings=settings, clock=clock
+            app=app, client=client, provider=provider, factory=factory, store=store, settings=settings, clock=clock
         )
     await engine.dispose()
 
@@ -367,6 +374,204 @@ def guest_spec(provider):
     payload = json.loads(cloud.split("\n", 1)[1])
     content = next(file["content"] for file in payload["write_files"] if file["path"].endswith("spec.json"))
     return json.loads(base64.b64decode(content))
+
+
+@pytest.mark.asyncio
+async def test_get_instance_with_a_busy_sql_mutex_returns_committed_200_and_normal_request_log(
+    instance_hub, monkeypatch, caplog
+):
+    import logging
+    import sqlite3
+
+    from sqlalchemy.exc import OperationalError
+
+    from palimpsest_hub.main import log_request
+
+    h = instance_hub
+    h.app.middleware("http")(log_request)
+    created = await create_and_advance(h, json=request_body())
+    assert created.status_code == 202, created.text
+    instance_id = created.json()["id"]
+    session_type = h.factory.class_
+    execute = session_type.execute
+
+    async def fail_mutex_update(session, statement, *args, **kwargs):
+        if getattr(statement, "is_update", False):
+            raise OperationalError("UPDATE worker_leases", {}, sqlite3.OperationalError("database is locked"))
+        return await execute(session, statement, *args, **kwargs)
+
+    monkeypatch.setattr(session_type, "execute", fail_mutex_update)
+    with caplog.at_level(logging.INFO):
+        response = await h.client.get(f"/v1/instances/{instance_id}")
+    assert response.status_code == 200 and response.json() == created.json()
+    assert "Retry-After" not in response.headers
+    hub_log = [record.getMessage() for record in caplog.records if record.name.startswith("palimpsest_hub")]
+    assert any(
+        message.startswith("hub request method=GET route=/v1/instances/{instance_id} status=200 ")
+        for message in hub_log
+    )
+    assert not any(message.startswith("hub request failed ") for message in hub_log)
+
+
+@pytest.mark.asyncio
+async def test_a_mutex_timeout_inside_admitted_observation_is_not_reported_as_a_successful_read(
+    instance_hub, monkeypatch
+):
+    h = instance_hub
+    created = await create_and_advance(h, json=request_body())
+    assert created.status_code == 202, created.text
+    observed = []
+
+    async def fail_after_reconcile_started(session, row, *args):
+        observed.append(row.id)
+        raise MutexBusy("a nested fence timed out after reconciliation started")
+
+    monkeypatch.setattr(service, "reconcile", fail_after_reconcile_started)
+    response = await h.client.get("/v1/instances/" + created.json()["id"])
+    assert response.status_code == 503 and response.headers["Retry-After"] == "1"
+    assert "busy with another operation" in response.json()["detail"]
+    assert observed == [created.json()["id"]]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/v1/instances", "/v1/projects/mutex-busy"])
+async def test_uncaught_sql_mutex_busy_returns_handled_503_and_normal_request_log(
+    instance_hub, monkeypatch, caplog, path
+):
+    import logging
+    import sqlite3
+
+    from sqlalchemy.exc import OperationalError
+
+    from palimpsest_hub.main import log_request
+
+    h = instance_hub
+    h.app.middleware("http")(log_request)
+
+    @h.app.post("/v1/projects/mutex-busy")
+    async def package_mutex():
+        async with service.sql_mutex(h.factory, "build-api:package-test"):
+            pytest.fail("a busy SQL mutex yielded its session")
+
+    session_type = h.factory.class_
+    execute = session_type.execute
+
+    async def fail_mutex_update(session, statement, *args, **kwargs):
+        if getattr(statement, "is_update", False):
+            raise OperationalError("UPDATE worker_leases", {}, sqlite3.OperationalError("database is locked"))
+        return await execute(session, statement, *args, **kwargs)
+
+    monkeypatch.setattr(session_type, "execute", fail_mutex_update)
+    with caplog.at_level(logging.INFO):
+        response = await h.client.post(path, json=request_body())
+    assert response.status_code == 503, response.text
+    assert response.headers["Retry-After"] == "1"
+    assert response.headers["Cache-Control"] == "no-store"
+    message = "Resource is busy with another operation; retry shortly"
+    if path.startswith("/v1/projects/"):
+        assert response.json() == {
+            "error": {
+                "code": "IDENTITY_UNAVAILABLE",
+                "message": message,
+                "request_id": response.headers["X-Request-Id"],
+            }
+        }
+    else:
+        assert response.json() == {"detail": message}
+    hub_log = [record.getMessage() for record in caplog.records if record.name.startswith("palimpsest_hub")]
+    assert any(entry.startswith(f"hub request method=POST route={path} status=503 ") for entry in hub_log)
+    assert not any(entry.startswith("hub request failed ") for entry in hub_log)
+    assert h.provider.creates == h.provider.volume_creates == []
+
+
+def test_the_production_app_maps_an_unhandled_mutex_busy_to_503():
+    # The fixtures above register the handler on their own app; production must do it too.
+    from palimpsest_hub.main import app, handle_mutex_busy
+
+    assert app.exception_handlers[MutexBusy] is handle_mutex_busy
+
+
+@pytest.mark.asyncio
+async def test_a_mutex_timeout_inside_an_admitted_mutation_is_not_reported_as_not_applied(instance_hub, monkeypatch):
+    h = instance_hub
+    monkeypatch.setattr(service, "request_project", lambda actor, conn: PROJECT)
+    with pytest.raises(MutexBusy):
+        async with service.mutation_mutex(h.factory, {"user_id": USER}, object(), str(uuid4())):
+            # Admission succeeded; a later lock timeout must not become "409, not applied".
+            raise MutexBusy("a nested fence timed out after the intent")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["stop", "delete", "advance"])
+@pytest.mark.parametrize("target", ["foreign-project", "missing"])
+async def test_busy_owner_mutation_keeps_foreign_or_missing_instance_hidden(
+    instance_hub, monkeypatch, operation, target
+):
+    h = instance_hub
+    created = await create_and_advance(h, json=request_body())
+    assert created.status_code == 202, created.text
+    item = created.json()
+    async with h.factory() as session:
+        row = await session.get(PalimpsestHubInstance, item["id"])
+        row.project_id = OTHER
+        await session.commit()
+    instance_id = item["id"] if target == "foreign-project" else str(uuid4())
+    attempts = []
+
+    @asynccontextmanager
+    async def busy_mutex(factory, name, *, wait_seconds=None):
+        attempts.append((factory, name, wait_seconds))
+        raise MutexBusy("forced contention")
+        yield
+
+    monkeypatch.setattr(service, "sql_mutex", busy_mutex)
+    path = "/v1/instances/" + instance_id
+    if operation == "delete":
+        response = await h.client.delete(path)
+    elif operation == "advance":
+        response = await advance_instance(h, {**item, "id": instance_id})
+    else:
+        response = await h.client.post(path + "/stop")
+    assert response.status_code == 404, response.text
+    assert response.json() == {"detail": "Instance not found"}
+    assert "Retry-After" not in response.headers
+    assert attempts == [(h.factory, "build-api:instance:" + instance_id, service.INSTANCE_MUTEX_WAIT_SECONDS)]
+    assert h.provider.stops == h.provider.deletes == h.provider.volume_deletes == []
+    async with h.factory() as session:
+        row = await session.get(PalimpsestHubInstance, item["id"])
+        assert row.project_id == OTHER and row.status == item["status"]
+
+
+@pytest.mark.asyncio
+async def test_busy_get_keeps_private_instance_hidden_from_other_creators(instance_hub, monkeypatch):
+    h = instance_hub
+    created = await create_and_advance(h, json=request_body())
+    assert created.status_code == 202, created.text
+    item = created.json()
+    async with h.factory() as session:
+        row = await session.get(PalimpsestHubInstance, item["id"])
+        row.spec_json = {**row.spec_json, "published_visibility": "private"}
+        await session.commit()
+        committed = service.projection(row)
+    attempts = []
+
+    @asynccontextmanager
+    async def busy_mutex(factory, name, *, wait_seconds=None):
+        attempts.append((factory, name, wait_seconds))
+        raise MutexBusy("forced contention")
+        yield
+
+    monkeypatch.setattr(service, "sql_mutex", busy_mutex)
+    path = "/v1/instances/" + item["id"]
+    h.provider._afterglow_user_id = OTHER
+    hidden = await h.client.get(path, headers={"X-User": OTHER})
+    assert hidden.status_code == 404 and hidden.json() == {"detail": "Instance not found"}
+    assert "Retry-After" not in hidden.headers
+    h.provider._afterglow_user_id = USER
+    visible = await h.client.get(path)
+    assert visible.status_code == 200 and visible.json() == committed
+    assert "Retry-After" not in visible.headers
+    assert attempts == [(h.factory, "build-api:instance:" + item["id"], service.INSTANCE_MUTEX_WAIT_SECONDS)] * 2
 
 
 @pytest.mark.asyncio

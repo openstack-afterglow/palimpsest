@@ -8,13 +8,16 @@ No other process can take over an expired row while the fence holds its lock.
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import uuid
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime, timedelta
+from math import ceil
+from time import monotonic
 
-from sqlalchemy import delete, select, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import delete, select, text, update
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from palimpsest_hub.models import PalimpsestWorkerLease
 
@@ -29,6 +32,18 @@ def _aware(value: datetime) -> datetime:
 
 class LeaseLost(RuntimeError):
     """The caller must stop starting effects after losing ownership."""
+
+
+class MutexBusy(RuntimeError):
+    """The caller's API mutex acquisition could not obtain the SQL fence."""
+
+
+def _mutex_timeout(exc: OperationalError) -> bool:
+    original = exc.orig
+    code = getattr(original, "errno", None)
+    if code is None:
+        code = next(iter(getattr(original, "args", ())), None)
+    return code == 1205 or (isinstance(original, sqlite3.OperationalError) and str(original) == "database is locked")
 
 
 async def run_blocking(fn, *args, **kwargs):
@@ -186,7 +201,7 @@ async def role_lease(factory, name: str, *, ttl_seconds: float = 120):
 
 
 @asynccontextmanager
-async def sql_mutex(factory, name: str):
+async def sql_mutex(factory, name: str, *, wait_seconds: int | None = None):
     """Serialize API transactions even with empty queues and disjoint CAS locks.
 
     Reserved ``build-api:`` rows are transaction mutexes, not renewable worker
@@ -194,21 +209,55 @@ async def sql_mutex(factory, name: str):
     Use the yielded session for every protected SQL mutation and commit only
     after all blocking effects have drained. SQLite's UPDATE takes its writer
     lock too, so it does not rely on unsupported FOR UPDATE semantics.
+    MariaDB bounds the row lock with FOR UPDATE WAIT (remaining seconds rounded up).
+    Other dialects retain the plain UPDATE and driver-configured lock timeout.
+    Every recognized lock timeout raises MutexBusy after rollback, including
+    first-row insertion, which remains unbounded. No pooled settings are changed.
     """
     if not name.startswith("build-api:"):
         raise ValueError("API mutex names must use the build-api namespace")
+    if wait_seconds is not None and (not isinstance(wait_seconds, int) or wait_seconds < 0):
+        raise ValueError("Mutex wait_seconds must be a nonnegative integer or None")
+    deadline = None if wait_seconds is None else monotonic() + wait_seconds
     async with factory() as session:
-        exists = await session.get(PalimpsestWorkerLease, name)
-    if exists is None:
         try:
-            async with factory() as session, session.begin():
-                session.add(PalimpsestWorkerLease(name=name, token=uuid.uuid4().hex, expires_at=_now()))
-        except IntegrityError:
-            pass  # Another API initialized the same mutex first.
+            exists = await session.get(PalimpsestWorkerLease, name)
+        except OperationalError as exc:
+            await session.rollback()
+            if _mutex_timeout(exc):
+                raise MutexBusy("Resource is busy with another operation") from None
+            raise
+    if exists is None:
+        async with factory() as session:
+            try:
+                async with session.begin():
+                    session.add(PalimpsestWorkerLease(name=name, token=uuid.uuid4().hex, expires_at=_now()))
+            except IntegrityError:
+                pass  # Another API initialized the same mutex first.
+            except OperationalError as exc:
+                await session.rollback()
+                if _mutex_timeout(exc):
+                    raise MutexBusy("Resource is busy with another operation") from None
+                raise
     async with factory() as session:
-        await session.execute(
-            update(PalimpsestWorkerLease)
-            .where(PalimpsestWorkerLease.name == name)
-            .values(token=uuid.uuid4().hex, expires_at=_now())
-        )
+        try:
+            if wait_seconds is not None:
+                dialect = (await session.connection()).dialect
+                if getattr(dialect, "is_mariadb", False):
+                    seconds = max(0, ceil(deadline - monotonic()))
+                    await session.execute(
+                        text(f"SELECT name FROM palimpsest_worker_leases WHERE name = :name FOR UPDATE WAIT {seconds}"),
+                        {"name": name},
+                    )
+            await session.execute(
+                update(PalimpsestWorkerLease)
+                .where(PalimpsestWorkerLease.name == name)
+                .values(token=uuid.uuid4().hex, expires_at=_now())
+            )
+        except OperationalError as exc:
+            # A provider operation may hold this fence longer than the database's lock wait.
+            await session.rollback()
+            if _mutex_timeout(exc):
+                raise MutexBusy("Resource is busy with another operation") from None
+            raise
         yield session
