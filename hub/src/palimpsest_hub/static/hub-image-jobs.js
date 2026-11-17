@@ -4,7 +4,7 @@
 (() => {
   const { node, action, empty, message, json, bodyOptions, guard, report, connection, identity } = window.Hub;
   const $ = (id) => document.getElementById(id);
-  let pending = null, sending = false, timer = null, requestVersion = 0, quietRounds = 0, lastSeen = "", retryAt = 0;
+  let pending = null, sending = false, timer = null, retryTimer = null, requestVersion = 0, quietRounds = 0, lastSeen = "", retryAt = 0;
 
   function controls() {
     const kind = $("image-job-kind").value;
@@ -91,7 +91,11 @@
     } catch (error) {
       if (version === connection()) {
         const seconds = Number(error.retryAfter);
-        if (Number.isFinite(seconds) && seconds > 0) retryAt = Date.now() + seconds * 1000;
+        if (Number.isFinite(seconds) && seconds > 0) {
+          retryAt = Date.now() + seconds * 1000;
+          window.clearTimeout(retryTimer);
+          retryTimer = window.setTimeout(() => { if (version === connection()) controls(); }, seconds * 1000);
+        }
         message("image-job-message", `${error.message} Request ID: ${requestId}. Refresh jobs to reconcile admission before any explicit resubmission; keep this descriptor unchanged.`);
       }
     } finally { if (version === connection()) { sending = false; controls(); } }
@@ -101,6 +105,7 @@
   window.Hub.onConnect.push(() => { controls(); return listJobs(); });
   window.Hub.onDisconnect.push(() => {
     window.clearTimeout(timer); requestVersion++;
+    window.clearTimeout(retryTimer);
     pending = null; sending = false; quietRounds = 0; lastSeen = ""; retryAt = 0;
     $("image-job-list").replaceChildren(); message("image-job-message", ""); controls();
   });

@@ -125,13 +125,14 @@ for (const [status, retryAfter, guidance] of [[409, "10", /Request not applied/]
     await page.get("refresh-image-jobs").dispatch("click"); await page.submit();
     assert.equal(page.posts().length, 1);
     page.advance(Number(retryAfter) * 1000);
-    await page.get("refresh-image-jobs").dispatch("click");
+    const release = [...page.timers.values()][0]; page.timers.clear(); release();
     assert.equal(page.get("image-job-submit").disabled, false);
     assert.equal(page.posts().length, 1);
     // Only a new, explicit submit can replay; unchanged descriptor keeps the original UUID.
     await page.submit();
     assert.equal(JSON.parse(page.posts()[0].body).request_id, JSON.parse(page.posts()[1].body).request_id);
     await page.disconnect();
+    assert.equal(page.timers.size, 0, "Disconnect cancels the new cooldown timer");
   });
 }
 
@@ -163,4 +164,14 @@ test("confirmed admission allows an explicit new job with the same descriptor af
   assert.notEqual(JSON.parse(page.posts()[0].body).request_id, JSON.parse(page.posts()[1].body).request_id);
   assert.match(page.get("image-job-message").textContent, /job-2/);
   await page.disconnect();
+});
+
+test("new image fields enforce valid Unicode-sets patterns used by browser constraints", () => {
+  const html = asset("hub.html");
+  for (const id of ["image-job-name", "image-job-credential"]) {
+    const pattern = html.match(new RegExp(`<input id="${id}"[^>]*pattern="([^"]+)"`))[1];
+    const constraint = new RegExp(`^(?:${pattern})$`, "v");
+    assert.equal(constraint.test("valid-name.1"), true);
+    assert.equal(constraint.test("invalid/name"), false);
+  }
 });

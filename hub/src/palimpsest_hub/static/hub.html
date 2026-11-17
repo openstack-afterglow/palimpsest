@@ -46,7 +46,7 @@
           <p id="image-job-help" class="hint">Git builds need an allowed HTTPS repository and a full 40-character commit. Successful jobs publish an image under the chosen name and audience, subject to quota. Builds target linux/amd64. No credentials belong in URLs or Dockerfiles.</p>
           <form id="image-job-form" class="form-grid" aria-labelledby="image-job-heading" aria-describedby="image-job-help" method="post" action="/v1/git-builds">
             <label>Source<select id="image-job-kind" name="kind"><option value="git">Pinned Git repository</option><option value="registry">Registry import</option><option value="dockerfile">Dockerfile</option></select></label>
-            <label>Name (required)<input id="image-job-name" name="name" required pattern="[a-z0-9][a-z0-9.+-]{0,63}" placeholder="service-playbook"></label>
+            <label>Name (required)<input id="image-job-name" name="name" required pattern="[a-z0-9][a-z0-9.+\-]{0,63}" placeholder="service-playbook"></label>
             <label>Audience<select id="image-job-visibility" name="visibility"><option value="private">private: only you</option><option value="internal">internal: project members</option><option value="public">public: anyone</option></select></label>
             <label>OS family (required)<input id="image-job-os-family" name="os_family" required maxlength="128" placeholder="ubuntu"></label>
             <label>OS version (required)<input id="image-job-os-version" name="os_version" required maxlength="128" placeholder="24.04"></label>
@@ -56,7 +56,7 @@
               <label class="wide">Full commit SHA (required)<input id="image-job-revision" name="revision" required pattern="[0-9a-fA-F]{40}" maxlength="40" spellcheck="false"></label>
               <label>Context directory (required)<input id="image-job-context" name="context_subdir" required value="." maxlength="1024" spellcheck="false"></label>
               <label>Dockerfile path (required)<input id="image-job-path" name="dockerfile_path" required value="Dockerfile" maxlength="1024" spellcheck="false"></label>
-              <label class="wide">Credential reference <span class="hint">Optional operator-configured reference, never a token or password.</span><input id="image-job-credential" name="credential_ref" pattern="[A-Za-z0-9][A-Za-z0-9_.-]{0,127}" maxlength="128" autocomplete="off"></label>
+              <label class="wide">Credential reference <span class="hint">Optional operator-configured reference, never a token or password.</span><input id="image-job-credential" name="credential_ref" pattern="[A-Za-z0-9][A-Za-z0-9_.\-]{0,127}" maxlength="128" autocomplete="off"></label>
             </fieldset>
             <fieldset id="image-job-registry-fields" class="wide form-grid" hidden disabled>
               <legend>Registry source</legend>

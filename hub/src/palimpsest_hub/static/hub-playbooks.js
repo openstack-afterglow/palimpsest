@@ -15,7 +15,7 @@
   const gib = 1024 ** 3;
   let playbooks = [], selected = null, choices = null, instances = [], pending = null, timer = null;
   let playbookVersion = 0, instanceVersion = 0, quietRounds = 0, lastSeen = "";
-  const busy = new Set(), retryAt = new Map();
+  const busy = new Set(), retryAt = new Map(), retryTimers = new Map();
 
   function same(left, right) { return left.length === right.length && left.every((item, index) => item === right[index]); }
   function size(bytes) {
@@ -211,7 +211,15 @@
       report(version, "instance-message", error);
       if (row && version === connection() && error.retryAfter) {
         const seconds = Number(error.retryAfter);
-        if (Number.isFinite(seconds) && seconds > 0) retryAt.set(row.id, Date.now() + seconds * 1000);
+        if (Number.isFinite(seconds) && seconds > 0) {
+          retryAt.set(row.id, Date.now() + seconds * 1000);
+          window.clearTimeout(retryTimers.get(row.id));
+          retryTimers.set(row.id, window.setTimeout(() => {
+            if (version !== connection()) return;
+            retryTimers.delete(row.id);
+            renderInstances();
+          }, seconds * 1000));
+        }
       }
     } finally {
       if (version === connection()) {
@@ -237,7 +245,8 @@
     instanceCall(button, () => `Stop requested for ${row.name}. Writable data is retained.`, () => json(`/instances/${row.id}/stop`, { method: "POST" }), row);
   }
   function showResults(row, container) {
-    for (const [label, result] of [["First result (sealed)", row.result], ["Latest resume result", row.resume_result]]) {
+    const restoreLabel = row.status === "resumed" ? "Previous resume result (new report pending)" : "Latest resume result";
+    for (const [label, result] of [["First result (sealed)", row.result], [restoreLabel, row.resume_result]]) {
       if (!result) continue;
       const detail = node("details", "");
       detail.append(node("summary", label), node("pre", JSON.stringify(result, null, 2), "descriptor"));
@@ -367,6 +376,8 @@
     window.clearTimeout(timer);
     playbooks = []; selected = null; choices = null; instances = []; pending = null; playbookVersion++; instanceVersion++;
     busy.clear(); retryAt.clear();
+    for (const timer of retryTimers.values()) window.clearTimeout(timer);
+    retryTimers.clear();
     quietRounds = 0; lastSeen = "";
     $("playbook-list").replaceChildren(); $("instance-list").replaceChildren(); $("playbook-detail").hidden = true;
     $("launch-submit").disabled = false;

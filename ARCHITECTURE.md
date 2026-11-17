@@ -3023,6 +3023,12 @@ lists. The fenced lifecycle, bootstrap, session, trust and instance service
 bodies remain unchanged. Local tests/browser checks and independent review
 are recorded separately; no release, deployment or cloud mutation is claimed.
 
+Independent review of199d5d7 found no P0-P2 and three P3 UI issues, all addressed:
+new image-name/credential patterns escape hyphens for browser Unicode-sets
+validation; Retry-After expiry schedules a guarded control-only render (never a
+request), cancelled on disconnect; an existing restore report is labelled
+previous while a new report is pending. Focused regressions cover these states.
+
 2026-11-17 combined0.3.31 delta review: rebased the reviewed Hub candidate
 144cd9b onto origin/dev34ffc60, incorporating #116 reference docs/examples and
 #119 native-VZ client HOLD destruction. The Hub source/test subtree is unchanged
@@ -4208,9 +4214,9 @@ Reserved names and duplicate listings (2026-11-15, from the commit-path review, 
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "41e66d4c7452c268885ecd5a3cbccc5b1920529d54b78cdebbb674e232e6d841",
-  "reviewed_at": "2026-11-17T12:10:37Z",
-  "summary": "Console0.3.32: existing API-only Git/registry/Dockerfile admission and playbook selection, service/dev stop and dev resume, per-row mutation fence/Retry-After, sealed/restore receipts, bounded polling, Afterglow contract; lifecycle/trust/projection/schema/version unchanged; local synthetic evidence only"
+  "source_sha256": "b694b4adf0a74d465ab2273da8acf05aa5e8a1c02ff365e34ca92cfdc463f145",
+  "reviewed_at": "2026-11-17T12:22:18Z",
+  "summary": "Console0.3.32 review followup: browser Unicode-sets-safe name/credential patterns; Retry-After expiry updates controls only with connection guard and disconnect cancellation; previous restore report labelled pending; fenced services unchanged"
 }
 ```
 <!-- architecture-review:end -->

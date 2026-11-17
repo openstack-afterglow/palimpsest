@@ -246,11 +246,11 @@ for (const [status, retryAfter] of [[409, "10"], [503, "1"]]) {
     await page.get("refresh-instances").dispatch("click");
     assert.equal(button(page, "Resume").disabled, true);
     assert.equal(page.requests.length, 1);
-    assert.equal(page.timers.size, 0);
+    assert.equal(page.timers.size, 1, "Cooldown schedules only a control update");
     now = Number(retryAfter) * 1000;
-    await page.get("refresh-instances").dispatch("click");
+    const release = [...page.timers.values()][0]; page.timers.clear(); release();
     assert.equal(button(page, "Resume").disabled, false);
-    assert.equal(page.requests.length, 1, "Reading after the interval never reissues the action");
+    assert.equal(page.requests.length, 1, "Releasing controls never reads or reissues the action");
     page.disconnect();
   });
 }
@@ -279,5 +279,31 @@ test("completed job output selects its playbook and loads launch choices", async
   assert.equal(page.get("playbook-title").textContent, "Own playbook");
   assert.equal(page.get("launch-form").hidden, false);
   assert.equal(page.get("launch-image").options.length, 2);
+  page.disconnect();
+});
+
+test("pending restore labels the retained report as previous and preserves the first result", async () => {
+  const row = instance({ status: "resumed", result: { stdout: "first" }, resume_result: { stdout: "previous cycle" } });
+  const page = dashboard({ rows: [row], mutate: async () => row });
+  await page.connect();
+  const details = page.get("instance-list").children[0].children[0].children.filter((item) => item.children[0]?.textContent.includes("result"));
+  assert.equal(details[0].children[0].textContent, "First result (sealed)");
+  assert.equal(details[1].children[0].textContent, "Previous resume result (new report pending)");
+  assert.match(details[1].children[1].textContent, /previous cycle/);
+  page.disconnect();
+});
+
+test("disconnect cancels cooldown rendering and stale timers cannot alter a new connection", async () => {
+  const row = instance({ status: "shelved" });
+  const page = dashboard({ rows: [row], mutate: async () => { throw Object.assign(new Error("busy"), { retryAfter: "10" }); } });
+  await page.connect(); await button(page, "Resume").dispatch("click"); await settled();
+  const release = [...page.timers.values()][0];
+  assert.equal(page.timers.size, 1);
+  page.disconnect();
+  assert.equal(page.timers.size, 0);
+  await page.connect(); release();
+  assert.equal(button(page, "Resume").disabled, false);
+  assert.equal(page.get("instance-message").textContent, "");
+  assert.equal(page.requests.length, 1);
   page.disconnect();
 });
