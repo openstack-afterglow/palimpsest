@@ -3076,6 +3076,17 @@ destination column's reflected type, matching existing membership handling.
 The regression matrix covers JSON/Text source and destination pairs, complete
 set/removal histories and malformed text refusal. This is portable type
 simulation, not an actual MariaDB rollout or data migration.
+The added quota requirement is proposed through
+`openspec/changes/add-image-quota-subject-overrides/`; the accepted capability
+spec stays unchanged until archive. A supplementary differential regression
+compares no-override enforce outcomes and serialized refusal bodies with the
+original tier-policy lookup across free/paid and every visibility. This is
+admission compatibility with the new table bootstrapped, not identical SQL
+traffic or a missing-table fallback. Before merge, independent correspondence
+rulings remain required for M2-17 (`spec.md:550`) and the explicit M3-08
+`image_quota` revert condition (`spec.md:617`), plus affected M2 quota/H4 evidence.
+Parent owns those rulings and any checkbox changes; local source checks do not
+preserve checklist completion by themselves.
 
 
 2026-11-17 combined0.3.31 delta review: rebased the reviewed Hub candidate
@@ -4263,9 +4274,9 @@ Reserved names and duplicate listings (2026-11-15, from the commit-path review, 
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "5342ab74a7f4db3872b8583e1e614aaf5a7633e1a7d4dc435c2d701482f86c20",
-  "reviewed_at": "2026-11-17T12:14:29Z",
-  "summary": "Review subject quota ledger and admin API/SDK/CLI; fix independent-review MariaDB JSON alias migration gap with JSON/Text matrix; no lifecycle, tier policy or seed changes"
+  "source_sha256": "4446c99e9c463cb8ee86b440aed0bb29c148170808a8ff8e4ce8ac819d4fea37",
+  "reviewed_at": "2026-11-17T12:36:24Z",
+  "summary": "Review quota override source plus active OpenSpec delta, restore accepted capability, prove inherited tier admission byte compatibility, flag M2-17/M3-08 pre-merge rulings; preserve lifecycle fence"
 }
 ```
 <!-- architecture-review:end -->

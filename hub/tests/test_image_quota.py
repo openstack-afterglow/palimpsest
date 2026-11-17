@@ -1097,3 +1097,88 @@ async def test_override_subject_lookup_is_byte_exact_under_nocase_collation(tmp_
         assert collision.value.status_code == 409
     finally:
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tier", image_quota.TIERS)
+@pytest.mark.parametrize("visibility", image_quota.VISIBILITIES)
+async def test_no_override_enforcement_matches_original_tier_lookup_byte_for_byte(
+    quota,
+    monkeypatch,
+    tier,
+    visibility,
+):
+    import json
+
+    payload = quota.payload("a", 64)
+    larger = quota.payload("b", 65)
+    scope = image_quota.scope_of(visibility)
+    subject = P1 if scope == "project" else U1
+    async with sql_mutex(quota.factory, published_images.IMAGE_MUTEX) as session:
+        await image_quota.assign_tier(session, scope, subject, tier, ADMIN)
+        await session.commit()
+    await quota.set_policy(tier, visibility, 1, 64, 100)
+    await quota.publish(actor(), "existing", ["a"], visibility=visibility)
+    original_resolver = image_quota.effective_policy
+
+    async def tier_only(_session, selected_visibility, _subject_id, selected_tier, policies):
+        # This is exactly the policy lookup used by enforce at base 19761a0.
+        return policies[(selected_tier, selected_visibility)]
+
+    async def outcome(name, layers, source):
+        async with sql_mutex(quota.factory, published_images.IMAGE_MUTEX) as session:
+            try:
+                await image_quota.enforce(session, actor(), name, manifest(layers), visibility, source=source)
+            except HTTPException as exc:
+                return exc.status_code, json.dumps({"detail": exc.detail}, separators=(",", ":")).encode()
+        return None
+
+    cases = (
+        ("existing", [payload], 100, None),
+        ("new", [payload], 0, (403, count_error(visibility, scope, 1, 1))),
+        (
+            "existing",
+            [larger],
+            0,
+            (
+                413,
+                {
+                    "code": "image_chain_size_limit",
+                    "visibility": visibility,
+                    "limit_bytes": 64,
+                    "chain_bytes": 65,
+                },
+            ),
+        ),
+        (
+            "existing",
+            [payload],
+            101,
+            (
+                413,
+                {
+                    "code": "image_source_size_limit",
+                    "visibility": visibility,
+                    "limit_bytes": 100,
+                    "source_bytes": 101,
+                },
+            ),
+        ),
+        ("existing", [payload, payload], 100, None),
+    )
+    for name, layers, source, expected in cases:
+        inherited = await outcome(name, layers, source)
+        with monkeypatch.context() as baseline:
+            baseline.setattr(image_quota, "effective_policy", tier_only)
+            assert await outcome(name, layers, source) == inherited
+        if expected is None:
+            assert inherited is None
+        else:
+            status, detail = expected
+            assert inherited == (status, json.dumps({"detail": detail}, separators=(",", ":")).encode())
+    await quota.set_policy(tier, visibility, None, None, None)
+    assert await outcome("new", [payload, larger], 101) is None
+    monkeypatch.setattr(image_quota, "effective_policy", tier_only)
+    assert await outcome("new", [payload, larger], 101) is None
+    monkeypatch.setattr(image_quota, "effective_policy", original_resolver)
+    assert await quota.count_images() == 1
