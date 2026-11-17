@@ -1697,11 +1697,23 @@ def _failed_start_path_exists(path):
 
 
 def _failed_start_network(config, native, custody, *, provider_absent=False):
-    """Closed Lima2.2.1 default network shape; unknown YAML means HOLD."""
+    """Check the scoped original network profile before failed-start cleanup."""
     guard = _FAILED_START_CLEANUP.get()
+    return _default_cleanup_network(
+        config,
+        native,
+        custody,
+        network_pin=(guard.network_digest, guard.network_stamp),
+        instance_names=guard.instance_names,
+        provider_absent=provider_absent,
+    )
+
+
+def _default_cleanup_network(config, native, custody, *, network_pin, instance_names, provider_absent=False):
+    """Closed Lima2.2.1 default network shape; unknown YAML means HOLD."""
     path = config.home / "_config" / "networks.yaml"
     raw, digest, stamp = _file(path, owned=True, limit=_MAX_JSON)
-    if digest != guard.network_digest or tuple(stamp) != guard.network_stamp:
+    if (digest, tuple(stamp)) != network_pin:
         raise VZNativeHold("native VZ effective network configuration differs from its cleanup pin")
     # Not a general YAML parser: aliases, duplicates and alternate paths fail.
     expected = (
@@ -1746,7 +1758,7 @@ def _failed_start_network(config, native, custody, *, provider_absent=False):
     if any(_failed_start_path_exists(candidate) for candidate in absent):
         raise VZNativeHold("native VZ network reconciliation could affect a daemon or user network")
     instances = _instances(config, custody, allow_expired=True)
-    expected_names = set(guard.instance_names)
+    expected_names = set(instance_names)
     if native["instance"] not in expected_names:
         raise VZNativeHold("native VZ original instance is missing from the scoped provider inventory")
     if provider_absent:
@@ -1894,7 +1906,14 @@ def _failed_start_default_network_pins(directory, native, guard, *, previous=Non
         and (not isinstance(previous, dict) or not set(previous).issubset({"default_ep.sock", "default_fd.sock"}))
     ):
         raise VZNativeHold("native VZ default network snapshot lacks ordinary returned-stop provenance")
-    guard.check_deadline()
+    return _inactive_default_network_pins(
+        directory, native, started, stopped_after, guard.check_deadline, previous=previous
+    )
+
+
+def _inactive_default_network_pins(directory, native, started, stopped_after, check, *, previous=None):
+    """Observe the exact inactive pair without granting stop/start or unlink authority."""
+    check()
     try:
         fd = _directory(directory)
         try:
@@ -1903,7 +1922,7 @@ def _failed_start_default_network_pins(directory, native, guard, *, previous=Non
                 raise VZNativeHold("native VZ default network directory identity changed")
 
             def recheck(name=None, stamp=None):
-                guard.check_deadline()
+                check()
                 visible = _directory(directory)
                 try:
                     if _stamp(os.fstat(visible)) != directory_stamp or _stamp(os.fstat(fd)) != directory_stamp:
@@ -1912,11 +1931,11 @@ def _failed_start_default_network_pins(directory, native, guard, *, previous=Non
                     os.close(visible)
                 if name is not None and _stamp(os.stat(name, dir_fd=fd, follow_symlinks=False)) != stamp:
                     raise VZNativeHold("native VZ default network socket changed during inspection")
-                guard.check_deadline()
+                check()
 
             pins = {}
             for name in os.listdir(fd):
-                guard.check_deadline()
+                check()
                 info = os.stat(name, dir_fd=fd, follow_symlinks=False)
                 if not (stat.S_ISSOCK(info.st_mode) or name.endswith((".sock", ".pid")) or name == "sock"):
                     continue
@@ -2186,6 +2205,7 @@ def _load_checked(
     cleanup_only=False,
     failed_start=False,
     stopped_hold=False,
+    stopped_delete=False,
 ):
     data = _data(authority) if data is None else data
     native = data.get("vz_native", {})
@@ -2198,7 +2218,9 @@ def _load_checked(
     }
     read_vz_plan(state)
     _stop_settlement(authority, config, native)
-    if stopped_hold:
+    if stopped_delete:
+        _stopped_delete_hold(authority, config, data)
+    elif stopped_hold:
         _ordinary_stop_hold(authority, config, data)
     elif failed_start:
         _failed_start_cleanup_hold(authority, config, data)
@@ -3331,6 +3353,119 @@ def _stop_settlement(authority, config, native):
     return recovery
 
 
+def _stopped_delete_hold(authority, config, data):
+    """Bind destruction only; a stopped provider does not prove guest quiescence."""
+    native = data["vz_native"]
+    attempt = native.get("start_attempt")
+    if (
+        _FAILED_START_CLEANUP.get() is not None
+        or authority.snapshot.state["status"] != "failed"
+        or native.get("hold") != "stop-incomplete"
+        or native.get("instance") != "plm-" + authority.record.run_id.replace("-", "")[:12]
+        or not isinstance(attempt, dict)
+        or type(attempt.get("started_unix")) not in (int, float)
+        or not math.isfinite(attempt["started_unix"])
+        or not 0 < attempt["started_unix"] <= time.time()
+        or "failed_start_cleanup" in native
+        or "stop_settlement" in native
+    ):
+        raise VZNativeHold("native VZ deletion requires exact stopped stop-incomplete authority")
+    _verify_host_authority(config, native)
+    config.verify(allow_expired=True)
+    marker = config.home / "_palimpsest-native" / ("hold-" + authority.record.run_id + ".json")
+    value, digest, stamp = _resource_hold_marker(marker)
+    if value != {"schema": _SCHEMA, "run_id": authority.record.run_id, "reason": "stop-incomplete"}:
+        raise VZNativeHold("native VZ stopped deletion original HOLD differs")
+    authority.verify_binding()
+    return marker, digest, stamp
+
+
+def _stopped_delete_actors(config, native):
+    directory = config.home / native["instance"]
+    resources = [str(directory), str(config.home / "_disks" / native["disk_name"]), native["lower_path"]]
+    if any(
+        actor.pid != os.getpid()
+        and any(
+            arg in {native["instance"], native["disk_name"]} or any(path in arg for path in resources)
+            for arg in actor.argv
+        )
+        for actor in list_processes()
+    ):
+        raise VZNativeHold("native VZ stopped deletion has a related live or unidentified actor")
+    plist = config.home / "Library" / "LaunchAgents" / ("io.lima-vm.autostart." + native["instance"] + ".plist")
+    if _failed_start_path_exists(plist):
+        raise VZNativeHold("native VZ stopped deletion has launchd autostart custody")
+
+
+def _stopped_delete_observation(authority, roots, config, custody, data, *, previous=None, deadline):
+    """Observe deletion eligibility, never authenticate or adopt a stopped run."""
+    native = data["vz_native"]
+
+    def check():
+        _observation_timeout(deadline)
+
+    check()
+    _stopped_delete_actors(config, native)
+    instance = _owned_instance(config, native, custody, allow_expired=True, deadline=deadline)
+    if (
+        instance.get("status") != "Stopped"
+        or instance.get("dir") != str(config.home / native["instance"])
+        or any(
+            type(instance.get(key, 0)) is not int or instance.get(key, 0) != 0 for key in ("hostAgentPID", "driverPID")
+        )
+        or instance.get("autoStartedIdentifier") not in (None, "")
+        or not isinstance(instance.get("config"), dict)
+        or instance["config"].get("networks") not in (None, [])
+    ):
+        raise VZNativeHold("native VZ stopped deletion lacks exact Stopped provider/actor/network absence")
+    network_path = config.home / "_config" / "networks.yaml"
+    _, digest, stamp = _file(network_path, owned=True, limit=_MAX_JSON)
+    network_pin = (digest, tuple(stamp))
+    names = tuple(sorted(_instances(config, custody, allow_expired=True, deadline=deadline)))
+    _default_cleanup_network(config, native, custody, network_pin=network_pin, instance_names=names)
+    endpoints = _inactive_default_network_pins(
+        config.home / native["instance"],
+        native,
+        native["start_attempt"]["started_unix"],
+        _stopped_delete_hold(authority, config, data)[2][6] / 1_000_000_000,
+        check,
+        previous=None if previous is None else previous["endpoints"],
+    )
+    root = load_vz_root_volume(
+        roots,
+        native["root_volume_id"],
+        owner=ArtifactLeaseOwner(authority.record.run_id, authority.record.name, "root-lower"),
+    )
+    _require_stopped_root_exclusive(root.record.storage.directory)
+    observation = {
+        "network_digest": digest,
+        "network_stamp": list(stamp),
+        "instance_names": list(names),
+        "endpoints": endpoints,
+    }
+    if previous is not None and observation != previous:
+        raise VZNativeHold("native VZ stopped deletion resource observation changed")
+    authority.verify_binding()
+    _stopped_delete_actors(config, native)
+    current = _default_cleanup_network(config, native, custody, network_pin=network_pin, instance_names=names)
+    if current.get(native["instance"]) != instance:
+        raise VZNativeHold("native VZ stopped deletion provider changed during resource observation")
+    final_endpoints = _inactive_default_network_pins(
+        config.home / native["instance"],
+        native,
+        native["start_attempt"]["started_unix"],
+        _stopped_delete_hold(authority, config, data)[2][6] / 1_000_000_000,
+        check,
+        previous=endpoints,
+    )
+    if final_endpoints != endpoints:
+        raise VZNativeHold("native VZ stopped deletion endpoints changed during resource observation")
+    _require_stopped_root_exclusive(root.record.storage.directory)
+    _stopped_delete_actors(config, native)
+    check()
+    return observation
+
+
 def _ordinary_stop_hold(authority, config, data):
     """Bind only an ordinary stop's original HOLD, never failed launch authority."""
     native = data["vz_native"]
@@ -3342,6 +3477,7 @@ def _ordinary_stop_hold(authority, config, data):
         or native.get("instance") != "plm-" + authority.record.run_id.replace("-", "")[:12]
         or not isinstance(native.get("start_attempt"), dict)
         or "failed_start_cleanup" in native
+        or "stopped_delete" in native
         or not (
             status == "failed"
             and native.get("hold") == "stop-incomplete"
@@ -3785,7 +3921,10 @@ def rm_oci_run(roots, name, *, expected_record=None):
         failed_start = (
             data.get("vz_native", {}).get("hold") == "launch-incomplete" and "start_attempt" in data["vz_native"]
         )
-        cleanup_only = bool(data.get("vz_native", {}).get("hold")) and not failed_start
+        stopped_delete = data.get("vz_native", {}).get("hold") == "stop-incomplete"
+        if stopped_delete and "stopped_delete" in data["vz_native"]:
+            raise VZNativeHold("native VZ stopped deletion was already attempted; blind replay forbidden")
+        cleanup_only = bool(data.get("vz_native", {}).get("hold")) and not failed_start and not stopped_delete
         if failed_start:
             _require_failed_start_operation(RuntimeOperation.RM)
             if not _failed_start_settled(data["vz_native"].get("failed_start_cleanup")):
@@ -3793,25 +3932,50 @@ def rm_oci_run(roots, name, *, expected_record=None):
         cleanup_hold = (
             _failed_start_cleanup_hold(authority, config, data)
             if failed_start
+            else _stopped_delete_hold(authority, config, data)
+            if stopped_delete
             else _prestart_cleanup_hold(authority, config, data)
             if cleanup_only
             else None
         )
         with _custody(config, cleanup_hold=cleanup_hold) as custody:
-            loader = _load_checked if failed_start else _load
-            options = {"failed_start": True} if failed_start else {"cleanup_only": cleanup_only}
+            loader = _load_checked if failed_start or stopped_delete else _load
+            options = (
+                {"failed_start": True}
+                if failed_start
+                else {"stopped_delete": True}
+                if stopped_delete
+                else {"cleanup_only": cleanup_only}
+            )
             data, store, owner, lease, receipts, export = loader(
                 authority, roots, config, custody, allow_expired=True, data=data, **options
             )
             native = data["vz_native"]
+            if stopped_delete:
+                delete_observation = _stopped_delete_observation(
+                    authority, roots, config, custody, data, deadline=time.monotonic() + 30
+                )
+                _load_checked(authority, roots, config, custody, allow_expired=True, data=data, stopped_delete=True)
+                _stopped_delete_observation(
+                    authority,
+                    roots,
+                    config,
+                    custody,
+                    data,
+                    previous=delete_observation,
+                    deadline=time.monotonic() + 30,
+                )
+                if _stopped_delete_hold(authority, config, data) != cleanup_hold:
+                    raise VZNativeHold("native VZ stopped deletion original HOLD changed during observation")
             try:
                 if failed_start:
                     _failed_start_stop(authority, roots, config, custody, data)
-                elif not cleanup_only:
+                elif not cleanup_only and not stopped_delete:
                     _stop(authority, roots, config, custody, data)
-                instance = _owned_instance(config, native, custody, allow_expired=True)
-                if instance.get("status") != "Stopped":
-                    raise VZNativeHold("native VZ removal requires exact normal Stopped state")
+                if not stopped_delete:
+                    instance = _owned_instance(config, native, custody, allow_expired=True)
+                    if instance.get("status") != "Stopped":
+                        raise VZNativeHold("native VZ removal requires exact normal Stopped state")
                 if failed_start:
                     if _failed_start_cleanup_hold(authority, config, data) != cleanup_hold:
                         raise VZNativeHold("native VZ original launch HOLD changed before deletion")
@@ -3829,12 +3993,17 @@ def rm_oci_run(roots, name, *, expected_record=None):
                     if "default_network_endpoints" in before_delete:
                         native["failed_start_cleanup"]["after_stop"] = before_delete
                         _write(authority, "failed", data)
+                elif stopped_delete:
+                    # All refusal-capable admission checks precede this one-shot intent.
+                    native["stopped_delete"] = {"phase": "attempted", "observation": delete_observation}
+                    _write(authority, "failed", data)
+                    # No replay or promotion to a graceful stopped state is allowed.
                 elif cleanup_hold is not None:
                     if _prestart_cleanup_hold(authority, config, data) != cleanup_hold:
                         raise VZNativeHold("native VZ cleanup HOLD changed before provider deletion")
                     prestart_root = load_vz_root_volume(roots, native["root_volume_id"], owner=owner)
                     _require_stopped_root_exclusive(prestart_root.record.storage.directory)
-                if not failed_start:
+                if not failed_start and not stopped_delete:
                     _write(authority, "stopped", data)
                 authority.verify_binding()
                 _lima(config, ["delete", "--tty=false", native["instance"]], custody, timeout=90, allow_expired=True)
@@ -3842,6 +4011,18 @@ def rm_oci_run(roots, name, *, expected_record=None):
                     config.home / native["instance"]
                 ):
                     raise VZNativeHold("native VZ exact provider absence was not proven")
+                if stopped_delete:
+                    _stopped_delete_actors(config, native)
+                    _default_cleanup_network(
+                        config,
+                        native,
+                        custody,
+                        network_pin=(delete_observation["network_digest"], tuple(delete_observation["network_stamp"])),
+                        instance_names=delete_observation["instance_names"],
+                        provider_absent=True,
+                    )
+                    native["stopped_delete"]["phase"] = "provider-absent"
+                    _write(authority, "failed", data)
                 if failed_start:
                     _failed_start_observation(
                         authority, roots, config, custody, data, phase="after-delete", absent=True

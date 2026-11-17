@@ -1212,13 +1212,14 @@ def test_last_default_probe_rechecks_previously_probed_leaf(normal_default_endpo
 
 
 @pytest.fixture
-def ordinary_stop_case(tmp_path, monkeypatch):
+def ordinary_stop_case(tmp_path, monkeypatch, request):
     """Real canonical ledger/custody files; provider and boot pins are host seams."""
     from palimpsest_local import state
     from palimpsest_local.runtime_types import DispatchKey, RuntimeBackend, RuntimeKind
 
-    home = tmp_path.resolve() / "lima"
-    home.mkdir(mode=0o700)
+    temporary = tempfile.TemporaryDirectory(prefix="plmo-", dir=str(Path("/tmp").resolve()))
+    request.addfinalizer(temporary.cleanup)
+    home = Path(temporary.name)
     custody = home / "_palimpsest-native"
     custody.mkdir(mode=0o700)
     upper = home / "upper"
@@ -1239,7 +1240,9 @@ def ordinary_stop_case(tmp_path, monkeypatch):
             "instance": instance,
             "instance_identity": [identity.st_dev, identity.st_ino],
             "root_volume_id": "bdb3c42e-0410-4a6e-987a-bb293235993a",
-            "start_attempt": {"id": "0caa89a3-c4b7-419d-a7b5-b3629f578932"},
+            "start_attempt": {"id": "0caa89a3-c4b7-419d-a7b5-b3629f578932", "started_unix": time.time() - 60},
+            "disk_name": "owned-root",
+            "lower_path": str(home / "lower"),
             "plan_sha256": "1" * 64,
             "ssh_local_port": 59571,
             "plan": {
@@ -1872,3 +1875,417 @@ def test_port_reuse_after_admission_does_not_create_an_unissued_start_hold(ordin
             case.start()
         assert case.read() == before
     assert not case.marker.exists() and case.commands == []
+
+
+@pytest.fixture
+def stopped_delete_case(ordinary_stop_case, monkeypatch):
+    """Observed unclean stop: stale default pair and no authenticated stop-ready."""
+    case = ordinary_stop_case
+    case.update(
+        change=lambda data: data["vz_status"].update(
+            phase="running",
+            explicit_stop_fenced=False,
+            main={"state": "running", "pid": 42, "output_complete": False},
+        )
+    )
+    case.update(change=lambda data: data["vz_native"]["plan"].update(root_graph_digest="sha256:" + "d" * 64))
+    for name in ("default_ep.sock", "default_fd.sock"):
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as channel:
+            channel.bind(str(case.directory / name))
+        (case.directory / name).chmod(0o755)
+
+    def renew_marker():
+        payload = case.marker.read_bytes()
+        case.marker.unlink()
+        vz_native_runtime._new_file(case.marker, payload)
+
+    renew_marker()  # The original stop HOLD follows the original provider endpoints.
+    config_dir = case.home / "_config"
+    config_dir.mkdir(mode=0o700)
+    case.network = config_dir / "networks.yaml"
+    case.network.write_text(
+        'paths:\n  socketVMNet: "/opt/socket_vmnet/bin/socket_vmnet"\n'
+        "  varRun: /private/var/run/lima\n  sudoers: /private/etc/sudoers.d/lima\n"
+        "group: admin\nnetworks:\n  user-v2:\n    mode: user-v2\n"
+        "    gateway: 192.168.104.1\n    netmask: 255.255.255.0\n"
+        "  shared:\n    mode: shared\n    gateway: 192.168.105.1\n"
+        "    dhcpEnd: 192.168.105.254\n    netmask: 255.255.255.0\n"
+        "  bridged:\n    mode: bridged\n    interface: en0\n"
+        "  host:\n    mode: host\n    gateway: 192.168.106.1\n"
+        "    dhcpEnd: 192.168.106.254\n    netmask: 255.255.255.0\n"
+    )
+    case.network.chmod(0o600)
+    case.provider.update(name=case.directory.name, vmType="vz", arch="aarch64", config={"networks": []})
+    case.foreign = {}
+    case.released = []
+    case.delete_effect = True
+    case.renew_marker = renew_marker
+    source_pins = vz_native_runtime._load_checked
+    exists = vz_native_runtime._failed_start_path_exists
+    monkeypatch.setattr(
+        vz_native_runtime,
+        "_failed_start_path_exists",
+        lambda path: exists(path) if path.is_relative_to(case.home) else False,
+    )
+
+    def released(kind):
+        assert not case.directory.exists()
+        assert case.marker.exists()
+        assert case.read()["status"] == "failed"
+        case.released.append(kind)
+
+    store = SimpleNamespace(release_lease_set=lambda _lease: released("lease"))
+
+    def pins(authority, roots, config, custody, *, data=None, stopped_delete=False, **kwargs):
+        if stopped_delete:
+            vz_native_runtime._stopped_delete_hold(authority, config, data)
+        result = source_pins(authority, roots, config, custody, data=data, **kwargs)
+        return result[0], store, None, None, None, None
+
+    def delete(_config, argv, _custody, **_kwargs):
+        assert argv == ["delete", "--tty=false", case.directory.name]
+        data = case.read()
+        assert data["status"] == "failed"
+        assert data["vz_native"]["hold"] == "stop-incomplete"
+        assert data["vz_native"]["stopped_delete"]["phase"] == "attempted"
+        assert "stop_settlement" not in data["vz_native"]
+        assert not case.released
+        case.commands.append(tuple(argv))
+        if case.delete_effect:
+            case.directory.rename(case.home / "provider-deleted")
+
+    monkeypatch.setattr(vz_native_runtime, "_load_checked", pins)
+    monkeypatch.setattr(vz_native_runtime, "_lima", delete)
+    monkeypatch.setattr(
+        vz_native_runtime,
+        "_instances",
+        lambda *_args, **_kw: {
+            **case.foreign,
+            **({case.directory.name: copy.deepcopy(case.provider)} if case.directory.exists() else {}),
+        },
+    )
+    monkeypatch.setattr(vz_native_runtime, "release_vz_lower_export", lambda *_args, **_kw: released("export"))
+    monkeypatch.setattr(vz_native_runtime, "release_vz_root_volume", lambda *_args, **_kw: released("root"))
+    case.rm = lambda: vz_native_runtime.rm_oci_run(case.roots, "ordinary", expected_record=case.record)
+    return case
+
+
+def test_unclean_stopped_hold_allows_only_explicit_owned_delete(stopped_delete_case):
+    case = stopped_delete_case
+    before = case.read()
+    marker = case.marker.read_bytes()
+    for operation in (case.stop, case.start):
+        with pytest.raises(vz_native_runtime.VZNativeHold):
+            operation()
+        assert case.read() == before and case.marker.read_bytes() == marker
+    result = case.rm()
+    after = case.read()
+    assert (result.previous_status, result.current_status) == ("failed", "removed")
+    assert after["vz_status"] == before["vz_status"]
+    assert after["vz_native"]["hold"] is None
+    assert "stop_settlement" not in after["vz_native"]
+    assert not case.marker.exists()
+    assert case.released == ["export", "lease", "root"]
+    assert case.commands == [("delete", "--tty=false", case.directory.name)]
+    # Provider-owned deletion removed both endpoints; the product never unlinks them.
+    assert {p.name for p in (case.home / "provider-deleted").iterdir()} == {
+        "keep",
+        "default_ep.sock",
+        "default_fd.sock",
+    }
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "live-pid",
+        "reused-pid",
+        "unknown-actor",
+        "foreign-upper",
+        "foreign-disk",
+        "changed-pins",
+        "unknown-socket",
+        "socket-symlink",
+        "socket-mode",
+        "post-hold-socket",
+        "wrong-marker",
+        "session-marker",
+        "other-hold",
+        "named-network",
+        "unknown-network",
+        "autostart",
+    ],
+)
+def test_stopped_delete_refuses_uncertain_custody_without_changing_hold(stopped_delete_case, change):
+    case = stopped_delete_case
+    if change == "live-pid":
+        case.provider["driverPID"] = 900
+    elif change in {"reused-pid", "unknown-actor"}:
+        case.processes = (
+            darwin_process.DarwinProcessIdentity(
+                900,
+                1,
+                os.geteuid(),
+                901,
+                2000,
+                None if change == "unknown-actor" else "/foreign/reused",
+                ("unrelated-program", str(case.directory / "ha.sock")),
+            ),
+        )
+    elif change == "foreign-upper":
+        (case.upper / "in_use_by").symlink_to(case.home / "foreign")
+    elif change == "foreign-disk":
+        case.foreign["foreign"] = {
+            "name": "foreign",
+            "vmType": "vz",
+            "arch": "aarch64",
+            "config": {"additionalDisks": [{"name": "owned-root"}]},
+        }
+    elif change == "changed-pins":
+        case.pin_failure = True
+    elif change == "unknown-socket":
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as channel:
+            channel.bind(str(case.directory / "unknown.sock"))
+    elif change == "socket-symlink":
+        path = case.directory / "default_ep.sock"
+        path.unlink()
+        path.symlink_to(case.home / "foreign")
+    elif change == "socket-mode":
+        (case.directory / "default_ep.sock").chmod(0o777)
+    elif change == "post-hold-socket":
+        path = case.directory / "default_ep.sock"
+        stamp = case.marker.stat().st_mtime_ns + 1_000_000_000
+        os.utime(path, ns=(stamp, stamp))
+    elif change == "wrong-marker":
+        payload = vz_native_runtime._json(
+            {"schema": vz_native_runtime._SCHEMA, "run_id": case.run_id, "reason": "launch-incomplete"}
+        )
+        case.marker.unlink()
+        vz_native_runtime._new_file(case.marker, payload)
+    elif change in {"session-marker", "other-hold"}:
+        name = "session-foreign" if change == "session-marker" else "hold-foreign.json"
+        (case.marker.parent / name).write_bytes(b"foreign")
+    elif change == "named-network":
+        case.provider["config"]["networks"] = [{"lima": "shared"}]
+    elif change == "unknown-network":
+        case.network.write_text("networks: {unknown: {mode: shared}}\n")
+    else:
+        directory = case.home / "Library" / "LaunchAgents"
+        directory.mkdir(parents=True)
+        (directory / ("io.lima-vm.autostart." + case.directory.name + ".plist")).write_bytes(b"foreign")
+    before = case.read()
+    marker = case.marker.read_bytes()
+    with pytest.raises((StateError, vz_native_runtime.VZNativeHold)):
+        case.rm()
+    assert case.read() == before
+    assert case.marker.read_bytes() == marker
+    assert case.released == [] and case.commands == []
+
+
+def test_stopped_delete_can_retry_after_a_refused_live_actor_is_gone(stopped_delete_case):
+    case = stopped_delete_case
+    case.provider["hostAgentPID"] = 900
+    before = case.read()
+    with pytest.raises(vz_native_runtime.VZNativeHold):
+        case.rm()
+    assert case.read() == before
+    case.provider["hostAgentPID"] = 0
+    assert case.rm().current_status == "removed"
+    assert len(case.commands) == 1
+
+
+@pytest.mark.parametrize("kind", [socket.SOCK_STREAM, socket.SOCK_DGRAM])
+def test_stopped_delete_preserves_active_default_endpoint(stopped_delete_case, kind):
+    case = stopped_delete_case
+    path = case.directory / "default_ep.sock"
+    path.unlink()
+    with socket.socket(socket.AF_UNIX, kind) as channel:
+        channel.bind(str(path))
+        path.chmod(0o755)
+        if kind == socket.SOCK_STREAM:
+            channel.listen(1)
+        case.renew_marker()
+        before = case.read()
+        marker = case.marker.read_bytes()
+        with pytest.raises(vz_native_runtime.VZNativeHold):
+            case.rm()
+        assert case.read() == before and case.marker.read_bytes() == marker
+    assert case.released == [] and case.commands == []
+
+
+def test_stopped_delete_does_not_replay_uncertain_provider_delete(stopped_delete_case):
+    case = stopped_delete_case
+    case.delete_effect = False
+    with pytest.raises(vz_native_runtime.VZNativeHold):
+        case.rm()
+    assert case.read()["vz_native"]["hold"] == "removal-incomplete"
+    assert case.read()["vz_native"]["stopped_delete"]["phase"] == "attempted"
+    assert case.marker.exists() and case.released == []
+    with pytest.raises(vz_native_runtime.VZNativeHold):
+        case.rm()
+    assert len(case.commands) == 1
+
+
+@pytest.mark.parametrize("change", ["provider", "marker", "endpoint", "upper", "pins"])
+def test_stopped_delete_rechecks_resources_after_final_reload(stopped_delete_case, monkeypatch, change):
+    case = stopped_delete_case
+    loader = vz_native_runtime._load_checked
+
+    def late_change(*args, **kwargs):
+        result = loader(*args, **kwargs)
+        if case.pin_reads == 2:
+            if change == "provider":
+                case.provider["status"] = "Running"
+            elif change == "marker":
+                case.renew_marker()
+            elif change == "endpoint":
+                path = case.directory / "default_ep.sock"
+                path.rename(case.directory / "unknown.sock")
+            elif change == "upper":
+                (case.upper / "foreign-lock").write_bytes(b"foreign")
+            else:
+                case.pin_failure = True
+                raise vz_native_runtime.VZNativeHold("retained disk pin changed")
+        return result
+
+    monkeypatch.setattr(vz_native_runtime, "_load_checked", late_change)
+    before = case.read()
+    with pytest.raises(vz_native_runtime.VZNativeHold):
+        case.rm()
+    assert case.read() == before and case.marker.exists()
+    assert case.commands == [] and case.released == []
+
+
+@pytest.mark.parametrize("reason", ["retained-authority-changed", "removal-incomplete", "start-incomplete"])
+def test_stopped_delete_never_adopts_a_different_hold_reason(stopped_delete_case, reason):
+    case = stopped_delete_case
+    case.update(change=lambda data: data["vz_native"].update(hold=reason))
+    before = case.read()
+    marker = case.marker.read_bytes()
+    with pytest.raises(vz_native_runtime.VZNativeHold):
+        case.rm()
+    assert case.read() == before and case.marker.read_bytes() == marker
+    assert case.commands == [] and case.released == []
+
+
+@pytest.mark.parametrize("started", [None, True, -1, "invalid"])
+def test_stopped_delete_requires_recorded_start_lifetime(stopped_delete_case, started):
+    case = stopped_delete_case
+    case.update(change=lambda data: data["vz_native"]["start_attempt"].update(started_unix=started))
+    before = case.read()
+    marker = case.marker.read_bytes()
+    with pytest.raises(vz_native_runtime.VZNativeHold):
+        case.rm()
+    assert case.read() == before and case.marker.read_bytes() == marker
+    assert case.commands == [] and case.released == []
+
+
+@pytest.mark.parametrize("key,value", [("driverPID", None), ("hostAgentPID", False)])
+def test_stopped_delete_never_treats_unknown_provider_pid_as_absent(stopped_delete_case, key, value):
+    case = stopped_delete_case
+    case.provider[key] = value
+    before = case.read()
+    marker = case.marker.read_bytes()
+    with pytest.raises(vz_native_runtime.VZNativeHold):
+        case.rm()
+    assert case.read() == before and case.marker.read_bytes() == marker
+    assert case.commands == [] and case.released == []
+
+
+@pytest.mark.parametrize("change", ["actor", "upper"])
+def test_stopped_delete_keeps_resources_if_postdelete_custody_is_uncertain(stopped_delete_case, monkeypatch, change):
+    case = stopped_delete_case
+    delete = vz_native_runtime._lima
+
+    def after_delete(*args, **kwargs):
+        delete(*args, **kwargs)
+        if change == "actor":
+            case.processes = (
+                darwin_process.DarwinProcessIdentity(
+                    900,
+                    1,
+                    os.geteuid(),
+                    900,
+                    1000,
+                    None,
+                    ("detached", str(case.directory)),
+                ),
+            )
+        else:
+            (case.upper / "in_use_by").symlink_to(case.home / "foreign")
+
+    monkeypatch.setattr(vz_native_runtime, "_lima", after_delete)
+    with pytest.raises(vz_native_runtime.VZNativeHold):
+        case.rm()
+    assert case.read()["vz_native"]["hold"] == "removal-incomplete"
+    assert case.marker.exists() and case.released == []
+    assert len(case.commands) == 1
+
+
+def test_stop_cannot_settle_a_persisted_delete_intent_with_older_quiescence(ordinary_stop_case):
+    case = ordinary_stop_case
+    case.update(change=lambda data: data["vz_native"].update(stopped_delete={"phase": "attempted"}))
+    before = case.read()
+    marker = case.marker.read_bytes()
+    with pytest.raises(vz_native_runtime.VZNativeHold):
+        case.stop()
+    assert case.read() == before and case.marker.read_bytes() == marker
+    assert case.commands == []
+
+
+@pytest.mark.parametrize("when", ["before-delete", "after-delete"])
+def test_unrelated_ssh_port_reuse_does_not_hold_stopped_delete(stopped_delete_case, monkeypatch, when):
+    case = stopped_delete_case
+    delete = vz_native_runtime._lima
+    monkeypatch.setattr(vz_native_runtime, "_require_ssh_port_free", case.port_checker)
+    monkeypatch.setattr(vz_native_runtime, "_rendered_config", lambda _native: {"portForwards": []})
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as unrelated:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reservation:
+            reservation.bind(("127.0.0.1", 0))
+            port = reservation.getsockname()[1]
+        case.update(change=lambda data: data["vz_native"].update(ssh_local_port=port))
+
+        def occupy():
+            unrelated.bind(("127.0.0.1", port))
+            unrelated.listen(1)
+
+        def after_delete(*args, **kwargs):
+            delete(*args, **kwargs)
+            occupy()
+
+        if when == "before-delete":
+            occupy()
+        else:
+            monkeypatch.setattr(vz_native_runtime, "_lima", after_delete)
+        assert case.rm().current_status == "removed"
+    assert case.released == ["export", "lease", "root"]
+    assert not case.marker.exists() and len(case.commands) == 1
+
+
+@pytest.mark.parametrize("reload_seconds", [31, 301])
+def test_stopped_delete_observation_deadlines_exclude_full_authority_reload(
+    stopped_delete_case, monkeypatch, reload_seconds
+):
+    case = stopped_delete_case
+    clock = [0.0]
+    loader = vz_native_runtime._load_checked
+    observation = vz_native_runtime._stopped_delete_observation
+    deadlines = []
+
+    def slow_reload(*args, **kwargs):
+        result = loader(*args, **kwargs)
+        if case.pin_reads == 2:
+            clock[0] += reload_seconds
+        return result
+
+    def observe(*args, **kwargs):
+        deadlines.append(kwargs["deadline"])
+        return observation(*args, **kwargs)
+
+    monkeypatch.setattr(vz_native_runtime.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(vz_native_runtime, "_load_checked", slow_reload)
+    monkeypatch.setattr(vz_native_runtime, "_stopped_delete_observation", observe)
+    assert case.rm().current_status == "removed"
+    assert deadlines == [30, reload_seconds + 30]
+    assert case.released == ["export", "lease", "root"]
+    assert not case.marker.exists() and len(case.commands) == 1

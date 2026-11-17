@@ -4,6 +4,18 @@ All notable changes to Palimpsest Local are documented here.
 
 ## [Unreleased]
 
+### Fixed
+
+- Experimental native VZ: explicit `rm` can delete a proven-owned stopped run
+  retaining its original `stop-incomplete` HOLD, including the exact inactive
+  default-network socket pair. It does not promote an unclean stop to graceful
+  stopped state or enable start/capture. Full retained authority, actor/root
+  exclusivity, closed network and unchanged repeated observations remain required.
+  Refused admission preserves the original HOLD; uncertain provider deletion is
+  not replayed or settled by `stop`. Unrelated SSH port reuse does not block RM.
+  This local source change has regression cases but no new live
+  qualification, release or remote cleanup.
+
 ## [0.3.30] - 2026-11-17 (UTC)
 
 ### Changed
