@@ -56,7 +56,7 @@
               <label class="wide">Full commit SHA (required)<input id="image-job-revision" name="revision" required pattern="[0-9a-fA-F]{40}" maxlength="40" spellcheck="false"></label>
               <label>Context directory (required)<input id="image-job-context" name="context_subdir" required value="." maxlength="1024" spellcheck="false"></label>
               <label>Dockerfile path (required)<input id="image-job-path" name="dockerfile_path" required value="Dockerfile" maxlength="1024" spellcheck="false"></label>
-              <label class="wide">Credential reference <span class="hint">Optional operator-configured reference, never a token or password.</span><input id="image-job-credential" name="credential_ref" pattern="[A-Za-z0-9][A-Za-z0-9_.\-]{0,127}" maxlength="128" autocomplete="off"></label>
+              <label class="wide">Credential reference <span class="hint">Currently unsupported: the server refuses any supplied reference. Private Git authentication is not implemented. Leave empty; never enter a token or password.</span><input id="image-job-credential" name="credential_ref" pattern="[A-Za-z0-9][A-Za-z0-9_.\-]{0,127}" maxlength="128" autocomplete="off"></label>
             </fieldset>
             <fieldset id="image-job-registry-fields" class="wide form-grid" hidden disabled>
               <legend>Registry source</legend>

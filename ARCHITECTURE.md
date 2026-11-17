@@ -3010,6 +3010,12 @@ uv run python scripts/test_lanes.py run gate2
 
 ## Maintenance
 
+2026-11-17 console credential wording correction: checked `git_staging`'s
+pre-fetch refusal of every supplied `credential_ref`. The Git form and external
+contract now state that private Git authentication is unimplemented and
+fail-closed, with no anonymous fallback. The field and API descriptor remain
+unchanged; this is a wording correction, not private-Git support.
+
 2026-11-17 console0.3.32 review: traced the original-human image admission,
 job/publication receipts, instance control routes and unchanged lifecycle
 provider gates before adding UI controls. Reviewed the new asset allowlist,
@@ -4214,9 +4220,9 @@ Reserved names and duplicate listings (2026-11-15, from the commit-path review, 
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "b694b4adf0a74d465ab2273da8acf05aa5e8a1c02ff365e34ca92cfdc463f145",
-  "reviewed_at": "2026-11-17T12:22:18Z",
-  "summary": "Console0.3.32 review followup: browser Unicode-sets-safe name/credential patterns; Retry-After expiry updates controls only with connection guard and disconnect cancellation; previous restore report labelled pending; fenced services unchanged"
+  "source_sha256": "5e3a0eb58a003e42a87fb295be1632921d21ba498f2e63fb8277d0f2ef430709",
+  "reviewed_at": "2026-11-17T14:57:59Z",
+  "summary": "Console credential wording correction: private Git authentication remains unimplemented and credential_ref fails closed before fetching; form and API contract now explicit; request shape and runtime behavior unchanged"
 }
 ```
 <!-- architecture-review:end -->

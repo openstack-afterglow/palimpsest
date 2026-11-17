@@ -82,9 +82,12 @@ worker builds target `linux/amd64`.
 
 Git also requires `repo_url` (operator-allowed HTTPS host, no embedded
 credentials) and a full 40-hex `revision`. `context_subdir` defaults to `.` and
-`dockerfile_path` to `Dockerfile`; paths stay inside the checkout. Optional
-`credential_ref` names an operator-managed credential, never its value. The Git
-route is rate-limited to six requests per hour; respect 429, do not loop.
+`dockerfile_path` to `Dockerfile`; paths stay inside the checkout. The optional
+`credential_ref` field remains in the request schema, but the server currently
+refuses any supplied reference before fetching: private Git authentication is
+not implemented and fails closed, without falling back to anonymous fetch.
+Leave it unset; never supply a token or password. The Git route is rate-limited
+to six requests per hour; respect 429, do not loop.
 
 Registry requires `reference`. Dockerfile requires `dockerfile`, with optional
 `context_digest`, `target` and bounded `build_args`. For local files, first POST

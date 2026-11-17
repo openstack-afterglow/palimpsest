@@ -175,3 +175,12 @@ test("new image fields enforce valid Unicode-sets patterns used by browser const
     assert.equal(constraint.test("invalid/name"), false);
   }
 });
+
+test("Git credential help states the current fail-closed limitation without removing the API field", () => {
+  const html = asset("hub.html");
+  const label = html.match(/<label[^>]*>Credential reference[\s\S]*?<\/label>/)[0];
+  assert.match(label, /Currently unsupported: the server refuses any supplied reference/);
+  assert.match(label, /Private Git authentication is not implemented/);
+  assert.match(label, /Leave empty; never enter a token or password/);
+  assert.match(label, /name="credential_ref"/);
+});
