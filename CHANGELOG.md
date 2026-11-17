@@ -4,6 +4,19 @@ All notable changes to Palimpsest Local are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- Hub console stop for service/dev instances and dev-only resume, with the sealed
+  first result and latest restore report shown separately. In-flight controls
+  remain locked across refresh; retry headers and uncertain outcomes are surfaced
+  without automatic mutation repeats.
+- Console pinned-Git, registry and Dockerfile image-job submission, bounded status
+  polling, and completed output selection as a launchable playbook. Dockerfile
+  jobs can reference an existing uploaded context; context upload remains API/SDK.
+- Afterglow consumer API contract covering Keystone/project assertions, build and
+  lifecycle endpoints, state transitions, replay, retry semantics and monitoring
+  limits. No instance service, projection, schema or version changes.
+
 ## [0.3.31] - 2026-11-17 (UTC; prepared)
 
 Prepared source only: not published, deployed or live-verified. No schema change; 0.3.30 remains the deployed release.

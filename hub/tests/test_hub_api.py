@@ -2107,11 +2107,11 @@ async def test_legacy_upload_remains_private_to_its_original_member(tmp_path: Pa
 def test_app_assets_http_allowlist_includes_package_console_without_arbitrary_files(tmp_path, monkeypatch):
     from palimpsest_hub import main as hub_main
 
-    for asset in ("hub.js", "hub.css", "hub-packages.js", "hub-playbooks.js", "private.js"):
+    for asset in ("hub.js", "hub.css", "hub-packages.js", "hub-playbooks.js", "hub-image-jobs.js", "private.js"):
         (tmp_path / asset).write_text("fixture asset", encoding="utf-8")
     monkeypatch.setattr(hub_main, "_APP_FILES", tmp_path)
     client = TestClient(app)
-    for asset in ("hub.js", "hub.css", "hub-packages.js", "hub-playbooks.js"):
+    for asset in ("hub.js", "hub.css", "hub-packages.js", "hub-playbooks.js", "hub-image-jobs.js"):
         response = client.get("/app/" + asset)
         assert response.status_code == 200 and response.text == "fixture asset"
         assert response.headers["cache-control"] == "no-store"
@@ -3439,3 +3439,34 @@ async def test_rel312_adapted_delete_preserves_other_project_identical_layer(sto
         assert (outcome, grant is not None) == (409, True)
     finally:
         await engine.dispose()
+
+
+def test_afterglow_contract_endpoints_and_admission_schemas_are_served_by_running_app():
+    import re
+
+    response = TestClient(app).get("/openapi.json")
+    assert response.status_code == 200
+    schema = response.json()
+    assert schema == app.openapi()
+    document = (Path(__file__).resolve().parents[2] / "docs" / "afterglow-api-contract.md").read_text()
+    endpoints = re.findall(r"\| (GET|POST|PUT|DELETE) \| `(/v1/[^`]+)` \|", document)
+    assert len(endpoints) >= 20
+    for method, path in endpoints:
+        assert method.lower() in schema["paths"][path], (method, path)
+    assert schema["components"]["securitySchemes"]["KeystoneToken"]["name"] == "X-Auth-Token"
+    for path in ("/v1/me", "/v1/instances", "/v1/instances/{instance_id}/resume"):
+        operation = schema["paths"][path]["get" if path == "/v1/me" else "post"]
+        assert any("KeystoneToken" in item for item in operation["security"])
+        assert {item["name"] for item in operation["parameters"]} >= {"X-Auth-Token", "X-Project-Id"}
+    for path, fields in (
+        ("/v1/git-builds", {"request_id", "name", "repo_url", "revision", "os_family", "os_version"}),
+        ("/v1/registry-imports", {"request_id", "name", "reference", "os_family", "os_version"}),
+        ("/v1/dockerfile-builds", {"request_id", "name", "dockerfile", "os_family", "os_version"}),
+    ):
+        operation = schema["paths"][path]["post"]
+        body = operation["requestBody"]
+        assert body["required"] is True
+        assert set(body["content"]["application/json"]["schema"]["required"]) >= fields
+        assert "202" in operation["responses"]
+    context = schema["paths"]["/v1/build-contexts"]["post"]["requestBody"]["content"]
+    assert context["application/x-tar"]["schema"]["format"] == "binary"

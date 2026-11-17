@@ -223,6 +223,14 @@ Palimpsest Hub runs as a standalone FastAPI service on default port 8020 using t
 
 The console searches filtered, newest-first layer/image pages (`offset >= 0`, `1 <= limit <= 200`), verifies SHA-256 and size before saving downloads, and supports acknowledged-offset upload resume/status/abort with captured registration metadata. Original project tokens receive the role-appropriate operations; exact creator/key-bound cancellation of an unfinished upload remains write-tier rollback. Native `ppk_v1_…` credentials are a separate domain limited to five delegated package/cache read/write actions. They never gain key issuance/revocation, VM cleanup, package deletion, project switching or build admission. Connection changes cancel tab-controlled work without automatic re-publication.
 
+The working-source console also submits pinned Git, registry and Dockerfile
+image jobs, exposes completed output as selectable playbooks, and provides
+preserving Stop plus dev-only Resume with separate first/restore results.
+Actions never repeat automatically; retry headers distinguish not-applied
+admission from uncertain effects. See the
+[Afterglow consumer API contract](docs/afterglow-api-contract.md) for endpoints,
+authentication, state transitions, replay and monitoring limits.
+
 Hub's native `/v1` API stores Palimpsest boot images, SquashFS runtime blocks and bundles, with separate project-scoped package/BuildKit-cache APIs. Native package keys authorize only their delegated package/cache operations; legacy commands retain the original Keystone token. `POST /v1/builds` queues member-authorized project work and reader-authorized GET routes report only that project state. The retained HTTPS-only dedicated CPU service-VM executor performs direct recipe execution and API-registered private project outputs, with no nested/per-build KVM/libvirt or API-container recipe execution. Hub is not a Docker/OCI `/v2` registry; profiles explicitly select `palimpsest` or `oci` transport.
 
 ### Working-source Hub execution APIs

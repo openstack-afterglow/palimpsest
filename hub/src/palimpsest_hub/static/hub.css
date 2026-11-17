@@ -184,3 +184,16 @@ button.danger:hover { background: #fff1ef; }
 .layers .meta { color: #7b867d; }
 #playbook-detail h4 { font-size: 13px; margin: 0 0 10px; }
 #launch-reason { margin: 0 0 20px; }
+
+#image-job-form fieldset { min-width: 0; margin: 0; padding: 20px; border: 1px solid #d8ddd8; border-radius: 5px; }
+#image-job-form legend { padding: 0 8px; font-size: 14px; font-weight: 600; }
+#image-job-form input, #image-job-form textarea, #image-job-form select { min-width: 0; font-size: 16px; }
+#image-job-form .hint, #image-job-help { color: #626f65; line-height: 1.6; }
+#instance-list .row-main { flex: 1; overflow-wrap: anywhere; }
+#instance-list details { margin-top: 12px; font-size: 13px; }
+#instance-list summary { cursor: pointer; padding: 8px 0; }
+@media (max-width: 720px) {
+  #playbook-facts { grid-template-columns: 1fr; gap: 4px; }
+  #playbook-facts dt, #playbook-facts dd { grid-column: 1; }
+  #playbook-facts dd { margin-bottom: 12px; }
+}
