@@ -9,9 +9,9 @@
 "packages:manage_own": "role:member or role:manager or role:admin"
 "cache:read": "role:reader or role:member or role:manager or role:admin"
 "cache:write": "role:member or role:manager or role:admin"
-"keys:issue": "role:manager or role:admin"
+"keys:issue": "role:member or role:manager or role:admin"
 "keys:list": "role:reader or role:member or role:manager or role:admin"
-"keys:revoke": "role:manager or role:admin"
+"keys:revoke": "role:member or role:manager or role:admin"
 # Original Keystone token only; never another owner's key or bearer-key control.
 "keys:revoke_own": "role:reader or role:member or role:manager or role:admin"
 # A project admin/manager is not a system administrator. This check additionally

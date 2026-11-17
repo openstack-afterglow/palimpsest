@@ -1269,13 +1269,14 @@ async def test_standard_project_roles_publish_but_only_managers_manage(hub, role
     assert (await hub.client.get(base + "/packages", headers=member)).status_code == 200
     assert (await hub.client.get(base + "/keys", headers=member)).status_code == 200
     management = role in {"manager", "admin"}
+    # Package-key issuance is a member action; only deletion remains manager-only.
     assert (
         await hub.client.post(
             base + "/keys",
             headers=member,
             json={"name": "new", "scope": {"packages": ["test"]}, "actions": ["packages:read"]},
         )
-    ).status_code == (201 if management else 403)
+    ).status_code == 201
     assert (await hub.client.delete(base + "/keys/" + issued["key"]["key_id"], headers=member)).status_code == 204
     assert (await hub.client.get("/v1/auth/me", headers=key_headers)).status_code == 401
     assert (await hub.client.delete(base + "/package", params={"package": "test"}, headers=member)).status_code == (
@@ -1425,7 +1426,7 @@ async def test_key_control_rechecks_current_authority_at_commit(hub, monkeypatch
     async def downgrade(member, required, **kwargs):
         if required == action:
             if action == "keys:issue":
-                hub.people["one"]["roles"] = ["member"]
+                hub.people["one"]["roles"] = ["reader"]
             else:
                 hub.disabled.add(member["user_id"])
         return await original(member, required, **kwargs)
@@ -1494,15 +1495,16 @@ async def test_demoted_owner_can_revoke_only_own_key_with_original_token(hub, ro
     context = await hub.client.get("/v1/projects/current", headers=own)
     assert context.status_code == 200
     assert context.json()["capabilities"]["keys_revoke"] is True
-    assert context.json()["capabilities"]["keys_issue"] is False
+    assert context.json()["capabilities"]["keys_issue"] is (role == "member")
     assert (await hub.client.delete(base + "/" + issued["key"]["key_id"], headers=credential)).status_code == 401
+    # Owner-only for every tier that can revoke, including the member tier that now holds keys:revoke.
     assert (await hub.client.delete(base + "/" + issued["key"]["key_id"], headers=other)).status_code == 404
     denied = await hub.client.post(
         base,
         headers=own,
         json={"name": "cannot delegate", "scope": {"packages": ["test"]}, "actions": ["packages:read"]},
     )
-    assert denied.status_code == 403
+    assert denied.status_code == (201 if role == "member" else 403)
     assert (await hub.client.delete(base + "/" + issued["key"]["key_id"], headers=own)).status_code == 204
     assert (await hub.client.get("/v1/auth/me", headers=credential)).status_code == 401
 

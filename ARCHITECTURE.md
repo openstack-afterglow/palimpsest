@@ -292,9 +292,9 @@ VZ OCI-root runtime record the later state.
 Fresh native project roles, not custom operation roles, determine thirteen
 oslo-policy actions. Reader-or-above has visible inventory/content/cache reads,
 own-key metadata and original-token `keys:revoke_own`. Member-or-above adds
-publication/cache editing and `packages:manage_own` for only its recorded
-consumer/exclusive boot volume. Manager-or-above adds project management,
-package/layer/export deletion and key issuance/full owner-bound revocation.
+publication/cache editing, package-key issuance/full owner-bound revocation and
+`packages:manage_own` for only its recorded consumer/exclusive boot volume.
+Manager-or-above adds project management and package/layer/export deletion.
 Human system administration remains separately proved; project manager/admin
 does not create cross-project or other-private-creator authority.
 
@@ -4102,9 +4102,9 @@ Reserved names and duplicate listings (2026-11-15, from the commit-path review, 
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "a01397314340c87fe21652ab55216e5d1e3a7493348a4340882570f4ce3ccedb",
-  "reviewed_at": "2026-11-16T08:13:50Z",
-  "summary": "Record 2026-11-16 third/fourth owner-form results: M4-07 checked, M3-03/04/05 reverted after PR #115, M3-10 and M4-10 adjudications, defects and fix candidate"
+  "source_sha256": "268a7b62d2312f111a8a2d2a87165db66ff28e086b1257861a4f6d6bf9a019ea",
+  "reviewed_at": "2026-11-17T07:20:44Z",
+  "summary": "Merge dev 0.3.30 into the immutable block-layer design PR: examples/ and docs/design/ are the only added source, not imported by the product; dev side already reviewed in 0.3.30"
 }
 ```
 <!-- architecture-review:end -->

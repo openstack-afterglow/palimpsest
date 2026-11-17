@@ -921,7 +921,7 @@ async def test_global_catalog_targetless_policy_still_requires_native_human_syst
     "role,inventory,download,publish,issue,revoke",
     [
         ("reader", True, True, False, False, False),
-        ("member", True, True, True, False, False),
+        ("member", True, True, True, True, True),
         ("manager", True, True, True, True, True),
         ("admin", True, True, True, True, True),
         ("palimpsest_reader", False, False, False, False, False),
@@ -1010,7 +1010,7 @@ async def test_native_http_standard_role_and_legacy_denial_matrix(
     assert created_build.status_code == (422 if publish else 403), created_build.text
     assert (await h.client.post("/v1/builds", headers=credential, json=build)).status_code == 401
     assert (await h.client.delete("/v1/layers/" + body["root_digest"], headers=token)).status_code == (
-        404 if revoke else 403
+        404 if role in {"manager", "admin"} else 403
     )
     assert not any(event.get("methods") == ["token"] for event in h.identity["requests"])
 
@@ -2134,7 +2134,6 @@ async def test_native_policy_http_reload_controls_key_ceiling_without_inventory_
                 **dict.fromkeys(ACTIONS, "!"),
                 "packages:write": "role:member",
                 "cache:write": "role:member",
-                "keys:issue": "role:member",
             }
         )
     )
@@ -2482,9 +2481,9 @@ def test_policy_defaults_and_packaged_sample_enforce_native_tiers(tmp_path, monk
     if role != "palimpsest_admin":
         expected.update({"packages:inventory", "packages:read", "cache:read", "keys:list", "keys:revoke_own"})
     if role in {"member", "manager", "admin"}:
-        expected.update({"packages:write", "cache:write", "packages:manage_own"})
+        expected.update({"packages:write", "cache:write", "packages:manage_own", "keys:issue", "keys:revoke"})
     if role in {"manager", "admin"}:
-        expected.update({"packages:delete", "packages:manage", "keys:issue", "keys:revoke"})
+        expected.update({"packages:delete", "packages:manage"})
     assert policy.allowed_actions({role}, PROJECT_A, FEDERATED_OWNER) == expected
     # Exercise raw oslo decisions too: the hard native ceiling must not hide
     # a sample that accidentally advertises member management permissions.
@@ -3046,11 +3045,8 @@ async def test_openid_human_member_keeps_write_without_project_management(keysto
     keystone_http["token_methods"] = methods
     member = await get_package_member_info(validate_token(ORIGINAL_SUBJECT))
     assert member["can_write"]
-    assert {"packages:write", "cache:write", "keys:list"} <= member["package_actions"]
-    assert (
-        not {"packages:delete", "packages:manage", "keys:issue", "keys:revoke", "system:manage"}
-        & member["package_actions"]
-    )
+    assert {"packages:write", "cache:write", "keys:list", "keys:issue", "keys:revoke"} <= member["package_actions"]
+    assert not {"packages:delete", "packages:manage", "system:manage"} & member["package_actions"]
     assert not any(event.get("methods") == ["token"] for event in keystone_http["requests"])
 
 
@@ -3085,7 +3081,7 @@ async def test_policy_allow_cannot_uplift_native_role_ceiling(native_http, tmp_p
         else set()
     )
     if role == "member":
-        expected.update({"packages:write", "cache:write", "packages:manage_own"})
+        expected.update({"packages:write", "cache:write", "packages:manage_own", "keys:issue", "keys:revoke"})
     assert projection.status_code == 200 and set(projection.json()["actions"]) == expected
     assert (await h.client.post("/v1/uploads", headers=token, json={})).status_code == (
         200 if role == "member" else 403
@@ -3150,17 +3146,17 @@ async def test_core_personal_member_ignores_irrelevant_raw_project_provenance(ke
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "issued,current,management",
+    "issued,current,management,keys",
     [
-        ("member", "manager", False),
-        ("manager", "member", False),
-        ("reader", "manager", False),
-        ("manager", "reader", False),
-        ("manager", "manager", True),
+        ("member", "manager", False, True),
+        ("manager", "member", False, True),
+        ("reader", "manager", False, False),
+        ("manager", "reader", False, False),
+        ("manager", "manager", True, True),
     ],
 )
 async def test_original_token_and_current_owner_intersection_cannot_promote_manager(
-    keystone_http, issued, current, management
+    keystone_http, issued, current, management, keys
 ):
     from palimpsest_hub.policy import MANAGE_ACTIONS
 
@@ -3169,7 +3165,7 @@ async def test_original_token_and_current_owner_intersection_cannot_promote_mana
     original = validate_token(ORIGINAL_SUBJECT)
     member = await get_package_member_info(original)
     assert bool(MANAGE_ACTIONS & member["package_actions"]) is management
-    assert ("keys:issue" in member["package_actions"]) is management
+    assert ("keys:issue" in member["package_actions"]) is keys
     assert "system:manage" not in member["package_actions"]
     assert member["roles"] == [issued]
 
@@ -3183,7 +3179,9 @@ async def test_native_manager_implication_withdrawal_cannot_leave_stored_manager
     keystone_http["edges"]["project_manager"] = ["member"]
     reduced = await get_package_member_info(original)
     assert "packages:write" in reduced["package_actions"]
-    assert not {"packages:delete", "packages:manage", "keys:issue", "keys:revoke"} & reduced["package_actions"]
+    # Member-level key issuance survives; only the manager-only actions are withdrawn.
+    assert {"keys:issue", "keys:revoke"} <= reduced["package_actions"]
+    assert not {"packages:delete", "packages:manage"} & reduced["package_actions"]
 
 
 @pytest.mark.asyncio
