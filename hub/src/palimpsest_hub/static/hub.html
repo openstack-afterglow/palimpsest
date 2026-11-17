@@ -8,6 +8,7 @@
   <script defer src="/app/hub.js"></script>
   <script defer src="/app/hub-packages.js"></script>
   <script defer src="/app/hub-playbooks.js"></script>
+  <script defer src="/app/hub-image-jobs.js"></script>
 </head>
 <body>
   <header class="masthead"><div class="brand">PALIMPSEST <span>/ HUB</span></div><a href="/docs">API reference ↗</a></header>
@@ -40,6 +41,38 @@
       <section id="build" class="panel">
         <div class="panel-heading"><div><p class="eyebrow">SERVER BUILD</p><h2>Build a layer</h2></div><p>Requires current project member authority and a configured isolated host worker; readers can view project build status. No recipe runs in the API process.</p></div>
         <form id="build-form" class="form-grid"><label>Output name<input id="build-name" required pattern="[a-z0-9][a-z0-9.+-]{0,63}" placeholder="service-base"></label><label>Cloud-image digest<input id="build-base" required pattern="sha256:[0-9a-fA-F]{64}" placeholder="sha256:…"></label><label class="wide">Parent layer digests <span class="hint">Root first; leave empty for a base-only build.</span><textarea id="build-layers" rows="2" placeholder="sha256:…"></textarea></label><label class="wide">Palimpsestfile <span class="hint">FROM and LAYER must match the digests above. RUN executes inside the guest with network disabled.</span><textarea id="build-recipe" rows="7" required spellcheck="false" placeholder="FROM sha256:…&#10;RUN echo ready > /opt/ready"></textarea></label><div class="wide actions"><button type="submit">Queue build</button></div></form><p id="build-message" role="status"></p>
+        <div class="native-section">
+          <h3 id="image-job-heading">Build a playbook</h3>
+          <p id="image-job-help" class="hint">Git builds need an allowed HTTPS repository and a full 40-character commit. Successful jobs publish an image under the chosen name and audience, subject to quota. Builds target linux/amd64. No credentials belong in URLs or Dockerfiles.</p>
+          <form id="image-job-form" class="form-grid" aria-labelledby="image-job-heading" aria-describedby="image-job-help" method="post" action="/v1/git-builds">
+            <label>Source<select id="image-job-kind" name="kind"><option value="git">Pinned Git repository</option><option value="registry">Registry import</option><option value="dockerfile">Dockerfile</option></select></label>
+            <label>Name (required)<input id="image-job-name" name="name" required pattern="[a-z0-9][a-z0-9.+\-]{0,63}" placeholder="service-playbook"></label>
+            <label>Audience<select id="image-job-visibility" name="visibility"><option value="private">private: only you</option><option value="internal">internal: project members</option><option value="public">public: anyone</option></select></label>
+            <label>OS family (required)<input id="image-job-os-family" name="os_family" required maxlength="128" placeholder="ubuntu"></label>
+            <label>OS version (required)<input id="image-job-os-version" name="os_version" required maxlength="128" placeholder="24.04"></label>
+            <fieldset id="image-job-git-fields" class="wide form-grid">
+              <legend>Pinned Git source</legend>
+              <label class="wide">Repository HTTPS URL (required)<input id="image-job-repo" name="repo_url" type="url" required maxlength="2048" spellcheck="false" placeholder="https://github.com/example/project.git"></label>
+              <label class="wide">Full commit SHA (required)<input id="image-job-revision" name="revision" required pattern="[0-9a-fA-F]{40}" maxlength="40" spellcheck="false"></label>
+              <label>Context directory (required)<input id="image-job-context" name="context_subdir" required value="." maxlength="1024" spellcheck="false"></label>
+              <label>Dockerfile path (required)<input id="image-job-path" name="dockerfile_path" required value="Dockerfile" maxlength="1024" spellcheck="false"></label>
+              <label class="wide">Credential reference <span class="hint">Currently unsupported: the server refuses any supplied reference. Private Git authentication is not implemented. Leave empty; never enter a token or password.</span><input id="image-job-credential" name="credential_ref" pattern="[A-Za-z0-9][A-Za-z0-9_.\-]{0,127}" maxlength="128" autocomplete="off"></label>
+            </fieldset>
+            <fieldset id="image-job-registry-fields" class="wide form-grid" hidden disabled>
+              <legend>Registry source</legend>
+              <label class="wide">Image reference (required)<input id="image-job-reference" name="reference" required maxlength="512" spellcheck="false" placeholder="docker.io/library/ubuntu:24.04"></label>
+            </fieldset>
+            <fieldset id="image-job-dockerfile-fields" class="wide form-grid" hidden disabled>
+              <legend>Dockerfile source</legend>
+              <label class="wide">Dockerfile (required)<textarea id="image-job-dockerfile" name="dockerfile" required rows="6" maxlength="1048576" spellcheck="false" placeholder="FROM ubuntu:24.04&#10;CMD [&quot;/bin/true&quot;]"></textarea></label>
+              <label class="wide">Existing context digest <span class="hint">Optional tar uploaded with POST /v1/build-contexts (see API reference). Leave empty for a build without local files.</span><input id="image-job-context-digest" name="context_digest" pattern="sha256:[0-9a-fA-F]{64}" spellcheck="false"></label>
+            </fieldset>
+            <div class="wide actions"><button type="submit" id="image-job-submit">Submit image job</button><span class="hint">Submission is explicit. Only status reads repeat automatically.</span></div>
+          </form>
+          <p id="image-job-message" role="status"></p>
+          <div class="list-heading"><h3>Your image jobs (newest 100)</h3><button type="button" class="secondary" id="refresh-image-jobs">Refresh jobs</button></div>
+          <div id="image-job-list" class="rows" aria-live="polite"></div>
+        </div>
         <div class="list-heading"><h3>Recent builds</h3><button type="button" class="secondary" id="refresh-builds">Refresh</button></div><div id="build-list" class="rows" aria-live="polite"></div>
       </section>
       <section id="playbooks" class="panel">

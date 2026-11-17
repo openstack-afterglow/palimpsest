@@ -281,7 +281,7 @@ async def hub_console() -> FileResponse:
 
 @app.get("/app/{asset}", include_in_schema=False)
 async def hub_console_asset(asset: str) -> FileResponse:
-    if asset not in {"hub.css", "hub.js", "hub-packages.js", "hub-playbooks.js"}:
+    if asset not in {"hub.css", "hub.js", "hub-packages.js", "hub-playbooks.js", "hub-image-jobs.js"}:
         raise HTTPException(status_code=404)
     return FileResponse(_APP_FILES / asset, headers=_APP_HEADERS)
 

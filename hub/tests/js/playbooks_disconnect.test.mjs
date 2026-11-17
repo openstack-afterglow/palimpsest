@@ -28,7 +28,7 @@ class Element {
   }
 }
 
-function dashboard() {
+function dashboard({ rows = [], mutate = async () => ({}), clock = () => 0 } = {}) {
   const ids = [
     "playbook-list", "playbook-facts", "playbook-layers", "playbook-title", "playbook-detail",
     "playbook-message", "launch-form", "launch-submit", "launch-reason", "launch-message",
@@ -46,6 +46,8 @@ function dashboard() {
     output_digests: [`sha256:${"a".repeat(64)}`],
   };
   const requests = [];
+  const timers = new Map();
+  let timerId = 0;
   let resolveCreate, rejectCreate;
   const create = new Promise((resolve, reject) => { resolveCreate = resolve; rejectCreate = reject; });
   let version = 0, caller = null;
@@ -70,7 +72,11 @@ function dashboard() {
     json: async (path, options) => {
       if (path === "/image-jobs?limit=100") return [job];
       if (path === "/published-images?limit=200&offset=0") return { items: [] };
-      if (path === "/instances?limit=50") return [];
+      if (path === "/instances?limit=50") return rows;
+      if (path.startsWith("/instances/")) {
+        requests.push({ path, ...options });
+        return mutate(path, options);
+      }
       if (path === "/instance-options") return {
         images: [{ id: "boot-1", min_disk_gib: 2, size_bytes: 1024, disk_format: "qcow2" }],
         flavors: [{ id: "flavor-1", vcpus: 2, ram_mib: 4096 }],
@@ -86,11 +92,16 @@ function dashboard() {
     onDisconnect: [],
   };
   let issued = 0;
-  const window = { Hub, crypto: { randomUUID: () => `request-${++issued}` }, setTimeout, clearTimeout };
-  vm.runInContext(source, vm.createContext({ document: { getElementById: get }, window }), { filename: "hub-playbooks.js" });
+  const window = {
+    Hub, crypto: { randomUUID: () => `request-${++issued}` },
+    confirm: () => true, prompt: () => rows[0]?.name,
+    setTimeout: (fn) => { timers.set(++timerId, fn); return timerId; },
+    clearTimeout: (id) => timers.delete(id),
+  };
+  vm.runInContext(source, vm.createContext({ document: { getElementById: get }, window, Date: { now: clock } }), { filename: "hub-playbooks.js" });
 
   return {
-    get, requests, resolveCreate, rejectCreate,
+    get, requests, resolveCreate, rejectCreate, timers, Hub,
     async connect() {
       version++;
       caller = { project_id: "project-1", capabilities: { upload: true, inventory: true } };
@@ -162,3 +173,137 @@ for (const outcome of ["resolve", "reject"]) {
     assert.notEqual(JSON.parse(page.requests[1].body).request_id, JSON.parse(page.requests[0].body).request_id);
   });
 }
+
+function instance(overrides = {}) {
+  return {
+    id: "vm-1", name: "demo", status: "ready", lifecycle: "dev", server_id: "server-1",
+    provider_phase: "server_attempted", boot_volume_id: "volume-1", server_create_attempted: true,
+    image_job_id: "job-1", ...overrides,
+  };
+}
+function buttons(page) { return page.get("instance-list").children[0].children[1].children; }
+function button(page, label) { return buttons(page).find((item) => item.textContent === label); }
+const settled = () => new Promise(setImmediate);
+
+for (const lifecycle of ["dev", "service"]) {
+  test(`console stops ${lifecycle} once and only dev can resume`, async () => {
+    const row = instance({ lifecycle }), page = dashboard({
+      rows: [row],
+      mutate: async (path, options) => {
+        if (options?.method === "POST") {
+          assert.equal(path, "/instances/vm-1/stop");
+          row.status = "stopped";
+        }
+        return row;
+      },
+    });
+    await page.connect();
+    await button(page, "Stop").dispatch("click"); await settled();
+    assert.equal(page.requests.filter((request) => request.method === "POST").length, 1);
+    assert.equal(!!button(page, "Resume"), lifecycle === "dev");
+    assert.equal(!!button(page, "Stop"), false);
+    page.disconnect();
+  });
+}
+
+test("resume polls a new restore result without replacing the sealed result", async () => {
+  const row = instance({ status: "shelved", result: { stdout: "first" } });
+  let reads = 0;
+  const page = dashboard({
+    rows: [row],
+    mutate: async (path, options) => {
+      if (options?.method === "POST") {
+        assert.equal(path, "/instances/vm-1/resume");
+        row.status = "resumed";
+      } else {
+        reads++;
+        row.status = "ready"; row.resume_result = { stdout: "restored marker" };
+      }
+      return row;
+    },
+  });
+  await page.connect();
+  await button(page, "Resume").dispatch("click"); await settled();
+  assert.equal(reads, 1);
+  const details = page.get("instance-list").children[0].children[0].children.filter((item) => item.children[0]?.textContent.includes("result"));
+  assert.deepEqual(details.map((item) => item.children[0].textContent), ["First result (sealed)", "Latest resume result"]);
+  assert.match(details[0].children[1].textContent, /first/);
+  assert.match(details[1].children[1].textContent, /restored marker/);
+  assert.equal(page.requests.filter((request) => request.method === "POST").length, 1);
+  page.disconnect();
+});
+
+for (const [status, retryAfter] of [[409, "10"], [503, "1"]]) {
+  test(`${status} honours Retry-After through refresh without repeating resume`, async () => {
+    let now = 0;
+    const row = instance({ status: "shelved" });
+    const page = dashboard({
+      rows: [row], clock: () => now,
+      mutate: async () => { throw Object.assign(new Error(`${status} conflict`), { status, retryAfter }); },
+    });
+    await page.connect();
+    await button(page, "Resume").dispatch("click"); await settled();
+    await page.get("refresh-instances").dispatch("click");
+    assert.equal(button(page, "Resume").disabled, true);
+    assert.equal(page.requests.length, 1);
+    assert.equal(page.timers.size, 1, "Cooldown schedules only a control update");
+    now = Number(retryAfter) * 1000;
+    const release = [...page.timers.values()][0]; page.timers.clear(); release();
+    assert.equal(button(page, "Resume").disabled, false);
+    assert.equal(page.requests.length, 1, "Releasing controls never reads or reissues the action");
+    page.disconnect();
+  });
+}
+
+test("in-flight mutation survives row refresh and disconnect cannot affect a new connection", async () => {
+  let finish;
+  const row = instance();
+  const page = dashboard({ rows: [row], mutate: () => new Promise((resolve) => { finish = resolve; }) });
+  await page.connect();
+  await button(page, "Stop").dispatch("click");
+  await page.get("refresh-instances").dispatch("click");
+  assert.equal(button(page, "Stop").disabled, true);
+  assert.equal(button(page, "Delete").disabled, true);
+  page.disconnect(); await page.connect();
+  finish(row); await settled();
+  assert.equal(page.get("instance-message").textContent, "");
+  assert.equal(button(page, "Stop").disabled, false);
+  assert.equal(page.requests.length, 1);
+  page.disconnect();
+});
+
+test("completed job output selects its playbook and loads launch choices", async () => {
+  const page = dashboard();
+  await page.connect();
+  await page.Hub.selectPlaybook("job-1"); await settled();
+  assert.equal(page.get("playbook-title").textContent, "Own playbook");
+  assert.equal(page.get("launch-form").hidden, false);
+  assert.equal(page.get("launch-image").options.length, 2);
+  page.disconnect();
+});
+
+test("pending restore labels the retained report as previous and preserves the first result", async () => {
+  const row = instance({ status: "resumed", result: { stdout: "first" }, resume_result: { stdout: "previous cycle" } });
+  const page = dashboard({ rows: [row], mutate: async () => row });
+  await page.connect();
+  const details = page.get("instance-list").children[0].children[0].children.filter((item) => item.children[0]?.textContent.includes("result"));
+  assert.equal(details[0].children[0].textContent, "First result (sealed)");
+  assert.equal(details[1].children[0].textContent, "Previous resume result (new report pending)");
+  assert.match(details[1].children[1].textContent, /previous cycle/);
+  page.disconnect();
+});
+
+test("disconnect cancels cooldown rendering and stale timers cannot alter a new connection", async () => {
+  const row = instance({ status: "shelved" });
+  const page = dashboard({ rows: [row], mutate: async () => { throw Object.assign(new Error("busy"), { retryAfter: "10" }); } });
+  await page.connect(); await button(page, "Resume").dispatch("click"); await settled();
+  const release = [...page.timers.values()][0];
+  assert.equal(page.timers.size, 1);
+  page.disconnect();
+  assert.equal(page.timers.size, 0);
+  await page.connect(); release();
+  assert.equal(button(page, "Resume").disabled, false);
+  assert.equal(page.get("instance-message").textContent, "");
+  assert.equal(page.requests.length, 1);
+  page.disconnect();
+});

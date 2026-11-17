@@ -169,7 +169,13 @@ async function api(path, options = {}) {
       check();
       detail = typeof body.detail === "string" ? body.detail : body.detail?.message || body.error?.message || JSON.stringify(body.detail || body.error || body);
     } catch (error) { check(); }
-    throw Object.assign(new Error(`${response.status}: ${detail}`), { status: response.status, path });
+    const retryAfter = response.headers.get("Retry-After");
+    const mutation = !["GET", "HEAD"].includes((options.method || "GET").toUpperCase());
+    let guidance = retryAfter ? ` Retry-After: ${retryAfter}.` : "";
+    if (mutation && response.status === 409 && retryAfter === "10") guidance += " Request not applied. Wait at least 10 seconds, then check provider state before another explicit attempt.";
+    else if (mutation && response.status >= 500) guidance += " Outcome unknown. Reconcile state before deciding any further action; do not blindly repeat this request.";
+    if (mutation) guidance += " No automatic repeat was sent.";
+    throw Object.assign(new Error(`${response.status}: ${detail}${guidance}`), { status: response.status, path, retryAfter });
   }
   return response;
 }

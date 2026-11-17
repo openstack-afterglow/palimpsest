@@ -11,10 +11,11 @@
     internal: "internal: members of the owning project",
     public: "public: anyone, including anonymous readers",
   };
-  const moving = new Set(["preparing", "booting", "stopping", "deleting"]);
+  const moving = new Set(["preparing", "booting", "stopping", "deleting", "resumed"]);
   const gib = 1024 ** 3;
   let playbooks = [], selected = null, choices = null, instances = [], pending = null, timer = null;
   let playbookVersion = 0, instanceVersion = 0, quietRounds = 0, lastSeen = "";
+  const busy = new Set(), retryAt = new Map(), retryTimers = new Map();
 
   function same(left, right) { return left.length === right.length && left.every((item, index) => item === right[index]); }
   function size(bytes) {
@@ -197,14 +198,35 @@
   }
 
   // One request per click: the button stays disabled until the answer is shown and the list is read again.
-  async function instanceCall(button, text, call) {
+  async function instanceCall(button, text, call, row = null) {
     const version = connection(), check = guard(version);
+    if (row && (busy.has(row.id) || Date.now() < (retryAt.get(row.id) || 0))) return;
     button.disabled = true;
+    if (row) { busy.add(row.id); renderInstances(); }
     try {
       const result = await call(); check();
       message("instance-message", text(result));
       await listInstances();
-    } catch (error) { report(version, "instance-message", error); if (version === connection()) button.disabled = false; }
+    } catch (error) {
+      report(version, "instance-message", error);
+      if (row && version === connection() && error.retryAfter) {
+        const seconds = Number(error.retryAfter);
+        if (Number.isFinite(seconds) && seconds > 0) {
+          retryAt.set(row.id, Date.now() + seconds * 1000);
+          window.clearTimeout(retryTimers.get(row.id));
+          retryTimers.set(row.id, window.setTimeout(() => {
+            if (version !== connection()) return;
+            retryTimers.delete(row.id);
+            renderInstances();
+          }, seconds * 1000));
+        }
+      }
+    } finally {
+      if (version === connection()) {
+        if (row) { busy.delete(row.id); renderInstances(); }
+        else button.disabled = false;
+      }
+    }
   }
   function advance(row, operation) {
     return json(`/instances/${row.id}/advance`, bodyOptions("POST", { operation, request_id: row.request_id, boot_volume_id: row.boot_volume_id }));
@@ -212,11 +234,24 @@
   function removeInstance(row, button) {
     const typed = window.prompt(`Deleting a VM removes its server and its private writable data. Type the VM name to confirm.\n${row.name}`);
     if (typed !== row.name) return;
-    instanceCall(button, () => `Delete requested for ${row.name}. No request is repeated automatically.`, () => json(`/instances/${row.id}`, { method: "DELETE" }));
+    instanceCall(button, () => `Delete requested for ${row.name}. No request is repeated automatically.`, () => json(`/instances/${row.id}`, { method: "DELETE" }), row);
   }
   function started(row, result) {
     if (result.server_create_attempted) return `Server requested for ${row.name}.`;
     return `No server was requested for ${row.name}${result.error_code ? `: ${result.error_code}` : ""}.`;
+  }
+  function stopInstance(row, button) {
+    if (!window.confirm(`Stop ${row.name}? Its writable data is retained.${row.lifecycle === "service" ? " A stopped service cannot resume; delete it when finished." : " Dev resume requires retained successful execution state. Without it, this stop is one-way; delete the VM when finished."}`)) return;
+    instanceCall(button, () => `Stop requested for ${row.name}. Writable data is retained.`, () => json(`/instances/${row.id}/stop`, { method: "POST" }), row);
+  }
+  function showResults(row, container) {
+    const restoreLabel = row.status === "resumed" ? "Previous resume result (new report pending)" : "Latest resume result";
+    for (const [label, result] of [["First result (sealed)", row.result], [restoreLabel, row.resume_result]]) {
+      if (!result) continue;
+      const detail = node("details", "");
+      detail.append(node("summary", label), node("pre", JSON.stringify(result, null, 2), "descriptor"));
+      container.append(detail);
+    }
   }
   async function showConnection(row, container) {
     const version = connection(), check = guard(version);
@@ -235,16 +270,34 @@
       left.append(node("strong", row.name), node("span", row.status, `status ${["error", "uncertain"].includes(row.status) ? "error" : moving.has(row.status) ? "building" : ""}`));
       for (const text of describe(row)) left.append(node("div", text, "meta"));
       left.append(node("code", row.id), details);
+      showResults(row, left);
+      const mutate = (label, text, call, style = "") => {
+        const button = action(label, (event) => instanceCall(event.currentTarget, text, call, row), style);
+        button.disabled = busy.has(row.id) || Date.now() < (retryAt.get(row.id) || 0);
+        buttons.append(button);
+      };
       if (row.provider_phase === "volume_ready" && row.server_create_attempted === false && row.boot_volume_id) {
-        buttons.append(action("Start server", (event) => instanceCall(event.currentTarget, (result) => started(row, result), () => advance(row, "create-server")), ""));
+        mutate("Start server", (result) => started(row, result), () => advance(row, "create-server"));
       }
       if (row.provider_phase === "delete_volume_ready" && row.boot_volume_id) {
-        buttons.append(action("Remove boot volume", (event) => instanceCall(event.currentTarget, () => `Boot volume removal requested for ${row.name}.`, () => advance(row, "delete-volume")), "danger"));
+        mutate("Remove boot volume", () => `Boot volume removal requested for ${row.name}.`, () => advance(row, "delete-volume"), "danger");
+      }
+      if (row.server_id && ["ready", "error", "booting", "resumed"].includes(row.status)) {
+        const button = action("Stop", (event) => stopInstance(row, event.currentTarget), "danger");
+        button.disabled = busy.has(row.id) || Date.now() < (retryAt.get(row.id) || 0);
+        buttons.append(button);
+      }
+      if (row.server_id && row.lifecycle === "dev" && ["shelved", "stopped"].includes(row.status)) {
+        mutate("Resume", () => `Resume requested for ${row.name}. Watch Latest resume result; the first result stays sealed.`, () => json(`/instances/${row.id}/resume`, { method: "POST" }));
       }
       // Reading one VM records what the provider reports now; it requests nothing.
       buttons.append(action("Check provider", (event) => instanceCall(event.currentTarget, (result) => `${row.name}: ${result.status}; ${describe(result)[0]}.`, () => json(`/instances/${row.id}`))));
       if (row.server_id && row.status !== "deleting") buttons.append(action("Connection", () => showConnection(row, details)));
-      if (row.status !== "deleting") buttons.append(action("Delete", (event) => removeInstance(row, event.currentTarget), "danger"));
+      if (row.status !== "deleting") {
+        const button = action("Delete", (event) => removeInstance(row, event.currentTarget), "danger");
+        button.disabled = busy.has(row.id) || Date.now() < (retryAt.get(row.id) || 0);
+        buttons.append(button);
+      }
       line.append(left, buttons); container.append(line);
     }
     const gone = instances.length - live.length;
@@ -310,10 +363,21 @@
   $("refresh-playbooks").addEventListener("click", listPlaybooks);
   $("refresh-instances").addEventListener("click", () => listInstances());
 
+  window.Hub.selectPlaybook = async (id) => {
+    const check = guard(connection());
+    await listPlaybooks(); check();
+    const playbook = playbooks.find((item) => item.id === id);
+    if (!playbook) throw new Error("Job output is not in the visible playbook list. Refresh playbooks or check its publication receipt.");
+    showPlaybook(playbook);
+    $("playbook-detail").scrollIntoView({ block: "nearest" });
+  };
   window.Hub.onConnect.push(() => Promise.all([listPlaybooks(), listInstances()]));
   window.Hub.onDisconnect.push(() => {
     window.clearTimeout(timer);
     playbooks = []; selected = null; choices = null; instances = []; pending = null; playbookVersion++; instanceVersion++;
+    busy.clear(); retryAt.clear();
+    for (const timer of retryTimers.values()) window.clearTimeout(timer);
+    retryTimers.clear();
     quietRounds = 0; lastSeen = "";
     $("playbook-list").replaceChildren(); $("instance-list").replaceChildren(); $("playbook-detail").hidden = true;
     $("launch-submit").disabled = false;
