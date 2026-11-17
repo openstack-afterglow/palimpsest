@@ -3020,6 +3020,13 @@ capture gains recovery authority. This changes the M3-09 removal contract, not
 the commit adapter or capture policy. Local checks and independent review are
 reported separately; no live proof, publication, deployment or remote cleanup.
 
+Independent review of `1e35331` found a P2 availability defect: the first
+30-second observation window also covered the full source/boot authority reload,
+which can hash and decompress large image layers. Each repeated resource
+observation now receives its own 30-second window, with the full reload between
+them. Both observations and their exact comparison remain mandatory. Regression
+cases simulate 31- and 301-second reloads without weakening observation bounds.
+
 2026-11-15 local unclean native VZ stop review: traced `_load_checked`, ordinary
 stop settlement, failed-start endpoint pins and canonical RM. Added a distinct
 stop-incomplete destruction-only branch rather than weakening quiescence or
@@ -4152,9 +4159,9 @@ Reserved names and duplicate listings (2026-11-15, from the commit-path review, 
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "a5fbf156f6cc289ad1058c125c0b88249adf723aa2414e5ab8e1f7d29c2b937c",
-  "reviewed_at": "2026-11-17T09:44:29Z",
-  "summary": "Reviewed d8d2717 rebased onto 79507f3: exact stop-incomplete HOLD destruction only; repeated provider/actor/network/root proofs and one-shot RM; commit adapter unchanged and stopped_delete defaults false; no live proof or release"
+  "source_sha256": "9fe269c9140468d2393921d261bd8438256ec98764adc1f765b20eef549eafa4",
+  "reviewed_at": "2026-11-17T09:59:47Z",
+  "summary": "Reviewed rebased RM-only HOLD destruction and independent P2 correction: separate 30-second resource observation windows exclude full retained-source reload; commit adapter/default path unchanged; no live proof or release"
 }
 ```
 <!-- architecture-review:end -->

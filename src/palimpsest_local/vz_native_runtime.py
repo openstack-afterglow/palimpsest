@@ -3952,13 +3952,18 @@ def rm_oci_run(roots, name, *, expected_record=None):
             )
             native = data["vz_native"]
             if stopped_delete:
-                delete_deadline = time.monotonic() + 30
                 delete_observation = _stopped_delete_observation(
-                    authority, roots, config, custody, data, deadline=delete_deadline
+                    authority, roots, config, custody, data, deadline=time.monotonic() + 30
                 )
                 _load_checked(authority, roots, config, custody, allow_expired=True, data=data, stopped_delete=True)
                 _stopped_delete_observation(
-                    authority, roots, config, custody, data, previous=delete_observation, deadline=delete_deadline
+                    authority,
+                    roots,
+                    config,
+                    custody,
+                    data,
+                    previous=delete_observation,
+                    deadline=time.monotonic() + 30,
                 )
                 if _stopped_delete_hold(authority, config, data) != cleanup_hold:
                     raise VZNativeHold("native VZ stopped deletion original HOLD changed during observation")

@@ -2260,3 +2260,32 @@ def test_unrelated_ssh_port_reuse_does_not_hold_stopped_delete(stopped_delete_ca
         assert case.rm().current_status == "removed"
     assert case.released == ["export", "lease", "root"]
     assert not case.marker.exists() and len(case.commands) == 1
+
+
+@pytest.mark.parametrize("reload_seconds", [31, 301])
+def test_stopped_delete_observation_deadlines_exclude_full_authority_reload(
+    stopped_delete_case, monkeypatch, reload_seconds
+):
+    case = stopped_delete_case
+    clock = [0.0]
+    loader = vz_native_runtime._load_checked
+    observation = vz_native_runtime._stopped_delete_observation
+    deadlines = []
+
+    def slow_reload(*args, **kwargs):
+        result = loader(*args, **kwargs)
+        if case.pin_reads == 2:
+            clock[0] += reload_seconds
+        return result
+
+    def observe(*args, **kwargs):
+        deadlines.append(kwargs["deadline"])
+        return observation(*args, **kwargs)
+
+    monkeypatch.setattr(vz_native_runtime.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(vz_native_runtime, "_load_checked", slow_reload)
+    monkeypatch.setattr(vz_native_runtime, "_stopped_delete_observation", observe)
+    assert case.rm().current_status == "removed"
+    assert deadlines == [30, reload_seconds + 30]
+    assert case.released == ["export", "lease", "root"]
+    assert not case.marker.exists() and len(case.commands) == 1
