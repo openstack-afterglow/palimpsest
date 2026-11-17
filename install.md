@@ -1,18 +1,18 @@
 # Install Palimpsest
 
 Palimpsest requires Python 3.11 or newer. This source prepares
-[`palimpsest-client 0.3.31`](https://pypi.org/project/palimpsest-client/0.3.31/)
-(prepared; not published, deployed or live-verified). Version 0.3.30 remains the deployed release.
-It contains both Hub dev-resume/contention fixes and the native-VZ client destruction-only RM fix (#119, original `d8d2717`); the latter has local-test evidence only and does not enable start/capture or graceful-stop adoption.
+[`palimpsest-client 0.3.32`](https://pypi.org/project/palimpsest-client/0.3.32/)
+(prepared; not published, deployed or live-verified). Version 0.3.31 remains the deployed release.
+It adds console stop/resume and image-build submission, the Afterglow API contract, subject image-quota overrides and destruction-only native-VZ carrier-ctime RM.
 Publication and deployment are separate. After formal publication, install exact bytes in isolation:
 
 ```sh
-uv tool install --python 3.11 "palimpsest-client==0.3.31"
+uv tool install --python 3.11 "palimpsest-client==0.3.32"
 palimpsest --version
 
 # Or use pip, without changing system Python:
 python3.11 -m venv .venv
-.venv/bin/python -m pip install "palimpsest-client==0.3.31"
+.venv/bin/python -m pip install "palimpsest-client==0.3.32"
 .venv/bin/palimpsest --version
 ```
 
@@ -30,12 +30,17 @@ upgrade does not publish or roll out Hub images.
 
 Publication, deployment-server package selection and actual running services are
 separate gates; use the [latest release/operator handoff](docs/development-handoff.md)
-for their exact receipts. Installing the 0.3.31 client does not activate native
+for their exact receipts. Installing the 0.3.32 client does not activate native
 profiles, provision Ceph credentials, or deploy the matching Hub containers.
-The [0.3.31 transition note](docs/install.md#0331-transition-note--2026-11-17-utc-prepared)
-describes no-probe dev resume, unchanged idle auto-shelve cost policy, legacy
-missing-state errors, bounded instance admission and Nova task-state handling.
-There is no schema change.
+The [0.3.32 upgrade note](docs/install.md#0332-transition-note--2026-11-18-utc-prepared)
+requires the new API image's `palimpsest-hub-bootstrap` to run offline before any
+new application starts. Drain every API/export/build writer and take the paired
+SQL/CAS/config backup first. `reconfigure` does not bootstrap:
+`palimpsest_hub_image_quota_overrides` must exist before the 0.3.32 app starts.
+For an app-only rollback, stop new writers before selecting old images; old apps
+ignore overrides and enforce tier limits instead. Preserve the table and its
+history for roll-forward; never drop it. A data restore requires separate,
+approved paired SQL/CAS/config recovery.
 
 Historical release `v0.3.5` followed protected-dev PR #24 and merge
 `04d51ad6e1bf00c4b6e5bf82050383d0bb0a10cf`. Its publication and then-production
@@ -131,7 +136,7 @@ Repository tags also drive GHCR image tags for
 `ghcr.io/openstack-afterglow/palimpsest-hub-worker` and
 `ghcr.io/openstack-afterglow/palimpsest-hub-build-worker`; image tags follow the
 repository tag, not the independently versioned Hub wheel. This source's Kolla
-role defaults to Hub image tag `0.3.31`; verify publication and exact reviewed
+role defaults to Hub image tag `0.3.32`; verify publication and exact reviewed
 API/export/build-worker digests and platform manifests before any deployment.
 Root publication requires trusted tag artifact checks and protected PyPI
 publisher gates. Native policy permits only enabled/success or explicitly

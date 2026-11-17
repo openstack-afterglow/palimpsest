@@ -1,24 +1,33 @@
 # Detailed installation and configuration guide
 
-## Subject image-quota overrides — 0.3.32 candidate
+## 0.3.32 transition note — 2026-11-18 (UTC; prepared)
 
-This source adds `palimpsest_hub_image_quota_overrides`, one independent,
-append-only table. Before rollout, drain every API/export/build writer and take
-the runbook's paired SQL/CAS/config backup. Run the reviewed new API image's
-`palimpsest-hub-bootstrap` once offline; `reconfigure` does not bootstrap.
-Bootstrap creates the new table without altering tier policies, tier assignments
-or published images. Offline `palimpsest-hub-migrate-data` accepts older sources
-without the table and validates/copies its full history when present.
-Roll all application cohorts to the same reviewed release before reopening.
-No production migration or quota change is performed by these instructions.
+0.3.32 is prepared source, not published, deployed or live-verified. Console
+stop/resume and image-build submission use the existing lifecycle/build APIs;
+the Afterglow API contract documents their integration boundaries. Native-VZ
+carrier-ctime RM remains destruction-only, with no relaxed execution authority.
 
-**App-only rollback:** stop new writers before selecting the old application
-images. The new table may stay: it has no foreign keys into old tables and old
-code never reads it. Old code enforces tier limits, not overrides; a raised cap
-will no longer apply and a lowered override will no longer restrict publication.
-Inspect effective tier-only admission before reopening ingress. Preserve the
-ledger for later roll-forward; do not drop it or restore SQL alone. Any data
-restore still needs the separately approved paired SQL/CAS/config recovery.
+The subject image-quota override release adds the independent append-only
+`palimpsest_hub_image_quota_overrides` table. Drain every API/export/build writer
+and take the paired SQL/CAS/config backup, then run the reviewed new API image's
+`palimpsest-hub-bootstrap` once offline. The table must exist before any 0.3.32
+application starts; `kolla-ansible reconfigure` does not bootstrap. Roll all
+application cohorts to the same reviewed release before reopening ingress.
+
+For an app-only rollback, stop new writers before selecting the old images.
+Old applications ignore overrides and enforce tier limits: raised caps stop
+applying, and lowered overrides stop restricting publication. Inspect tier-only
+admission before reopening. Preserve the table and its audit history for
+roll-forward; never drop it or restore SQL alone. Any data restore still needs
+separate approval and paired SQL/CAS/config recovery.
+
+### Subject image-quota overrides
+
+Bootstrap creates the new independent table without altering tier policies,
+tier assignments or published images. It has no foreign keys into old tables.
+Offline `palimpsest-hub-migrate-data` accepts older sources without the table
+and validates/copies its full history when present. No production migration
+or quota change is performed by these instructions.
 
 A current human system administrator with a project-scoped original Keystone
 token and `system:manage` can replace all three limits for one exact subject and
@@ -66,7 +75,8 @@ max_images=3, max_chain_bytes=1073741824, max_source_bytes=None)`,
 automatically retried. After an uncertain mutation, read usage/history and
 reconcile before deciding whether another explicit request is needed; repeated
 set/remove requests append another audit revision.
-## Unreleased native-VZ carrier-ctime destruction
+
+### Native-VZ carrier-ctime destruction
 
 The working source adds only a destruction-only canonical `rm` predicate for an
 original `retained-authority-changed` HOLD: marker and failed run must agree,
@@ -190,7 +200,7 @@ Version 0.3.25 is published (tag `0.3.25`, PyPI `palimpsest-client` 0.3.25) and 
 SDK publication and native execution remain separately qualified. Root/Hub metadata, module versions,
 generated locks and Kolla image defaults move together. After formal publication,
 install exact client bytes with
-`uv tool install --python 3.11 palimpsest-client==0.3.31`, or install a trusted
+`uv tool install --python 3.11 palimpsest-client==0.3.32`, or install a trusted
 local checkout with `uv tool install --force --python 3.11 .`.
 A root wheel upgrade neither deploys Hub nor qualifies actual build/run behavior.
 Git/outbound GitHub HTTPS is needed only for VCS installation.
@@ -1868,7 +1878,7 @@ and the [command workflows](cli/workflows.md) for operational details.
 
 ## SDK image/native integration: operator prerequisites
 
-The prepared `0.3.31` Hub distribution declares the exact matching client dependency.
+The prepared `0.3.32` Hub distribution declares the exact matching client dependency.
 Checkout resolution uses `hub`'s explicit parent-path source; installed release
 bytes must match the same immutable tag and reviewed image digests. Paired wheel
 or local container checks do not establish production upgrade or native readiness.

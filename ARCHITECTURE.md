@@ -3048,6 +3048,24 @@ uv run python scripts/test_lanes.py run gate2
 
 ## Maintenance
 
+2026-11-18 release0.3.32 preparation review: checked matching client/Hub
+manifests and module versions, the exact Hub client dependency, native-generated
+root/Hub locks, Kolla image defaults and current installation pins against the
+0.3.31 preparation file list. This patch changes release metadata and upgrade
+documentation only; it does not change lifecycle, trust, runtime or quota code.
+The quota release's independent append-only
+`palimpsest_hub_image_quota_overrides` table must exist before the new app
+starts: stop/drain all writers, take the paired SQL/CAS/config backup and run
+the new API image's bootstrap offline before application cutover. Old apps
+ignore overrides after app-only rollback; preserve the table/history and
+inspect tier-only admission before reopening. Publication, deployment and live
+qualification remain separate. Rebased this prep last onto origin/dev424b967,
+after console#122, quota#123 and carrier-ctime RM#124. All incoming Unreleased
+bullets remain verbatim under0.3.32. The runtime patch-id from fec3080 is
+befb00d158c9bb224cde8a6852d83cb044bf85c3 for both dev and this candidate;
+the only src change versus dev is the client module version. Reconciled the
+upgrade notes without changing source behavior or spec/handoff records.
+
 2026-11-17 console credential wording correction: checked `git_staging`'s
 pre-fetch refusal of every supplied `credential_ref`. The Git form and external
 contract now state that private Git authentication is unimplemented and
@@ -4303,9 +4321,9 @@ Reserved names and duplicate listings (2026-11-15, from the commit-path review, 
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "b2dd4c5b4da394dcf75f93e7a3136dbfeaf7912699f9e3508836d0e86e158723",
-  "reviewed_at": "2026-11-17T16:29:45Z",
-  "summary": "Rebase of the reviewed carrier-ctime destruction-only rm onto dev after the console and quota merges: runtime patch-id befb00d1 unchanged (vz_native_runtime only; unheld lifecycle, _custody, _session, commit path untouched); quota and console deltas already reviewed separately; spec and handoff records added"
+  "source_sha256": "6aff0b2e6d6c2a20363b10c8891d923a514ec70a2c0d674d0913edd347d5c97b",
+  "reviewed_at": "2026-11-17T16:58:42Z",
+  "summary": "Reviewed final metadata-only 0.3.32 prep rebased last on dev424b967 after console#122, quota#123 and carrier-ctime destruction#124. Matching root/Hub manifests, module versions, exact client dependency, native-generated locks and Kolla/install pins; all Unreleased bullets retained verbatim. Reconciled bootstrap-before-app and preserve-table app-only rollback contract. Runtime patch-id from fec3080 remains befb00d158c9bb224cde8a6852d83cb044bf85c3; no runtime/lifecycle/trust/spec/handoff edits. No publication, deployment or live proof."
 }
 ```
 <!-- architecture-review:end -->
