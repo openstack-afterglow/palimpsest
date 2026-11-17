@@ -92,6 +92,69 @@ async def put_tier(subject_kind: SubjectKind, subject_id: str, request: Request,
         return value
 
 
+def _override_scope(subject_kind, visibility):
+    if service.scope_of(visibility) != subject_kind:
+        raise HTTPException(status_code=422, detail="visibility does not belong to quota subject kind")
+
+
+@router.put(
+    "/admin/image-quota/overrides/{subject_kind}/{subject_id}/{visibility}",
+    operation_id="set_image_quota_override",
+)
+async def put_override(
+    subject_kind: SubjectKind,
+    subject_id: str,
+    visibility: Visibility,
+    request: Request,
+    admin: dict = Depends(require_admin),
+):
+    subject_id = _subject(subject_id)
+    _override_scope(subject_kind, visibility)
+    payload = await _quota_body(request, PolicyUpdate, 4096)
+    async with sql_mutex(_factory_or_503(), published_images.IMAGE_MUTEX) as session:
+        value = await service.change_override(
+            session, subject_kind, subject_id, visibility, payload.model_dump(), admin["user_id"]
+        )
+        await session.commit()
+        return value
+
+
+@router.delete(
+    "/admin/image-quota/overrides/{subject_kind}/{subject_id}/{visibility}",
+    operation_id="remove_image_quota_override",
+)
+async def delete_override(
+    subject_kind: SubjectKind,
+    subject_id: str,
+    visibility: Visibility,
+    admin: dict = Depends(require_admin),
+):
+    subject_id = _subject(subject_id)
+    _override_scope(subject_kind, visibility)
+    async with sql_mutex(_factory_or_503(), published_images.IMAGE_MUTEX) as session:
+        value = await service.change_override(session, subject_kind, subject_id, visibility, None, admin["user_id"])
+        await session.commit()
+        return value
+
+
+@router.get(
+    "/admin/image-quota/overrides/{subject_kind}/{subject_id}/{visibility}/history",
+    operation_id="list_image_quota_override_history",
+)
+async def get_override_history(
+    subject_kind: SubjectKind,
+    subject_id: str,
+    visibility: Visibility,
+    limit: int = Query(100, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    _: dict = Depends(require_admin),
+):
+    subject_id = _subject(subject_id)
+    _override_scope(subject_kind, visibility)
+    async with _factory_or_503()() as session:
+        return await service.override_history(session, subject_kind, subject_id, visibility, limit, offset)
+
+
 @router.get("/admin/image-quota/usage", operation_id="get_image_quota_usage")
 async def usage(subject_kind: SubjectKind = Query(...), subject_id: str = Query(...), _: dict = Depends(require_admin)):
     subject_id = _subject(subject_id)

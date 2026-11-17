@@ -3718,3 +3718,84 @@ def test_cli_instance_lifecycle_completion_candidates():
     }
     assert completion.resolve_candidates(parser, ["instance", "create", "--lifecycle", ""]) == ["dev", "service"]
     assert completion.resolve_candidates(parser, ["instance", "create", "--restart", ""]) == ["no", "unless-stopped"]
+
+
+@pytest.mark.parametrize(
+    ("arguments", "method", "positional", "keywords"),
+    [
+        (
+            [
+                "set",
+                "user",
+                "u",
+                "private",
+                "--max-images",
+                "3",
+                "--max-chain-bytes",
+                "1073741824",
+                "--max-source-bytes",
+                "unlimited",
+            ],
+            "set_image_quota_override",
+            ("user", "u", "private"),
+            {"max_images": 3, "max_chain_bytes": 1073741824, "max_source_bytes": None},
+        ),
+        (["remove", "project", "p", "internal"], "remove_image_quota_override", ("project", "p", "internal"), {}),
+        (["usage", "user", "u"], "image_quota_usage", (), {"subject_kind": "user", "subject_id": "u"}),
+        (
+            ["history", "user", "u", "public", "--limit", "5", "--offset", "2"],
+            "image_quota_override_history",
+            ("user", "u", "public"),
+            {"limit": 5, "offset": 2},
+        ),
+    ],
+)
+def test_admin_quota_cli_routes_to_supported_sdk(monkeypatch, capsys, arguments, method, positional, keywords):
+    calls = []
+
+    class Client:
+        def __getattr__(self, name):
+            def invoke(*args, **kwargs):
+                calls.append((name, args, kwargs))
+                return {"source": "override"}
+
+            return invoke
+
+    monkeypatch.setattr(cli, "hub_client", lambda url, cloud: Client())
+    assert cli.main(["--cloud", "admin-cloud", "admin", "image-quota", *arguments]) == 0
+    assert calls == [(method, positional, keywords)]
+    assert json.loads(capsys.readouterr().out) == {"source": "override"}
+
+
+@pytest.mark.parametrize("bad", ["-1", "true", "1.5", str(2**63)])
+def test_admin_quota_cli_invalid_limit_never_calls_hub(monkeypatch, bad):
+    monkeypatch.setattr(cli, "hub_client", lambda *args: pytest.fail("invalid quota reached Hub"))
+    assert (
+        cli.main(
+            [
+                "admin",
+                "image-quota",
+                "set",
+                "user",
+                "u",
+                "private",
+                "--max-images",
+                bad,
+                "--max-chain-bytes",
+                "1",
+                "--max-source-bytes",
+                "unlimited",
+            ]
+        )
+        == 2
+    )
+
+
+def test_published_quota_cli_reads_own_usage(monkeypatch, capsys):
+    class Client:
+        def image_quota_usage(self):
+            return {"scopes": [{"max_images": 2, "source": "tier"}]}
+
+    monkeypatch.setattr(cli, "hub_client", lambda url, cloud: Client())
+    assert cli.main(["published", "quota"]) == 0
+    assert json.loads(capsys.readouterr().out) == {"scopes": [{"max_images": 2, "source": "tier"}]}

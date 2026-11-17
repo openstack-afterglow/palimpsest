@@ -390,6 +390,7 @@ async def test_downgrade_preserves_images_reports_over_limit_and_rejects_new_nam
         "scope": "user",
         "subject_id": U1,
         "tier": "free",
+        "source": "tier",
         "max_images": 1,
         "max_chain_bytes": 120,
         "max_source_bytes": None,
@@ -830,6 +831,7 @@ async def test_quota_routes_are_no_store_through_the_real_app(quota):
                 "/v1/admin/image-quota/policies",
                 f"/v1/admin/image-quota/usage?subject_kind=user&subject_id={U1}",
                 "/v1/admin/image-quota/tiers/user/bad%20id",
+                override_path() + "/history",
             ):
                 response = await client.get(path)
                 assert response.status_code in (200, 422), (path, response.status_code)
@@ -885,5 +887,213 @@ async def test_tier_ids_are_byte_exact_and_a_case_collision_is_a_409(tmp_path, m
             # Exact lookup never returns the differently-cased row.
             assert (await image_quota.subject_tier(session, "user", "abc"))["assigned"] is False
             assert (await image_quota.subject_tier(session, "user", "AbC"))["tier"] == "free"
+    finally:
+        await engine.dispose()
+
+
+def override_path(kind="user", subject=U1, visibility="private"):
+    return f"/v1/admin/image-quota/overrides/{kind}/{subject}/{visibility}"
+
+
+@pytest.mark.asyncio
+async def test_override_free_subject_enforcement_usage_removal_and_audit(quota, admin_client):
+    quota.payload("a", 64)
+    await quota.publish(actor(), "one", ["a"])
+    await quota.publish(actor(), "two", ["a"])
+    limits = {"max_images": 3, "max_chain_bytes": 64, "max_source_bytes": 100}
+    response = await admin_client.client.put(override_path(), json=limits)
+    assert response.status_code == 200
+    first = response.json()
+    assert first["old_limits"] is None and first["new_limits"] == limits
+    assert first["updated_by"] == ADMIN and first["updated_at"].endswith("+00:00")
+    assert first["revision"] == 1
+    await quota.publish(actor(), "three", ["a"])
+    with pytest.raises(HTTPException) as denied:
+        await quota.publish(actor(), "four", ["a"])
+    assert denied.value.detail == count_error("private", "user", 3, 3)
+    own = (await admin_client.client.get("/v1/published-images/quota")).json()
+    admin = (
+        await admin_client.client.get(
+            "/v1/admin/image-quota/usage",
+            params={"subject_kind": "user", "subject_id": U1},
+        )
+    ).json()
+    assert own["user_tier"] == admin["tier"] == "free"
+    assert own["scopes"][:2] == admin["scopes"]
+    assert (admin["scopes"][0]["max_images"], admin["scopes"][0]["source"]) == (3, "override")
+    assert admin["scopes"][1]["source"] == "tier"
+    lowered = {"max_images": 1, "max_chain_bytes": 32, "max_source_bytes": 0}
+    response = await admin_client.client.put(override_path(), json=lowered)
+    assert response.json()["old_limits"] == limits and response.json()["new_limits"] == lowered
+    assert await quota.count_images() == 3
+    with pytest.raises(HTTPException) as too_big:
+        await quota.publish(actor(), "one", ["a"], tag="lowered")
+    assert too_big.value.detail["code"] == "image_chain_size_limit"
+    response = await admin_client.client.delete(override_path())
+    assert response.status_code == 200
+    removed = response.json()
+    assert removed["old_limits"] == lowered and removed["new_limits"] is None
+    assert removed["updated_by"] == ADMIN and removed["revision"] == 3
+    own = (await admin_client.client.get("/v1/published-images/quota")).json()["scopes"][0]
+    assert (own["max_images"], own["source"], own["unique_names"], own["over_limit"]) == (2, "tier", 3, True)
+    assert await quota.count_images() == 3
+    # Existing-name versions remain allowed after the tier count is restored.
+    await quota.publish(actor(), "one", ["a"], tag="restored")
+    history = (await admin_client.client.get(override_path() + "/history")).json()["items"]
+    assert [item["revision"] for item in history] == [3, 2, 1]
+    assert [item["new_limits"] for item in history] == [None, lowered, limits]
+    assert all(item["updated_by"] == ADMIN and item["updated_at"].endswith("+00:00") for item in history)
+    page = (await admin_client.client.get(override_path() + "/history?limit=1&offset=1")).json()
+    assert page["items"] == [history[1]]
+
+
+@pytest.mark.asyncio
+async def test_override_is_exact_subject_visibility_and_tier_independent(quota, admin_client):
+    quota.payload("a", 64)
+    before = (await admin_client.client.get("/v1/admin/image-quota/policies")).json()
+    await admin_client.client.put(f"/v1/admin/image-quota/tiers/user/{U2}", json={"tier": "paid"})
+    limits = {"max_images": 0, "max_chain_bytes": 1, "max_source_bytes": 0}
+    for kind, subject, visibility in (("user", U1, "private"), ("project", P1, "internal"), ("user", U2, "public")):
+        response = await admin_client.client.put(override_path(kind, subject, visibility), json=limits)
+        assert response.status_code == 200
+    for who, visibility in ((actor(), "private"), (actor(user=U2), "internal"), (actor(user=U2), "public")):
+        with pytest.raises(HTTPException) as denied:
+            await quota.publish(who, "blocked", ["a"], visibility=visibility)
+        assert denied.value.detail == count_error(visibility, image_quota.scope_of(visibility), 0, 0)
+    for who, visibility in (
+        (actor(user=U2), "private"),
+        (actor(project=P2), "internal"),
+        (actor(), "public"),
+    ):
+        await quota.publish(who, "allowed", ["a"], visibility=visibility)
+    # Overrides do not seed or rewrite global policies.
+    after = (await admin_client.client.get("/v1/admin/image-quota/policies")).json()
+    assert [{k: v for k, v in row.items() if k not in ("source", "updated_at")} for row in before["items"]] == [
+        {k: v for k, v in row.items() if k not in ("source", "updated_at")} for row in after["items"]
+    ]
+    response = await admin_client.client.delete(override_path("user", U2, "public"))
+    assert response.status_code == 200
+    own = (await admin_client.client.get("/v1/published-images/quota", headers={"X-User": U2})).json()
+    public = next(item for item in own["scopes"] if item["visibility"] == "public")
+    assert (public["tier"], public["max_chain_bytes"], public["source"]) == ("paid", 100 * GIB, "tier")
+
+
+@pytest.mark.asyncio
+async def test_override_chain_source_and_unlimited_caps_on_enforce(quota, admin_client):
+    payload = quota.payload("a", 64)
+    limits = {"max_images": None, "max_chain_bytes": 64, "max_source_bytes": 100}
+    assert (await admin_client.client.put(override_path(), json=limits)).status_code == 200
+    # This is the same enforce hook used by every registration, with explicit source bytes.
+    async with sql_mutex(quota.factory, published_images.IMAGE_MUTEX) as session:
+        await image_quota.enforce(session, actor(), "boundary", manifest([payload]), "private", source=100)
+        with pytest.raises(HTTPException) as denied:
+            await image_quota.enforce(session, actor(), "source", manifest([payload]), "private", source=101)
+        assert denied.value.detail["code"] == "image_source_size_limit"
+    quota.payload("b", 65)
+    with pytest.raises(HTTPException) as denied:
+        await quota.publish(actor(), "chain", ["b"])
+    assert denied.value.detail["code"] == "image_chain_size_limit"
+    assert (await admin_client.client.put(override_path(), json=dict.fromkeys(limits))).status_code == 200
+    for index in range(4):
+        await quota.publish(actor(), f"unlimited-{index}", ["a", "b"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", [-1, True, "3", 1.5, 2**63, [], {}])
+async def test_override_rejects_invalid_limits_without_audit(admin_client, bad):
+    for field in image_quota.LIMIT_FIELDS:
+        limits = dict.fromkeys(image_quota.LIMIT_FIELDS)
+        limits[field] = bad
+        assert (await admin_client.client.put(override_path(), json=limits)).status_code == 422
+    assert (await admin_client.client.get(override_path() + "/history")).json() == {"items": []}
+
+
+@pytest.mark.asyncio
+async def test_override_rejects_bad_scope_body_and_non_admin(admin_client):
+    limits = dict.fromkeys(image_quota.LIMIT_FIELDS)
+    for path in (
+        override_path("project", P1, "private"),
+        override_path("user", U1, "internal"),
+        override_path("group"),
+        override_path(subject="bad id"),
+        override_path(visibility="secret"),
+    ):
+        assert (await admin_client.client.put(path, json=limits)).status_code == 422
+    for body in ({}, {**limits, "extra": 1}, {"max_images": 3}):
+        assert (await admin_client.client.put(override_path(), json=body)).status_code == 422
+    assert (await admin_client.client.put(override_path(), content="{")).status_code == 422
+    assert (await admin_client.client.put(override_path(), content=" " * 4097)).status_code == 413
+    for query in ("limit=0", "limit=101", "offset=-1"):
+        assert (await admin_client.client.get(override_path() + "/history?" + query)).status_code == 422
+    admin_client.state["admin"] = False
+    for method, path in (("PUT", override_path()), ("DELETE", override_path()), ("GET", override_path() + "/history")):
+        assert (await admin_client.client.request(method, path, json=limits)).status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_override_update_and_removal_share_publication_mutex(quota, admin_client, monkeypatch):
+    quota.payload("a", 64)
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = image_quota.enforce
+
+    async def held(*args, **kwargs):
+        await original(*args, **kwargs)
+        entered.set()
+        await release.wait()
+
+    monkeypatch.setattr(image_quota, "enforce", held)
+    publisher = asyncio.create_task(quota.publish(actor(), "first", ["a"]))
+    await asyncio.wait_for(entered.wait(), 5)
+    limits = {"max_images": 0, "max_chain_bytes": 64, "max_source_bytes": None}
+    updater = asyncio.create_task(admin_client.client.put(override_path(), json=limits))
+    try:
+        await asyncio.sleep(0.05)
+        assert not updater.done()
+    finally:
+        release.set()
+    assert isinstance(await publisher, dict)
+    assert (await updater).status_code == 200
+    with pytest.raises(HTTPException) as denied:
+        await quota.publish(actor(), "second", ["a"])
+    assert denied.value.detail == count_error("private", "user", 0, 1)
+    # A removal cannot jump ahead of an admitted publication either.
+    async with sql_mutex(quota.factory, published_images.IMAGE_MUTEX):
+        remover = asyncio.create_task(admin_client.client.delete(override_path()))
+        await asyncio.sleep(0.05)
+        assert not remover.done()
+    assert (await remover).status_code == 200
+    await quota.publish(actor(), "second", ["a"])
+
+
+@pytest.mark.asyncio
+async def test_override_subject_lookup_is_byte_exact_under_nocase_collation(tmp_path, monkeypatch):
+    from sqlalchemy.dialects.mysql import VARCHAR
+
+    with monkeypatch.context() as schema:
+        schema.setattr(
+            Base.metadata.tables["palimpsest_hub_image_quota_overrides"].c.subject_id,
+            "type",
+            VARCHAR(128, collation="NOCASE"),
+        )
+        engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'case.sqlite'}")
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    limits = dict.fromkeys(image_quota.LIMIT_FIELDS, 0)
+    try:
+        async with sql_mutex(factory, published_images.IMAGE_MUTEX) as session:
+            await image_quota.change_override(session, "user", "AbC", "private", limits, ADMIN)
+            await session.commit()
+        async with factory() as session:
+            policies = await image_quota.load_policies(session)
+            own = await image_quota.effective_policy(session, "private", "AbC", "free", policies)
+            other = await image_quota.effective_policy(session, "private", "abc", "free", policies)
+            assert (own["source"], own["max_images"]) == ("override", 0)
+            assert (other["source"], other["max_images"]) == ("tier", 2)
+            assert (await image_quota.override_history(session, "user", "abc", "private", 100, 0))["items"] == []
+        with pytest.raises(HTTPException) as collision:
+            async with sql_mutex(factory, published_images.IMAGE_MUTEX) as session:
+                await image_quota.change_override(session, "user", "abc", "private", None, ADMIN)
+        assert collision.value.status_code == 409
     finally:
         await engine.dispose()

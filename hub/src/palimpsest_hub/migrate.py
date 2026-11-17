@@ -21,7 +21,7 @@ from palimpsest_hub import image_key_models, image_models, instance_models, nati
 from palimpsest_hub.config import validate_keystone_id
 from palimpsest_hub.image_key_models import IMAGE_ACTIONS, MAX_EXPIRY_DAYS
 from palimpsest_hub.image_models import LEGACY_JOB_VISIBILITY
-from palimpsest_hub.services.image_quota import MAX_BIGINT, SUBJECT_KINDS, TIERS, VISIBILITIES
+from palimpsest_hub.services.image_quota import LIMIT_FIELDS, MAX_BIGINT, SUBJECT_KINDS, TIERS, VISIBILITIES, scope_of
 from palimpsest_hub.services.published_images import normalize_source_closure
 
 _TABLES = (
@@ -41,6 +41,7 @@ _TABLES = (
     "palimpsest_hub_image_source_blobs",
     "palimpsest_hub_image_quota_policies",
     "palimpsest_hub_image_quota_tiers",
+    "palimpsest_hub_image_quota_overrides",
     "palimpsest_native_instances",
     "palimpsest_hub_instances",
     "palimpsest_hub_instance_lifecycle",
@@ -55,9 +56,10 @@ _TABLES = (
     "palimpsest_package_caches",
     "palimpsest_image_keys",
 )
-# Quota tables have no foreign keys; older sources lack both, a partial pair is corrupt.
+# The original policy/tier pair is atomic; the later append-only override table is optional on old sources.
 _QUOTA_PREFIX = "palimpsest_hub_image_quota_"
-_QUOTA_TABLES = frozenset(name for name in _TABLES if name.startswith(_QUOTA_PREFIX))
+_QUOTA_TABLES = frozenset({_QUOTA_PREFIX + "policies", _QUOTA_PREFIX + "tiers"})
+_OVERRIDES = _QUOTA_PREFIX + "overrides"
 _IMAGE_KEYS = "palimpsest_image_keys"
 _HEX32 = re.compile(r"[0-9a-f]{32}", re.ASCII)
 _HEX64 = re.compile(r"[0-9a-f]{64}", re.ASCII)
@@ -232,6 +234,47 @@ def _validate_quota_rows(table_name: str, rows: list[dict], table: Table) -> Non
             raise MigrationError(f"source {table_name} row is invalid; correct it in the source before migrating")
 
 
+def _validate_override_rows(rows: list[dict]) -> None:
+    previous = {}
+    for row in sorted(
+        rows,
+        key=lambda item: (
+            str(item.get("subject_kind")),
+            str(item.get("subject_id")),
+            str(item.get("visibility")),
+            item.get("revision") if type(item.get("revision")) is int else 0,
+        ),
+    ):
+        try:
+            validate_keystone_id(row.get("subject_id"))
+            validate_keystone_id(row.get("updated_by"))
+        except ValueError:
+            raise MigrationError("source quota override identity is invalid") from None
+        visibility = row.get("visibility")
+        key = (row.get("subject_kind"), row["subject_id"], visibility)
+        revision, old = previous.get(key, (0, None))
+        valid_limits = all(
+            limits is None
+            or (
+                isinstance(limits, dict)
+                and set(limits) == set(LIMIT_FIELDS)
+                and all(_limit_valid(value) for value in limits.values())
+            )
+            for limits in (row.get("old_limits"), row.get("new_limits"))
+        )
+        if (
+            visibility not in VISIBILITIES
+            or key[0] != scope_of(visibility)
+            or type(row.get("revision")) is not int
+            or row["revision"] != revision + 1
+            or not valid_limits
+            or row.get("old_limits") != old
+            or not isinstance(row.get("updated_at"), datetime)
+        ):
+            raise MigrationError("source quota override history is invalid")
+        previous[key] = (row["revision"], row["new_limits"])
+
+
 def _validate_source_blob_rows(rows: list[dict], published: dict[str, dict]) -> None:
     """Each image's closure must be one the Hub itself would accept for that image."""
     closures: dict[str, list[dict]] = defaultdict(list)
@@ -379,6 +422,8 @@ async def migrate(
                     published = {row["id"]: row for row in rows}
                 if table_name == _SOURCE_BLOBS:
                     _validate_source_blob_rows(rows, published)
+                if table_name == _OVERRIDES:
+                    _validate_override_rows(rows)
                 if table_name == _IMAGE_KEYS:
                     _validate_image_key_rows(rows)
                 copied[table_name] = len(rows)

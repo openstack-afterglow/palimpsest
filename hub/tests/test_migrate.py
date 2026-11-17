@@ -1090,3 +1090,121 @@ async def test_migrate_keeps_the_dev_instance_lifecycle_ledger_or_accepts_an_old
     finally:
         await source.dispose()
         await destination.dispose()
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_adds_override_history_to_existing_schema_without_changing_policy(tmp_path, monkeypatch):
+    from sqlalchemy import inspect
+
+    from palimpsest_hub import database
+
+    url = f"sqlite+aiosqlite:///{tmp_path / 'pre-override.sqlite'}"
+    engine = create_async_engine(url)
+    overrides = Base.metadata.tables["palimpsest_hub_image_quota_overrides"]
+    policies = Base.metadata.tables["palimpsest_hub_image_quota_policies"]
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(
+                lambda sync: Base.metadata.create_all(
+                    sync,
+                    tables=[table for table in Base.metadata.sorted_tables if table is not overrides],
+                )
+            )
+            await connection.execute(
+                policies.insert().values(
+                    tier="free",
+                    visibility="private",
+                    max_images=7,
+                    max_chain_bytes=10,
+                    max_source_bytes=20,
+                    updated_by="f" * 32,
+                )
+            )
+            original = (await connection.execute(select(policies))).mappings().all()
+        monkeypatch.setattr(database, "_engine", engine)
+        await database.create_schema()
+        await database.create_schema()
+        async with engine.connect() as connection:
+            assert (await connection.execute(select(policies))).mappings().all() == original
+            assert (await connection.execute(select(overrides))).all() == []
+            assert await connection.run_sync(lambda sync: inspect(sync).get_foreign_keys(overrides.name)) == []
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", [None, "negative", "scope", "admin", "old", "gap"])
+async def test_migrate_preserves_and_validates_override_audit(tmp_path, damage):
+    source_url = f"sqlite+aiosqlite:///{tmp_path / 'overrides.sqlite'}"
+    destination_url = f"sqlite+aiosqlite:///{tmp_path / 'destination.sqlite'}"
+    await create_database(source_url, with_rows=True)
+    await create_database(destination_url, with_rows=False)
+    overrides = Base.metadata.tables["palimpsest_hub_image_quota_overrides"]
+    limits = {"max_images": 3, "max_chain_bytes": 64, "max_source_bytes": None}
+    rows = [
+        dict(
+            subject_kind="user",
+            subject_id="d" * 32,
+            visibility="private",
+            revision=1,
+            old_limits=None,
+            new_limits=limits,
+            updated_by="f" * 32,
+            updated_at=datetime.now(UTC),
+        ),
+        dict(
+            subject_kind="user",
+            subject_id="d" * 32,
+            visibility="private",
+            revision=2,
+            old_limits=limits,
+            new_limits=None,
+            updated_by="e" * 32,
+            updated_at=datetime.now(UTC),
+        ),
+    ]
+    if damage == "negative":
+        rows[0]["new_limits"] = {**limits, "max_images": -1}
+    elif damage == "scope":
+        rows[0]["visibility"] = "internal"
+    elif damage == "admin":
+        rows[0]["updated_by"] = ""
+    elif damage == "old":
+        rows[1]["old_limits"] = None
+    elif damage == "gap":
+        rows[1]["revision"] = 3
+    source, destination = create_async_engine(source_url), create_async_engine(destination_url)
+    try:
+        async with source.begin() as connection:
+            await connection.execute(overrides.insert(), rows)
+        if damage:
+            with pytest.raises(MigrationError):
+                await migrate(source_url, destination_url)
+            async with destination.connect() as connection:
+                assert (await connection.execute(select(overrides))).all() == []
+                assert (await connection.execute(select(Base.metadata.tables["palimpsest_hub_layers"]))).all() == []
+        else:
+            assert (await migrate(source_url, destination_url))["palimpsest_hub_image_quota_overrides"] == 2
+            async with source.connect() as left, destination.connect() as right:
+                query = select(overrides).order_by(overrides.c.revision)
+                assert (await left.execute(query)).all() == (await right.execute(query)).all()
+    finally:
+        await source.dispose()
+        await destination.dispose()
+
+
+@pytest.mark.asyncio
+async def test_migrate_accepts_pre_override_schema_with_original_quota_pair(tmp_path):
+    source_url = f"sqlite+aiosqlite:///{tmp_path / 'pre-override.sqlite'}"
+    destination_url = f"sqlite+aiosqlite:///{tmp_path / 'destination.sqlite'}"
+    await create_database(source_url, with_rows=True)
+    await create_database(destination_url, with_rows=False)
+    engine = create_async_engine(source_url)
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(text("DROP TABLE palimpsest_hub_image_quota_overrides"))
+    finally:
+        await engine.dispose()
+    copied = await migrate(source_url, destination_url)
+    assert copied["palimpsest_hub_image_quota_overrides"] == 0
+    assert copied["palimpsest_hub_layers"] == 1

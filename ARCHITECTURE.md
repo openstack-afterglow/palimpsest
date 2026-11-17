@@ -106,6 +106,31 @@ logical from physical bytes. Null is reported only for unknown application
 base-image sizes and for Manila or unreadable store capacity; a missing chain-layer
 or membership row is a definite 409.
 
+**Per-subject override contract (0.3.32 candidate).**
+`palimpsest_hub_image_quota_overrides` is an append-only ledger keyed by
+`(subject_kind, subject_id, visibility, revision)`. Its latest revision's
+`new_limits` replaces all three tier limits; SQL NULL restores tier inheritance,
+whereas an object containing null values means unlimited limits. `old_limits`,
+`new_limits`, `updated_by` and UTC `updated_at` retain every set/removal, including
+repeated requests. Private/public overrides bind exact user IDs and internal
+overrides bind exact project IDs. Free and paid tier rows and seeds stay unchanged.
+Both `enforce` and SQL usage accounting resolve that same effective policy.
+Own and admin usage scope objects expose the effective limits plus
+`source: tier|override`. Lowering or removing an override never deletes images;
+existing-name versions retain the count exception but must pass chain/source caps.
+`PUT|DELETE /v1/admin/image-quota/overrides/{subject_kind}/{subject_id}/{visibility}`
+and paged `GET .../history` use the existing fresh project-token human system
+administrator gate (`system:manage`). Set/remove share the global image mutex
+with publication check-and-insert and tier/policy updates. No instance/session,
+trust or lifecycle path changes. `HubClient` and `palimpsest admin image-quota`
+expose set/remove/usage/history; `published quota` reads own effective usage.
+Offline bootstrap creates this additive table via registered model metadata;
+offline data migration accepts pre-override sources and validates/copies the
+complete audit chain. There are no foreign keys into existing tables. App-only
+rollback can leave the table in place, but old code ignores overrides, so
+operators must reconcile tier-only admission before reopening ingress.
+
+
 **Image API keys.** [`services/image_keys.py`](hub/src/palimpsest_hub/services/image_keys.py),
 [`api/image_keys.py`](hub/src/palimpsest_hub/api/image_keys.py) and
 [`image_key_models.py`](hub/src/palimpsest_hub/image_key_models.py) add a key
@@ -3034,6 +3059,18 @@ new image-name/credential patterns escape hyphens for browser Unicode-sets
 validation; Retry-After expiry schedules a guarded control-only render (never a
 request), cancelled on disconnect; an existing restore report is labelled
 previous while a new report is pending. Focused regressions cover these states.
+2026-11-17 quota-override review: traced publication admission, SQL usage,
+human-admin authorization, global image mutex, bootstrap metadata and offline
+migration. Added one append-only subject/visibility override ledger, not a
+second quota policy or tier convention. Both consumer usage views and enforce
+resolve its latest revision; removals retain audit history and restore the
+unchanged tier. Reviewed exact-ID lookup, bounded request/history validation,
+UTC attribution, no-delete lowering and additive-schema rollback limits.
+SDK/CLI methods use the existing transport and never retry changes automatically.
+No lifecycle/session/trust paths, tier seeds or global policy rows changed.
+Checks and independent SHA-bound review are reported separately; this source
+review is not deployment or live quota proof.
+
 
 2026-11-17 combined0.3.31 delta review: rebased the reviewed Hub candidate
 144cd9b onto origin/dev34ffc60, incorporating #116 reference docs/examples and
@@ -4220,9 +4257,9 @@ Reserved names and duplicate listings (2026-11-15, from the commit-path review, 
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "5e3a0eb58a003e42a87fb295be1632921d21ba498f2e63fb8277d0f2ef430709",
-  "reviewed_at": "2026-11-17T14:57:59Z",
-  "summary": "Console credential wording correction: private Git authentication remains unimplemented and credential_ref fails closed before fetching; form and API contract now explicit; request shape and runtime behavior unchanged"
+  "source_sha256": "0cb37733d2120e64087232c8f4b3b3f8dfd43a0e4884f21c8316c379a939e1d4",
+  "reviewed_at": "2026-11-17T12:03:40Z",
+  "summary": "Review subject-specific quota override ledger, shared enforce/usage resolution, human-admin API/SDK/CLI, additive bootstrap and offline audit migration; preserve tiers, image rows and lifecycle fences"
 }
 ```
 <!-- architecture-review:end -->

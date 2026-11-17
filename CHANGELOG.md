@@ -16,6 +16,7 @@ All notable changes to Palimpsest Local are documented here.
 - Afterglow consumer API contract covering Keystone/project assertions, build and
   lifecycle endpoints, state transitions, replay, retry semantics and monitoring
   limits. No instance service, projection, schema or version changes.
+- Human system administrators can set and remove visibility-specific image quota overrides for individual users or projects, including free-tier subjects, through the API, `HubClient` and `palimpsest admin image-quota`. Effective usage reports identify `tier` versus `override`; append-only history records each administrator, UTC timestamp and old/new limits. Overrides never change tier policies or delete existing images. Offline bootstrap adds one independent history table; app-only rollback may retain it, but old applications ignore overrides.
 
 ## [0.3.31] - 2026-11-17 (UTC; prepared)
 

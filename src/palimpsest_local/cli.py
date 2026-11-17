@@ -387,6 +387,8 @@ _CLOUD_CONSUMERS = frozenset(
         ("bundle", "verify"),
         ("published", "push"),
         ("published", "pull"),
+        ("published", "quota"),
+        ("admin", "image-quota"),
         ("instance", "ls"),
         ("instance", "status"),
         ("instance", "create"),
@@ -436,6 +438,42 @@ def _published_roots(selected: Path | None) -> StatePaths:
         raise PalimpsestError("--state-root must name a state directory without '..' components")
     config = Path(os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")) / "palimpsest"
     return StatePaths(config, path.parent.resolve() / path.name)
+
+
+def _quota_limit(value: str) -> int | None:
+    if value == "unlimited":
+        return None
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("quota limit must be an integer or 'unlimited'") from None
+    if not 0 <= number <= 2**63 - 1:
+        raise argparse.ArgumentTypeError("quota limit must be between 0 and 2**63 - 1")
+    return number
+
+
+def _dispatch_image_quota(args: argparse.Namespace) -> int:
+    client = hub_client(args.url, args.hub_cloud)
+    op = args.quota_operation
+    if op == "usage":
+        value = client.image_quota_usage(subject_kind=args.subject_kind, subject_id=args.subject_id)
+    elif op == "set":
+        value = client.set_image_quota_override(
+            args.subject_kind,
+            args.subject_id,
+            args.visibility,
+            max_images=args.max_images,
+            max_chain_bytes=args.max_chain_bytes,
+            max_source_bytes=args.max_source_bytes,
+        )
+    elif op == "remove":
+        value = client.remove_image_quota_override(args.subject_kind, args.subject_id, args.visibility)
+    else:
+        value = client.image_quota_override_history(
+            args.subject_kind, args.subject_id, args.visibility, limit=args.limit, offset=args.offset
+        )
+    print(json.dumps(value, indent=2, sort_keys=True))
+    return 0
 
 
 def _dispatch_published(args: argparse.Namespace) -> int:
@@ -1095,12 +1133,44 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="allow sending credentials over plain http:// to a non-loopback Hub",
     )
+    published_commands.add_parser("quota", help="show your effective publication limits, their source and usage")
+
     published_status = published_commands.add_parser(
         "status", help="show local publication status and pulled images without contacting Hub"
     )
     published_status.add_argument(
         "--state-root", type=Path, help="state root to inspect (default: the configured state root)"
     )
+
+    admin = commands.add_parser("admin", help="human system administrator commands; requires system:manage")
+    admin_commands = admin.add_subparsers(dest="admin_operation", required=True)
+    quota = admin_commands.add_parser(
+        "image-quota", help="set/remove subject overrides without changing tier policies or deleting images"
+    )
+    quota_commands = quota.add_subparsers(dest="quota_operation", required=True)
+    for operation, help_text in (
+        ("set", "replace all three limits for one subject visibility"),
+        ("remove", "remove an override and restore the subject's tier limits"),
+        ("usage", "show a subject's effective limits, their source and publication usage"),
+        ("history", "show audited override changes, newest first"),
+    ):
+        command = quota_commands.add_parser(operation, help=help_text)
+        command.add_argument("subject_kind", choices=("user", "project"), help="quota subject: user or project")
+        command.add_argument("subject_id", help="exact Keystone user or project identifier")
+        if operation != "usage":
+            command.add_argument(
+                "visibility",
+                choices=("private", "internal", "public"),
+                help="private/public for a user, internal for a project",
+            )
+        if operation == "set":
+            for field in ("max-images", "max-chain-bytes", "max-source-bytes"):
+                command.add_argument(
+                    "--" + field, required=True, type=_quota_limit, help="nonnegative integer or unlimited"
+                )
+        if operation == "history":
+            command.add_argument("--limit", type=int, default=100, help="maximum history rows (1-100)")
+            command.add_argument("--offset", type=int, default=0, help="history rows to skip (default: 0)")
 
     instance = commands.add_parser(
         "instance",
@@ -2812,6 +2882,11 @@ def dispatch_args(args: argparse.Namespace) -> int:
     op = args.operation
     if op == "instance":
         return _dispatch_instance(args)
+    if op == "admin":
+        return _dispatch_image_quota(args)
+    if op == "published" and args.published_operation == "quota":
+        print(json.dumps(hub_client(args.url, args.hub_cloud).image_quota_usage(), indent=2, sort_keys=True))
+        return 0
     if op == "published":
         return _dispatch_published(args)
     if op == "benchmark":
