@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+"""libvirt qemu hook: make the host block devices of a domain's block stacks exist.
+
+Installed as /etc/libvirt/hooks/qemu (inside the libvirt container when libvirt is
+containerised; the agent socket directory /run/blkstack must then be bind-mounted).
+
+libvirt calls:  qemu GUEST OPERATION SUB-OPERATION EXTRA   with the domain XML on stdin.
+  prepare begin  - before labelling and before QEMU starts: every disk whose source is
+                   /dev/blkstack/<volume-id> is assembled by the host agent. A failure makes
+                   libvirt refuse to start the guest.
+  release end    - after QEMU is gone and labels are restored: the devices are torn down.
+A hook cannot change the XML of a normal start and must not call back into libvirt; this
+one only talks to the agent socket. An incoming live migration also runs `prepare` on the
+destination while the source still holds the writable delta exclusively, so the attach
+fails there and the migration is refused instead of two hosts writing one delta.
+"""
+
+import re
+import socket
+import sys
+import xml.etree.ElementTree as ET
+
+AGENT_SOCKET = "/run/blkstack/agent.sock"
+DEVICE = re.compile(r"/dev/blkstack/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})")
+
+
+def stack_volumes(domain_xml: str) -> list[str]:
+    """Volume IDs of the block disks of this domain that are block stacks, in document order."""
+    found = []
+    for disk in ET.fromstring(domain_xml).iterfind("./devices/disk[@type='block']"):
+        source = disk.find("source")
+        match = DEVICE.fullmatch(source.get("dev", "")) if source is not None else None
+        if match and match.group(1) not in found:
+            found.append(match.group(1))
+    return found
+
+
+# Longer than the agent unit's TimeoutStartSec, so the agent always answers (or is stopped
+# and rolls back) before the hook gives up.
+AGENT_TIMEOUT = 270.0
+
+
+def ask_agent(operation: str, volume: str, timeout: float = AGENT_TIMEOUT) -> str:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as agent:
+        agent.settimeout(timeout)
+        agent.connect(AGENT_SOCKET)
+        agent.sendall(f"{operation} {volume}\n".encode())
+        reply = b""
+        while chunk := agent.recv(4096):
+            reply += chunk
+    return reply.decode(errors="replace").strip()
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) < 4:
+        return 0
+    operation, sub_operation = argv[2], argv[3]
+    if (operation, sub_operation) not in (("prepare", "begin"), ("release", "end")):
+        return 0
+    try:
+        volumes = stack_volumes(sys.stdin.read())
+    except ET.ParseError as error:
+        print(f"blkstack hook: unreadable domain XML: {error}", file=sys.stderr)
+        return 1 if operation == "prepare" else 0
+    failed = False
+    for volume in volumes:
+        try:
+            reply = ask_agent("attach" if operation == "prepare" else "detach", volume)
+        except OSError as error:
+            reply = f"error agent unreachable: {error}"
+        if not reply.startswith("ok"):
+            print(f"blkstack hook: {operation} {volume}: {reply}", file=sys.stderr)
+            failed = True
+    # A failed prepare must stop the guest from starting. A failed release cannot undo the
+    # stop; it is reported and the agent's journal has the reason.
+    return 1 if failed and operation == "prepare" else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

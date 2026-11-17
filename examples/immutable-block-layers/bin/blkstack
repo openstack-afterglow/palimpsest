@@ -1,0 +1,831 @@
+#!/usr/bin/env bash
+# blkstack — reference pipeline for immutable block-layer stacks.
+#
+# A stack is an ordered list of immutable OverlayBD layer blobs (bottom first) that together
+# form one virtual disk: layer 0 is a whole bootable OS disk, every later layer is the block
+# delta of one change (a library install, a user's work). One writable upper sits on top.
+# The same blobs are published to an OCI registry (lazy loading on a developer machine) and to
+# a Ceph RBD pool (one copy, mapped read-only on every compute node).
+#
+# This is reference code for the design in docs/design/immutable-block-layers/. It needs root,
+# a Linux host with the target_core_user, tcm_loop and dm-ebs modules, and the overlaybd
+# package. See that directory's README for what was actually run and what was not.
+set -euo pipefail
+shopt -s inherit_errexit
+
+ROOT=${BLKSTACK_ROOT:-/var/lib/blkstack}
+OBD=${BLKSTACK_OVERLAYBD_BIN:-/opt/overlaybd/bin}
+RBD=${BLKSTACK_RBD:-rbd}   # deliberately expanded unquoted: it may carry arguments such as --id
+ZALGO=${BLKSTACK_ZFILE_ALGORITHM:-lz4}
+LAYER_MEDIA_TYPE=application/vnd.palimpsest.blocklayer.v1.overlaybd+zfile
+CONFIG_MEDIA_TYPE=application/vnd.palimpsest.blockstack.config.v1+json
+ARTIFACT_TYPE=application/vnd.palimpsest.blockstack.v1
+TCMU_CORE=/sys/kernel/config/target/core/user_1
+TCMU_LOOP=/sys/kernel/config/target/loopback
+MAX_LAYERS=255             # overlaybd's limit on lower layers
+DIGEST_RE='^sha256:[0-9a-f]{64}$'
+UUID_RE='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+POOL_RE='^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$'
+
+die() { printf 'blkstack: %s\n' "$*" >&2; exit 1; }
+log() { printf 'blkstack: %s\n' "$*" >&2; }
+need() { local c; for c in "$@"; do command -v "$c" >/dev/null 2>&1 || [ -x "$c" ] || die "missing command: $c"; done; }
+now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+new_uuid() { cat /proc/sys/kernel/random/uuid; }
+
+# Names are validated as plain statements at the start of every command: a `die` inside
+# "$(...)" only ends that subshell.
+valid_name() { [[ $1 =~ ^[a-z0-9][a-z0-9._-]{0,62}(:[A-Za-z0-9._-]{1,62})?$ && $1 != *__* ]] || die "invalid stack name: $1"; }
+valid_session() { [[ $1 =~ ^[a-z0-9][a-z0-9._-]{0,62}$ ]] || die "invalid session name: $1"; }
+stack_file() { printf '%s/stacks/%s.json' "$ROOT" "${1//:/__}"; }
+session_dir() { printf '%s/sessions/%s' "$ROOT" "$1"; }
+blob_path() { printf '%s/blobs/sha256/%s' "$ROOT" "${1#sha256:}"; }
+
+# validate_stack JSON: a stack description can come from a registry or from RBD image
+# metadata written by another identity. Everything that later becomes a path, an image name
+# or a command argument is checked here, and the layers must form one parent chain.
+validate_stack() {
+  jq -e --arg d "$DIGEST_RE" --arg u "$UUID_RE" --argjson max "$MAX_LAYERS" '
+    (.schema == "palimpsest.blockstack.v1")
+    and (.virtualSizeBytes | type == "number" and . > 0 and . == floor and . % 1073741824 == 0)
+    and (.layers | type == "array" and length >= 1 and length <= $max)
+    and (.layers | all(
+          (.digest | type == "string" and test($d))
+          and (.size | type == "number" and . > 0 and . == floor)
+          and (.uuid | type == "string" and test($u))
+          and (.parentUuid | type == "string")))
+    and ([.layers[].parentUuid] == ([""] + [.layers[:-1][].uuid]))
+    and ((.source // null) as $s | $s == null or (
+          ($s.scheme == "https" or $s.scheme == "http")
+          and ($s.registry | type == "string" and test("^[A-Za-z0-9.-]+(:[0-9]+)?$"))
+          and ($s.repository | type == "string" and test("^[a-z0-9]+((\\.|_|__|-+|/)[a-z0-9]+)*$"))))
+  ' >/dev/null 2>&1 <<<"$1" || die "not a valid block stack description"
+}
+read_stack() {
+  local f stack
+  valid_name "$1"; f=$(stack_file "$1"); [ -f "$f" ] || die "unknown stack: $1"
+  stack=$(cat "$f"); validate_stack "$stack"; printf '%s\n' "$stack"
+}
+
+init_dirs() {
+  [ "$(id -u)" = 0 ] || die "must run as root"
+  mkdir -p "$ROOT"/{blobs/sha256,stacks,sessions,lazy,run}
+  chmod 0700 "$ROOT"
+}
+
+# ---- Cleanup -------------------------------------------------------------------------------------
+# One EXIT handler (it also runs on SIGTERM and SIGINT); commands register what has to be
+# undone. Each step runs in its own subshell with errexit on, outside any `||` list, so that a
+# failing command inside a step stops that step and does not skip the others.
+CLEANUP_MOUNTS='' CLEANUP_DEVICE='' CLEANUP_TMP='' CLEANUP_NODE='' CLEANUP_RBD_TMP=''
+cleanup() {
+  local rc
+  set +e
+  if [ -n "$CLEANUP_MOUNTS" ]; then (set -e; unmount_tree "$CLEANUP_MOUNTS" lazy); fi
+  if [ -n "$CLEANUP_DEVICE" ]; then (set -e; tcmu_detach "$CLEANUP_DEVICE"); fi
+  if [ -n "$CLEANUP_NODE" ]; then
+    (set -e; node_teardown "$CLEANUP_NODE"); rc=$?
+    [ "$rc" = 0 ] || log "attach of $CLEANUP_NODE was not fully rolled back; run: blkstack node-detach --instance $CLEANUP_NODE"
+  fi
+  if [ -n "$CLEANUP_RBD_TMP" ]; then (rbd_discard "$CLEANUP_RBD_TMP"); fi
+  if [ -n "$CLEANUP_TMP" ]; then rm -rf "$CLEANUP_TMP"; fi
+}
+
+# rm follows mount points. Nothing may be mounted at or below a directory that is removed,
+# or a failed build would be deleted through its bind mounts (the guest root, the host /dev).
+mounts_under() { awk -v d="$(realpath -m "$1")" '$5 == d || index($5, d "/") == 1 { print $5 }' /proc/self/mountinfo | sort -r; }
+# unmount_tree DIR [lazy]: deepest first. A busy mount is an error, because the callers go on
+# to change the filesystem offline; only the exit handler may fall back to a lazy unmount.
+unmount_tree() {
+  local mp
+  while read -r mp; do
+    umount "$mp" 2>/dev/null || { [ "${2:-}" = lazy ] && umount -l "$mp"; } || die "$mp is busy"
+  done < <(mounts_under "$1")
+}
+remove_dir() {
+  [ -e "$1" ] || return 0
+  [ -z "$(mounts_under "$1")" ] || die "refusing to remove $1: something is still mounted below it"
+  rm -rf --one-file-system "$1"
+}
+
+# ---- OverlayBD device through TCMU ------------------------------------------------------------
+#
+# Three things overlaybd-tcmu does not do by itself are set up here for every device, and a
+# device that cannot be set up this way is refused:
+#
+# 1. Timeouts. TCMU and the SCSI layer abort a command after 30 s by default, which turns a
+#    slow registry or a Ceph stall into guest I/O errors. Both are raised so that I/O waits,
+#    as it does on a plain RBD volume.
+# 2. Flushes. overlaybd-tcmu reports "no volatile write cache", so the kernel never sends it a
+#    flush, yet it writes the upper through the host page cache: a guest fsync would be
+#    acknowledged while the data is only in host memory. Marking the SCSI disk as write-back
+#    makes every flush reach overlaybd, which answers with fdatasync.
+# 3. Write alignment. A sparse upper remembers what was written by the holes of its data
+#    file, that is per 4 KiB filesystem block. A write smaller than that over existing lower
+#    data reads back correctly until the device is reopened and then returns zeros for the
+#    rest of the block. Writable devices are therefore exposed through dm-ebs, which turns
+#    every write into whole 4 KiB blocks (read-modify-write); consumers still see 512-byte
+#    sectors. Nothing may write to the raw /dev/sdX of a writable stack.
+
+TCMU_TIMEOUT=2147483   # seconds; the value containerd's overlaybd snapshotter uses
+
+tcmu_id() { printf '%s' "$1" | sha256sum | cut -c1-16; }
+tcmu_raw_device() { # NAME -> /dev/sdX or nothing
+  local id naa address dev
+  id=$(tcmu_id "$1"); naa=naa.6001${id:0:12}
+  [ -d "$TCMU_LOOP/$naa/tpgt_1" ] || return 0
+  address=$(cat "$TCMU_LOOP/$naa/tpgt_1/address")
+  dev=$(ls "/sys/class/scsi_device/$address:0/device/block" 2>/dev/null | head -n1 || true)
+  [ -z "$dev" ] || printf '/dev/%s\n' "$dev"
+}
+tcmu_device() { # NAME -> the device consumers use (the dm-ebs device of a writable stack)
+  local id; id=$(tcmu_id "$1")
+  if [ -b "/dev/mapper/blk-$id" ]; then printf '/dev/mapper/blk-%s\n' "$id"; else tcmu_raw_device "$1"; fi
+}
+
+# tcmu_attach NAME CONFIG -> prints the block device. NAME only has to be unique on this host.
+tcmu_attach() {
+  local id core naa lun raw='' sd result why f
+  id=$(tcmu_id "$1"); core=$TCMU_CORE/blk_$id; naa=naa.6001${id:0:12}; lun=$TCMU_LOOP/$naa/tpgt_1/lun/lun_0
+  result=$(jq -r '.resultFile' "$2")
+  [ ! -d "$core" ] || die "device for '$1' already exists"
+  modprobe target_core_user; modprobe tcm_loop
+  systemctl is-active --quiet overlaybd-tcmu || die "overlaybd-tcmu service is not running"
+  mkdir -p "$core"
+  printf 'dev_config=overlaybd/%s' "$2" >"$core/control"
+  printf 'blk%s' "$id" >"$core/wwn/vpd_unit_serial"
+  if ! printf 1 >"$core/enable" 2>/dev/null || [ "$(cat "$result" 2>/dev/null || true)" != success ]; then
+    why=$(cat "$result" 2>/dev/null || true)
+    rmdir "$core" 2>/dev/null || true
+    die "overlaybd refused the image: ${why:-no result written}"
+  fi
+  # Only possible before the device is exported through a LUN.
+  printf '%s' "$TCMU_TIMEOUT" >"$core/attrib/cmd_time_out"
+  mkdir -p "$lun"
+  printf '%s' "$naa" >"$TCMU_LOOP/$naa/tpgt_1/nexus"
+  ln -s "$core" "$lun/blk_$id"
+  for _ in $(seq 100); do
+    raw=$(tcmu_raw_device "$1")
+    if [ -n "$raw" ] && [ -b "$raw" ]; then break; fi
+    sleep 0.1
+  done
+  [ -n "$raw" ] || { tcmu_detach "$1"; die "no block device appeared for '$1'"; }
+  udevadm settle
+  sd=${raw#/dev/}
+  printf '%s' "$TCMU_TIMEOUT" >"/sys/block/$sd/device/timeout"
+  if [ "$(cat "$core/attrib/cmd_time_out")" != "$TCMU_TIMEOUT" ] || [ "$(cat "/sys/block/$sd/device/timeout")" != "$TCMU_TIMEOUT" ]; then
+    tcmu_detach "$1"; die "could not raise the I/O timeouts of $raw"
+  fi
+  if ! jq -e '.upper' "$2" >/dev/null; then printf '%s\n' "$raw"; return; fi   # read-only stack
+  for f in "/sys/block/$sd/device/scsi_disk"/*/cache_type; do printf 'temporary write back' >"$f"; done
+  if [ "$(cat "/sys/block/$sd/queue/write_cache")" != "write back" ]; then
+    tcmu_detach "$1"; die "could not enable flushes on $raw; refusing a writable device without them"
+  fi
+  # ebs <device> <offset> <emulated block size in sectors> <underlying block size in sectors>
+  if ! modprobe dm-ebs || ! dmsetup create "blk-$id" --table "0 $(blockdev --getsz "$raw") ebs $raw 0 1 8"; then
+    tcmu_detach "$1"; die "dm-ebs is not available; refusing a writable device without 4 KiB write alignment"
+  fi
+  udevadm settle
+  printf '/dev/mapper/blk-%s\n' "$id"
+}
+
+# Partition mappings of a device-mapper disk: every dm device stacked directly on it, whoever
+# made it (kpartx and parted name them differently).
+dm_partitions() {
+  local kernel holder
+  kernel=$(basename "$(readlink -f "$1")")
+  for holder in "/sys/block/$kernel/holders"/*; do
+    [ ! -e "$holder/dm/name" ] || printf '/dev/mapper/%s\n' "$(cat "$holder/dm/name")"
+  done
+}
+dm_drop_partitions() {
+  local part
+  udevadm settle
+  for part in $(dm_partitions "$1"); do dmsetup remove --retry "${part#/dev/mapper/}"; done
+}
+# dm_partition_number DISK PARTITION -> its number in the disk's partition table (matched by start sector)
+dm_partition_number() {
+  local start
+  start=$(dmsetup table "${2#/dev/mapper/}" | awk '{ print $5 }')
+  partx -g -o NR,START "$1" | awk -v s="$start" '$2 == s { print $1 }'
+}
+
+tcmu_detach() { # NAME: safe to repeat; fails, and changes nothing more, while something still uses the device
+  local id core naa dev raw
+  id=$(tcmu_id "$1"); core=$TCMU_CORE/blk_$id; naa=naa.6001${id:0:12}
+  dev=$(tcmu_device "$1"); raw=$(tcmu_raw_device "$1")
+  if [ -n "$dev" ] && lsblk -rno MOUNTPOINT "$dev" | grep -q .; then die "$dev is still mounted"; fi
+  if [ -b "/dev/mapper/blk-$id" ]; then
+    dm_drop_partitions "/dev/mapper/blk-$id"
+    dmsetup remove --retry "blk-$id" 2>/dev/null || die "/dev/mapper/blk-$id is still in use"   # also flushes dm-ebs
+  fi
+  [ -z "$raw" ] || blockdev --flushbufs "$raw" 2>/dev/null || true
+  # Reverse order of creation; each step is a no-op when the object is already gone.
+  rm -f "$TCMU_LOOP/$naa/tpgt_1/lun/lun_0/blk_$id"
+  rmdir "$TCMU_LOOP/$naa/tpgt_1/lun/lun_0" "$TCMU_LOOP/$naa/tpgt_1" "$TCMU_LOOP/$naa" 2>/dev/null || true
+  [ ! -d "$core" ] || rmdir "$core"
+}
+
+# ---- Guest filesystem helpers (builder and own sessions only: they mount the guest's root) ----
+
+# An ext4 journal keeps a copy of every metadata block that changed, and journal blocks are
+# never freed, so up to a whole journal of stale blocks would end up in a layer. Dropping the
+# journal of a cleanly unmounted filesystem and creating an empty one of the same size removes
+# them. journal_drop prints the size to restore; both are no-ops without a journal.
+journal_drop() { # PARTITION -> journal size in MiB, or nothing
+  local header blocks bsize
+  header=$(dumpe2fs -h "$1" 2>/dev/null)
+  blocks=$(awk -F: '/^Total journal blocks/ { gsub(/[^0-9]/, "", $2); print $2 }' <<<"$header")
+  bsize=$(awk -F: '/^Block size/ { gsub(/[^0-9]/, "", $2); print $2 }' <<<"$header")
+  [ -n "$blocks" ] || return 0
+  tune2fs -O ^has_journal "$1" >/dev/null
+  printf '%s\n' "$((blocks * bsize / 1048576))"
+}
+journal_restore() { [ -z "$2" ] || tune2fs -J "size=$2" "$1" >/dev/null; }
+fsck_fix() { local rc=0; e2fsck -fp "$1" >/dev/null || rc=$?; [ "$rc" -le 1 ] || die "e2fsck could not repair $1 (exit $rc)"; }
+
+root_partition() { # DEVICE -> the partition labelled cloudimg-rootfs on that device only
+  local part candidates
+  udevadm settle
+  case $1 in
+    /dev/mapper/*) # device-mapper disks get partition devices from kpartx (dm-linear on top of dm-ebs)
+      [ -n "$(dm_partitions "$1")" ] || kpartx -as "$1" >/dev/null
+      udevadm settle
+      candidates=$(dm_partitions "$1") ;;
+    *) candidates=$(lsblk -rno NAME,TYPE "$1" | awk '$2 == "part" { print "/dev/" $1 }') ;;
+  esac
+  for part in $candidates; do
+    # Probe the partition itself: the udev database may lag, and the host's own root can carry the same label.
+    if [ "$(blkid -p -o value -s LABEL "$part" 2>/dev/null || true)" = cloudimg-rootfs ]; then printf '%s\n' "$part"; return; fi
+  done
+  die "no cloudimg-rootfs partition on $1"
+}
+
+# Processes a recipe left behind would keep the guest root busy.
+kill_chroot_processes() {
+  local p left
+  for _ in $(seq 50); do
+    left=0
+    for p in /proc/[0-9]*; do
+      [ "$(readlink "$p/root" 2>/dev/null || true)" = "$1" ] || continue
+      left=1; kill -9 "${p#/proc/}" 2>/dev/null || true
+    done
+    [ "$left" = 1 ] || return 0
+    sleep 0.1
+  done
+  die "processes started by the recipe are still running in $1"
+}
+
+# ---- Sessions: a stack plus one writable upper ----------------------------------------------
+
+# write_config SESSION_DIR STACK_JSON MODE(rw|ro) -> config.v1.json for overlaybd
+write_config() {
+  local dir=$1 stack=$2 mode=$3 lowers='[]' digest size path url
+  while IFS=$'\t' read -r digest size; do
+    path=$(blob_path "$digest")
+    if [ -f "$path" ]; then
+      lowers=$(jq -c --arg f "$path" '. + [{file: $f}]' <<<"$lowers")
+    else
+      jq -e '.source' >/dev/null <<<"$stack" || die "layer $digest is not stored here and the stack has no registry source"
+      mkdir -p "$ROOT/lazy/${digest#sha256:}"
+      lowers=$(jq -c --arg d "$digest" --argjson s "$size" --arg dir "$ROOT/lazy/${digest#sha256:}" \
+        '. + [{digest: $d, size: $s, dir: $dir}]' <<<"$lowers")
+    fi
+  done < <(jq -r '.layers[] | [.digest, .size] | @tsv' <<<"$stack")
+  url=$(jq -r 'if .source then "\(.source.scheme)://\(.source.registry)/v2/\(.source.repository)/blobs" else "" end' <<<"$stack")
+  jq -n --argjson lowers "$lowers" --arg url "$url" --arg dir "$dir" --arg mode "$mode" '
+    {lowers: $lowers, resultFile: "\($dir)/result"}
+    + (if $url != "" then {repoBlobUrl: $url} else {} end)
+    + (if $mode == "rw" then {upper: {index: "\($dir)/index", data: "\($dir)/data"}} else {} end)' >"$dir/config.v1.json"
+}
+
+# session_create NAME STACK_JSON: a sparse writable upper whose parent is the top layer.
+session_create() {
+  local dir stack=$2 size_gb parent
+  dir=$(session_dir "$1"); [ ! -e "$dir" ] || die "session exists: $1"
+  mkdir -p "$dir"
+  size_gb=$(jq -r '.virtualSizeBytes / 1073741824' <<<"$stack")
+  parent=$(jq -r '.layers[-1].uuid' <<<"$stack")
+  "$OBD/overlaybd-create" -s -u "$parent" "$dir/data" "$dir/index" "$size_gb" >"$dir/create.log" 2>&1 \
+    || { cat "$dir/create.log" >&2; die "overlaybd-create failed"; }
+  jq '{stack: ., created: $now}' --arg now "$(now)" <<<"$stack" >"$dir/session.json"
+  write_config "$dir" "$stack" rw
+}
+
+# A build session of the same name may be left from a failed run: take it apart in order.
+reset_session() {
+  local dir; dir=$(session_dir "$1")
+  [ -e "$dir" ] || return 0
+  unmount_tree "$dir" lazy; tcmu_detach "$1"; remove_dir "$dir"
+}
+
+# commit_layer DATA INDEX PARENT_UUID TITLE -> prints a layer JSON object and stores the blob.
+# Always a ZFile whose header is rewritten at commit (-z, never -t): that is the form that
+# opens from a block device, where the file size is rounded.
+commit_layer() {
+  local data=$1 index=$2 parent=$3 title=$4 uuid tmp digest size pargs=()
+  [ -z "$parent" ] || pargs=(-p "$parent")
+  uuid=$(new_uuid); tmp=$(mktemp "$ROOT/blobs/commit.XXXXXX")
+  "$OBD/overlaybd-commit" -z -f --algorithm "$ZALGO" --uuid "$uuid" "${pargs[@]}" "$data" "$index" "$tmp" >"$tmp.log" 2>&1 \
+    || { cat "$tmp.log" >&2; rm -f "$tmp" "$tmp.log"; die "overlaybd-commit failed"; }
+  rm -f "$tmp.log"
+  digest=sha256:$(sha256sum "$tmp" | cut -d' ' -f1); size=$(stat -c %s "$tmp")
+  chmod 0444 "$tmp"; mv -f "$tmp" "$(blob_path "$digest")"
+  jq -n --arg d "$digest" --argjson s "$size" --arg u "$uuid" --arg p "$parent" --arg t "$title" --arg c "$(now)" \
+    '{digest: $d, size: $s, uuid: $u, parentUuid: $p, title: $t, created: $c}'
+}
+
+save_stack() { # NAME JSON — a stack name is written once and never replaced (link fails if it exists)
+  local f tmp
+  validate_stack "$2"
+  f=$(stack_file "$1"); tmp=$(mktemp "$ROOT/stacks/.new.XXXXXX")
+  jq --arg n "$1" '.name = $n' <<<"$2" >"$tmp"; chmod 0444 "$tmp"
+  if ! ln "$tmp" "$f" 2>/dev/null; then rm -f "$tmp"; die "stack exists and stacks are immutable: $1"; fi
+  rm -f "$tmp"
+}
+
+# ---- Commands -----------------------------------------------------------------------------------
+
+cmd_init() {
+  init_dirs
+  need jq sha256sum lsblk blkid parted partx kpartx dmsetup flock resize2fs e2fsck tune2fs fstrim \
+    "$OBD/overlaybd-create" "$OBD/overlaybd-commit" "$OBD/overlaybd-apply"
+  modprobe target_core_user; modprobe tcm_loop
+  modprobe dm-ebs || die "the dm-ebs kernel module is required for writable stacks"
+  systemctl is-active --quiet overlaybd-tcmu || systemctl enable --now /opt/overlaybd/overlaybd-tcmu.service
+  log "ready: $ROOT"
+}
+
+# build-base --name NAME --image QCOW2 --size-gb N
+# Layer 0: the whole cloud image disk (partition table, ESP, root filesystem), grown once to
+# the stack's virtual size so that no instance has to repeat that write in its own delta.
+cmd_build_base() {
+  local name='' image='' size_gb=20 session dir dev part number layer mnt groups=0 zeroed=-1 previous still=0
+  while [ $# -gt 0 ]; do case $1 in
+    --name) name=$2; shift 2 ;; --image) image=$2; shift 2 ;; --size-gb) size_gb=$2; shift 2 ;;
+    *) die "build-base: unknown option $1" ;; esac; done
+  [ -n "$name" ] && [ -f "$image" ] || die "usage: build-base --name NAME --image QCOW2 [--size-gb N]"
+  valid_name "$name"; [[ $size_gb =~ ^[1-9][0-9]*$ ]] || die "size must be whole gibibytes"
+  init_dirs; [ ! -e "$(stack_file "$name")" ] || die "stack exists: $name"
+  session=build-$(tcmu_id "$name"); dir=$(session_dir "$session")
+  reset_session "$session"; mkdir -p "$dir"
+  "$OBD/overlaybd-create" -s "$dir/data" "$dir/index" "$size_gb" >"$dir/create.log" 2>&1 || die "overlaybd-create failed"
+  jq -n --arg d "$dir" '{lowers: [], upper: {index: "\($d)/index", data: "\($d)/data"}, resultFile: "\($d)/result"}' >"$dir/config.v1.json"
+  log "converting $(basename "$image") into a block layer"
+  "$OBD/overlaybd-apply" --from_qcow2 --no-extract-rootfs "$image" "$dir/config.v1.json" >"$dir/apply.log" 2>&1 \
+    || { tail -n 20 "$dir/apply.log" >&2; die "overlaybd-apply failed"; }
+  CLEANUP_DEVICE=$session
+  dev=$(tcmu_attach "$session" "$dir/config.v1.json")
+  part=$(root_partition "$dev")
+  number=$(dm_partition_number "$dev" "$part"); [[ $number =~ ^[0-9]+$ ]] || die "cannot find the root partition's number"
+  dm_drop_partitions "$dev"
+  parted -s -f "$dev" print >/dev/null 2>&1     # moves the backup GPT to the end of the larger disk
+  parted -s "$dev" resizepart "$number" 100%
+  dm_drop_partitions "$dev"                     # parted leaves its own mappings; rebuild them at the new size
+  part=$(root_partition "$dev")
+  fsck_fix "$part"
+  resize2fs "$part" >/dev/null 2>&1
+  # ext4 zeroes the inode tables of the block groups resize2fs added lazily, during the first
+  # writable mount. Let that happen here, once, in the base layer; otherwise every layer build
+  # and every instance's first boot would write the same zeros into its own delta.
+  mnt=$dir/mnt; mkdir -p "$mnt"; CLEANUP_MOUNTS=$mnt
+  mount -o noatime,nodev,nosuid,noexec,init_itable=0 "$part" "$mnt"
+  # Done when every group is flagged, or when the count has stopped moving (the kernel thread
+  # leaves groups it does not need to touch unflagged).
+  for _ in $(seq 900); do
+    previous=$zeroed
+    read -r groups zeroed < <(dumpe2fs "$part" 2>/dev/null | awk '/^Group /{ g++ } /ITABLE_ZEROED/{ z++ } END { print g + 0, z + 0 }')
+    if [ "$zeroed" -ge "$groups" ]; then break; fi
+    if [ "$zeroed" = "$previous" ]; then still=$((still + 1)); else still=0; fi
+    [ "$still" -lt 5 ] || break
+    sleep 1
+  done
+  unmount_tree "$mnt"; CLEANUP_MOUNTS=''
+  log "inode tables initialised in $zeroed of $groups block groups"
+  sync
+  tcmu_detach "$session"; CLEANUP_DEVICE=''
+  layer=$(commit_layer "$dir/data" "$dir/index" "" "base:$(basename "$image")")
+  save_stack "$name" "$(jq -n --argjson l "$layer" --argjson gb "$size_gb" --arg arch "$(uname -m)" \
+    '{schema: "palimpsest.blockstack.v1", arch: $arch, virtualSizeBytes: ($gb * 1073741824), layers: [$l]}')"
+  remove_dir "$dir"
+  log "stack $name: 1 layer, $(jq -r .digest <<<"$layer")"
+}
+
+# build-layer --from STACK --name NEW --recipe SCRIPT [--title TEXT]
+# Runs the recipe inside the stack's root filesystem (chroot) and commits what it changed as
+# one new layer. Run it on a disposable builder: the recipe executes as root.
+cmd_build_layer() {
+  local from='' name='' recipe='' title='' stack session dir dev part mnt layer journal_mb
+  while [ $# -gt 0 ]; do case $1 in
+    --from) from=$2; shift 2 ;; --name) name=$2; shift 2 ;; --recipe) recipe=$2; shift 2 ;; --title) title=$2; shift 2 ;;
+    *) die "build-layer: unknown option $1" ;; esac; done
+  [ -n "$from" ] && [ -n "$name" ] && [ -f "$recipe" ] || die "usage: build-layer --from STACK --name NEW --recipe SCRIPT"
+  valid_name "$from"; valid_name "$name"
+  init_dirs; [ ! -e "$(stack_file "$name")" ] || die "stack exists: $name"
+  stack=$(read_stack "$from"); session=build-$(tcmu_id "$name"); dir=$(session_dir "$session"); mnt=$dir/mnt
+  reset_session "$session"; session_create "$session" "$stack"
+  CLEANUP_DEVICE=$session; CLEANUP_MOUNTS=$mnt
+  dev=$(tcmu_attach "$session" "$dir/config.v1.json")
+  part=$(root_partition "$dev"); mkdir -p "$mnt"
+  journal_mb=$(journal_drop "$part")   # build without a journal, see journal_drop
+  mount -o noatime "$part" "$mnt"
+  mount --bind /dev "$mnt/dev"; mount --make-private "$mnt/dev"
+  mount --bind /dev/pts "$mnt/dev/pts"; mount --make-private "$mnt/dev/pts"
+  mount -t proc proc "$mnt/proc"; mount -t sysfs -o ro sysfs "$mnt/sys"; mount -t tmpfs tmpfs "$mnt/run"
+  mkdir -p "$mnt/run/systemd/resolve"
+  cp /run/systemd/resolve/resolv.conf "$mnt/run/systemd/resolve/stub-resolv.conf" 2>/dev/null || cp -L /etc/resolv.conf "$mnt/run/systemd/resolve/stub-resolv.conf"
+  printf '#!/bin/sh\nexit 101\n' >"$mnt/usr/sbin/policy-rc.d"; chmod 0755 "$mnt/usr/sbin/policy-rc.d"
+  install -m 0755 "$recipe" "$mnt/tmp/blkstack-recipe.sh"
+  log "running $(basename "$recipe") in $name"
+  chroot "$mnt" /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin DEBIAN_FRONTEND=noninteractive NEEDRESTART_SUSPEND=1 HOME=/root /bin/bash -euo pipefail /tmp/blkstack-recipe.sh
+  kill_chroot_processes "$mnt"
+  rm -f "$mnt/tmp/blkstack-recipe.sh" "$mnt/usr/sbin/policy-rc.d"
+  # A block layer keeps the blocks of deleted files unless the filesystem discards them.
+  sync; fstrim "$mnt"
+  sync
+  unmount_tree "$mnt"; CLEANUP_MOUNTS=''
+  journal_restore "$part" "$journal_mb"
+  tcmu_detach "$session"; CLEANUP_DEVICE=''
+  layer=$(commit_layer "$dir/data" "$dir/index" "$(jq -r '.layers[-1].uuid' <<<"$stack")" "${title:-$(basename "$recipe")}")
+  # .source is kept: lower layers that were pulled lazily still live in that registry.
+  save_stack "$name" "$(jq --argjson l "$layer" 'del(.name) | .layers += [$l]' <<<"$stack")"
+  remove_dir "$dir"
+  log "stack $name: $(jq '.layers | length + 1' <<<"$stack") layers, new $(jq -r .digest <<<"$layer") ($(jq -r .size <<<"$layer") bytes)"
+}
+
+# session-create STACK SESSION | attach SESSION | device SESSION | detach SESSION | session-rm SESSION
+user_session() { valid_session "$1"; [[ $1 != node-* && $1 != build-* ]] || die "$1 is managed by node-attach or a build"; }
+cmd_session_create() { valid_name "$1"; user_session "$2"; init_dirs; session_create "$2" "$(read_stack "$1")"; log "session $2 on $1"; }
+cmd_attach() { local dir; user_session "$1"; dir=$(session_dir "$1"); [ -f "$dir/session.json" ] || die "unknown session: $1"; tcmu_attach "$1" "$dir/config.v1.json"; }
+cmd_detach() { user_session "$1"; tcmu_detach "$1"; }
+cmd_device() { valid_session "$1"; tcmu_device "$1"; }
+cmd_session_rm() {
+  user_session "$1"
+  [ -z "$(tcmu_device "$1")" ] || die "session $1 is attached"
+  remove_dir "$(session_dir "$1")"
+}
+
+# trim SESSION: discard the blocks of files deleted in the session and the stale blocks of its
+# filesystem journal, so that the committed layer does not carry them. It mounts the session's
+# root filesystem on this host, so use it only for disks you trust (your own session, a
+# builder); otherwise run fstrim in the guest and accept the journal's share.
+cmd_trim() {
+  local session=$1 dir dev part mnt
+  user_session "$session"
+  dir=$(session_dir "$session"); [ -f "$dir/session.json" ] || die "unknown session: $session"
+  [ -z "$(tcmu_device "$session")" ] || die "detach the session first"
+  mnt=$dir/mnt; mkdir -p "$mnt"
+  CLEANUP_DEVICE=$session; CLEANUP_MOUNTS=$mnt
+  dev=$(tcmu_attach "$session" "$dir/config.v1.json")
+  part=$(root_partition "$dev"); mount -o noatime,nodev,nosuid,noexec "$part" "$mnt"
+  fstrim -v "$mnt" >&2
+  unmount_tree "$mnt"; CLEANUP_MOUNTS=''
+  fsck_fix "$part"
+  journal_restore "$part" "$(journal_drop "$part")"
+  tcmu_detach "$session"; CLEANUP_DEVICE=''
+}
+
+# commit SESSION --name NEW [--title TEXT]: the session's writes become one new immutable layer.
+cmd_commit() {
+  local session=$1 name='' title='' dir stack layer; shift
+  while [ $# -gt 0 ]; do case $1 in --name) name=$2; shift 2 ;; --title) title=$2; shift 2 ;; *) die "commit: unknown option $1" ;; esac; done
+  [ -n "$name" ] || die "usage: commit SESSION --name NEW"
+  user_session "$session"; valid_name "$name"
+  dir=$(session_dir "$session"); [ -f "$dir/session.json" ] || die "unknown session: $session"
+  [ -z "$(tcmu_device "$session")" ] || die "detach the session first (stop the VM, then: blkstack detach $session)"
+  [ ! -e "$(stack_file "$name")" ] || die "stack exists: $name"
+  stack=$(jq -c .stack "$dir/session.json"); validate_stack "$stack"
+  layer=$(commit_layer "$dir/data" "$dir/index" "$(jq -r '.layers[-1].uuid' <<<"$stack")" "${title:-delta of $session}")
+  save_stack "$name" "$(jq --argjson l "$layer" 'del(.name) | .layers += [$l]' <<<"$stack")"
+  log "stack $name: new layer $(jq -r .digest <<<"$layer") ($(jq -r .size <<<"$layer") bytes)"
+}
+
+# ---- OCI registry ---------------------------------------------------------------------------------
+
+split_ref() { # REGISTRY/REPO:TAG -> REGISTRY REPO TAG
+  [[ $1 =~ ^([A-Za-z0-9.-]+(:[0-9]+)?)/([a-z0-9]+((\.|_|__|-+|/)[a-z0-9]+)*):([A-Za-z0-9._-]+)$ ]] || die "reference must be REGISTRY/REPOSITORY:TAG: $1"
+  printf '%s %s %s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[6]}"
+}
+
+# push STACK REGISTRY/REPO:TAG [--plain-http]
+# Credentials come from `oras login` run as the same user (root), never from argv.
+cmd_push() {
+  local name=$1 ref=$2 plain=() stack registry repo tag cfg_digest digest size
+  [ "${3:-}" != --plain-http ] || plain=(--plain-http)
+  need oras; stack=$(read_stack "$name"); read -r registry repo tag < <(split_ref "$ref")
+  while IFS=$'\t' read -r digest size; do
+    if oras blob fetch "${plain[@]}" --descriptor "$registry/$repo@$digest" >/dev/null 2>&1 </dev/null; then
+      log "layer $digest already in the registry"
+    else
+      [ -f "$(blob_path "$digest")" ] || die "layer $digest is not stored here"
+      oras blob push "${plain[@]}" --size "$size" "$registry/$repo@$digest" "$(blob_path "$digest")" >/dev/null </dev/null
+      log "pushed layer $digest ($size bytes)"
+    fi
+  done < <(jq -r '.layers[] | [.digest, .size] | @tsv' <<<"$stack")
+  CLEANUP_TMP=$(mktemp -d)
+  jq -cS 'del(.source)' <<<"$stack" >"$CLEANUP_TMP/config"
+  cfg_digest=sha256:$(sha256sum "$CLEANUP_TMP/config" | cut -d' ' -f1)
+  oras blob push "${plain[@]}" "$registry/$repo@$cfg_digest" "$CLEANUP_TMP/config" >/dev/null
+  jq -n --arg at "$ARTIFACT_TYPE" --arg cmt "$CONFIG_MEDIA_TYPE" --arg lmt "$LAYER_MEDIA_TYPE" \
+    --arg cd "$cfg_digest" --argjson cs "$(stat -c %s "$CLEANUP_TMP/config")" --argjson stack "$stack" '
+    {schemaVersion: 2, mediaType: "application/vnd.oci.image.manifest.v1+json", artifactType: $at,
+     config: {mediaType: $cmt, digest: $cd, size: $cs},
+     layers: [$stack.layers[] | {mediaType: $lmt, digest: .digest, size: .size,
+              annotations: {"org.opencontainers.image.title": .title}}]}' >"$CLEANUP_TMP/manifest"
+  oras manifest push "${plain[@]}" --media-type application/vnd.oci.image.manifest.v1+json "$registry/$repo:$tag" "$CLEANUP_TMP/manifest" >/dev/null
+  log "pushed $ref"
+}
+
+# pull REGISTRY/REPO:TAG --name STACK [--plain-http] [--blobs]
+# Without --blobs only the manifest and the stack description are fetched: layers stay in the
+# registry and are read on demand (lazy) when a session of this stack is attached. Lazy reads
+# are not checked against the layer digest; --blobs downloads every layer and verifies it.
+cmd_pull() {
+  local ref=$1 name='' plain=() blobs=0 scheme=https registry repo tag manifest cfg_digest stack digest size tmp; shift
+  while [ $# -gt 0 ]; do case $1 in
+    --name) name=$2; shift 2 ;; --plain-http) plain=(--plain-http); scheme=http; shift ;; --blobs) blobs=1; shift ;;
+    *) die "pull: unknown option $1" ;; esac; done
+  [ -n "$name" ] || die "usage: pull REGISTRY/REPO:TAG --name STACK"
+  valid_name "$name"
+  need oras; init_dirs; read -r registry repo tag < <(split_ref "$ref")
+  [ ! -e "$(stack_file "$name")" ] || die "stack exists: $name"
+  CLEANUP_TMP=$(mktemp -d "$ROOT/blobs/pull.XXXXXX")
+  manifest=$(oras manifest fetch "${plain[@]}" -o - "$registry/$repo:$tag")
+  [ "$(jq -r '.artifactType // ""' <<<"$manifest")" = "$ARTIFACT_TYPE" ] || die "$ref is not a block stack"
+  cfg_digest=$(jq -r '.config.digest // ""' <<<"$manifest"); [[ $cfg_digest =~ $DIGEST_RE ]] || die "$ref has no usable stack description"
+  oras blob fetch "${plain[@]}" -o "$CLEANUP_TMP/config" "$registry/$repo@$cfg_digest" >/dev/null
+  [ "sha256:$(sha256sum "$CLEANUP_TMP/config" | cut -d' ' -f1)" = "$cfg_digest" ] || die "stack description does not match its digest"
+  stack=$(jq -c 'del(.source, .name)' "$CLEANUP_TMP/config"); validate_stack "$stack"   # before any digest becomes a path
+  [ "$(jq -c '[.layers[] | [.digest, .size]]' <<<"$stack")" = "$(jq -c '[.layers[] | [.digest, .size]]' <<<"$manifest")" ] \
+    || die "manifest and stack description disagree about the layers"
+  if [ "$blobs" = 1 ]; then
+    while IFS=$'\t' read -r digest size; do
+      [ ! -f "$(blob_path "$digest")" ] || continue   # stored under its digest after an earlier verification
+      tmp=$CLEANUP_TMP/layer
+      oras blob fetch "${plain[@]}" -o "$tmp" "$registry/$repo@$digest" >/dev/null </dev/null
+      [ "$(stat -c %s "$tmp")" = "$size" ] && [ "sha256:$(sha256sum "$tmp" | cut -d' ' -f1)" = "$digest" ] \
+        || die "layer $digest failed verification"
+      chmod 0444 "$tmp"; mv -f "$tmp" "$(blob_path "$digest")"; log "fetched and verified $digest"
+    done < <(jq -r '.layers[] | [.digest, .size] | @tsv' <<<"$stack")
+  fi
+  save_stack "$name" "$(jq --arg r "$registry" --arg p "$repo" --arg s "$scheme" '.source = {registry: $r, repository: $p, scheme: $s}' <<<"$stack")"
+  log "stack $name from $ref ($([ "$blobs" = 1 ] && echo 'layers stored locally' || echo 'lazy: layers stay in the registry'))"
+}
+
+# ---- Ceph RBD -------------------------------------------------------------------------------------
+
+rbd_name() { printf 'blk-%s' "${1#sha256:}"; }
+rbd_sealed() { $RBD snap ls --format json "$1" 2>/dev/null | jq -e 'any(.[]; .name == "sealed")' >/dev/null; }
+rbd_discard() { $RBD snap unprotect "$1@sealed" >/dev/null 2>&1 || true; $RBD snap purge "$1" >/dev/null 2>&1 || true; $RBD rm "$1" >/dev/null 2>&1 || true; }
+
+# rbd-publish STACK --pool POOL: every layer blob becomes one RBD image with a protected
+# snapshot `sealed`; an image that already exists is not written again. A layer is imported
+# under a temporary name, sealed, read back from the snapshot and compared with its digest,
+# and only then renamed to its final name. The rename fails when that name exists, so two
+# publishers cannot both write blk-<digest>, and nodes never see a name without a verified
+# snapshot behind it.
+cmd_rbd_publish() {
+  local name=$1 pool='' stack digest size image tmp; shift
+  while [ $# -gt 0 ]; do case $1 in --pool) pool=$2; shift 2 ;; *) die "rbd-publish: unknown option $1" ;; esac; done
+  [[ $pool =~ $POOL_RE ]] || die "usage: rbd-publish STACK --pool POOL"
+  stack=$(read_stack "$name")
+  while IFS=$'\t' read -r digest size; do
+    image=$pool/$(rbd_name "$digest")
+    if rbd_sealed "$image"; then log "$image@sealed already published"; continue; fi
+    ! $RBD info "$image" >/dev/null 2>&1 </dev/null || die "$image exists without a sealed snapshot; inspect it and remove it by hand"
+    [ -f "$(blob_path "$digest")" ] || die "layer $digest is not stored here"
+    tmp=$pool/tmp-$(new_uuid); CLEANUP_RBD_TMP=$tmp
+    $RBD import --no-progress --image-format 2 --image-feature layering "$(blob_path "$digest")" "$tmp" </dev/null
+    $RBD image-meta set "$tmp" blkstack.digest "$digest" </dev/null
+    $RBD image-meta set "$tmp" blkstack.size "$size" </dev/null
+    $RBD snap create "$tmp@sealed" </dev/null 2>/dev/null; $RBD snap protect "$tmp@sealed" </dev/null
+    if [ "sha256:$($RBD export --no-progress "$tmp@sealed" - </dev/null | sha256sum | cut -d' ' -f1)" != "$digest" ]; then
+      die "$image does not read back from the cluster as $digest"   # the exit handler discards the temporary image
+    fi
+    if $RBD rename "$tmp" "$image" </dev/null 2>/dev/null; then
+      CLEANUP_RBD_TMP=''
+      log "published $image@sealed ($size bytes)"
+    else
+      rbd_discard "$tmp"; CLEANUP_RBD_TMP=''
+      rbd_sealed "$image" || die "could not publish $image"
+      log "$image@sealed was published by someone else meanwhile"
+    fi
+  done < <(jq -r '.layers[] | [.digest, .size] | @tsv' <<<"$stack")
+}
+
+rbd_mapped() { $RBD device list --format json | jq -r --arg p "$1" --arg i "$2" --arg s "${3:-}" \
+  '[.[] | select(.pool == $p and .name == $i and ((.snap // "-") == (if $s == "" then "-" else $s end))) | .device][0] // ""'; }
+
+# Layer mappings are shared by every instance of a node, so everything that maps, unmaps or
+# decides whether a layer is still in use runs under one node-wide lock.
+node_lock() { exec 9>"$ROOT/run/node.lock"; flock -w 120 9 || die "another attach or detach is still running on this node"; }
+
+# node-attach STACK|- --instance ID --layer-pool POOL --delta-pool POOL [--delta-image NAME] [--delta-size-gb N]
+# Compute-node side: layers come from RBD snapshots mapped read-only (shared by every instance
+# on the node), the writable upper lives in a filesystem on the instance's own RBD image. The
+# delta image records the stack it was created on; with `-` the stack is read from there, so
+# a node needs nothing but the image name to assemble an existing instance disk.
+cmd_node_attach() {
+  local name=$1 instance='' lpool='' dpool='' dimage='' dsize=0 stack dir digest size image dev lowers='[]' delta ddev mnt size_gb recorded f digests fs_uuid found; shift
+  while [ $# -gt 0 ]; do case $1 in
+    --instance) instance=$2; shift 2 ;; --layer-pool) lpool=$2; shift 2 ;; --delta-pool) dpool=$2; shift 2 ;;
+    --delta-image) dimage=$2; shift 2 ;; --delta-size-gb) dsize=$2; shift 2 ;; *) die "node-attach: unknown option $1" ;; esac; done
+  [[ $instance =~ ^[a-z0-9][a-z0-9-]{0,62}$ && $lpool =~ $POOL_RE && $dpool =~ $POOL_RE && $dsize =~ ^[0-9]+$ ]] \
+    || die "usage: node-attach STACK|- --instance ID --layer-pool POOL --delta-pool POOL"
+  dimage=${dimage:-delta-$instance}; delta=$dpool/$dimage
+  [[ $dimage =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,90}$ ]] || die "invalid delta image name"
+  init_dirs; node_lock
+  dir=$(session_dir "node-$instance"); mnt=$dir/delta
+  [ ! -e "$dir" ] || die "instance $instance is attached here, or a failed attach was left behind (blkstack node-detach --instance $instance)"
+  recorded=$($RBD image-meta get "$delta" blkstack.stack 2>/dev/null || true)
+  if [ "$name" = - ]; then
+    [ -n "$recorded" ] || die "$delta does not exist or records no stack"
+    stack=$recorded
+  else
+    stack=$(read_stack "$name" | jq -cS 'del(.name, .source)')
+    if [ -z "$recorded" ]; then
+      ! $RBD info "$delta" >/dev/null 2>&1 || die "$delta exists but records no stack"
+      size_gb=$(jq -r '.virtualSizeBytes / 1073741824' <<<"$stack")
+      # Room for a full overwrite of the virtual disk plus the filesystem that holds the upper.
+      [ "$dsize" -gt 0 ] || dsize=$((size_gb + size_gb / 16 + 1))
+      $RBD create --size "${dsize}G" --image-feature layering,exclusive-lock,object-map,fast-diff "$delta"
+      $RBD image-meta set "$delta" blkstack.stack "$stack"
+    elif [ "$(jq -c '[.layers[].digest]' <<<"$recorded")" != "$(jq -c '[.layers[].digest]' <<<"$stack")" ]; then
+      die "$delta was written on other layers; a writable delta is only valid on the exact stack it was created on"
+    fi
+  fi
+  validate_stack "$stack"   # the recorded copy was written by another identity
+  $RBD info --format json "$delta" | jq -e '.features | index("exclusive-lock")' >/dev/null \
+    || die "$delta lacks the exclusive-lock feature, so nothing would stop a second host from writing it"
+  [ "$(($($RBD info --format json "$delta" | jq -r .size)))" -gt "$(jq -r .virtualSizeBytes <<<"$stack")" ] \
+    || die "$delta is not larger than the virtual disk: the upper could run out of space before the guest's disk is full"
+
+  # From here on a failure is rolled back by node_teardown (see cleanup); node.json comes first
+  # because it is what teardown and other instances' in-use checks read.
+  mkdir -p "$dir" "$mnt"; CLEANUP_NODE=$instance
+  jq -n --arg p "$dpool" --arg i "$dimage" --arg lp "$lpool" --argjson stack "$stack" \
+    '{deltaPool: $p, deltaImage: $i, layerPool: $lp, stack: $stack}' >"$dir/node.json"
+  # A layer image is named after its digest by the publisher, the only identity that can write
+  # the layer pool. The node identity can only read, so what it can check is that the sealed
+  # image exists and has the size the stack states.
+  mapfile -t digests < <(jq -r '.layers[] | "\(.digest) \(.size)"' <<<"$stack")
+  for digest in "${digests[@]}"; do
+    size=${digest#* }; digest=${digest% *}; image=$(rbd_name "$digest")
+    rbd_sealed "$lpool/$image" && [ "$($RBD info --format json "$lpool/$image" 2>/dev/null | jq -r .size)" = "$size" ] \
+      || die "$lpool/$image is not a published layer of $size bytes"
+    dev=$(rbd_mapped "$lpool" "$image" sealed)
+    [ -n "$dev" ] || dev=$($RBD device map --read-only "$lpool/$image@sealed")
+    lowers=$(jq -c --arg f "$dev" '. + [{file: $f}]' <<<"$lowers")
+  done
+  # --exclusive: this host keeps the image's lock and never hands it over, so a second host
+  # that tries to attach the same delta fails instead of writing next to this one.
+  # Format once, and never again. Two records on the image (written while it is unmapped: an
+  # exclusive kernel mapping keeps the image's lock) make that hold across interruptions:
+  # `blkstack.fs_uuid` is chosen before mkfs, `blkstack.formatted` is set after it. Once
+  # `formatted` is there, a probe that finds nothing (a damaged superblock, a read error) is an
+  # error and not "empty".
+  if [ "$($RBD image-meta get "$delta" blkstack.formatted 2>/dev/null || true)" != 1 ]; then
+    fs_uuid=$($RBD image-meta get "$delta" blkstack.fs_uuid 2>/dev/null || true)
+    if ! [[ $fs_uuid =~ $UUID_RE ]]; then fs_uuid=$(new_uuid); $RBD image-meta set "$delta" blkstack.fs_uuid "$fs_uuid"; fi
+    ddev=$($RBD device map --exclusive "$delta")
+    found=$(blkid -p -o value -s UUID "$ddev" 2>/dev/null) || found=''
+    if [ -z "$found" ] && [ -z "$(blkid -p -o value -s TYPE "$ddev" 2>/dev/null || true)" ]; then
+      # Two files live here: few inodes, no reserved blocks.
+      mkfs.ext4 -q -U "$fs_uuid" -m 0 -T largefile4 -E lazy_itable_init=0,lazy_journal_init=0,nodiscard "$ddev"
+    elif [ "$found" != "$fs_uuid" ]; then
+      die "$delta holds data that this tool did not put there"
+    fi   # else: an earlier attach formatted it and stopped before recording that
+    $RBD device unmap "$ddev"
+    $RBD image-meta set "$delta" blkstack.formatted 1
+  fi
+  ddev=$($RBD device map --exclusive "$delta")
+  # The pool is writable by every node identity: never follow a link or run anything from it.
+  mount -o noatime,discard,nodev,nosuid,noexec,nosymfollow "$ddev" "$mnt"
+  if [ ! -e "$mnt/data" ] && [ ! -e "$mnt/index" ]; then
+    "$OBD/overlaybd-create" -s -u "$(jq -r '.layers[-1].uuid' <<<"$stack")" "$mnt/data" "$mnt/index" \
+      "$(jq -r '.virtualSizeBytes / 1073741824' <<<"$stack")" >"$dir/create.log" 2>&1 || die "overlaybd-create failed"
+  fi
+  for f in data index; do [ -f "$mnt/$f" ] && [ ! -L "$mnt/$f" ] || die "$delta: $f is not a regular file"; done
+  jq -n --argjson lowers "$lowers" --arg m "$mnt" --arg d "$dir" \
+    '{lowers: $lowers, upper: {index: "\($m)/index", data: "\($m)/data"}, resultFile: "\($d)/result"}' >"$dir/config.v1.json"
+  dev=$(tcmu_attach "node-$instance" "$dir/config.v1.json")
+  mkdir -p /dev/blkstack; ln -sfn "$dev" "/dev/blkstack/$instance"
+  CLEANUP_NODE=''
+  printf '/dev/blkstack/%s\n' "$instance"
+}
+
+# node_teardown INSTANCE: undo whatever exists of an attach, in reverse order; safe to repeat.
+# The caller holds the node lock. The delta image itself is never removed.
+node_teardown() {
+  local instance=$1 dir dpool image lpool digest dev other in_use digests
+  dir=$(session_dir "node-$instance")
+  tcmu_detach "node-$instance" || die "cannot remove the device of $instance"
+  ! mountpoint -q "$dir/delta" || umount "$dir/delta" || die "cannot unmount the delta of $instance"
+  if [ -f "$dir/node.json" ]; then
+    dpool=$(jq -r .deltaPool "$dir/node.json"); image=$(jq -r .deltaImage "$dir/node.json"); lpool=$(jq -r .layerPool "$dir/node.json")
+    dev=$(rbd_mapped "$dpool" "$image") || die "cannot list RBD mappings"
+    [ -z "$dev" ] || $RBD device unmap "$dev" || die "cannot unmap $dev"
+    mapfile -t digests < <(jq -r '.stack.layers[].digest' "$dir/node.json")
+    for digest in "${digests[@]}"; do
+      in_use=0
+      for other in "$ROOT"/sessions/node-*/node.json; do
+        [ -f "$other" ] && [ "$other" != "$dir/node.json" ] || continue
+        ! jq -e --arg d "$digest" '.stack.layers | any(.digest == $d)' "$other" >/dev/null || in_use=1
+      done
+      dev=$(rbd_mapped "$lpool" "$(rbd_name "$digest")" sealed) || die "cannot list RBD mappings"
+      [ "$in_use" = 1 ] || [ -z "$dev" ] || $RBD device unmap "$dev" || die "cannot unmap $dev"
+    done
+  fi
+  remove_dir "$dir"
+  rm -f "/dev/blkstack/$instance"   # last: its absence means nothing of the attach is left
+}
+
+# node-detach --instance ID [--missing-ok]: the delta image is kept; layer mappings stay
+# while another instance on this node uses them.
+cmd_node_detach() {
+  local instance='' missing_ok=0
+  while [ $# -gt 0 ]; do case $1 in --instance) instance=$2; shift 2 ;; --missing-ok) missing_ok=1; shift ;; *) die "node-detach: unknown option $1" ;; esac; done
+  [[ $instance =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] || die "usage: node-detach --instance ID"
+  init_dirs; node_lock
+  if [ ! -d "$(session_dir "node-$instance")" ] && [ ! -L "/dev/blkstack/$instance" ]; then
+    [ "$missing_ok" = 1 ] || die "unknown instance: $instance"
+    return 0
+  fi
+  node_teardown "$instance"
+}
+
+# usage --image POOL/IMAGE: what a delta image occupies, for metering. --exact counts the
+# written extents (and walks every object); without it rbd rounds every touched object up
+# to the object size. Snapshots of the image are listed separately and not counted here.
+cmd_usage() {
+  local image=''
+  while [ $# -gt 0 ]; do case $1 in --image) image=$2; shift 2 ;; *) die "usage: unknown option $1" ;; esac; done
+  [ -n "$image" ] || die "usage: usage --image POOL/IMAGE"
+  jq -cn --argjson exact "$($RBD du --exact --format json "$image")" --argjson fast "$($RBD du --format json "$image")" '
+    def head: .images | map(select(has("snapshot") | not)) | .[0];
+    {image: ($exact | head).name, provisioned_bytes: ($exact | head).provisioned_size,
+     used_bytes_exact: ($exact | head).used_size, used_bytes_object_granular: ($fast | head).used_size}'
+}
+
+# ---- Local boot ------------------------------------------------------------------------------------
+
+# boot SESSION [--user-data FILE] [--ssh-port N] [--memory-mb N] [--cpus N]
+# Boots the attached session with QEMU as a background process; the VM's console goes to the
+# session directory. Stop it from inside (poweroff) or with: kill "$(cat SESSION_DIR/qemu.pid)".
+cmd_boot() {
+  local session=$1 user_data='' port=2222 mem=2048 cpus=2 dir dev accel=(-accel kvm -cpu host) seed=(); shift
+  while [ $# -gt 0 ]; do case $1 in
+    --user-data) user_data=$2; shift 2 ;; --ssh-port) port=$2; shift 2 ;; --memory-mb) mem=$2; shift 2 ;; --cpus) cpus=$2; shift 2 ;;
+    *) die "boot: unknown option $1" ;; esac; done
+  valid_session "$session"; [[ $port =~ ^[0-9]+$ && $mem =~ ^[0-9]+$ && $cpus =~ ^[0-9]+$ ]] || die "boot: port, memory and cpus are numbers"
+  dir=$(session_dir "$session"); dev=$(tcmu_device "$session"); [ -n "$dev" ] || die "attach the session first"
+  [ -w /dev/kvm ] || { accel=(-accel tcg -cpu max); log "no /dev/kvm: falling back to emulation (slow)"; }
+  if [ -n "$user_data" ]; then
+    need cloud-localds
+    printf 'instance-id: %s\nlocal-hostname: %s\n' "$session-$(date +%s)" "$session" >"$dir/meta-data"
+    cloud-localds "$dir/seed.img" "$user_data" "$dir/meta-data"
+    seed=(-drive "if=virtio,format=raw,readonly=on,file=$dir/seed.img")
+  fi
+  # cache=none: QEMU passes guest flushes on and does not add a second cache above the device.
+  local common=(-m "$mem" -smp "$cpus" -display none -serial "file:$dir/console.log" -daemonize -pidfile "$dir/qemu.pid"
+    -drive "if=none,id=root,format=raw,file=$dev,cache=none,aio=native,discard=unmap"
+    -device "virtio-blk-pci,drive=root,serial=blkstack-root" "${seed[@]}"
+    -netdev "user,id=n0,hostfwd=tcp:127.0.0.1:$port-:22" -device "virtio-net-pci,netdev=n0")
+  case $(uname -m) in
+    aarch64)
+      [ -f "$dir/efivars.fd" ] || cp /usr/share/AAVMF/AAVMF_VARS.fd "$dir/efivars.fd"
+      qemu-system-aarch64 -machine virt,gic-version=max "${accel[@]}" \
+        -drive if=pflash,format=raw,readonly=on,file=/usr/share/AAVMF/AAVMF_CODE.fd \
+        -drive "if=pflash,format=raw,file=$dir/efivars.fd" "${common[@]}" ;;
+    x86_64) qemu-system-x86_64 -machine q35 "${accel[@]}" "${common[@]}" ;;   # SeaBIOS; the image also has an ESP
+    *) die "unsupported host architecture" ;;
+  esac
+  log "VM started: ssh -p $port ubuntu@127.0.0.1, console $dir/console.log"
+}
+
+cmd_ls() {
+  local f
+  for f in "$ROOT"/stacks/*.json; do
+    [ ! -f "$f" ] || jq -r '"\(.name)\t\(.layers | length) layers\t\(.layers | map(.size) | add) bytes\t\(if .source then "lazy " + .source.registry else "local" end)"' "$f"
+  done
+}
+cmd_inspect() { read_stack "$1" | jq .; }
+
+main() {
+  local cmd=${1:-help}; shift || true
+  trap cleanup EXIT
+  case $cmd in
+    init) cmd_init "$@" ;; build-base) cmd_build_base "$@" ;; build-layer) cmd_build_layer "$@" ;;
+    session-create) cmd_session_create "$@" ;; session-rm) cmd_session_rm "$@" ;;
+    attach) cmd_attach "$@" ;; detach) cmd_detach "$@" ;; device) cmd_device "$@" ;;
+    trim) cmd_trim "$@" ;; commit) cmd_commit "$@" ;;
+    push) cmd_push "$@" ;; pull) cmd_pull "$@" ;; rbd-publish) cmd_rbd_publish "$@" ;;
+    node-attach) cmd_node_attach "$@" ;; node-detach) cmd_node_detach "$@" ;; usage) cmd_usage "$@" ;;
+    boot) cmd_boot "$@" ;; ls) cmd_ls ;; inspect) cmd_inspect "$@" ;;
+    help | -h | --help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+      printf '\ncommands: init build-base build-layer session-create attach device detach trim commit session-rm\n          push pull rbd-publish node-attach node-detach usage boot ls inspect\n' ;;
+    *) die "unknown command: $cmd" ;;
+  esac
+}
+
+main "$@"

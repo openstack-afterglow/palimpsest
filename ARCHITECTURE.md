@@ -4102,9 +4102,9 @@ Reserved names and duplicate listings (2026-11-15, from the commit-path review, 
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "33924260eb9de1457974ce03728df59af6b592d5aeccb7fb7a1a079ff8a9837c",
-  "reviewed_at": "2026-11-16T17:16:56Z",
-  "summary": "Release 0.3.30: member-tier package-key issue/revoke; version bump, locks, docs, changelog."
+  "source_sha256": "268a7b62d2312f111a8a2d2a87165db66ff28e086b1257861a4f6d6bf9a019ea",
+  "reviewed_at": "2026-11-17T07:20:44Z",
+  "summary": "Merge dev 0.3.30 into the immutable block-layer design PR: examples/ and docs/design/ are the only added source, not imported by the product; dev side already reviewed in 0.3.30"
 }
 ```
 <!-- architecture-review:end -->
@@ -4121,3 +4121,7 @@ Reserved names and duplicate listings (2026-11-15, from the commit-path review, 
 - **Stage-1/PID 1**: initramfs에서 authenticated block과 process contract를 확인하고 root transition/workload supervision을 수행하는 freestanding guest binary.
 - **Hub `/v1`**: Palimpsest artifact/upload/bundle/export API. Docker/OCI Distribution `/v2` registry가 아니다.
 - **Glance export**: OpenStack Glance image를 Hub가 다운로드·qemu-img 변환하여 managed blob으로 만드는 비동기 작업.
+
+## Immutable block-layer design proposal (not product code)
+
+`docs/design/immutable-block-layers/` and `examples/immutable-block-layers/` describe a proposed OverlayBD stack shared by local KVM and an OpenStack/Ceph RBD compute path. Nothing in the product imports the reference code. A one-node disposable VM run exposed two block-device hazards when a sparse upper is used as a VM disk: sub-4 KiB writes can lose the rest of a 4 KiB block after reopen, and guest flushes are not delivered to the upper by the default TCMU cache setting. The reference code applies `dm-ebs` alignment and enables flush delivery; timeout settings are also raised. Nova/Cinder, multiple hosts, live migration, GPU and performance were not tested. See the design README for the verification matrix and the unverified alternative (RBD clone chain).
