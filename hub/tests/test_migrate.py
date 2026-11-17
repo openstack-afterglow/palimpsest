@@ -1134,12 +1134,28 @@ async def test_bootstrap_adds_override_history_to_existing_schema_without_changi
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("damage", [None, "negative", "scope", "admin", "old", "gap"])
-async def test_migrate_preserves_and_validates_override_audit(tmp_path, damage):
+@pytest.mark.parametrize("text_source,text_destination", [(False, False), (True, False), (False, True), (True, True)])
+async def test_migrate_preserves_and_validates_override_audit(
+    tmp_path,
+    monkeypatch,
+    damage,
+    text_source,
+    text_destination,
+):
+    from sqlalchemy import Text
+
     source_url = f"sqlite+aiosqlite:///{tmp_path / 'overrides.sqlite'}"
     destination_url = f"sqlite+aiosqlite:///{tmp_path / 'destination.sqlite'}"
-    await create_database(source_url, with_rows=True)
-    await create_database(destination_url, with_rows=False)
     overrides = Base.metadata.tables["palimpsest_hub_image_quota_overrides"]
+    for url, with_rows, use_text in (
+        (source_url, True, text_source),
+        (destination_url, False, text_destination),
+    ):
+        with monkeypatch.context() as schema:
+            if use_text:
+                for field in ("old_limits", "new_limits"):
+                    schema.setattr(overrides.c[field], "type", Text())
+            await create_database(url, with_rows=with_rows)
     limits = {"max_images": 3, "max_chain_bytes": 64, "max_source_bytes": None}
     rows = [
         dict(
@@ -1208,3 +1224,39 @@ async def test_migrate_accepts_pre_override_schema_with_original_quota_pair(tmp_
     copied = await migrate(source_url, destination_url)
     assert copied["palimpsest_hub_image_quota_overrides"] == 0
     assert copied["palimpsest_hub_layers"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["old_limits", "new_limits"])
+async def test_migrate_rejects_malformed_longtext_override_limits(tmp_path, monkeypatch, field):
+    from sqlalchemy import Text
+
+    source_url = f"sqlite+aiosqlite:///{tmp_path / 'malformed-overrides.sqlite'}"
+    destination_url = f"sqlite+aiosqlite:///{tmp_path / 'destination.sqlite'}"
+    overrides = Base.metadata.tables["palimpsest_hub_image_quota_overrides"]
+    with monkeypatch.context() as schema:
+        for name in ("old_limits", "new_limits"):
+            schema.setattr(overrides.c[name], "type", Text())
+        await create_database(source_url, with_rows=True)
+    await create_database(destination_url, with_rows=False)
+    engine = create_async_engine(source_url)
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                overrides.insert().values(
+                    subject_kind="user",
+                    subject_id="d" * 32,
+                    visibility="private",
+                    revision=1,
+                    old_limits=None,
+                    new_limits=dict.fromkeys(("max_images", "max_chain_bytes", "max_source_bytes")),
+                    updated_by="e" * 32,
+                )
+            )
+            await connection.execute(
+                text(f"UPDATE palimpsest_hub_image_quota_overrides SET {field} = :bad"), {"bad": "{"}
+            )
+        with pytest.raises(MigrationError, match="invalid JSON"):
+            await migrate(source_url, destination_url)
+    finally:
+        await engine.dispose()

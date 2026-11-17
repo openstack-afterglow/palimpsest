@@ -3070,6 +3070,12 @@ SDK/CLI methods use the existing transport and never retry changes automatically
 No lifecycle/session/trust paths, tier seeds or global policy rows changed.
 Checks and independent SHA-bound review are reported separately; this source
 review is not deployment or live quota proof.
+Independent review of `a221b37` found the MariaDB JSON-as-LONGTEXT migration
+gap. Override audit limits now decode before validation and bind for each
+destination column's reflected type, matching existing membership handling.
+The regression matrix covers JSON/Text source and destination pairs, complete
+set/removal histories and malformed text refusal. This is portable type
+simulation, not an actual MariaDB rollout or data migration.
 
 
 2026-11-17 combined0.3.31 delta review: rebased the reviewed Hub candidate
@@ -4257,9 +4263,9 @@ Reserved names and duplicate listings (2026-11-15, from the commit-path review, 
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "0cb37733d2120e64087232c8f4b3b3f8dfd43a0e4884f21c8316c379a939e1d4",
-  "reviewed_at": "2026-11-17T12:03:40Z",
-  "summary": "Review subject-specific quota override ledger, shared enforce/usage resolution, human-admin API/SDK/CLI, additive bootstrap and offline audit migration; preserve tiers, image rows and lifecycle fences"
+  "source_sha256": "5342ab74a7f4db3872b8583e1e614aaf5a7633e1a7d4dc435c2d701482f86c20",
+  "reviewed_at": "2026-11-17T12:14:29Z",
+  "summary": "Review subject quota ledger and admin API/SDK/CLI; fix independent-review MariaDB JSON alias migration gap with JSON/Text matrix; no lifecycle, tier policy or seed changes"
 }
 ```
 <!-- architecture-review:end -->

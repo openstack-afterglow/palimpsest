@@ -245,6 +245,13 @@ def _validate_override_rows(rows: list[dict]) -> None:
             item.get("revision") if type(item.get("revision")) is int else 0,
         ),
     ):
+        for field in ("old_limits", "new_limits"):
+            if isinstance(row.get(field), str):
+                # MariaDB reflects JSON aliases as LONGTEXT; validate decoded values.
+                try:
+                    row[field] = json.loads(row[field])
+                except (ValueError, RecursionError):
+                    raise MigrationError("source quota override limits are invalid JSON") from None
         try:
             validate_keystone_id(row.get("subject_id"))
             validate_keystone_id(row.get("updated_by"))
@@ -424,6 +431,10 @@ async def migrate(
                     _validate_source_blob_rows(rows, published)
                 if table_name == _OVERRIDES:
                     _validate_override_rows(rows)
+                    for row in rows:
+                        for field in ("old_limits", "new_limits"):
+                            if row[field] is not None and not isinstance(destination_table.c[field].type, JSON):
+                                row[field] = json.dumps(row[field])
                 if table_name == _IMAGE_KEYS:
                     _validate_image_key_rows(rows)
                 copied[table_name] = len(rows)
