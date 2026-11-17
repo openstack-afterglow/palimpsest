@@ -2606,3 +2606,76 @@ def test_carrier_ctime_exception_keeps_full_loader_authority_gate(carrier_ctime_
         assert source_checks == [(case.roots, {"original": "source"}, {"original": "qualification"})]
         assert case.read() == before
     assert case.marker.exists() and case.commands == [] and case.released == []
+
+
+@pytest.mark.parametrize("change", ["content", "unchanged"])
+def test_real_loader_rejects_ineligible_carrier_before_source_validation(
+    carrier_ctime_delete_case, monkeypatch, change
+):
+    from palimpsest_local import state
+
+    case = carrier_ctime_delete_case
+    source_checks = []
+
+    def source(*args):
+        source_checks.append(args)
+        raise AssertionError("ineligible carrier reached retained-source validation")
+
+    monkeypatch.setattr(vz_native_runtime, "read_vz_plan", lambda _data: None)
+    monkeypatch.setattr(vz_native_runtime, "_reopen_source", source)
+    with state.locked_existing_run(case.roots, "ordinary", expected=case.record) as authority:
+        data = authority.mutable_state()
+        data["vz_native"]["source_snapshot"] = {"original": "source"}
+        data["source_qualification"] = {"original": "qualification"}
+        carrier = data["vz_native"]["carrier"]
+        if change == "content":
+            original = case.carrier.stat()
+            case.carrier.write_bytes(b"x" * original.st_size)
+            os.utime(case.carrier, ns=(original.st_atime_ns, original.st_mtime_ns))
+            assert vz_native_runtime._stamp(case.carrier.stat())[:7] == carrier["stamp"][:7]
+        else:
+            carrier["stamp"] = vz_native_runtime._stamp(case.carrier.stat())
+        before, marker = case.read(), case.marker.read_bytes()
+        # Exercise the production loader, not the RM fixture's carrier-checking double.
+        with pytest.raises(vz_native_runtime.VZNativeHold, match="pinned carrier copy changed"):
+            case.real_checked_loader(
+                authority,
+                case.roots,
+                case.config,
+                case.marker.parent,
+                data=data,
+                allow_expired=True,
+                stopped_delete=True,
+                carrier_ctime_delete=True,
+            )
+        assert source_checks == []
+        assert case.read() == before and case.marker.read_bytes() == marker
+    assert case.commands == [] and case.released == []
+
+
+def test_real_loader_requires_destructive_gate_for_carrier_exception(carrier_ctime_delete_case, monkeypatch):
+    from palimpsest_local import state
+
+    case = carrier_ctime_delete_case
+    source_checks = []
+    monkeypatch.setattr(vz_native_runtime, "read_vz_plan", lambda _data: None)
+    monkeypatch.setattr(vz_native_runtime, "_reopen_source", lambda *args: source_checks.append(args))
+    with state.locked_existing_run(case.roots, "ordinary", expected=case.record) as authority:
+        data = authority.mutable_state()
+        data["vz_native"]["hold"] = None
+        data["vz_native"]["source_snapshot"] = {"original": "source"}
+        data["source_qualification"] = {"original": "qualification"}
+        before, marker = case.read(), case.marker.read_bytes()
+        with pytest.raises(vz_native_runtime.VZNativeHold, match="requires destruction-only RM"):
+            case.real_checked_loader(
+                authority,
+                case.roots,
+                case.config,
+                case.marker.parent,
+                data=data,
+                allow_expired=True,
+                carrier_ctime_delete=True,
+            )
+        assert source_checks == []
+        assert case.read() == before and case.marker.read_bytes() == marker
+    assert case.commands == [] and case.released == []

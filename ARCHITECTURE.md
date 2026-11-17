@@ -4303,9 +4303,9 @@ Reserved names and duplicate listings (2026-11-15, from the commit-path review, 
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "9a9d31d7f39081cfa76647c301178aa21565701a2df0a57acbb278e2a899ab42",
-  "reviewed_at": "2026-11-17T15:36:25Z",
-  "summary": "Reviewed carrier-ctime-only canonical RM: original retained-authority HOLD, streamed digest and seven exact stamp fields, default-false loader gate with unchanged ordinary comparison, repeated stopped-delete proofs and one-shot receipts; removed ledger/private evidence retained; no live access or release"
+  "source_sha256": "13156a6394176fa45ad287e45391b9abcb969f27068ee0484eb466203a1546b7",
+  "reviewed_at": "2026-11-17T15:53:00Z",
+  "summary": "Reviewed unchanged carrier-ctime-only RM source plus direct real-loader content-mismatch, unchanged-ctime and wrong-gate regressions; ordinary comparison remains unchanged; retained private evidence and one-shot deletion; no live access or release"
 }
 ```
 <!-- architecture-review:end -->
