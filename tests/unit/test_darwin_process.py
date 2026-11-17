@@ -1297,6 +1297,7 @@ def ordinary_stop_case(tmp_path, monkeypatch, request):
         pin_reads=0,
         control=None,
     )
+    case.real_checked_loader = vz_native_runtime._load_checked
     case.config = SimpleNamespace(home=home, verify=lambda **_kw: None)
     case.read = lambda: state.read_json(state.run_paths(roots, "ordinary").state)
 
@@ -1920,6 +1921,7 @@ def stopped_delete_case(ordinary_stop_case, monkeypatch):
     case.released = []
     case.delete_effect = True
     case.renew_marker = renew_marker
+    case.hold_reason = "stop-incomplete"
     source_pins = vz_native_runtime._load_checked
     exists = vz_native_runtime._failed_start_path_exists
     monkeypatch.setattr(
@@ -1936,9 +1938,13 @@ def stopped_delete_case(ordinary_stop_case, monkeypatch):
 
     store = SimpleNamespace(release_lease_set=lambda _lease: released("lease"))
 
-    def pins(authority, roots, config, custody, *, data=None, stopped_delete=False, **kwargs):
+    def pins(
+        authority, roots, config, custody, *, data=None, stopped_delete=False, carrier_ctime_delete=False, **kwargs
+    ):
         if stopped_delete:
-            vz_native_runtime._stopped_delete_hold(authority, config, data)
+            vz_native_runtime._stopped_delete_hold(authority, config, data, carrier_ctime=carrier_ctime_delete)
+        if carrier_ctime_delete:
+            vz_native_runtime._verify_carrier_ctime_delete(authority, data["vz_native"])
         result = source_pins(authority, roots, config, custody, data=data, **kwargs)
         return result[0], store, None, None, None, None
 
@@ -1946,7 +1952,7 @@ def stopped_delete_case(ordinary_stop_case, monkeypatch):
         assert argv == ["delete", "--tty=false", case.directory.name]
         data = case.read()
         assert data["status"] == "failed"
-        assert data["vz_native"]["hold"] == "stop-incomplete"
+        assert data["vz_native"]["hold"] == case.hold_reason
         assert data["vz_native"]["stopped_delete"]["phase"] == "attempted"
         assert "stop_settlement" not in data["vz_native"]
         assert not case.released
@@ -2289,3 +2295,314 @@ def test_stopped_delete_observation_deadlines_exclude_full_authority_reload(
     assert deadlines == [30, reload_seconds + 30]
     assert case.released == ["export", "lease", "root"]
     assert not case.marker.exists() and len(case.commands) == 1
+
+
+@pytest.fixture
+def carrier_ctime_delete_case(stopped_delete_case):
+    """Real carrier bytes/stamps and ledger, with the same fake-provider seams as #119."""
+    from palimpsest_local import state
+
+    case = stopped_delete_case
+    private = state.run_paths(case.roots, "ordinary").root / "vz-private"
+    private.mkdir(mode=0o700)
+    case.carrier = private / "carrier.img"
+    vz_native_runtime._new_file(case.carrier, b"immutable carrier")
+    case.seed = private / "seed"
+    case.seed.mkdir(mode=0o700)
+    vz_native_runtime._new_file(case.seed / "plan.json", b"retained plan")
+    _, digest, stamp = vz_native_runtime._file(case.carrier, private=True, capture=False)
+    # Pin a distinct ctime deterministically; no reliance on filesystem clock resolution.
+    original_stamp = [*stamp[:7], stamp[7] - 1]
+    case.hold_reason = "retained-authority-changed"
+    case.update(
+        change=lambda data: data["vz_native"].update(
+            hold=case.hold_reason,
+            carrier={"path": str(case.carrier), "digest": digest, "stamp": original_stamp},
+        )
+    )
+    case.marker.unlink()
+    vz_native_runtime._new_file(
+        case.marker,
+        vz_native_runtime._json(
+            {"schema": vz_native_runtime._SCHEMA, "run_id": case.run_id, "reason": case.hold_reason}
+        ),
+    )
+    return case
+
+
+def test_carrier_ctime_rm_preserves_evidence_and_exact_effect_receipt(carrier_ctime_delete_case):
+    case = carrier_ctime_delete_case
+    before = case.read()
+    marker = case.marker.read_bytes()
+    for operation in (case.stop, case.start):
+        with pytest.raises(vz_native_runtime.VZNativeHold):
+            operation()
+        assert case.read() == before and case.marker.read_bytes() == marker
+    carrier = case.carrier.read_bytes()
+    # Custody lock survives; provider-owned endpoint deletion is the only provider operation.
+    lock = case.marker.parent / "lock"
+    lock.touch(mode=0o600)
+    lock_identity = lock.stat().st_ino
+    result = case.rm()
+    after = case.read()
+    receipt = after["vz_native"]["stopped_delete"]
+    assert (result.previous_status, result.current_status) == ("failed", "removed")
+    assert result.storage_policy == "instance-root-and-topology-purged"
+    assert after["vz_status"] == before["vz_status"]
+    assert after["vz_native"]["carrier"] == before["vz_native"]["carrier"]
+    assert receipt["phase"] == "provider-absent"
+    pin = receipt["observation"]["carrier"]
+    assert set(pin) == {"path", "digest", "original_stamp", "current_stamp"}
+    assert pin["path"] == str(case.carrier)
+    assert pin["digest"] == before["vz_native"]["carrier"]["digest"]
+    assert pin["original_stamp"] == before["vz_native"]["carrier"]["stamp"]
+    assert pin["current_stamp"] == vz_native_runtime._stamp(case.carrier.stat())
+    assert pin["original_stamp"][:7] == pin["current_stamp"][:7]
+    assert pin["original_stamp"][7] != pin["current_stamp"][7]
+    assert case.carrier.read_bytes() == carrier
+    assert (case.seed / "plan.json").read_bytes() == b"retained plan"
+    assert case.released == ["export", "lease", "root"]
+    assert case.commands == [("delete", "--tty=false", case.directory.name)]
+    assert not case.marker.exists() and lock.stat().st_ino == lock_identity
+    # The canonical removed ledger, carrier and seed are retained, not migrated or purged.
+    assert case.rm().current_status == "removed"
+    assert case.read() == after and len(case.commands) == 1
+
+
+@pytest.mark.parametrize("field", range(7))
+def test_carrier_ctime_rm_refuses_each_other_stamp_difference(carrier_ctime_delete_case, field):
+    case = carrier_ctime_delete_case
+    case.update(change=lambda data: data["vz_native"]["carrier"]["stamp"].__setitem__(field, -1))
+    before, marker = case.read(), case.marker.read_bytes()
+    with pytest.raises(vz_native_runtime.VZNativeHold):
+        case.rm()
+    assert case.read() == before and case.marker.read_bytes() == marker
+    assert case.commands == [] and case.released == []
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "content",
+        "unchanged",
+        "stamp-short",
+        "stamp-bool",
+        "stamp-null",
+        "digest",
+        "path",
+        "escape",
+        "symlink",
+        "parent-symlink",
+        "hardlink",
+    ],
+)
+def test_carrier_ctime_rm_refuses_nonexclusive_or_changed_carrier(carrier_ctime_delete_case, change):
+    case = carrier_ctime_delete_case
+    if change == "content":
+        original = case.carrier.stat()
+        case.carrier.write_bytes(b"x" * original.st_size)
+        os.utime(case.carrier, ns=(original.st_atime_ns, original.st_mtime_ns))
+    elif change == "unchanged":
+        case.update(
+            change=lambda data: data["vz_native"]["carrier"].update(stamp=vz_native_runtime._stamp(case.carrier.stat()))
+        )
+    elif change.startswith("stamp-"):
+        stamp = {"stamp-short": [1], "stamp-bool": [True] * 8, "stamp-null": None}[change]
+        case.update(change=lambda data: data["vz_native"]["carrier"].update(stamp=stamp))
+    elif change == "digest":
+        case.update(change=lambda data: data["vz_native"]["carrier"].update(digest="sha256:" + "0" * 64))
+    elif change in {"path", "escape"}:
+        path = (
+            str(case.carrier.parent / ".." / "vz-private" / "carrier.img")
+            if change == "escape"
+            else str(case.home / "foreign.img")
+        )
+        case.update(change=lambda data: data["vz_native"]["carrier"].update(path=path))
+    elif change == "symlink":
+        target = case.carrier.with_name("foreign.img")
+        case.carrier.rename(target)
+        case.carrier.symlink_to(target)
+    elif change == "parent-symlink":
+        private = case.carrier.parent
+        private.rename(private.with_name("original-private"))
+        private.symlink_to(private.with_name("original-private"), target_is_directory=True)
+    else:
+        os.link(case.carrier, case.carrier.with_name("foreign.img"))
+    before, marker = case.read(), case.marker.read_bytes()
+    with pytest.raises((StateError, OSError, vz_native_runtime.VZNativeHold)):
+        case.rm()
+    assert case.read() == before and case.marker.read_bytes() == marker
+    assert case.commands == [] and case.released == []
+
+
+@pytest.mark.parametrize(
+    "change", ["running", "absent", "reason", "marker-reason", "marker-schema", "marker-run", "other-marker", "pins"]
+)
+def test_carrier_ctime_rm_refuses_other_authority_changes(carrier_ctime_delete_case, change):
+    case = carrier_ctime_delete_case
+    other = case.marker.parent / "hold-foreign.json"
+    if change == "running":
+        case.provider["status"] = "Running"
+    elif change == "absent":
+        case.directory.rename(case.home / "missing")
+        case.provider["status"] = None
+    elif change == "reason":
+        case.update(change=lambda data: data["vz_native"].update(hold="start-incomplete"))
+    elif change.startswith("marker-"):
+        value = {"schema": vz_native_runtime._SCHEMA, "run_id": case.run_id, "reason": case.hold_reason}
+        key = {"marker-reason": "reason", "marker-schema": "schema", "marker-run": "run_id"}[change]
+        value[key] = "changed"
+        case.marker.unlink()
+        vz_native_runtime._new_file(case.marker, vz_native_runtime._json(value))
+    elif change == "other-marker":
+        vz_native_runtime._new_file(other, b"foreign evidence")
+    else:
+        case.pin_failure = True
+    before, marker = case.read(), case.marker.read_bytes()
+    with pytest.raises((StateError, OSError, vz_native_runtime.VZNativeHold)):
+        case.rm()
+    assert case.read() == before and case.marker.read_bytes() == marker
+    assert case.commands == [] and case.released == []
+    if change == "other-marker":
+        assert other.read_bytes() == b"foreign evidence"
+
+
+@pytest.mark.parametrize("boundary", ["intent", "provider", "export", "lease", "root", "removed", "marker"])
+def test_carrier_ctime_rm_never_replays_uncertain_delete(carrier_ctime_delete_case, monkeypatch, boundary):
+    case = carrier_ctime_delete_case
+    write = vz_native_runtime._write
+    delete = vz_native_runtime._lima
+    unlink = vz_native_runtime.os.unlink
+    store_loader = vz_native_runtime._load_checked
+    write_failed = False
+
+    def interrupted(*_args, **_kwargs):
+        raise StateError("simulated crash")
+
+    def write_crash(authority, status, data):
+        nonlocal write_failed
+        if not write_failed and (
+            boundary == "intent"
+            and "stopped_delete" in data["vz_native"]
+            or boundary == "removed"
+            and status == "removed"
+        ):
+            write_failed = True
+            interrupted()
+        return write(authority, status, data)
+
+    def delete_crash(*args, **kwargs):
+        delete(*args, **kwargs)
+        interrupted()
+
+    def load(*args, **kwargs):
+        data, store, *rest = store_loader(*args, **kwargs)
+        store.release_lease_set = interrupted
+        return data, store, *rest
+
+    def unlink_crash(path, *args, **kwargs):
+        if path == case.marker.name:
+            interrupted()
+        return unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(vz_native_runtime, "_write", write_crash)
+    if boundary == "provider":
+        monkeypatch.setattr(vz_native_runtime, "_lima", delete_crash)
+    elif boundary in {"export", "root"}:
+        monkeypatch.setattr(
+            vz_native_runtime,
+            "release_vz_lower_export" if boundary == "export" else "release_vz_root_volume",
+            interrupted,
+        )
+    elif boundary == "lease":
+        monkeypatch.setattr(vz_native_runtime, "_load_checked", load)
+    elif boundary == "marker":
+        monkeypatch.setattr(vz_native_runtime.os, "unlink", unlink_crash)
+    with pytest.raises(StateError, match="simulated crash"):
+        case.rm()
+    assert case.marker.exists() and case.carrier.exists()
+    first_commands = list(case.commands)
+    monkeypatch.setattr(vz_native_runtime, "_write", write)
+    monkeypatch.setattr(vz_native_runtime, "_lima", delete)
+    monkeypatch.setattr(vz_native_runtime.os, "unlink", unlink)
+    with pytest.raises((StateError, OSError, vz_native_runtime.VZNativeHold)):
+        case.rm()
+    assert case.commands == first_commands and len(case.commands) <= 1
+
+
+def test_carrier_ctime_verification_keeps_ordinary_carrier_pins_strict(carrier_ctime_delete_case, monkeypatch):
+    from palimpsest_local import state
+
+    case = carrier_ctime_delete_case
+    monkeypatch.setattr(vz_native_runtime, "read_vz_plan", lambda _data: None)
+    with state.locked_existing_run(case.roots, "ordinary", expected=case.record) as authority:
+        data = authority.mutable_state()
+        data["vz_native"]["hold"] = None
+        with pytest.raises(vz_native_runtime.VZNativeHold, match="pinned carrier copy changed"):
+            case.real_checked_loader(authority, case.roots, case.config, case.marker.parent, data=data)
+        receipt = vz_native_runtime._verify_carrier_ctime_delete(authority, data["vz_native"])
+        assert receipt["digest"] == data["vz_native"]["carrier"]["digest"]
+
+
+@pytest.mark.parametrize("change", ["stamp", "content", "path"])
+def test_carrier_ctime_rm_rechecks_carrier_after_full_reload(carrier_ctime_delete_case, monkeypatch, change):
+    case = carrier_ctime_delete_case
+    loader = vz_native_runtime._load_checked
+
+    def late_change(*args, **kwargs):
+        result = loader(*args, **kwargs)
+        if case.pin_reads == 2:
+            if change == "stamp":
+                stamp = case.carrier.stat()
+                os.utime(case.carrier, ns=(stamp.st_atime_ns, stamp.st_mtime_ns + 1))
+            elif change == "content":
+                case.carrier.write_bytes(b"changed")
+            else:
+                case.carrier.rename(case.carrier.with_name("replaced"))
+                case.carrier.symlink_to(case.carrier.with_name("replaced"))
+        return result
+
+    monkeypatch.setattr(vz_native_runtime, "_load_checked", late_change)
+    before, marker = case.read(), case.marker.read_bytes()
+    with pytest.raises((StateError, OSError, vz_native_runtime.VZNativeHold)):
+        case.rm()
+    assert case.read() == before and case.marker.read_bytes() == marker
+    assert case.commands == [] and case.released == []
+
+
+def test_carrier_ctime_exception_keeps_full_loader_authority_gate(carrier_ctime_delete_case, monkeypatch):
+    from palimpsest_local import state
+
+    case = carrier_ctime_delete_case
+    source_checks = []
+
+    def source(*args):
+        source_checks.append(args)
+        raise vz_native_runtime.VZNativeHold("changed retained source")
+
+    monkeypatch.setattr(vz_native_runtime, "read_vz_plan", lambda _data: None)
+    monkeypatch.setattr(vz_native_runtime, "_reopen_source", source)
+    with state.locked_existing_run(case.roots, "ordinary", expected=case.record) as authority:
+        data = authority.mutable_state()
+        data["vz_native"]["source_snapshot"] = {"original": "source"}
+        data["source_qualification"] = {"original": "qualification"}
+        before = case.read()
+        # Default lifecycle load still refuses this HOLD before source/provider access.
+        with pytest.raises(vz_native_runtime.VZNativeHold, match="retains HOLD"):
+            case.real_checked_loader(authority, case.roots, case.config, case.marker.parent, data=data)
+        assert source_checks == []
+        # RM's narrow exception does not skip any subsequent retained-authority validation.
+        with pytest.raises(vz_native_runtime.VZNativeHold, match="changed retained source"):
+            case.real_checked_loader(
+                authority,
+                case.roots,
+                case.config,
+                case.marker.parent,
+                data=data,
+                allow_expired=True,
+                stopped_delete=True,
+                carrier_ctime_delete=True,
+            )
+        assert source_checks == [(case.roots, {"original": "source"}, {"original": "qualification"})]
+        assert case.read() == before
+    assert case.marker.exists() and case.commands == [] and case.released == []

@@ -647,9 +647,22 @@ Unrelated SSH port reuse does not create removal custody. Ordinary starts do not
 retain the failed-start cleanup's original hostagent incarnation; this path grants
 no signal authority, does not infer a dead PID from CLI success and rejects
 currently related actors.
-If original provider/root custody is already missing, or HOLD reason is
-`retained-authority-changed`, this route remains unavailable. Local regression
-cases define the behavior; no new VM, remote cleanup or live result is claimed.
+Missing original provider/root custody still refuses deletion. A separate
+canonical-RM predicate now permits an exact `retained-authority-changed` HOLD
+only when the run's canonical `vz-private/carrier.img` differs from its pinned
+eight-integer stamp in ctime alone and its streaming SHA-256 still matches.
+Both marker and failed run must name that reason and the same run/schema.
+All other retained source/config/host/provider/disk/directory/lease authorities
+remain exact. The same stopped-delete actor/network/endpoint/exclusive-upper
+proofs and two bounded observations around a full authority reload apply.
+The receipt retains original/current carrier stamps and the verified digest.
+No historical stamp is repinned; ordinary exec/stop/start/capture remain strict.
+Both deletion predicates retain the canonical removed ledger, carrier, seed and
+other private run evidence, as #119 does; they release provider, disposable root,
+export references and leases, then only the original run's custody marker.
+They do not remove the custody lock or another run's marker. The ctime-changing
+actor is unknown. Local regression cases are not live proof; the held mac-mini
+state is untouched and its future approved product cleanup remains pending.
 
 
 The inetd argv matches the selected static Dropbear build: omit `-E` and `-s`
@@ -3087,6 +3100,22 @@ rulings remain required for M2-17 (`spec.md:550`) and the explicit M3-08
 `image_quota` revert condition (`spec.md:617`), plus affected M2 quota/H4 evidence.
 Parent owns those rulings and any checkbox changes; local source checks do not
 preserve checklist completion by themselves.
+2026-11-18 carrier-ctime destruction review: reused #119's one-shot stopped-delete
+proof/release path with one new canonical-RM admissibility predicate.
+`_load_checked` adds a default-false `carrier_ctime_delete` branch; its ordinary
+carrier comparison statements are preserved under the default branch.
+Only the explicit destructive branch requires an actual ctime-only difference,
+canonical run-private path and the same streamed content digest. No lifecycle
+flag, force path, stop/signal, commit-adapter or guest change is added.
+The original `retained-authority-changed` marker must agree with the failed run,
+and all retained authorities still pass the full loader twice. Repeated resource
+observations also pin the current carrier stamp; the delete receipt preserves
+original/current stamps and digest equality without repinning the original.
+Intent/crash handling, final original-marker release and removed-ledger/private
+evidence retention match #119. Unknown actor, current-provider absence and
+ambiguous deletion remain refusals, not adoption/recovery. Live cleanup of the
+held mac-mini run is pending a separately reviewed release; no remote access,
+publication, deployment or live call occurred in this work.
 
 
 2026-11-17 combined0.3.31 delta review: rebased the reviewed Hub candidate
@@ -4274,9 +4303,9 @@ Reserved names and duplicate listings (2026-11-15, from the commit-path review, 
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "51a00b2ed51dc65121b841376de606fc6f6bdc35fc9ef63a9c94a1bfe60abfbd",
-  "reviewed_at": "2026-11-17T15:45:13Z",
-  "summary": "Rebase of the reviewed quota-override delta onto dev after the console merge (#122): no overlapping source files; quota ledger, shared enforce/usage resolution, human-admin API/SDK/CLI, additive bootstrap and offline audit migration preserved; tiers, image rows and lifecycle fences unchanged; console delta already reviewed separately"
+  "source_sha256": "9a9d31d7f39081cfa76647c301178aa21565701a2df0a57acbb278e2a899ab42",
+  "reviewed_at": "2026-11-17T15:36:25Z",
+  "summary": "Reviewed carrier-ctime-only canonical RM: original retained-authority HOLD, streamed digest and seven exact stamp fields, default-false loader gate with unchanged ordinary comparison, repeated stopped-delete proofs and one-shot receipts; removed ledger/private evidence retained; no live access or release"
 }
 ```
 <!-- architecture-review:end -->

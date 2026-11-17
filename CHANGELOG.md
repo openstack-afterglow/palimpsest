@@ -17,6 +17,19 @@ All notable changes to Palimpsest Local are documented here.
   lifecycle endpoints, state transitions, replay, retry semantics and monitoring
   limits. No instance service, projection, schema or version changes.
 - Human system administrators can set and remove visibility-specific image quota overrides for individual users or projects, including free-tier subjects, through the API, `HubClient` and `palimpsest admin image-quota`. Effective usage reports identify `tier` versus `override`; append-only history records each administrator, UTC timestamp and old/new limits. Overrides never change tier policies or delete existing images. Offline bootstrap adds one independent history table; app-only rollback may retain it, but old applications ignore overrides.
+### Fixed
+
+- Experimental native VZ: canonical `rm` can destroy an exact failed
+  `retained-authority-changed` HOLD only when the canonical run-private carrier
+  differs solely in ctime_ns and its streamed SHA-256 still matches. Every other
+  pinned authority and #119's repeated stopped-provider/actor/network/upper
+  proofs remain mandatory. Admission refusal has no delete effect; uncertain
+  deletion is never replayed. The removed ledger records both carrier stamps
+  and the matching digest; private carrier/seed evidence and the custody lock
+  remain. Ordinary exec/stop/start/capture are not relaxed. The ctime-changing
+  actor is unknown; live cleanup of the held mac-mini state is pending review
+  and release, not performed here.
+
 
 ## [0.3.31] - 2026-11-17 (UTC; prepared)
 
