@@ -815,7 +815,7 @@ async def native_http(keystone_http, tmp_path, monkeypatch):
     from fastapi import FastAPI
     from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-    from palimpsest_hub.api import builds, catalog, hub, packages
+    from palimpsest_hub.api import builds, catalog, hub, image_admin, packages
     from palimpsest_hub.models import Base
     from palimpsest_hub.services import image_exports, package_registry
     from palimpsest_hub.services.hub_store import LocalPathBlobStore
@@ -832,7 +832,7 @@ async def native_http(keystone_http, tmp_path, monkeypatch):
     from palimpsest_hub.api import policy as policy_api
 
     app.include_router(policy_api.router, prefix="/v1")
-    for router in (packages.router, hub.router, builds.router, catalog.router):
+    for router in (packages.router, hub.router, builds.router, catalog.router, image_admin.router):
         app.include_router(router, prefix="/v1")
     listener = socket.socket()
     listener.bind(("127.0.0.1", 0))
@@ -3390,3 +3390,41 @@ async def test_rel312_adapted_reduced_original_token_never_advertises_human_muta
     assert me.status_code == 200 and not any(me.json()["capabilities"].values()), me.text
     h.identity["subject_revoked"] = True
     assert (await h.client.get("/v1/policy/capabilities", headers=headers)).status_code == 401
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "identity", ["admin", "member", "delegated", "application_credential", "system", "domain", "policy"]
+)
+async def test_quota_override_routes_require_current_project_human_system_admin(
+    native_http,
+    tmp_path,
+    monkeypatch,
+    identity,
+):
+    h = native_http
+    h.identity["system_roles"] = ["admin"]
+    if identity == "member":
+        h.identity["system_roles"] = []
+    elif identity == "delegated":
+        h.identity["delegated"] = True
+    elif identity == "application_credential":
+        h.identity["token_methods"] = ["application_credential"]
+    elif identity in ("system", "domain"):
+        h.identity["subject_scope"] = identity
+    elif identity == "policy":
+        policy = tmp_path / "deny-system.yaml"
+        policy.write_text(json.dumps({"system:manage": "!"}))
+        monkeypatch.setenv("OSLO_POLICY_POLICY_FILE", str(policy))
+        get_settings.cache_clear()
+    path = f"/v1/admin/image-quota/overrides/user/{FEDERATED_OWNER}/private"
+    headers = {"X-Auth-Token": ORIGINAL_SUBJECT}
+    for method, route in (("PUT", path), ("DELETE", path), ("GET", path + "/history")):
+        response = await h.client.request(
+            method,
+            route,
+            headers=headers,
+            json={"max_images": 3, "max_chain_bytes": None, "max_source_bytes": None} if method == "PUT" else None,
+        )
+        expected = 200 if identity == "admin" else 401 if identity in ("system", "domain") else 403
+        assert response.status_code == expected, response.text

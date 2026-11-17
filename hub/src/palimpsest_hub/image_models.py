@@ -171,6 +171,21 @@ class PalimpsestHubImageQuotaTier(Base):
     updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False, default=_now)
 
 
+class PalimpsestHubImageQuotaOverride(Base):
+    """Append-only subject limit history; the latest revision is effective."""
+
+    __tablename__ = "palimpsest_hub_image_quota_overrides"
+
+    subject_kind: Mapped[str] = mapped_column(VARCHAR(16), primary_key=True)
+    subject_id: Mapped[str] = mapped_column(VARCHAR(128), primary_key=True)
+    visibility: Mapped[str] = mapped_column(VARCHAR(16), primary_key=True)
+    revision: Mapped[int] = mapped_column(BIGINT, primary_key=True)
+    old_limits: Mapped[dict | None] = mapped_column(JSON(none_as_null=True))
+    new_limits: Mapped[dict | None] = mapped_column(JSON(none_as_null=True))
+    updated_by: Mapped[str] = mapped_column(VARCHAR(128), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False, default=_now)
+
+
 class PalimpsestHubImageSourceBlob(Base):
     """One OCI source-closure blob of a publication (root/manifest/config/compressed layer)."""
 

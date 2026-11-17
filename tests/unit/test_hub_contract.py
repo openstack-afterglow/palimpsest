@@ -716,3 +716,57 @@ def test_build_git_posts_the_pinned_request_to_the_git_builds_contract(monkeypat
     request = {"repo_url": "https://github.com/o/r.git", "revision": "a" * 40, "name": "git-app"}
     assert client.build_git(request) == {"id": "job-1"}
     assert sent == [("POST", "/git-builds", request)]
+
+
+@pytest.mark.parametrize(
+    ("method", "verb", "suffix", "kwargs"),
+    [
+        ("set_image_quota_override", "PUT", "", {"max_images": 3, "max_chain_bytes": None, "max_source_bytes": 0}),
+        ("remove_image_quota_override", "DELETE", "", {}),
+        ("image_quota_override_history", "GET", "/history", {"limit": 5, "offset": 2}),
+    ],
+)
+def test_quota_sdk_exact_subject_routes_and_no_retry(monkeypatch, method, verb, suffix, kwargs):
+    client = HubClient("https://hub.example", "original-token")
+    calls = []
+
+    def opened(actual_verb, path, **options):
+        calls.append((actual_verb, path, options))
+        return _Response({"ok": True})
+
+    monkeypatch.setattr(client, "_open", opened)
+    assert getattr(client, method)("user", "subject/id", "private", **kwargs) == {"ok": True}
+    assert calls[0][:2] == (verb, "/admin/image-quota/overrides/user/subject%2Fid/private" + suffix)
+    if verb == "PUT":
+        assert json.loads(calls[0][2]["body"]) == kwargs
+    calls.clear()
+
+    def failed(*args, **options):
+        calls.append(args)
+        raise HubError("uncertain quota change")
+
+    monkeypatch.setattr(client, "_open", failed)
+    with pytest.raises(HubError, match="uncertain quota change"):
+        getattr(client, method)("user", "subject", "private", **kwargs)
+    assert len(calls) == 1
+
+
+def test_quota_sdk_usage_and_invalid_values(monkeypatch):
+    client = HubClient("https://hub.example", "original-token")
+    calls = []
+    monkeypatch.setattr(client, "_json_request", lambda *args, **kwargs: calls.append((args, kwargs)) or {})
+    client.image_quota_usage()
+    client.image_quota_usage(subject_kind="project", subject_id="project")
+    assert calls == [
+        (("GET", "/published-images/quota"), {}),
+        (("GET", "/admin/image-quota/usage"), {"query": {"subject_kind": "project", "subject_id": "project"}}),
+    ]
+    for bad in (-1, True, "3", 2**63):
+        with pytest.raises(HubError, match="quota limits"):
+            client.set_image_quota_override(
+                "user", "subject", "private", max_images=bad, max_chain_bytes=None, max_source_bytes=None
+            )
+    with pytest.raises(HubError, match="scope"):
+        client.remove_image_quota_override("user", "subject", "internal")
+    with pytest.raises(HubError, match="both"):
+        client.image_quota_usage(subject_kind="user")

@@ -428,6 +428,68 @@ class HubClient:
             },
         )
 
+    def image_quota_usage(self, *, subject_kind: str | None = None, subject_id: str | None = None) -> dict:
+        """Read own effective limits, or a subject's usage with human system admin authority."""
+        if subject_kind is None and subject_id is None:
+            return self._json_request("GET", "/published-images/quota")
+        if subject_kind not in ("user", "project") or not subject_id:
+            raise HubError("quota usage requires both subject_kind (user|project) and subject_id")
+        return self._json_request(
+            "GET", "/admin/image-quota/usage", query={"subject_kind": subject_kind, "subject_id": subject_id}
+        )
+
+    @staticmethod
+    def _quota_override_path(subject_kind: str, subject_id: str, visibility: str) -> str:
+        if (
+            subject_kind not in ("user", "project")
+            or visibility not in ("private", "internal", "public")
+            or (subject_kind == "project") != (visibility == "internal")
+            or not isinstance(subject_id, str)
+            or not subject_id
+        ):
+            raise HubError("quota override requires a user private/public scope or a project internal scope")
+        return "/admin/image-quota/overrides/" + "/".join(
+            urllib.parse.quote(item, safe="") for item in (subject_kind, subject_id, visibility)
+        )
+
+    def set_image_quota_override(
+        self,
+        subject_kind: str,
+        subject_id: str,
+        visibility: str,
+        *,
+        max_images: int | None,
+        max_chain_bytes: int | None,
+        max_source_bytes: int | None,
+    ) -> dict:
+        """Replace all three subject limits; None means unlimited, never inherit."""
+        path = self._quota_override_path(subject_kind, subject_id, visibility)
+        limits = dict(max_images=max_images, max_chain_bytes=max_chain_bytes, max_source_bytes=max_source_bytes)
+        if any(
+            value is not None and (type(value) is not int or not 0 <= value <= 2**63 - 1) for value in limits.values()
+        ):
+            raise HubError("quota limits must be null or integers between 0 and 2**63 - 1")
+        return self._json_request("PUT", path, limits)
+
+    def remove_image_quota_override(self, subject_kind: str, subject_id: str, visibility: str) -> dict:
+        """Restore tier inheritance without deleting publications; retain the audit history."""
+        return self._json_request("DELETE", self._quota_override_path(subject_kind, subject_id, visibility))
+
+    def image_quota_override_history(
+        self,
+        subject_kind: str,
+        subject_id: str,
+        visibility: str,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> dict:
+        return self._json_request(
+            "GET",
+            self._quota_override_path(subject_kind, subject_id, visibility) + "/history",
+            query={"limit": limit, "offset": offset},
+        )
+
     def list_published_images(self, *, limit: int = 100, offset: int = 0) -> dict:
         return self._json_request("GET", "/published-images", query={"limit": limit, "offset": offset})
 

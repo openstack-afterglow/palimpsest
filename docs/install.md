@@ -1,5 +1,72 @@
 # Detailed installation and configuration guide
 
+## Subject image-quota overrides — 0.3.32 candidate
+
+This source adds `palimpsest_hub_image_quota_overrides`, one independent,
+append-only table. Before rollout, drain every API/export/build writer and take
+the runbook's paired SQL/CAS/config backup. Run the reviewed new API image's
+`palimpsest-hub-bootstrap` once offline; `reconfigure` does not bootstrap.
+Bootstrap creates the new table without altering tier policies, tier assignments
+or published images. Offline `palimpsest-hub-migrate-data` accepts older sources
+without the table and validates/copies its full history when present.
+Roll all application cohorts to the same reviewed release before reopening.
+No production migration or quota change is performed by these instructions.
+
+**App-only rollback:** stop new writers before selecting the old application
+images. The new table may stay: it has no foreign keys into old tables and old
+code never reads it. Old code enforces tier limits, not overrides; a raised cap
+will no longer apply and a lowered override will no longer restrict publication.
+Inspect effective tier-only admission before reopening ingress. Preserve the
+ledger for later roll-forward; do not drop it or restore SQL alone. Any data
+restore still needs the separately approved paired SQL/CAS/config recovery.
+
+A current human system administrator with a project-scoped original Keystone
+token and `system:manage` can replace all three limits for one exact subject and
+visibility. Users own private/public limits; projects own internal limits.
+Free and paid subjects both support overrides, without changing billing tiers,
+global policies, seeds or other subjects. A limit is a nonnegative integer up to
+`2**63 - 1`; explicit JSON null means unlimited. All three fields are required.
+Lowering never deletes existing images. New publications face the effective
+chain/source caps; new names face the effective count cap, while existing-name
+versions keep the existing count exception.
+
+| Route | Effect |
+| --- | --- |
+| `PUT /v1/admin/image-quota/overrides/{user|project}/{id}/{private|internal|public}` | Replace the subject's override with `max_images`, `max_chain_bytes`, `max_source_bytes` |
+| `DELETE` at the same path | Remove the override and restore current tier limits |
+| `GET` at the same path plus `/history?limit=100&offset=0` | Audit entries, newest revision first; limit 1–100 |
+| `GET /v1/admin/image-quota/usage?subject_kind=user&subject_id={id}` | Admin usage and effective scope limits |
+| `GET /v1/published-images/quota` | Caller's own usage and effective scope limits |
+
+Every set/removal appends `revision`, `updated_by` (admin user), `updated_at`
+(UTC), `old_limits` and `new_limits`. A null limits object means tier inheritance;
+an object with null field values means an unlimited override. Both usage views
+include `source: "tier"` or `"override"` per scope. A tier-policy change still
+affects inheriting subjects; it does not replace active overrides.
+Admin history, set and removal reject ordinary members, delegated/machine
+credentials and system/domain-scoped tokens. Existing admin routes retain their
+same authorization. Responses are not cached.
+
+Supported CLI procedure (bytes, not GiB; use `--cloud` or `PALIMPSEST_TOKEN`):
+
+```sh
+palimpsest --cloud admin-cloud admin image-quota usage user USER_ID
+palimpsest --cloud admin-cloud admin image-quota set user USER_ID private \
+  --max-images 3 --max-chain-bytes 1073741824 --max-source-bytes unlimited
+palimpsest --cloud member-cloud published quota
+palimpsest --cloud admin-cloud admin image-quota history user USER_ID private
+palimpsest --cloud admin-cloud admin image-quota remove user USER_ID private
+```
+
+SDK: `HubClient.set_image_quota_override("user", user_id, "private",
+max_images=3, max_chain_bytes=1073741824, max_source_bytes=None)`,
+`remove_image_quota_override(...)`, `image_quota_override_history(...)` and
+`image_quota_usage(subject_kind="user", subject_id=user_id)`.
+`image_quota_usage()` without arguments reads own usage. Requests are not
+automatically retried. After an uncertain mutation, read usage/history and
+reconcile before deciding whether another explicit request is needed; repeated
+set/remove requests append another audit revision.
+
 ## 0.3.31 transition note — 2026-11-17 (UTC; prepared)
 
 0.3.31 is a prepared patch over the deployed 0.3.30 release containing both the Hub dev-resume/contention fixes and the native-VZ client HOLD-deletion fix (#119, original patch `d8d2717`), with no schema change. It is not published, deployed or live-verified. Package-key policy from 0.3.30 is unchanged.

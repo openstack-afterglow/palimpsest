@@ -3,7 +3,7 @@
 
 This file is generated from `palimpsest_local.cli.build_parser`. It inventories every command, positional, option, choice, and parser default. For behavior, examples, and runtime restrictions, read [the usage guide](usage.md). Every command except raw `docker` pass-through accepts automatic `-h`/`--help`.
 
-Coverage: **173 command paths**, **477 positional/option definitions** (excluding automatic `-h/--help`).
+Coverage: **180 command paths**, **493 positional/option definitions** (excluding automatic `-h/--help`).
 
 ## `palimpsest`
 
@@ -12,10 +12,10 @@ Coverage: **173 command paths**, **477 positional/option definitions** (excludin
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest [-h] [--url URL] [--cloud CLOUD] [--version] {cloud,benchmark,image,published,instance,layer,bundle,oci,build,registry,login,logout,pull,push,tag,images,history,rmi,save,load,docker,run,compose,ps,volumes,networks,volume,inspect,logs,shell,exec,start,stop,rm,commit,web,store,completion} ...
+usage: palimpsest [-h] [--url URL] [--cloud CLOUD] [--version] {cloud,benchmark,image,published,admin,instance,layer,bundle,oci,build,registry,login,logout,pull,push,tag,images,history,rmi,save,load,docker,run,compose,ps,volumes,networks,volume,inspect,logs,shell,exec,start,stop,rm,commit,web,store,completion} ...
 ```
 
-Subcommands: `cloud`, `benchmark`, `image`, `published`, `instance`, `layer`, `bundle`, `oci`, `build`, `registry`, `login`, `logout`, `pull`, `push`, `tag`, `images`, `history`, `rmi`, `save`, `load`, `docker`, `run`, `compose`, `ps`, `volumes`, `networks`, `volume`, `inspect`, `logs`, `shell`, `exec`, `start`, `stop`, `rm`, `commit`, `web`, `store`, `completion`.
+Subcommands: `cloud`, `benchmark`, `image`, `published`, `admin`, `instance`, `layer`, `bundle`, `oci`, `build`, `registry`, `login`, `logout`, `pull`, `push`, `tag`, `images`, `history`, `rmi`, `save`, `load`, `docker`, `run`, `compose`, `ps`, `volumes`, `networks`, `volume`, `inspect`, `logs`, `shell`, `exec`, `start`, `stop`, `rm`, `commit`, `web`, `store`, `completion`.
 
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
@@ -1140,10 +1140,10 @@ usage: palimpsest image load [-h] [-i INPUT_PATH] [--platform PLATFORM] [-q]
 Automatic `-h`/`--help` prints help for this command and exits.
 
 ```text
-usage: palimpsest published [-h] {push,pull,status} ...
+usage: palimpsest published [-h] {push,pull,quota,status} ...
 ```
 
-Subcommands: `push`, `pull`, `status`.
+Subcommands: `push`, `pull`, `quota`, `status`.
 
 ### `palimpsest published push`
 
@@ -1187,6 +1187,16 @@ usage: palimpsest published pull [-h] [--name NAME] --state-root STATE_ROOT [--i
 | `--anonymous` | flag | `False` | ignore configured credentials and read a public image anonymously |
 | `--allow-insecure-http` | flag | `False` | allow sending credentials over plain http:// to a non-loopback Hub |
 
+### `palimpsest published quota`
+
+[Behavior, restrictions, and examples](usage.md#hub-cloud-images-layers-and-bundles).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest published quota [-h]
+```
+
 ### `palimpsest published status`
 
 [Behavior, restrictions, and examples](usage.md#hub-cloud-images-layers-and-bundles).
@@ -1200,6 +1210,98 @@ usage: palimpsest published status [-h] [--state-root STATE_ROOT]
 | Argument | Value | Parser default | Description |
 | --- | --- | --- | --- |
 | `--state-root` | Path | `None` | state root to inspect (default: the configured state root) |
+
+## `palimpsest admin`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest admin [-h] {image-quota} ...
+```
+
+Subcommands: `image-quota`.
+
+### `palimpsest admin image-quota`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest admin image-quota [-h] {set,remove,usage,history} ...
+```
+
+Subcommands: `set`, `remove`, `usage`, `history`.
+
+### `palimpsest admin image-quota set`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest admin image-quota set [-h] --max-images MAX_IMAGES --max-chain-bytes MAX_CHAIN_BYTES --max-source-bytes MAX_SOURCE_BYTES {user,project} subject_id {private,internal,public}
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `subject_kind` | one of: `user`, `project` | required | quota subject: user or project |
+| `subject_id` | string | required | exact Keystone user or project identifier |
+| `visibility` | one of: `private`, `internal`, `public` | required | private/public for a user, internal for a project |
+| `--max-images` | _quota_limit | required | nonnegative integer or unlimited |
+| `--max-chain-bytes` | _quota_limit | required | nonnegative integer or unlimited |
+| `--max-source-bytes` | _quota_limit | required | nonnegative integer or unlimited |
+
+### `palimpsest admin image-quota remove`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest admin image-quota remove [-h] {user,project} subject_id {private,internal,public}
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `subject_kind` | one of: `user`, `project` | required | quota subject: user or project |
+| `subject_id` | string | required | exact Keystone user or project identifier |
+| `visibility` | one of: `private`, `internal`, `public` | required | private/public for a user, internal for a project |
+
+### `palimpsest admin image-quota usage`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest admin image-quota usage [-h] {user,project} subject_id
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `subject_kind` | one of: `user`, `project` | required | quota subject: user or project |
+| `subject_id` | string | required | exact Keystone user or project identifier |
+
+### `palimpsest admin image-quota history`
+
+[Behavior, restrictions, and examples](usage.md#runtime-lifecycle-and-observation).
+
+Automatic `-h`/`--help` prints help for this command and exits.
+
+```text
+usage: palimpsest admin image-quota history [-h] [--limit LIMIT] [--offset OFFSET] {user,project} subject_id {private,internal,public}
+```
+
+| Argument | Value | Parser default | Description |
+| --- | --- | --- | --- |
+| `subject_kind` | one of: `user`, `project` | required | quota subject: user or project |
+| `subject_id` | string | required | exact Keystone user or project identifier |
+| `visibility` | one of: `private`, `internal`, `public` | required | private/public for a user, internal for a project |
+| `--limit` | int | `100` | maximum history rows (1-100) |
+| `--offset` | int | `0` | history rows to skip (default: 0) |
 
 ## `palimpsest instance`
 

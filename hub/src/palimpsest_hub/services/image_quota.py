@@ -23,6 +23,7 @@ from sqlalchemy.exc import IntegrityError
 
 from palimpsest_hub.image_models import (
     PalimpsestHubImageMembership,
+    PalimpsestHubImageQuotaOverride,
     PalimpsestHubImageQuotaPolicy,
     PalimpsestHubImageQuotaTier,
     PalimpsestHubImageSourceBlob,
@@ -185,6 +186,81 @@ async def assign_tier(session, subject_kind, subject_id, tier, admin_user):
     return _tier_value(row, subject_kind, subject_id)
 
 
+async def _override_row(session, subject_kind, subject_id, visibility):
+    return await session.scalar(
+        select(PalimpsestHubImageQuotaOverride)
+        .where(
+            PalimpsestHubImageQuotaOverride.subject_kind == subject_kind,
+            exact_identity(PalimpsestHubImageQuotaOverride.subject_id, subject_id),
+            PalimpsestHubImageQuotaOverride.visibility == visibility,
+        )
+        .order_by(PalimpsestHubImageQuotaOverride.revision.desc())
+        .limit(1)
+    )
+
+
+def override_value(row):
+    return {
+        "subject_kind": row.subject_kind,
+        "subject_id": row.subject_id,
+        "visibility": row.visibility,
+        "revision": row.revision,
+        "old_limits": row.old_limits,
+        "new_limits": row.new_limits,
+        "updated_by": row.updated_by,
+        "updated_at": row.updated_at.replace(tzinfo=UTC).isoformat(),
+    }
+
+
+async def change_override(session, subject_kind, subject_id, visibility, limits, admin_user):
+    """Append an audited change under the publication mutex; never mutate published rows."""
+    previous = await _override_row(session, subject_kind, subject_id, visibility)
+    row = PalimpsestHubImageQuotaOverride(
+        subject_kind=subject_kind,
+        subject_id=subject_id,
+        visibility=visibility,
+        revision=previous.revision + 1 if previous else 1,
+        old_limits=previous.new_limits if previous else None,
+        new_limits=limits,
+        updated_by=admin_user,
+        updated_at=_now(),
+    )
+    session.add(row)
+    try:
+        await session.flush()
+    except IntegrityError:
+        await session.rollback()
+        raise HTTPException(
+            status_code=409, detail="an override exists for an identifier differing only in letter case"
+        ) from None
+    return override_value(row)
+
+
+async def override_history(session, subject_kind, subject_id, visibility, limit, offset):
+    rows = await session.scalars(
+        select(PalimpsestHubImageQuotaOverride)
+        .where(
+            PalimpsestHubImageQuotaOverride.subject_kind == subject_kind,
+            exact_identity(PalimpsestHubImageQuotaOverride.subject_id, subject_id),
+            PalimpsestHubImageQuotaOverride.visibility == visibility,
+        )
+        .order_by(PalimpsestHubImageQuotaOverride.revision.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+    return {"items": [override_value(row) for row in rows]}
+
+
+async def effective_policy(session, visibility, subject_id, tier, policies):
+    row = await _override_row(session, scope_of(visibility), subject_id, visibility)
+    limits = row.new_limits if row else None
+    return {
+        **policies[(tier, visibility)],
+        **(limits if limits is not None else {}),
+        "source": "override" if limits is not None else "tier",
+    }
+
+
 def _exact(column, value):
     return (column == value) & (cast(column, LargeBinary) == value.encode())
 
@@ -239,7 +315,7 @@ async def enforce(session, actor, name, manifest, visibility, *, source=0):
     await ensure_seeded(session)
     scope, subject = scope_of(visibility), _subject(actor, visibility)
     tier = (await subject_tier(session, scope, subject))["tier"]
-    policy = (await load_policies(session))[(tier, visibility)]
+    policy = await effective_policy(session, visibility, subject, tier, await load_policies(session))
     limit = policy["max_images"]
     if limit is not None:
         scoped = _scope_filter(visibility, subject)
@@ -288,7 +364,7 @@ def _over(column, limit):
 
 
 async def scope_usage(session, visibility, subject_id, tier, policies):
-    policy = policies[(tier, visibility)]
+    policy = await effective_policy(session, visibility, subject_id, tier, policies)
     max_images, max_bytes, max_source = (policy[field] for field in LIMIT_FIELDS)
     chains, sources = _chains(), _sources()
     chain = func.coalesce(chains.c.bytes, 0)
@@ -324,6 +400,7 @@ async def scope_usage(session, visibility, subject_id, tier, policies):
         "tier": tier,
         "max_images": max_images,
         "max_chain_bytes": max_bytes,
+        "source": policy["source"],
         "max_source_bytes": max_source,
         "unique_names": names,
         "images": images,
