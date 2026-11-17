@@ -598,6 +598,33 @@ shared networks hold. Ordinary provider deletion removes its own directory;
 resource absence precedes root/export/lease release and HOLD removal. The separate
 SIGKILL-only original ha/vz metadata exception is unchanged.
 
+2026-11-15 local source correction separates a completed boot's unclean
+`stop-incomplete` HOLD from failed-prestart cleanup. Public RM now has an explicit
+destruction-only admission path; it does not claim the missing authenticated
+stop-ready evidence or unlock start/stop/capture. It requires unchanged complete
+retained input/root/lease authority, Stopped/zero PIDs, repeated current actor,
+directory and exclusive-upper proof, the closed default network profile,
+no foreign disk consumer and the exact original resource marker. Only the same
+inactive default socket pair may remain, with initial timestamps bounded by the
+recorded start and the original HOLD marker's mtime. Shared snapshot helpers
+retain the failed-start provenance gates; normal stop/start socket rules do not
+change. No product endpoint unlink or signal is introduced.
+
+Admission refusals precede the delete intent and preserve ledger/marker bytes.
+After admission the product records one intent while still failed/held, calls
+ordinary provider delete once, observes provider/directory/actor absence, then
+uses existing resource release order and removes the exact original HOLD last.
+Uncertain deletion is not replayed or settled by ordinary stop; the persisted
+delete intent blocks older quiescence evidence from making the run startable.
+Unrelated SSH port reuse does not create removal custody. Ordinary starts do not
+retain the failed-start cleanup's original hostagent incarnation; this path grants
+no signal authority, does not infer a dead PID from CLI success and rejects
+currently related actors.
+If original provider/root custody is already missing, or HOLD reason is
+`retained-authority-changed`, this route remains unavailable. Local regression
+cases define the behavior; no new VM, remote cleanup or live result is claimed.
+
+
 The inetd argv matches the selected static Dropbear build: omit `-E` and `-s`
 because syslog/password/PAM/plugin support is compiled out. Builder and loader
 now independently qualify actual archived bytes against the reviewed506576byte
@@ -2981,6 +3008,29 @@ uv run python scripts/test_lanes.py run gate2
 
 ## Maintenance
 
+2026-11-17 rebased HOLD-deletion review: reviewed the complete runtime and test
+delta from `d8d2717` against dev `79507f3`. Source and test patches apply unchanged;
+only changelog history and the architecture marker conflicted. Keep the fix under
+Unreleased and retain the current release history. `_load_checked` adds a
+default-false `stopped_delete` gate; the commit adapter and its capture helpers
+keep their existing inputs and defaults. Canonical RM alone enters the new
+destruction branch. Shared failed-start network/socket helpers preserve their
+prior checks. Stop refuses an attempted destructive delete; neither start nor
+capture gains recovery authority. This changes the M3-09 removal contract, not
+the commit adapter or capture policy. Local checks and independent review are
+reported separately; no live proof, publication, deployment or remote cleanup.
+
+2026-11-15 local unclean native VZ stop review: traced `_load_checked`, ordinary
+stop settlement, failed-start endpoint pins and canonical RM. Added a distinct
+stop-incomplete destruction-only branch rather than weakening quiescence or
+failed-start provenance. The original HOLD timestamp bounds stale endpoint
+eligibility; refusal keeps original ledger/marker authority. Defined regressions
+for observed stale sockets, active/reused/unknown actors, foreign disk/marker
+custody, changed observations, one-shot deletion and unchanged graceful stop.
+No tests, lint, formatter, architecture stamp, remote operation or release ran
+in this implementation slice; integration verification belongs to the parent.
+
+
 2026-11-03 standard project-role source review: traced policy defaults/override
 ceiling, native original/current role intersection, key attenuation, registry
 human mutation/deletion, layer/global catalog distinction, project build APIs,
@@ -4102,9 +4152,9 @@ Reserved names and duplicate listings (2026-11-15, from the commit-path review, 
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "268a7b62d2312f111a8a2d2a87165db66ff28e086b1257861a4f6d6bf9a019ea",
-  "reviewed_at": "2026-11-17T07:20:44Z",
-  "summary": "Merge dev 0.3.30 into the immutable block-layer design PR: examples/ and docs/design/ are the only added source, not imported by the product; dev side already reviewed in 0.3.30"
+  "source_sha256": "a5fbf156f6cc289ad1058c125c0b88249adf723aa2414e5ab8e1f7d29c2b937c",
+  "reviewed_at": "2026-11-17T09:44:29Z",
+  "summary": "Reviewed d8d2717 rebased onto 79507f3: exact stop-incomplete HOLD destruction only; repeated provider/actor/network/root proofs and one-shot RM; commit adapter unchanged and stopped_delete defaults false; no live proof or release"
 }
 ```
 <!-- architecture-review:end -->
