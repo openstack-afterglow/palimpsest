@@ -4274,9 +4274,9 @@ Reserved names and duplicate listings (2026-11-15, from the commit-path review, 
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "4446c99e9c463cb8ee86b440aed0bb29c148170808a8ff8e4ce8ac819d4fea37",
-  "reviewed_at": "2026-11-17T12:36:24Z",
-  "summary": "Review quota override source plus active OpenSpec delta, restore accepted capability, prove inherited tier admission byte compatibility, flag M2-17/M3-08 pre-merge rulings; preserve lifecycle fence"
+  "source_sha256": "51a00b2ed51dc65121b841376de606fc6f6bdc35fc9ef63a9c94a1bfe60abfbd",
+  "reviewed_at": "2026-11-17T15:45:13Z",
+  "summary": "Rebase of the reviewed quota-override delta onto dev after the console merge (#122): no overlapping source files; quota ledger, shared enforce/usage resolution, human-admin API/SDK/CLI, additive bootstrap and offline audit migration preserved; tiers, image rows and lifecycle fences unchanged; console delta already reviewed separately"
 }
 ```
 <!-- architecture-review:end -->
