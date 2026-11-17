@@ -4303,9 +4303,9 @@ Reserved names and duplicate listings (2026-11-15, from the commit-path review, 
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "13156a6394176fa45ad287e45391b9abcb969f27068ee0484eb466203a1546b7",
-  "reviewed_at": "2026-11-17T15:53:00Z",
-  "summary": "Reviewed unchanged carrier-ctime-only RM source plus direct real-loader content-mismatch, unchanged-ctime and wrong-gate regressions; ordinary comparison remains unchanged; retained private evidence and one-shot deletion; no live access or release"
+  "source_sha256": "b2dd4c5b4da394dcf75f93e7a3136dbfeaf7912699f9e3508836d0e86e158723",
+  "reviewed_at": "2026-11-17T16:29:45Z",
+  "summary": "Rebase of the reviewed carrier-ctime destruction-only rm onto dev after the console and quota merges: runtime patch-id befb00d1 unchanged (vz_native_runtime only; unheld lifecycle, _custody, _session, commit path untouched); quota and console deltas already reviewed separately; spec and handoff records added"
 }
 ```
 <!-- architecture-review:end -->
