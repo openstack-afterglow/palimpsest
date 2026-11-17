@@ -237,7 +237,16 @@ schemes matched. Canonically reserialized capture SHA-256:
 `c346c1613c3dbc00965e5045dbcce889a5494d0b5766d5c0b5489792000b0670`.
 The deployed package behind that earlier capture was not identified; the fixed
 OpenAPI version is not release evidence. Later public GETs returned 503 during
-the separately controlled 0.3.31 rollout. Current post-rollout schema equality is
-**not live-verified** here; a post-rollout receipt must establish it. Local tests
-and a synthetic browser exercise do not replace the separately approved 0.3.32
-console/provider journey.
+the separately controlled 0.3.31 rollout.
+
+After the rollout-complete notice, exactly one authorized read-only public GET
+at **2026-11-17T12:11:30Z** returned 200. The entire downloaded OpenAPI document
+matched `app.openapi()` from source
+`49f2596893bae274910da64585885ecf550e40cf`: all **93 paths**, **42 component
+schemas**, security schemes and remaining document fields. Raw response
+SHA-256: `ed394c307eaf075add3c916baeb53415412c7b5bbca6f868c8ae8aa45f5433d7`.
+No credential or other production request was used. This proves the live
+machine-readable API contract matches the unchanged consumer routes in this
+source, not that the new console is deployed or that provider operations work.
+Local tests and a synthetic browser exercise do not replace the separately
+approved 0.3.32 console/provider journey.
