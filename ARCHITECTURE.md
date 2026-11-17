@@ -3009,6 +3009,24 @@ uv run python scripts/test_lanes.py run gate2
 
 ## Maintenance
 
+2026-11-17 combined0.3.31 delta review: rebased the reviewed Hub candidate
+144cd9b onto origin/dev34ffc60, incorporating #116 reference docs/examples and
+#119 native-VZ client HOLD destruction. The Hub source/test subtree is unchanged
+from144cd9b; the upstream product-code delta is confined to
+`src/palimpsest_local/vz_native_runtime.py`, with its Darwin process regressions.
+Reviewed the default-false stopped-delete loader gate, canonical-RM-only entry,
+two bounded resource observations around the retained-authority reload, original
+HOLD/endpoint binding, one-shot deletion intent and refusal of blind replay.
+This grants destruction eligibility only, never graceful-stop adoption or
+start/capture authority; the native patch has local-test evidence only.
+The two fixes touch disjoint runtime modules and retain matching0.3.31 package,
+Hub/client lock and Kolla pins. The #116 reference code is not product/CI wiring.
+Both fixes are recorded under the prepared0.3.31 changelog; Unreleased is empty.
+The combined release still requires fresh checks, SHA-bound surface review and
+separate publication/deployment/live qualification. No spec or handoff edits
+were made by this rebase preparation.
+
+
 2026-11-17 rebased HOLD-deletion review: reviewed the complete runtime and test
 delta from `d8d2717` against dev `79507f3`. Source and test patches apply unchanged;
 only changelog history and the architecture marker conflicted. Keep the fix under
@@ -4176,9 +4194,9 @@ Reserved names and duplicate listings (2026-11-15, from the commit-path review, 
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "9fe269c9140468d2393921d261bd8438256ec98764adc1f765b20eef549eafa4",
-  "reviewed_at": "2026-11-17T09:59:47Z",
-  "summary": "Reviewed rebased RM-only HOLD destruction and independent P2 correction: separate 30-second resource observation windows exclude full retained-source reload; commit adapter/default path unchanged; no live proof or release"
+  "source_sha256": "c34818c3e01607fcad123bc44d802a43d5e2742ea3e250c5379c5ce7f90c8a1b",
+  "reviewed_at": "2026-11-17T10:40:23Z",
+  "summary": "Combined 0.3.31 on dev34ffc60: unchanged reviewed Hub resume/mutex/task-state fix plus disjoint native-VZ client destruction-only HOLD RM (#119,d8d2717), local-test evidence only; #116 reference docs/examples; coherent changelog/version/install surface"
 }
 ```
 <!-- architecture-review:end -->

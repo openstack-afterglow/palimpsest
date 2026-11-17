@@ -2,7 +2,9 @@
 
 ## 0.3.31 transition note — 2026-11-17 (UTC; prepared)
 
-0.3.31 is a prepared patch over the deployed 0.3.30 release, with no schema change. It is not published, deployed or live-verified. Package-key policy from 0.3.30 is unchanged.
+0.3.31 is a prepared patch over the deployed 0.3.30 release containing both the Hub dev-resume/contention fixes and the native-VZ client HOLD-deletion fix (#119, original patch `d8d2717`), with no schema change. It is not published, deployed or live-verified. Package-key policy from 0.3.30 is unchanged.
+
+The native-VZ change is destruction-only canonical RM of an exact proved stopped run retaining its original `stop-incomplete` HOLD. Full retained ownership, exclusive root/actor custody, a closed network and unchanged repeated observations are required. It does not adopt an unclean stop as graceful, enable start/capture or authorize manual marker deletion. Admission refusal preserves the HOLD and an uncertain provider delete is not replayed. This client-only patch has local regression-test evidence only, not live settlement qualification; it is separate from the Hub changes below.
 
 New CPU dev instances created with the updated runner retain resume state after a command exits successfully even without a readiness probe. Every resumed boot or power-on reruns the command, including one that already finished successfully; commands that must run once must guard themselves. Existing guests are not upgraded in place. Idle auto-shelve and its cost policy are unchanged, including for guests without retained state. Older no-probe guests, first-result-error guests and GPU guests without resume state still shelve when idle and return as the bare VM with `error` / `resume_state_missing`, not a restored workload. Legacy non-restorable rows stuck in `resumed` report that error on resume or an idle ACTIVE status read.
 

@@ -3,6 +3,7 @@
 Palimpsest requires Python 3.11 or newer. This source prepares
 [`palimpsest-client 0.3.31`](https://pypi.org/project/palimpsest-client/0.3.31/)
 (prepared; not published, deployed or live-verified). Version 0.3.30 remains the deployed release.
+It contains both Hub dev-resume/contention fixes and the native-VZ client destruction-only RM fix (#119, original `d8d2717`); the latter has local-test evidence only and does not enable start/capture or graceful-stop adoption.
 Publication and deployment are separate. After formal publication, install exact bytes in isolation:
 
 ```sh

@@ -26,7 +26,8 @@ Prepared source only: not published, deployed or live-verified. No schema change
   not replayed or settled by `stop`. Unrelated SSH port reuse does not block RM.
   This local source change has regression cases but no new live
   qualification, release or remote cleanup.
-  The `d8d2717` patch merged through #119 is native-VZ client only,
+  #119 (squash `34ffc60`; original `d8d2717` plus the independent deadline
+  correction) is native-VZ client only,
   destruction-only RM, with local-test evidence only; no live settlement proof.
 
 ## [0.3.30] - 2026-11-16 (UTC; published and deployed)
