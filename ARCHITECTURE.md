@@ -3038,6 +3038,22 @@ custody, changed observations, one-shot deletion and unchanged graceful stop.
 No tests, lint, formatter, architecture stamp, remote operation or release ran
 in this implementation slice; integration verification belongs to the parent.
 
+2026-11-17 release0.3.31 preparation review: rebased the dev lifecycle fix onto
+origin/dev543186e (deployed0.3.30), preserving its member-tier package-key policy.
+Reviewed the rendered guest runner, capability-bound resume marker, first-result
+restore eligibility, lifecycle/Nova status-and-task transitions, unchanged idle
+shelve cost policy, SQL acquisition/rollback and owner/private visibility fences,
+typed API503 handling, and matching package/lock/Kolla/install version inputs.
+The busy read and mutation fallbacks apply only before admission: a MutexBusy
+raised after reconciliation or an admitted effect must reach the API handler,
+not become a stale200 or a misleading not-applied409. Added the corresponding
+observation-body regression beside the existing admitted-mutation regression.
+No schema, trust-role/TTL, session observer/controller/reporter, or deployment
+topology changes. Source tests, package checks and a fresh independent review
+are required for this rebased candidate; none is a release, deployment or live
+VM acceptance claim. Checklist invalidation and source-bound re-verification
+remain required before merge and rollout.
+
 
 2026-11-03 standard project-role source review: traced policy defaults/override
 ceiling, native original/current role intersection, key attenuation, registry

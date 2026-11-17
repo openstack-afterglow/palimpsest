@@ -34,31 +34,32 @@ are not deployed-service acceptance; see the [control-plane boundaries](ARCHITEC
 - **0.3.27 (published and deployed 2026-11-15):** Hub image jobs (registry intake, Dockerfile and Git builds) no longer reject claims when the build worker's output limit is smaller than the API's blob limit. The experimental native VZ commit bounds `/.plmignore` evaluation and refuses ordinary files named `.wh.*`; a session marker left by a killed `exec` client is released only by its own run, also when that run's VM is stopped. The image-rule fallback and reserved-name refusal were exercised on the tag source in native VZ; an out-of-band unclean stop remains an unresolved recovery limit.
 - **0.3.28 (published and deployed 2026-11-15):** the Hub dashboard can inspect visible playbooks and request VMs from the caller's own completed image jobs. Provider choices use the caller's token, and server creation and deletion remain explicit actions. Browser verification of the dashboard used a local fake API; in production one CPU VM was created from a Git-built image and deleted through the released CLI, not through the dashboard.
 - **0.3.29 (published and deployed 2026-11-15):** the Hub API and export worker name three kinds of swallowed failure in their logs (an unhandled request failure, a failed or stuck `/v1/ready` probe, a failed worker pass) by exception class and Hub call site, never by message or traceback. No API, schema or role input changes. It follows a production window on 0.3.28 in which 5xx answers could not be attributed from the Hub's own logs. The new lines are covered by tests; none has been observed in production because no failure has occurred since the rollout.
-- **0.3.30 (prepared; not yet published at the time of this edit):** a project member issues its own package keys (`keys:issue`, `keys:revoke` moved from the manager tier to the member tier), so a member holds all five package capabilities; a manager keeps package/layer/export deletion and project management, a reader is unchanged, and key access stays owner-only. It also carries the merged read-only layer impact plan and staged diagnosis (PR #115). No schema change.
+- **0.3.30 (published and deployed 2026-11-16 UTC):** a project member issues its own package keys (`keys:issue`, `keys:revoke` moved from the manager tier to the member tier), so a member holds all five package capabilities; a manager keeps package/layer/export deletion and project management, a reader is unchanged, and key access stays owner-only. It also carries the merged read-only layer impact plan and staged diagnosis (PR #115). No schema change.
+- **0.3.31 (prepared; not published, deployed or live-verified):** new CPU dev guests retain resume state after a successful command without a readiness probe; resumed boots rerun that command. Idle auto-shelve and its cost policy are unchanged. Legacy guests without retained state are not upgraded and report `error` / `resume_state_missing` after resume rather than remaining falsely `resumed`. Instance reads and owner admission use a two-second mutex allowance: busy reads return committed state, and refused mutations return transient HTTP 409 with `Retry-After: 10` without applying the request. Other typed mutex timeouts receive HTTP 503 at the API boundary. Nova status plus task state distinguishes shelving and unshelving from idle states. No schema change; see the [transition note](docs/install.md#0331-transition-note--2026-11-17-utc-prepared).
 
 ## Install from PyPI
 
 Requires Python 3.11 or newer. Prefer an isolated uv tool, or a pip virtual environment:
 
 ```sh
-uv tool install --python 3.11 "palimpsest-client==0.3.30"
+uv tool install --python 3.11 "palimpsest-client==0.3.31"
 palimpsest --version
 
 # Alternative: pip, without modifying the system Python.
 python3.11 -m venv .venv
-.venv/bin/python -m pip install "palimpsest-client==0.3.29"
+.venv/bin/python -m pip install "palimpsest-client==0.3.31"
 .venv/bin/palimpsest --version
 ```
 
 If uv's tool directory is not on `PATH`, run `uv tool update-shell` explicitly
 and open a new terminal. One-off use: `uvx --python 3.11 --from
-palimpsest-client==0.3.30 palimpsest --version`.
+palimpsest-client==0.3.31 palimpsest --version`.
 
 Root client installation and Hub service deployment are separate. API, export
 worker and build-worker images must match the reviewed release; updating the
 root wheel alone does not update running Kolla containers.
 
-The commands above select version 0.3.30 after its formal publication. Check the
+The commands above select version 0.3.31 after its formal publication. Check the
 [release handoff](docs/development-handoff.md) for actual PyPI/image receipts and
 the deployment-server package/lock selection. Older release and production
 receipts remain historical and do not establish the currently running version.

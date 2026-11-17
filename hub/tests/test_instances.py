@@ -414,6 +414,26 @@ async def test_get_instance_with_a_busy_sql_mutex_returns_committed_200_and_norm
 
 
 @pytest.mark.asyncio
+async def test_a_mutex_timeout_inside_admitted_observation_is_not_reported_as_a_successful_read(
+    instance_hub, monkeypatch
+):
+    h = instance_hub
+    created = await create_and_advance(h, json=request_body())
+    assert created.status_code == 202, created.text
+    observed = []
+
+    async def fail_after_reconcile_started(session, row, *args):
+        observed.append(row.id)
+        raise MutexBusy("a nested fence timed out after reconciliation started")
+
+    monkeypatch.setattr(service, "reconcile", fail_after_reconcile_started)
+    response = await h.client.get("/v1/instances/" + created.json()["id"])
+    assert response.status_code == 503 and response.headers["Retry-After"] == "1"
+    assert "busy with another operation" in response.json()["detail"]
+    assert observed == [created.json()["id"]]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("path", ["/v1/instances", "/v1/projects/mutex-busy"])
 async def test_uncaught_sql_mutex_busy_returns_handled_503_and_normal_request_log(
     instance_hub, monkeypatch, caplog, path

@@ -4,8 +4,19 @@ All notable changes to Palimpsest Local are documented here.
 
 ## [Unreleased]
 
+## [0.3.31] - 2026-11-17 (UTC; prepared)
+
+Prepared source only: not published, deployed or live-verified. No schema change; 0.3.30 remains the deployed release.
+
+### Added
+
+- Immutable block-layer design proposal and reference code (OverlayBD, OCI registry, Ceph RBD, local KVM): `docs/design/immutable-block-layers/`, `examples/immutable-block-layers/`. Not wired into the product or CI. A disposable VM run covered local and Ceph assembly, lazy loading, delta commit/push, integrity and the libvirt hook; Nova/Cinder, multi-host, GPU and performance were not run. The run also found sparse-upper sub-4 KiB write damage and undelivered guest flushes without host-side mitigations.
+
 ### Fixed
 
+- Hub CPU dev instances created with the updated runner retain resume state after a successful command even without a readiness probe. Their command runs again after every resumed boot or power-on, including commands that already finished successfully; commands that must run once must guard themselves. Idle auto-shelve and its cost policy are unchanged. Instances without retained state (older no-probe guests, first-result-error guests or GPU guests) still shelve when idle and come back as the bare VM with `error` / `resume_state_missing`. Older guests are not upgraded in place, and legacy non-restorable rows stuck in `resumed` now report that error on resume or an idle ACTIVE status read.
+- Instance reads and owner-mutation admission use a two-second mutex allowance. Busy reads return committed state without reconciliation or writes; owner mutations refused at admission return HTTP 409 with `Retry-After: 10` without applying the request when any concurrent request holds the instance, including automatic shelve, resume or a slow status read. The CLI does not retry. Transient in-progress conflicts carry the ten-second retry header; permanent state conflicts do not. Other typed `MutexBusy` timeouts receive HTTP 503 with `Retry-After: 1` at the API boundary rather than HTTP 500, without promising that an already-admitted request was not applied.
+- Nova task-state classification uses status plus task state: ACTIVE with a shelving task is not idle, and SHELVED/SHELVED_OFFLOADED with an unshelving or spawning task is still in progress. This avoids false resume success and duplicate actions. An idle already-ACTIVE resume preserves workload status instead of awaiting a report from a guest that did not reboot.
 - Experimental native VZ: explicit `rm` can delete a proven-owned stopped run
   retaining its original `stop-incomplete` HOLD, including the exact inactive
   default-network socket pair. It does not promote an unclean stop to graceful
@@ -15,8 +26,10 @@ All notable changes to Palimpsest Local are documented here.
   not replayed or settled by `stop`. Unrelated SSH port reuse does not block RM.
   This local source change has regression cases but no new live
   qualification, release or remote cleanup.
+  The `d8d2717` patch merged through #119 is native-VZ client only,
+  destruction-only RM, with local-test evidence only; no live settlement proof.
 
-## [0.3.30] - 2026-11-17 (UTC)
+## [0.3.30] - 2026-11-16 (UTC; published and deployed)
 
 ### Changed
 
@@ -29,12 +42,8 @@ All notable changes to Palimpsest Local are documented here.
 - Base-migration structure check (M51-01): pure comparison of an old and a new base against the paths kept layers touch, with a fixed report format. Listing adapters, acknowledgement and registration are not implemented.
 - Design records without implementation: declared `provides`/`requires`/`conflicts`, composition lock, Hub descendant lookup (`openspec/changes/add-layer-lineage-impact-and-staged-diagnosis`); related-work comparison with a validation design, a storage-backend comparison plan including OverlayBD, and a review of sharing the base and layers read-only with a user-owned writable volume through Nova, Cinder and Glance (`docs/research/`). No experiment was run.
 
-- Immutable block-layer design proposal and reference code (OverlayBD, OCI registry, Ceph RBD, local KVM): `docs/design/immutable-block-layers/`, `examples/immutable-block-layers/`. Not wired into the product or CI. A disposable VM run covered local and Ceph assembly, lazy loading, delta commit/push, integrity and the libvirt hook; Nova/Cinder, multi-host, GPU and performance were not run. The run also found sparse-upper sub-4 KiB write damage and undelivered guest flushes without host-side mitigations.
-
 ### Fixed
 
-- Hub CPU dev instances created with the updated runner retain resume state after a successful command even without a readiness probe. Their command runs again after every resumed boot or power-on, including commands that already finished successfully; commands that must run once must guard themselves. Idle shelve policy is unchanged. Instances without retained state (older no-probe guests, first-result-error guests or GPU guests) still shelve when idle and come back as the bare VM with `error` / `resume_state_missing`. Older guests are not upgraded in place, and legacy non-restorable rows stuck in `resumed` now report that error on resume or an idle ACTIVE status read.
-- Instance reads fall back to committed state after a two-second mutex allowance; owner mutations return HTTP 409 with `Retry-After: 10` without applying the request when any concurrent request holds the instance, including automatic shelve, resume or a slow status read. The CLI does not retry. Nova task-state detection avoids false resume success and duplicate actions; transient in-progress conflicts carry the retry header, permanent state conflicts do not. An idle already-ACTIVE resume preserves workload status instead of awaiting a report from a guest that did not reboot. Other unhandled mutex timeouts now receive HTTP 503 with `Retry-After` at the API boundary rather than HTTP 500.
 - Experimental native VZ commit: the view of the parent image no longer depends on where a layer lists its whiteout and opaque markers. Before, an entry that a layer listed before its own marker was treated as absent, so the committed layer could miss the whiteout that hides a parent identity file (an SSH host key, for example) and an unclassified parent `authorized_keys` was not refused. Images whose layers were written by Palimpsest list markers first and were not affected; images from other tools could be.
 - Experimental native VZ commit: a file or symlink that replaces a lower directory now removes that directory's entries from the parent view, as the materializer does. Before, they stayed listed, so a commit could refuse on a path that no longer exists or write a whiteout below a non-directory.
 - Hub dashboard: Create VM stayed disabled until a page reload when the connection was closed while a create request was in flight. The button is restored on disconnect.

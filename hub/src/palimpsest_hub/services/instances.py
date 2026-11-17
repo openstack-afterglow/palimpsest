@@ -1513,14 +1513,19 @@ async def reconcile(session, row, conn, actor=None, settings=None):
 
 async def observe(factory, actor, conn, instance_id, settings=None):
     project = request_project(actor, conn)
+    admitted = False
     try:
         async with sql_mutex(
             factory, "build-api:instance:" + instance_id, wait_seconds=INSTANCE_MUTEX_WAIT_SECONDS
         ) as session:
+            admitted = True
             row = await owned(session, instance_id, project, actor["user_id"])
             await reconcile(session, row, conn, actor, settings)
             return projection(row)
     except MutexBusy:
+        if admitted:
+            # Reconciliation already ran: a body timeout must not become a successful stale read.
+            raise
         # A busy read returns committed state only; it must not reconcile or write.
         async with factory() as session:
             return projection(await owned(session, instance_id, project, actor["user_id"]))

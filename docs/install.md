@@ -1,8 +1,18 @@
 # Detailed installation and configuration guide
 
-## 0.3.30 transition note — 2026-11-17 (UTC; prepared)
+## 0.3.31 transition note — 2026-11-17 (UTC; prepared)
 
-0.3.30 is a patch over 0.3.29 with no schema change. Package-key issuance and revoke (`keys:issue`, `keys:revoke`) are now member-tier actions: a project member can issue its own restricted package keys, and a manager keeps package/layer/export deletion and project management. Key listing, issuance and revocation stay owner-only for the exact project, and another owner's key is never reachable. An operator `policy.yaml` that narrowed these actions to manager keeps denying member; one that granted them to member now takes effect. Existing bearer keys keep their stored scope and actions. The release also carries the merged read-only client commands `palimpsest layer impact` and the staged compatibility diagnosis. Roll all Hub cohorts together after publication.
+0.3.31 is a prepared patch over the deployed 0.3.30 release, with no schema change. It is not published, deployed or live-verified. Package-key policy from 0.3.30 is unchanged.
+
+New CPU dev instances created with the updated runner retain resume state after a command exits successfully even without a readiness probe. Every resumed boot or power-on reruns the command, including one that already finished successfully; commands that must run once must guard themselves. Existing guests are not upgraded in place. Idle auto-shelve and its cost policy are unchanged, including for guests without retained state. Older no-probe guests, first-result-error guests and GPU guests without resume state still shelve when idle and return as the bare VM with `error` / `resume_state_missing`, not a restored workload. Legacy non-restorable rows stuck in `resumed` report that error on resume or an idle ACTIVE status read.
+
+Instance reads and owner-mutation admission allow two seconds to acquire the per-instance mutex. A busy read returns the last committed state without reconciliation or writes; it is not a fresh provider observation. A mutation refused at admission returns HTTP 409 with `Retry-After: 10` and applies no request, whether a shelve, resume or slow status read holds the mutex. Transient in-progress state conflicts also carry that ten-second retry header; permanent state conflicts do not. The CLI does not retry automatically. Other typed `MutexBusy` timeouts, including those raised after admission, receive HTTP 503 with `Retry-After: 1` from the API handler instead of HTTP 500; that response does not promise the request was not applied.
+
+Nova actions are classified from status plus task state, not invented `SHELVING` statuses: an ACTIVE server with a shelving task is still shelving, and a SHELVED or SHELVED_OFFLOADED server with an unshelving/spawning task is still unshelving. In-flight actions must not produce false resume success or duplicate provider actions. An idle already-ACTIVE resume preserves workload status rather than waiting for a guest report when no reboot occurred. After separate publication and rollout approval, keep all API/export-worker cohorts and the build worker on the same reviewed release; a local version pin is not deployment evidence.
+
+## 0.3.30 transition note — 2026-11-16 (UTC; deployed)
+
+0.3.30 is a patch over 0.3.29 with no schema change. Package-key issuance and revoke (`keys:issue`, `keys:revoke`) are now member-tier actions: a project member can issue its own restricted package keys, and a manager keeps package/layer/export deletion and project management. Key listing, issuance and revocation stay owner-only for the exact project, and another owner's key is never reachable. An operator `policy.yaml` that narrowed these actions to manager keeps denying member; one that granted them to member now takes effect. Existing bearer keys keep their stored scope and actions. The release also carries the merged read-only client commands `palimpsest layer impact` and the staged compatibility diagnosis. Publication and deployment receipts remain in the [handoff](development-handoff.md).
 
 ## 0.3.29 transition note — 2026-11-15 (UTC; deployed)
 
@@ -91,7 +101,7 @@ Version 0.3.25 is published (tag `0.3.25`, PyPI `palimpsest-client` 0.3.25) and 
 SDK publication and native execution remain separately qualified. Root/Hub metadata, module versions,
 generated locks and Kolla image defaults move together. After formal publication,
 install exact client bytes with
-`uv tool install --python 3.11 palimpsest-client==0.3.30`, or install a trusted
+`uv tool install --python 3.11 palimpsest-client==0.3.31`, or install a trusted
 local checkout with `uv tool install --force --python 3.11 .`.
 A root wheel upgrade neither deploys Hub nor qualifies actual build/run behavior.
 Git/outbound GitHub HTTPS is needed only for VCS installation.
@@ -1769,7 +1779,7 @@ and the [command workflows](cli/workflows.md) for operational details.
 
 ## SDK image/native integration: operator prerequisites
 
-The `0.3.30` Hub distribution declares the exact matching client dependency.
+The prepared `0.3.31` Hub distribution declares the exact matching client dependency.
 Checkout resolution uses `hub`'s explicit parent-path source; installed release
 bytes must match the same immutable tag and reviewed image digests. Paired wheel
 or local container checks do not establish production upgrade or native readiness.

@@ -1,16 +1,17 @@
 # Install Palimpsest
 
 Palimpsest requires Python 3.11 or newer. This source prepares
-[`palimpsest-client 0.3.30`](https://pypi.org/project/palimpsest-client/0.3.30/)
-(prepared for formal publication; the receipts live in the handoff). Publication and deployment are separate. Install exact bytes in isolation:
+[`palimpsest-client 0.3.31`](https://pypi.org/project/palimpsest-client/0.3.31/)
+(prepared; not published, deployed or live-verified). Version 0.3.30 remains the deployed release.
+Publication and deployment are separate. After formal publication, install exact bytes in isolation:
 
 ```sh
-uv tool install --python 3.11 "palimpsest-client==0.3.30"
+uv tool install --python 3.11 "palimpsest-client==0.3.31"
 palimpsest --version
 
 # Or use pip, without changing system Python:
 python3.11 -m venv .venv
-.venv/bin/python -m pip install "palimpsest-client==0.3.29"
+.venv/bin/python -m pip install "palimpsest-client==0.3.31"
 .venv/bin/palimpsest --version
 ```
 
@@ -28,8 +29,12 @@ upgrade does not publish or roll out Hub images.
 
 Publication, deployment-server package selection and actual running services are
 separate gates; use the [latest release/operator handoff](docs/development-handoff.md)
-for their exact receipts. Installing the 0.3.29 client does not activate native
+for their exact receipts. Installing the 0.3.31 client does not activate native
 profiles, provision Ceph credentials, or deploy the matching Hub containers.
+The [0.3.31 transition note](docs/install.md#0331-transition-note--2026-11-17-utc-prepared)
+describes no-probe dev resume, unchanged idle auto-shelve cost policy, legacy
+missing-state errors, bounded instance admission and Nova task-state handling.
+There is no schema change.
 
 Historical release `v0.3.5` followed protected-dev PR #24 and merge
 `04d51ad6e1bf00c4b6e5bf82050383d0bb0a10cf`. Its publication and then-production
@@ -125,7 +130,7 @@ Repository tags also drive GHCR image tags for
 `ghcr.io/openstack-afterglow/palimpsest-hub-worker` and
 `ghcr.io/openstack-afterglow/palimpsest-hub-build-worker`; image tags follow the
 repository tag, not the independently versioned Hub wheel. This source's Kolla
-role defaults to Hub image tag `0.3.30`; verify publication and exact reviewed
+role defaults to Hub image tag `0.3.31`; verify publication and exact reviewed
 API/export/build-worker digests and platform manifests before any deployment.
 Root publication requires trusted tag artifact checks and protected PyPI
 publisher gates. Native policy permits only enabled/success or explicitly
