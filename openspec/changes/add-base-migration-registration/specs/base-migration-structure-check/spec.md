@@ -131,7 +131,7 @@ Surfaces and compatibility status adapters SHALL distinguish comparison evidence
 
 ### Requirement: Risk acknowledgement is explicit, specific and narrow
 
-The service SHALL use the exact sealed `effective_risk_verdict`, not the pure comparison verdict or its `requires_risk_acknowledgement` field, to decide whether a managed migration needs acknowledgement. An otherwise admissible registration or fresh run or instance creation SHALL require acknowledgement exactly when its effective verdict is not `clean`. Unavailable or invalid required provenance SHALL NOT be treated as `clean`.
+The service SHALL use the exact sealed `effective_risk_verdict`, not the pure comparison verdict or its `requires_risk_acknowledgement` field, to decide whether a managed migration needs acknowledgement. An otherwise admissible registration or fresh run or instance creation SHALL require acknowledgement exactly when its effective verdict is not `clean`. Unavailable or invalid required provenance SHALL NOT be treated as `clean`. A migration registration, or a fresh run or instance creation from a publication the server classifies as a managed migration, whose migration provenance is missing, malformed, contradictory or not backed by a valid sealed report, or that fails any hard check, is not otherwise admissible: it SHALL be refused regardless of acknowledgement and SHALL NOT be treated as an ordinary image.
 
 Compatibility risk SHALL be acknowledged through the dedicated control: the CLI flag `--yes-i-understand-the-risk`, the Hub API's strict JSON boolean `acknowledge_compatibility_risk: true`, and a dashboard confirmation that states the same risk for the exact selected result and operation. The three SHALL have the same meaning. No general force, yes, confirm, recreate option or prior operation's recorded acknowledgement SHALL count. Acknowledgement SHALL NOT bypass authentication, authorization, ownership, visibility, payload integrity, quota/resource limits, supported-OS, platform or separate operator checks, and SHALL NOT turn a refused migration into an accepted one.
 
@@ -146,3 +146,7 @@ Compatibility risk SHALL be acknowledged through the dedicated control: the CLI 
 #### Scenario: Acknowledgement does not widen authority
 - **WHEN** the caller acknowledges the risk but lacks permission, exceeds quota or names an unsupported OS
 - **THEN** the request fails exactly as it would without the acknowledgement
+
+#### Scenario: Invalid provenance is refused even with acknowledgement
+- **WHEN** a registration or fresh run names a managed migration whose provenance is missing, malformed, contradictory or not backed by a valid sealed report, and the caller acknowledges the risk
+- **THEN** the request is refused before any write or runtime side effect, and the image is not treated as ordinary or clean

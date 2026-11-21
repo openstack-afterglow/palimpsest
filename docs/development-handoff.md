@@ -34,10 +34,10 @@ files_modified:
   - a tool-activity receipt with controller SSH login times;
   - an owner form that discloses the unidentified actor and the freeze breach.
   The freeze stays.
-- **M5.1 design (design only, spec.md line 19):** `openspec/changes/add-base-migration-registration/` covers M51-02..05 and was rated READY after four independent review rounds (records preserved in `m51-design-reviews-20261121/`, outside the repo).
+- **M5.1 design (design only, spec.md line 19):** `openspec/changes/add-base-migration-registration/` covers M51-02..05. Review records (rounds r1–r6) are preserved outside the repo in `m51-design-reviews-20261121/`. Round r4 rated READY on delta spec `0e9f04f9…`; a later author cleanup dropped the launch-time hard-refusal rule (r5 READY AFTER FIXES). With the rule restored, round r6 rated delta spec `41352b98…` READY. Non-blocking r6 note: the delta spec could also state launch behaviour for rows lacking an origin class and for unreconciled rollback-period rows; design.md:48,114 already blocks both.
   - Registration: the original combination stays immutable; migration results register as new immutable combinations bound to a server-sealed report.
-  - Gate: admission uses `effective_risk_verdict` (the strictest of the comparison and the inherited verdicts). Extensions of non-clean results and no-op or laundering re-migrations are refused; resume requires a fresh acknowledgement; automatic restart is refused for non-clean images.
-  - The acknowledgement never bypasses auth, ownership, integrity, quota or supported-OS checks.
+  - Gate: admission uses `effective_risk_verdict` (the strictest of the comparison and the inherited verdicts). Extensions of non-clean results and no-op re-migrations are refused, and a re-migration must start from the recorded replacement base. Gating covers server-recorded migration lineage only: republishing non-clean payloads as an ordinary image and migrating that can still yield a managed `clean` result (owner decision 5). Resume requires a fresh acknowledgement; automatic restart is refused for non-clean images.
+  - Missing, malformed or unsealed migration provenance is refused even with acknowledgement. The acknowledgement never bypasses auth, ownership, integrity, quota or supported-OS checks.
   - Six owner decisions remain. No implementation; no checkbox.
 
 ## 0.3.32 rollout executed through cutover; phase 9 verification FAIL — 2026-11-20 (Goal 71/109 unchanged)
