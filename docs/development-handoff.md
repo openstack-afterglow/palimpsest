@@ -24,6 +24,22 @@ files_modified:
 [ARCHITECTURE.md](../ARCHITECTURE.md), 실행 경계는 [testing.md](testing.md),
 세부 결과는 아래 링크된 문서와 source다.
 
+## r3.4.11 not adopted; owner infrastructure maintenance; M5.1 design proposal READY — 2026-11-21 (Goal 71/109 unchanged)
+
+- **r3.4.11 NOT READY** (`INDEPENDENT-REVIEW-RESULT-r3.4.11.md`, `e1c90b1e…`): the phase-9 package (manifest `6420235d…`, 68 exact accepted API lines, ProxySQL re-identity, 46/46 offline tests) is mechanically correct. A re-run is still certain to fail: controller3 haproxy was recreated at 13:40:51Z and Valkey server/sentinel restarted on all controllers at 13:49:51–13:50:48Z, raising API incident lines from 9/50/9 to 53/96/93 and changing the pinned Valkey identities. Nothing was installed on the operator host.
+- **Owner form 29** (`owner-approval-29.json`, `7efede0a…`): the restarts are the owner's own or delegated maintenance; the owner will report when it ends. Then: prepare a new accepted set, get independent review, re-verify. A successor needs:
+  - a quiet-period recapture with full traceback text and Docker events for infrastructure restarts;
+  - a Valkey re-pin plus a Valkey log-continuity rule;
+  - a pre-window read-only stop-on-new-event check;
+  - a tool-activity receipt with controller SSH login times;
+  - an owner form that discloses the unidentified actor and the freeze breach.
+  The freeze stays.
+- **M5.1 design (design only, spec.md line 19):** `openspec/changes/add-base-migration-registration/` covers M51-02..05. Review records (rounds r1–r6) are preserved outside the repo in `m51-design-reviews-20261121/`. Round r4 rated READY on delta spec `0e9f04f9…`; a later author cleanup dropped the launch-time hard-refusal rule (r5 READY AFTER FIXES). With the rule restored, round r6 rated delta spec `41352b98…` READY. Non-blocking r6 note: the delta spec could also state launch behaviour for rows lacking an origin class and for unreconciled rollback-period rows; design.md:48,114 already blocks both.
+  - Registration: the original combination stays immutable; migration results register as new immutable combinations bound to a server-sealed report.
+  - Gate: admission uses `effective_risk_verdict` (the strictest of the comparison and the inherited verdicts). Extensions of non-clean results and no-op re-migrations are refused, and a re-migration must start from the recorded replacement base. Gating covers server-recorded migration lineage only: republishing non-clean payloads as an ordinary image and migrating that can still yield a managed `clean` result (owner decision 5). Resume requires a fresh acknowledgement; automatic restart is refused for non-clean images.
+  - Missing, malformed or unsealed migration provenance is refused even with acknowledgement. The acknowledgement never bypasses auth, ownership, integrity, quota or supported-OS checks.
+  - Six owner decisions remain. No implementation; no checkbox.
+
 ## 0.3.32 rollout executed through cutover; phase 9 verification FAIL — 2026-11-20 (Goal 71/109 unchanged)
 
 - **Execution:** `R=/home/pieroot/palimpsest-rollout-0.3.32-20261120T060649Z`; full timeline in `rollout-0.3.32-20261118/execution-20261120.log`. Owner forms 22–28 (`owner-approval-20261116/owner-approval-22.json` … `-28.json`). Where the owner left reason text empty, owner lines state that fact instead of inventing a reason.
