@@ -29,6 +29,9 @@ def test_numeric_and_historical_release_tags_match_both_distribution_versions(tm
         (ROOT / "scripts/check_release_version.py").read_bytes()
     )
     (tmp_path / "hub").mkdir()
+
+    (tmp_path / "src/palimpsest_local").mkdir(parents=True)
+    (tmp_path / "src/palimpsest_local/__init__.py").write_text('__version__ = "0.3.12"\n')
     for file in ("pyproject.toml", "hub/pyproject.toml"):
         (tmp_path / file).write_text('[project]\nversion = "0.3.12"\n')
     for tag, accepted in (
@@ -61,9 +64,27 @@ def test_numeric_and_historical_release_tags_match_both_distribution_versions(tm
         ["bash", "-c", command], cwd=tmp_path, env={"PATH": "/usr/bin:/bin", "RELEASE_TAG": "0.3.12"}
     )
     assert mismatched_hub.returncode != 0
+
+    (tmp_path / "hub/pyproject.toml").write_text('[project]\nversion = "0.3.12"\n')
+    (tmp_path / "src/palimpsest_local/__init__.py").write_text('__version__ = "0.3.11"\n')
+    mismatched_cli = subprocess.run(
+        ["bash", "-c", command], cwd=tmp_path, env={"PATH": "/usr/bin:/bin", "RELEASE_TAG": "0.3.12"}
+    )
+    assert mismatched_cli.returncode != 0
+
     for image in ("api", "worker", "build-worker"):
         metadata = next(step for step in image_workflow["jobs"]["build-and-push"]["steps"] if step.get("id") == image)
         assert "type=semver,pattern={{version}}" in metadata["with"]["tags"]
+
+
+def test_cli_version_matches_installed_distribution_metadata(capsys) -> None:
+    from importlib.metadata import version
+
+    from palimpsest_local import __version__, cli
+
+    expected = version("palimpsest-client")
+    assert cli.main(["--version"]) == 0
+    assert capsys.readouterr().out.strip() == expected == __version__
 
 
 def _run_steps(job: dict) -> list[str]:

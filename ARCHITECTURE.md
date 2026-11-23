@@ -3048,6 +3048,22 @@ uv run python scripts/test_lanes.py run gate2
 
 ## Maintenance
 
+2026-11-23 Kolla precondition fix / 0.3.33 candidate: reviewed the Palimpsest
+database preconditions against Kolla's MariaDB shard defaults and
+`proxysql-config` user renderer. The role selects `root_shard_<id>` when
+ProxySQL is enabled, retains `database_user` otherwise, and defaults a service
+ProxySQL user from existing secret variables and shard ID. Database and user
+creation are skipped when `use_preconfigured_databases` is enabled, preserving
+external database ownership and avoiding administrative grants. Keystone reader
+modules pass `openstack_auth_cloud | default(omit)`, supplying the named profile
+on Kolla 2026.1 and preserving 2025.2's full auth mapping. The root CLI
+`__version__`, release tag guard and package smoke now stay aligned with the
+distribution metadata. `no_log`, TLS validation and reader-only role scope
+remain unchanged. No Hub schema/API/runtime behavior changes. Release, operator
+installation and live readiness remain separate until exact receipts are
+recorded in the handoff.
+
+
 2026-11-18 release0.3.32 preparation review: checked matching client/Hub
 manifests and module versions, the exact Hub client dependency, native-generated
 root/Hub locks, Kolla image defaults and current installation pins against the
@@ -4321,9 +4337,9 @@ Reserved names and duplicate listings (2026-11-15, from the commit-path review, 
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "6aff0b2e6d6c2a20363b10c8891d923a514ec70a2c0d674d0913edd347d5c97b",
-  "reviewed_at": "2026-11-17T16:58:42Z",
-  "summary": "Reviewed final metadata-only 0.3.32 prep rebased last on dev424b967 after console#122, quota#123 and carrier-ctime destruction#124. Matching root/Hub manifests, module versions, exact client dependency, native-generated locks and Kolla/install pins; all Unreleased bullets retained verbatim. Reconciled bootstrap-before-app and preserve-table app-only rollback contract. Runtime patch-id from fec3080 remains befb00d158c9bb224cde8a6852d83cb044bf85c3; no runtime/lifecycle/trust/spec/handoff edits. No publication, deployment or live proof."
+  "source_sha256": "cacabe907c1a4d4dac0ea19b0eeef30503bc595c87dc3b0c8c38455b0e8731f6",
+  "reviewed_at": "2026-11-23T04:48:00Z",
+  "summary": "Reviewed preconfigured database guard alongside Kolla shard and Keystone auth; external databases retain operator ownership and no admin grant is created."
 }
 ```
 <!-- architecture-review:end -->

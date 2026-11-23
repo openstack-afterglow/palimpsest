@@ -2,6 +2,15 @@
 
 All notable changes to Palimpsest Local are documented here.
 
+## [0.3.33] - 2026-11-23 (prepared)
+
+### Fixed
+
+- Kolla database preconditions use the shard-root account for ProxySQL and provide a default ProxySQL user mapping for Palimpsest.
+- Keystone reader modules pass the named cloud profile when Kolla exposes it and retain the full auth mapping when it does not.
+- The release version gate and installed-package smoke reject a CLI `--version` that differs from distribution metadata.
+- No Hub schema change or offline bootstrap is required.
+
 ## [0.3.32] - 2026-11-18 (UTC; prepared)
 
 Prepared patch source for console lifecycle/build controls, the Afterglow API contract, per-subject image-quota overrides and destruction-only carrier-ctime RM; not published, deployed or live-verified. Run the new API image's `palimpsest-hub-bootstrap` offline before the new app starts so `palimpsest_hub_image_quota_overrides` exists; app-only rollback ignores overrides, but must never drop their additive history table.

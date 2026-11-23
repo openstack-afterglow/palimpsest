@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ast
 import os
 import re
 import tomllib
@@ -18,6 +19,19 @@ def main() -> None:
     for file in ("pyproject.toml", "hub/pyproject.toml"):
         if tomllib.loads(Path(file).read_text())["project"]["version"] != version:
             raise SystemExit("release tag and distribution versions differ")
+
+    client_module = ast.parse(Path("src/palimpsest_local/__init__.py").read_text(encoding="utf-8"))
+    client_version = next(
+        (
+            ast.literal_eval(node.value)
+            for node in client_module.body
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "__version__" for target in node.targets)
+        ),
+        None,
+    )
+    if client_version != version:
+        raise SystemExit("release tag and client CLI versions differ")
     print(version)
 
 

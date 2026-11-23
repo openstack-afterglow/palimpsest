@@ -31,6 +31,7 @@ precheck_text = (ROLE_DIR / "tasks" / "precheck_controller.yml").read_text(encod
 source_build_text = (ROLE_DIR / "tasks" / "source_build.yml").read_text(encoding="utf-8")
 bootstrap_text = (ROLE_DIR / "tasks" / "bootstrap_service.yml").read_text(encoding="utf-8")
 keystone_text = (ROLE_DIR / "tasks" / "preconditions_keystone.yml").read_text(encoding="utf-8")
+database_preconditions_text = (ROLE_DIR / "tasks" / "preconditions_db.yml").read_text(encoding="utf-8")
 loadbalancer_text = (ROLE_DIR / "tasks" / "loadbalancer.yml").read_text(encoding="utf-8")
 validator_text = (ROLE_DIR / "files" / "validate_image_ref.py").read_text(encoding="utf-8")
 
@@ -389,5 +390,33 @@ def test_reader_provisioning_preserves_return_shape_and_verified_least_privilege
     assert assignment_args["system"] == "all"
     assert "project" not in assignment_args
     for args in (identity_args, assignment_args):
+        assert args["auth"] == "{{ openstack_auth }}"
+        assert args["cloud"] == "{{ openstack_auth_cloud | default(omit) }}"
         assert args["interface"] == "{{ openstack_interface | default('internal') }}"
         assert args["validate_certs"] == "{{ not (openstack_insecure | default(false) | bool) }}"
+
+
+def test_database_admin_and_proxy_user_follow_kolla_shard_contract():
+    assert defaults_yaml["palimpsest_database_shard_id"] == "{{ mariadb_default_database_shard_id | int }}"
+    assert defaults_yaml["palimpsest_database_admin_user"] == (
+        "{% if enable_proxysql | bool %}root_shard_{{ palimpsest_database_shard_id }}{% else %}{{ database_user }}{% endif %}"
+    )
+    assert defaults_yaml["palimpsest_database_shard"] == {
+        "users": [
+            {
+                "user": "{{ palimpsest_database_user }}",
+                "password": "{{ palimpsest_database_password }}",
+                "shard_id": "{{ palimpsest_database_shard_id }}",
+            }
+        ]
+    }
+    tasks = yaml.safe_load(database_preconditions_text)
+    database_tasks = [task for task in tasks if task["name"].startswith("DB |")]
+    assert len(database_tasks) == 2
+    assert all("not use_preconfigured_databases | bool" in task["when"] for task in database_tasks)
+    assert all(
+        task["kolla_toolbox"]["module_args"]["login_user"] == "{{ palimpsest_database_admin_user }}"
+        for task in database_tasks
+    )
+
+    assert "project_name: palimpsest" in loadbalancer_text

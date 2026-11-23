@@ -1,18 +1,19 @@
 # Install Palimpsest
 
 Palimpsest requires Python 3.11 or newer. This source prepares
-[`palimpsest-client 0.3.32`](https://pypi.org/project/palimpsest-client/0.3.32/)
-(prepared; not published, deployed or live-verified). Version 0.3.31 remains the deployed release.
-It adds console stop/resume and image-build submission, the Afterglow API contract, subject image-quota overrides and destruction-only native-VZ carrier-ctime RM.
+[`palimpsest-client 0.3.33`](https://pypi.org/project/palimpsest-client/0.3.33/)
+(release candidate; not yet published or installed). It fixes the Kolla
+ProxySQL shard-root and Keystone cloud-profile preconditions; no Hub schema
+change is included. Version 0.3.32 remains the latest published release.
 Publication and deployment are separate. After formal publication, install exact bytes in isolation:
 
 ```sh
-uv tool install --python 3.11 "palimpsest-client==0.3.32"
+uv tool install --python 3.11 "palimpsest-client==0.3.33"
 palimpsest --version
 
 # Or use pip, without changing system Python:
 python3.11 -m venv .venv
-.venv/bin/python -m pip install "palimpsest-client==0.3.32"
+.venv/bin/python -m pip install "palimpsest-client==0.3.33"
 .venv/bin/palimpsest --version
 ```
 

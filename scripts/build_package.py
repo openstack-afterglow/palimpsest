@@ -99,7 +99,17 @@ def _verify_install(wheel: Path, workspace: Path, uv: str, version: str) -> None
     )
     for command in ("palimpsest", "plm"):
         executable = workspace / "tool-bin" / (f"{command}.exe" if os.name == "nt" else command)
-        _run([str(executable), "--version"], env=tool_environment, cwd=workspace)
+        version_result = subprocess.run(
+            [str(executable), "--version"],
+            env=tool_environment,
+            cwd=workspace,
+            check=True,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        reported_version = version_result.stdout.strip()
+        if reported_version != version:
+            raise RuntimeError(f"{command} reports version {reported_version!r}, expected {version!r}")
         _run([str(executable), "--help"], env=tool_environment, cwd=workspace)
 
 
