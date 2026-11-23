@@ -37,9 +37,9 @@ are not deployed-service acceptance; see the [control-plane boundaries](ARCHITEC
 - **0.3.30 (published and deployed 2026-11-16 UTC):** a project member issues its own package keys (`keys:issue`, `keys:revoke` moved from the manager tier to the member tier), so a member holds all five package capabilities; a manager keeps package/layer/export deletion and project management, a reader is unchanged, and key access stays owner-only. It also carries the merged read-only layer impact plan and staged diagnosis (PR #115). No schema change.
 - **0.3.31 (prepared; not published, deployed or live-verified):** contains both the Hub dev-resume/contention fixes and the native-VZ client destruction-only RM fix (#119, original patch `d8d2717`). New CPU dev guests retain resume state after a successful command without a readiness probe; resumed boots rerun that command. Idle auto-shelve and its cost policy are unchanged. Legacy guests without retained state are not upgraded and report `error` / `resume_state_missing` after resume rather than remaining falsely `resumed`. Instance reads and owner admission use a two-second mutex allowance: busy reads return committed state, and refused mutations return transient HTTP 409 with `Retry-After: 10` without applying the request. Other typed mutex timeouts receive HTTP 503 at the API boundary. Nova status plus task state distinguishes shelving and unshelving from idle states. The native-VZ change permits only canonical RM of an exact proved stopped `stop-incomplete` HOLD; it does not grant start/capture or graceful-stop recovery and has local-test evidence only. No schema change; see the [transition note](docs/install.md#0331-transition-note--2026-11-17-utc-prepared).
 
-- **0.3.32 (prepared; not published, deployed or live-verified):** console stop/resume and image-build submission, the Afterglow API contract, per-subject image-quota overrides and destruction-only carrier-ctime RM. The new API image's offline `palimpsest-hub-bootstrap` must run before any new application starts; app-only rollback ignores overrides but must preserve their additive history table. See the [upgrade contract](docs/install.md#0332-transition-note--2026-11-18-utc-prepared).
+- **0.3.32 (published 2026-11-18; deployment evidence remains in the handoff):** console stop/resume and image-build submission, the Afterglow API contract, per-subject image-quota overrides and destruction-only carrier-ctime RM. The new API image's offline `palimpsest-hub-bootstrap` must run before any new application starts; app-only rollback ignores overrides but must preserve their additive history table. See the [upgrade contract](docs/install.md#0332-transition-note--2026-11-18-utc-prepared).
 
-The prepared 0.3.32 native-VZ source extends only canonical `rm` to an exact
+The 0.3.32 native-VZ release extends only canonical `rm` to an exact
 `retained-authority-changed` HOLD whose run-private carrier changed only in
 ctime_ns, with the same streamed content digest and every other pinned authority
 unchanged. It uses #119's complete repeated stopped-provider/actor/network/upper
@@ -50,30 +50,32 @@ released. Ordinary exec/stop/start/capture stay fail-closed. The ctime-changing
 actor is unknown, and the held mac-mini cleanup remains pending reviewed release
 and live proof. See the [native-root contract](openspec/specs/vz-native-root/spec.md).
 
+- **0.3.33 (prepared; publication and deployment pending):** Kolla database preconditions use the configured shard-root account when ProxySQL is enabled, the role supplies its ProxySQL user default, Keystone reader modules pass the named cloud profile when available, and release checks require the CLI version to match distribution metadata. No Hub schema change.
+
 
 ## Install from PyPI
 
 Requires Python 3.11 or newer. Prefer an isolated uv tool, or a pip virtual environment:
 
 ```sh
-uv tool install --python 3.11 "palimpsest-client==0.3.32"
+uv tool install --python 3.11 "palimpsest-client==0.3.33"
 palimpsest --version
 
 # Alternative: pip, without modifying the system Python.
 python3.11 -m venv .venv
-.venv/bin/python -m pip install "palimpsest-client==0.3.32"
+.venv/bin/python -m pip install "palimpsest-client==0.3.33"
 .venv/bin/palimpsest --version
 ```
 
 If uv's tool directory is not on `PATH`, run `uv tool update-shell` explicitly
 and open a new terminal. One-off use: `uvx --python 3.11 --from
-palimpsest-client==0.3.32 palimpsest --version`.
+palimpsest-client==0.3.33 palimpsest --version`.
 
 Root client installation and Hub service deployment are separate. API, export
 worker and build-worker images must match the reviewed release; updating the
 root wheel alone does not update running Kolla containers.
 
-The commands above select version 0.3.32 after its formal publication. Check the
+The commands above select version 0.3.33 after its formal publication. Check the
 [release handoff](docs/development-handoff.md) for actual PyPI/image receipts and
 the deployment-server package/lock selection. Older release and production
 receipts remain historical and do not establish the currently running version.

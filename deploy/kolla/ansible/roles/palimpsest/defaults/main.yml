@@ -1,7 +1,7 @@
 ---
 # Palimpsest kolla role defaults
 
-palimpsest_image_tag: "0.3.32"
+palimpsest_image_tag: "0.3.33"
 palimpsest_image_namespace: "ghcr.io/openstack-afterglow"
 palimpsest_api_image: "{{ palimpsest_image_namespace }}/palimpsest-hub-api"
 palimpsest_worker_image: "{{ palimpsest_image_namespace }}/palimpsest-hub-worker"
@@ -98,7 +98,13 @@ palimpsest_database_name: "palimpsest_kolla"
 palimpsest_database_user: "palimpsest_kolla"
 palimpsest_database_address: "{{ database_address }}"
 palimpsest_database_port: "{{ database_port }}"
-palimpsest_database_admin_user: "{{ database_user }}"
+palimpsest_database_shard_id: "{{ mariadb_default_database_shard_id | int }}"
+palimpsest_database_admin_user: "{% if enable_proxysql | bool %}root_shard_{{ palimpsest_database_shard_id }}{% else %}{{ database_user }}{% endif %}"
+palimpsest_database_shard:
+  users:
+    - user: "{{ palimpsest_database_user }}"
+      password: "{{ palimpsest_database_password }}"
+      shard_id: "{{ palimpsest_database_shard_id }}"
 palimpsest_database_admin_password: "{{ database_password }}"
 palimpsest_database_url: "mysql+asyncmy://{{ palimpsest_database_user }}:{{ palimpsest_database_password }}@{{ palimpsest_database_address }}:{{ palimpsest_database_port }}/{{ palimpsest_database_name }}"
 palimpsest_valkey_host: "{{ 'api' | kolla_address(groups['valkey'][0]) }}"

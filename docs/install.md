@@ -1,8 +1,23 @@
 # Detailed installation and configuration guide
 
+## 0.3.33 transition note — 2026-11-23 (prepared)
+
+0.3.33 synchronizes root client and Hub metadata with the Kolla role default.
+It uses Kolla's configured shard-root administrator when ProxySQL is enabled,
+supplies Palimpsest's ProxySQL user mapping, and passes the named Keystone cloud
+profile when the running Kolla version exposes it. Older Kolla versions retain
+their full `openstack_auth` mapping and omit the undefined `cloud` argument.
+No Hub schema change or offline bootstrap is added. When Kolla manages MariaDB,
+its post-deploy role provisions the shard root. With a preconfigured external
+database, the managed role is skipped; an authorized operator must use Kolla
+Toolbox `mysql_user` against the direct backend before ProxySQL-routed Palimpsest
+preconditions run. Never send `kolla_root` through the ProxySQL VIP.
+Publication and deployment receipts belong in the current handoff.
+
 ## 0.3.32 transition note — 2026-11-18 (UTC; prepared)
 
-0.3.32 is prepared source, not published, deployed or live-verified. Console
+0.3.32 was prepared on 2026-11-18 and subsequently published; its dated
+deployment and verification status is in the development handoff. Console
 stop/resume and image-build submission use the existing lifecycle/build APIs;
 the Afterglow API contract documents their integration boundaries. Native-VZ
 carrier-ctime RM remains destruction-only, with no relaxed execution authority.
@@ -726,7 +741,7 @@ image digests in Kolla globals; a Python update does not change running containe
 ### Install the Kolla role from PyPI
 
 In the existing operator project's dependency array, pin
-`palimpsest-client==0.3.3` and remove only the `palimpsest-client` Git entry from
+`palimpsest-client==0.3.33` and remove only the `palimpsest-client` Git entry from
 `[tool.uv.sources]`. Keep Kolla and the other packages' existing pins unchanged.
 Normal release installation does not require GitHub access to Palimpsest and
 does not enable a source-image build.
