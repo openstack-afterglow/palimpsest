@@ -413,6 +413,7 @@ def test_database_admin_and_proxy_user_follow_kolla_shard_contract():
     tasks = yaml.safe_load(database_preconditions_text)
     database_tasks = [task for task in tasks if task["name"].startswith("DB |")]
     assert len(database_tasks) == 2
+    assert all("not use_preconfigured_databases | bool" in task["when"] for task in database_tasks)
     assert all(
         task["kolla_toolbox"]["module_args"]["login_user"] == "{{ palimpsest_database_admin_user }}"
         for task in database_tasks

@@ -7,11 +7,11 @@ It uses Kolla's configured shard-root administrator when ProxySQL is enabled,
 supplies Palimpsest's ProxySQL user mapping, and passes the named Keystone cloud
 profile when the running Kolla version exposes it. Older Kolla versions retain
 their full `openstack_auth` mapping and omit the undefined `cloud` argument.
-No Hub schema change or offline bootstrap is added. When Kolla manages MariaDB,
-its post-deploy role provisions the shard root. With a preconfigured external
-database, the managed role is skipped; an authorized operator must use Kolla
-Toolbox `mysql_user` against the direct backend before ProxySQL-routed Palimpsest
-preconditions run. Never send `kolla_root` through the ProxySQL VIP.
+No Hub schema change or offline bootstrap is added. With
+`use_preconfigured_databases: yes`, the role skips database and user creation;
+the operator must provision the database and service credentials separately.
+Otherwise, Kolla-managed MariaDB must provide its shard-root account before
+Palimpsest database preconditions run.
 Publication and deployment receipts belong in the current handoff.
 
 ## 0.3.32 transition note — 2026-11-18 (UTC; prepared)

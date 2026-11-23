@@ -18,4 +18,4 @@ Kolla's stock database roles use `root_shard_<id>` for administrative SQL throug
 
 ## Risks / Trade-offs
 
-The shard-root account has database-wide privileges. Provision it only through Kolla's `kolla_toolbox` `mysql_user` module: the stock MariaDB post-deploy path when Kolla manages the cluster, or a separately authorized direct-backend task when the database is preconfigured externally. The role's portable tests do not prove ProxySQL runtime state or Keystone API success; those require post-release Kolla checks.
+With preconfigured databases, the operator must provision the database and service user before deployment; the role skips both administrative tasks. With managed databases, Kolla provisions its shard-root account. Portable tests do not prove ProxySQL runtime state or Keystone API success; those require post-release checks.

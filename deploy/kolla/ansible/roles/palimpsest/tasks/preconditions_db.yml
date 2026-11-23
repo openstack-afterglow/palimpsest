@@ -14,6 +14,7 @@
       name: "{{ palimpsest_database_name }}"
   no_log: true
   when:
+    - not use_preconfigured_databases | bool
     - '"palimpsest-hub-api" in palimpsest_local_services'
     - inventory_hostname == (groups.get('palimpsest', []) | first)
 
@@ -33,5 +34,6 @@
       state: present
   no_log: true
   when:
+    - not use_preconfigured_databases | bool
     - '"palimpsest-hub-api" in palimpsest_local_services'
     - inventory_hostname == (groups.get('palimpsest', []) | first)

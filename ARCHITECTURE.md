@@ -3050,9 +3050,11 @@ uv run python scripts/test_lanes.py run gate2
 
 2026-11-23 Kolla precondition fix / 0.3.33 candidate: reviewed the Palimpsest
 database preconditions against Kolla's MariaDB shard defaults and
-`proxysql-config` user renderer. The role now selects `root_shard_<id>` when
+`proxysql-config` user renderer. The role selects `root_shard_<id>` when
 ProxySQL is enabled, retains `database_user` otherwise, and defaults a service
-ProxySQL user from existing secret variables and shard ID. Keystone reader
+ProxySQL user from existing secret variables and shard ID. Database and user
+creation are skipped when `use_preconfigured_databases` is enabled, preserving
+external database ownership and avoiding administrative grants. Keystone reader
 modules pass `openstack_auth_cloud | default(omit)`, supplying the named profile
 on Kolla 2026.1 and preserving 2025.2's full auth mapping. The root CLI
 `__version__`, release tag guard and package smoke now stay aligned with the
@@ -4335,9 +4337,9 @@ Reserved names and duplicate listings (2026-11-15, from the commit-path review, 
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "af4db6d97c47449cd0e48bcaf5f33e5cb478afedf8ac1e8c99495237f1af0d1f",
-  "reviewed_at": "2026-11-23T03:20:16Z",
-  "summary": "Reviewed Kolla ProxySQL shard and Keystone cloud-profile preconditions, synchronized 0.3.33 versions, and verified installed CLI version outputs. No Hub runtime or schema change."
+  "source_sha256": "cacabe907c1a4d4dac0ea19b0eeef30503bc595c87dc3b0c8c38455b0e8731f6",
+  "reviewed_at": "2026-11-23T04:48:00Z",
+  "summary": "Reviewed preconfigured database guard alongside Kolla shard and Keystone auth; external databases retain operator ownership and no admin grant is created."
 }
 ```
 <!-- architecture-review:end -->

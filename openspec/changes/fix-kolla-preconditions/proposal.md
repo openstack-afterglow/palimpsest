@@ -21,4 +21,4 @@ The canonical Kolla reconfigure failed in Palimpsest database and Keystone preco
 
 ## Impact
 
-Only the root Kolla role defaults and precondition tasks change behavior. No Hub schema or runtime code changes. Shard-root provisioning must use Kolla's `mysql_user` module against a direct database backend before ProxySQL-routed Palimpsest preconditions; managed MariaDB uses its post-deploy task, while preconfigured external databases require an explicitly authorized toolbox operation. Release and live deployment remain separate gates.
+The Kolla role defaults and precondition tasks change behavior. No Hub schema or runtime code changes. Preconfigured databases and their service credentials remain operator-managed; no database-wide administrator grant is required for Palimpsest deployment in that mode. Release and live deployment remain separate gates.

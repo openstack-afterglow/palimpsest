@@ -15,6 +15,11 @@ The Palimpsest Kolla role SHALL use `root_shard_<id>` for database administratio
 - **WHEN** the Palimpsest database preconditions run without ProxySQL
 - **THEN** database creation and user provisioning use Kolla's `database_user`
 
+#### Scenario: Externally preconfigured database
+
+- **WHEN** `use_preconfigured_databases` is enabled
+- **THEN** the role skips database and user creation and uses the existing service credentials
+
 ### Requirement: Use the named Keystone cloud profile for reader provisioning
 
 The reader identity and system-role assignment modules SHALL receive the existing `openstack_auth` mapping and SHALL pass `openstack_auth_cloud` when Kolla defines it. When the running Kolla version does not define that variable, the `cloud` argument SHALL be omitted so the complete legacy auth mapping remains usable.
